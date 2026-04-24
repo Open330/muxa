@@ -1,0 +1,16 @@
+# muxa daemon configuration — copy to ~/.config/muxa/config.toml
+
+# Unix socket the daemon listens on.
+# Defaults to $XDG_RUNTIME_DIR/muxa.sock (or /tmp/muxa-$UID.sock as fallback).
+# socket = "/run/user/1000/muxa.sock"
+
+# tmux socket to attach to for control mode. Default: auto-detect from $TMUX.
+# tmux_socket = "default"
+
+[notifier]
+# enabled = true
+# backend = "libnotify"   # libnotify | none   (more backends TBD)
+
+[log]
+# RUST_LOG-style filter. Default: "muxa=info"
+# level = "muxa=debug,tokio=warn"
