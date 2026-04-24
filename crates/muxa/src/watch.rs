@@ -3,7 +3,7 @@
 //! Polls the daemon via `Client::snapshot()` every 500 ms and renders a
 //! live-updating table of tracked agents. Input is handled via crossterm
 //! events (`q`/`Esc`/`Ctrl-C` to quit, `r` to force-refresh, `↑/↓` or
-//! `j/k` for selection).
+//! `j/k` for selection, `Enter` to attach into the selected pane).
 //!
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
@@ -22,6 +22,7 @@ use crossterm::terminal::{
 use muxa_core::state::Agent;
 use muxa_core::AgentState;
 use muxa_runtime::ipc::Client;
+use muxa_runtime::tmux;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -104,6 +105,25 @@ impl App {
         };
         self.table_state.select(Some(i));
     }
+
+    /// `pane_id` of the currently selected row, if any.
+    pub(crate) fn selected_pane(&self) -> Option<String> {
+        let i = self.table_state.selected()?;
+        self.agents.get(i)?.pane.clone()
+    }
+}
+
+/// Render a `pane_id` as `session:window.pane` when we can resolve it via
+/// tmux, falling back to the raw id (e.g. `%1618`) so this still degrades
+/// gracefully outside tmux.
+fn pane_display(pane_id: Option<&str>) -> String {
+    let Some(id) = pane_id else {
+        return "-".into();
+    };
+    match tmux::resolve_pane(id) {
+        Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
+        None => id.to_string(),
+    }
 }
 
 /// Restore the terminal to a sane state on drop.
@@ -145,7 +165,12 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 }
 
 /// Entry point for `muxa watch`.
-pub async fn run(client: &Client) -> Result<()> {
+///
+/// Returns `Some(pane_id)` if the user pressed Enter on a selected agent,
+/// meaning they want to attach to that pane. The caller (`main.rs`) runs
+/// the actual tmux switch-client invocation *after* this returns so the
+/// terminal is already restored by the time we hand off control.
+pub async fn run(client: &Client) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
@@ -158,6 +183,7 @@ pub async fn run(client: &Client) -> Result<()> {
     }
 
     let mut last_poll = tokio::time::Instant::now();
+    let mut jump_target: Option<String> = None;
 
     loop {
         guard
@@ -181,6 +207,12 @@ pub async fn run(client: &Client) -> Result<()> {
         if let Some(ev) = got_event {
             match handle_event(ev, &mut app) {
                 Action::Quit => break,
+                Action::Attach => {
+                    if let Some(pane) = app.selected_pane() {
+                        jump_target = Some(pane);
+                        break;
+                    }
+                }
                 Action::Refresh => {
                     refresh(client, &mut app).await;
                     last_poll = tokio::time::Instant::now();
@@ -195,7 +227,7 @@ pub async fn run(client: &Client) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(jump_target)
 }
 
 async fn refresh(client: &Client, app: &mut App) {
@@ -214,6 +246,8 @@ enum Action {
     None,
     Quit,
     Refresh,
+    /// Attach to the currently-selected pane.
+    Attach,
 }
 
 fn handle_event(ev: Event, app: &mut App) -> Action {
@@ -241,6 +275,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Enter => Action::Attach,
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_down();
             Action::None
@@ -342,7 +377,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let rows: Vec<Row> = app.agents.iter().map(|a| agent_row(a, now)).collect();
 
     let widths = [
-        Constraint::Length(8),
+        // PANE — "session:window.pane" can run long; 22 covers most.
+        Constraint::Length(22),
         Constraint::Length(12),
         Constraint::Length(14),
         Constraint::Length(16),
@@ -381,7 +417,7 @@ fn agent_row(a: &Agent, now: OffsetDateTime) -> Row<'_> {
         AgentState::Starting => Style::default().fg(Color::Cyan),
     };
 
-    let pane = a.pane.as_deref().unwrap_or("-").to_string();
+    let pane = pane_display(a.pane.as_deref());
     let kind = kind_label(a.kind);
     let state = state_label(a.state);
     let model = a.model.as_deref().unwrap_or("-").to_string();
@@ -462,13 +498,13 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
 
 fn render_footer(f: &mut Frame, area: Rect, _app: &App) {
     let hint = Line::from(vec![
-        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" quit  "),
-        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" refresh  "),
         Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" move  "),
-        Span::styled(" ^C ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::raw(" attach  "),
+        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" refresh  "),
+        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" quit"),
     ]);
     f.render_widget(Paragraph::new(hint), area);
@@ -569,6 +605,45 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         terminal.draw(|f| render(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn selected_pane_returns_pane_id_for_selected_row() {
+        let mut app = App::new();
+        app.set_agents(vec![
+            fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            ),
+            fake_agent(
+                "s2",
+                Some("%22"),
+                AgentKind::Codex,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ]);
+        // Selection starts at 0 after set_agents.
+        assert_eq!(app.selected_pane().as_deref(), Some("%1"));
+        app.move_down();
+        assert_eq!(app.selected_pane().as_deref(), Some("%22"));
+    }
+
+    #[test]
+    fn pane_display_falls_back_to_raw_id_outside_tmux() {
+        // Outside a tmux server, resolve_pane returns None, and we expect
+        // the raw pane id back.
+        assert_eq!(pane_display(Some("%9999")), "%9999");
+        assert_eq!(pane_display(None), "-");
     }
 
     #[test]

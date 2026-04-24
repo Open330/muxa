@@ -265,12 +265,13 @@ restored cleanly even on panic.
 
 **Keybindings**
 
-| Key              | Action                               |
-| ---------------- | ------------------------------------ |
-| `q` / `Esc`      | Quit                                 |
-| `r`              | Force an immediate refresh           |
-| `↑` / `↓` / `k` / `j` | Move the selection cursor      |
-| `Ctrl-C`         | Quit                                 |
+| Key                   | Action                                                                 |
+| --------------------- | ---------------------------------------------------------------------- |
+| `↑` / `↓` / `k` / `j` | Move the selection cursor.                                             |
+| `Enter`               | Attach to the selected pane (`tmux select-pane` + `switch-client`).    |
+| `r`                   | Force an immediate refresh.                                            |
+| `q` / `Esc`           | Quit.                                                                  |
+| `Ctrl-C`              | Quit.                                                                  |
 
 ## Desktop notifications
 

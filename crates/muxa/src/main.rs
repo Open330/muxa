@@ -103,7 +103,35 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane } => cmd_recap(&client, pane).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
-        Cmd::Watch => watch::run(&client).await,
+        Cmd::Watch => cmd_watch(&client).await,
+    }
+}
+
+async fn cmd_watch(client: &Client) -> Result<()> {
+    // watch::run restores the terminal before returning, so by the time we
+    // get here it's safe to exec tmux commands that mutate the client's
+    // attached session / pane.
+    if let Some(pane_id) = watch::run(client).await? {
+        jump_to_pane(&pane_id);
+    }
+    Ok(())
+}
+
+/// Move the current tmux client to `pane_id`.
+///
+/// We first make the pane active in its window (`select-pane` implicitly
+/// switches windows too), then `switch-client` to the pane's session. Two
+/// calls cover both same-session and cross-session jumps. Errors are
+/// swallowed: the user just exited a fullscreen TUI, a dangling error
+/// message on their terminal would be more annoying than useful.
+fn jump_to_pane(pane_id: &str) {
+    let _ = Command::new("tmux")
+        .args(["select-pane", "-t", pane_id])
+        .status();
+    if let Some(info) = tmux::resolve_pane(pane_id) {
+        let _ = Command::new("tmux")
+            .args(["switch-client", "-t", &info.session])
+            .status();
     }
 }
 
