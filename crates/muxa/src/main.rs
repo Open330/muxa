@@ -86,11 +86,20 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Hook commands are invoked on the agent's critical path (every prompt,
+/// every tool call). If the daemon is down we MUST NOT block or fail — a
+/// best-effort ingest with a stderr warning keeps the agent healthy.
+async fn best_effort_ingest(client: &Client, ev: &muxa_core::event::AgentEvent) {
+    if let Err(e) = client.ingest(ev).await {
+        tracing::debug!(error = %e, "muxa ingest failed (daemon down?)");
+    }
+}
+
 async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     match cmd {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
-            client.ingest(&ev).await?;
+            best_effort_ingest(client, &ev).await;
         }
         HookCmd::ClaudeStatusline => {
             let input = claude::parse_statusline(&mut std::io::stdin())?;
@@ -114,15 +123,15 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             println!("{label}{ctx}{cost}");
             let pane = std::env::var("TMUX_PANE").ok();
             let ev = claude::statusline_heartbeat(input, pane);
-            let _ = client.ingest(&ev).await;
+            best_effort_ingest(client, &ev).await;
         }
         HookCmd::Codex { event } => {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
-            client.ingest(&ev).await?;
+            best_effort_ingest(client, &ev).await;
         }
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
-            client.ingest(&ev).await?;
+            best_effort_ingest(client, &ev).await;
         }
     }
     Ok(())
