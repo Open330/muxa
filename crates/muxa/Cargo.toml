@@ -25,8 +25,13 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# `muxa status` table + colors.
 comfy-table = { version = "7", default-features = false }
 owo-colors = { version = "4", features = ["supports-colors"] }
+
+# TUI — `muxa watch`.
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
 tempfile = "3"
