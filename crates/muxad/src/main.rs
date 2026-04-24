@@ -37,7 +37,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let socket = args.socket.or(cfg.socket.clone()).unwrap_or_else(paths::default_socket);
+    let socket = args
+        .socket
+        .or(cfg.socket.clone())
+        .unwrap_or_else(paths::default_socket);
     tracing::info!(socket = %socket.display(), "starting muxad");
 
     let store = Store::shared();

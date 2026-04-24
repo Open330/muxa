@@ -2,9 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use muxa_adapters::{
-    claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter,
-};
+use muxa_adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
 use muxa_core::paths;
 use muxa_core::state::Agent;
 use muxa_runtime::{ipc::Client, tmux};
@@ -210,8 +208,8 @@ fn cmd_panes() -> Result<()> {
 
 fn print_table(agents: &[Agent]) {
     println!(
-        "{:<14} {:<12} {:<14} {:<16} {}",
-        "PANE", "KIND", "STATE", "MODEL", "LAST PROMPT"
+        "{:<14} {:<12} {:<14} {:<16} LAST PROMPT",
+        "PANE", "KIND", "STATE", "MODEL"
     );
     for a in agents {
         let pane = a.pane.as_deref().unwrap_or("-");
@@ -225,7 +223,13 @@ fn print_table(agents: &[Agent]) {
             .to_string();
         let model = a.model.as_deref().unwrap_or("-");
         let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
-        let prompt: String = prompt_raw.lines().next().unwrap_or("").chars().take(60).collect();
+        let prompt: String = prompt_raw
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
         println!("{pane:<14} {kind:<12} {state:<14} {model:<16} {prompt}");
     }
 }

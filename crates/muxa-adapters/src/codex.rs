@@ -1,4 +1,4 @@
-//! OpenAI Codex CLI adapter.
+//! `OpenAI` Codex CLI adapter.
 //!
 //! Codex's hook engine is a verbatim port of Claude Code's (it's literally
 //! named `ClaudeHooksEngine` upstream). Wire up in `~/.codex/config.toml`:

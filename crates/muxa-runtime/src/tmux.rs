@@ -38,8 +38,7 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
             String::from_utf8_lossy(&out.stderr).into(),
         ));
     }
-    let stdout = String::from_utf8(out.stdout)
-        .map_err(|e| TmuxError::BadOutput(e.to_string()))?;
+    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
     let mut panes = Vec::new();
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split('\t').collect();

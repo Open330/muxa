@@ -74,7 +74,13 @@ impl Store {
         let id = ev.id();
         let at = ev.at();
         let agent = agents.entry(id.session_id.clone()).or_insert_with(|| {
-            Agent::new(id.kind, id.session_id.clone(), id.pane.clone(), id.cwd.clone(), at)
+            Agent::new(
+                id.kind,
+                id.session_id.clone(),
+                id.pane.clone(),
+                id.cwd.clone(),
+                at,
+            )
         });
 
         // Keep identity fields fresh — adapters may re-send with more info.
@@ -183,7 +189,10 @@ mod tests {
         let now = datetime!(2026-04-24 12:00:00 UTC);
 
         store
-            .apply(&AgentEvent::Started { id: id("s"), at: now })
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: now,
+            })
             .await;
         assert_eq!(store.by_session("s").await.unwrap().state, AgentState::Idle);
 
@@ -194,7 +203,10 @@ mod tests {
                 at: now,
             })
             .await;
-        assert_eq!(store.by_session("s").await.unwrap().state, AgentState::Working);
+        assert_eq!(
+            store.by_session("s").await.unwrap().state,
+            AgentState::Working
+        );
 
         store
             .apply(&AgentEvent::NotificationFired {
@@ -210,12 +222,18 @@ mod tests {
         );
 
         store
-            .apply(&AgentEvent::TurnStopped { id: id("s"), at: now })
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                at: now,
+            })
             .await;
         assert_eq!(store.by_session("s").await.unwrap().state, AgentState::Idle);
 
         store
-            .apply(&AgentEvent::SessionEnded { id: id("s"), at: now })
+            .apply(&AgentEvent::SessionEnded {
+                id: id("s"),
+                at: now,
+            })
             .await;
         assert_eq!(
             store.by_session("s").await.unwrap().state,
@@ -228,10 +246,16 @@ mod tests {
         let store = Store::shared();
         let stale = OffsetDateTime::now_utc() - time::Duration::hours(2);
         store
-            .apply(&AgentEvent::Started { id: id("s"), at: stale })
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: stale,
+            })
             .await;
         store
-            .apply(&AgentEvent::SessionEnded { id: id("s"), at: stale })
+            .apply(&AgentEvent::SessionEnded {
+                id: id("s"),
+                at: stale,
+            })
             .await;
         let removed = store.gc(time::Duration::hours(1)).await;
         assert_eq!(removed, 1);
