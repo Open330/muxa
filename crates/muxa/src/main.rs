@@ -1,5 +1,7 @@
 //! muxa CLI — user-facing entry point.
 
+mod watch;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use muxa_adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
@@ -39,6 +41,8 @@ enum Cmd {
     },
     /// Debug: print tmux pane inventory.
     Panes,
+    /// Fullscreen TUI dashboard of all tracked agents.
+    Watch,
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +87,7 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane } => cmd_recap(&client, pane).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
+        Cmd::Watch => watch::run(&client).await,
     }
 }
 
