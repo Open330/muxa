@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-- Rust `1.80+` (workspace-pinned via `rust-version`)
+- Rust `1.88+` (workspace-pinned via `rust-version`)
 - `cargo fmt`, `cargo clippy`, `cargo test` — all three are gated in CI
 
 ## Development

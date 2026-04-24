@@ -7,7 +7,7 @@
 See which agents are working, waiting, or idle — right from your status line.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
-![MSRV](https://img.shields.io/badge/MSRV-1.85-informational)
+![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
 
@@ -80,11 +80,12 @@ plugin-based, not shell-hook.</sub>
 
 ## Install
 
-Requires **Rust 1.85+**, **tmux 3.x**, and a Unix-y OS.
+Requires **Rust 1.88+**, **tmux 3.x**, and a Unix-y OS.
 
 ```bash
 git clone https://github.com/Open330/muxa.git && cd muxa
-cargo install --path crates/muxad --path crates/muxa
+cargo install --path crates/muxad --locked
+cargo install --path crates/muxa  --locked
 ```
 
 That installs two bins to `~/.cargo/bin/`:
