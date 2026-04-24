@@ -20,9 +20,13 @@ muxa-adapters = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+comfy-table = { version = "7", default-features = false }
+owo-colors = { version = "4", features = ["supports-colors"] }
 
 [dev-dependencies]
 tempfile = "3"

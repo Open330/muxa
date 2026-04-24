@@ -65,3 +65,15 @@ pub fn inside_tmux() -> bool {
 pub fn current_pane() -> Option<String> {
     std::env::var("TMUX_PANE").ok()
 }
+
+/// Resolve a raw tmux `pane_id` (e.g. `%42`) to its full `PaneInfo`.
+///
+/// Returns `None` if tmux is unavailable, if the pane no longer exists, or
+/// if `list-panes` fails for any other reason. Callers should be ready to
+/// fall back to showing the raw id.
+pub fn resolve_pane(pane_id: &str) -> Option<PaneInfo> {
+    list_panes()
+        .ok()?
+        .into_iter()
+        .find(|p| p.pane_id == pane_id)
+}

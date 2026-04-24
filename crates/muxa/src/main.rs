@@ -2,11 +2,17 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use comfy_table::presets::UTF8_BORDERS_ONLY;
+use comfy_table::{Cell, ContentArrangement, Table};
 use muxa_adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
 use muxa_core::paths;
 use muxa_core::state::Agent;
+use muxa_core::AgentState;
 use muxa_runtime::{ipc::Client, tmux};
+use owo_colors::{OwoColorize, Style};
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use time::OffsetDateTime;
 
 #[derive(Debug, Parser)]
 #[command(name = "muxa", version, about = "muxa CLI")]
@@ -143,7 +149,7 @@ async fn cmd_status(client: &Client) -> Result<()> {
         println!("no active agents");
         return Ok(());
     }
-    print_table(&agents);
+    print_table(&agents, OffsetDateTime::now_utc(), use_colors());
     Ok(())
 }
 
@@ -153,22 +159,24 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
         Some(p) => client.by_pane(p).await?,
         None => client.snapshot().await?,
     };
+    // tmux handles its own color markup, so we never emit ANSI here.
     let parts: Vec<String> = agents
         .iter()
         .map(|a| {
-            let icon = match a.state {
-                muxa_core::AgentState::Working => "⚙",
-                muxa_core::AgentState::Idle => "·",
-                muxa_core::AgentState::WaitingInput => "!",
-                muxa_core::AgentState::Error => "✗",
-                muxa_core::AgentState::Stopped => "∅",
-                muxa_core::AgentState::Starting => "…",
-            };
-            let kind = serde_json::to_string(&a.kind)
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_string();
-            format!("{icon} {kind}")
+            let icon = state_icon(a.state);
+            let kind = kind_label(a);
+            // Prefer session:window when we can resolve it — makes the
+            // status-line read "⚙ main:2 claude_code" instead of a
+            // context-free glyph.
+            let loc = a
+                .pane
+                .as_deref()
+                .and_then(tmux::resolve_pane)
+                .map(|p| format!(" {}:{}", p.session, p.window_index));
+            match loc {
+                Some(l) => format!("{icon}{l} {kind}"),
+                None => format!("{icon} {kind}"),
+            }
         })
         .collect();
     println!("{}", parts.join(" | "));
@@ -215,22 +223,113 @@ fn cmd_panes() -> Result<()> {
     Ok(())
 }
 
-fn print_table(agents: &[Agent]) {
-    println!(
-        "{:<14} {:<12} {:<14} {:<16} LAST PROMPT",
-        "PANE", "KIND", "STATE", "MODEL"
-    );
+/// Decide whether to emit ANSI color. We check `NO_COLOR` (per the de-facto
+/// standard) and require stdout to be a TTY — piping `muxa status | grep`
+/// should stay clean.
+fn use_colors() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
+}
+
+fn state_icon(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "⚙",
+        AgentState::Idle => "·",
+        AgentState::WaitingInput => "!",
+        AgentState::Error => "✗",
+        AgentState::Stopped => "∅",
+        AgentState::Starting => "…",
+    }
+}
+
+fn kind_label(a: &Agent) -> String {
+    serde_json::to_string(&a.kind)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+fn state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "working",
+        AgentState::Idle => "idle",
+        AgentState::WaitingInput => "waiting_input",
+        AgentState::Error => "error",
+        AgentState::Stopped => "stopped",
+        AgentState::Starting => "starting",
+    }
+}
+
+fn state_style(state: AgentState) -> Style {
+    match state {
+        AgentState::Working => Style::new().green(),
+        AgentState::WaitingInput => Style::new().yellow(),
+        AgentState::Idle => Style::new().dimmed(),
+        AgentState::Error => Style::new().red(),
+        AgentState::Stopped => Style::new().dimmed().strikethrough(),
+        AgentState::Starting => Style::new().cyan(),
+    }
+}
+
+/// Pretty-print `Agent.pane` as `session:window.pane` when tmux agrees, or
+/// fall back to the raw pane id (or `-` if unknown).
+fn pane_display(a: &Agent) -> String {
+    let Some(raw) = a.pane.as_deref() else {
+        return "-".to_string();
+    };
+    match tmux::resolve_pane(raw) {
+        Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
+        None => raw.to_string(),
+    }
+}
+
+/// Human-friendly delta between `then` and `now`, rounded to the largest
+/// unit. Past timestamps only — future clocks collapse to "0s ago".
+fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
+    let delta = now - then;
+    let secs = delta.whole_seconds().max(0);
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
+fn print_table(agents: &[Agent], now: OffsetDateTime, colored: bool) {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "PANE",
+            "KIND",
+            "STATE",
+            "MODEL",
+            "LAST ACTIVITY",
+            "LAST PROMPT",
+        ]);
+
     for a in agents {
-        let pane = a.pane.as_deref().unwrap_or("-");
-        let kind = serde_json::to_string(&a.kind)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let state = serde_json::to_string(&a.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let model = a.model.as_deref().unwrap_or("-");
+        let pane = pane_display(a);
+        let kind = kind_label(a);
+        let state_txt = state_label(a.state);
+        let state_cell = if colored {
+            Cell::new(state_txt.style(state_style(a.state)).to_string())
+        } else {
+            Cell::new(state_txt)
+        };
+        let model = a.model.as_deref().unwrap_or("-").to_string();
+        let last_activity = relative_time(now, a.last_activity_at);
         let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
         let prompt: String = prompt_raw
             .lines()
@@ -239,6 +338,54 @@ fn print_table(agents: &[Agent]) {
             .chars()
             .take(60)
             .collect();
-        println!("{pane:<14} {kind:<12} {state:<14} {model:<16} {prompt}");
+
+        table.add_row(vec![
+            Cell::new(pane),
+            Cell::new(kind),
+            state_cell,
+            Cell::new(model),
+            Cell::new(last_activity),
+            Cell::new(prompt),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn relative_time_units() {
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+        assert_eq!(relative_time(now, now), "0s ago");
+        assert_eq!(
+            relative_time(now, datetime!(2026-04-24 11:59:30 UTC)),
+            "30s ago"
+        );
+        assert_eq!(
+            relative_time(now, datetime!(2026-04-24 11:55:00 UTC)),
+            "5m ago"
+        );
+        assert_eq!(
+            relative_time(now, datetime!(2026-04-24 10:00:00 UTC)),
+            "2h ago"
+        );
+        assert_eq!(
+            relative_time(now, datetime!(2026-04-22 12:00:00 UTC)),
+            "2d ago"
+        );
+    }
+
+    #[test]
+    fn relative_time_future_clamped() {
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+        // Clock skew or reordering — don't emit negative strings.
+        assert_eq!(
+            relative_time(now, datetime!(2026-04-24 12:00:30 UTC)),
+            "0s ago"
+        );
     }
 }
