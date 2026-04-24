@@ -6,13 +6,24 @@
 //! Concurrency: a single `tokio::sync::RwLock` guards the registry. This is
 //! fine at the event rates we expect (tens/sec peak); revisit if profiling
 //! shows contention.
+//!
+//! State-change fanout: the store owns a `tokio::sync::broadcast` channel
+//! that emits a `Transition` on every `state`-field change. This is an
+//! **in-process** signal only — it is not exposed over IPC — and is used
+//! by the daemon's desktop-notifier task to wake users when an agent moves
+//! into `WaitingInput` or `Error`.
 
 use crate::event::{AgentEvent, AgentKind, AgentState, NotificationLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+
+/// Capacity of the in-process state-transition broadcast. Slow subscribers
+/// that lag past this will see `RecvError::Lagged` and should resync via
+/// `Store::snapshot` — the notifier task logs and continues.
+const TRANSITION_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -57,9 +68,33 @@ impl Agent {
     }
 }
 
-#[derive(Debug, Default)]
+/// In-process notification emitted when an agent's `state` field changes.
+///
+/// Not part of the IPC protocol — consumers must live in the daemon
+/// process. `agent` is the post-transition snapshot, suitable for rendering
+/// UI (desktop notification body, log line, etc.) without racing further
+/// mutations.
+#[derive(Debug, Clone, Serialize)]
+pub struct Transition {
+    pub from: AgentState,
+    pub to: AgentState,
+    pub agent: Agent,
+}
+
+#[derive(Debug)]
 pub struct Store {
     agents: RwLock<HashMap<String, Agent>>,
+    transitions: broadcast::Sender<Transition>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        let (tx, _) = broadcast::channel(TRANSITION_CHANNEL_CAPACITY);
+        Self {
+            agents: RwLock::default(),
+            transitions: tx,
+        }
+    }
 }
 
 pub type SharedStore = Arc<Store>;
@@ -67,6 +102,15 @@ pub type SharedStore = Arc<Store>;
 impl Store {
     pub fn shared() -> SharedStore {
         Arc::new(Self::default())
+    }
+
+    /// Subscribe to in-process state transitions.
+    ///
+    /// Returns a fresh receiver; each subscriber has an independent cursor.
+    /// Callers should handle `broadcast::error::RecvError::Lagged` by
+    /// resyncing from `snapshot()` rather than treating it as fatal.
+    pub fn subscribe(&self) -> broadcast::Receiver<Transition> {
+        self.transitions.subscribe()
     }
 
     pub async fn apply(&self, ev: &AgentEvent) {
@@ -113,6 +157,8 @@ impl Store {
         }
         agent.last_activity_at = at;
 
+        let prev_state = agent.state;
+
         match ev {
             AgentEvent::Started { .. } => {
                 agent.state = AgentState::Idle;
@@ -157,6 +203,17 @@ impl Store {
                     agent.cost_usd = Some(*c);
                 }
             }
+        }
+
+        if agent.state != prev_state {
+            let transition = Transition {
+                from: prev_state,
+                to: agent.state,
+                agent: agent.clone(),
+            };
+            // `send` errors only when there are zero subscribers — that's
+            // the common case (notifier disabled) and not worth logging.
+            let _ = self.transitions.send(transition);
         }
     }
 
@@ -326,5 +383,72 @@ mod tests {
         let removed = store.gc(time::Duration::hours(1)).await;
         assert_eq!(removed, 1);
         assert!(store.by_session("s").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_receives_state_transition() {
+        let store = Store::shared();
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+
+        // Subscribe BEFORE applying; otherwise the event is missed.
+        let mut rx = store.subscribe();
+
+        // Seed the agent so its prior state is known (Starting -> Idle on
+        // Started). Drain that transition so the assertion below targets
+        // the one we care about.
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: now,
+            })
+            .await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.from, AgentState::Starting);
+        assert_eq!(first.to, AgentState::Idle);
+
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("s"),
+                prompt: "hello".into(),
+                at: now,
+            })
+            .await;
+
+        let t = rx.recv().await.unwrap();
+        assert_eq!(t.from, AgentState::Idle);
+        assert_eq!(t.to, AgentState::Working);
+        assert_eq!(t.agent.session_id, "s");
+        assert_eq!(t.agent.last_prompt.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn no_transition_when_state_unchanged() {
+        let store = Store::shared();
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: now,
+            })
+            .await;
+
+        let mut rx = store.subscribe();
+
+        // Heartbeat updates metadata only — no state change, no broadcast.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: Some("Opus".into()),
+                context_used_pct: None,
+                cost_usd: None,
+                at: now,
+            })
+            .await;
+
+        // A 50ms window is plenty — the send is synchronous-ish (tokio
+        // broadcast send is non-blocking) and we're on a single runtime.
+        let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(res.is_err(), "expected no transition, got {res:?}");
     }
 }
