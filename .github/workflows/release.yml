@@ -1,0 +1,85 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (aarch64 linux)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build muxa + muxad
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target "${{ matrix.target }}" -p muxa  -p muxad
+          else
+            cargo build --release --target "${{ matrix.target }}" -p muxa  -p muxad
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGET="${{ matrix.target }}"
+          STAGE=$(mktemp -d)
+          NAME="muxa-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir -p "$STAGE/$NAME"
+          cp "target/${TARGET}/release/muxa"  "$STAGE/$NAME/"
+          cp "target/${TARGET}/release/muxad" "$STAGE/$NAME/"
+          cp README.md LICENSE-MIT LICENSE-APACHE PROTOCOL.md "$STAGE/$NAME/"
+          ( cd "$STAGE" && tar czf "${NAME}.tar.gz" "$NAME" )
+          ( cd "$STAGE" && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          mv "$STAGE/${NAME}.tar.gz"        .
+          mv "$STAGE/${NAME}.tar.gz.sha256" .
+          echo "ARCHIVE=${NAME}.tar.gz"         >> "$GITHUB_ENV"
+          echo "CHECKSUM=${NAME}.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ env.CHECKSUM }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true

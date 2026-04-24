@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 160" role="img" aria-label="muxa">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7aa2f7"/>
+      <stop offset="100%" stop-color="#bb9af7"/>
+    </linearGradient>
+    <style>
+      .wordmark {
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+        font-weight: 700;
+        font-size: 96px;
+        letter-spacing: -4px;
+        fill: url(#g);
+      }
+      .glyph { fill: #7aa2f7; }
+      .glyph-dim { fill: #7aa2f7; opacity: 0.45; }
+      .glyph-hot { fill: #e0af68; }
+    </style>
+  </defs>
+
+  <!-- Pane-grid icon: three rectangles with state glyphs -->
+  <g transform="translate(32 32)">
+    <rect class="glyph" x="0"  y="0"  width="36" height="44" rx="4"/>
+    <rect class="glyph-dim" x="44" y="0"  width="36" height="20" rx="4"/>
+    <rect class="glyph-hot" x="44" y="24" width="36" height="20" rx="4"/>
+    <rect class="glyph-dim" x="0"  y="52" width="80" height="44" rx="4"/>
+    <!-- Working gear dot -->
+    <circle cx="18"  cy="22" r="6" fill="#1a1b26"/>
+    <!-- Waiting-input bang -->
+    <rect x="60" y="28" width="4" height="10" rx="1" fill="#1a1b26"/>
+    <rect x="60" y="40" width="4" height="4"  rx="1" fill="#1a1b26"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text class="wordmark" x="150" y="108">muxa</text>
+</svg>
