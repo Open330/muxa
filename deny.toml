@@ -11,7 +11,9 @@ ignore = []
 
 [licenses]
 version = 2
-# Licenses we accept in our dependency tree.
+# Licenses accepted in our dependency tree. MPL-2.0 appears transitively
+# via `dirs -> dirs-sys -> option-ext`; MPL-2.0 is file-level copyleft, fine
+# to link against without triggering our distribution obligations.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -20,6 +22,7 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
+    "MPL-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
