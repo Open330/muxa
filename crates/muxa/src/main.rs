@@ -119,19 +119,42 @@ async fn cmd_watch(client: &Client) -> Result<()> {
 
 /// Move the current tmux client to `pane_id`.
 ///
-/// We first make the pane active in its window (`select-pane` implicitly
-/// switches windows too), then `switch-client` to the pane's session. Two
-/// calls cover both same-session and cross-session jumps. Errors are
-/// swallowed: the user just exited a fullscreen TUI, a dangling error
-/// message on their terminal would be more annoying than useful.
+/// Runs three tmux commands in order:
+///   1. `switch-client -t <session>`   — attach this client to the right session
+///   2. `select-window -t <session>:<window>` — make the target window current
+///   3. `select-pane   -t <pane_id>`   — focus the specific pane
+///
+/// The previous two-call sequence (select-pane first, switch-client second)
+/// silently ate both error paths with `let _ =`, so if `resolve_pane`
+/// returned None the user saw no attach and no error — just the muxa TUI
+/// closing and a shell prompt where they were. Now each step surfaces a
+/// stderr message on failure, which lands in the original pane the user is
+/// still viewing when a switch fails.
 fn jump_to_pane(pane_id: &str) {
-    let _ = Command::new("tmux")
-        .args(["select-pane", "-t", pane_id])
-        .status();
-    if let Some(info) = tmux::resolve_pane(pane_id) {
-        let _ = Command::new("tmux")
-            .args(["switch-client", "-t", &info.session])
-            .status();
+    if !tmux::inside_tmux() {
+        eprintln!("muxa: not running inside tmux — attach skipped");
+        return;
+    }
+    let Some(info) = tmux::resolve_pane(pane_id) else {
+        eprintln!("muxa: pane {pane_id} not found in tmux — it may have closed");
+        return;
+    };
+    let target_window = format!("{}:{}", info.session, info.window_index);
+
+    run_tmux(&["switch-client", "-t", &info.session]);
+    run_tmux(&["select-window", "-t", &target_window]);
+    run_tmux(&["select-pane", "-t", pane_id]);
+}
+
+fn run_tmux(args: &[&str]) {
+    match Command::new("tmux").args(args).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "muxa: `tmux {}` exited with {}",
+            args.join(" "),
+            s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+        ),
+        Err(e) => eprintln!("muxa: failed to spawn `tmux {}`: {e}", args.join(" ")),
     }
 }
 
