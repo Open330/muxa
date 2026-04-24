@@ -26,7 +26,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # `muxa status` table + colors.
-comfy-table = { version = "7", default-features = false }
+# NOTE: keep default features ON — they include `custom_styling`, which
+# makes comfy-table recognize ANSI escape sequences as zero-width. Disabling
+# them broke alignment on rows where cells contained owo-colors wrappers
+# (the escapes were counted as visible chars).
+comfy-table = "7"
 owo-colors = { version = "4", features = ["supports-colors"] }
 
 # TUI — `muxa watch`.
