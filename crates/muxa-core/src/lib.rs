@@ -14,4 +14,4 @@ pub mod state;
 pub use config::Config;
 pub use error::{CoreError, Result};
 pub use event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, PROTOCOL_VERSION};
-pub use state::{Agent, SharedStore, Store};
+pub use state::{Agent, SharedStore, Store, Transition};

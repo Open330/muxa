@@ -5,8 +5,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use muxa_core::config::NotifierBackend;
 use muxa_core::{paths, Config, Store};
 use muxa_runtime::ipc::{harden_permissions, Server};
+use muxa_runtime::notify::Notifier;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
@@ -60,6 +62,18 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Desktop notifier: spawned only when opted in. We subscribe BEFORE
+    // the server starts accepting events so no early transition is lost.
+    if cfg.notifier.enabled && matches!(cfg.notifier.backend, NotifierBackend::Libnotify) {
+        let rx = store.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = Notifier::new().run(rx).await {
+                tracing::warn!(error = %e, "notifier task exited");
+            }
+        });
+        tracing::info!("desktop notifier enabled");
     }
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
