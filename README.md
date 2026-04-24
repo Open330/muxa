@@ -117,6 +117,31 @@ systemctl --user enable --now muxad.service
 Claude Code — merge [`examples/claude-settings.json`](examples/claude-settings.json)
 into `~/.claude/settings.json`.
 
+<details>
+<summary>Already using <code>ccstatusline</code> (or another statusLine tool)?</summary>
+
+Claude Code only runs a single `statusLine.command`, so you can't stack
+muxa on top of `ccstatusline` with the default config. Use `--forward` to
+tee the status-line JSON to your existing tool — muxa captures a
+Heartbeat (model, context %, cost) out of band, then pipes the same JSON
+into the forwarded command and passes its stdout + exit code through
+unchanged:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "muxa hook claude-statusline --forward 'npx -y ccstatusline@latest'",
+  "refreshInterval": 5
+}
+```
+
+See [`examples/claude-settings-with-ccstatusline.json`](examples/claude-settings-with-ccstatusline.json)
+for the full drop-in. The forwarded command runs under `/bin/sh -c`, so
+any shell one-liner works. If the daemon is down muxa still forwards
+normally — hook paths are best-effort.
+
+</details>
+
 Codex and Gemini CLI follow the same pattern with different config files.
 See each adapter's module-level docs in `crates/muxa-adapters/src/`.
 

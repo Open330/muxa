@@ -12,8 +12,9 @@ use muxa_core::state::Agent;
 use muxa_core::AgentState;
 use muxa_runtime::{ipc::Client, tmux};
 use owo_colors::{OwoColorize, Style};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use time::OffsetDateTime;
 
 #[derive(Debug, Parser)]
@@ -60,7 +61,16 @@ enum HookCmd {
     },
     /// Claude Code status-line feeder: emit a Heartbeat and print a
     /// one-liner back to stdout (so it remains a valid status line script).
-    ClaudeStatusline,
+    ///
+    /// With `--forward <CMD>`, the captured stdin is tee'd to the given
+    /// command (run via `/bin/sh -c`) and its stdout/exit code are passed
+    /// through unchanged — useful for layering muxa on top of tools like
+    /// `ccstatusline` without giving up their rendering.
+    ClaudeStatusline {
+        /// Forward stdin to this shell command and pass through its stdout.
+        #[arg(long, value_name = "CMD")]
+        forward: Option<String>,
+    },
     /// Codex hook handler.
     Codex {
         #[arg(long)]
@@ -106,13 +116,77 @@ async fn best_effort_ingest(client: &Client, ev: &muxa_core::event::AgentEvent) 
     }
 }
 
+/// Spawn `cmd` via `/bin/sh -c`, feed it `stdin_bytes`, stream its stdout to
+/// our stdout, and return its exit code (128 + signal if killed by signal).
+fn run_forward(cmd: &str, stdin_bytes: &[u8]) -> Result<i32> {
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // stderr is inherited so the forwarded tool can report errors.
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn forward command: {cmd}"))?;
+
+    // Write the captured stdin in a scope so the pipe closes and the child
+    // sees EOF — otherwise `npx`/`ccstatusline` would hang.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_bytes)
+            .with_context(|| "failed to write stdin to forward command")?;
+    }
+
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut out = std::io::stdout().lock();
+        std::io::copy(&mut stdout, &mut out)
+            .with_context(|| "failed to relay forward command stdout")?;
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| "failed to wait on forward command")?;
+    Ok(status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map_or(1, |s| 128 + s)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    }))
+}
+
 async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     match cmd {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
         }
-        HookCmd::ClaudeStatusline => {
+        HookCmd::ClaudeStatusline { forward } => {
+            if let Some(cmd) = forward {
+                // Forward mode: capture stdin, fire Heartbeat best-effort,
+                // then tee stdin to the forwarded command and pass its
+                // stdout + exit code back to our parent unchanged.
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)?;
+
+                // Best-effort Heartbeat: parse errors on stdin must never
+                // cause the status line to fail, so log and move on.
+                if let Ok(input) = serde_json::from_slice::<claude::StatusLineInput>(&buf) {
+                    let pane = std::env::var("TMUX_PANE").ok();
+                    let ev = claude::statusline_heartbeat(input, pane);
+                    best_effort_ingest(client, &ev).await;
+                } else {
+                    tracing::debug!("claude-statusline: stdin was not valid statusline JSON");
+                }
+
+                let code = run_forward(&cmd, &buf)?;
+                std::process::exit(code);
+            }
+
             let input = claude::parse_statusline(&mut std::io::stdin())?;
             let label = input
                 .model

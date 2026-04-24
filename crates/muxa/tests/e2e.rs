@@ -113,6 +113,47 @@ fn claude_hook_round_trip() {
 }
 
 #[test]
+fn claude_statusline_forward_passes_stdin_to_command() {
+    // Use `--forward cat` as a trivial passthrough: whatever we write to
+    // muxa's stdin should appear verbatim on muxa's stdout. This exercises
+    // the full forward path (spawn, feed stdin, relay stdout, propagate
+    // exit code) without depending on the daemon or `npx`.
+    let d = Daemon::spawn();
+
+    let payload = br#"{"session_id":"sess-fwd","cwd":"/tmp","model":{"display_name":"Opus"}}"#;
+
+    let mut child = d
+        .cli()
+        .args(["hook", "claude-statusline", "--forward", "cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn muxa hook claude-statusline --forward cat");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload)
+        .expect("write stdin");
+    // Drop stdin so `cat` sees EOF.
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait forward");
+    assert!(
+        out.status.success(),
+        "forward command failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout,
+        payload,
+        "forwarded stdout should mirror stdin byte-for-byte; got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn rejects_unknown_hook_event() {
     let d = Daemon::spawn();
 

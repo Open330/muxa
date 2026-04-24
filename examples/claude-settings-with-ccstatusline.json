@@ -1,0 +1,31 @@
+{
+  "_comment": "Drop-in snippet for ~/.claude/settings.json — wires Claude Code events into muxad AND tees the status-line JSON to `ccstatusline` so its rendering is unchanged. muxa captures model/context/cost as a best-effort Heartbeat.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event session_start" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event user_prompt_submit" }] }
+    ],
+    "PreToolUse": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event pre_tool_use" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event post_tool_use" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event notification" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event stop" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "muxa hook claude --event session_end" }] }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "muxa hook claude-statusline --forward 'npx -y ccstatusline@latest'",
+    "refreshInterval": 5
+  }
+}
