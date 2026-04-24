@@ -73,6 +73,27 @@ impl Store {
         let mut agents = self.agents.write().await;
         let id = ev.id();
         let at = ev.at();
+
+        // Dedupe stale agents in the same pane when a new session starts.
+        //
+        // When an `AgentEvent::Started` arrives carrying a pane, any other
+        // non-Stopped agents sharing that pane are older sessions that have
+        // already exited — the user just launched a fresh agent in the
+        // same pane. Mark them Stopped so `muxa status` stays uncluttered.
+        if matches!(ev, AgentEvent::Started { .. }) {
+            if let Some(pane) = id.pane.as_deref() {
+                for other in agents.values_mut() {
+                    if other.session_id != id.session_id
+                        && other.pane.as_deref() == Some(pane)
+                        && other.state != AgentState::Stopped
+                    {
+                        other.state = AgentState::Stopped;
+                        other.last_activity_at = at;
+                    }
+                }
+            }
+        }
+
         let agent = agents.entry(id.session_id.clone()).or_insert_with(|| {
             Agent::new(
                 id.kind,
@@ -238,6 +259,51 @@ mod tests {
         assert_eq!(
             store.by_session("s").await.unwrap().state,
             AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn started_dedupes_previous_session_in_same_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:05:00 UTC);
+
+        // First session starts on pane %1 and is happily working.
+        store
+            .apply(&AgentEvent::Started {
+                id: id("first"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("first"),
+                prompt: "do a thing".into(),
+                at: t0,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("first").await.unwrap().state,
+            AgentState::Working
+        );
+
+        // A fresh session opens in the same pane — e.g. user closed the old
+        // agent and launched a new one without the adapter ever seeing a
+        // SessionEnded. The old row must flip to Stopped.
+        store
+            .apply(&AgentEvent::Started {
+                id: id("second"),
+                at: t1,
+            })
+            .await;
+
+        assert_eq!(
+            store.by_session("first").await.unwrap().state,
+            AgentState::Stopped
+        );
+        assert_eq!(
+            store.by_session("second").await.unwrap().state,
+            AgentState::Idle
         );
     }
 
