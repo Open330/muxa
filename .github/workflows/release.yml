@@ -83,3 +83,27 @@ jobs:
             ${{ env.CHECKSUM }}
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  bump-tap:
+    name: bump Open330/homebrew-tap
+    needs: build
+    runs-on: ubuntu-latest
+    # Skip on pre-releases (rc, alpha, beta) — tap only tracks stable versions.
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Open PR against Open330/homebrew-tap
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: muxa
+          formula-path: Formula/muxa.rb
+          homebrew-tap: Open330/homebrew-tap
+          base-branch: main
+          download-url: https://github.com/Open330/muxa/releases/download/${{ github.ref_name }}/muxa-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+          commit-message: |
+            muxa ${{ github.ref_name }}
+
+            Created by https://github.com/mislav/bump-homebrew-formula-action
+        env:
+          # Requires a PAT with `repo` scope on Open330/homebrew-tap.
+          # Add it as a repo secret named HOMEBREW_TAP_TOKEN.
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

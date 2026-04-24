@@ -24,16 +24,9 @@ a thin CLI.
 It does **not** fork tmux. It talks to tmux via the tmux CLI and to each agent
 via that agent's own hook / event-emission system.
 
-```console
-$ muxa status
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ PANE           KIND          STATE           MODEL   LAST ACTIVITY   LAST PROMPT │
-╞══════════════════════════════════════════════════════════════════════════════════╡
-│ main:2.0       claude_code   working         Opus    0s ago          refactor …  │
-│ work:1.1       codex         waiting_input   -       7m ago          -           │
-│ review:0.0     gemini_cli    idle            Gemini  16s ago         summarize … │
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
+<div align="center">
+  <img src="docs/demo.gif" alt="muxa demo — status, status-line, watch" width="900" />
+</div>
 
 ```text
 ┌─ tmux status-right ──────────────────────────────────────────────────┐

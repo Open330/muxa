@@ -2,8 +2,8 @@
 #
 #   vhs docs/demo.tape
 #
-# Requires charmbracelet/vhs (https://github.com/charmbracelet/vhs) which in
-# turn uses ttyd + ffmpeg under the hood.
+# Requires charmbracelet/vhs, ttyd, ffmpeg, and a Chromium-based browser
+# (VHS uses Chrome for frame capture).
 
 Output docs/demo.gif
 
@@ -11,60 +11,55 @@ Set Shell bash
 Set FontSize 14
 Set Width 1200
 Set Height 720
-Set Theme "Tokyo Night"
+Set Theme "TokyoNight"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
-# Prelude: start a fresh daemon on a scratch socket and seed some fake agents.
+# Prelude — start a scratch daemon and seed it. Nothing here is visible in
+# the final GIF.
 Hide
 Type "export MUXA_SOCKET=/tmp/muxa-demo.sock"
 Enter
-Type "rm -f $MUXA_SOCKET && muxad &"
+Type "rm -f $MUXA_SOCKET"
+Enter
+Type "muxad &"
 Enter
 Sleep 500ms
 Type "until [ -S $MUXA_SOCKET ]; do sleep 0.1; done"
 Enter
+Type "bash docs/demo-seed.sh"
+Enter
+Sleep 200ms
 Type "clear"
 Enter
 Show
 
-Type "# seed a few agents"
-Sleep 800ms
+Type "# a live snapshot across four agent CLIs"
+Sleep 600ms
 Enter
-
-Hide
-Type "TMUX_PANE=%10 bash -lc 'echo {\"session_id\":\"s-a\",\"prompt\":\"refactor the ipc module to use length-prefixed frames\"} | muxa hook claude --event user_prompt_submit'"
-Enter
-Type "TMUX_PANE=%11 bash -lc 'echo {\"session_id\":\"s-b\",\"tool_name\":\"shell\"} | muxa hook codex --event permission_request'"
-Enter
-Type "TMUX_PANE=%12 bash -lc 'echo {\"session_id\":\"s-c\",\"prompt\":\"summarize this PR\"} | muxa hook gemini --event before_agent'"
-Enter
-Type "TMUX_PANE=%12 bash -lc 'echo {\"session_id\":\"s-c\"}                                | muxa hook gemini --event after_agent'"
-Enter
-Show
-
 Type "muxa status"
 Enter
-Sleep 2s
+Sleep 2500ms
 
 Type "# one-liner for tmux status-right"
-Sleep 800ms
+Sleep 600ms
 Enter
 Type "muxa status-line"
 Enter
 Sleep 1500ms
 
-Type "# live dashboard"
-Sleep 800ms
+Type "# live dashboard — q to quit"
+Sleep 600ms
 Enter
 Type "muxa watch"
 Sleep 200ms
 Enter
-Sleep 3s
+Sleep 3000ms
 Type "q"
-Sleep 500ms
+Sleep 800ms
 
+# Postlude — tear down the scratch daemon.
 Hide
-Type "pkill muxad; rm -f $MUXA_SOCKET"
+Type "kill %1 2>/dev/null; wait 2>/dev/null; rm -f $MUXA_SOCKET"
 Enter
 Show
