@@ -44,6 +44,7 @@ via that agent's own hook / event-emission system.
 
 ## Contents
 
+- [Quickstart for Agents](#quickstart-for-agents)
 - [Features](#features)
 - [Agent support](#agent-support)
 - [Install](#install)
@@ -80,6 +81,55 @@ plugin-based, not shell-hook.</sub>
 | OpenAI Codex        | ✓ shell hooks (Claude-protocol clone upstream)     | `~/.codex/config.toml`      |
 | Google Gemini CLI   | ✓ shell hooks (Claude-compatible upstream)         | `~/.gemini/settings.json`   |
 | opencode            | deferred — SSE subscription / TS plugin planned    | —                           |
+
+## Quickstart for Agents
+
+Paste the prompt below to an AI coding agent (Claude Code, Codex, Gemini
+CLI, etc.) running in a tmux pane. It installs `muxa`, wires the active
+agent's hook config, and updates `~/.tmux.conf` so this very pane starts
+reporting state within seconds.
+
+<div><img src="https://quickstart-for-agents.vercel.app/api/header.svg?theme=claude-code&mascot=thinking&title=install+muxa&lang=Agents" width="100%" /></div>
+
+```text
+You're helping install muxa (https://github.com/Open330/muxa), an agent
+CLI observability layer for tmux. Requirements: Rust 1.88+, tmux 3.x.
+
+1) Clone and install binaries
+   git clone https://github.com/Open330/muxa.git /tmp/muxa
+   cargo install --path /tmp/muxa/crates/muxad --locked
+   cargo install --path /tmp/muxa/crates/muxa  --locked
+
+2) Start the daemon (foreground is fine; detach with `&` or systemd)
+   muxad &
+
+3) Wire the CLI you're running under (detect from $0 / process tree)
+   - Claude Code: merge /tmp/muxa/examples/claude-settings.json into
+     ~/.claude/settings.json. Do NOT overwrite existing hooks — jq-append
+     to each hooks.<event> array.
+   - Codex:       append the [[hooks.*]] blocks from
+                  crates/muxa-adapters/src/codex.rs module doc to
+                  ~/.codex/config.toml.
+   - Gemini CLI:  merge the hooks block from
+                  crates/muxa-adapters/src/gemini.rs module doc into
+                  ~/.gemini/settings.json.
+
+4) Wire tmux (append if not already present)
+   set -g status-interval 2
+   set -g status-right "#(muxa status-line --pane #{pane_id}) | %H:%M"
+   tmux source-file ~/.tmux.conf
+
+5) Verify. The current pane should appear in both outputs below.
+   muxa status
+   muxa status-line --pane $TMUX_PANE
+
+Rollback: every file edited above was backed up to <file>.muxa-backup-<ts>;
+kill muxad with pkill, restore backups, tmux source-file to reload.
+```
+
+<div><img src="https://quickstart-for-agents.vercel.app/api/footer.svg?theme=claude-code&tokens=0.4k&model=Any+agent" width="100%" /></div>
+
+Prefer to do it yourself? Keep reading.
 
 ## Install
 
