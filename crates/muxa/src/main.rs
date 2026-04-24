@@ -117,33 +117,51 @@ async fn cmd_watch(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Move the current tmux client to `pane_id`.
+/// Attach the user to `pane_id`. Handles two cases:
 ///
-/// Runs three tmux commands in order:
-///   1. `switch-client -t <session>`   — attach this client to the right session
-///   2. `select-window -t <session>:<window>` — make the target window current
-///   3. `select-pane   -t <pane_id>`   — focus the specific pane
+/// * **Inside tmux** (`$TMUX` set): the user is already attached to some
+///   client. Run `switch-client` to move that client to the target session,
+///   with `select-window` + `select-pane` pre-positioning so the attach
+///   lands on the exact pane.
 ///
-/// The previous two-call sequence (select-pane first, switch-client second)
-/// silently ate both error paths with `let _ =`, so if `resolve_pane`
-/// returned None the user saw no attach and no error — just the muxa TUI
-/// closing and a shell prompt where they were. Now each step surfaces a
-/// stderr message on failure, which lands in the original pane the user is
-/// still viewing when a switch fails.
+/// * **Bare shell** (`$TMUX` unset): the user ran `muxa watch` from a
+///   terminal that isn't inside tmux. There's no client to "switch" — we
+///   have to hand this terminal over to a new `tmux attach-session`, with
+///   the target window+pane already selected so the attach lands there.
+///
+/// In both cases we pre-select the window and pane *before* attaching/
+/// switching — `select-window`/`select-pane` are plain control messages to
+/// the tmux server and don't need an attached client.
 fn jump_to_pane(pane_id: &str) {
-    if !tmux::inside_tmux() {
-        eprintln!("muxa: not running inside tmux — attach skipped");
-        return;
-    }
     let Some(info) = tmux::resolve_pane(pane_id) else {
         eprintln!("muxa: pane {pane_id} not found in tmux — it may have closed");
         return;
     };
     let target_window = format!("{}:{}", info.session, info.window_index);
 
-    run_tmux(&["switch-client", "-t", &info.session]);
+    // Pre-position so whichever path we take below lands on the right pane.
     run_tmux(&["select-window", "-t", &target_window]);
     run_tmux(&["select-pane", "-t", pane_id]);
+
+    if tmux::inside_tmux() {
+        // Already attached — just switch this client's session.
+        run_tmux(&["switch-client", "-t", &info.session]);
+    } else {
+        // Bare shell — hand our terminal to a fresh tmux attach-session.
+        // `.status()` waits for tmux to exit; on detach the user is back at
+        // this shell prompt, which is the least-surprising behaviour.
+        match Command::new("tmux")
+            .args(["attach-session", "-t", &info.session])
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "muxa: tmux attach-session exited with {}",
+                s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+            ),
+            Err(e) => eprintln!("muxa: failed to spawn tmux attach-session: {e}"),
+        }
+    }
 }
 
 fn run_tmux(args: &[&str]) {
