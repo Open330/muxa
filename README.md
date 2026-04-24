@@ -228,14 +228,26 @@ See each adapter's module-level docs in `crates/muxa-adapters/src/`.
 
 ### 3. Wire tmux
 
-Append to `~/.tmux.conf`:
+Append to `~/.tmux.conf` (or `source-file` the drop-in
+[`examples/muxa.tmux.conf`](examples/muxa.tmux.conf)):
 
 ```tmux
+# Agent glyph per pane on the right-hand status
 set -g status-interval 2
 set -g status-right "#(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M"
+
+# Replace the stock session-switcher with an agent-aware popup.
+# Enter on a row attaches to that pane; popup closes on exit.
+bind-key s display-popup -E -w 90% -h 85% "muxa watch"
 ```
 
 Reload: `tmux source-file ~/.tmux.conf`.
+
+> [!TIP]
+> `prefix + s` now opens `muxa watch` as a floating popup — a drop-in
+> replacement for tmux's built-in `choose-tree`, with live agent state
+> baked in. `prefix + w` still opens the stock window/session tree if
+> you need it.
 
 ### 4. Confirm
 
@@ -259,9 +271,18 @@ muxa watch          # live TUI
 
 ## Live TUI
 
-`muxa watch` opens a full-screen dashboard of every tracked agent, refreshed at
-2 Hz. The UI is rendered with [ratatui](https://ratatui.rs); the terminal is
+`muxa watch` opens a full-screen dashboard of every tracked agent, refreshed
+at 2 Hz. Rendered with [ratatui](https://ratatui.rs); the terminal is
 restored cleanly even on panic.
+
+The best way to use it is via a tmux popup (see the
+[tmux wiring](#3-wire-tmux) above). Press `prefix + s` from any pane → popup
+with the live dashboard → `Enter` on the target row → popup closes and your
+client switches to that pane. Press `prefix + s` again to bounce back.
+
+Run `muxa watch` directly from a bare shell to attach into an existing tmux
+session — same Enter semantics, except muxa execs `tmux attach-session` for
+you instead of `switch-client`.
 
 **Keybindings**
 
