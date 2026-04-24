@@ -340,6 +340,7 @@ dependencies = [
  "muxa-core",
  "muxa-runtime",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
