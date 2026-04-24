@@ -1,0 +1,27 @@
+[package]
+name = "muxad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "muxa daemon"
+
+[[bin]]
+name = "muxad"
+path = "src/main.rs"
+
+[dependencies]
+muxa-core = { workspace = true }
+muxa-runtime = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+
+[lints]
+workspace = true
