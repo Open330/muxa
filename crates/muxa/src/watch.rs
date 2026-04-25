@@ -22,24 +22,42 @@ use crossterm::terminal::{
 use muxa_core::state::Agent;
 use muxa_core::AgentState;
 use muxa_runtime::ipc::Client;
-use muxa_runtime::tmux;
+use muxa_runtime::tmux::{self, PaneInfo};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
+use std::collections::HashSet;
 use time::OffsetDateTime;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const INPUT_POLL: Duration = Duration::from_millis(50);
+
+/// One row of the dashboard. Either a tracked muxa agent or a plain tmux
+/// pane the daemon doesn't know about — listing both makes `muxa watch` a
+/// drop-in replacement for tmux's `choose-tree -Zs`.
+pub(crate) enum WatchRow {
+    Agent(Agent),
+    BarePane(PaneInfo),
+}
+
+impl WatchRow {
+    fn pane_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent(a) => a.pane.as_deref(),
+            Self::BarePane(p) => Some(&p.pane_id),
+        }
+    }
+}
 
 /// State held by the TUI.
 ///
 /// Kept separate from rendering so the smoke test can construct it
 /// directly without touching a real terminal.
 pub(crate) struct App {
-    pub agents: Vec<Agent>,
+    pub rows: Vec<WatchRow>,
     pub table_state: TableState,
     pub last_error: Option<String>,
     pub last_refresh: OffsetDateTime,
@@ -48,15 +66,17 @@ pub(crate) struct App {
 impl App {
     pub(crate) fn new() -> Self {
         Self {
-            agents: Vec::new(),
+            rows: Vec::new(),
             table_state: TableState::default(),
             last_error: None,
             last_refresh: OffsetDateTime::now_utc(),
         }
     }
 
-    pub(crate) fn set_agents(&mut self, mut agents: Vec<Agent>) {
-        // Stable order so the cursor doesn't jump around between polls.
+    /// Replace the row set. `agents` (tracked) are listed first in stable
+    /// order; `panes` minus any pane already represented by an agent are
+    /// appended as `BarePane` rows.
+    pub(crate) fn set_data(&mut self, mut agents: Vec<Agent>, panes: Vec<PaneInfo>) {
         agents.sort_by(|a, b| {
             a.pane
                 .as_deref()
@@ -64,19 +84,37 @@ impl App {
                 .cmp(b.pane.as_deref().unwrap_or(""))
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
-        self.agents = agents;
+
+        let known: HashSet<String> = agents.iter().filter_map(|a| a.pane.clone()).collect();
+
+        let mut bare: Vec<PaneInfo> = panes
+            .into_iter()
+            .filter(|p| !known.contains(&p.pane_id))
+            .collect();
+        bare.sort_by(|a, b| {
+            a.session
+                .cmp(&b.session)
+                .then_with(|| a.window_index.cmp(&b.window_index))
+                .then_with(|| a.pane_index.cmp(&b.pane_index))
+        });
+
+        let mut rows: Vec<WatchRow> = Vec::with_capacity(agents.len() + bare.len());
+        rows.extend(agents.into_iter().map(WatchRow::Agent));
+        rows.extend(bare.into_iter().map(WatchRow::BarePane));
+
+        self.rows = rows;
         self.last_refresh = OffsetDateTime::now_utc();
         self.clamp_selection();
     }
 
     fn clamp_selection(&mut self) {
-        if self.agents.is_empty() {
+        if self.rows.is_empty() {
             self.table_state.select(None);
             return;
         }
         match self.table_state.selected() {
-            Some(i) if i >= self.agents.len() => {
-                self.table_state.select(Some(self.agents.len() - 1));
+            Some(i) if i >= self.rows.len() => {
+                self.table_state.select(Some(self.rows.len() - 1));
             }
             None => self.table_state.select(Some(0)),
             Some(_) => {}
@@ -84,19 +122,19 @@ impl App {
     }
 
     pub(crate) fn move_down(&mut self) {
-        if self.agents.is_empty() {
+        if self.rows.is_empty() {
             return;
         }
         let i = match self.table_state.selected() {
-            Some(i) if i + 1 < self.agents.len() => i + 1,
-            Some(_) => self.agents.len() - 1,
+            Some(i) if i + 1 < self.rows.len() => i + 1,
+            Some(_) => self.rows.len() - 1,
             None => 0,
         };
         self.table_state.select(Some(i));
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.agents.is_empty() {
+        if self.rows.is_empty() {
             return;
         }
         let i = match self.table_state.selected() {
@@ -109,7 +147,7 @@ impl App {
     /// `pane_id` of the currently selected row, if any.
     pub(crate) fn selected_pane(&self) -> Option<String> {
         let i = self.table_state.selected()?;
-        self.agents.get(i)?.pane.clone()
+        self.rows.get(i)?.pane_id().map(String::from)
     }
 }
 
@@ -177,10 +215,7 @@ pub async fn run(client: &Client) -> Result<Option<String>> {
     let mut app = App::new();
 
     // Prime the initial snapshot so we don't paint an empty frame first.
-    match client.snapshot().await {
-        Ok(agents) => app.set_agents(agents),
-        Err(e) => app.last_error = Some(e.to_string()),
-    }
+    refresh(client, &mut app).await;
 
     let mut last_poll = tokio::time::Instant::now();
     let mut jump_target: Option<String> = None;
@@ -231,13 +266,17 @@ pub async fn run(client: &Client) -> Result<Option<String>> {
 }
 
 async fn refresh(client: &Client, app: &mut App) {
+    // tmux pane inventory is independent of the daemon — fetch it even
+    // when muxad is down so `muxa watch` stays useful as a session picker.
+    let panes = tmux::list_panes().unwrap_or_default();
     match client.snapshot().await {
         Ok(agents) => {
             app.last_error = None;
-            app.set_agents(agents);
+            app.set_data(agents, panes);
         }
         Err(e) => {
             app.last_error = Some(e.to_string());
+            app.set_data(Vec::new(), panes);
         }
     }
 }
@@ -307,7 +346,12 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let count = app.agents.len();
+    let agents = app
+        .rows
+        .iter()
+        .filter(|r| matches!(r, WatchRow::Agent(_)))
+        .count();
+    let bare = app.rows.len() - agents;
     let now = app.last_refresh;
     let clock = format!(
         "{:02}:{:02}:{:02} UTC",
@@ -326,8 +370,13 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{count} agent{}", if count == 1 { "" } else { "s" }),
+            format!("{agents} agent{}", if agents == 1 { "" } else { "s" }),
             Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("+ {bare} pane{}", if bare == 1 { "" } else { "s" }),
+            Style::default().fg(Color::DarkGray),
         ),
         Span::raw("   "),
         Span::styled(clock, Style::default().fg(Color::DarkGray)),
@@ -374,7 +423,14 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header = Row::new(header_cells).height(1);
 
     let now = OffsetDateTime::now_utc();
-    let rows: Vec<Row> = app.agents.iter().map(|a| agent_row(a, now)).collect();
+    let rows: Vec<Row> = app
+        .rows
+        .iter()
+        .map(|r| match r {
+            WatchRow::Agent(a) => agent_row(a, now),
+            WatchRow::BarePane(p) => bare_pane_row(p),
+        })
+        .collect();
 
     let widths = [
         // PANE — "session:window.pane" can run long; 22 covers most.
@@ -448,6 +504,33 @@ fn agent_row(a: &Agent, now: OffsetDateTime) -> Row<'_> {
         Cell::from(cost),
         Cell::from(prompt),
         Cell::from(activity),
+    ])
+}
+
+/// Row for a tmux pane the daemon doesn't track. Dimmed so the eye lands
+/// on real agents first, with the pane title or current command surfaced
+/// where the prompt text would otherwise be.
+fn bare_pane_row(p: &PaneInfo) -> Row<'_> {
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let pane = format!("{}:{}.{}", p.session, p.window_index, p.pane_index);
+    let summary = if p.title.is_empty() || p.title == p.current_command {
+        p.current_command.clone()
+    } else {
+        format!("{}  {}", p.current_command, p.title)
+    };
+    let summary: String = summary.chars().take(80).collect();
+
+    Row::new(vec![
+        Cell::from(pane).style(dim),
+        Cell::from("—").style(dim),
+        Cell::from("—").style(dim),
+        Cell::from("-").style(dim),
+        Cell::from("-").style(dim),
+        Cell::from("-").style(dim),
+        Cell::from(summary).style(dim),
+        Cell::from("-").style(dim),
     ])
 }
 
@@ -545,58 +628,104 @@ mod tests {
         }
     }
 
+    fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane.into(),
+            session: session.into(),
+            window_index: window.to_string(),
+            pane_index: pane_idx.to_string(),
+            tty: "/dev/pts/0".into(),
+            current_command: cmd.into(),
+            title: cmd.into(),
+        }
+    }
+
     #[test]
     fn render_does_not_panic_on_test_backend() {
         let backend = TestBackend::new(140, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = App::new();
-        app.set_agents(vec![
-            fake_agent(
-                "sess-a",
-                Some("%10"),
-                AgentKind::ClaudeCode,
-                AgentState::Working,
-                Some(
-                    "refactor the ipc module to use generics across multiple lines\nand keep going",
+        app.set_data(
+            vec![
+                fake_agent(
+                    "sess-a",
+                    Some("%10"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Working,
+                    Some(
+                        "refactor the ipc module to use generics across multiple lines\nand keep going",
+                    ),
+                    Some("Opus"),
+                    Some(34.0),
+                    Some(0.12),
                 ),
-                Some("Opus"),
-                Some(34.0),
-                Some(0.12),
-            ),
-            fake_agent(
-                "sess-b",
-                Some("%11"),
-                AgentKind::Codex,
-                AgentState::WaitingInput,
-                None,
-                None,
-                None,
-                None,
-            ),
-            fake_agent(
-                "sess-c",
-                Some("%12"),
-                AgentKind::GeminiCli,
-                AgentState::Idle,
-                Some("summarize this PR"),
-                Some("Gemini"),
-                Some(12.5),
-                Some(0.01),
-            ),
-            fake_agent(
-                "sess-d",
-                None,
-                AgentKind::Unknown,
-                AgentState::Error,
-                None,
-                None,
-                None,
-                None,
-            ),
-        ]);
+                fake_agent(
+                    "sess-b",
+                    Some("%11"),
+                    AgentKind::Codex,
+                    AgentState::WaitingInput,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "sess-c",
+                    Some("%12"),
+                    AgentKind::GeminiCli,
+                    AgentState::Idle,
+                    Some("summarize this PR"),
+                    Some("Gemini"),
+                    Some(12.5),
+                    Some(0.01),
+                ),
+                fake_agent(
+                    "sess-d",
+                    None,
+                    AgentKind::Unknown,
+                    AgentState::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![
+                fake_pane("%30", "work", 0, 0, "vim"),
+                fake_pane("%31", "work", 1, 0, "cargo build"),
+            ],
+        );
 
         terminal.draw(|f| render(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn bare_panes_appear_after_agents_and_dedupe_by_pane_id() {
+        let mut app = App::new();
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%10"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![
+                fake_pane("%10", "main", 0, 0, "claude"), // dedupes (matches agent)
+                fake_pane("%99", "side", 2, 1, "vim"),
+            ],
+        );
+        assert_eq!(app.rows.len(), 2);
+        assert!(matches!(app.rows[0], WatchRow::Agent(_)));
+        assert!(matches!(app.rows[1], WatchRow::BarePane(_)));
+        // selection works across both kinds
+        assert_eq!(app.selected_pane().as_deref(), Some("%10"));
+        app.move_down();
+        assert_eq!(app.selected_pane().as_deref(), Some("%99"));
     }
 
     #[test]
@@ -610,29 +739,31 @@ mod tests {
     #[test]
     fn selected_pane_returns_pane_id_for_selected_row() {
         let mut app = App::new();
-        app.set_agents(vec![
-            fake_agent(
-                "s1",
-                Some("%1"),
-                AgentKind::ClaudeCode,
-                AgentState::Idle,
-                None,
-                None,
-                None,
-                None,
-            ),
-            fake_agent(
-                "s2",
-                Some("%22"),
-                AgentKind::Codex,
-                AgentState::Idle,
-                None,
-                None,
-                None,
-                None,
-            ),
-        ]);
-        // Selection starts at 0 after set_agents.
+        app.set_data(
+            vec![
+                fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s2",
+                    Some("%22"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
         assert_eq!(app.selected_pane().as_deref(), Some("%1"));
         app.move_down();
         assert_eq!(app.selected_pane().as_deref(), Some("%22"));
@@ -649,28 +780,31 @@ mod tests {
     #[test]
     fn selection_movement_is_bounded() {
         let mut app = App::new();
-        app.set_agents(vec![
-            fake_agent(
-                "s1",
-                Some("%1"),
-                AgentKind::ClaudeCode,
-                AgentState::Idle,
-                None,
-                None,
-                None,
-                None,
-            ),
-            fake_agent(
-                "s2",
-                Some("%2"),
-                AgentKind::ClaudeCode,
-                AgentState::Idle,
-                None,
-                None,
-                None,
-                None,
-            ),
-        ]);
+        app.set_data(
+            vec![
+                fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s2",
+                    Some("%2"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
         assert_eq!(app.table_state.selected(), Some(0));
         app.move_down();
         assert_eq!(app.table_state.selected(), Some(1));
