@@ -19,6 +19,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use muxa_core::config::{WatchConfig, WidthSpec};
 use muxa_core::state::Agent;
 use muxa_core::AgentState;
 use muxa_runtime::ipc::Client;
@@ -34,6 +35,185 @@ use time::OffsetDateTime;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const INPUT_POLL: Duration = Duration::from_millis(50);
+
+/// A single column in the watch TUI. The set of valid columns is fixed by
+/// this enum — the `[watch]` config picks which ones to show and in what
+/// order, but cannot introduce new ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchColumn {
+    Pane,
+    Kind,
+    State,
+    Model,
+    Ctx,
+    Cost,
+    Prompt,
+    Activity,
+}
+
+impl WatchColumn {
+    /// Parse a config-string column key. Returns `None` for unknown keys
+    /// so the caller can warn and skip rather than refuse to load.
+    fn from_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "pane" => Self::Pane,
+            "kind" => Self::Kind,
+            "state" => Self::State,
+            "model" => Self::Model,
+            "ctx" => Self::Ctx,
+            "cost" => Self::Cost,
+            "prompt" => Self::Prompt,
+            "activity" => Self::Activity,
+            _ => return None,
+        })
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Self::Pane => "PANE",
+            Self::Kind => "KIND",
+            Self::State => "STATE",
+            Self::Model => "MODEL",
+            Self::Ctx => "CTX%",
+            Self::Cost => "COST$",
+            Self::Prompt => "LAST PROMPT",
+            Self::Activity => "ACTIVITY",
+        }
+    }
+
+    fn default_width(self) -> Constraint {
+        match self {
+            // PANE — "session:window.pane" can run long; 22 covers most.
+            Self::Pane => Constraint::Length(22),
+            Self::Kind => Constraint::Length(12),
+            Self::State => Constraint::Length(14),
+            Self::Model => Constraint::Length(16),
+            Self::Ctx => Constraint::Length(5),
+            Self::Cost => Constraint::Length(7),
+            Self::Prompt => Constraint::Min(20),
+            Self::Activity => Constraint::Length(10),
+        }
+    }
+
+    fn agent_cell(self, a: &Agent, now: OffsetDateTime) -> Cell<'_> {
+        match self {
+            Self::Pane => Cell::from(pane_display(a.pane.as_deref())),
+            Self::Kind => Cell::from(a.kind.to_string()),
+            Self::State => {
+                let style = match a.state {
+                    AgentState::Working => Style::default().fg(Color::Green),
+                    AgentState::WaitingInput => Style::default().fg(Color::Yellow),
+                    AgentState::Error => Style::default().fg(Color::Red),
+                    AgentState::Idle | AgentState::Stopped => Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    AgentState::Starting => Style::default().fg(Color::Cyan),
+                };
+                Cell::from(a.state.to_string()).style(style)
+            }
+            Self::Model => Cell::from(a.model.as_deref().unwrap_or("-").to_string()),
+            Self::Ctx => Cell::from(
+                a.context_used_pct
+                    .map_or_else(|| "-".into(), |p| format!("{p:>3.0}%")),
+            ),
+            Self::Cost => Cell::from(
+                a.cost_usd
+                    .map_or_else(|| "-".into(), |c| format!("${c:.2}")),
+            ),
+            Self::Prompt => Cell::from(
+                a.last_prompt
+                    .as_deref()
+                    .unwrap_or("-")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>(),
+            ),
+            Self::Activity => Cell::from(relative_time(a.last_activity_at, now)),
+        }
+    }
+
+    fn bare_cell(self, p: &PaneInfo) -> Cell<'_> {
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        match self {
+            Self::Pane => {
+                let pane = format!("{}:{}.{}", p.session, p.window_index, p.pane_index);
+                Cell::from(pane).style(dim)
+            }
+            // Bare panes have no agent metadata. We surface the pane title /
+            // current command in the prompt slot so the row still carries
+            // useful at-a-glance info; everything else collapses to a dash.
+            Self::Prompt => {
+                let summary = if p.title.is_empty() || p.title == p.current_command {
+                    p.current_command.clone()
+                } else {
+                    format!("{}  {}", p.current_command, p.title)
+                };
+                let summary: String = summary.chars().take(80).collect();
+                Cell::from(summary).style(dim)
+            }
+            Self::Kind | Self::State => Cell::from("—").style(dim),
+            Self::Model | Self::Ctx | Self::Cost | Self::Activity => Cell::from("-").style(dim),
+        }
+    }
+}
+
+/// Resolve the configured column list against `WatchConfig`. Unknown keys
+/// are skipped with a `tracing::warn!` rather than aborting.
+pub(crate) fn resolve_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
+    let mut out = Vec::with_capacity(cfg.columns.len());
+    for key in &cfg.columns {
+        if let Some(c) = WatchColumn::from_key(key) {
+            out.push(c);
+        } else {
+            tracing::warn!(column = %key, "unknown watch column key, skipping");
+        }
+    }
+    // Warn (once each) on widths entries with no matching column. This
+    // catches typos like `widths.prompts = 30` that would otherwise be
+    // silently ignored.
+    for key in cfg.widths.keys() {
+        if WatchColumn::from_key(key).is_none() {
+            tracing::warn!(column = %key, "unknown watch.widths key, ignoring");
+        }
+    }
+    out
+}
+
+/// Resolve the width Constraint for `col`, falling back to its default
+/// when the config has no entry or an `Invalid` spec.
+fn resolve_width(col: WatchColumn, cfg: &WatchConfig) -> Constraint {
+    let key = col.config_key();
+    match cfg.widths.get(key) {
+        Some(WidthSpec::Length(n)) => Constraint::Length(*n),
+        Some(WidthSpec::Min(n)) => Constraint::Min(*n),
+        Some(WidthSpec::Percentage(n)) => Constraint::Percentage((*n).min(100)),
+        Some(WidthSpec::Invalid(raw)) => {
+            tracing::warn!(column = %key, value = %raw, "invalid watch.widths value, using default");
+            col.default_width()
+        }
+        None => col.default_width(),
+    }
+}
+
+impl WatchColumn {
+    fn config_key(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Kind => "kind",
+            Self::State => "state",
+            Self::Model => "model",
+            Self::Ctx => "ctx",
+            Self::Cost => "cost",
+            Self::Prompt => "prompt",
+            Self::Activity => "activity",
+        }
+    }
+}
 
 /// One row of the dashboard. Either a tracked muxa agent or a plain tmux
 /// pane the daemon doesn't know about — listing both makes `muxa watch` a
@@ -61,15 +241,29 @@ pub(crate) struct App {
     pub table_state: TableState,
     pub last_error: Option<String>,
     pub last_refresh: OffsetDateTime,
+    /// Watch config — held by value so the rendering path doesn't need to
+    /// re-resolve columns every frame, and the smoke tests can swap it in.
+    pub watch_cfg: WatchConfig,
+    /// Column set resolved from `watch_cfg` once at construction. Unknown
+    /// keys are warned-and-skipped here (see `resolve_columns`).
+    pub columns: Vec<WatchColumn>,
 }
 
 impl App {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_config(WatchConfig::default())
+    }
+
+    pub(crate) fn with_config(cfg: WatchConfig) -> Self {
+        let columns = resolve_columns(&cfg);
         Self {
             rows: Vec::new(),
             table_state: TableState::default(),
             last_error: None,
             last_refresh: OffsetDateTime::now_utc(),
+            watch_cfg: cfg,
+            columns,
         }
     }
 
@@ -208,11 +402,11 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// meaning they want to attach to that pane. The caller (`main.rs`) runs
 /// the actual tmux switch-client invocation *after* this returns so the
 /// terminal is already restored by the time we hand off control.
-pub async fn run(client: &Client) -> Result<Option<String>> {
+pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
-    let mut app = App::new();
+    let mut app = App::with_config(watch_cfg);
 
     // Prime the initial snapshot so we don't paint an empty frame first.
     refresh(client, &mut app).await;
@@ -402,19 +596,8 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
-    let header_cells = [
-        "PANE",
-        "KIND",
-        "STATE",
-        "MODEL",
-        "CTX%",
-        "COST$",
-        "LAST PROMPT",
-        "ACTIVITY",
-    ]
-    .iter()
-    .map(|h| {
-        Cell::from(*h).style(
+    let header_cells = app.columns.iter().map(|c| {
+        Cell::from(c.header()).style(
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
@@ -427,22 +610,26 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .rows
         .iter()
         .map(|r| match r {
-            WatchRow::Agent(a) => agent_row(a, now),
-            WatchRow::BarePane(p) => bare_pane_row(p),
+            WatchRow::Agent(a) => Row::new(
+                app.columns
+                    .iter()
+                    .map(|c| c.agent_cell(a, now))
+                    .collect::<Vec<_>>(),
+            ),
+            WatchRow::BarePane(p) => Row::new(
+                app.columns
+                    .iter()
+                    .map(|c| c.bare_cell(p))
+                    .collect::<Vec<_>>(),
+            ),
         })
         .collect();
 
-    let widths = [
-        // PANE — "session:window.pane" can run long; 22 covers most.
-        Constraint::Length(22),
-        Constraint::Length(12),
-        Constraint::Length(14),
-        Constraint::Length(16),
-        Constraint::Length(5),
-        Constraint::Length(7),
-        Constraint::Min(20),
-        Constraint::Length(10),
-    ];
+    let widths: Vec<Constraint> = app
+        .columns
+        .iter()
+        .map(|c| resolve_width(*c, &app.watch_cfg))
+        .collect();
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -460,78 +647,6 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
-}
-
-fn agent_row(a: &Agent, now: OffsetDateTime) -> Row<'_> {
-    let state_style = match a.state {
-        AgentState::Working => Style::default().fg(Color::Green),
-        AgentState::WaitingInput => Style::default().fg(Color::Yellow),
-        AgentState::Error => Style::default().fg(Color::Red),
-        AgentState::Idle | AgentState::Stopped => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-        AgentState::Starting => Style::default().fg(Color::Cyan),
-    };
-
-    let pane = pane_display(a.pane.as_deref());
-    let kind = a.kind.to_string();
-    let state = a.state.to_string();
-    let model = a.model.as_deref().unwrap_or("-").to_string();
-    let ctx = a
-        .context_used_pct
-        .map_or_else(|| "-".into(), |p| format!("{p:>3.0}%"));
-    let cost = a
-        .cost_usd
-        .map_or_else(|| "-".into(), |c| format!("${c:.2}"));
-    let prompt = a
-        .last_prompt
-        .as_deref()
-        .unwrap_or("-")
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(80)
-        .collect::<String>();
-    let activity = relative_time(a.last_activity_at, now);
-
-    Row::new(vec![
-        Cell::from(pane),
-        Cell::from(kind),
-        Cell::from(state).style(state_style),
-        Cell::from(model),
-        Cell::from(ctx),
-        Cell::from(cost),
-        Cell::from(prompt),
-        Cell::from(activity),
-    ])
-}
-
-/// Row for a tmux pane the daemon doesn't track. Dimmed so the eye lands
-/// on real agents first, with the pane title or current command surfaced
-/// where the prompt text would otherwise be.
-fn bare_pane_row(p: &PaneInfo) -> Row<'_> {
-    let dim = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
-    let pane = format!("{}:{}.{}", p.session, p.window_index, p.pane_index);
-    let summary = if p.title.is_empty() || p.title == p.current_command {
-        p.current_command.clone()
-    } else {
-        format!("{}  {}", p.current_command, p.title)
-    };
-    let summary: String = summary.chars().take(80).collect();
-
-    Row::new(vec![
-        Cell::from(pane).style(dim),
-        Cell::from("—").style(dim),
-        Cell::from("—").style(dim),
-        Cell::from("-").style(dim),
-        Cell::from("-").style(dim),
-        Cell::from("-").style(dim),
-        Cell::from(summary).style(dim),
-        Cell::from("-").style(dim),
-    ])
 }
 
 fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
@@ -575,6 +690,7 @@ mod tests {
     use super::*;
     use muxa_core::event::{AgentKind, AgentState};
     use ratatui::backend::TestBackend;
+    use std::collections::HashMap;
     use time::OffsetDateTime;
 
     #[allow(clippy::too_many_arguments)]
@@ -800,5 +916,142 @@ mod tests {
         assert!(relative_time(now - time::Duration::minutes(5), now).ends_with("m ago"));
         assert!(relative_time(now - time::Duration::hours(3), now).ends_with("h ago"));
         assert!(relative_time(now - time::Duration::days(3), now).ends_with("d ago"));
+    }
+
+    #[test]
+    fn default_columns_are_prompt_forward() {
+        let app = App::new();
+        assert_eq!(
+            app.columns,
+            vec![
+                WatchColumn::Pane,
+                WatchColumn::State,
+                WatchColumn::Prompt,
+                WatchColumn::Activity,
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_columns_resolve_in_config_order() {
+        let cfg = WatchConfig {
+            columns: vec!["prompt".into(), "pane".into(), "kind".into()],
+            widths: HashMap::new(),
+        };
+        let app = App::with_config(cfg);
+        assert_eq!(
+            app.columns,
+            vec![WatchColumn::Prompt, WatchColumn::Pane, WatchColumn::Kind]
+        );
+    }
+
+    #[test]
+    fn unknown_column_keys_are_skipped() {
+        let cfg = WatchConfig {
+            columns: vec!["pane".into(), "bogus".into(), "prompt".into()],
+            widths: HashMap::new(),
+        };
+        let app = App::with_config(cfg);
+        // "bogus" was warned-and-skipped; the rest survive in order.
+        assert_eq!(app.columns, vec![WatchColumn::Pane, WatchColumn::Prompt]);
+    }
+
+    #[test]
+    fn width_spec_kinds_translate_to_constraints() {
+        let mut widths = HashMap::new();
+        widths.insert("pane".into(), WidthSpec::Length(40));
+        widths.insert("prompt".into(), WidthSpec::Min(50));
+        widths.insert("kind".into(), WidthSpec::Percentage(20));
+        widths.insert("state".into(), WidthSpec::Invalid("nope".into()));
+        let cfg = WatchConfig {
+            columns: vec![
+                "pane".into(),
+                "prompt".into(),
+                "kind".into(),
+                "state".into(),
+            ],
+            widths,
+        };
+        assert_eq!(
+            resolve_width(WatchColumn::Pane, &cfg),
+            Constraint::Length(40)
+        );
+        assert_eq!(
+            resolve_width(WatchColumn::Prompt, &cfg),
+            Constraint::Min(50)
+        );
+        assert_eq!(
+            resolve_width(WatchColumn::Kind, &cfg),
+            Constraint::Percentage(20)
+        );
+        // Invalid -> column default.
+        assert_eq!(
+            resolve_width(WatchColumn::State, &cfg),
+            WatchColumn::State.default_width()
+        );
+        // Missing -> column default.
+        assert_eq!(
+            resolve_width(WatchColumn::Activity, &cfg),
+            WatchColumn::Activity.default_width()
+        );
+    }
+
+    #[test]
+    fn agent_cell_renders_for_each_column_kind() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hello world"),
+            Some("Opus"),
+            Some(42.0),
+            Some(0.34),
+        );
+        // Smoke-test that every column variant produces a Cell without panic.
+        for col in [
+            WatchColumn::Pane,
+            WatchColumn::Kind,
+            WatchColumn::State,
+            WatchColumn::Model,
+            WatchColumn::Ctx,
+            WatchColumn::Cost,
+            WatchColumn::Prompt,
+            WatchColumn::Activity,
+        ] {
+            let _ = col.agent_cell(&a, now);
+        }
+    }
+
+    #[test]
+    fn bare_pane_summary_lands_in_prompt_column() {
+        // Render with a column set that includes Prompt but excludes the
+        // others — we verify the BarePane row is built without panic and
+        // that the prompt column carries the summary.
+        let cfg = WatchConfig {
+            columns: vec!["pane".into(), "prompt".into()],
+            widths: HashMap::new(),
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![],
+            vec![fake_pane("%99", "main", 0, 0, "vim README.md")],
+        );
+        assert_eq!(app.rows.len(), 1);
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // The pane current command should be visible somewhere in the row.
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("vim"),
+            "expected pane summary in render: {text:?}"
+        );
     }
 }

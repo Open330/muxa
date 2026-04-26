@@ -9,7 +9,7 @@ use comfy_table::{Cell, ContentArrangement, Table};
 use muxa_adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
 use muxa_core::paths;
 use muxa_core::state::Agent;
-use muxa_core::AgentState;
+use muxa_core::{AgentState, Config};
 use muxa_runtime::{ipc::Client, tmux};
 use owo_colors::{OwoColorize, Style};
 use std::io::{IsTerminal, Read, Write};
@@ -22,6 +22,10 @@ use time::OffsetDateTime;
 struct Args {
     #[arg(long, env = "MUXA_SOCKET", global = true)]
     socket: Option<PathBuf>,
+
+    /// Config file path. Defaults to `$XDG_CONFIG_HOME/muxa/config.toml`.
+    #[arg(long, env = "MUXA_CONFIG", global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -94,7 +98,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let socket = args.socket.unwrap_or_else(paths::default_socket);
+    let config_path = args.config.clone().or_else(paths::default_config_file);
+    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    let socket = args
+        .socket
+        .or_else(|| cfg.socket.clone())
+        .unwrap_or_else(paths::default_socket);
     let client = Client::new(socket);
 
     match args.cmd {
@@ -103,15 +112,15 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane } => cmd_recap(&client, pane).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
-        Cmd::Watch => cmd_watch(&client).await,
+        Cmd::Watch => cmd_watch(&client, cfg).await,
     }
 }
 
-async fn cmd_watch(client: &Client) -> Result<()> {
+async fn cmd_watch(client: &Client, cfg: Config) -> Result<()> {
     // watch::run restores the terminal before returning, so by the time we
     // get here it's safe to exec tmux commands that mutate the client's
     // attached session / pane.
-    if let Some(pane_id) = watch::run(client).await? {
+    if let Some(pane_id) = watch::run(client, cfg.watch).await? {
         jump_to_pane(&pane_id);
     }
     Ok(())

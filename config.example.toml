@@ -14,3 +14,22 @@
 # Logging is controlled via the standard RUST_LOG env var, e.g.:
 #   RUST_LOG=muxa=debug,tokio=warn muxad
 # Default when unset: "muxa=info".
+
+# `muxa watch` TUI columns. Default leads with the last prompt; uncomment
+# to opt back into model / ctx / cost or to reorder.
+#
+# Valid column keys: pane, kind, state, model, ctx, cost, prompt, activity.
+# Omit a key to hide the column. Unknown keys log a warning and are skipped.
+[watch]
+# columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+
+# Per-column widths. Three accepted forms:
+#   integer  -> fixed length      (Constraint::Length)
+#   "min:N"  -> minimum length    (Constraint::Min, takes leftover space)
+#   "pct:N"  -> percentage 0..100 (Constraint::Percentage)
+# Missing keys fall back to a per-column default.
+# [watch.widths]
+# pane     = 22
+# state    = 14
+# prompt   = "min:30"
+# activity = 10

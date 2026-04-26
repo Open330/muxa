@@ -316,7 +316,33 @@ backend = "libnotify"
 
 `muxad`는 `$XDG_CONFIG_HOME/muxa/config.toml`이 있으면 읽어들입니다. 모든 필드에
 적절한 기본값이 있습니다 — 전체 스키마는
-[`config.example.toml`](config.example.toml)에서 확인할 수 있습니다.
+[`config.example.toml`](config.example.toml)에서 확인할 수 있습니다. `muxa` CLI도
+같은 파일을 읽습니다(주로 `[watch]` 섹션 때문) — `MUXA_CONFIG=…`로 경로를
+바꿀 수 있습니다.
+
+### Watch 컬럼
+
+`muxa watch` TUI의 컬럼 구성은 변경 가능합니다. 기본값은 마지막 프롬프트를
+앞세우며, `model` / `ctx` / `cost`는 옵트인입니다:
+
+```toml
+[watch]
+# 표시 순서. 빠진 키는 숨겨집니다.
+columns = ["pane", "state", "prompt", "activity"]
+
+[watch.widths]
+# 숫자             -> Constraint::Length
+# "min:N" 문자열   -> Constraint::Min(N)        (남는 공간을 흡수)
+# "pct:N" 문자열   -> Constraint::Percentage(N)
+pane     = 22
+state    = 14
+prompt   = "min:30"
+activity = 10
+```
+
+사용 가능한 컬럼 키: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
+`prompt`, `activity`. 모르는 키는 경고만 남기고 무시되며, muxa 실행을
+막지는 않습니다.
 
 <details>
 <summary>환경 변수</summary>

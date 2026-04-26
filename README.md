@@ -330,7 +330,32 @@ Then restart the daemon.
 
 `muxad` reads `$XDG_CONFIG_HOME/muxa/config.toml` if it exists. All fields
 have sensible defaults — see [`config.example.toml`](config.example.toml)
-for the full schema.
+for the full schema. The `muxa` CLI reads the same file (mainly for
+`[watch]`); override with `MUXA_CONFIG=…`.
+
+### Watch columns
+
+The `muxa watch` TUI columns are configurable. The default view leads with
+the last prompt — `model` / `ctx` / `cost` are opt-in:
+
+```toml
+[watch]
+# Display order. Omitted keys are hidden.
+columns = ["pane", "state", "prompt", "activity"]
+
+[watch.widths]
+# Numeric         -> Constraint::Length
+# "min:N" string  -> Constraint::Min(N)         (takes leftover space)
+# "pct:N" string  -> Constraint::Percentage(N)
+pane     = 22
+state    = 14
+prompt   = "min:30"
+activity = 10
+```
+
+Valid column keys: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
+`prompt`, `activity`. Unknown keys log a warning and are skipped — they
+don't prevent muxa from starting.
 
 <details>
 <summary>Environment variables</summary>
