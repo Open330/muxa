@@ -30,13 +30,15 @@ chmod +x "$SHIM_DIR/tmux"
 
 TM=/usr/bin/tmux  # use absolute path here so we don't depend on PATH ordering
 
-# 2) Isolated demo server.
+# 2) Isolated demo server. Each pane runs `cat` so it sits on stdin with
+#    no prompt visible — keeps the recording free of $PS1 / Starship
+#    clutter that would otherwise bleed around the muxa watch popup.
 "$TM" -L "$TMUX_LBL" kill-server 2>/dev/null || true
-"$TM" -L "$TMUX_LBL" new-session -d -s main   -x 200 -y 40
-"$TM" -L "$TMUX_LBL" new-window  -t main: -n review
-"$TM" -L "$TMUX_LBL" new-window  -t main: -n vim
-"$TM" -L "$TMUX_LBL" new-session -d -s ops    -x 200 -y 40
-"$TM" -L "$TMUX_LBL" new-window  -t ops:  -n logs
+"$TM" -L "$TMUX_LBL" new-session -d -s main -x 200 -y 40 cat
+"$TM" -L "$TMUX_LBL" new-window  -t main: -n review cat
+"$TM" -L "$TMUX_LBL" new-window  -t main: -n vim    cat
+"$TM" -L "$TMUX_LBL" new-session -d -s ops  -x 200 -y 40 cat
+"$TM" -L "$TMUX_LBL" new-window  -t ops:  -n logs cat
 
 # 3) Seed muxad. Pick the first three pane ids so the agent rows resolve to
 #    real session:window.pane labels in muxa watch.
@@ -54,9 +56,17 @@ TMUX_PANE="$PC" muxa hook gemini --event before_agent \
 TMUX_PANE="$PC" muxa hook gemini --event after_agent \
   <<<'{"session_id":"s-c"}'
 
-# 4) Wire status-right on the demo server so attaching shows muxa live.
+# 4) Wire muxa into the demo server so the recording shows the integration.
 "$TM" -L "$TMUX_LBL" set-option -g status-interval 1
+# Status bar at the top — much more legible in a 1200×720 GIF than the
+# default bottom bar squeezed against the recording's edge.
+"$TM" -L "$TMUX_LBL" set-option -g status-position top
+"$TM" -L "$TMUX_LBL" set-option -g status-style "bg=#1a1b26,fg=white"
+"$TM" -L "$TMUX_LBL" set-option -g status-left  "#[bg=#7aa2f7,fg=#1a1b26,bold] muxa-demo #[default] "
+"$TM" -L "$TMUX_LBL" set-option -g status-left-length 20
 "$TM" -L "$TMUX_LBL" set-option -g status-right \
-  "#(muxa status-line --pane #{pane_id})  #[fg=cyan]%H:%M#[default]"
+  "#[fg=#bb9af7,bold]#(muxa status-line --pane #{pane_id})#[default]   #[fg=cyan]%H:%M#[default] "
 "$TM" -L "$TMUX_LBL" set-option -g status-right-length 120
-"$TM" -L "$TMUX_LBL" set-option -g status-style "bg=default,fg=white"
+
+# Bind prefix + s to the muxa watch popup so we can demo the flagship flow.
+"$TM" -L "$TMUX_LBL" bind-key s display-popup -E -w 90% -h 85% "muxa watch"

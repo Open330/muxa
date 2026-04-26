@@ -2,13 +2,9 @@
 #
 #   vhs docs/demo.tape
 #
-# Requires charmbracelet/vhs, ttyd, ffmpeg, and a Chromium-based browser
-# (VHS uses Chrome for frame capture). docs/demo-setup.sh handles the
-# muxad + tmux bootstrap so this file stays focused on the recording.
-#
-# The visible flow: muxa status (table) → attach to a real tmux session
-# with muxa wired into status-right → walk a couple of panes to show the
-# glyph update live → drop into muxa watch from inside tmux → detach.
+# Requires charmbracelet/vhs, ttyd, ffmpeg, and a Chromium-based browser.
+# docs/demo-setup.sh handles the muxad + tmux bootstrap so this file
+# stays focused on the recording.
 
 Output docs/demo.gif
 
@@ -20,9 +16,7 @@ Set Theme "TokyoNight"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
-# Prelude — invisible setup. Spins up a scratch muxad, builds an isolated
-# tmux server with three sessions / five panes, seeds three of the panes
-# as agents, and configures status-right to render muxa status-line live.
+# Prelude — invisible setup.
 Hide
 Type "export PATH=$HOME/.cargo/bin:/tmp/muxa-demo-shim:$PATH"
 Enter
@@ -42,34 +36,30 @@ Type "clear"
 Enter
 Show
 
-Type "# muxa status — every tracked agent at a glance"
-Sleep 800ms
-Enter
+# 1. Table view — read the data.
 Type "muxa status"
 Enter
 Sleep 2500ms
 
-Type "# attach to a tmux session — muxa is wired into status-right"
-Sleep 800ms
-Enter
+# 2. Attach to a real tmux session. The status bar at the TOP renders
+#    `muxa status-line --pane #{pane_id}` live — watch the right side.
 Type "/usr/bin/tmux -L muxa-demo attach -t main"
 Enter
 Sleep 2500ms
 
-# Walk a couple of windows so the glyph in status-right updates per pane.
+# 3. Walk a couple of windows so the muxa indicator on the right side of
+#    the status bar updates per pane (working / waiting / idle glyphs).
 Ctrl+B
 Type "n"
 Sleep 1800ms
 Ctrl+B
 Type "n"
 Sleep 1800ms
-Ctrl+B
-Type "p"
-Sleep 1500ms
 
-# Drop into the fullscreen TUI from inside tmux.
-Type "muxa watch"
-Enter
+# 4. prefix + s → muxa watch in a popup. This is the production flow:
+#    floating dashboard, agents on top, every other pane below.
+Ctrl+B
+Type "s"
 Sleep 4500ms
 Type "j"
 Sleep 300ms
@@ -78,10 +68,10 @@ Sleep 600ms
 Type "q"
 Sleep 800ms
 
-# Detach from tmux — the recording ends back in the bare shell.
+# 5. Detach from tmux.
 Ctrl+B
 Type "d"
-Sleep 800ms
+Sleep 600ms
 
 # Postlude — tear down everything.
 Hide
