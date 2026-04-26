@@ -114,9 +114,14 @@ impl WatchColumn {
         }
     }
 
-    fn agent_cell(self, a: &Agent, now: OffsetDateTime) -> Cell<'_> {
+    fn agent_cell<'a>(
+        self,
+        a: &'a Agent,
+        now: OffsetDateTime,
+        panes: &'a [PaneInfo],
+    ) -> Cell<'a> {
         match self {
-            Self::Pane => Cell::from(pane_display(a.pane.as_deref())),
+            Self::Pane => Cell::from(pane_display(a.pane.as_deref(), panes)),
             Self::Kind => Cell::from(a.kind.to_string()),
             Self::State => {
                 let style = match a.state {
@@ -275,6 +280,12 @@ pub(crate) struct App {
     /// Column set resolved from `watch_cfg` once at construction. Unknown
     /// keys are warned-and-skipped here (see `resolve_columns`).
     pub columns: Vec<WatchColumn>,
+    /// Snapshot of the full tmux pane inventory from the last refresh.
+    /// Used by `pane_display` to render `session:window.pane` labels for
+    /// agent rows without shelling out to tmux on every render frame —
+    /// per-row resolves used to cost ~5 ms each, so a 35-agent table
+    /// blocked the input loop for ~175 ms per paint.
+    pub panes: Vec<PaneInfo>,
 }
 
 impl App {
@@ -292,6 +303,7 @@ impl App {
             last_refresh: OffsetDateTime::now_utc(),
             watch_cfg: cfg,
             columns,
+            panes: Vec::new(),
         }
     }
 
@@ -310,8 +322,9 @@ impl App {
         let known: HashSet<String> = agents.iter().filter_map(|a| a.pane.clone()).collect();
 
         let mut bare: Vec<PaneInfo> = panes
-            .into_iter()
+            .iter()
             .filter(|p| !known.contains(&p.pane_id))
+            .cloned()
             .collect();
         bare.sort_by(|a, b| {
             a.session
@@ -325,6 +338,10 @@ impl App {
         rows.extend(bare.into_iter().map(WatchRow::BarePane));
 
         self.rows = rows;
+        // Keep the *full* pane inventory (not just the bare ones) so
+        // `pane_display` can resolve `session:window.pane` labels for
+        // agent rows by lookup instead of a tmux shell-out per render.
+        self.panes = panes;
         self.last_refresh = OffsetDateTime::now_utc();
         self.clamp_selection();
     }
@@ -373,14 +390,21 @@ impl App {
     }
 }
 
-/// Render a `pane_id` as `session:window.pane` when we can resolve it via
-/// tmux, falling back to the raw id (e.g. `%1618`) so this still degrades
-/// gracefully outside tmux.
-fn pane_display(pane_id: Option<&str>) -> String {
+/// Render a `pane_id` as `session:window.pane` when we can resolve it
+/// against the cached pane list, falling back to the raw id (e.g.
+/// `%1618`) when the agent's pane no longer exists.
+///
+/// **Why a slice and not a tmux shell-out**: this function runs once
+/// per agent row per render frame. Shelling out to `tmux list-panes`
+/// per call cost ~5 ms each, so a 35-agent table at 60 Hz target
+/// blocked the input loop for ~175 ms per frame. The refresh task
+/// already caches the full pane inventory in `App::panes`; we read
+/// from there instead.
+fn pane_display(pane_id: Option<&str>, panes: &[PaneInfo]) -> String {
     let Some(id) = pane_id else {
         return "-".into();
     };
-    match tmux::resolve_pane(id) {
+    match panes.iter().find(|p| p.pane_id == id) {
         Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
         None => id.to_string(),
     }
@@ -781,7 +805,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             WatchRow::Agent(a) => Row::new(
                 app.columns
                     .iter()
-                    .map(|c| c.agent_cell(a, now))
+                    .map(|c| c.agent_cell(a, now, &app.panes))
                     .collect::<Vec<_>>(),
             ),
             WatchRow::BarePane(p) => Row::new(
@@ -1031,11 +1055,28 @@ mod tests {
     }
 
     #[test]
-    fn pane_display_falls_back_to_raw_id_outside_tmux() {
-        // Outside a tmux server, resolve_pane returns None, and we expect
-        // the raw pane id back.
-        assert_eq!(pane_display(Some("%9999")), "%9999");
-        assert_eq!(pane_display(None), "-");
+    fn pane_display_falls_back_to_raw_id_when_not_in_cache() {
+        // Empty pane cache simulates "no tmux running" or a stale agent
+        // pane id; we expect the raw id back.
+        let panes: Vec<PaneInfo> = Vec::new();
+        assert_eq!(pane_display(Some("%9999"), &panes), "%9999");
+        assert_eq!(pane_display(None, &panes), "-");
+    }
+
+    #[test]
+    fn pane_display_resolves_against_cached_panes() {
+        let panes = vec![PaneInfo {
+            pane_id: "%42".into(),
+            session: "main".into(),
+            window_index: "1".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: String::new(),
+            title: String::new(),
+        }];
+        assert_eq!(pane_display(Some("%42"), &panes), "main:1.0");
+        // Misses fall through to the raw id without panicking.
+        assert_eq!(pane_display(Some("%missing"), &panes), "%missing");
     }
 
     #[test]
@@ -1188,7 +1229,7 @@ mod tests {
             WatchColumn::Prompt,
             WatchColumn::Activity,
         ] {
-            let _ = col.agent_cell(&a, now);
+            let _ = col.agent_cell(&a, now, &[]);
         }
     }
 
