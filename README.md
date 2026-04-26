@@ -12,6 +12,8 @@ See which agents are working, waiting, or idle — right from your status line, 
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
 ![tests](https://img.shields.io/badge/tests-25%20green-brightgreen)
 
+**English** · [한국어](README.ko.md)
+
 </div>
 
 ---
