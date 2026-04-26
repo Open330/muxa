@@ -16,6 +16,30 @@ pub struct Config {
 
     pub notifier: NotifierConfig,
     pub watch: WatchConfig,
+    pub dashboard: DashboardTomlConfig,
+}
+
+/// `[dashboard]` config — the user-facing TOML schema for the dashboard
+/// HTTP server. All fields are `Option` so the config-file layer can
+/// distinguish "not set" (use default or env/flag override) from
+/// "explicitly set". The fully-resolved [`DashboardConfig`](crate::dashboard::DashboardConfig)
+/// lives in the dashboard module and is computed by
+/// `DashboardConfig::resolve` at startup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DashboardTomlConfig {
+    pub enabled: Option<bool>,
+    /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
+    pub bind: Option<String>,
+    /// Bearer token. Empty string is treated as "unset". Required when
+    /// `bind` is non-loopback.
+    pub token: Option<String>,
+    /// Required to be `true` for non-loopback `bind` values. Acts as an
+    /// explicit acknowledgement that the operator means to expose the
+    /// dashboard beyond the local machine.
+    pub allow_public: Option<bool>,
+    /// Pane scanner cache TTL in milliseconds. Default 2000.
+    pub pane_cache_ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

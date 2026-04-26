@@ -6,6 +6,7 @@
 
 pub mod adapters;
 pub mod config;
+pub mod dashboard;
 pub mod error;
 pub mod event;
 pub mod ipc;

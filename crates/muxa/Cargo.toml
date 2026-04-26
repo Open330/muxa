@@ -18,6 +18,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 strum = { workspace = true }
+subtle = { workspace = true }
 notify-rust = "4"
 
 [dev-dependencies]
