@@ -28,6 +28,11 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 strum = { version = "0.27", features = ["derive"] }
 subtle = "2"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

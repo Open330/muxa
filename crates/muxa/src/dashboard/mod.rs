@@ -1,8 +1,9 @@
 //! HTTP dashboard for the muxa daemon.
 //!
 //! The dashboard exposes the daemon's read-only state — agents, panes
-//! across every tmux server, and a live event stream — over a small
-//! `axum`-based HTTP API alongside the existing Unix-socket IPC.
+//! across every tmux server, and (in a later commit) a live event stream
+//! — over a small `axum`-based HTTP API alongside the existing
+//! Unix-socket IPC.
 //!
 //! ## Security model
 //!
@@ -17,11 +18,11 @@
 //! - [`config`] — resolved [`DashboardConfig`] + the precedence rules
 //!   that turn TOML + env + CLI into one set of values.
 //! - [`auth`] — header-level bearer-token check (framework-agnostic).
-//! - The actual `axum::Router` and SSE handlers land in subsequent
-//!   commits; this module currently exports only the configuration and
-//!   auth primitives that the rest of the daemon's wiring depends on.
+//! - [`server`] — the `axum::Router`, handlers, and [`serve`] entrypoint.
 
 pub mod auth;
 pub mod config;
+pub mod server;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
+pub use server::{router, serve, AppState};
