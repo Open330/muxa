@@ -37,7 +37,12 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const INPUT_POLL: Duration = Duration::from_millis(50);
+/// Max time to wait for a single keystroke when the input buffer is
+/// empty. ~60 Hz so a press feels immediate without burning CPU on an
+/// idle terminal. Held keys / fast typing are absorbed by the
+/// drain-all-pending pattern in `run`, so this only governs idle
+/// responsiveness.
+const INPUT_POLL: Duration = Duration::from_millis(16);
 
 /// Channel capacity for the wake signal sent from the input loop to the
 /// background refresh task. Capacity 1 is intentional: when the user mashes
@@ -549,34 +554,50 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
             .draw(|f| render(f, &mut app))
             .map_err(anyhow::Error::from)?;
 
-        // Drain a batch of input events. `crossterm::event::poll` is
-        // blocking, so we run it on a blocking thread to not starve the
-        // tokio runtime. A short timeout keeps UI latency low.
-        let got_event = tokio::task::spawn_blocking(|| -> io::Result<Option<Event>> {
-            if crossterm::event::poll(INPUT_POLL)? {
-                Ok(Some(crossterm::event::read()?))
-            } else {
-                Ok(None)
+        // Drain every event already in the OS buffer in one go before
+        // rendering again. Holding a key (or typing in bursts) used to
+        // pile up events because the loop only handled one per
+        // iteration; the render between events made the queue grow
+        // faster than we drained. `poll(Duration::ZERO)` is
+        // non-blocking, so this is cheap when the buffer is empty.
+        let mut events = drain_pending_events()?;
+
+        // If nothing was waiting, do exactly one bounded blocking
+        // wait so an idle UI yields the CPU.
+        if events.is_empty() {
+            let waited = tokio::task::spawn_blocking(|| -> io::Result<Option<Event>> {
+                if crossterm::event::poll(INPUT_POLL)? {
+                    Ok(Some(crossterm::event::read()?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await
+            .map_err(anyhow::Error::from)??;
+            if let Some(ev) = waited {
+                events.push(ev);
             }
-        })
-        .await
-        .map_err(anyhow::Error::from)??;
+        }
 
         let mut quit = false;
-        if let Some(ev) = got_event {
+        for ev in events {
             match handle_event(ev, &mut app) {
-                Action::Quit => quit = true,
+                Action::Quit => {
+                    quit = true;
+                    break;
+                }
                 Action::Attach => {
                     if let Some(pane) = app.selected_pane() {
                         jump_target = Some(pane);
                         quit = true;
+                        break;
                     }
                 }
                 Action::Refresh => {
                     // Coalesce repeated `r` mashes: if the wake slot is
                     // already full a request is pending, so a `try_send`
-                    // failure is fine — the in-flight request will pick up
-                    // the user's intent.
+                    // failure is fine — the in-flight request will pick
+                    // up the user's intent.
                     let _ = wake_tx.try_send(());
                 }
                 Action::None => {}
@@ -602,6 +623,18 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     let _ = bg.await;
 
     Ok(jump_target)
+}
+
+/// Pull every event already sitting in the OS-side terminal input
+/// buffer without ever blocking. `poll(Duration::ZERO)` returns
+/// immediately; we keep reading until nothing is left. Safe to call
+/// from an async context since neither call yields.
+fn drain_pending_events() -> io::Result<Vec<Event>> {
+    let mut events = Vec::new();
+    while crossterm::event::poll(Duration::ZERO)? {
+        events.push(crossterm::event::read()?);
+    }
+    Ok(events)
 }
 
 enum Action {
