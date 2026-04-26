@@ -281,6 +281,13 @@ pub(crate) struct App {
     /// per-row resolves used to cost ~5 ms each, so a 35-agent table
     /// blocked the input loop for ~175 ms per paint.
     pub panes: Vec<PaneInfo>,
+    /// True between a user-triggered refresh request (`r`) and the
+    /// matching outcome landing on the channel. Surfaces a brief
+    /// "↻ refreshing…" hint in the header so mashing `r` during a
+    /// slow daemon snapshot isn't silently swallowed. Periodic
+    /// background ticks intentionally don't toggle this — only the
+    /// user's deliberate action lights it up.
+    pub refresh_pending: bool,
 }
 
 impl App {
@@ -299,6 +306,7 @@ impl App {
             watch_cfg: cfg,
             columns,
             panes: Vec::new(),
+            refresh_pending: false,
         }
     }
 
@@ -618,6 +626,7 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                     // failure is fine — the in-flight request will pick
                     // up the user's intent.
                     let _ = wake_tx.try_send(());
+                    app.refresh_pending = true;
                 }
                 Action::None => {}
             }
@@ -626,8 +635,13 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         // Drain any refresh outcomes that landed since the last frame.
         // The render path never awaits the refresh — this is the only
         // place data flows back into `App`.
+        let mut received_outcome = false;
         while let Ok(outcome) = outcome_rx.try_recv() {
             apply_outcome(&mut app, outcome);
+            received_outcome = true;
+        }
+        if received_outcome {
+            app.refresh_pending = false;
         }
 
         if quit {
@@ -637,9 +651,20 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
 
     // Drop the wake sender so refresh_task's `wake.recv()` returns None
     // on its next iteration; then await the join so we don't leak a task.
+    //
+    // Bound the join with a short timeout: if the refresh task is mid-
+    // `tmux list-panes` shell-out or stuck on a daemon snapshot to a
+    // hung Unix socket, we'd otherwise wedge `muxa watch` quit until
+    // those resolve at the OS layer. 2 seconds is well above the
+    // usual fetch latency (sub-50 ms) so a healthy run never hits it.
     drop(wake_tx);
     drop(outcome_rx);
-    let _ = bg.await;
+    if tokio::time::timeout(Duration::from_secs(2), bg)
+        .await
+        .is_err()
+    {
+        tracing::warn!("refresh task did not exit within 2s of shutdown; abandoning");
+    }
 
     Ok(jump_target)
 }
@@ -756,6 +781,19 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("   "),
         Span::styled(clock, Style::default().fg(Color::DarkGray)),
     ]);
+    let title = if app.refresh_pending {
+        let mut spans = title.spans;
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            "↻ refreshing…",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        ));
+        Line::from(spans)
+    } else {
+        title
+    };
 
     let err_line = app
         .last_error

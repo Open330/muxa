@@ -355,11 +355,17 @@ async fn cmd_status(client: &Client) -> Result<()> {
         println!("no active agents");
         return Ok(());
     }
-    print_table(&agents, OffsetDateTime::now_utc(), use_colors());
+    // Resolve the full pane inventory once so `pane_display` does N
+    // lookups against a slice instead of N `tmux list-panes -a`
+    // shell-outs (each ~5 ms, observable as ~170 ms total at 30+
+    // agents).
+    let panes = tmux::list_panes().unwrap_or_default();
+    print_table(&agents, &panes, OffsetDateTime::now_utc(), use_colors());
     Ok(())
 }
 
 async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
+    let panes_snapshot = tmux::list_panes().unwrap_or_default();
     let pane = pane.or_else(tmux::current_pane);
     let agents = match &pane {
         Some(p) => client.by_pane(p).await?,
@@ -374,11 +380,14 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
             // Prefer session:window when we can resolve it — makes the
             // status-line read "⚙ main:2 claude_code" instead of a
             // context-free glyph.
-            let loc = a
-                .pane
-                .as_deref()
-                .and_then(tmux::resolve_pane)
-                .map(|p| format!(" {}:{}", p.session, p.window_index));
+            // Resolve against the snapshot fetched once above instead
+            // of shelling out per agent.
+            let loc = a.pane.as_deref().and_then(|raw| {
+                panes_snapshot
+                    .iter()
+                    .find(|p| p.pane_id == raw)
+                    .map(|p| format!(" {}:{}", p.session, p.window_index))
+            });
             match loc {
                 Some(l) => format!("{icon}{l} {kind}"),
                 None => format!("{icon} {kind}"),
@@ -455,13 +464,20 @@ fn state_style(state: AgentState) -> Style {
     }
 }
 
-/// Pretty-print `Agent.pane` as `session:window.pane` when tmux agrees, or
-/// fall back to the raw pane id (or `-` if unknown).
-fn pane_display(a: &Agent) -> String {
+/// Pretty-print `Agent.pane` as `session:window.pane` by lookup against
+/// a pre-fetched pane list, or fall back to the raw pane id (or `-` if
+/// unknown).
+///
+/// **Why a slice and not a tmux shell-out**: this used to call
+/// `tmux::resolve_pane` which itself shells out to `tmux list-panes
+/// -a` per call. With 30+ agents that meant 30+ subprocess invocations
+/// for one `muxa status` run. Callers now fetch the pane list once and
+/// pass it down.
+fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String {
     let Some(raw) = a.pane.as_deref() else {
         return "-".to_string();
     };
-    match tmux::resolve_pane(raw) {
+    match panes.iter().find(|p| p.pane_id == raw) {
         Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
         None => raw.to_string(),
     }
@@ -487,7 +503,12 @@ fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
     format!("{days}d ago")
 }
 
-fn print_table(agents: &[Agent], now: OffsetDateTime, colored: bool) {
+fn print_table(
+    agents: &[Agent],
+    panes: &[muxa::tmux::PaneInfo],
+    now: OffsetDateTime,
+    colored: bool,
+) {
     let mut table = Table::new();
     table
         .load_preset(UTF8_BORDERS_ONLY)
@@ -502,7 +523,7 @@ fn print_table(agents: &[Agent], now: OffsetDateTime, colored: bool) {
         ]);
 
     for a in agents {
-        let pane = pane_display(a);
+        let pane = pane_display(a, panes);
         let kind = a.kind.to_string();
         let state_txt = a.state.to_string();
         let state_cell = if colored {
