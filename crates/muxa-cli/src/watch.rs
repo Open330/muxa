@@ -19,11 +19,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa_core::config::{WatchConfig, WidthSpec};
-use muxa_core::state::Agent;
-use muxa_core::AgentState;
-use muxa_runtime::ipc::Client;
-use muxa_runtime::tmux::{self, PaneInfo};
+use muxa::config::{WatchConfig, WidthSpec};
+use muxa::ipc::Client;
+use muxa::state::Agent;
+use muxa::tmux::{self, PaneInfo};
+use muxa::AgentState;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -688,7 +688,7 @@ fn render_footer(f: &mut Frame, area: Rect, _app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muxa_core::event::{AgentKind, AgentState};
+    use muxa::event::{AgentKind, AgentState};
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
     use time::OffsetDateTime;

@@ -15,8 +15,8 @@
 //! the `shutdown` channel and stops accepting new connections; in-flight
 //! connections finish naturally.
 
-use muxa_core::event::{AgentEvent, PROTOCOL_VERSION};
-use muxa_core::state::{Agent, SharedStore};
+use crate::event::{AgentEvent, PROTOCOL_VERSION};
+use crate::state::{Agent, SharedStore};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -285,8 +285,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muxa_core::event::{AgentEvent, AgentId, AgentKind};
-    use muxa_core::state::Store;
+    use crate::event::{AgentEvent, AgentId, AgentKind};
+    use crate::state::Store;
     use tempfile::tempdir;
     use time::OffsetDateTime;
 

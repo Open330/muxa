@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,9 +12,7 @@ authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-muxa-core = { path = "crates/muxa-core", version = "0.0.1" }
-muxa-runtime = { path = "crates/muxa-runtime", version = "0.0.1" }
-muxa-adapters = { path = "crates/muxa-adapters", version = "0.0.1" }
+muxa = { path = "crates/muxa", version = "0.0.1" }
 
 # external
 anyhow = "1"

@@ -5,10 +5,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use muxa_core::config::NotifierBackend;
-use muxa_core::{paths, Config, Store};
-use muxa_runtime::ipc::{harden_permissions, Server};
-use muxa_runtime::notify::Notifier;
+use muxa::config::NotifierBackend;
+use muxa::ipc::{harden_permissions, Server};
+use muxa::notify::Notifier;
+use muxa::{paths, Config, Store};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;

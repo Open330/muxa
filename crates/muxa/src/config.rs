@@ -100,7 +100,7 @@ impl Default for WatchConfig {
 }
 
 /// One column's width directive. Mirrors a subset of
-/// `ratatui::layout::Constraint`, but lives in `muxa-core` so the daemon's
+/// `ratatui::layout::Constraint`, but lives in `muxa` so the daemon's
 /// config schema doesn't have to depend on the TUI crate.
 ///
 /// TOML representations:

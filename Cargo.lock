@@ -1125,13 +1125,28 @@ dependencies = [
 name = "muxa"
 version = "0.0.1"
 dependencies = [
+ "dirs",
+ "notify-rust",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "muxa-cli"
+version = "0.0.1"
+dependencies = [
  "anyhow",
  "clap",
  "comfy-table",
  "crossterm",
- "muxa-adapters",
- "muxa-core",
- "muxa-runtime",
+ "muxa",
  "owo-colors",
  "ratatui",
  "serde_json",
@@ -1143,53 +1158,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "muxa-adapters"
-version = "0.0.1"
-dependencies = [
- "muxa-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "muxa-core"
-version = "0.0.1"
-dependencies = [
- "dirs",
- "serde",
- "serde_json",
- "strum",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "muxa-runtime"
-version = "0.0.1"
-dependencies = [
- "muxa-core",
- "notify-rust",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "muxad"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
- "muxa-core",
- "muxa-runtime",
+ "muxa",
  "time",
  "tokio",
  "tracing",

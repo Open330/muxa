@@ -6,11 +6,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ContentArrangement, Table};
-use muxa_adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
-use muxa_core::paths;
-use muxa_core::state::Agent;
-use muxa_core::{AgentState, Config};
-use muxa_runtime::{ipc::Client, tmux};
+use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
+use muxa::ipc::Client;
+use muxa::state::Agent;
+use muxa::{paths, tmux, AgentState, Config};
 use owo_colors::{OwoColorize, Style};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -188,7 +187,7 @@ fn run_tmux(args: &[&str]) {
 /// Hook commands are invoked on the agent's critical path (every prompt,
 /// every tool call). If the daemon is down we MUST NOT block or fail — a
 /// best-effort ingest with a stderr warning keeps the agent healthy.
-async fn best_effort_ingest(client: &Client, ev: &muxa_core::event::AgentEvent) {
+async fn best_effort_ingest(client: &Client, ev: &muxa::event::AgentEvent) {
     if let Err(e) = client.ingest(ev).await {
         tracing::debug!(error = %e, "muxa ingest failed (daemon down?)");
     }
