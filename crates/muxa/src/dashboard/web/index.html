@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark light">
+  <title>muxa dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▦</span>
+      <span class="title">muxa</span>
+      <span class="version" id="version" title="protocol version"></span>
+    </div>
+    <div class="status">
+      <span class="conn" id="conn">●</span>
+      <span class="conn-label" id="conn-label">connecting…</span>
+      <span class="counts" id="counts"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="agents-panel">
+      <div class="panel-header">
+        <h2>Agents</h2>
+        <div class="filters">
+          <span class="filter-label">state:</span>
+          <span class="chips" id="agent-state-chips"></span>
+          <span class="filter-label">kind:</span>
+          <span class="chips" id="agent-kind-chips"></span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>PANE</th>
+              <th>KIND</th>
+              <th>STATE</th>
+              <th>MODEL</th>
+              <th class="num">CTX</th>
+              <th class="num">COST</th>
+              <th>LAST PROMPT</th>
+              <th>ACTIVITY</th>
+            </tr>
+          </thead>
+          <tbody id="agents-tbody">
+            <tr class="empty"><td colspan="8">loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="panes-panel">
+      <div class="panel-header">
+        <h2>tmux panes <span class="muted">(global)</span></h2>
+        <div class="filters">
+          <span class="filter-label">socket:</span>
+          <span class="chips" id="pane-socket-chips"></span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>SOCKET</th>
+              <th>SESSION</th>
+              <th>WINDOW</th>
+              <th>PANE</th>
+              <th>COMMAND</th>
+              <th>TITLE</th>
+              <th>ATTACH</th>
+            </tr>
+          </thead>
+          <tbody id="panes-tbody">
+            <tr class="empty"><td colspan="7">loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script type="module" src="/static/main.js"></script>
+</body>
+</html>

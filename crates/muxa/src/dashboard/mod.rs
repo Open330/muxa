@@ -20,6 +20,7 @@
 //! - [`auth`] — header-level bearer-token check (framework-agnostic).
 //! - [`server`] — the `axum::Router`, handlers, and [`serve`] entrypoint.
 
+pub mod assets;
 pub mod auth;
 pub mod config;
 pub mod server;

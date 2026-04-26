@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
-use crate::dashboard::{auth, DashboardConfig};
+use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::PROTOCOL_VERSION;
 use crate::state::{Agent, SharedStore};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
@@ -72,14 +72,17 @@ impl AppState {
 /// touching this file.
 pub fn router(state: AppState) -> Router {
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);
-    Router::new()
+    let api = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/panes", get(panes_handler))
         .route("/api/events", get(events_handler))
         .layer(auth_layer)
+        .with_state(state);
+    // Static assets sit OUTSIDE the auth layer — see assets.rs for the
+    // rationale (token bootstrap in the browser).
+    api.merge(assets::router::<()>())
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 /// Bind and serve the router until `shutdown` fires or the listener
