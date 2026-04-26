@@ -20,8 +20,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Create the GitHub Release once, before any matrix build runs. The
+  # taiki-e/upload-rust-binary-action only uploads — it doesn't create
+  # the release container — so without this prelude every matrix leg
+  # races on a non-existent release and bails with "release not found".
+  # Skipped on workflow_dispatch (which is dry-run mode).
+  create-release:
+    name: create release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent: if a previous run already created it, skip.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; reusing"
+            exit 0
+          fi
+          gh release create "$tag" \
+            --title "$tag" \
+            --draft \
+            --notes "Release notes are populated from CHANGELOG.md after the matrix uploads finish."
+
   build:
     name: build ${{ matrix.target }}
+    needs: [create-release]
+    # Run on workflow_dispatch (dry-run, where create-release is skipped)
+    # AND on tag push (where create-release must succeed first).
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.create-release.result == 'success') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
