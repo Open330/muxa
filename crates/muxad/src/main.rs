@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use muxa_core::config::NotifierBackend;
 use muxa_core::{paths, Config, Store};
-use muxa_runtime::ipc::{harden_permissions, Server};
+use muxa_runtime::discovery;
+use muxa_runtime::ipc::{harden_permissions, Client, Server};
 use muxa_runtime::notify::Notifier;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
@@ -100,16 +101,86 @@ async fn main() -> Result<()> {
 
     // Harden socket permissions once the listener exists. We poll briefly
     // because bind is fire-and-forget vs. spawn timing.
+    let mut listener_ready = false;
     for _ in 0..50 {
         if socket.exists() {
             if let Err(e) = harden_permissions(&socket) {
                 tracing::warn!(error = %e, "chmod 0600 on socket failed");
             }
+            listener_ready = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
+    // One-shot startup discovery: backfill agents that are still running in
+    // tmux panes from before the daemon (re)started. Configurable; default
+    // on. Does not block server readiness — spawned in the background.
+    if listener_ready {
+        spawn_startup_discovery(&cfg, socket.clone());
+    }
+
     handle.await??;
     Ok(())
+}
+
+/// Decide whether to fire the one-shot discovery pass and, if so, spawn it
+/// onto the current tokio runtime.
+///
+/// Returns `true` when a task was spawned. Extracted from `main` so tests
+/// can drive both branches of the `discovery.enabled` flag without having
+/// to spawn the real daemon.
+fn spawn_startup_discovery(cfg: &Config, socket: PathBuf) -> bool {
+    if !cfg.discovery.enabled {
+        tracing::debug!("startup discovery disabled by config");
+        return false;
+    }
+    tokio::spawn(async move {
+        // Small grace so the listener's `accept` loop is actually running
+        // by the time we connect. The 250 ms figure matches the design
+        // doc — anything less is racy on slower hosts, anything more
+        // delays the visible backfill needlessly.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let client = Client::new(socket);
+        match discovery::run_discovery(&client).await {
+            Ok(report) => {
+                tracing::info!(
+                    claude_code = report.claude_code,
+                    codex = report.codex,
+                    gemini_cli = report.gemini_cli,
+                    skipped_known = report.skipped_known,
+                    failed = report.failed,
+                    "startup discovery complete",
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "startup discovery failed"),
+        }
+    });
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muxa_core::config::DiscoveryConfig;
+
+    #[tokio::test]
+    async fn startup_discovery_runs_when_enabled() {
+        let cfg = Config {
+            discovery: DiscoveryConfig { enabled: true },
+            ..Config::default()
+        };
+        let spawned = spawn_startup_discovery(&cfg, PathBuf::from("/tmp/never-bound.sock"));
+        assert!(spawned, "discovery should spawn when enabled");
+    }
+
+    #[tokio::test]
+    async fn startup_discovery_skipped_when_disabled() {
+        let cfg = Config {
+            discovery: DiscoveryConfig { enabled: false },
+            ..Config::default()
+        };
+        let spawned = spawn_startup_discovery(&cfg, PathBuf::from("/tmp/never-bound.sock"));
+        assert!(!spawned, "discovery must not spawn when disabled");
+    }
 }

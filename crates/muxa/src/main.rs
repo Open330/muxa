@@ -10,7 +10,7 @@ use muxa_adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter
 use muxa_core::paths;
 use muxa_core::state::Agent;
 use muxa_core::{AgentState, Config};
-use muxa_runtime::{ipc::Client, tmux};
+use muxa_runtime::{discovery, ipc::Client, tmux};
 use owo_colors::{OwoColorize, Style};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -54,6 +54,8 @@ enum Cmd {
     Panes,
     /// Fullscreen TUI dashboard of all tracked agents.
     Watch,
+    /// Backfill the registry by scanning tmux panes for agent processes.
+    Sync,
 }
 
 #[derive(Debug, Subcommand)]
@@ -113,7 +115,55 @@ async fn main() -> Result<()> {
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
         Cmd::Watch => cmd_watch(&client, cfg).await,
+        Cmd::Sync => cmd_sync(&client).await,
     }
+}
+
+/// Backfill the daemon's registry from tmux panes. Idempotent.
+async fn cmd_sync(client: &Client) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let report = discovery::run_discovery(client)
+        .await
+        .context("running discovery")?;
+
+    // Build the kind breakdown only for non-zero counts so the line stays
+    // readable when only one agent kind is present.
+    let mut parts: Vec<String> = Vec::new();
+    if report.claude_code > 0 {
+        parts.push(format!("{} claude_code", report.claude_code));
+    }
+    if report.codex > 0 {
+        parts.push(format!("{} codex", report.codex));
+    }
+    if report.gemini_cli > 0 {
+        parts.push(format!("{} gemini_cli", report.gemini_cli));
+    }
+
+    let total = report.total_ingested();
+    if total == 0 && report.skipped_known == 0 && report.failed == 0 {
+        println!("no agent panes discovered");
+        return Ok(());
+    }
+
+    let mut line = format!("discovered {total} agent");
+    if total != 1 {
+        line.push('s');
+    }
+    if !parts.is_empty() {
+        line.push_str(": ");
+        line.push_str(&parts.join(", "));
+    }
+    if report.skipped_known > 0 {
+        // `write!` to a String never fails — unwrap is fine and avoids the
+        // intermediate allocation that `push_str(&format!(..))` would do.
+        let _ = write!(line, " (skipped {} already-known)", report.skipped_known);
+    }
+    if report.failed > 0 {
+        let _ = write!(line, " — {} failed", report.failed);
+    }
+    println!("{line}");
+    Ok(())
 }
 
 async fn cmd_watch(client: &Client, cfg: Config) -> Result<()> {

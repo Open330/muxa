@@ -10,7 +10,7 @@ See which agents are working, waiting, or idle — right from your status line, 
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
-![tests](https://img.shields.io/badge/tests-36%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-49%20green-brightgreen)
 
 **English** · [한국어](README.ko.md)
 
@@ -41,7 +41,7 @@ via that agent's own hook / event-emission system.
 
 > [!IMPORTANT]
 > Pre-alpha. Event ingest, adapters, daemon, CLI, live TUI, and desktop
-> notifications all work end-to-end with 36 tests green. APIs may still shift.
+> notifications all work end-to-end with 49 tests green. APIs may still shift.
 > opencode support is deferred.
 
 ## Contents
@@ -266,10 +266,21 @@ muxa watch          # live TUI
 | `muxa watch`                               | Full-screen live TUI — see [Live TUI](#live-tui).                      |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N]`                   | Show the last prompt for the given pane.                               |
+| `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
 | `muxa panes`                               | Debug: dump tmux pane inventory.                                       |
 | `muxa hook <agent> --event <e>`            | Hook adapter entry point. Invoked by the agent CLIs themselves.        |
 | `muxa hook claude-statusline --forward CMD` | Tee Claude's status-line JSON to muxa + a downstream tool.             |
 | `muxad`                                    | The daemon. Listens on `$XDG_RUNTIME_DIR/muxa.sock` by default.        |
+
+### Sync
+
+`muxa sync` scans `tmux list-panes`, matches `pane_current_command` against
+known agent CLIs (`claude`, `codex`, `gemini` / `gemini-cli`), and asks the
+daemon to register them as synthetic agents. The same one-shot pass runs
+automatically on `muxad` startup so a daemon restart doesn't blank out
+agents that are still alive in their panes. Idempotent: synthetic entries
+are replaced in place when a real hook later fires. Toggle via
+`[discovery] enabled = false`.
 
 ## Live TUI
 

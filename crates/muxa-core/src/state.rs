@@ -20,6 +20,19 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, RwLock};
 
+/// Prefix used by `muxa sync` / startup discovery for the `session_id` of a
+/// synthesized `Started` event. The store recognizes this prefix to keep
+/// dedup honest: a real hook event arriving for the same `(kind, pane)`
+/// replaces the synthetic placeholder rather than racing it.
+///
+/// Kept here (not in the runtime crate) so the no-I/O store layer can dedup
+/// without taking a cross-crate dependency on the discovery module.
+pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
+
+fn is_synthetic(session_id: &str) -> bool {
+    session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
+}
+
 /// Capacity of the in-process state-transition broadcast. Slow subscribers
 /// that lag past this will see `RecvError::Lagged` and should resync via
 /// `Store::snapshot` — the notifier task logs and continues.
@@ -99,6 +112,48 @@ impl Default for Store {
 
 pub type SharedStore = Arc<Store>;
 
+/// Reconcile pane occupants for an incoming `Started` event.
+///
+/// Returns `false` when the event should be dropped (re-running `muxa sync`
+/// against a pane that's already represented). Otherwise the map has been
+/// updated to make room for the new agent:
+///
+/// * Synthetic placeholders for `pane` are removed when the incoming event
+///   is real, so the real entry replaces them rather than coexisting.
+/// * Older non-stopped sessions sharing the pane are flipped to `Stopped`
+///   (the user launched a fresh agent in the same pane and the previous
+///   session never emitted `SessionEnd`).
+fn reconcile_pane_for_started(
+    agents: &mut HashMap<String, Agent>,
+    incoming_session: &str,
+    pane: &str,
+    at: OffsetDateTime,
+) -> bool {
+    if is_synthetic(incoming_session) {
+        // Idempotent re-sync: any non-stopped occupant wins, real or not.
+        let occupied = agents
+            .values()
+            .any(|a| a.pane.as_deref() == Some(pane) && a.state != AgentState::Stopped);
+        if occupied {
+            return false;
+        }
+    } else {
+        // Real Started — drop synthetic placeholders for this pane outright.
+        agents.retain(|_, a| !(a.pane.as_deref() == Some(pane) && is_synthetic(&a.session_id)));
+    }
+
+    for other in agents.values_mut() {
+        if other.session_id != incoming_session
+            && other.pane.as_deref() == Some(pane)
+            && other.state != AgentState::Stopped
+        {
+            other.state = AgentState::Stopped;
+            other.last_activity_at = at;
+        }
+    }
+    true
+}
+
 impl Store {
     pub fn shared() -> SharedStore {
         Arc::new(Self::default())
@@ -118,22 +173,10 @@ impl Store {
         let id = ev.id();
         let at = ev.at();
 
-        // Dedupe stale agents in the same pane when a new session starts.
-        //
-        // When an `AgentEvent::Started` arrives carrying a pane, any other
-        // non-Stopped agents sharing that pane are older sessions that have
-        // already exited — the user just launched a fresh agent in the
-        // same pane. Mark them Stopped so `muxa status` stays uncluttered.
         if matches!(ev, AgentEvent::Started { .. }) {
             if let Some(pane) = id.pane.as_deref() {
-                for other in agents.values_mut() {
-                    if other.session_id != id.session_id
-                        && other.pane.as_deref() == Some(pane)
-                        && other.state != AgentState::Stopped
-                    {
-                        other.state = AgentState::Stopped;
-                        other.last_activity_at = at;
-                    }
+                if !reconcile_pane_for_started(&mut agents, &id.session_id, pane, at) {
+                    return;
                 }
             }
         }
@@ -419,6 +462,118 @@ mod tests {
         assert_eq!(t.to, AgentState::Working);
         assert_eq!(t.agent.session_id, "s");
         assert_eq!(t.agent.last_prompt.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn synthetic_started_idempotent_on_same_pane() {
+        let store = Store::shared();
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+
+        // First synthetic from `muxa sync` lands an Idle agent on %1.
+        let synthetic = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "synthetic-%1".into(),
+            pane: Some("%1".into()),
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: synthetic.clone(),
+                at: now,
+            })
+            .await;
+        assert_eq!(store.snapshot().await.len(), 1);
+
+        // Re-running discovery must not create a duplicate or wipe the
+        // first entry's started_at — it's a no-op.
+        let later = datetime!(2026-04-24 12:30:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: synthetic,
+                at: later,
+            })
+            .await;
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].started_at, now);
+    }
+
+    #[tokio::test]
+    async fn real_started_replaces_synthetic_on_same_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:01:00 UTC);
+
+        // Discovery synthesizes a placeholder.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "synthetic-%7".into(),
+                    pane: Some("%7".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+
+        // A real hook arrives — same pane, real session id. The synthetic
+        // should be replaced (gone), leaving exactly one entry under the
+        // canonical session id.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "real-sess".into(),
+                    pane: Some("%7".into()),
+                    cwd: Some("/work".into()),
+                },
+                at: t1,
+            })
+            .await;
+
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1, "synthetic should have been removed");
+        assert_eq!(snap[0].session_id, "real-sess");
+        assert_eq!(snap[0].cwd.as_deref(), Some("/work"));
+        assert_eq!(snap[0].state, AgentState::Idle);
+        assert!(store.by_session("synthetic-%7").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_skipped_when_real_agent_present() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+
+        // Real agent already known via a prior hook.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "real-sess".into(),
+                    pane: Some("%9".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+
+        // `muxa sync` runs and tries to backfill the same pane.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "synthetic-%9".into(),
+                    pane: Some("%9".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "real-sess");
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub struct Config {
 
     pub notifier: NotifierConfig,
     pub watch: WatchConfig,
+    pub discovery: DiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +40,30 @@ impl Default for NotifierConfig {
 pub enum NotifierBackend {
     None,
     Libnotify,
+}
+
+/// `[discovery]` config — controls the tmux-pane backfill scan.
+///
+/// When enabled, `muxad` runs a single discovery pass shortly after binding
+/// its IPC socket and the `muxa sync` CLI uses the same routine on demand.
+/// Discovery synthesizes `Started` events for any pane whose
+/// `pane_current_command` matches a known agent CLI, populating the registry
+/// without waiting for a real hook to fire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -175,6 +200,14 @@ mod tests {
     fn parses_empty_toml() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(!cfg.notifier.enabled);
+        // Discovery defaults on so users get backfill out of the box.
+        assert!(cfg.discovery.enabled);
+    }
+
+    #[test]
+    fn discovery_can_be_disabled() {
+        let cfg: Config = toml::from_str("[discovery]\nenabled = false\n").unwrap();
+        assert!(!cfg.discovery.enabled);
     }
 
     #[test]
