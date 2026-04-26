@@ -184,10 +184,24 @@ async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<PaneInfo>, String> {
         .map_err(|_| format!("timed out after {TMUX_LIST_TIMEOUT:?}"))?
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Stale socket file with no server bound — common when a tmux
+        // session crashes without unlinking, or when a recording tool
+        // (vhs, asciinema) leaves a `muxa-demo` socket behind. tmux
+        // emits this exact phrase as a stable indicator; treat it as
+        // "no panes here" rather than a scan failure so the dashboard
+        // doesn't surface it as an error.
+        if is_no_server_running(&stderr) {
+            return Ok(Vec::new());
+        }
+        return Err(stderr);
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     Ok(parse_pane_lines(&stdout))
+}
+
+fn is_no_server_running(stderr: &str) -> bool {
+    stderr.starts_with("no server running on")
 }
 
 fn to_summary(p: PaneInfo, socket: PathBuf) -> PaneSummary {
@@ -356,6 +370,23 @@ mod tests {
         ];
         let found = enumerate_sockets_in(&dirs);
         assert_eq!(found, vec![sock]);
+    }
+
+    #[test]
+    fn no_server_running_phrase_is_recognised() {
+        // tmux's stable phrasing for a stale socket file. Trim leading
+        // whitespace mirrors what `String::from_utf8_lossy(...).trim()`
+        // produces in the scanner.
+        assert!(is_no_server_running(
+            "no server running on /tmp/tmux-1000/default"
+        ));
+        assert!(is_no_server_running("no server running on /weird/path"));
+        // Anything else stays an error.
+        assert!(!is_no_server_running(
+            "error connecting to /tmp/tmux-1000/default (Permission denied)"
+        ));
+        assert!(!is_no_server_running(""));
+        assert!(!is_no_server_running("server exiting"));
     }
 
     #[tokio::test]
