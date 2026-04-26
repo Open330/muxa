@@ -53,6 +53,7 @@ via that agent's own hook / event-emission system.
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Live TUI](#live-tui)
+- [Web dashboard](#web-dashboard)
 - [Desktop notifications](#desktop-notifications)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
@@ -308,6 +309,48 @@ attach-session` for you instead of `switch-client`.
 | `r`                   | Force an immediate refresh.                                            |
 | `q` / `Esc`           | Quit.                                                                  |
 | `Ctrl-C`              | Quit.                                                                  |
+
+## Web dashboard
+
+A read-only HTTP UI bolted onto `muxad`. Same agents you see on the tmux
+status line, plus **every tmux pane on the box** across all running tmux
+servers, updated live over Server-Sent Events. Off by default; loopback-
+only when on by default.
+
+```bash
+muxad --dashboard      # then open http://127.0.0.1:7878/
+```
+
+Three deployment shapes — pick the one that matches who needs to see it:
+
+| Shape                     | Command                                                                                                                  | URL                                       |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------- |
+| **Loopback, no token**    | `muxad --dashboard`                                                                                                      | `http://127.0.0.1:7878/`                  |
+| **Loopback, token**       | `muxad --dashboard --dashboard-token "$TOK"`                                                                             | `http://127.0.0.1:7878/?token=$TOK`       |
+| **LAN / public**          | `muxad --dashboard --dashboard-bind 0.0.0.0:7878 --dashboard-token "$TOK" --allow-public`                                | `http://<host>:7878/?token=$TOK`          |
+
+Non-loopback binds are rejected at startup unless you pass *both*
+`--allow-public` and a non-empty `--dashboard-token` — the daemon won't
+let you open an unauthenticated socket beyond this host. The `?token=`
+query param is captured by the page on first load, stashed in
+`sessionStorage`, and stripped from the URL bar; subsequent requests
+attach it as `Authorization: Bearer …`.
+
+Generate a token with `openssl rand -hex 32`. Front with nginx/Caddy if
+you need TLS — it's intentionally out of scope.
+
+JSON / SSE endpoints (under `/api/*`):
+
+| Method | Path            | What it returns                                                  |
+| ------ | --------------- | ---------------------------------------------------------------- |
+| GET    | `/api/health`   | `{ ok, version, protocol }`                                      |
+| GET    | `/api/agents`   | Current `Store` snapshot.                                        |
+| GET    | `/api/panes`    | Global tmux pane list (every readable socket), TTL-cached.       |
+| GET    | `/api/events`   | SSE: `snapshot` (initial), `transition` (live), `lagged` (drop). |
+
+Full operator guide — config reference, security model rationale, the
+"global tmux" mechanism, and the SSE wire contract — in
+[`docs/DASHBOARD.md`](docs/DASHBOARD.md).
 
 ## Desktop notifications
 

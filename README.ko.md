@@ -52,6 +52,7 @@ tmux를 포크하지 않습니다. tmux와는 tmux CLI를 통해, 각 에이전�
 - [빠른 시작](#빠른-시작)
 - [명령어](#명령어)
 - [실시간 TUI](#실시간-tui)
+- [웹 대시보드](#웹-대시보드)
 - [데스크톱 알림](#데스크톱-알림)
 - [설정](#설정)
 - [아키텍처](#아키텍처)
@@ -293,6 +294,46 @@ Enter 동작도 동일합니다. 다만 muxa가 `switch-client` 대신
 | `r`                   | 즉시 리프레시 강제.                                                    |
 | `q` / `Esc`           | 종료.                                                                  |
 | `Ctrl-C`              | 종료.                                                                  |
+
+## 웹 대시보드
+
+`muxad`에 얹은 read-only HTTP UI. tmux 상태바에 보이는 에이전트 + **이
+머신의 모든 tmux 페인** (모든 tmux 서버 통합) 을 한 탭에서, SSE로 실시간
+업데이트. 기본값은 OFF, 켜도 loopback 전용이 기본.
+
+```bash
+muxad --dashboard      # 이후 http://127.0.0.1:7878/ 접속
+```
+
+배포 형태 세 가지 — 누가 봐야 하느냐로 선택:
+
+| 형태                          | 명령                                                                                                                  | URL                                       |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| **루프백, 토큰 없음**         | `muxad --dashboard`                                                                                                   | `http://127.0.0.1:7878/`                  |
+| **루프백, 토큰 사용**         | `muxad --dashboard --dashboard-token "$TOK"`                                                                          | `http://127.0.0.1:7878/?token=$TOK`       |
+| **LAN / 외부 노출**           | `muxad --dashboard --dashboard-bind 0.0.0.0:7878 --dashboard-token "$TOK" --allow-public`                             | `http://<host>:7878/?token=$TOK`          |
+
+비-루프백 바인딩은 `--allow-public` **그리고** 비어있지 않은
+`--dashboard-token` **둘 다** 없으면 startup에서 거절됩니다 — 호스트
+바깥으로 인증 없는 소켓을 못 열게 막아둔 안전망입니다. `?token=` 쿼리
+파라미터는 페이지 첫 로드에서 캡처되어 `sessionStorage`에 저장되고 URL
+바에서는 제거됩니다. 이후 모든 요청에 `Authorization: Bearer …`로 자동
+부착됩니다.
+
+토큰 생성: `openssl rand -hex 32`. TLS가 필요하면 nginx/Caddy 같은 리버스
+프록시를 앞에 — 의도적으로 v1 범위 밖입니다.
+
+JSON / SSE 엔드포인트 (`/api/*`):
+
+| Method | Path            | 내용                                                                |
+| ------ | --------------- | ------------------------------------------------------------------- |
+| GET    | `/api/health`   | `{ ok, version, protocol }`                                         |
+| GET    | `/api/agents`   | 현재 `Store` 스냅샷                                                 |
+| GET    | `/api/panes`    | 모든 readable tmux 소켓의 페인 목록 (TTL 캐시)                     |
+| GET    | `/api/events`   | SSE: `snapshot` (초기), `transition` (라이브), `lagged` (드롭)      |
+
+전체 운영 가이드 — 설정 레퍼런스, 보안 모델 설명, "global tmux" 동작
+방식, SSE 와이어 포맷 — 은 [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
 
 ## 데스크톱 알림
 
