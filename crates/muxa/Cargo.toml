@@ -24,13 +24,17 @@ tower-http = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 rust-embed = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
 notify-rust = "4"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+wiremock = "0.6"
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

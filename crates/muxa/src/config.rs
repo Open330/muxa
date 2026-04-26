@@ -18,6 +18,41 @@ pub struct Config {
     pub watch: WatchConfig,
     pub dashboard: DashboardTomlConfig,
     pub discovery: DiscoveryConfig,
+    pub sinks: SinksConfig,
+}
+
+/// `[sinks]` config — opt-in fan-out to external systems.
+///
+/// Each sub-table corresponds to one sink implementation. All sinks are
+/// off by default; a missing table is equivalent to one with
+/// `enabled = false`. Resolution to runtime sink instances happens in the
+/// daemon, not here — this struct only holds raw TOML.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SinksConfig {
+    pub oh_my_prompt: OhMyPromptToml,
+}
+
+/// `[sinks.oh_my_prompt]` raw TOML schema. The daemon resolves these
+/// fields against env vars + defaults via `OhMyPromptSink::resolve` at
+/// startup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OhMyPromptToml {
+    pub enabled: Option<bool>,
+    /// Base URL of the omp ingestion endpoint, e.g. `https://prompt.example`.
+    /// `enabled = true` with no endpoint is a config error — there is no
+    /// default endpoint by design.
+    pub endpoint: Option<String>,
+    /// Name of the env var holding the X-User-Token UUID. Defaults to
+    /// `OMP_SERVER_TOKEN`. The token never lives in TOML.
+    pub token_env: Option<String>,
+    /// Optional device identifier echoed in the upload payload.
+    pub device_id: Option<String>,
+    /// Records per HTTP batch. Defaults to 50.
+    pub batch_size: Option<usize>,
+    /// Time-based flush interval (ms). Defaults to 5000.
+    pub flush_interval_ms: Option<u64>,
 }
 
 /// `[dashboard]` config — the user-facing TOML schema for the dashboard

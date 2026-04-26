@@ -34,6 +34,8 @@ tower-http = { version = "0.6", features = ["trace"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 rust-embed = "8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

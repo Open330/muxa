@@ -27,6 +27,11 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
+    # `webpki-roots >= 1.0` (transitive via reqwest -> hyper-rustls)
+    # ships under CDLA-Permissive-2.0 — a permissive, OSI-aligned data
+    # license with no copyleft. Compatible with our MIT/Apache-2.0
+    # distribution model. https://cdla.dev/permissive-2-0/
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

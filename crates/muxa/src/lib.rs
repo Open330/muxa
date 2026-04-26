@@ -13,6 +13,7 @@ pub mod event;
 pub mod ipc;
 pub mod notify;
 pub mod paths;
+pub mod sinks;
 pub mod state;
 pub mod tmux;
 
@@ -20,4 +21,4 @@ pub use config::Config;
 pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 pub use error::{CoreError, Result};
 pub use event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, PROTOCOL_VERSION};
-pub use state::{Agent, SharedStore, Store, Transition};
+pub use state::{Agent, PromptRecord, SharedStore, Store, Transition};
