@@ -13,8 +13,7 @@ name = "muxad"
 path = "src/main.rs"
 
 [dependencies]
-muxa-core = { workspace = true }
-muxa-runtime = { workspace = true }
+muxa = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

@@ -17,10 +17,10 @@
 //! `ps` on macOS) and the foreground command is good enough at the resolution
 //! we need.
 
+use crate::event::{AgentEvent, AgentId, AgentKind};
 use crate::ipc::{Client, RuntimeError};
+use crate::state::SYNTHETIC_SESSION_PREFIX;
 use crate::tmux::{self, PaneInfo, TmuxError};
-use muxa_core::event::{AgentEvent, AgentId, AgentKind};
-use muxa_core::state::SYNTHETIC_SESSION_PREFIX;
 use time::OffsetDateTime;
 
 /// One discovered agent pane.
@@ -143,7 +143,7 @@ pub async fn run_discovery(client: &Client) -> Result<DiscoveryReport, RuntimeEr
         let already_known = snapshot.iter().any(|a| {
             a.kind == d.kind
                 && a.pane.as_deref() == Some(d.pane.pane_id.as_str())
-                && a.state != muxa_core::AgentState::Stopped
+                && a.state != crate::AgentState::Stopped
         });
         if already_known {
             report.skipped_known += 1;

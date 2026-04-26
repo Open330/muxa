@@ -1,6 +1,6 @@
 //! Shared machinery for stdin-JSON hook adapters.
 
-use muxa_core::event::{AgentEvent, AgentKind};
+use crate::event::{AgentEvent, AgentKind};
 use serde::de::DeserializeOwned;
 use std::io::Read;
 

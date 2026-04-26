@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,9 +12,7 @@ authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-muxa-core = { path = "crates/muxa-core", version = "0.1.0" }
-muxa-runtime = { path = "crates/muxa-runtime", version = "0.1.0" }
-muxa-adapters = { path = "crates/muxa-adapters", version = "0.1.0" }
+muxa = { path = "crates/muxa", version = "0.1.0" }
 
 # external
 anyhow = "1"
@@ -22,13 +20,20 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 strum = { version = "0.27", features = ["derive"] }
+subtle = "2"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+rust-embed = "8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

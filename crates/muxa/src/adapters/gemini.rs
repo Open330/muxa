@@ -15,8 +15,8 @@
 //! }
 //! ```
 
-use crate::hook::{truncate, AdapterError, HookAdapter};
-use muxa_core::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
+use super::hook::{truncate, AdapterError, HookAdapter};
+use crate::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
 use serde::Deserialize;
 use time::OffsetDateTime;
 

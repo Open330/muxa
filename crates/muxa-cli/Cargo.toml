@@ -1,0 +1,42 @@
+[package]
+name = "muxa-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "muxa CLI"
+
+[[bin]]
+name = "muxa"
+path = "src/main.rs"
+
+[dependencies]
+muxa = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# `muxa status` table + colors.
+# NOTE: keep default features ON — they include `custom_styling`, which
+# makes comfy-table recognize ANSI escape sequences as zero-width. Disabling
+# them broke alignment on rows where cells contained owo-colors wrappers
+# (the escapes were counted as visible chars).
+comfy-table = "7"
+owo-colors = { version = "4", features = ["supports-colors"] }
+
+# TUI — `muxa watch`.
+ratatui = "0.30"
+crossterm = "0.29"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

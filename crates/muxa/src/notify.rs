@@ -19,8 +19,8 @@
 //! `NSUserNotification`, and on Windows uses `WinRT` toasts. No platform
 //! gating is needed at this layer.
 
-use muxa_core::state::Transition;
-use muxa_core::AgentState;
+use crate::state::Transition;
+use crate::AgentState;
 use tokio::sync::broadcast;
 
 /// Max body length we hand to the notification backend. Longer prompts are
@@ -136,8 +136,8 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muxa_core::state::Agent;
-    use muxa_core::AgentKind;
+    use crate::state::Agent;
+    use crate::AgentKind;
     use time::macros::datetime;
 
     fn agent(state: AgentState) -> Agent {

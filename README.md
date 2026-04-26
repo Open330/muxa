@@ -10,7 +10,7 @@ See which agents are working, waiting, or idle — right from your status line, 
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
-![tests](https://img.shields.io/badge/tests-49%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-92%20green-brightgreen)
 
 **English** · [한국어](README.ko.md)
 
@@ -41,7 +41,7 @@ via that agent's own hook / event-emission system.
 
 > [!IMPORTANT]
 > Pre-alpha. Event ingest, adapters, daemon, CLI, live TUI, and desktop
-> notifications all work end-to-end with 49 tests green. APIs may still shift.
+> notifications all work end-to-end with 92 tests green. APIs may still shift.
 > opencode support is deferred.
 
 ## Contents
@@ -66,9 +66,10 @@ via that agent's own hook / event-emission system.
 | **Pan-agent**            | One daemon. One CLI. Four adapters (Claude · Codex · Gemini · opencode [†]).     |
 | **tmux-native**          | Pane correlation via `$TMUX_PANE`; output labelled `session:window.pane`.        |
 | **Zero coupling**        | No changes to tmux or to agent CLIs — just their existing hook systems.          |
-| **Live dashboard**       | `muxa watch` — agents on top, every other tmux pane below, 2 Hz, configurable columns. |
+| **Live TUI**             | `muxa watch` — agents on top, every other tmux pane below, 2 Hz, configurable columns. |
+| **Web dashboard**        | Opt-in HTTP UI + SSE — every agent and **every tmux pane on the box**, in one tab. See [`docs/DASHBOARD.md`](docs/DASHBOARD.md). |
 | **Desktop alerts**       | Opt-in libnotify / native-toast pings on `WaitingInput` / `Error` transitions.   |
-| **Safe by default**      | Socket is `0600`; `SIGTERM` drains and unlinks; `unsafe_code = forbid`.          |
+| **Safe by default**      | Socket is `0600`; dashboard is loopback-only until you flip two flags; `SIGTERM` drains; `unsafe_code = forbid`. |
 | **Versioned protocol**   | Explicit `PROTOCOL_VERSION`; mismatched clients are rejected.                    |
 | **Fast**                 | In-memory registry; no database, no external services.                           |
 
