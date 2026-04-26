@@ -173,7 +173,9 @@ where
 }
 
 async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<PaneInfo>, String> {
-    let sock_str = sock.to_str().ok_or_else(|| "non-utf8 socket path".to_string())?;
+    let sock_str = sock
+        .to_str()
+        .ok_or_else(|| "non-utf8 socket path".to_string())?;
     let fut = Command::new("tmux")
         .args(["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT])
         .output();
@@ -413,7 +415,11 @@ mod tests {
             })
             .await;
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "second hit should not refresh");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "second hit should not refresh"
+        );
         assert_eq!(r1.fetched_at, r2.fetched_at);
     }
 
@@ -445,7 +451,10 @@ mod tests {
 
     #[test]
     fn shell_quote_passes_through_simple_paths() {
-        assert_eq!(shell_quote(Path::new("/tmp/tmux-1000/default")), "/tmp/tmux-1000/default");
+        assert_eq!(
+            shell_quote(Path::new("/tmp/tmux-1000/default")),
+            "/tmp/tmux-1000/default"
+        );
     }
 
     #[test]

@@ -196,13 +196,13 @@ fn resolve_dashboard_config(cfg: &Config, args: &Args) -> Result<DashboardConfig
     } else if args.no_dashboard {
         Some(false)
     } else {
-        std::env::var("MUXA_DASHBOARD_ENABLED")
-            .ok()
-            .and_then(|s| match s.to_ascii_lowercase().as_str() {
+        std::env::var("MUXA_DASHBOARD_ENABLED").ok().and_then(|s| {
+            match s.to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "on" => Some(true),
                 "0" | "false" | "no" | "off" => Some(false),
                 _ => None,
-            })
+            }
+        })
     };
 
     let allow_public = if args.allow_public {

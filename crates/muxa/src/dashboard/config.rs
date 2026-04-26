@@ -22,7 +22,7 @@ use std::time::Duration;
 /// and a "muxa → 7878" mnemonic.
 pub const DEFAULT_PORT: u16 = 7878;
 /// The default pane scanner cache TTL.
-pub const DEFAULT_PANE_CACHE_TTL: Duration = Duration::from_millis(2000);
+pub const DEFAULT_PANE_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Fully-resolved dashboard configuration. Constructed via
 /// [`DashboardConfig::resolve`]; the HTTP server takes this by reference.
@@ -185,7 +185,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, DashboardConfigError::NonLoopbackRequiresAllowPublic { .. }),
+            matches!(
+                err,
+                DashboardConfigError::NonLoopbackRequiresAllowPublic { .. }
+            ),
             "got {err:?}"
         );
     }

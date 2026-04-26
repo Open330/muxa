@@ -57,7 +57,11 @@ pub struct AppState {
 
 impl AppState {
     #[must_use]
-    pub fn new(store: SharedStore, config: Arc<DashboardConfig>, pane_cache: Arc<PaneCache>) -> Self {
+    pub fn new(
+        store: SharedStore,
+        config: Arc<DashboardConfig>,
+        pane_cache: Arc<PaneCache>,
+    ) -> Self {
         Self {
             store,
             config,
@@ -207,9 +211,9 @@ async fn events_handler(
             .event("transition")
             .json_data(&t)
             .unwrap_or_else(|_| SseEvent::default().event("transition").data("{}")),
-        Err(BroadcastStreamRecvError::Lagged(n)) => SseEvent::default()
-            .event("lagged")
-            .data(n.to_string()),
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            SseEvent::default().event("lagged").data(n.to_string())
+        }
     });
 
     let combined = stream::once(async move { snapshot_event })
@@ -257,7 +261,12 @@ mod tests {
     async fn health_endpoint_returns_ok_json() {
         let app = router(fresh_state());
         let resp = app
-            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -291,7 +300,12 @@ mod tests {
 
         let app = router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/api/agents").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -310,7 +324,12 @@ mod tests {
         // with `panes`, `errors`, and `fetched_at` keys regardless.
         let app = router(fresh_state());
         let resp = app
-            .oneshot(Request::builder().uri("/api/panes").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/panes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -340,7 +359,12 @@ mod tests {
     async fn auth_middleware_rejects_missing_header_when_token_set() {
         let app = router(state_with_token("s3cret"));
         let resp = app
-            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -367,7 +391,12 @@ mod tests {
         // Default state has no token — every request should pass.
         let app = router(fresh_state());
         let resp = app
-            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -418,7 +447,12 @@ mod tests {
 
         let app = router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/api/events").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -450,7 +484,12 @@ mod tests {
 
         let app = router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/api/events").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

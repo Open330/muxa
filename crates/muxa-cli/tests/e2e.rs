@@ -289,10 +289,7 @@ fn dashboard_token_gates_api() {
     assert_eq!(curl_status(&url, None), 401);
 
     // With wrong token → 401.
-    assert_eq!(
-        curl_status(&url, Some("Authorization: Bearer wrong")),
-        401
-    );
+    assert_eq!(curl_status(&url, Some("Authorization: Bearer wrong")), 401);
 
     // With correct token → 200.
     assert_eq!(
