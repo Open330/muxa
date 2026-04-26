@@ -13,7 +13,7 @@
 //! by the daemon's desktop-notifier task to wake users when an agent moves
 //! into `WaitingInput` or `Error`.
 
-use crate::event::{AgentEvent, AgentKind, AgentState, NotificationLevel};
+use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,6 +43,13 @@ fn is_synthetic(session_id: &str) -> bool {
 /// see lag on a healthy network. 256 is ~4× the in-process notifier's
 /// previous capacity; bump again if profiling shows lag on real traffic.
 const TRANSITION_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the in-process prompt broadcast. Sized identically to the
+/// transition channel — sinks subscribe here to receive every
+/// `PromptSubmitted` event without having to reverse-engineer prompts
+/// from `Transition` payloads. Slow subscribers see `RecvError::Lagged`
+/// and should log + continue (same pattern as the notifier).
+const PROMPT_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -100,18 +107,36 @@ pub struct Transition {
     pub agent: Agent,
 }
 
+/// In-process record emitted whenever a `PromptSubmitted` event lands.
+///
+/// Sibling to [`Transition`] — sinks subscribe via
+/// [`Store::subscribe_prompts`] and forward these records to external
+/// systems (e.g. `oh-my-prompt`'s ingestion API). The `model` field is a
+/// best-effort snapshot from the post-apply agent row at the time of the
+/// prompt — `None` when no Heartbeat has populated it yet.
+#[derive(Debug, Clone)]
+pub struct PromptRecord {
+    pub id: AgentId,
+    pub prompt: String,
+    pub at: OffsetDateTime,
+    pub model: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct Store {
     agents: RwLock<HashMap<String, Agent>>,
     transitions: broadcast::Sender<Transition>,
+    prompts: broadcast::Sender<PromptRecord>,
 }
 
 impl Default for Store {
     fn default() -> Self {
         let (tx, _) = broadcast::channel(TRANSITION_CHANNEL_CAPACITY);
+        let (prompts_tx, _) = broadcast::channel(PROMPT_CHANNEL_CAPACITY);
         Self {
             agents: RwLock::default(),
             transitions: tx,
+            prompts: prompts_tx,
         }
     }
 }
@@ -174,6 +199,17 @@ impl Store {
         self.transitions.subscribe()
     }
 
+    /// Subscribe to in-process prompt events.
+    ///
+    /// One [`PromptRecord`] is broadcast per `PromptSubmitted` event the
+    /// store applies. Independent of the state-transition channel so
+    /// downstream sinks see every prompt — even prompts that don't change
+    /// the agent's state field. Same `Lagged` semantics as
+    /// [`Self::subscribe`].
+    pub fn subscribe_prompts(&self) -> broadcast::Receiver<PromptRecord> {
+        self.prompts.subscribe()
+    }
+
     pub async fn apply(&self, ev: &AgentEvent) {
         let mut agents = self.agents.write().await;
         let id = ev.id();
@@ -207,6 +243,7 @@ impl Store {
         agent.last_activity_at = at;
 
         let prev_state = agent.state;
+        let mut prompt_record: Option<PromptRecord> = None;
 
         match ev {
             AgentEvent::Started { .. } => {
@@ -215,6 +252,12 @@ impl Store {
             AgentEvent::PromptSubmitted { prompt, .. } => {
                 agent.last_prompt = Some(prompt.clone());
                 agent.state = AgentState::Working;
+                prompt_record = Some(PromptRecord {
+                    id: id.clone(),
+                    prompt: prompt.clone(),
+                    at,
+                    model: agent.model.clone(),
+                });
             }
             AgentEvent::ToolStarted { .. } => {
                 agent.state = AgentState::Working;
@@ -263,6 +306,13 @@ impl Store {
             // `send` errors only when there are zero subscribers — that's
             // the common case (notifier disabled) and not worth logging.
             let _ = self.transitions.send(transition);
+        }
+
+        if let Some(record) = prompt_record {
+            // Same "errors only when no subscribers" semantics as the
+            // transitions channel — sinks are opt-in, so a no-subscriber
+            // state is the steady-state default.
+            let _ = self.prompts.send(record);
         }
     }
 

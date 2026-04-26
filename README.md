@@ -70,6 +70,7 @@ via that agent's own hook / event-emission system.
 | **Live TUI**             | `muxa watch` — agents on top, every other tmux pane below, 2 Hz, configurable columns. |
 | **Web dashboard**        | Opt-in HTTP UI + SSE — every agent and **every tmux pane on the box**, in one tab. See [`docs/DASHBOARD.md`](docs/DASHBOARD.md). |
 | **Desktop alerts**       | Opt-in libnotify / native-toast pings on `WaitingInput` / `Error` transitions.   |
+| **External sinks**       | Opt-in fan-out — today: forward prompts to [oh-my-prompt](https://github.com/jiunbae/oh-my-prompt). See [`docs/SINKS.md`](docs/SINKS.md). |
 | **Safe by default**      | Socket is `0600`; dashboard is loopback-only until you flip two flags; `SIGTERM` drains; `unsafe_code = forbid`. |
 | **Versioned protocol**   | Explicit `PROTOCOL_VERSION`; mismatched clients are rejected.                    |
 | **Fast**                 | In-memory registry; no database, no external services.                           |

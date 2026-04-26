@@ -11,6 +11,7 @@ use muxa::config::NotifierBackend;
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
+use muxa::sinks::OhMyPromptSink;
 use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
 use std::io::IsTerminal;
@@ -154,6 +155,8 @@ async fn main() -> Result<()> {
         tracing::info!(addr = %dash_cfg.bind, "dashboard task spawned");
     }
 
+    spawn_oh_my_prompt_sink(&cfg, &store, &shutdown_tx)?;
+
     let server = Server::new(socket.clone(), store);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -226,6 +229,33 @@ fn resolve_dashboard_config(cfg: &Config, args: &Args) -> Result<DashboardConfig
 
     DashboardConfig::resolve(&cfg.dashboard, &overrides)
         .map_err(|e| anyhow::anyhow!(e).context("resolving dashboard config"))
+}
+
+/// Resolve the oh-my-prompt sink config and, if enabled, spawn its
+/// task. Mirrors the dashboard wire-up: the daemon's existing shutdown
+/// broadcast is reused for joint shutdown.
+fn spawn_oh_my_prompt_sink(
+    cfg: &Config,
+    store: &muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Result<()> {
+    match OhMyPromptSink::resolve(&cfg.sinks.oh_my_prompt) {
+        Ok(Some(sink)) => {
+            let prompt_rx = store.subscribe_prompts();
+            let shutdown_rx = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                if let Err(e) = sink.run(prompt_rx, shutdown_rx).await {
+                    tracing::error!(error = %e, "oh-my-prompt sink exited");
+                }
+            });
+            tracing::info!("oh-my-prompt sink enabled");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("resolving oh-my-prompt sink"));
+        }
+    }
+    Ok(())
 }
 
 /// Decide whether to fire the one-shot discovery pass and, if so, spawn it

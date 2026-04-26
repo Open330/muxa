@@ -66,3 +66,28 @@
 # token         = "<paste 32+ random hex bytes here>"
 # allow_public  = false
 # pane_cache_ttl_ms = 2000
+
+# External sinks. Default off — none of these forward data anywhere
+# unless you explicitly opt in.
+#
+# [sinks.oh_my_prompt] forwards every PromptSubmitted event to an
+# oh-my-prompt (omp) instance via its HTTP ingestion endpoint
+# (POST /api/sync/upload). The X-User-Token UUID lives in an env var
+# (default OMP_SERVER_TOKEN) — never in this file. The endpoint must be
+# explicitly set; there is no default to keep "send your data to a
+# stranger's server" out of the footgun zone.
+#
+# What gets sent: prompt text, char/word/token counts, agent kind,
+# session id, working directory + project basename (when known),
+# model (when known), and a deterministic event_id derived from
+# session id + timestamp so retries dedup cleanly.
+#
+# See docs/SINKS.md for setup, troubleshooting, and an exhaustive
+# field-by-field mapping.
+[sinks.oh_my_prompt]
+# enabled            = true
+# endpoint           = "https://prompt.example.dev"
+# token_env          = "OMP_SERVER_TOKEN"
+# device_id          = "laptop-01"
+# batch_size         = 50
+# flush_interval_ms  = 5000
