@@ -114,12 +114,7 @@ impl WatchColumn {
         }
     }
 
-    fn agent_cell<'a>(
-        self,
-        a: &'a Agent,
-        now: OffsetDateTime,
-        panes: &'a [PaneInfo],
-    ) -> Cell<'a> {
+    fn agent_cell<'a>(self, a: &'a Agent, now: OffsetDateTime, panes: &'a [PaneInfo]) -> Cell<'a> {
         match self {
             Self::Pane => Cell::from(pane_display(a.pane.as_deref(), panes)),
             Self::Kind => Cell::from(a.kind.to_string()),
