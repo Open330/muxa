@@ -33,3 +33,29 @@
 # state    = 14
 # prompt   = "min:30"
 # activity = 10
+
+# HTTP dashboard. Off by default. When enabled, muxad serves a small
+# read-only web UI + JSON/SSE API alongside its unix-socket IPC.
+#
+# Security model:
+#   - Bound to 127.0.0.1 by default; non-loopback `bind` is rejected
+#     unless `allow_public = true` AND `token` is non-empty. There is no
+#     opt-out for that pair.
+#   - Static HTML/CSS/JS load without auth so a browser can bootstrap
+#     a token via `?token=...` (which is then stored in sessionStorage
+#     and stripped from the URL bar). All `/api/*` routes are gated.
+#   - TLS is intentionally out of scope — front with nginx/Caddy if you
+#     expose this beyond your machine.
+#
+# Generate a token with `openssl rand -hex 32` (or any 32+ random bytes).
+# CLI flags / env vars override these values per-field:
+#   --dashboard / --no-dashboard
+#   --dashboard-bind   / MUXA_DASHBOARD_BIND
+#   --dashboard-token  / MUXA_DASHBOARD_TOKEN
+#   --allow-public     / MUXA_DASHBOARD_ALLOW_PUBLIC
+[dashboard]
+# enabled       = true
+# bind          = "127.0.0.1:7878"
+# token         = "<paste 32+ random hex bytes here>"
+# allow_public  = false
+# pane_cache_ttl_ms = 2000

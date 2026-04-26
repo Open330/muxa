@@ -66,9 +66,10 @@ via that agent's own hook / event-emission system.
 | **Pan-agent**            | One daemon. One CLI. Four adapters (Claude · Codex · Gemini · opencode [†]).     |
 | **tmux-native**          | Pane correlation via `$TMUX_PANE`; output labelled `session:window.pane`.        |
 | **Zero coupling**        | No changes to tmux or to agent CLIs — just their existing hook systems.          |
-| **Live dashboard**       | `muxa watch` — agents on top, every other tmux pane below, refreshed at 2 Hz.    |
+| **Live TUI**             | `muxa watch` — agents on top, every other tmux pane below, refreshed at 2 Hz.    |
+| **Web dashboard**        | Opt-in HTTP UI + SSE — every agent and **every tmux pane on the box**, in one tab. See [`docs/DASHBOARD.md`](docs/DASHBOARD.md). |
 | **Desktop alerts**       | Opt-in libnotify / native-toast pings on `WaitingInput` / `Error` transitions.   |
-| **Safe by default**      | Socket is `0600`; `SIGTERM` drains and unlinks; `unsafe_code = forbid`.          |
+| **Safe by default**      | Socket is `0600`; dashboard is loopback-only until you flip two flags; `SIGTERM` drains; `unsafe_code = forbid`. |
 | **Versioned protocol**   | Explicit `PROTOCOL_VERSION`; mismatched clients are rejected.                    |
 | **Fast**                 | In-memory registry; no database, no external services.                           |
 
