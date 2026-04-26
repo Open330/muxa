@@ -22,7 +22,7 @@ use crossterm::terminal::{
 use muxa_core::config::{WatchConfig, WidthSpec};
 use muxa_core::state::Agent;
 use muxa_core::AgentState;
-use muxa_runtime::ipc::Client;
+use muxa_runtime::ipc::{Client, RuntimeError};
 use muxa_runtime::tmux::{self, PaneInfo};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -232,6 +232,15 @@ impl WatchRow {
     }
 }
 
+/// A daemon error to surface in the header. We track whether the inner
+/// error is the "daemon not reachable" variant so the renderer can drop the
+/// `daemon error: ` prefix — otherwise the message reads
+/// "daemon error: daemon not reachable at …" which is awkward.
+pub(crate) struct DaemonError {
+    pub message: String,
+    pub self_describing: bool,
+}
+
 /// State held by the TUI.
 ///
 /// Kept separate from rendering so the smoke test can construct it
@@ -239,7 +248,7 @@ impl WatchRow {
 pub(crate) struct App {
     pub rows: Vec<WatchRow>,
     pub table_state: TableState,
-    pub last_error: Option<String>,
+    pub last_error: Option<DaemonError>,
     pub last_refresh: OffsetDateTime,
     /// Watch config — held by value so the rendering path doesn't need to
     /// re-resolve columns every frame, and the smoke tests can swap it in.
@@ -469,7 +478,10 @@ async fn refresh(client: &Client, app: &mut App) {
             app.set_data(agents, panes);
         }
         Err(e) => {
-            app.last_error = Some(e.to_string());
+            app.last_error = Some(DaemonError {
+                self_describing: matches!(e, RuntimeError::NotConnected(_)),
+                message: e.to_string(),
+            });
             app.set_data(Vec::new(), panes);
         }
     }
@@ -580,10 +592,16 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .last_error
         .as_ref()
         .map(|e| {
-            Line::from(Span::styled(
-                format!("daemon error: {e}"),
-                Style::default().fg(Color::Red),
-            ))
+            // The NotConnected variant already reads as a complete sentence
+            // ("daemon not reachable at … — is `muxad` running? …"), so a
+            // `daemon error: ` prefix would just stutter. Other IO errors
+            // benefit from the prefix to mark them as daemon-related.
+            let text = if e.self_describing {
+                e.message.clone()
+            } else {
+                format!("daemon error: {}", e.message)
+            };
+            Line::from(Span::styled(text, Style::default().fg(Color::Red)))
         })
         .unwrap_or_default();
 
