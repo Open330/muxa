@@ -64,7 +64,7 @@ via that agent's own hook / event-emission system.
 | **Pan-agent**            | One daemon. One CLI. Four adapters (Claude · Codex · Gemini · opencode [†]).     |
 | **tmux-native**          | Pane correlation via `$TMUX_PANE`; output labelled `session:window.pane`.        |
 | **Zero coupling**        | No changes to tmux or to agent CLIs — just their existing hook systems.          |
-| **Live dashboard**       | `muxa watch` — full-screen ratatui TUI that refreshes at 2 Hz.                   |
+| **Live dashboard**       | `muxa watch` — agents on top, every other tmux pane below, refreshed at 2 Hz.    |
 | **Desktop alerts**       | Opt-in libnotify / native-toast pings on `WaitingInput` / `Error` transitions.   |
 | **Safe by default**      | Socket is `0600`; `SIGTERM` drains and unlinks; `unsafe_code = forbid`.          |
 | **Versioned protocol**   | Explicit `PROTOCOL_VERSION`; mismatched clients are rejected.                    |
@@ -271,18 +271,31 @@ muxa watch          # live TUI
 
 ## Live TUI
 
-`muxa watch` opens a full-screen dashboard of every tracked agent, refreshed
-at 2 Hz. Rendered with [ratatui](https://ratatui.rs); the terminal is
-restored cleanly even on panic.
+`muxa watch` is the headline UI: a full-screen dashboard refreshed at 2 Hz,
+rendered with [ratatui](https://ratatui.rs). The terminal is restored
+cleanly even on panic.
+
+It lists **two row kinds** in one table — the cumulative effect is a
+drop-in replacement for tmux's `prefix + s`:
+
+- **Tracked agents** at the top (full color), with kind, state, model,
+  prompt, context %, cost, last activity.
+- **Untracked tmux panes** below (dim), labelled `session:window.pane`
+  with the pane title or current command. These come straight from
+  `tmux list-panes -a`, so a freshly-spawned pane shows up on the next
+  poll without any muxad knowledge.
+
+Both kinds are selectable. `Enter` on either attaches you to that pane.
 
 The best way to use it is via a tmux popup (see the
-[tmux wiring](#3-wire-tmux) above). Press `prefix + s` from any pane → popup
-with the live dashboard → `Enter` on the target row → popup closes and your
-client switches to that pane. Press `prefix + s` again to bounce back.
+[tmux wiring](#3-wire-tmux) above). Press `prefix + s` from any pane →
+popup with the live dashboard → `Enter` on the target row → popup closes
+and your client switches to that pane. Press `prefix + s` again to bounce
+back.
 
-Run `muxa watch` directly from a bare shell to attach into an existing tmux
-session — same Enter semantics, except muxa execs `tmux attach-session` for
-you instead of `switch-client`.
+Run `muxa watch` directly from a bare shell to attach into an existing
+tmux session — same Enter semantics, except muxa execs `tmux
+attach-session` for you instead of `switch-client`.
 
 **Keybindings**
 
