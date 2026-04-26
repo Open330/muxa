@@ -38,14 +38,21 @@ Type "clear"
 Enter
 Show
 
-Type "# muxa watch — agents + every other tmux pane in one view"
+Type "# table view — every tracked agent, one row each"
 Sleep 800ms
 Enter
 Type "muxa status"
 Enter
 Sleep 2500ms
 
-Type "# fullscreen dashboard, agent-aware, attaches on ⏎"
+Type "# one-liner — drop this in tmux status-right per pane"
+Sleep 800ms
+Enter
+Type "muxa status-line"
+Enter
+Sleep 2000ms
+
+Type "# fullscreen dashboard — agents on top, every other tmux pane below"
 Sleep 800ms
 Enter
 Type "muxa watch"
