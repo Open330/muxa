@@ -312,7 +312,7 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
         .iter()
         .map(|a| {
             let icon = state_icon(a.state);
-            let kind = kind_label(a);
+            let kind = a.kind.to_string();
             // Prefer session:window when we can resolve it — makes the
             // status-line read "⚙ main:2 claude_code" instead of a
             // context-free glyph.
@@ -341,14 +341,8 @@ async fn cmd_recap(client: &Client, pane: Option<String>) -> Result<()> {
         return Ok(());
     }
     for a in agents {
-        let kind = serde_json::to_string(&a.kind)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let state = serde_json::to_string(&a.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
+        let kind = a.kind.to_string();
+        let state = a.state.to_string();
         let prompt = a.last_prompt.unwrap_or_else(|| "(none)".into());
         println!("── {kind}  [{state}] ────────────");
         println!("{prompt}");
@@ -389,24 +383,6 @@ fn state_icon(state: AgentState) -> &'static str {
         AgentState::Error => "✗",
         AgentState::Stopped => "∅",
         AgentState::Starting => "…",
-    }
-}
-
-fn kind_label(a: &Agent) -> String {
-    serde_json::to_string(&a.kind)
-        .unwrap_or_default()
-        .trim_matches('"')
-        .to_string()
-}
-
-fn state_label(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Working => "working",
-        AgentState::Idle => "idle",
-        AgentState::WaitingInput => "waiting_input",
-        AgentState::Error => "error",
-        AgentState::Stopped => "stopped",
-        AgentState::Starting => "starting",
     }
 }
 
@@ -469,8 +445,8 @@ fn print_table(agents: &[Agent], now: OffsetDateTime, colored: bool) {
 
     for a in agents {
         let pane = pane_display(a);
-        let kind = kind_label(a);
-        let state_txt = state_label(a.state);
+        let kind = a.kind.to_string();
+        let state_txt = a.state.to_string();
         let state_cell = if colored {
             Cell::new(state_txt.style(state_style(a.state)).to_string())
         } else {

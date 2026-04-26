@@ -20,7 +20,7 @@
 //! gating is needed at this layer.
 
 use muxa_core::state::Transition;
-use muxa_core::{AgentKind, AgentState};
+use muxa_core::AgentState;
 use tokio::sync::broadcast;
 
 /// Max body length we hand to the notification backend. Longer prompts are
@@ -92,9 +92,7 @@ fn should_notify(t: &Transition) -> bool {
 
 /// Build (title, body) strings for a given transition.
 fn render(_app: &str, t: &Transition) -> (String, String) {
-    let kind = kind_label(t.agent.kind);
-    let state = state_label(t.to);
-    let title = format!("muxa · {kind} · {state}");
+    let title = format!("muxa · {} · {}", t.agent.kind, t.to);
 
     let pane = t.agent.pane.as_deref().unwrap_or("-");
     // Prefer the notification message (it's the one the agent explicitly
@@ -125,27 +123,6 @@ fn post(app_name: &str, title: &str, body: &str) -> Result<(), notify_rust::erro
     Ok(())
 }
 
-fn kind_label(k: AgentKind) -> &'static str {
-    match k {
-        AgentKind::ClaudeCode => "claude_code",
-        AgentKind::Codex => "codex",
-        AgentKind::GeminiCli => "gemini_cli",
-        AgentKind::Opencode => "opencode",
-        AgentKind::Unknown => "unknown",
-    }
-}
-
-fn state_label(s: AgentState) -> &'static str {
-    match s {
-        AgentState::Starting => "starting",
-        AgentState::Working => "working",
-        AgentState::Idle => "idle",
-        AgentState::WaitingInput => "waiting_input",
-        AgentState::Error => "error",
-        AgentState::Stopped => "stopped",
-    }
-}
-
 /// Char-boundary-safe truncation with an ellipsis.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -160,6 +137,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use muxa_core::state::Agent;
+    use muxa_core::AgentKind;
     use time::macros::datetime;
 
     fn agent(state: AgentState) -> Agent {

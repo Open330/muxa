@@ -11,6 +11,6 @@
 # enabled = true
 # backend = "libnotify"   # libnotify | none   (more backends TBD)
 
-[log]
-# RUST_LOG-style filter. Default: "muxa=info"
-# level = "muxa=debug,tokio=warn"
+# Logging is controlled via the standard RUST_LOG env var, e.g.:
+#   RUST_LOG=muxa=debug,tokio=warn muxad
+# Default when unset: "muxa=info".

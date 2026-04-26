@@ -155,8 +155,9 @@ Same fields as stored in the registry:
   for a given `session_id`. Out-of-order events produce incorrect state.
 - **Late-arriving identity.** `pane` and `cwd` may be `null` on the first
   event; the daemon fills them in from subsequent events.
-- **GC.** Agents in state `stopped` for more than
-  `gc.stopped_agent_ttl_minutes` (default 60) are evicted.
+- **GC.** Agents in state `stopped` for more than 60 minutes are evicted
+  by the daemon's GC sweeper (interval: 60s). The thresholds are
+  hardcoded — they live as `const` in `muxad`, not in config.
 
 ---
 

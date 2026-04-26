@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
+strum = { version = "0.27", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

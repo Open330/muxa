@@ -474,8 +474,8 @@ fn agent_row(a: &Agent, now: OffsetDateTime) -> Row<'_> {
     };
 
     let pane = pane_display(a.pane.as_deref());
-    let kind = kind_label(a.kind);
-    let state = state_label(a.state);
+    let kind = a.kind.to_string();
+    let state = a.state.to_string();
     let model = a.model.as_deref().unwrap_or("-").to_string();
     let ctx = a
         .context_used_pct
@@ -532,29 +532,6 @@ fn bare_pane_row(p: &PaneInfo) -> Row<'_> {
         Cell::from(summary).style(dim),
         Cell::from("-").style(dim),
     ])
-}
-
-fn kind_label(kind: muxa_core::AgentKind) -> String {
-    match kind {
-        muxa_core::AgentKind::ClaudeCode => "claude_code",
-        muxa_core::AgentKind::Codex => "codex",
-        muxa_core::AgentKind::GeminiCli => "gemini_cli",
-        muxa_core::AgentKind::Opencode => "opencode",
-        muxa_core::AgentKind::Unknown => "unknown",
-    }
-    .to_string()
-}
-
-fn state_label(state: AgentState) -> String {
-    match state {
-        AgentState::Starting => "starting",
-        AgentState::Working => "working",
-        AgentState::Idle => "idle",
-        AgentState::WaitingInput => "waiting_input",
-        AgentState::Error => "error",
-        AgentState::Stopped => "stopped",
-    }
-    .to_string()
 }
 
 fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {

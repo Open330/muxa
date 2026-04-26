@@ -13,6 +13,11 @@ use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
+/// Inactivity window before a stopped agent is evicted from the in-memory store.
+const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
+/// Cadence at which the GC task scans for evictable agents.
+const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
+
 #[derive(Debug, Parser)]
 #[command(name = "muxad", version, about = "muxa daemon")]
 struct Args {
@@ -35,7 +40,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| cfg.log.level.as_str().into()),
+                .unwrap_or_else(|_| "muxa=info".into()),
         )
         .init();
 
@@ -50,8 +55,8 @@ async fn main() -> Result<()> {
     // GC task: evict long-stopped agents.
     {
         let store = store.clone();
-        let ttl = time::Duration::minutes(i64::from(cfg.gc.stopped_agent_ttl_minutes));
-        let tick = std::time::Duration::from_secs(u64::from(cfg.gc.sweep_interval_seconds));
+        let ttl = time::Duration::minutes(STOPPED_AGENT_TTL_MINUTES);
+        let tick = std::time::Duration::from_secs(GC_SWEEP_INTERVAL_SECONDS);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tick);
             loop {

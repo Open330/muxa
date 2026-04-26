@@ -1,7 +1,7 @@
 //! Configuration model.
 //!
 //! Loaded from TOML. CLI/env-var overrides happen at the binary layer — this
-//! module only parses and validates.
+//! module only parses.
 
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,6 @@ pub struct Config {
     pub socket: Option<PathBuf>,
 
     pub notifier: NotifierConfig,
-    pub log: LogConfig,
-    pub gc: GcConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,39 +39,6 @@ pub enum NotifierBackend {
     Libnotify,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct LogConfig {
-    /// `RUST_LOG`-style filter. Default: `muxa=info`.
-    pub level: String,
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            level: "muxa=info".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct GcConfig {
-    /// Minutes of inactivity before a stopped agent is evicted.
-    pub stopped_agent_ttl_minutes: u32,
-    /// Seconds between GC sweeps.
-    pub sweep_interval_seconds: u32,
-}
-
-impl Default for GcConfig {
-    fn default() -> Self {
-        Self {
-            stopped_agent_ttl_minutes: 60,
-            sweep_interval_seconds: 60,
-        }
-    }
-}
-
 impl Config {
     /// Load a config from the given file. Missing file is an error — use
     /// `load_or_default` if you want silent fallback.
@@ -83,7 +48,6 @@ impl Config {
             path: path.to_path_buf(),
             source: e,
         })?;
-        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -96,15 +60,6 @@ impl Config {
         }
         Ok(Self::default())
     }
-
-    fn validate(&self) -> Result<()> {
-        if self.gc.sweep_interval_seconds == 0 {
-            return Err(CoreError::InvalidConfig(
-                "gc.sweep_interval_seconds must be > 0".into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -114,19 +69,12 @@ mod tests {
     #[test]
     fn parses_empty_toml() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.log.level, "muxa=info");
+        assert!(!cfg.notifier.enabled);
     }
 
     #[test]
     fn rejects_unknown_fields() {
         let err = toml::from_str::<Config>("unknown_field = 1").unwrap_err();
         assert!(err.to_string().contains("unknown"));
-    }
-
-    #[test]
-    fn validate_catches_zero_sweep_interval() {
-        let mut cfg = Config::default();
-        cfg.gc.sweep_interval_seconds = 0;
-        assert!(cfg.validate().is_err());
     }
 }

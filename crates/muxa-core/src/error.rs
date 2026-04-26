@@ -16,9 +16,6 @@ pub enum CoreError {
         source: toml::de::Error,
     },
 
-    #[error("invalid config: {0}")]
-    InvalidConfig(String),
-
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
