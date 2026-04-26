@@ -151,19 +151,7 @@ Installs to `~/.cargo/bin/`. Make sure it's on your `PATH`.
 </details>
 
 <details>
-<summary><strong>Homebrew</strong> (macOS + Linux, from v0.1.0)</summary>
-
-```bash
-brew install Open330/tap/muxa
-```
-
-The tap repo lives at [Open330/homebrew-tap](https://github.com/Open330/homebrew-tap).
-The formula tracks GitHub Releases, so it's only available from v0.1.0 onward.
-
-</details>
-
-<details>
-<summary><strong>Pre-built binaries</strong> (from v0.1.0)</summary>
+<summary><strong>Pre-built binaries</strong></summary>
 
 Grab the archive for your platform from the
 [Releases page](https://github.com/Open330/muxa/releases) and drop `muxa` +

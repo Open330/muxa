@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "muxa"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-adapters"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "muxa-core",
  "serde",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "serde",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-runtime"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "muxa-core",
  "notify-rust",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "muxad"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
