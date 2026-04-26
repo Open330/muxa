@@ -34,7 +34,12 @@ use std::collections::HashSet;
 use time::OffsetDateTime;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const INPUT_POLL: Duration = Duration::from_millis(50);
+/// Max time to wait for a single keystroke when the input buffer is
+/// empty. ~60 Hz so a press feels immediate without burning CPU on an
+/// idle terminal. Held keys / fast typing are absorbed by the
+/// drain-all-pending pattern in `run`, so this only governs idle
+/// responsiveness.
+const INPUT_POLL: Duration = Duration::from_millis(16);
 
 /// A single column in the watch TUI. The set of valid columns is fixed by
 /// this enum — the `[watch]` config picks which ones to show and in what
@@ -429,34 +434,56 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
             .draw(|f| render(f, &mut app))
             .map_err(anyhow::Error::from)?;
 
-        // Drain a batch of input events. `crossterm::event::poll` is
-        // blocking, so we run it on a blocking thread to not starve the
-        // tokio runtime. A short timeout keeps UI latency low.
-        let got_event = tokio::task::spawn_blocking(|| -> io::Result<Option<Event>> {
-            if crossterm::event::poll(INPUT_POLL)? {
-                Ok(Some(crossterm::event::read()?))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(anyhow::Error::from)??;
+        // Drain every event already in the OS buffer in one go before
+        // rendering again. Holding a key (or typing in bursts) used to
+        // pile up events because the loop only handled one per
+        // iteration; the render between events made the queue grow
+        // faster than we drained. `poll(Duration::ZERO)` is
+        // non-blocking, so this is cheap when the buffer is empty.
+        let mut events = drain_pending_events()?;
 
-        if let Some(ev) = got_event {
+        // If nothing was waiting, do exactly one bounded blocking
+        // wait so an idle UI yields the CPU.
+        if events.is_empty() {
+            let waited = tokio::task::spawn_blocking(|| -> io::Result<Option<Event>> {
+                if crossterm::event::poll(INPUT_POLL)? {
+                    Ok(Some(crossterm::event::read()?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await
+            .map_err(anyhow::Error::from)??;
+            if let Some(ev) = waited {
+                events.push(ev);
+            }
+        }
+
+        let mut should_quit = false;
+        let mut should_refresh = false;
+        for ev in events {
             match handle_event(ev, &mut app) {
-                Action::Quit => break,
+                Action::Quit => {
+                    should_quit = true;
+                    break;
+                }
                 Action::Attach => {
                     if let Some(pane) = app.selected_pane() {
                         jump_target = Some(pane);
+                        should_quit = true;
                         break;
                     }
                 }
-                Action::Refresh => {
-                    refresh(client, &mut app).await;
-                    last_poll = tokio::time::Instant::now();
-                }
+                Action::Refresh => should_refresh = true,
                 Action::None => {}
             }
+        }
+        if should_quit {
+            break;
+        }
+        if should_refresh {
+            refresh(client, &mut app).await;
+            last_poll = tokio::time::Instant::now();
         }
 
         if last_poll.elapsed() >= POLL_INTERVAL {
@@ -466,6 +493,18 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     }
 
     Ok(jump_target)
+}
+
+/// Pull every event already sitting in the OS-side terminal input
+/// buffer without ever blocking. `poll(Duration::ZERO)` returns
+/// immediately; we keep reading until nothing is left. Safe to call
+/// from an async context since neither call yields.
+fn drain_pending_events() -> io::Result<Vec<Event>> {
+    let mut events = Vec::new();
+    while crossterm::event::poll(Duration::ZERO)? {
+        events.push(crossterm::event::read()?);
+    }
+    Ok(events)
 }
 
 async fn refresh(client: &Client, app: &mut App) {
