@@ -4,9 +4,10 @@
 //! Cargo sets `CARGO_BIN_EXE_<name>` for binaries in sibling packages of
 //! the same workspace when `cargo test` is invoked.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn bin(name: &str) -> PathBuf {
@@ -151,6 +152,185 @@ fn claude_statusline_forward_passes_stdin_to_command() {
         "forwarded stdout should mirror stdin byte-for-byte; got {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+/// Variant of [`Daemon::spawn`] that turns the HTTP dashboard on,
+/// binds it to port 0 (OS-picked), and reads stderr until it sees the
+/// "dashboard listening" log line so the test gets the actual port.
+/// Returns `None` if `curl` is unavailable on PATH — test functions
+/// turn that into a `return` so dashboard tests are skipped without
+/// failing the suite on minimal CI images.
+struct DashboardDaemon {
+    daemon: Daemon,
+    port: u16,
+}
+
+fn curl_available() -> bool {
+    Command::new("curl")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
+    if !curl_available() {
+        eprintln!("skipping dashboard test — curl not on PATH");
+        return None;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.keep().join("muxa-dash.sock");
+
+    let mut cmd = Command::new(bin("muxad"));
+    cmd.arg("--socket")
+        .arg(&socket)
+        .arg("--dashboard")
+        .arg("--dashboard-bind")
+        .arg("127.0.0.1:0")
+        .env("RUST_LOG", "muxa=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(t) = token {
+        cmd.arg("--dashboard-token").arg(t);
+    }
+    let mut child = cmd.spawn().expect("spawn muxad");
+
+    // Read stderr in a thread; signal back the bound port via a channel.
+    let stderr = child.stderr.take().expect("stderr piped");
+    let (tx, rx) = mpsc::channel::<u16>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("dashboard listening") {
+                if let Some(port) = line
+                    .split_whitespace()
+                    .find_map(|tok| tok.strip_prefix("addr="))
+                    .and_then(|a| a.rsplit(':').next())
+                    .and_then(|p| p.parse::<u16>().ok())
+                {
+                    let _ = tx.send(port);
+                    // Keep draining so the child's stderr buffer
+                    // never fills.
+                }
+            }
+        }
+    });
+
+    let port = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dashboard never logged its bound port");
+    wait_for_socket(&socket, Duration::from_secs(3));
+
+    Some(DashboardDaemon {
+        daemon: Daemon { child, socket },
+        port,
+    })
+}
+
+fn curl_status(url: &str, header: Option<&str>) -> u16 {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "2",
+    ]);
+    if let Some(h) = header {
+        cmd.arg("-H").arg(h);
+    }
+    cmd.arg(url);
+    let out = cmd.output().expect("curl");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn curl_body(url: &str, header: Option<&str>) -> String {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "--max-time", "2"]);
+    if let Some(h) = header {
+        cmd.arg("-H").arg(h);
+    }
+    cmd.arg(url);
+    let out = cmd.output().expect("curl");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn dashboard_health_endpoint_returns_ok() {
+    let Some(dd) = spawn_dashboard(None) else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/api/health", dd.port);
+    assert_eq!(curl_status(&url, None), 200);
+    let body = curl_body(&url, None);
+    assert!(
+        body.contains(r#""ok":true"#) && body.contains(r#""protocol":"#),
+        "unexpected health body: {body}"
+    );
+    drop(dd.daemon);
+}
+
+#[test]
+fn dashboard_token_gates_api() {
+    let Some(dd) = spawn_dashboard(Some("e2e-token")) else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/api/health", dd.port);
+
+    // Without auth → 401.
+    assert_eq!(curl_status(&url, None), 401);
+
+    // With wrong token → 401.
+    assert_eq!(
+        curl_status(&url, Some("Authorization: Bearer wrong")),
+        401
+    );
+
+    // With correct token → 200.
+    assert_eq!(
+        curl_status(&url, Some("Authorization: Bearer e2e-token")),
+        200
+    );
+
+    drop(dd.daemon);
+}
+
+#[test]
+fn dashboard_static_index_is_public() {
+    // The HTML/CSS/JS bundle bootstraps the token, so it must be
+    // reachable without auth even when /api/* is gated.
+    let Some(dd) = spawn_dashboard(Some("e2e-token")) else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/", dd.port);
+    assert_eq!(curl_status(&url, None), 200);
+    let body = curl_body(&url, None);
+    assert!(
+        body.contains("muxa dashboard"),
+        "expected dashboard HTML; got: {body:.200}"
+    );
+    drop(dd.daemon);
+}
+
+#[test]
+fn dashboard_panes_endpoint_is_well_formed_with_no_tmux() {
+    let Some(dd) = spawn_dashboard(None) else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/api/panes", dd.port);
+    let body = curl_body(&url, None);
+    assert!(body.contains(r#""panes":"#), "{body}");
+    assert!(body.contains(r#""errors":"#), "{body}");
+    assert!(body.contains(r#""fetched_at":"#), "{body}");
+    drop(dd.daemon);
 }
 
 #[test]
