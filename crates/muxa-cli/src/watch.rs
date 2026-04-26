@@ -8,6 +8,7 @@
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
 
+use std::future::Future;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -32,9 +33,22 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use std::collections::HashSet;
 use time::OffsetDateTime;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const INPUT_POLL: Duration = Duration::from_millis(50);
+
+/// Channel capacity for the wake signal sent from the input loop to the
+/// background refresh task. Capacity 1 is intentional: when the user mashes
+/// `r`, we want extra requests to coalesce into a single pending wake rather
+/// than queue up.
+const WAKE_CAPACITY: usize = 1;
+/// Channel capacity for refresh outcomes flowing from the background task to
+/// the main loop. 2 is just enough to absorb a tick that lands while the
+/// main task is mid-render without stalling the refresh task; the main loop
+/// always drains all pending outcomes before each render.
+const OUTCOME_CAPACITY: usize = 2;
 
 /// A single column in the watch TUI. The set of valid columns is fixed by
 /// this enum — the `[watch]` config picks which ones to show and in what
@@ -405,6 +419,96 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(backend)?)
 }
 
+/// One full result of a refresh — what the background task hands back to
+/// the main loop on every tick or wake. The main task holds nothing else
+/// daemon-related, so all the state diffs come through this single struct.
+pub(crate) struct RefreshOutcome {
+    pub agents: Vec<Agent>,
+    pub panes: Vec<PaneInfo>,
+    pub error: Option<DaemonError>,
+}
+
+/// Apply a `RefreshOutcome` to `App` exactly the way the old inline
+/// `refresh` helper did. Kept as a free function so unit tests can build
+/// outcomes from a fake fetcher and assert on `App` afterwards without
+/// pulling in any networking.
+pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
+    app.last_error = outcome.error;
+    app.set_data(outcome.agents, outcome.panes);
+}
+
+/// Compute one refresh outcome: tmux pane inventory (off-runtime via
+/// `spawn_blocking`) plus a daemon snapshot. Kept independent of `App` so
+/// the work can run on a worker thread without holding any UI state.
+async fn compute_refresh(client: &Client) -> RefreshOutcome {
+    // tmux pane inventory is independent of the daemon — fetch it even
+    // when muxad is down so `muxa watch` stays useful as a session picker.
+    // `tmux::list_panes` shells out (~few ms) and must NOT run on a tokio
+    // worker — that's the whole point of this refactor.
+    let panes = tokio::task::spawn_blocking(tmux::list_panes)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+
+    match client.snapshot().await {
+        Ok(agents) => RefreshOutcome {
+            agents,
+            panes,
+            error: None,
+        },
+        Err(e) => RefreshOutcome {
+            agents: Vec::new(),
+            panes,
+            error: Some(DaemonError {
+                self_describing: matches!(e, RuntimeError::NotConnected(_)),
+                message: e.to_string(),
+            }),
+        },
+    }
+}
+
+/// Background task that owns its own `Client` clone and produces refresh
+/// outcomes on a 500 ms tick or whenever the input loop sends a wake
+/// request. The task exits cleanly when *either* end of either channel
+/// closes — main drops `wake_tx` to signal shutdown.
+///
+/// Generic over the fetcher so unit tests can swap in a closure that
+/// returns a canned `RefreshOutcome` without touching tmux or the daemon.
+async fn refresh_task<F, Fut>(
+    mut fetch: F,
+    mut wake: mpsc::Receiver<()>,
+    out: mpsc::Sender<RefreshOutcome>,
+) where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = RefreshOutcome> + Send,
+{
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    // If a refresh runs longer than one tick (slow daemon, slow tmux),
+    // don't pile up backlog ticks — skip them.
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The first `tick()` fires immediately. We don't want a duplicate
+    // refresh right after the priming snapshot in `run`, so consume it.
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            req = wake.recv() => {
+                // None => the input loop dropped wake_tx, i.e. quit/attach.
+                if req.is_none() {
+                    return;
+                }
+            }
+        }
+        let outcome = fetch().await;
+        if out.send(outcome).await.is_err() {
+            // Main loop dropped its receiver (quit/attach) — go home.
+            return;
+        }
+    }
+}
+
 /// Entry point for `muxa watch`.
 ///
 /// Returns `Some(pane_id)` if the user pressed Enter on a selected agent,
@@ -417,10 +521,26 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
 
     let mut app = App::with_config(watch_cfg);
 
-    // Prime the initial snapshot so we don't paint an empty frame first.
-    refresh(client, &mut app).await;
+    // Prime the initial snapshot so the first frame already has data —
+    // otherwise the user sees an empty table for ~one tick.
+    apply_outcome(&mut app, compute_refresh(client).await);
 
-    let mut last_poll = tokio::time::Instant::now();
+    // Background refresh task owns its own Client clone so the borrowed
+    // `client: &Client` doesn't have to outlive the task. The clone is
+    // cheap (a single `PathBuf`) and avoids needing an `Arc`/lifetime
+    // wrapper for what is effectively immutable data.
+    let bg_client = client.clone();
+    let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
+    let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
+    let bg = tokio::spawn(refresh_task(
+        move || {
+            let client = bg_client.clone();
+            async move { compute_refresh(&client).await }
+        },
+        wake_rx,
+        outcome_tx,
+    ));
+
     let mut jump_target: Option<String> = None;
 
     loop {
@@ -442,49 +562,46 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         .await
         .map_err(anyhow::Error::from)??;
 
+        let mut quit = false;
         if let Some(ev) = got_event {
             match handle_event(ev, &mut app) {
-                Action::Quit => break,
+                Action::Quit => quit = true,
                 Action::Attach => {
                     if let Some(pane) = app.selected_pane() {
                         jump_target = Some(pane);
-                        break;
+                        quit = true;
                     }
                 }
                 Action::Refresh => {
-                    refresh(client, &mut app).await;
-                    last_poll = tokio::time::Instant::now();
+                    // Coalesce repeated `r` mashes: if the wake slot is
+                    // already full a request is pending, so a `try_send`
+                    // failure is fine — the in-flight request will pick up
+                    // the user's intent.
+                    let _ = wake_tx.try_send(());
                 }
                 Action::None => {}
             }
         }
 
-        if last_poll.elapsed() >= POLL_INTERVAL {
-            refresh(client, &mut app).await;
-            last_poll = tokio::time::Instant::now();
+        // Drain any refresh outcomes that landed since the last frame.
+        // The render path never awaits the refresh — this is the only
+        // place data flows back into `App`.
+        while let Ok(outcome) = outcome_rx.try_recv() {
+            apply_outcome(&mut app, outcome);
+        }
+
+        if quit {
+            break;
         }
     }
+
+    // Drop the wake sender so refresh_task's `wake.recv()` returns None
+    // on its next iteration; then await the join so we don't leak a task.
+    drop(wake_tx);
+    drop(outcome_rx);
+    let _ = bg.await;
 
     Ok(jump_target)
-}
-
-async fn refresh(client: &Client, app: &mut App) {
-    // tmux pane inventory is independent of the daemon — fetch it even
-    // when muxad is down so `muxa watch` stays useful as a session picker.
-    let panes = tmux::list_panes().unwrap_or_default();
-    match client.snapshot().await {
-        Ok(agents) => {
-            app.last_error = None;
-            app.set_data(agents, panes);
-        }
-        Err(e) => {
-            app.last_error = Some(DaemonError {
-                self_describing: matches!(e, RuntimeError::NotConnected(_)),
-                message: e.to_string(),
-            });
-            app.set_data(Vec::new(), panes);
-        }
-    }
 }
 
 enum Action {
@@ -1071,5 +1188,123 @@ mod tests {
             text.contains("vim"),
             "expected pane summary in render: {text:?}"
         );
+    }
+
+    // ---- background refresh task -----------------------------------------
+
+    fn outcome_with_marker(session: &str) -> RefreshOutcome {
+        RefreshOutcome {
+            agents: vec![fake_agent(
+                session,
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            panes: vec![],
+            error: None,
+        }
+    }
+
+    /// A wake request sent from the input side must trigger a refresh on
+    /// the outcome channel. The fetcher counts calls and returns a marker
+    /// outcome so the assertion can confirm it actually came from us.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wake_request_drives_a_refresh_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fetch = Arc::clone(&calls);
+
+        let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
+        let (out_tx, mut out_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
+
+        let task = tokio::spawn(refresh_task(
+            move || {
+                let n = calls_for_fetch.fetch_add(1, Ordering::SeqCst);
+                async move { outcome_with_marker(&format!("call-{n}")) }
+            },
+            wake_rx,
+            out_tx,
+        ));
+
+        // The 500 ms tick is paused; force the wake path.
+        wake_tx.try_send(()).expect("wake slot empty at start");
+        let outcome = out_rx.recv().await.expect("refresh outcome on wake");
+        assert_eq!(outcome.agents.len(), 1);
+        assert_eq!(outcome.agents[0].session_id, "call-0");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Dropping the wake sender ends the task cleanly.
+        drop(wake_tx);
+        task.await.expect("refresh_task joins on shutdown");
+    }
+
+    /// On the periodic tick (no wake), the fetcher still runs and an
+    /// outcome lands on the channel. Validates that `MissedTickBehavior`
+    /// + the consume-first-tick dance still produces deliveries.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn periodic_tick_drives_a_refresh_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fetch = Arc::clone(&calls);
+
+        let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
+        let (out_tx, mut out_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
+
+        let task = tokio::spawn(refresh_task(
+            move || {
+                calls_for_fetch.fetch_add(1, Ordering::SeqCst);
+                async { outcome_with_marker("tick") }
+            },
+            wake_rx,
+            out_tx,
+        ));
+
+        // Time is paused; advance past one full POLL_INTERVAL so the
+        // interval fires its second tick (the first is consumed inside
+        // refresh_task before the loop).
+        tokio::time::advance(POLL_INTERVAL + Duration::from_millis(50)).await;
+        let outcome = out_rx.recv().await.expect("refresh outcome on tick");
+        assert_eq!(outcome.agents[0].session_id, "tick");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+
+        drop(wake_tx);
+        task.await.expect("refresh_task joins on shutdown");
+    }
+
+    /// `apply_outcome` is the only path data flows back into `App`. It
+    /// must mirror what the old inline `refresh` helper did: stash the
+    /// error and feed agents+panes through `set_data`.
+    #[test]
+    fn apply_outcome_mirrors_old_refresh_helper() {
+        let mut app = App::new();
+        let outcome = RefreshOutcome {
+            agents: vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            panes: vec![fake_pane("%99", "side", 0, 0, "vim")],
+            error: Some(DaemonError {
+                self_describing: false,
+                message: "boom".into(),
+            }),
+        };
+        apply_outcome(&mut app, outcome);
+        assert_eq!(app.rows.len(), 2);
+        assert!(app.last_error.is_some());
+        assert_eq!(app.last_error.as_ref().unwrap().message, "boom");
     }
 }
