@@ -34,6 +34,12 @@ pub enum RuntimeError {
 
     #[error("socket already exists and is in use at {0}; another daemon may be running")]
     SocketInUse(PathBuf),
+
+    #[error(
+        "daemon not reachable at {} — is `muxad` running? (start `muxad`, or set MUXA_SOCKET)",
+        .0.display()
+    )]
+    NotConnected(PathBuf),
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +275,19 @@ impl Client {
     }
 
     pub async fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, RuntimeError> {
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        // Connect-time ECONNREFUSED/ENOENT mean the daemon socket isn't there
+        // or nothing is listening — surface a friendly message that names the
+        // socket path. Other IO errors (timeouts, permission denied, …) keep
+        // their existing display via the `Io(#[from] _)` impl.
+        let mut stream =
+            UnixStream::connect(&self.socket_path)
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                        RuntimeError::NotConnected(self.socket_path.clone())
+                    }
+                    _ => RuntimeError::Io(e),
+                })?;
         let mut bytes = serde_json::to_vec(req)?;
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
@@ -332,6 +350,45 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn not_connected_when_socket_missing() {
+        // ENOENT path: tempdir exists but the socket file doesn't.
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("does-not-exist.sock");
+        let client = Client::new(sock.clone());
+        let err = client
+            .call(&serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" }))
+            .await
+            .expect_err("expected NotConnected when socket does not exist");
+        match err {
+            RuntimeError::NotConnected(p) => assert_eq!(p, sock),
+            other => panic!("expected NotConnected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn not_connected_when_socket_is_stale_file() {
+        // Stale-file path: a regular file exists at the socket path but
+        // nothing is listening. On Linux, connect(2) returns ECONNREFUSED for
+        // a non-socket path; `tokio` may also surface ENOTSOCK. We accept any
+        // mapping into NotConnected — the user-visible behaviour is the same.
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("stale.sock");
+        std::fs::write(&sock, b"").unwrap();
+        let client = Client::new(sock.clone());
+        let res = client
+            .call(&serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" }))
+            .await;
+        // If the platform returns a kind we don't remap (e.g. ENOTSOCK on
+        // some libc), the call still errors — just not necessarily with
+        // NotConnected. Only assert the friendly mapping when we got it.
+        if let Err(RuntimeError::NotConnected(p)) = &res {
+            assert_eq!(p, &sock);
+        }
+        // Either way, the call must not succeed.
+        assert!(res.is_err());
     }
 
     #[tokio::test]

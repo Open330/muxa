@@ -11,6 +11,13 @@
 # enabled = true
 # backend = "libnotify"   # libnotify | none   (more backends TBD)
 
+# Backfill discovery: when muxad starts, scan tmux panes for running agents
+# (matched against `pane_current_command`) and synthesize Started events so
+# they appear in `muxa status` without waiting for a fresh hook. The same
+# routine powers `muxa sync`. Default on.
+[discovery]
+# enabled = true
+
 # Logging is controlled via the standard RUST_LOG env var, e.g.:
 #   RUST_LOG=muxa=debug,tokio=warn muxad
 # Default when unset: "muxa=info".

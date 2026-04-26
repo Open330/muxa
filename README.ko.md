@@ -10,7 +10,7 @@
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
-![tests](https://img.shields.io/badge/tests-25%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-92%20green-brightgreen)
 
 [English](README.md) · **한국어**
 
@@ -40,7 +40,7 @@ tmux를 포크하지 않습니다. tmux와는 tmux CLI를 통해, 각 에이전�
 
 > [!IMPORTANT]
 > 프리알파 단계입니다. 이벤트 인제스트, 어댑터, 데몬, CLI, 실시간 TUI, 데스크톱
-> 알림이 모두 엔드투엔드로 동작하며 25개 테스트가 통과합니다. API는 아직 변경될
+> 알림이 모두 엔드투엔드로 동작하며 92개 테스트가 통과합니다. API는 아직 변경될
 > 수 있습니다. opencode 지원은 보류 중입니다.
 
 ## 목차
@@ -65,9 +65,10 @@ tmux를 포크하지 않습니다. tmux와는 tmux CLI를 통해, 각 에이전�
 | **범용 에이전트**         | 데몬 하나, CLI 하나, 어댑터 4개 (Claude · Codex · Gemini · opencode [†]).         |
 | **tmux 네이티브**        | `$TMUX_PANE`으로 페인을 식별하고, 출력은 `session:window.pane` 형식으로 라벨링. |
 | **무결합**               | tmux나 에이전트 CLI에 어떠한 변경도 가하지 않음 — 기존 훅 시스템만 활용.          |
-| **실시간 대시보드**       | `muxa watch` — 2 Hz로 갱신되는 풀스크린 ratatui TUI.                            |
+| **실시간 TUI**            | `muxa watch` — 에이전트가 상단, 그 외 tmux 페인이 하단, 2 Hz 갱신, 컬럼 설정 가능. |
+| **웹 대시보드**           | 옵트인 HTTP UI + SSE — 모든 에이전트와 **이 머신의 모든 tmux 페인**을 한 탭에. [`docs/DASHBOARD.md`](docs/DASHBOARD.md) 참고. |
 | **데스크톱 알림**         | 옵트인 방식의 libnotify / 네이티브 토스트 — `WaitingInput` / `Error` 전이 시.   |
-| **기본값으로 안전**       | 소켓은 `0600` 권한, `SIGTERM` 시 드레인 후 언링크, `unsafe_code = forbid`.       |
+| **기본값으로 안전**       | 소켓은 `0600` 권한, 대시보드는 두 플래그를 켜기 전까진 루프백 전용, `SIGTERM` 시 드레인, `unsafe_code = forbid`. |
 | **버전 관리되는 프로토콜**| 명시적인 `PROTOCOL_VERSION`, 호환되지 않는 클라이언트는 거부.                    |
 | **빠름**                  | 인메모리 레지스트리 — DB나 외부 서비스 의존 없음.                                |
 
@@ -265,10 +266,20 @@ muxa watch          # 실시간 TUI
 | `muxa watch`                               | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고.                    |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N]`                   | 해당 페인의 마지막 프롬프트를 보여줌.                                    |
+| `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
 | `muxa panes`                               | 디버그용: tmux 페인 목록 덤프.                                            |
 | `muxa hook <agent> --event <e>`            | 훅 어댑터 진입점 — 에이전트 CLI가 직접 호출.                             |
 | `muxa hook claude-statusline --forward CMD` | Claude의 status-line JSON을 muxa로 받으면서 다운스트림 도구로 포워딩.   |
 | `muxad`                                    | 데몬 — 기본적으로 `$XDG_RUNTIME_DIR/muxa.sock`을 리슨.                   |
+
+### Sync
+
+`muxa sync`는 `tmux list-panes`를 훑어 `pane_current_command`를 알려진 에이전트
+CLI(`claude`, `codex`, `gemini` / `gemini-cli`)와 매칭하고, 데몬에 합성 에이전트로
+등록하도록 요청합니다. 동일한 일회성 패스가 `muxad` 기동 직후에도 자동으로
+실행되므로 데몬을 재시작해도 페인에 살아 있는 에이전트가 사라지지 않습니다.
+멱등(idempotent)이며, 합성 항목은 실제 훅이 도착하면 그 자리에서 교체됩니다.
+`[discovery] enabled = false`로 끌 수 있습니다.
 
 ## 실시간 TUI
 
