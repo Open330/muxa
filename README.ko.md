@@ -151,19 +151,7 @@ cargo install --path crates/muxa  --locked
 </details>
 
 <details>
-<summary><strong>Homebrew</strong> (macOS + Linux, v0.1.0부터)</summary>
-
-```bash
-brew install Open330/tap/muxa
-```
-
-탭 저장소는 [Open330/homebrew-tap](https://github.com/Open330/homebrew-tap)에
-있습니다. 포뮬러는 GitHub Releases를 따라가므로 v0.1.0부터 사용할 수 있습니다.
-
-</details>
-
-<details>
-<summary><strong>사전 빌드된 바이너리</strong> (v0.1.0부터)</summary>
+<summary><strong>사전 빌드된 바이너리</strong></summary>
 
 자신의 플랫폼에 맞는 아카이브를
 [Releases 페이지](https://github.com/Open330/muxa/releases)에서 받아 `muxa`와

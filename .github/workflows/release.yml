@@ -3,6 +3,15 @@ name: release
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run_tag:
+        description: |
+          Synthetic tag to embed in archive filenames during a manual
+          dry-run (e.g. v0.1.0-rc1). The dispatched run never publishes
+          a release — archives are uploaded as workflow artifacts.
+        required: false
+        default: v0.0.0-dryrun
 
 permissions:
   contents: write
@@ -20,90 +29,64 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
-            cross: false
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install cross (aarch64 linux)
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Build muxa + muxad
+      # Resolve the version-ish ref that goes into archive filenames.
+      # - tag push: GITHUB_REF_NAME (e.g. "v0.1.0")
+      # - workflow_dispatch: the user-supplied dry_run_tag input
+      - name: Resolve ref name
+        id: ref
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target "${{ matrix.target }}" -p muxa  -p muxad
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ref="${{ inputs.dry_run_tag }}"
           else
-            cargo build --release --target "${{ matrix.target }}" -p muxa  -p muxad
+            ref="${GITHUB_REF_NAME}"
           fi
+          echo "name=${ref}" >> "$GITHUB_OUTPUT"
 
-      - name: Package archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          TARGET="${{ matrix.target }}"
-          STAGE=$(mktemp -d)
-          NAME="muxa-${GITHUB_REF_NAME}-${TARGET}"
-          mkdir -p "$STAGE/$NAME"
-          cp "target/${TARGET}/release/muxa"  "$STAGE/$NAME/"
-          cp "target/${TARGET}/release/muxad" "$STAGE/$NAME/"
-          cp README.md LICENSE-MIT LICENSE-APACHE PROTOCOL.md "$STAGE/$NAME/"
-          ( cd "$STAGE" && tar czf "${NAME}.tar.gz" "$NAME" )
-          ( cd "$STAGE" && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
-          mv "$STAGE/${NAME}.tar.gz"        .
-          mv "$STAGE/${NAME}.tar.gz.sha256" .
-          echo "ARCHIVE=${NAME}.tar.gz"         >> "$GITHUB_ENV"
-          echo "CHECKSUM=${NAME}.tar.gz.sha256" >> "$GITHUB_ENV"
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      - name: Build, package, and (on tag) upload to release
+        uses: taiki-e/upload-rust-binary-action@v1
         with:
-          files: |
-            ${{ env.ARCHIVE }}
-            ${{ env.CHECKSUM }}
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+          # Two binaries from the workspace.
+          bin: muxa,muxad
+          target: ${{ matrix.target }}
+          # Archive filename pattern: muxa-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+          archive: muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}
+          # Bundle license, README, and example wiring next to the binaries.
+          # Note: the action also auto-includes top-level LICENSE* and
+          # README.md, but listing them here keeps intent explicit.
+          include: >-
+            LICENSE-MIT,LICENSE-APACHE,README.md,examples/muxad.service,examples/muxa.tmux.conf,examples/claude-settings.json
+          # Files inside the archive sit under a directory named after
+          # the archive (matches `tar tf` UX of common Rust releases).
+          leading-dir: true
+          # Emit SHA256SUMS-style sidecar per archive.
+          checksum: sha256
+          # workflow_dispatch path skips the gh release upload — we
+          # capture the archive ourselves below as a workflow artifact.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' }}
+          # Used for the gh release upload on tag push.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-  bump-tap:
-    name: bump Open330/homebrew-tap
-    needs: build
-    runs-on: ubuntu-latest
-    # Skip on pre-releases (rc, alpha, beta) — tap only tracks stable versions.
-    if: ${{ !contains(github.ref_name, '-') }}
-    steps:
-      - name: Open PR against Open330/homebrew-tap
-        uses: mislav/bump-homebrew-formula-action@v3
+      # Dry-run path: surface the built archive + checksum as a workflow
+      # artifact so it can be downloaded and inspected without cutting
+      # an actual GitHub Release.
+      - name: Upload archive as workflow artifact (dry-run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
         with:
-          formula-name: muxa
-          formula-path: Formula/muxa.rb
-          homebrew-tap: Open330/homebrew-tap
-          base-branch: main
-          download-url: https://github.com/Open330/muxa/releases/download/${{ github.ref_name }}/muxa-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
-          commit-message: |
-            muxa ${{ github.ref_name }}
-
-            Created by https://github.com/mislav/bump-homebrew-formula-action
-        env:
-          # Requires a PAT with `repo` scope on Open330/homebrew-tap.
-          # Add it as a repo secret named HOMEBREW_TAP_TOKEN.
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          name: muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}
+          path: |
+            muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}.tar.gz
+            muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
