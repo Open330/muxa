@@ -101,7 +101,7 @@ CLI observability layer for tmux. Requirements: Rust 1.88+, tmux 3.x.
 1) Clone and install binaries
    git clone https://github.com/Open330/muxa.git /tmp/muxa
    cargo install --path /tmp/muxa/crates/muxad --locked
-   cargo install --path /tmp/muxa/crates/muxa  --locked
+   cargo install --path /tmp/muxa/crates/muxa-cli --locked
 
 2) Start the daemon (foreground is fine; detach with `&` or systemd)
    muxad &
@@ -111,10 +111,10 @@ CLI observability layer for tmux. Requirements: Rust 1.88+, tmux 3.x.
      ~/.claude/settings.json. Do NOT overwrite existing hooks — jq-append
      to each hooks.<event> array.
    - Codex:       append the [[hooks.*]] blocks from
-                  crates/muxa-adapters/src/codex.rs module doc to
+                  crates/muxa/src/adapters/codex.rs module doc to
                   ~/.codex/config.toml.
    - Gemini CLI:  merge the hooks block from
-                  crates/muxa-adapters/src/gemini.rs module doc into
+                  crates/muxa/src/adapters/gemini.rs module doc into
                   ~/.gemini/settings.json.
 
 4) Wire tmux (append if not already present)
@@ -144,7 +144,7 @@ kill muxad with pkill, restore backups, tmux source-file to reload.
 ```bash
 git clone https://github.com/Open330/muxa.git && cd muxa
 cargo install --path crates/muxad --locked
-cargo install --path crates/muxa  --locked
+cargo install --path crates/muxa-cli --locked
 ```
 
 `~/.cargo/bin/`에 설치됩니다. 해당 경로가 `PATH`에 포함되어 있는지 확인하세요.
@@ -216,7 +216,7 @@ JSON을 기존 도구로 흘려보내세요 — muxa는 Heartbeat(모델, 컨텍
 </details>
 
 Codex와 Gemini CLI도 같은 패턴이며, 설정 파일만 다릅니다.
-각 어댑터의 모듈 레벨 문서는 `crates/muxa-adapters/src/`에 있습니다.
+각 어댑터의 모듈 레벨 문서는 `crates/muxa/src/adapters/`에 있습니다.
 
 ### 3. tmux 연결
 
@@ -412,13 +412,11 @@ agent CLIs (Claude, Codex, Gemini)
       └── graceful SIGTERM → drain → unlink socket
 ```
 
-5개 크레이트 워크스페이스:
+3개 크레이트 워크스페이스:
 
-- `muxa-core`     — 타입, 상태, 설정, 경로, 에러 (I/O 없음)
-- `muxa-runtime`  — 유닉스 소켓 IPC 서버/클라이언트 + tmux CLI 래퍼 + 알림 처리
-- `muxa-adapters` — `HookAdapter` 트레이트 + claude / codex / gemini 어댑터
-- `muxad`         — 데몬 바이너리
-- `muxa`          — CLI 바이너리 (`muxa watch` TUI 포함)
+- `muxa`     — 단일 라이브러리: 타입, 상태, 설정, IPC, tmux 래퍼, 알림, 어댑터, 대시보드
+- `muxad`    — 데몬 바이너리
+- `muxa-cli` — CLI 바이너리 (`muxa`; `status`, `watch` TUI, `sync`, `recap`, `hook` 제공)
 
 와이어 프로토콜 명세는 [`PROTOCOL.md`](PROTOCOL.md)를 참고하세요.
 

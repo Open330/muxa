@@ -102,7 +102,7 @@ CLI observability layer for tmux. Requirements: Rust 1.88+, tmux 3.x.
 1) Clone and install binaries
    git clone https://github.com/Open330/muxa.git /tmp/muxa
    cargo install --path /tmp/muxa/crates/muxad --locked
-   cargo install --path /tmp/muxa/crates/muxa  --locked
+   cargo install --path /tmp/muxa/crates/muxa-cli --locked
 
 2) Start the daemon (foreground is fine; detach with `&` or systemd)
    muxad &
@@ -112,10 +112,10 @@ CLI observability layer for tmux. Requirements: Rust 1.88+, tmux 3.x.
      ~/.claude/settings.json. Do NOT overwrite existing hooks — jq-append
      to each hooks.<event> array.
    - Codex:       append the [[hooks.*]] blocks from
-                  crates/muxa-adapters/src/codex.rs module doc to
+                  crates/muxa/src/adapters/codex.rs module doc to
                   ~/.codex/config.toml.
    - Gemini CLI:  merge the hooks block from
-                  crates/muxa-adapters/src/gemini.rs module doc into
+                  crates/muxa/src/adapters/gemini.rs module doc into
                   ~/.gemini/settings.json.
 
 4) Wire tmux (append if not already present)
@@ -145,7 +145,7 @@ Requires **Rust 1.88+**, **tmux 3.x**, and a Unix-y OS.
 ```bash
 git clone https://github.com/Open330/muxa.git && cd muxa
 cargo install --path crates/muxad --locked
-cargo install --path crates/muxa  --locked
+cargo install --path crates/muxa-cli --locked
 ```
 
 Installs to `~/.cargo/bin/`. Make sure it's on your `PATH`.
@@ -216,7 +216,7 @@ normally — hook paths are best-effort.
 </details>
 
 Codex and Gemini CLI follow the same pattern with different config files.
-See each adapter's module-level docs in `crates/muxa-adapters/src/`.
+See each adapter's module-level docs in `crates/muxa/src/adapters/`.
 
 ### 3. Wire tmux
 
@@ -428,13 +428,11 @@ agent CLIs (Claude, Codex, Gemini)
       └── graceful SIGTERM → drain → unlink socket
 ```
 
-Five-crate workspace:
+Three-crate workspace:
 
-- `muxa-core`     — types, state, config, paths, errors (no I/O)
-- `muxa-runtime`  — unix-socket IPC server/client + tmux CLI wrapper + notifier
-- `muxa-adapters` — `HookAdapter` trait + claude / codex / gemini adapters
-- `muxad`         — daemon binary
-- `muxa`          — CLI binary (incl. `muxa watch` TUI)
+- `muxa`     — single library: types, state, config, IPC, tmux wrapper, notifier, adapters, dashboard
+- `muxad`    — daemon binary
+- `muxa-cli` — CLI binary (`muxa`; ships `status`, `watch` TUI, `sync`, `recap`, `hook`)
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the wire-protocol contract.
 
