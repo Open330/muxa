@@ -4,7 +4,11 @@
 #
 # Requires charmbracelet/vhs, ttyd, ffmpeg, and a Chromium-based browser
 # (VHS uses Chrome for frame capture). docs/demo-setup.sh handles the
-# tmux/muxad bootstrap so this file stays focused on the recording.
+# muxad + tmux bootstrap so this file stays focused on the recording.
+#
+# The visible flow: muxa status (table) → attach to a real tmux session
+# with muxa wired into status-right → walk a couple of panes to show the
+# glyph update live → drop into muxa watch from inside tmux → detach.
 
 Output docs/demo.gif
 
@@ -16,13 +20,13 @@ Set Theme "TokyoNight"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
-# Prelude — invisible setup. Spins up a scratch muxad on its own socket,
-# stands up an isolated tmux server, seeds three agent rows, and prepends
-# a `tmux` PATH shim so muxa's children see the demo server.
+# Prelude — invisible setup. Spins up a scratch muxad, builds an isolated
+# tmux server with three sessions / five panes, seeds three of the panes
+# as agents, and configures status-right to render muxa status-line live.
 Hide
-Type "export MUXA_SOCKET=/tmp/muxa-demo.sock"
+Type "export PATH=$HOME/.cargo/bin:/tmp/muxa-demo-shim:$PATH"
 Enter
-Type "export PATH=/tmp/muxa-demo-shim:$PATH"
+Type "export MUXA_SOCKET=/tmp/muxa-demo.sock"
 Enter
 Type "rm -f $MUXA_SOCKET"
 Enter
@@ -38,40 +42,48 @@ Type "clear"
 Enter
 Show
 
-Type "# table view — every tracked agent, one row each"
+Type "# muxa status — every tracked agent at a glance"
 Sleep 800ms
 Enter
 Type "muxa status"
 Enter
 Sleep 2500ms
 
-Type "# one-liner — drop this in tmux status-right per pane"
+Type "# attach to a tmux session — muxa is wired into status-right"
 Sleep 800ms
 Enter
-Type "muxa status-line"
+Type "/usr/bin/tmux -L muxa-demo attach -t main"
 Enter
-Sleep 2000ms
+Sleep 2500ms
 
-Type "# fullscreen dashboard — agents on top, every other tmux pane below"
-Sleep 800ms
-Enter
+# Walk a couple of windows so the glyph in status-right updates per pane.
+Ctrl+B
+Type "n"
+Sleep 1800ms
+Ctrl+B
+Type "n"
+Sleep 1800ms
+Ctrl+B
+Type "p"
+Sleep 1500ms
+
+# Drop into the fullscreen TUI from inside tmux.
 Type "muxa watch"
-Sleep 200ms
 Enter
 Sleep 4500ms
-
 Type "j"
 Sleep 300ms
 Type "j"
-Sleep 300ms
-Type "j"
-Sleep 300ms
-Type "k"
-Sleep 800ms
+Sleep 600ms
 Type "q"
-Sleep 700ms
+Sleep 800ms
 
-# Postlude — tear down everything we created.
+# Detach from tmux — the recording ends back in the bare shell.
+Ctrl+B
+Type "d"
+Sleep 800ms
+
+# Postlude — tear down everything.
 Hide
 Type "/usr/bin/tmux -L muxa-demo kill-server 2>/dev/null"
 Enter

@@ -27,7 +27,7 @@ It does **not** fork tmux. It talks to tmux via the tmux CLI and to each agent
 via that agent's own hook / event-emission system.
 
 <div align="center">
-  <img src="docs/demo.gif" alt="muxa demo — status, status-line, watch" width="900" />
+  <img src="docs/demo.gif" alt="muxa demo — status table, tmux status-right glyphs, fullscreen watch TUI" width="900" />
 </div>
 
 ```text

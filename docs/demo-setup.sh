@@ -53,3 +53,10 @@ TMUX_PANE="$PC" muxa hook gemini --event before_agent \
   <<<'{"session_id":"s-c","prompt":"summarize this PR"}'
 TMUX_PANE="$PC" muxa hook gemini --event after_agent \
   <<<'{"session_id":"s-c"}'
+
+# 4) Wire status-right on the demo server so attaching shows muxa live.
+"$TM" -L "$TMUX_LBL" set-option -g status-interval 1
+"$TM" -L "$TMUX_LBL" set-option -g status-right \
+  "#(muxa status-line --pane #{pane_id})  #[fg=cyan]%H:%M#[default]"
+"$TM" -L "$TMUX_LBL" set-option -g status-right-length 120
+"$TM" -L "$TMUX_LBL" set-option -g status-style "bg=default,fg=white"
