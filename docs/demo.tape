@@ -5,6 +5,14 @@
 # Requires charmbracelet/vhs, ttyd, ffmpeg, and a Chromium-based browser.
 # docs/demo-setup.sh handles the muxad + tmux bootstrap so this file
 # stays focused on the recording.
+#
+# Visible flow:
+#   1. muxa status            — table, run from a bare shell
+#   2. tmux attach -t main    — drop into a real tmux session
+#   3. prefix + s             — muxa watch popup (the switcher)
+#   4. muxa status-line       — one-liner from inside the tmux pane
+#   5. prefix + n             — walk a window, see status-right update
+#   6. prefix + d             — detach
 
 Output docs/demo.gif
 
@@ -36,31 +44,21 @@ Type "clear"
 Enter
 Show
 
-# 1. Table view — read the data.
+# 1. muxa status — read the data.
 Type "muxa status"
 Enter
 Sleep 2500ms
 
-# 2. Attach to a real tmux session. The status bar at the TOP renders
-#    `muxa status-line --pane #{pane_id}` live — watch the right side.
-Type "/usr/bin/tmux -L muxa-demo attach -t main"
+# 2. Drop into a real tmux session. Top status bar already renders the
+#    muxa indicator on the right.
+Type "/usr/bin/tmux -L muxa-demo attach -t main:0"
 Enter
 Sleep 2500ms
 
-# 3. Walk a couple of windows so the muxa indicator on the right side of
-#    the status bar updates per pane (working / waiting / idle glyphs).
-Ctrl+B
-Type "n"
-Sleep 1800ms
-Ctrl+B
-Type "n"
-Sleep 1800ms
-
-# 4. prefix + s → muxa watch in a popup. This is the production flow:
-#    floating dashboard, agents on top, every other pane below.
+# 3. prefix + s — muxa watch popup. The "switch" experience.
 Ctrl+B
 Type "s"
-Sleep 4500ms
+Sleep 4000ms
 Type "j"
 Sleep 300ms
 Type "j"
@@ -68,7 +66,20 @@ Sleep 600ms
 Type "q"
 Sleep 800ms
 
-# 5. Detach from tmux.
+# 4. muxa status-line — invoked from inside the attached tmux pane so
+#    the viewer sees the same one-liner that tmux is feeding into
+#    status-right.
+Type "muxa status-line"
+Enter
+Sleep 2200ms
+
+# 5. Walk a window so the muxa indicator on the status bar updates from
+#    `working` → `waiting_input` → `idle`.
+Ctrl+B
+Type "n"
+Sleep 1800ms
+
+# 6. Detach.
 Ctrl+B
 Type "d"
 Sleep 600ms
@@ -81,6 +92,6 @@ Type "kill %1 2>/dev/null"
 Enter
 Type "wait 2>/dev/null"
 Enter
-Type "rm -rf /tmp/muxa-demo-shim $MUXA_SOCKET"
+Type "rm -rf /tmp/muxa-demo-shim /tmp/muxa-demo-bashrc $MUXA_SOCKET"
 Enter
 Show

@@ -30,15 +30,30 @@ chmod +x "$SHIM_DIR/tmux"
 
 TM=/usr/bin/tmux  # use absolute path here so we don't depend on PATH ordering
 
-# 2) Isolated demo server. Each pane runs `cat` so it sits on stdin with
-#    no prompt visible — keeps the recording free of $PS1 / Starship
-#    clutter that would otherwise bleed around the muxa watch popup.
+# 2) Isolated demo server.
+#    - main:0 runs an interactive bash with a dead-simple rcfile so we
+#      can type `muxa status-line` inside the recording without dragging
+#      the user's Starship/zinit setup along.
+#    - Every other pane sits on `cat` so the popup has clean space
+#      around it (no extra prompts, no scrollback noise).
 "$TM" -L "$TMUX_LBL" kill-server 2>/dev/null || true
-"$TM" -L "$TMUX_LBL" new-session -d -s main -x 200 -y 40 cat
-"$TM" -L "$TMUX_LBL" new-window  -t main: -n review cat
-"$TM" -L "$TMUX_LBL" new-window  -t main: -n vim    cat
+cat > /tmp/muxa-demo-bashrc <<'BASHRC'
+export PS1='$ '
+unset PROMPT_COMMAND
+BASHRC
+
+"$TM" -L "$TMUX_LBL" new-session -d -s main -x 200 -y 40 \
+  "bash --rcfile /tmp/muxa-demo-bashrc"
+# `-d` keeps the current window as main:0 — without it new-window switches
+# focus to itself, so attach would land on `vim` (cat-stdin) instead of
+# the bash pane.
+"$TM" -L "$TMUX_LBL" new-window -d -t main: -n review cat
+"$TM" -L "$TMUX_LBL" new-window -d -t main: -n vim    cat
 "$TM" -L "$TMUX_LBL" new-session -d -s ops  -x 200 -y 40 cat
-"$TM" -L "$TMUX_LBL" new-window  -t ops:  -n logs cat
+"$TM" -L "$TMUX_LBL" new-window -d -t ops:  -n logs cat
+# Belt-and-suspenders: be explicit about which window the recording
+# should attach to.
+"$TM" -L "$TMUX_LBL" select-window -t main:0
 
 # 3) Seed muxad. Pick the first three pane ids so the agent rows resolve to
 #    real session:window.pane labels in muxa watch.
