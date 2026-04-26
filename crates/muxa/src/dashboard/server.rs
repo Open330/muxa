@@ -16,21 +16,34 @@ use axum::{
     extract::State,
     http::{header, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Json, Response},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
     routing::get,
     Router,
 };
+use futures::stream::{self, Stream, StreamExt};
 use serde::Serialize;
+use serde_json::json;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
 use crate::dashboard::{auth, DashboardConfig};
 use crate::event::PROTOCOL_VERSION;
 use crate::state::{Agent, SharedStore};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
+
+/// SSE keep-alive ping interval. Picked long enough to be invisible
+/// (15s is well under any sane proxy idle-timeout) but short enough
+/// that a stale connection drops within ~30s.
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Application state shared by every handler. Cheap to clone (all
 /// fields are `Arc`-flavoured) so axum's `State` extractor copies
@@ -63,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/events", get(events_handler))
         .layer(auth_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -155,6 +169,53 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+/// Live SSE stream of state transitions.
+///
+/// Emits three event types on the wire:
+///
+/// - `snapshot` — sent first, exactly once. Payload: `{ agents: [...] }`.
+///   Lets a freshly-loaded client paint the table without a separate
+///   `/api/agents` round-trip.
+/// - `transition` — every `Store::subscribe()` broadcast. Payload: a
+///   serialized [`Transition`](crate::state::Transition).
+/// - `lagged` — emitted when the broadcast receiver falls behind the
+///   sender's ring buffer. Payload: the count of dropped messages.
+///   Clients should treat this as a hint to refetch `/api/agents` for
+///   a clean baseline.
+///
+/// Subscribe-then-snapshot ordering means a transition that lands
+/// between the subscribe and the snapshot is delivered twice (once in
+/// the snapshot, again as a transition); applying the transition is
+/// idempotent so this is harmless. The reverse ordering — snapshot
+/// then subscribe — would *miss* such a transition entirely.
+async fn events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let rx = state.store.subscribe();
+    let snapshot = state.store.snapshot().await;
+
+    let snapshot_event = SseEvent::default()
+        .event("snapshot")
+        .json_data(json!({ "agents": snapshot }))
+        .unwrap_or_else(|_| SseEvent::default().event("snapshot").data("{}"));
+
+    let live = BroadcastStream::new(rx).map(|res| match res {
+        Ok(t) => SseEvent::default()
+            .event("transition")
+            .json_data(&t)
+            .unwrap_or_else(|_| SseEvent::default().event("transition").data("{}")),
+        Err(BroadcastStreamRecvError::Lagged(n)) => SseEvent::default()
+            .event("lagged")
+            .data(n.to_string()),
+    });
+
+    let combined = stream::once(async move { snapshot_event })
+        .chain(live)
+        .map(Ok::<_, Infallible>);
+
+    Sse::new(combined).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,8 +223,8 @@ mod tests {
     use crate::state::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use serde_json::Value;
-    use std::time::Duration;
     use tower::ServiceExt;
 
     fn fresh_state() -> AppState {
@@ -307,5 +368,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Read up to `limit_bytes` of SSE body or until `dur` elapses,
+    /// whichever comes first. SSE streams never EOF on their own under
+    /// normal operation; we use the timeout as the read budget.
+    async fn collect_sse(resp: Response, dur: Duration, limit_bytes: usize) -> String {
+        let mut body = resp.into_body();
+        let mut bytes = Vec::new();
+        let deadline = tokio::time::sleep(dur);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut deadline => break,
+                frame = body.frame() => {
+                    match frame {
+                        Some(Ok(f)) => {
+                            if let Ok(data) = f.into_data() {
+                                bytes.extend_from_slice(&data);
+                                if bytes.len() >= limit_bytes { break; }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_emits_initial_snapshot() {
+        let state = fresh_state();
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "s1".into(),
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/api/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+        assert!(body.contains("event: snapshot"), "body: {body:?}");
+        assert!(body.contains("\"agents\""), "body: {body:?}");
+        assert!(body.contains("claude_code"), "body: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_streams_transitions_after_snapshot() {
+        use crate::event::{AgentState, NotificationLevel};
+
+        let state = fresh_state();
+        let store = state.store.clone();
+        // Pre-create an agent so the transition has something to mutate.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "s1".into(),
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/api/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // Drive a state transition concurrently with reading the body.
+        let store_for_task = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            store_for_task
+                .apply(&AgentEvent::NotificationFired {
+                    id: AgentId {
+                        kind: AgentKind::ClaudeCode,
+                        session_id: "s1".into(),
+                        pane: Some("%1".into()),
+                        cwd: None,
+                    },
+                    level: NotificationLevel::NeedsInput,
+                    message: "approve?".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            // sanity: state should now be WaitingInput
+            let snap = store_for_task.snapshot().await;
+            assert_eq!(snap[0].state, AgentState::WaitingInput);
+        });
+
+        let body = collect_sse(resp, Duration::from_millis(300), 1 << 16).await;
+        assert!(body.contains("event: snapshot"), "body: {body:?}");
+        assert!(body.contains("event: transition"), "body: {body:?}");
+        assert!(body.contains("waiting_input"), "body: {body:?}");
     }
 }

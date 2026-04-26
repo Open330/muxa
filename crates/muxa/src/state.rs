@@ -21,9 +21,15 @@ use time::OffsetDateTime;
 use tokio::sync::{broadcast, RwLock};
 
 /// Capacity of the in-process state-transition broadcast. Slow subscribers
-/// that lag past this will see `RecvError::Lagged` and should resync via
-/// `Store::snapshot` — the notifier task logs and continues.
-const TRANSITION_CHANNEL_CAPACITY: usize = 64;
+/// that lag past this see `RecvError::Lagged` and should resync via
+/// `Store::snapshot` — the notifier task logs and continues; the dashboard
+/// SSE handler emits an `event: lagged` so its client can do the same.
+///
+/// Sized for the dashboard case: a long-running SSE connection over a
+/// brief burst (e.g. a refactor touching many panes at once) should not
+/// see lag on a healthy network. 256 is ~4× the in-process notifier's
+/// previous capacity; bump again if profiling shows lag on real traffic.
+const TRANSITION_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
