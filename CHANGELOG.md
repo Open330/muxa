@@ -10,15 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First tagged release. End-to-end agent observability for tmux: a daemon
 (`muxad`) ingests hook events from Claude Code, Codex, and Gemini CLI and
 surfaces state via a CLI (`muxa status`), a tmux status-line one-liner, a
-fullscreen TUI dashboard (`muxa watch`), and opt-in desktop notifications.
-49 tests green.
+fullscreen TUI dashboard (`muxa watch`), an opt-in HTTP/SSE web dashboard,
+and opt-in desktop notifications. 92 tests green.
 
 ### Added
 
-- Five-crate workspace: `muxa-core`, `muxa-runtime`, `muxa-adapters`,
-  `muxad`, `muxa`. Versioned wire protocol over a 0600 unix socket.
+- Single `muxa` library + two binaries (`muxad`, `muxa-cli` shipping the
+  `muxa` binary). Versioned wire protocol over a 0600 unix socket.
 - Hook adapters for Claude Code, OpenAI Codex, and Google Gemini CLI.
   opencode is deferred (SSE / TS-plugin path, not shell-hook).
+- Web dashboard via `muxad --dashboard`: read-only HTTP UI with
+  `/api/health`, `/api/agents`, `/api/panes`, plus a live SSE stream at
+  `/api/events` (snapshot + transition + lagged events). Embedded
+  HTML/JS/CSS via `rust-embed`. Loopback-only by default; non-loopback
+  binds require both `allow_public = true` and a non-empty bearer token,
+  enforced once at startup. Constant-time token comparison via `subtle`.
+- Multi-socket tmux pane scanner — discovers every running tmux server
+  under `$TMUX_TMPDIR` / `/tmp/tmux-$UID/` (1 s per-socket timeout) and
+  folds results into a single `ScanResult` with per-socket error
+  isolation. TTL-cached (`PaneCache`) so HTTP handlers don't re-fork
+  tmux per request.
+- `docs/DASHBOARD.md` — operator's guide for the web dashboard
+  (binding, auth, deploy patterns).
 - `muxa status` — session-aware, deduped, ANSI-colored table; honors
   `NO_COLOR`.
 - `muxa watch` — fullscreen ratatui TUI at 2 Hz. Lists tracked agents
@@ -50,6 +63,12 @@ fullscreen TUI dashboard (`muxa watch`), and opt-in desktop notifications.
 
 ### Changed
 
+- Workspace consolidated from 5 crates (`muxa-core`, `-runtime`,
+  `-adapters`, `muxad`, `muxa`) into a single `muxa` lib plus the two
+  binaries. No public API or wire-protocol changes — the prior split
+  was internal scaffolding.
+- `TRANSITION_CHANNEL_CAPACITY` raised 64 → 256 to give long-lived SSE
+  subscribers headroom against pane-burst events.
 - Workspace leans on `strum` for enum derives and `RUST_LOG` for log
   filtering; redundant config knobs removed.
 - `muxa watch` now includes untracked tmux panes alongside tracked
