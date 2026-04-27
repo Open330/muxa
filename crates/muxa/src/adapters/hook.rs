@@ -35,6 +35,14 @@ pub trait HookAdapter {
 /// Shared hook entrypoint. Binaries call this after parsing `--event`.
 ///
 /// Reads stdin to EOF, parses as `A::Input`, normalizes to `AgentEvent`.
+///
+/// `pane` resolution: prefer the `TMUX_PANE` env var (set by tmux for
+/// any process running inside a pane). When that's missing — most
+/// commonly because the hook fired from a Claude Code SDK sub-process
+/// whose env didn't inherit it — fall back to walking the process
+/// ancestry and matching against `tmux list-panes`'s `pane_pid` map.
+/// The fallback is best-effort: any failure (no tmux, /proc unreadable,
+/// no match) yields `pane: None` exactly as before.
 pub fn run_hook<A, R>(event_flag: &str, stdin: &mut R) -> Result<AgentEvent, AdapterError>
 where
     A: HookAdapter,
@@ -44,8 +52,28 @@ where
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
-    let pane = std::env::var("TMUX_PANE").ok();
+    let pane = std::env::var("TMUX_PANE")
+        .ok()
+        .or_else(resolve_pane_via_ancestry);
     Ok(A::normalize(event, input, pane))
+}
+
+/// Walk our parent PID chain and look each ancestor up in the tmux
+/// pane-pid map. Returns the matching `pane_id` string when an
+/// ancestor is the shell of a known tmux pane.
+///
+/// Skips entirely when tmux returns no panes (no server running, etc).
+fn resolve_pane_via_ancestry() -> Option<String> {
+    use crate::adapters::proc_ancestry::{ancestor_in_set, parent_pid};
+    use crate::tmux::pane_pid_map;
+    let pid_map = pane_pid_map();
+    if pid_map.is_empty() {
+        return None;
+    }
+    let pids: std::collections::HashSet<u32> = pid_map.keys().copied().collect();
+    let me = std::process::id();
+    let matched = ancestor_in_set(me, &pids, parent_pid)?;
+    pid_map.get(&matched).cloned()
 }
 
 /// Utility: truncate a prompt/message to `max` bytes, appending a single

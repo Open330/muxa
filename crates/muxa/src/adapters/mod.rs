@@ -14,6 +14,7 @@ pub mod codex;
 pub mod gemini;
 pub mod hook;
 pub mod opencode;
+pub mod proc_ancestry;
 pub mod transcript;
 
 pub use hook::{run_hook, AdapterError, HookAdapter};

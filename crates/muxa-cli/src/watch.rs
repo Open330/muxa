@@ -119,7 +119,24 @@ impl WatchColumn {
     /// of it when the row is selected and a detail template is enabled.
     fn agent_text<'a>(self, a: &'a Agent, now: OffsetDateTime, panes: &'a [PaneInfo]) -> Text<'a> {
         match self {
-            Self::Pane => pane_display(a.pane.as_deref(), panes).into(),
+            Self::Pane => {
+                let label = pane_display(a.pane.as_deref(), panes);
+                // Dim the pane cell when there's nothing to attach to —
+                // a deliberate visual signal that Enter won't do anything
+                // useful for this row. Keeping the rest of the row's
+                // columns at full brightness preserves readability of
+                // state/prompt/etc.
+                if a.pane.is_none() {
+                    Text::from(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                    ))
+                } else {
+                    label.into()
+                }
+            }
             Self::Kind => a.kind.to_string().into(),
             Self::State => {
                 let style = match a.state {
@@ -410,7 +427,12 @@ impl App {
 /// from there instead.
 fn pane_display(pane_id: Option<&str>, panes: &[PaneInfo]) -> String {
     let Some(id) = pane_id else {
-        return "-".into();
+        // Distinguished from "—" / dash placeholders elsewhere so users
+        // can see at a glance which agents have no tmux attachment to
+        // jump into. Common case: Claude SDK sub-process whose env
+        // didn't carry TMUX_PANE and whose process ancestry walk also
+        // failed to find a pane.
+        return "(no pane)".into();
     };
     match panes.iter().find(|p| p.pane_id == id) {
         Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
@@ -1053,8 +1075,8 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
     format!("{days}d ago")
 }
 
-fn render_footer(f: &mut Frame, area: Rect, _app: &App) {
-    let hint = Line::from(vec![
+fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![
         Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" move  "),
         Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
@@ -1063,8 +1085,33 @@ fn render_footer(f: &mut Frame, area: Rect, _app: &App) {
         Span::raw(" refresh  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" quit"),
-    ]);
-    f.render_widget(Paragraph::new(hint), area);
+    ];
+    // When the highlighted row has no pane to attach to (e.g. a Claude
+    // SDK sub-process whose env didn't carry TMUX_PANE and whose
+    // ancestry walk didn't recover one) tell the user why Enter is a
+    // no-op rather than letting the keystroke vanish silently.
+    if selected_has_no_pane(app) {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            "no tmux pane — attach unavailable",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn selected_has_no_pane(app: &App) -> bool {
+    let Some(i) = app.table_state.selected() else {
+        return false;
+    };
+    match app.rows.get(i) {
+        Some(WatchRow::Agent(a)) => a.pane.is_none(),
+        // BarePane rows always have a pane id; tmux gives them a
+        // pane_id by definition.
+        Some(WatchRow::BarePane(_)) | None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1251,7 +1298,10 @@ mod tests {
         // pane id; we expect the raw id back.
         let panes: Vec<PaneInfo> = Vec::new();
         assert_eq!(pane_display(Some("%9999"), &panes), "%9999");
-        assert_eq!(pane_display(None, &panes), "-");
+        // None now renders explicitly as "(no pane)" to surface the
+        // attach-unavailable case visually rather than mimicking a
+        // generic "no data" dash.
+        assert_eq!(pane_display(None, &panes), "(no pane)");
     }
 
     #[test]
@@ -1755,6 +1805,103 @@ mod tests {
             !text.contains("↳"),
             "default template must suppress detail when last_response is None"
         );
+    }
+
+    // ---- pane=None UX safety net ------------------------------------------
+
+    #[test]
+    fn footer_hints_when_selected_row_has_no_pane() {
+        // Build a buffer-backed render with one agent that has no pane
+        // (the SDK sub-agent case). Selecting it must put a yellow
+        // "no tmux pane — attach unavailable" hint in the footer, where
+        // a regular agent would just show the keybinds.
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_data(
+            vec![fake_agent(
+                "s-no-pane",
+                None,
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                Some("a sub-agent prompt"),
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            dump.contains("attach unavailable"),
+            "expected pane=None footer hint in render"
+        );
+        assert!(
+            dump.contains("(no pane)"),
+            "expected '(no pane)' label in PANE column"
+        );
+    }
+
+    #[test]
+    fn footer_hides_hint_when_selected_row_has_pane() {
+        // Sanity check the inverse — a regular agent must NOT show the
+        // pane=None hint.
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_data(
+            vec![fake_agent(
+                "s",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!dump.contains("attach unavailable"));
+        assert!(!dump.contains("(no pane)"));
+    }
+
+    #[test]
+    fn selected_pane_returns_none_for_no_pane_agent() {
+        let mut app = App::new();
+        app.set_data(
+            vec![fake_agent(
+                "s",
+                None,
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        // Existing Action::Attach branch is `if let Some(pane) = ...`,
+        // so returning None here is what causes Enter to silently no-op.
+        // The footer hint added above is the user-facing fix; this
+        // assertion just nails down the underlying contract.
+        assert_eq!(app.selected_pane(), None);
     }
 
     /// `apply_outcome` is the only path data flows back into `App`. It
