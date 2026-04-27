@@ -28,7 +28,7 @@ use muxa::AgentState;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use std::collections::HashSet;
@@ -114,10 +114,13 @@ impl WatchColumn {
         }
     }
 
-    fn agent_cell<'a>(self, a: &'a Agent, now: OffsetDateTime, panes: &'a [PaneInfo]) -> Cell<'a> {
+    /// Build the `Text` content for one cell. Returning `Text` (rather
+    /// than a finished `Cell`) lets the caller stack a second line on top
+    /// of it when the row is selected and a detail template is enabled.
+    fn agent_text<'a>(self, a: &'a Agent, now: OffsetDateTime, panes: &'a [PaneInfo]) -> Text<'a> {
         match self {
-            Self::Pane => Cell::from(pane_display(a.pane.as_deref(), panes)),
-            Self::Kind => Cell::from(a.kind.to_string()),
+            Self::Pane => pane_display(a.pane.as_deref(), panes).into(),
+            Self::Kind => a.kind.to_string().into(),
             Self::State => {
                 let style = match a.state {
                     AgentState::Working => Style::default().fg(Color::Green),
@@ -128,40 +131,40 @@ impl WatchColumn {
                         .add_modifier(Modifier::DIM),
                     AgentState::Starting => Style::default().fg(Color::Cyan),
                 };
-                Cell::from(a.state.to_string()).style(style)
+                Text::from(Span::styled(a.state.to_string(), style))
             }
-            Self::Model => Cell::from(a.model.as_deref().unwrap_or("-").to_string()),
-            Self::Ctx => Cell::from(
-                a.context_used_pct
-                    .map_or_else(|| "-".into(), |p| format!("{p:>3.0}%")),
-            ),
-            Self::Cost => Cell::from(
-                a.cost_usd
-                    .map_or_else(|| "-".into(), |c| format!("${c:.2}")),
-            ),
-            Self::Prompt => Cell::from(
-                a.last_prompt
-                    .as_deref()
-                    .unwrap_or("-")
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect::<String>(),
-            ),
-            Self::Activity => Cell::from(relative_time(a.last_activity_at, now)),
+            Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
+            Self::Ctx => a
+                .context_used_pct
+                .map_or_else(|| "-".into(), |p| format!("{p:>3.0}%"))
+                .into(),
+            Self::Cost => a
+                .cost_usd
+                .map_or_else(|| "-".into(), |c| format!("${c:.2}"))
+                .into(),
+            Self::Prompt => a
+                .last_prompt
+                .as_deref()
+                .unwrap_or("-")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect::<String>()
+                .into(),
+            Self::Activity => relative_time(a.last_activity_at, now).into(),
         }
     }
 
-    fn bare_cell(self, p: &PaneInfo) -> Cell<'_> {
+    fn bare_text(self, p: &PaneInfo) -> Text<'_> {
         let dim = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
         match self {
             Self::Pane => {
                 let pane = format!("{}:{}.{}", p.session, p.window_index, p.pane_index);
-                Cell::from(pane).style(dim)
+                Text::from(Span::styled(pane, dim))
             }
             // Bare panes have no agent metadata. We surface the pane title /
             // current command in the prompt slot so the row still carries
@@ -173,10 +176,12 @@ impl WatchColumn {
                     format!("{}  {}", p.current_command, p.title)
                 };
                 let summary: String = summary.chars().take(80).collect();
-                Cell::from(summary).style(dim)
+                Text::from(Span::styled(summary, dim))
             }
-            Self::Kind | Self::State => Cell::from("—").style(dim),
-            Self::Model | Self::Ctx | Self::Cost | Self::Activity => Cell::from("-").style(dim),
+            Self::Kind | Self::State => Text::from(Span::styled("—", dim)),
+            Self::Model | Self::Ctx | Self::Cost | Self::Activity => {
+                Text::from(Span::styled("-", dim))
+            }
         }
     }
 }
@@ -831,22 +836,40 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header = Row::new(header_cells).height(1);
 
     let now = OffsetDateTime::now_utc();
+    let selected = app.table_state.selected();
+    let detail_host = detail_host_column(&app.columns);
     let rows: Vec<Row> = app
         .rows
         .iter()
-        .map(|r| match r {
-            WatchRow::Agent(a) => Row::new(
-                app.columns
+        .enumerate()
+        .map(|(i, r)| {
+            let mut texts: Vec<Text> = match r {
+                WatchRow::Agent(a) => app
+                    .columns
                     .iter()
-                    .map(|c| c.agent_cell(a, now, &app.panes))
-                    .collect::<Vec<_>>(),
-            ),
-            WatchRow::BarePane(p) => Row::new(
-                app.columns
-                    .iter()
-                    .map(|c| c.bare_cell(p))
-                    .collect::<Vec<_>>(),
-            ),
+                    .map(|c| c.agent_text(a, now, &app.panes))
+                    .collect(),
+                WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
+            };
+
+            let mut expanded = false;
+            if Some(i) == selected && app.watch_cfg.detail.enabled {
+                if let Some(host) = detail_host {
+                    if let Some(detail) =
+                        format_detail(&app.watch_cfg.detail.template, r, &app.panes, now)
+                    {
+                        texts[host] = stack_detail(std::mem::take(&mut texts[host]), &detail);
+                        expanded = true;
+                    }
+                }
+            }
+
+            let row = Row::new(texts.into_iter().map(Cell::from).collect::<Vec<_>>());
+            if expanded {
+                row.height(2)
+            } else {
+                row
+            }
         })
         .collect();
 
@@ -872,6 +895,140 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// Pick which column hosts the expanded detail line. Prefer `Prompt` (the
+/// natural fit and what the default template targets); otherwise the
+/// last column, which is usually the widest catch-all (`Activity`,
+/// or any `Min`-constrained column the user added).
+fn detail_host_column(cols: &[WatchColumn]) -> Option<usize> {
+    if cols.is_empty() {
+        return None;
+    }
+    cols.iter()
+        .position(|c| matches!(c, WatchColumn::Prompt))
+        .or(Some(cols.len() - 1))
+}
+
+/// Stack a dim "↳ detail" hint underneath `top` so the host cell renders
+/// as 2 lines. Caller must also bump the row height to 2.
+fn stack_detail<'a>(top: Text<'a>, detail: &str) -> Text<'a> {
+    let mut lines: Vec<Line<'a>> = top.lines;
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("↳ {}", truncate_chars(detail, 240)),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+    )));
+    Text::from(lines)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// Build the detail string by interpolating `{name}` placeholders against
+/// the row. Returns `None` when the resulting string is empty after
+/// trimming (so callers can skip rendering an empty hint).
+///
+/// Newlines in source values are collapsed to ` · ` so the detail stays
+/// on one visual line — the row is fixed at height 2.
+fn format_detail(
+    template: &str,
+    row: &WatchRow,
+    panes: &[PaneInfo],
+    now: OffsetDateTime,
+) -> Option<String> {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '{' {
+            out.push(c);
+            continue;
+        }
+        let mut name = String::new();
+        let mut closed = false;
+        for nc in chars.by_ref() {
+            if nc == '}' {
+                closed = true;
+                break;
+            }
+            name.push(nc);
+        }
+        if !closed {
+            out.push('{');
+            out.push_str(&name);
+            continue;
+        }
+        // Unknown placeholder: leave the literal so the user sees it
+        // and can fix the typo, rather than silently producing empty.
+        if let Some(v) = resolve_var(&name, row, panes, now) {
+            out.push_str(&collapse_lines(&v));
+        } else {
+            out.push('{');
+            out.push_str(&name);
+            out.push('}');
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() || trimmed == "—" || trimmed == "-" {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn collapse_lines(s: &str) -> String {
+    s.lines().collect::<Vec<_>>().join(" · ")
+}
+
+fn resolve_var(
+    name: &str,
+    row: &WatchRow,
+    panes: &[PaneInfo],
+    now: OffsetDateTime,
+) -> Option<String> {
+    match row {
+        WatchRow::Agent(a) => Some(match name {
+            "pane" => pane_display(a.pane.as_deref(), panes),
+            "kind" => a.kind.to_string(),
+            "state" => a.state.to_string(),
+            "model" => a.model.clone().unwrap_or_else(|| "—".into()),
+            "ctx" => a
+                .context_used_pct
+                .map_or_else(|| "—".into(), |p| format!("{p:.0}%")),
+            "cost" => a
+                .cost_usd
+                .map_or_else(|| "—".into(), |c| format!("${c:.2}")),
+            "activity" => relative_time(a.last_activity_at, now),
+            "last_prompt" => a.last_prompt.clone().unwrap_or_else(|| "—".into()),
+            "last_notification" => a.last_notification.clone().unwrap_or_else(|| "—".into()),
+            "cwd" => a.cwd.clone().unwrap_or_else(|| "—".into()),
+            _ => return None,
+        }),
+        WatchRow::BarePane(p) => Some(match name {
+            "pane" => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
+            "kind" => p.current_command.clone(),
+            "last_prompt" => {
+                if p.title.is_empty() || p.title == p.current_command {
+                    p.current_command.clone()
+                } else {
+                    p.title.clone()
+                }
+            }
+            "state" | "model" | "ctx" | "cost" | "activity" | "last_notification" | "cwd" => {
+                "—".into()
+            }
+            _ => return None,
+        }),
+    }
 }
 
 fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
@@ -1179,6 +1336,7 @@ mod tests {
         let cfg = WatchConfig {
             columns: vec!["prompt".into(), "pane".into(), "kind".into()],
             widths: HashMap::new(),
+            ..Default::default()
         };
         let app = App::with_config(cfg);
         assert_eq!(
@@ -1192,6 +1350,7 @@ mod tests {
         let cfg = WatchConfig {
             columns: vec!["pane".into(), "bogus".into(), "prompt".into()],
             widths: HashMap::new(),
+            ..Default::default()
         };
         let app = App::with_config(cfg);
         // "bogus" was warned-and-skipped; the rest survive in order.
@@ -1213,6 +1372,7 @@ mod tests {
                 "state".into(),
             ],
             widths,
+            ..Default::default()
         };
         assert_eq!(
             resolve_width(WatchColumn::Pane, &cfg),
@@ -1239,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_cell_renders_for_each_column_kind() {
+    fn agent_text_renders_for_each_column_kind() {
         let now = OffsetDateTime::now_utc();
         let a = fake_agent(
             "s",
@@ -1251,7 +1411,7 @@ mod tests {
             Some(42.0),
             Some(0.34),
         );
-        // Smoke-test that every column variant produces a Cell without panic.
+        // Smoke-test that every column variant produces a Text without panic.
         for col in [
             WatchColumn::Pane,
             WatchColumn::Kind,
@@ -1262,7 +1422,7 @@ mod tests {
             WatchColumn::Prompt,
             WatchColumn::Activity,
         ] {
-            let _ = col.agent_cell(&a, now, &[]);
+            let _ = col.agent_text(&a, now, &[]);
         }
     }
 
@@ -1274,6 +1434,7 @@ mod tests {
         let cfg = WatchConfig {
             columns: vec!["pane".into(), "prompt".into()],
             widths: HashMap::new(),
+            ..Default::default()
         };
         let mut app = App::with_config(cfg);
         app.set_data(
@@ -1386,6 +1547,160 @@ mod tests {
         task.await.expect("refresh_task joins on shutdown");
     }
 
+    // ---- detail row -------------------------------------------------------
+
+    #[test]
+    fn detail_host_prefers_prompt_then_falls_back_to_last() {
+        assert_eq!(
+            detail_host_column(&[
+                WatchColumn::Pane,
+                WatchColumn::Prompt,
+                WatchColumn::Activity
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            detail_host_column(&[WatchColumn::Pane, WatchColumn::State, WatchColumn::Activity]),
+            Some(2)
+        );
+        assert_eq!(detail_host_column(&[]), None);
+    }
+
+    #[test]
+    fn format_detail_interpolates_known_vars_and_collapses_lines() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("first line\nsecond line"),
+            Some("Opus"),
+            Some(7.0),
+            Some(0.05),
+        );
+        let row = WatchRow::Agent(a);
+        let s = format_detail("{model} · {last_prompt}", &row, &[], now).unwrap();
+        assert!(s.contains("Opus"));
+        assert!(s.contains("first line · second line"));
+    }
+
+    #[test]
+    fn format_detail_returns_none_when_only_dashes() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+        );
+        let row = WatchRow::Agent(a);
+        // Default template renders `—` because last_prompt is missing —
+        // detail should be suppressed instead of cluttering the row.
+        assert!(format_detail("{last_prompt}", &row, &[], now).is_none());
+    }
+
+    #[test]
+    fn format_detail_preserves_unknown_placeholder_literal() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hi"),
+            None,
+            None,
+            None,
+        );
+        let row = WatchRow::Agent(a);
+        let s = format_detail("{nope} {last_prompt}", &row, &[], now).unwrap();
+        assert!(s.contains("{nope}"));
+        assert!(s.contains("hi"));
+    }
+
+    #[test]
+    fn selected_row_renders_with_extra_detail_line() {
+        // Render to a TestBackend and assert the detail prefix appears in
+        // the buffer for the selected row only.
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_data(
+            vec![
+                fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::WaitingInput,
+                    Some("waiting prompt that is long enough to be visible in the detail line"),
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s2",
+                    Some("%2"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    Some("another prompt"),
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // The ↳ marker is unique to the detail line.
+        assert!(text.contains("↳"), "expected detail marker in render");
+    }
+
+    #[test]
+    fn detail_disabled_skips_expansion() {
+        let cfg = WatchConfig {
+            detail: muxa::config::DetailConfig {
+                enabled: false,
+                template: "{last_prompt}".into(),
+            },
+            ..Default::default()
+        };
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                Some("hello"),
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!text.contains("↳"), "detail line must be suppressed");
+    }
+
     /// `apply_outcome` is the only path data flows back into `App`. It
     /// must mirror what the old inline `refresh` helper did: stash the
     /// error and feed agents+panes through `set_data`.
@@ -1413,5 +1728,332 @@ mod tests {
         assert_eq!(app.rows.len(), 2);
         assert!(app.last_error.is_some());
         assert_eq!(app.last_error.as_ref().unwrap().message, "boom");
+    }
+
+    // ---- detail row: precise visual layout --------------------------------
+
+    /// Read one full visual row of text from the `TestBackend` buffer. Trims
+    /// trailing whitespace so callers can substring-match without juggling
+    /// padding.
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        let area = buf.area();
+        let mut s = String::with_capacity(usize::from(area.width));
+        for x in 0..area.width {
+            s.push_str(buf.cell((x, y)).map_or("", ratatui::buffer::Cell::symbol));
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Build an `App` configured to put the detail line on the Prompt
+    /// column with three rows of agents. Returns the constructed app.
+    fn three_agent_app(detail: muxa::config::DetailConfig) -> App {
+        let cfg = WatchConfig {
+            detail,
+            ..Default::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Working,
+                    Some("ALPHAprompt"),
+                    Some("Opus"),
+                    Some(7.0),
+                    Some(0.05),
+                ),
+                fake_agent(
+                    "s2",
+                    Some("%2"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    Some("BETAprompt"),
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s3",
+                    Some("%3"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Working,
+                    Some("GAMMAprompt"),
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        app
+    }
+
+    /// Selected row's host column should render exactly 2 visual lines:
+    /// the original cell on row N, the `↳ <detail>` hint on row N+1.
+    /// Non-selected rows must remain 1 line tall and no detail glyph
+    /// should appear on their row.
+    #[test]
+    fn detail_line_lands_on_row_below_selection() {
+        let backend = TestBackend::new(140, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        // Select the middle row so we can probe rows on both sides.
+        app.table_state.select(Some(1));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Layout: header chunk = 3 rows (y=0..2), then table chunk with
+        // `Borders::ALL` + a header row -> data rows start at y = 3 + 1
+        // (top border) + 1 (header) = y=5.
+        // Rows:
+        //   y=5  ALPHAprompt (row 0, not selected)
+        //   y=6  BETAprompt  (row 1, selected, 2-line)
+        //   y=7  ↳ BETAprompt (detail line)
+        //   y=8  GAMMAprompt (row 2, not selected)
+        let r0 = row_text(buf, 5);
+        let r1 = row_text(buf, 6);
+        let r1_detail = row_text(buf, 7);
+        let r2 = row_text(buf, 8);
+
+        assert!(r0.contains("ALPHAprompt"), "row 0 missing top text: {r0:?}",);
+        assert!(!r0.contains("↳"), "row 0 must not carry detail: {r0:?}");
+        assert!(
+            r1.contains("BETAprompt"),
+            "selected row missing top text: {r1:?}",
+        );
+        assert!(
+            !r1.contains("↳"),
+            "selected row's first line must not be the detail line: {r1:?}",
+        );
+        assert!(
+            r1_detail.contains("↳") && r1_detail.contains("BETAprompt"),
+            "detail line not on the row directly below the selection: {r1_detail:?}",
+        );
+        assert!(r2.contains("GAMMAprompt"), "row 2 missing top text: {r2:?}",);
+        assert!(!r2.contains("↳"), "row 2 must not carry detail: {r2:?}");
+    }
+
+    /// When `[watch.detail] enabled = false`, every row should be one
+    /// visual line — the rows pack against each other with no gap, and
+    /// no `↳` glyph appears anywhere.
+    #[test]
+    fn detail_disabled_keeps_all_rows_at_one_line() {
+        let backend = TestBackend::new(140, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig {
+            enabled: false,
+            template: "{last_prompt}".into(),
+        });
+        app.table_state.select(Some(1));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // y=5/6/7 should be the three packed rows.
+        assert!(row_text(buf, 5).contains("ALPHAprompt"));
+        assert!(row_text(buf, 6).contains("BETAprompt"));
+        assert!(row_text(buf, 7).contains("GAMMAprompt"));
+        // No detail anywhere.
+        let dump: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!dump.contains("↳"));
+    }
+
+    /// `format_detail` output must round-trip through render: even a
+    /// custom template (referencing a non-prompt var) shows up under
+    /// the selected row.
+    #[test]
+    fn custom_template_renders_below_selection() {
+        let detail = muxa::config::DetailConfig {
+            enabled: true,
+            template: "model={model} prompt={last_prompt}".into(),
+        };
+        let backend = TestBackend::new(160, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(detail);
+        app.table_state.select(Some(0));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Selected row (idx 0) sits at y=5; detail at y=6.
+        let detail_line = row_text(buf, 6);
+        assert!(
+            detail_line.contains("↳"),
+            "expected detail glyph at y=6: {detail_line:?}",
+        );
+        assert!(
+            detail_line.contains("model=Opus"),
+            "expected interpolated model: {detail_line:?}",
+        );
+        assert!(
+            detail_line.contains("prompt=ALPHAprompt"),
+            "expected interpolated prompt: {detail_line:?}",
+        );
+    }
+
+    // ---- detail edge cases -----------------------------------------------
+
+    #[test]
+    fn empty_template_returns_none() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hi"),
+            None,
+            None,
+            None,
+        );
+        let row = WatchRow::Agent(a);
+        // Empty after trimming -> suppress.
+        assert!(format_detail("", &row, &[], now).is_none());
+        assert!(format_detail("   ", &row, &[], now).is_none());
+    }
+
+    #[test]
+    fn literal_only_template_passes_through_verbatim() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hi"),
+            None,
+            None,
+            None,
+        );
+        let row = WatchRow::Agent(a);
+        let s = format_detail("just a literal string", &row, &[], now).unwrap();
+        assert_eq!(s, "just a literal string");
+    }
+
+    #[test]
+    fn unmatched_open_brace_does_not_panic() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hi"),
+            None,
+            None,
+            None,
+        );
+        let row = WatchRow::Agent(a);
+        // Trailing `{last_prompt` (no closing `}`) — current behavior
+        // emits the literal so the user sees their typo.
+        let s = format_detail("oops {last_prompt", &row, &[], now).unwrap();
+        assert!(s.contains("oops"));
+        assert!(s.contains("{last_prompt"));
+    }
+
+    #[test]
+    fn truncate_chars_boundary_at_max() {
+        // Exactly `max` -> no ellipsis.
+        let s_240: String = "a".repeat(240);
+        let out = truncate_chars(&s_240, 240);
+        assert_eq!(out.chars().count(), 240);
+        assert!(!out.ends_with('…'));
+
+        // 241 -> ellipsis appended after 240 chars.
+        let s_241: String = "a".repeat(241);
+        let out = truncate_chars(&s_241, 240);
+        assert_eq!(out.chars().count(), 241);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_handles_multibyte_and_wide() {
+        // 5 wide CJK chars, max 3 -> 3 chars + ellipsis.
+        let out = truncate_chars("가나다라마", 3);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("가나다"));
+
+        // Emoji (single scalar) — no panic on byte boundaries.
+        let out2 = truncate_chars("🦀🦀🦀🦀", 2);
+        assert_eq!(out2.chars().count(), 3);
+    }
+
+    #[test]
+    fn very_long_detail_renders_without_panic() {
+        // Long enough to exceed any reasonable terminal width plus the
+        // `truncate_chars` ceiling.
+        let long: String = "x".repeat(2000);
+        let cfg = WatchConfig::default();
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                Some(&long),
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // The detail line is capped at 240 chars + ellipsis; we only
+        // care that a `↳` glyph still got placed and rendering didn't
+        // wrap-around or panic.
+        let dump: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(dump.contains("↳"));
+    }
+
+    #[test]
+    fn bare_pane_detail_resolves_dashes_for_agent_only_vars() {
+        // Custom template references `{model}` (agent-only). For a bare
+        // pane this should resolve to `—`. With ONLY agent-only vars,
+        // the suppress-empty rule does not kick in (since the template
+        // has a literal "model=" prefix), so we should still get a
+        // detail line — and the rendered content includes the dash.
+        let now = OffsetDateTime::now_utc();
+        let p = fake_pane("%99", "side", 0, 0, "vim");
+        let row = WatchRow::BarePane(p);
+        let s = format_detail("model={model}", &row, &[], now).unwrap();
+        assert_eq!(s, "model=—");
+    }
+
+    #[test]
+    fn bare_pane_detail_with_only_agent_var_collapses_to_dash() {
+        // Template that resolves *purely* to `—` after interpolation —
+        // current `format_detail` suppresses this so we don't render
+        // a detail line that says nothing useful.
+        let now = OffsetDateTime::now_utc();
+        let p = fake_pane("%99", "side", 0, 0, "vim");
+        let row = WatchRow::BarePane(p);
+        assert!(format_detail("{model}", &row, &[], now).is_none());
+    }
+
+    #[test]
+    fn selection_at_last_row_with_short_terminal_does_not_panic() {
+        // 8 rows tall: header(3) + table(top border+header+rows...) + footer(1).
+        // With 3 agents and the last selected (height=2), the table
+        // body needs ~5 rows of content. Terminal is intentionally
+        // tight to surface any clipping panics from ratatui.
+        let backend = TestBackend::new(120, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(2));
+        // Render twice in case the first frame computes a different
+        // viewport offset than the second (TableState retains state).
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
     }
 }
