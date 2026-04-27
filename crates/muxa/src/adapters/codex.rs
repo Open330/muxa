@@ -97,7 +97,11 @@ impl HookAdapter for CodexAdapter {
                 ),
                 at,
             },
-            Event::Stop => AgentEvent::TurnStopped { id, at },
+            Event::Stop => AgentEvent::TurnStopped {
+                id,
+                response: None,
+                at,
+            },
         }
     }
 }

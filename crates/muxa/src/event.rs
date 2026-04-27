@@ -89,6 +89,13 @@ pub enum AgentEvent {
     },
     TurnStopped {
         id: AgentId,
+        /// Assistant's response text for the turn that just ended, when
+        /// the adapter was able to read it from the transcript. Optional
+        /// (and `#[serde(default)]`) so adapters that can't capture a
+        /// response — and older protocol peers that predate this field —
+        /// stay wire-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<String>,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
@@ -161,5 +168,42 @@ mod tests {
     fn kind_serializes_snake_case() {
         let json = serde_json::to_string(&AgentKind::GeminiCli).unwrap();
         assert_eq!(json, "\"gemini_cli\"");
+    }
+
+    /// Older muxa peers emit `TurnStopped` without the `response` field.
+    /// `#[serde(default)]` must let the new client deserialize them
+    /// instead of erroring out — otherwise a daemon and CLI on different
+    /// versions can't talk.
+    #[test]
+    fn turn_stopped_deserializes_without_response_field() {
+        let json = r#"{
+            "type": "turn_stopped",
+            "id": {"kind": "claude_code", "session_id": "s", "pane": null, "cwd": null},
+            "at": "2026-04-24T12:00:00Z"
+        }"#;
+        let ev: AgentEvent = serde_json::from_str(json).unwrap();
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => assert_eq!(response, None),
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn turn_stopped_without_response_omits_field_in_json() {
+        let ev = AgentEvent::TurnStopped {
+            id: AgentId {
+                kind: AgentKind::ClaudeCode,
+                session_id: "s".into(),
+                pane: None,
+                cwd: None,
+            },
+            response: None,
+            at: datetime!(2026-04-24 12:00:00 UTC),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        // `skip_serializing_if = "Option::is_none"` keeps the wire payload
+        // identical to the pre-`response` schema for adapters that don't
+        // capture a response.
+        assert!(!json.contains("response"), "json was: {json}");
     }
 }
