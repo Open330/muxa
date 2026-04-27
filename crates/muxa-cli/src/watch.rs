@@ -1817,21 +1817,21 @@ mod tests {
         let r1_detail = row_text(buf, 7);
         let r2 = row_text(buf, 8);
 
-        assert!(r0.contains("ALPHAprompt"), "row 0 missing top text: {r0:?}",);
+        assert!(r0.contains("ALPHAprompt"), "row 0 missing top text: {r0:?}");
         assert!(!r0.contains("↳"), "row 0 must not carry detail: {r0:?}");
         assert!(
             r1.contains("BETAprompt"),
-            "selected row missing top text: {r1:?}",
+            "selected row missing top text: {r1:?}"
         );
         assert!(
             !r1.contains("↳"),
-            "selected row's first line must not be the detail line: {r1:?}",
+            "selected row's first line must not be the detail line: {r1:?}"
         );
         assert!(
             r1_detail.contains("↳") && r1_detail.contains("BETAprompt"),
-            "detail line not on the row directly below the selection: {r1_detail:?}",
+            "detail line not on the row directly below the selection: {r1_detail:?}"
         );
-        assert!(r2.contains("GAMMAprompt"), "row 2 missing top text: {r2:?}",);
+        assert!(r2.contains("GAMMAprompt"), "row 2 missing top text: {r2:?}");
         assert!(!r2.contains("↳"), "row 2 must not carry detail: {r2:?}");
     }
 
@@ -1881,15 +1881,15 @@ mod tests {
         let detail_line = row_text(buf, 6);
         assert!(
             detail_line.contains("↳"),
-            "expected detail glyph at y=6: {detail_line:?}",
+            "expected detail glyph at y=6: {detail_line:?}"
         );
         assert!(
             detail_line.contains("model=Opus"),
-            "expected interpolated model: {detail_line:?}",
+            "expected interpolated model: {detail_line:?}"
         );
         assert!(
             detail_line.contains("prompt=ALPHAprompt"),
-            "expected interpolated prompt: {detail_line:?}",
+            "expected interpolated prompt: {detail_line:?}"
         );
     }
 
