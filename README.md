@@ -55,6 +55,7 @@ via that agent's own hook / event-emission system.
 - [Live TUI](#live-tui)
 - [Web dashboard](#web-dashboard)
 - [Desktop notifications](#desktop-notifications)
+- [Companion: oh-my-prompt](#companion-oh-my-prompt)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Development](#development)
@@ -369,6 +370,28 @@ backend = "libnotify"
 ```
 
 Then restart the daemon.
+
+## Companion: oh-my-prompt
+
+[`oh-my-prompt`](https://github.com/jiunbae/oh-my-prompt) is `muxa`'s
+natural counterpart on the history side. Where `muxa` shows what
+your agents are doing **right now** — pane state, status-line glyphs,
+dashboard tiles — `omp` captures every prompt over time and turns
+the history into searchable, scored, project-tagged analytics. Same
+four agents on both sides; orthogonal axes.
+
+Forward `muxa`'s prompt events to your `omp` instance with a few
+lines of config:
+
+```toml
+[sinks.oh_my_prompt]
+enabled  = true
+endpoint = "https://prompt.jiun.dev"   # or your self-hosted URL
+# token is read from $OMP_SERVER_TOKEN by default — never put secrets in TOML
+```
+
+Default-off, endpoint required, best-effort with retry/backoff. Full
+guide in [`docs/SINKS.md`](docs/SINKS.md).
 
 ## Configuration
 
