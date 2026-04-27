@@ -208,7 +208,11 @@ impl Default for DetailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            template: "{last_prompt}".to_string(),
+            // The PROMPT column already shows the user's last prompt, so
+            // the detail row defaults to its complement — the assistant's
+            // last response. Users who want both can override with e.g.
+            // `template = "{last_prompt} → {last_response}"`.
+            template: "{last_response}".to_string(),
         }
     }
 }
@@ -357,10 +361,10 @@ broken = "what"
     }
 
     #[test]
-    fn detail_defaults_to_last_prompt_template() {
+    fn detail_defaults_to_last_response_template() {
         let cfg = WatchConfig::default();
         assert!(cfg.detail.enabled);
-        assert_eq!(cfg.detail.template, "{last_prompt}");
+        assert_eq!(cfg.detail.template, "{last_response}");
     }
 
     #[test]
@@ -376,7 +380,7 @@ template = "{cwd} · {last_prompt}"
     }
 
     /// Missing `[watch.detail]` section -> defaults applied (enabled +
-    /// `{last_prompt}` template). The `default = WatchConfig::default`
+    /// `{last_response}` template). The `default = WatchConfig::default`
     /// machinery on the parent struct must kick in.
     #[test]
     fn missing_watch_detail_section_uses_defaults() {
@@ -386,7 +390,7 @@ columns = ["pane", "prompt"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.watch.detail.enabled);
-        assert_eq!(cfg.watch.detail.template, "{last_prompt}");
+        assert_eq!(cfg.watch.detail.template, "{last_response}");
     }
 
     /// Partial `[watch.detail]` (only `enabled`, no `template`) — the
@@ -400,7 +404,7 @@ enabled = false
 ";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(!cfg.watch.detail.enabled);
-        assert_eq!(cfg.watch.detail.template, "{last_prompt}");
+        assert_eq!(cfg.watch.detail.template, "{last_response}");
     }
 
     /// `deny_unknown_fields` is in force on `DetailConfig` — a stray
