@@ -59,6 +59,12 @@ pub struct Agent {
     pub cwd: Option<String>,
     pub state: AgentState,
     pub last_prompt: Option<String>,
+    /// Last assistant response captured for this agent. Populated by the
+    /// `TurnStopped` ingest path when the adapter could read the
+    /// transcript; remains `None` for adapters that don't expose response
+    /// text (e.g., Codex/Gemini today). Optional so the field is purely
+    /// additive on the wire and in the UI.
+    pub last_response: Option<String>,
     pub last_notification: Option<String>,
     pub model: Option<String>,
     pub context_used_pct: Option<f32>,
@@ -84,6 +90,7 @@ impl Agent {
             cwd,
             state: AgentState::Starting,
             last_prompt: None,
+            last_response: None,
             last_notification: None,
             model: None,
             context_used_pct: None,
@@ -271,7 +278,10 @@ impl Store {
                     NotificationLevel::Info | NotificationLevel::Warning => {}
                 }
             }
-            AgentEvent::TurnStopped { .. } => {
+            AgentEvent::TurnStopped { response, .. } => {
+                if let Some(text) = response {
+                    agent.last_response = Some(text.clone());
+                }
                 if agent.state != AgentState::Error {
                     agent.state = AgentState::Idle;
                 }
@@ -401,6 +411,7 @@ mod tests {
         store
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
+                response: None,
                 at: now,
             })
             .await;
@@ -416,6 +427,65 @@ mod tests {
             store.by_session("s").await.unwrap().state,
             AgentState::Stopped
         );
+    }
+
+    #[tokio::test]
+    async fn turn_stopped_with_response_sets_last_response() {
+        let store = Store::shared();
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                response: Some("the assistant said hi".into()),
+                at: now,
+            })
+            .await;
+        let agent = store.by_session("s").await.unwrap();
+        assert_eq!(
+            agent.last_response.as_deref(),
+            Some("the assistant said hi")
+        );
+        // Idle transition still happens.
+        assert_eq!(agent.state, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn turn_stopped_without_response_preserves_prior_value() {
+        let store = Store::shared();
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                response: Some("first answer".into()),
+                at: now,
+            })
+            .await;
+        // A subsequent TurnStopped from an adapter that can't read
+        // transcripts (Codex/Gemini) must not blank the previously
+        // captured response.
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                response: None,
+                at: now,
+            })
+            .await;
+        let agent = store.by_session("s").await.unwrap();
+        assert_eq!(agent.last_response.as_deref(), Some("first answer"));
     }
 
     #[tokio::test]

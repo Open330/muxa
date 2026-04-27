@@ -15,8 +15,10 @@
 //! ```
 
 use super::hook::{truncate, AdapterError, HookAdapter};
+use super::transcript;
 use crate::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
 use serde::Deserialize;
+use std::path::PathBuf;
 use time::OffsetDateTime;
 
 pub struct ClaudeAdapter;
@@ -33,6 +35,11 @@ pub struct Input {
     pub message: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Path to the JSONL session transcript. Provided by Claude Code on
+    /// every hook event; we use it on `Stop` to extract the assistant's
+    /// last response since the hook payload itself doesn't carry one.
+    #[serde(default)]
+    pub transcript_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +113,14 @@ impl HookAdapter for ClaudeAdapter {
                     at,
                 }
             }
-            Event::Stop => AgentEvent::TurnStopped { id, at },
+            Event::Stop => {
+                let response = input
+                    .transcript_path
+                    .as_deref()
+                    .and_then(transcript::last_assistant_text)
+                    .map(|t| truncate(t, 4_000));
+                AgentEvent::TurnStopped { id, response, at }
+            }
             Event::SessionEnd => AgentEvent::SessionEnded { id, at },
         }
     }
@@ -162,5 +176,83 @@ pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> Age
         context_used_pct: input.context_window.and_then(|c| c.used_percentage),
         cost_usd: input.cost.and_then(|c| c.total_cost_usd),
         at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn stop_input(transcript_path: Option<PathBuf>) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: None,
+            notification_type: None,
+            message: None,
+            prompt: None,
+            transcript_path,
+        }
+    }
+
+    #[test]
+    fn stop_without_transcript_path_emits_none_response() {
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(None), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => assert!(response.is_none()),
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_transcript_path_pulls_last_assistant_text() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"hello from the model"}}]}}}}"#
+        )
+        .unwrap();
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(f.path().into())), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => {
+                assert_eq!(response.as_deref(), Some("hello from the model"));
+            }
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_long_response_truncates_to_4kb() {
+        let mut f = NamedTempFile::new().unwrap();
+        let huge = "x".repeat(10_000);
+        // Embed the long string in a JSON-safe way.
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{huge}"}}]}}}}"#
+        );
+        writeln!(f, "{line}").unwrap();
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(f.path().into())), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => {
+                let text = response.expect("response present");
+                // truncate() bound is 4_000 bytes + a single ellipsis (3
+                // bytes in UTF-8) — anything larger means the truncation
+                // hook isn't running.
+                assert!(text.len() <= 4_000 + 3, "got {} bytes", text.len());
+                assert!(text.ends_with('…'));
+            }
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_unreadable_path_emits_none_response() {
+        let path = PathBuf::from("/tmp/no-such-transcript-zzz.jsonl");
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(path)), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => assert!(response.is_none()),
+            _ => panic!("expected TurnStopped"),
+        }
     }
 }

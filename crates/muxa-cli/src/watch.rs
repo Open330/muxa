@@ -937,6 +937,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: prompt.map(Into::into),
+            last_response: None,
             last_notification: None,
             model: model.map(Into::into),
             context_used_pct: ctx,
