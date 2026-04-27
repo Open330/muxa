@@ -316,9 +316,10 @@ muxad --dashboard      # 이후 http://127.0.0.1:7878/ 접속
 비-루프백 바인딩은 `--allow-public` **그리고** 비어있지 않은
 `--dashboard-token` **둘 다** 없으면 startup에서 거절됩니다 — 호스트
 바깥으로 인증 없는 소켓을 못 열게 막아둔 안전망입니다. `?token=` 쿼리
-파라미터는 페이지 첫 로드에서 캡처되어 `sessionStorage`에 저장되고 URL
+파라미터는 페이지 첫 로드에서 캡처되어 `localStorage`에 저장되고 URL
 바에서는 제거됩니다. 이후 모든 요청에 `Authorization: Bearer …`로 자동
-부착됩니다.
+부착됩니다. 토큰은 탭 종료/브라우저 재시작에도 유지되므로 브라우저
+프로파일당 한 번만 붙여넣으면 됩니다.
 
 토큰 생성: `openssl rand -hex 32`. TLS가 필요하면 nginx/Caddy 같은 리버스
 프록시를 앞에 — 의도적으로 v1 범위 밖입니다.

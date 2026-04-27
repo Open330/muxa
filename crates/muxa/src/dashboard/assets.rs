@@ -16,7 +16,7 @@
 //! behind auth would prevent the only practical way to bootstrap the
 //! token in a browser, since `<script src="?token=...">` does not fly
 //! and `EventSource` can't set headers either. The token bootstrap path
-//! is documented in the JS: `?token=...` in the URL → sessionStorage →
+//! is documented in the JS: `?token=...` in the URL → localStorage →
 //! `Authorization: Bearer …` on every `/api/*` request thereafter. The
 //! `/api/*` routes remain auth-gated, which is the actual data
 //! boundary.

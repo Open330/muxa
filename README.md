@@ -335,8 +335,9 @@ Non-loopback binds are rejected at startup unless you pass *both*
 `--allow-public` and a non-empty `--dashboard-token` — the daemon won't
 let you open an unauthenticated socket beyond this host. The `?token=`
 query param is captured by the page on first load, stashed in
-`sessionStorage`, and stripped from the URL bar; subsequent requests
-attach it as `Authorization: Bearer …`.
+`localStorage`, and stripped from the URL bar; subsequent requests
+attach it as `Authorization: Bearer …`. The token persists across tab
+close and browser restart — paste once per browser profile.
 
 Generate a token with `openssl rand -hex 32`. Front with nginx/Caddy if
 you need TLS — it's intentionally out of scope.

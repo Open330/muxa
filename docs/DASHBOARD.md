@@ -52,8 +52,11 @@ muxad --dashboard --dashboard-token "$TOK"
 # then in the browser:  http://127.0.0.1:7878/?token=$TOK
 ```
 
-The page captures `?token=...` into `sessionStorage` and rewrites the URL.
-Subsequent requests carry `Authorization: Bearer <tok>`.
+The page captures `?token=...` into `localStorage` and rewrites the URL.
+Subsequent requests carry `Authorization: Bearer <tok>`. The token persists
+across tab close and browser restart, so you only need to paste it once per
+browser profile. To revoke, clear the `muxa.token` key (DevTools → Application
+→ Local Storage) or restart `muxad` with a different token.
 
 ### Public bind (LAN / VPN)
 

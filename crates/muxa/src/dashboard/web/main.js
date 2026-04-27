@@ -4,8 +4,9 @@
 // <script type="module" src="/static/main.js"> from index.html.
 //
 // Runtime model:
-//   * On boot, capture ?token=... from the URL into sessionStorage and
-//     scrub it from the URL bar.
+//   * On boot, capture ?token=... from the URL into localStorage and
+//     scrub it from the URL bar. localStorage persists across tab close
+//     and browser restart, so the user only needs to paste the token once.
 //   * Fetch /api/health to populate the version string and confirm the
 //     token is good before opening the SSE.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
@@ -31,14 +32,14 @@ function bootstrapToken() {
   const url = new URL(window.location.href);
   const fromUrl = url.searchParams.get("token");
   if (fromUrl) {
-    sessionStorage.setItem(TOKEN_KEY, fromUrl);
+    localStorage.setItem(TOKEN_KEY, fromUrl);
     url.searchParams.delete("token");
     window.history.replaceState({}, "", url.toString());
   }
 }
 
 function authHeaders() {
-  const token = sessionStorage.getItem(TOKEN_KEY);
+  const token = localStorage.getItem(TOKEN_KEY);
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
@@ -167,6 +168,53 @@ const store = {
   },
 };
 
+// ── Helpers ───────────────────────────────────────────────────────
+
+// Resolve a raw tmux pane id (e.g. "%1645") to a richer label
+// "session:window.pane" by cross-referencing the global pane scan. Falls
+// back to the raw id when no scan match is available (e.g. before the
+// first /api/panes response, or when the pane lives on an unreadable
+// socket).
+function resolvePaneLabel(paneId) {
+  if (!paneId) return "—";
+  const match = store.panes.find((p) => p.pane_id === paneId);
+  if (!match) return paneId;
+  return `${match.session}:${match.window_index}.${paneId}`;
+}
+
+// Copy text to clipboard. Uses the async Clipboard API when available
+// (HTTPS or loopback) and falls back to the legacy execCommand path so
+// the dashboard remains usable when reached over plain HTTP via a
+// hostname like june.rtzr.ai.
+async function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      // permission denied / blocked — fall through to legacy path
+    }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "0";
+  ta.style.left = "0";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  return ok;
+}
+
 // ── Rendering ─────────────────────────────────────────────────────
 
 function renderCounts() {
@@ -193,7 +241,7 @@ function renderAgents() {
 
   const html = rows
     .map((a) => {
-      const pane = a.pane || "—";
+      const pane = resolvePaneLabel(a.pane);
       const ctx = a.context_used_pct == null ? "—" : `${Math.round(a.context_used_pct)}%`;
       const cost = a.cost_usd == null ? "—" : `$${a.cost_usd.toFixed(2)}`;
       const prompt = (a.last_prompt || "—").split("\n")[0].slice(0, 120);
@@ -255,12 +303,10 @@ function renderPanes() {
   dom.panesBody.innerHTML = errHtml + html;
 
   dom.panesBody.querySelectorAll(".attach-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const cmd = btn.getAttribute("data-cmd");
-      navigator.clipboard
-        .writeText(cmd)
-        .then(() => showToast("copied attach command"))
-        .catch(() => showToast("clipboard blocked — copy manually"));
+      const ok = await copyToClipboard(cmd);
+      showToast(ok ? "copied attach command" : "clipboard blocked — copy manually");
     });
   });
 }
@@ -357,6 +403,10 @@ async function fetchPanes() {
   store.panes = data.panes || [];
   store.paneErrors = data.errors || [];
   renderPanes();
+  // Agent rows render their PANE column by looking up store.panes, so a
+  // refreshed pane scan can change those labels even when no agent
+  // transition fires.
+  renderAgents();
   renderCounts();
 }
 
