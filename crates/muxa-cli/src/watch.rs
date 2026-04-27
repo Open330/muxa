@@ -1646,35 +1646,34 @@ mod tests {
     #[test]
     fn selected_row_renders_with_extra_detail_line() {
         // Render to a TestBackend and assert the detail prefix appears in
-        // the buffer for the selected row only.
+        // the buffer for the selected row only. Default template is
+        // `{last_response}`, so the agent must have a captured response
+        // for the detail line to render (otherwise it suppresses).
         let backend = TestBackend::new(140, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.set_data(
-            vec![
-                fake_agent(
-                    "s1",
-                    Some("%1"),
-                    AgentKind::ClaudeCode,
-                    AgentState::WaitingInput,
-                    Some("waiting prompt that is long enough to be visible in the detail line"),
-                    None,
-                    None,
-                    None,
-                ),
-                fake_agent(
-                    "s2",
-                    Some("%2"),
-                    AgentKind::ClaudeCode,
-                    AgentState::Idle,
-                    Some("another prompt"),
-                    None,
-                    None,
-                    None,
-                ),
-            ],
-            vec![],
+        let mut a1 = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::WaitingInput,
+            Some("waiting prompt that is long enough to be visible in the detail line"),
+            None,
+            None,
+            None,
         );
+        a1.last_response = Some("the assistant said something".into());
+        let a2 = fake_agent(
+            "s2",
+            Some("%2"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            Some("another prompt"),
+            None,
+            None,
+            None,
+        );
+        app.set_data(vec![a1, a2], vec![]);
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let text: String = buf
@@ -1772,41 +1771,40 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::with_config(cfg);
-        app.set_data(
-            vec![
-                fake_agent(
-                    "s1",
-                    Some("%1"),
-                    AgentKind::ClaudeCode,
-                    AgentState::Working,
-                    Some("ALPHAprompt"),
-                    Some("Opus"),
-                    Some(7.0),
-                    Some(0.05),
-                ),
-                fake_agent(
-                    "s2",
-                    Some("%2"),
-                    AgentKind::ClaudeCode,
-                    AgentState::Idle,
-                    Some("BETAprompt"),
-                    None,
-                    None,
-                    None,
-                ),
-                fake_agent(
-                    "s3",
-                    Some("%3"),
-                    AgentKind::ClaudeCode,
-                    AgentState::Working,
-                    Some("GAMMAprompt"),
-                    None,
-                    None,
-                    None,
-                ),
-            ],
-            vec![],
+        let mut a1 = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("ALPHAprompt"),
+            Some("Opus"),
+            Some(7.0),
+            Some(0.05),
         );
+        a1.last_response = Some("ALPHAresp".into());
+        let mut a2 = fake_agent(
+            "s2",
+            Some("%2"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            Some("BETAprompt"),
+            None,
+            None,
+            None,
+        );
+        a2.last_response = Some("BETAresp".into());
+        let mut a3 = fake_agent(
+            "s3",
+            Some("%3"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("GAMMAprompt"),
+            None,
+            None,
+            None,
+        );
+        a3.last_response = Some("GAMMAresp".into());
+        app.set_data(vec![a1, a2, a3], vec![]);
         app
     }
 
@@ -1830,7 +1828,7 @@ mod tests {
         // Rows:
         //   y=5  ALPHAprompt (row 0, not selected)
         //   y=6  BETAprompt  (row 1, selected, 2-line)
-        //   y=7  ↳ BETAprompt (detail line)
+        //   y=7  ↳ BETAresp  (detail line — default template is `{last_response}`)
         //   y=8  GAMMAprompt (row 2, not selected)
         let r0 = row_text(buf, 5);
         let r1 = row_text(buf, 6);
@@ -1848,7 +1846,7 @@ mod tests {
             "selected row's first line must not be the detail line: {r1:?}"
         );
         assert!(
-            r1_detail.contains("↳") && r1_detail.contains("BETAprompt"),
+            r1_detail.contains("↳") && r1_detail.contains("BETAresp"),
             "detail line not on the row directly below the selection: {r1_detail:?}"
         );
         assert!(r2.contains("GAMMAprompt"), "row 2 missing top text: {r2:?}");
@@ -2004,25 +2002,25 @@ mod tests {
     #[test]
     fn very_long_detail_renders_without_panic() {
         // Long enough to exceed any reasonable terminal width plus the
-        // `truncate_chars` ceiling.
+        // `truncate_chars` ceiling. Default template is `{last_response}`,
+        // so the long string lives on the response field.
         let long: String = "x".repeat(2000);
         let cfg = WatchConfig::default();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::with_config(cfg);
-        app.set_data(
-            vec![fake_agent(
-                "s1",
-                Some("%1"),
-                AgentKind::ClaudeCode,
-                AgentState::Working,
-                Some(&long),
-                None,
-                None,
-                None,
-            )],
-            vec![],
+        let mut a = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hi"),
+            None,
+            None,
+            None,
         );
+        a.last_response = Some(long);
+        app.set_data(vec![a], vec![]);
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         // The detail line is capped at 240 chars + ellipsis; we only
