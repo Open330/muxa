@@ -1009,6 +1009,7 @@ fn resolve_var(
                 .map_or_else(|| "—".into(), |c| format!("${c:.2}")),
             "activity" => relative_time(a.last_activity_at, now),
             "last_prompt" => a.last_prompt.clone().unwrap_or_else(|| "—".into()),
+            "last_response" => a.last_response.clone().unwrap_or_else(|| "—".into()),
             "last_notification" => a.last_notification.clone().unwrap_or_else(|| "—".into()),
             "cwd" => a.cwd.clone().unwrap_or_else(|| "—".into()),
             _ => return None,
@@ -1023,9 +1024,8 @@ fn resolve_var(
                     p.title.clone()
                 }
             }
-            "state" | "model" | "ctx" | "cost" | "activity" | "last_notification" | "cwd" => {
-                "—".into()
-            }
+            "state" | "model" | "ctx" | "cost" | "activity" | "last_response"
+            | "last_notification" | "cwd" => "—".into(),
             _ => return None,
         }),
     }
@@ -1584,6 +1584,25 @@ mod tests {
         let s = format_detail("{model} · {last_prompt}", &row, &[], now).unwrap();
         assert!(s.contains("Opus"));
         assert!(s.contains("first line · second line"));
+    }
+
+    #[test]
+    fn format_detail_resolves_last_response() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.last_response = Some("here is what I did".into());
+        let row = WatchRow::Agent(a);
+        let s = format_detail("{last_response}", &row, &[], now).unwrap();
+        assert_eq!(s, "here is what I did");
     }
 
     #[test]

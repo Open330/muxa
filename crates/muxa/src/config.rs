@@ -195,7 +195,7 @@ impl Default for WatchConfig {
 ///
 /// `template` is interpolated with `{name}` placeholders. Supported names:
 /// `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`,
-/// `last_prompt`, `last_notification`, `cwd`. Unknown placeholders are
+/// `last_prompt`, `last_response`, `last_notification`, `cwd`. Unknown placeholders are
 /// preserved verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
