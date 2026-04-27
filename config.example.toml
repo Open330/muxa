@@ -41,6 +41,26 @@
 # prompt   = "min:30"
 # activity = 10
 
+# Selected-row detail: a dim "↳ <text>" line rendered under whatever row
+# is currently highlighted. Useful for glancing at the agent's last
+# response while it's in WaitingInput state without attaching to the pane.
+#
+# Default `template = "{last_response}"` — the PROMPT column already
+# shows the prompt, so the detail row defaults to its complement.
+# When `last_response` is empty (Starting/Working state, or non-Claude
+# adapters that don't read transcripts yet) the detail line suppresses
+# itself, so a freshly-installed muxa with no completed turns shows
+# nothing here — that's normal, not a bug.
+#
+# Available variables: pane, kind, state, model, ctx, cost, activity,
+# last_prompt, last_response, last_notification, cwd. Unknown
+# placeholders are preserved verbatim so typos surface visually.
+# [watch.detail]
+# enabled  = true
+# template = "{last_response}"
+# # Combined view (heavily truncated since each side gets half the room):
+# # template = "{last_prompt} → {last_response}"
+
 # HTTP dashboard. Off by default. When enabled, muxad serves a small
 # read-only web UI + JSON/SSE API alongside its unix-socket IPC.
 #

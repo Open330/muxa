@@ -1720,6 +1720,43 @@ mod tests {
         assert!(!text.contains("↳"), "detail line must be suppressed");
     }
 
+    /// Fresh-install case: default config + an agent that hasn't completed
+    /// a turn yet (no `last_response` captured). The default template
+    /// `{last_response}` resolves to `—`, which the suppression rule in
+    /// `format_detail` turns into `None`, so the row stays one line tall
+    /// and no `↳` glyph appears. This is the path a brand-new user sees
+    /// on first launch — an empty detail is intentional, not a bug.
+    #[test]
+    fn default_template_suppresses_detail_when_no_response_captured() {
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                Some("a prompt the user just submitted"),
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !text.contains("↳"),
+            "default template must suppress detail when last_response is None"
+        );
+    }
+
     /// `apply_outcome` is the only path data flows back into `App`. It
     /// must mirror what the old inline `refresh` helper did: stash the
     /// error and feed agents+panes through `set_data`.
