@@ -10,7 +10,7 @@
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
-![tests](https://img.shields.io/badge/tests-92%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-172%20green-brightgreen)
 
 [English](README.md) · **한국어**
 
@@ -40,7 +40,7 @@ tmux를 포크하지 않습니다. tmux와는 tmux CLI를 통해, 각 에이전�
 
 > [!IMPORTANT]
 > 프리알파 단계입니다. 이벤트 인제스트, 어댑터, 데몬, CLI, 실시간 TUI, 데스크톱
-> 알림이 모두 엔드투엔드로 동작하며 92개 테스트가 통과합니다. API는 아직 변경될
+> 알림이 모두 엔드투엔드로 동작하며 172개 테스트가 통과합니다. API는 아직 변경될
 > 수 있습니다. opencode 지원은 보류 중입니다.
 
 ## 목차
@@ -276,6 +276,18 @@ CLI(`claude`, `codex`, `gemini` / `gemini-cli`)와 매칭하고, 데몬에 합�
 2 Hz로 갱신합니다. [ratatui](https://ratatui.rs)로 렌더링하며, 패닉이 나도
 터미널은 깔끔하게 복원됩니다.
 
+선택된 행은 두 줄로 확장되어 dim italic `↳ <detail>` 힌트가 아래에 깔립니다.
+에이전트가 `WaitingInput` 상태일 때 attach 안 하고도 마지막 응답을 한눈에
+확인하기 위함입니다. detail 라인은 템플릿이라 — 기본값은 `{last_response}` —
+컬럼은 "무엇을 물었나", 아래 줄은 "무엇이라 답했나"가 됩니다. 자세한 설정은
+[설정 > 디테일 행](#watch-detail-row) 참고.
+
+페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
+Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지
+못한 경우)는 PANE 컬럼에 `(no pane)`을 dim으로 표시하고, 해당 행이 선택될
+때 footer에 노란 `no tmux pane — attach unavailable` 힌트가 떠서 Enter가
+무반응인 이유를 보여줍니다.
+
 가장 좋은 사용법은 tmux 팝업을 통하는 것입니다(위 [tmux 연결](#3-tmux-연결)
 참고). 어떤 페인에서든 `prefix + s`를 누르면 → 실시간 대시보드가 팝업으로 뜨고
 → 원하는 행에서 `Enter`를 누르면 → 팝업이 닫히면서 클라이언트가 그 페인으로
@@ -384,6 +396,32 @@ activity = 10
 사용 가능한 컬럼 키: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `prompt`, `activity`. 모르는 키는 경고만 남기고 무시되며, muxa 실행을
 막지는 않습니다.
+
+<a name="watch-detail-row"></a>
+### 디테일 행
+
+`muxa watch`에서 선택된 행은 2줄짜리 셀로 확장됩니다 — 원래 컬럼들이
+첫 줄, 그 아래 dim `↳ <detail>` 힌트가 두 번째 줄. `[watch.detail]`로
+템플릿 설정:
+
+```toml
+[watch.detail]
+enabled  = true
+template = "{last_response}"            # 기본값 — 에이전트가 방금 한 답
+# template = "{last_prompt} → {last_response}"   # 합쳐서 보기 (둘 다 심하게 잘림)
+# template = "{cwd} · {last_prompt}"             # 워크플로우 맞춰 자유롭게
+```
+
+사용 가능한 placeholder: `pane`, `kind`, `state`, `model`, `ctx`,
+`cost`, `activity`, `last_prompt`, `last_response`,
+`last_notification`, `cwd`. 모르는 placeholder는 그대로 남아 오타가
+시각적으로 드러납니다.
+
+`{last_response}`는 Claude Code의 `Stop` hook 발화 시 트랜스크립트에서
+캡처되므로 — 첫 turn이 끝나기 전엔 detail 라인이 자동으로 숨겨집니다.
+정상 동작입니다. Codex / Gemini 어댑터는 아직 트랜스크립트를 안 읽어서
+`last_response`가 비어있으니, 그쪽 행에서 힌트를 보고 싶으면
+`template = "{last_prompt}"`로 덮어쓰면 됩니다.
 
 <details>
 <summary>환경 변수</summary>

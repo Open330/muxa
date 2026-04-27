@@ -10,7 +10,7 @@ See which agents are working, waiting, or idle — right from your status line, 
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-pre--alpha-orange)
-![tests](https://img.shields.io/badge/tests-92%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-172%20green-brightgreen)
 
 **English** · [한국어](README.ko.md)
 
@@ -41,7 +41,7 @@ via that agent's own hook / event-emission system.
 
 > [!IMPORTANT]
 > Pre-alpha. Event ingest, adapters, daemon, CLI, live TUI, and desktop
-> notifications all work end-to-end with 92 tests green. APIs may still shift.
+> notifications all work end-to-end with 172 tests green. APIs may still shift.
 > opencode support is deferred.
 
 ## Contents
@@ -292,6 +292,19 @@ drop-in replacement for tmux's `prefix + s`:
 
 Both kinds are selectable. `Enter` on either attaches you to that pane.
 
+The selected row expands to two visual lines: a dim italic `↳ <detail>`
+hint underneath, useful for glancing at the agent's last response while
+it's in `WaitingInput` without leaving the picker. The detail line is
+templated — by default it shows `{last_response}`, so the column tells
+you what was asked and the row underneath tells you what was answered.
+Configure via `[watch.detail]` (see [Configuration](#watch-detail-row)).
+
+Agents whose pane is unknown — usually Claude Code SDK sub-processes
+whose env didn't carry `TMUX_PANE` and whose process-ancestry walk
+didn't recover one — render `(no pane)` dim in the PANE column, and the
+footer surfaces a yellow `no tmux pane — attach unavailable` hint when
+one is selected, so an unresponsive `Enter` is never silent.
+
 The best way to use it is via a tmux popup (see the
 [tmux wiring](#3-wire-tmux) above). Press `prefix + s` from any pane →
 popup with the live dashboard → `Enter` on the target row → popup closes
@@ -424,6 +437,32 @@ activity = 10
 Valid column keys: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `prompt`, `activity`. Unknown keys log a warning and are skipped — they
 don't prevent muxa from starting.
+
+<a name="watch-detail-row"></a>
+### Detail row
+
+The selected row in `muxa watch` expands to a 2-line cell — original
+content on top, a dim `↳ <detail>` hint below. Templated via
+`[watch.detail]`:
+
+```toml
+[watch.detail]
+enabled  = true
+template = "{last_response}"            # default — what the agent just said
+# template = "{last_prompt} → {last_response}"   # combined view (heavily truncated)
+# template = "{cwd} · {last_prompt}"             # whatever fits your workflow
+```
+
+Available placeholders: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
+`activity`, `last_prompt`, `last_response`, `last_notification`, `cwd`.
+Unknown placeholders are preserved verbatim so typos surface visually.
+
+`{last_response}` is captured from the Claude Code transcript on every
+`Stop` hook — until an agent completes its first turn the detail line
+suppresses itself. That's normal, not a bug. Codex and Gemini adapters
+don't read transcripts yet, so they never populate `last_response`;
+override `template` to use `{last_prompt}` instead if you want a hint
+under those rows.
 
 <details>
 <summary>Environment variables</summary>
