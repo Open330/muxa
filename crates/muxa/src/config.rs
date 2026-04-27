@@ -162,6 +162,8 @@ pub struct WatchConfig {
     /// a TOML integer (fixed length) or a string of the form `min:N` /
     /// `pct:N`. Missing keys fall back to the column's built-in default.
     pub widths: HashMap<String, WidthSpec>,
+    /// Expanded detail line shown under the currently-selected row.
+    pub detail: DetailConfig,
 }
 
 impl Default for WatchConfig {
@@ -179,7 +181,35 @@ impl Default for WatchConfig {
         widths.insert("state".to_string(), WidthSpec::Length(14));
         widths.insert("prompt".to_string(), WidthSpec::Min(30));
         widths.insert("activity".to_string(), WidthSpec::Length(10));
-        Self { columns, widths }
+        Self {
+            columns,
+            widths,
+            detail: DetailConfig::default(),
+        }
+    }
+}
+
+/// `[watch.detail]` — the second visual line rendered under the selected
+/// row. Useful for glancing at the full last-prompt (or any other field)
+/// without leaving the picker.
+///
+/// `template` is interpolated with `{name}` placeholders. Supported names:
+/// `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`,
+/// `last_prompt`, `last_notification`, `cwd`. Unknown placeholders are
+/// preserved verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DetailConfig {
+    pub enabled: bool,
+    pub template: String,
+}
+
+impl Default for DetailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            template: "{last_prompt}".to_string(),
+        }
     }
 }
 
@@ -324,6 +354,68 @@ broken = "what"
             cfg.watch.widths.get("broken"),
             Some(WidthSpec::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn detail_defaults_to_last_prompt_template() {
+        let cfg = WatchConfig::default();
+        assert!(cfg.detail.enabled);
+        assert_eq!(cfg.detail.template, "{last_prompt}");
+    }
+
+    #[test]
+    fn parses_watch_detail_section() {
+        let toml = r#"
+[watch.detail]
+enabled = false
+template = "{cwd} · {last_prompt}"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.watch.detail.enabled);
+        assert_eq!(cfg.watch.detail.template, "{cwd} · {last_prompt}");
+    }
+
+    /// Missing `[watch.detail]` section -> defaults applied (enabled +
+    /// `{last_prompt}` template). The `default = WatchConfig::default`
+    /// machinery on the parent struct must kick in.
+    #[test]
+    fn missing_watch_detail_section_uses_defaults() {
+        let toml = r#"
+[watch]
+columns = ["pane", "prompt"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.watch.detail.enabled);
+        assert_eq!(cfg.watch.detail.template, "{last_prompt}");
+    }
+
+    /// Partial `[watch.detail]` (only `enabled`, no `template`) — the
+    /// missing `template` field must fall back to its default. This is
+    /// the `serde(default)` on `DetailConfig` doing its job.
+    #[test]
+    fn partial_watch_detail_section_fills_missing_fields() {
+        let toml = "
+[watch.detail]
+enabled = false
+";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.watch.detail.enabled);
+        assert_eq!(cfg.watch.detail.template, "{last_prompt}");
+    }
+
+    /// `deny_unknown_fields` is in force on `DetailConfig` — a stray
+    /// key in `[watch.detail]` must surface as a parse error so typos
+    /// don't fail silently.
+    #[test]
+    fn unknown_field_in_watch_detail_is_rejected() {
+        let toml = r#"
+[watch.detail]
+enabled = true
+template = "{last_prompt}"
+unknown = 1
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("unknown"));
     }
 
     #[test]
