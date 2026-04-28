@@ -322,6 +322,48 @@ pub struct WatchConfig {
     /// Set `false` here to flip the default the other way.
     #[serde(default = "default_true")]
     pub hide_paneless: bool,
+    /// Behaviour of the `p` preview overlay. See [`PreviewConfig`].
+    pub preview: PreviewConfig,
+}
+
+/// `[watch.preview]` — controls the preview overlay opened with `p`.
+///
+/// Geometry (popup vs fullscreen) is keyed off `f`; what's *inside*
+/// the overlay is keyed off `c`. This struct configures only the
+/// initial content; both keys still toggle in either direction at
+/// runtime regardless of the default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreviewConfig {
+    /// What to show on first open. Defaults to `live_pane` so the
+    /// overlay matches tmux's `prefix + s` choose-tree shape — a live
+    /// snapshot of the actual pane contents — rather than the agent's
+    /// stored prompt/response text. Set to `prompt_response` to revert
+    /// to the previous text-only default.
+    pub default_content: PreviewContent,
+}
+
+/// Content axis of the `muxa watch` preview overlay. Persisted in TOML
+/// for [`PreviewConfig::default_content`] and consumed at runtime by
+/// the watch crate when constructing a fresh `PreviewState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewContent {
+    /// Render the agent's last prompt + last response from the
+    /// in-memory store. Cheap (zero shell-out), text-only.
+    PromptResponse,
+    /// Live snapshot of the tmux pane's visible screen, captured via
+    /// `tmux capture-pane -ep` on each refresh tick. Preserves ANSI
+    /// colors — same shape as tmux's choose-tree preview.
+    LivePane,
+}
+
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            default_content: PreviewContent::LivePane,
+        }
+    }
 }
 
 /// A single sort key for the `muxa watch` agent row ordering. The keys
@@ -371,6 +413,7 @@ impl Default for WatchConfig {
             // shipped in c9a6572.
             sort: vec![WatchSortKey::Session, WatchSortKey::Activity],
             hide_paneless: true,
+            preview: PreviewConfig::default(),
         }
     }
 }
@@ -673,5 +716,54 @@ prompt = "pct:250"
             cfg.watch.widths.get("prompt"),
             Some(WidthSpec::Percentage(100))
         ));
+    }
+
+    /// Default `WatchConfig` opens the preview overlay in `LivePane` mode.
+    /// Locks down the headline UX shipped with `[watch.preview]` so a
+    /// future flip of the default is intentional and not a slip.
+    #[test]
+    fn watch_preview_default_is_live_pane() {
+        let cfg = WatchConfig::default();
+        assert_eq!(cfg.preview.default_content, PreviewContent::LivePane);
+    }
+
+    /// `[watch.preview] default_content = "prompt_response"` in TOML
+    /// flips the overlay back to the text view. Both serde branches
+    /// must be wired so users on the text-only workflow can opt out.
+    #[test]
+    fn watch_preview_can_be_set_to_prompt_response() {
+        let toml = r#"
+[watch.preview]
+default_content = "prompt_response"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.watch.preview.default_content,
+            PreviewContent::PromptResponse,
+        );
+    }
+
+    /// `live_pane` round-trips through TOML — the explicit-default form.
+    /// Together with the previous test this pins both serde variants.
+    #[test]
+    fn watch_preview_live_pane_round_trips() {
+        let toml = r#"
+[watch.preview]
+default_content = "live_pane"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.watch.preview.default_content, PreviewContent::LivePane);
+    }
+
+    /// Unknown `default_content` values are rejected by serde rather than
+    /// silently falling through — typos surface as parse errors so users
+    /// don't end up with a "broken" overlay they can't explain.
+    #[test]
+    fn watch_preview_unknown_content_is_rejected() {
+        let toml = r#"
+[watch.preview]
+default_content = "nope"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 }

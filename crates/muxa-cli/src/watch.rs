@@ -328,7 +328,7 @@ pub(crate) struct App {
     pub paneless_hidden: usize,
     /// Most recent `tmux capture-pane -ep` result, keyed by `pane_id`.
     /// Populated on demand when the preview is in
-    /// [`PreviewContent::PaneCapture`] and re-captured on every refresh
+    /// [`PreviewContent::LivePane`] and re-captured on every refresh
     /// tick while the preview stays open in that mode. `None` when the
     /// preview is closed or showing prompt/response content.
     pub pane_capture: Option<CapturedPane>,
@@ -372,19 +372,15 @@ pub enum PreviewMode {
     Fullscreen,
 }
 
-/// Content axis of the preview overlay. Independent of [`PreviewMode`]'s
-/// geometry — both compose freely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewContent {
-    /// Default: render the agent's last prompt + last response from the
-    /// in-memory store. Cheap (zero shell-out), text-only.
-    PromptResponse,
-    /// Live snapshot of the tmux pane's visible screen, captured via
-    /// `tmux capture-pane -ep` on each refresh tick. Preserves ANSI
-    /// colors via [`ansi_to_tui`], so the user sees what the pane
-    /// actually looks like — same shape as tmux's choose-tree preview.
-    PaneCapture,
-}
+/// Content axis of the preview overlay. Re-exported from
+/// [`muxa::config::PreviewContent`] so tests and downstream code in the
+/// watch crate can keep `PreviewContent::LivePane` working without
+/// having to know the enum lives in the muxa core. Independent of
+/// [`PreviewMode`]'s geometry — both compose freely. The runtime
+/// rendering path always reads from this enum; `[watch.preview]
+/// default_content` only seeds the initial value when a fresh
+/// `PreviewState` is constructed.
+pub use muxa::config::PreviewContent;
 
 /// Cached pane-capture result. One slot per `App` since only the
 /// currently-previewed pane needs a capture; flipping rows or closing
@@ -854,7 +850,11 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                             pane_id,
                             scroll: 0,
                             mode: PreviewMode::Popup,
-                            content: PreviewContent::PromptResponse,
+                            // Honor `[watch.preview] default_content` so
+                            // first-paint shape (live pane vs prompt
+                            // text) matches the user's preference. `c`
+                            // still toggles in either direction at runtime.
+                            content: app.watch_cfg.preview.default_content,
                         });
                     }
                 }
@@ -877,15 +877,15 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                 Action::TogglePreviewContent => {
                     if let Some(p) = app.preview.as_mut() {
                         p.content = match p.content {
-                            PreviewContent::PromptResponse => PreviewContent::PaneCapture,
-                            PreviewContent::PaneCapture => PreviewContent::PromptResponse,
+                            PreviewContent::PromptResponse => PreviewContent::LivePane,
+                            PreviewContent::LivePane => PreviewContent::PromptResponse,
                         };
                         // Reset scroll so the new content starts from
                         // the top — re-using the prompt-mode scroll
                         // offset on a wholly-different content surface
                         // tends to land mid-line.
                         p.scroll = 0;
-                        // Drop the cache when leaving PaneCapture so the
+                        // Drop the cache when leaving LivePane so the
                         // next entry starts with a fresh capture.
                         if matches!(p.content, PreviewContent::PromptResponse) {
                             app.pane_capture = None;
@@ -896,13 +896,13 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
             }
         }
 
-        // Live pane capture: when the preview is open in PaneCapture
+        // Live pane capture: when the preview is open in LivePane
         // mode and the cache is missing or stale (>500 ms), shell out
         // to `tmux capture-pane -ep -t <pane>` on a worker thread.
         // Bounded by the existing 500 ms TTL so we never fork more
         // than ~2 Hz, regardless of how fast the input loop spins.
         if let Some(p) = &app.preview {
-            if p.content == PreviewContent::PaneCapture {
+            if p.content == PreviewContent::LivePane {
                 let stale = app
                     .pane_capture
                     .as_ref()
@@ -1143,7 +1143,7 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
 
     let mode_tag = match preview.content {
         PreviewContent::PromptResponse => "prompt",
-        PreviewContent::PaneCapture => "live",
+        PreviewContent::LivePane => "live",
     };
     let title = format!(" preview · {} · {} ", preview.pane_id, mode_tag);
     let block = Block::default()
@@ -1162,7 +1162,7 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
     // dim styling are preserved. Wrapping is OFF because tmux already
     // wrapped at the source pane's width — turning it on a second time
     // breaks alignment of TUIs running inside the captured pane.
-    if matches!(preview.content, PreviewContent::PaneCapture) {
+    if matches!(preview.content, PreviewContent::LivePane) {
         let body = build_pane_capture_body(app, &preview.pane_id);
         let paragraph = Paragraph::new(body)
             .block(block)
@@ -1662,7 +1662,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         // where you already are.
         let content_label = match preview.content {
             PreviewContent::PromptResponse => " live pane  ",
-            PreviewContent::PaneCapture => " prompt  ",
+            PreviewContent::LivePane => " prompt  ",
         };
         let spans = vec![
             Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -3269,6 +3269,15 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::with_config(cfg);
+        seed_three_agents(&mut app);
+        app
+    }
+
+    /// Drop the canonical three-agent fixture into an arbitrary App —
+    /// lets tests pick their own `WatchConfig` (e.g. to pin
+    /// `[watch.preview] default_content`) and then reuse the same
+    /// agent set the rest of the suite expects.
+    fn seed_three_agents(app: &mut App) {
         let mut a1 = fake_agent(
             "s1",
             Some("%1"),
@@ -3303,7 +3312,6 @@ mod tests {
         );
         a3.last_response = Some("GAMMAresp".into());
         app.set_data(vec![a1, a2, a3], vec![]);
-        app
     }
 
     /// Selected row's host column should render exactly 2 visual lines:
@@ -3597,7 +3605,7 @@ mod tests {
                         pane_id: pane,
                         scroll: 0,
                         mode: PreviewMode::Popup,
-                        content: PreviewContent::PromptResponse,
+                        content: app.watch_cfg.preview.default_content,
                     });
                 }
             }
@@ -3616,8 +3624,8 @@ mod tests {
             Action::TogglePreviewContent => {
                 if let Some(p) = app.preview.as_mut() {
                     p.content = match p.content {
-                        PreviewContent::PromptResponse => PreviewContent::PaneCapture,
-                        PreviewContent::PaneCapture => PreviewContent::PromptResponse,
+                        PreviewContent::PromptResponse => PreviewContent::LivePane,
+                        PreviewContent::LivePane => PreviewContent::PromptResponse,
                     };
                     p.scroll = 0;
                     if matches!(p.content, PreviewContent::PromptResponse) {
@@ -3922,13 +3930,27 @@ mod tests {
         );
     }
 
-    /// `c` toggles the preview content axis: `PromptResponse` → `PaneCapture`
+    /// `c` toggles the preview content axis: `PromptResponse` → `LivePane`
     /// → `PromptResponse`. Geometry mode (popup vs fullscreen) is unaffected
     /// — the two axes compose. Scroll resets so the new content surface
     /// starts at the top instead of mid-line.
+    /// Overlay preset that opens to PromptResponse — used by tests that
+    /// want to pin the starting content axis instead of inheriting whatever
+    /// the global default happens to be. Keeps test intent stable across
+    /// future default flips.
+    fn cfg_with_prompt_default() -> WatchConfig {
+        WatchConfig {
+            preview: muxa::config::PreviewConfig {
+                default_content: PreviewContent::PromptResponse,
+            },
+            ..WatchConfig::default()
+        }
+    }
+
     #[test]
     fn c_toggles_preview_content_and_resets_scroll() {
-        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        let mut app = App::with_config(cfg_with_prompt_default());
+        seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         // Open the preview and scroll into the body.
         press(&mut app, 'p');
@@ -3940,7 +3962,7 @@ mod tests {
 
         press(&mut app, 'c');
         let p = app.preview.as_ref().unwrap();
-        assert_eq!(p.content, PreviewContent::PaneCapture);
+        assert_eq!(p.content, PreviewContent::LivePane);
         assert_eq!(p.scroll, 0, "content toggle must reset scroll");
         assert_eq!(p.mode, PreviewMode::Popup, "geometry must not flip");
 
@@ -3952,12 +3974,49 @@ mod tests {
         );
     }
 
+    /// Default `WatchConfig` opens the overlay in `LivePane` mode — this
+    /// is the headline UX change the `[watch.preview] default_content`
+    /// option ships with. A future flip of the default would land here
+    /// loud and clear.
+    #[test]
+    fn default_config_opens_preview_in_live_pane() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        press(&mut app, 'p');
+        let p = app.preview.as_ref().unwrap();
+        assert_eq!(
+            p.content,
+            PreviewContent::LivePane,
+            "default config must open preview in LivePane mode",
+        );
+    }
+
+    /// Setting `[watch.preview] default_content = "prompt_response"` in
+    /// config restores the pre-feature shape: `p` opens straight into
+    /// the text view. Both branches of the config knob must be wired
+    /// through, not just the default.
+    #[test]
+    fn prompt_response_default_opens_preview_in_text_mode() {
+        let mut app = App::with_config(cfg_with_prompt_default());
+        seed_three_agents(&mut app);
+        app.table_state.select(Some(0));
+        press(&mut app, 'p');
+        assert_eq!(
+            app.preview.as_ref().unwrap().content,
+            PreviewContent::PromptResponse,
+        );
+    }
+
     /// `f` (geometry) and `c` (content) are independent — composing them
     /// must produce all four combinations without one clobbering the
     /// other. This is the user-visible promise of the two-axis design.
     #[test]
     fn f_and_c_compose_independently() {
-        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        // Pin the starting axis state explicitly so this test reads as
+        // "all four (mode, content) combinations are reachable", not
+        // "the current default + 3 toggles lands somewhere expected."
+        let mut app = App::with_config(cfg_with_prompt_default());
+        seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         press(&mut app, 'p');
 
@@ -3967,18 +4026,18 @@ mod tests {
         assert_eq!(p.mode, PreviewMode::Fullscreen);
         assert_eq!(p.content, PreviewContent::PromptResponse);
 
-        // → press c → (Fullscreen, PaneCapture)
+        // → press c → (Fullscreen, LivePane)
         press(&mut app, 'c');
         let p = app.preview.as_ref().unwrap();
         assert_eq!(p.mode, PreviewMode::Fullscreen);
-        assert_eq!(p.content, PreviewContent::PaneCapture);
+        assert_eq!(p.content, PreviewContent::LivePane);
 
-        // → press f again → (Popup, PaneCapture) — content survives
+        // → press f again → (Popup, LivePane) — content survives
         // geometry flip
         press(&mut app, 'f');
         let p = app.preview.as_ref().unwrap();
         assert_eq!(p.mode, PreviewMode::Popup);
-        assert_eq!(p.content, PreviewContent::PaneCapture);
+        assert_eq!(p.content, PreviewContent::LivePane);
     }
 
     /// Closing the preview must drop the cached pane capture so a stale
@@ -4003,15 +4062,18 @@ mod tests {
         assert!(app.pane_capture.is_none(), "cache must drop with preview");
     }
 
-    /// Toggling content from `PaneCapture` back to `PromptResponse` drops
+    /// Toggling content from `LivePane` back to `PromptResponse` drops
     /// the cache too — re-entering capture mode should fetch a fresh
     /// view rather than flash the last cached frame for half a second.
     #[test]
     fn toggle_to_prompt_drops_cache() {
-        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        // Start from PromptResponse so the toggle direction this test
+        // exercises (LivePane → PromptResponse) is unambiguous.
+        let mut app = App::with_config(cfg_with_prompt_default());
+        seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         press(&mut app, 'p');
-        press(&mut app, 'c'); // → PaneCapture
+        press(&mut app, 'c'); // → LivePane
         app.pane_capture = Some(CapturedPane {
             pane_id: "%1".into(),
             text: "old".into(),
@@ -4100,9 +4162,9 @@ mod tests {
             "footer in PromptResponse mode must hint at flipping to live pane",
         );
 
-        // Flip to PaneCapture and re-render — label should now point
+        // Flip to LivePane and re-render — label should now point
         // back to "prompt".
-        app.preview.as_mut().unwrap().content = PreviewContent::PaneCapture;
+        app.preview.as_mut().unwrap().content = PreviewContent::LivePane;
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let dump: String = terminal
             .backend()
@@ -4113,7 +4175,7 @@ mod tests {
             .collect();
         assert!(
             dump.contains(" prompt"),
-            "footer in PaneCapture mode must hint at flipping back to prompt",
+            "footer in LivePane mode must hint at flipping back to prompt",
         );
     }
 }

@@ -307,14 +307,19 @@ prompt + 응답이 80% × 70% 박스에 렌더링되고 `↑`/`↓` / `PgUp`/`Pg
 않고, 정말 긴 콘텐츠는 **`f`** 로 풀스크린으로 토글할 수 있습니다.
 `q` / `Esc` / `p` 로 picker 로 복귀.
 
-preview 가 열린 상태에서 **`c`** 를 누르면 컨텐츠가 prompt/response ↔
-**실제 tmux 페인 라이브 캡처** 사이로 토글됩니다 — tmux 의 `prefix + s`
-choose-tree preview 와 같은 형태. 내부적으로 `tmux capture-pane -ep` 로
-shell out 해서 ANSI escape 를 [`ansi-to-tui`](https://crates.io/crates/ansi-to-tui)
-로 파싱하고, refresh tick 마다 (≤ 2 Hz, debounce 적용) 다시 캡처해서
-페인이 실제로 어떻게 보이는지를 그대로 보여줍니다 — 컬러, prompt
-글리프, 진행 중인 출력까지. `f` 와 `c` 는 독립 축이라 자유롭게 조합
-가능 (예: `c` 후 `f` 면 풀스크린 라이브 페인 뷰).
+기본값으로 preview 는 **실제 tmux 페인 라이브 스냅샷**으로 바로 열립니다 —
+tmux 의 `prefix + s` choose-tree preview 와 같은 형태. 내부적으로
+`tmux capture-pane -ep` 로 shell out 해서 ANSI escape 를
+[`ansi-to-tui`](https://crates.io/crates/ansi-to-tui) 로 파싱하고, refresh
+tick 마다 (≤ 2 Hz, debounce 적용) 다시 캡처해서 페인이 실제로 어떻게
+보이는지를 그대로 보여줍니다 — 컬러, prompt 글리프, 진행 중인 출력까지.
+**`c`** 키로 prompt/response 텍스트 뷰와 라이브 뷰를 토글할 수 있고,
+`f` 와 `c` 는 독립 축이라 자유롭게 조합 가능 (예: `f` 후 `c` 면 풀스크린
+prompt/response 뷰).
+
+텍스트 뷰로 시작하고 싶으면 config 에 `[watch.preview] default_content =
+"prompt_response"` 를 설정하면 됩니다 — `c` 는 어느 쪽이든 런타임 토글
+유지.
 
 페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
 Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지

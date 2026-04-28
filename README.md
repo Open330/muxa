@@ -328,15 +328,19 @@ visible behind it so you don't lose context; **`f`** toggles full-
 screen for very long content where the popup wraps too aggressively.
 `q` / `Esc` / `p` returns to the picker.
 
-While the preview is open, **`c`** toggles the content between
-prompt/response and a **live tmux pane snapshot** — same shape as
-tmux's `prefix + s` choose-tree preview. Internally it shells out to
-`tmux capture-pane -ep`, parses the ANSI escapes through
-[`ansi-to-tui`](https://crates.io/crates/ansi-to-tui), and re-fetches
-on every refresh tick (≤2 Hz, debounced) so you see what the pane
-actually looks like — colors, prompt glyphs, mid-turn output. `f` and
-`c` are independent axes: e.g. `c` then `f` gives you a fullscreen
-live pane view.
+By default the preview opens straight into a **live tmux pane
+snapshot** — same shape as tmux's `prefix + s` choose-tree preview.
+Internally it shells out to `tmux capture-pane -ep`, parses the ANSI
+escapes through [`ansi-to-tui`](https://crates.io/crates/ansi-to-tui),
+and re-fetches on every refresh tick (≤2 Hz, debounced) so you see
+what the pane actually looks like — colors, prompt glyphs, mid-turn
+output. **`c`** flips the content to the agent's last prompt + last
+response (the text-only view) and back. `f` and `c` are independent
+axes: e.g. `f` then `c` gives you a fullscreen live pane view.
+
+To start in the text view instead, set
+`[watch.preview] default_content = "prompt_response"` in your
+config — `c` still toggles either direction at runtime.
 
 Agents whose pane is unknown — usually Claude Code SDK sub-processes
 whose env didn't carry `TMUX_PANE` and whose process-ancestry walk

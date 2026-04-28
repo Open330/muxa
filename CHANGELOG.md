@@ -10,16 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `muxa watch` preview popup gains a content-axis toggle (`c`): flip
-  between the existing prompt + response view and a live snapshot of
-  the tmux pane itself, captured via `tmux capture-pane -ep` and
+  between the agent's last prompt + last response and a live snapshot
+  of the tmux pane itself, captured via `tmux capture-pane -ep` and
   rendered with ANSI colors preserved through `ansi-to-tui`. Same
   shape as tmux's `prefix + s` choose-tree preview. Re-captures on
   every refresh tick (debounced to ≤2 Hz) while the preview stays
   open. Geometry (popup ↔ fullscreen, `f`) and content (prompt ↔ live
   pane, `c`) are independent axes — both compose freely.
+- `[watch.preview] default_content` config knob picks the overlay's
+  first-paint shape: `"live_pane"` (default) or `"prompt_response"`.
+  `c` still toggles in either direction at runtime regardless of the
+  default. The flipped default lines `muxa watch` up with tmux's
+  `prefix + s` first-impression — operators primarily using muxa as
+  a session picker get the same instant visual context.
 - `muxa::tmux::capture_pane(pane_id)` — minimal wrapper around
   `tmux capture-pane -ep -t <pane>` for callers that need the live
   pane contents with ANSI escapes intact.
+
+### Changed
+
+- `muxa watch` preview now opens straight into the live pane view
+  instead of the prompt/response text view. The text view remains a
+  one-keystroke toggle (`c`) away, and `[watch.preview]
+  default_content = "prompt_response"` opts back into the previous
+  default for users on text-focused workflows.
 
 ## [0.2.0] - 2026-04-28
 
