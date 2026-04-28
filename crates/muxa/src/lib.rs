@@ -5,6 +5,7 @@
 //! full `muxa::ipc::Server` form.
 
 pub mod adapters;
+pub mod backend;
 pub mod config;
 pub mod dashboard;
 pub mod discovery;
@@ -20,6 +21,7 @@ pub mod snapshot;
 pub mod state;
 pub mod tmux;
 
+pub use backend::{tmux::TmuxBackend, HostKind, PaneBackend};
 pub use config::Config;
 pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 pub use error::{CoreError, Result};

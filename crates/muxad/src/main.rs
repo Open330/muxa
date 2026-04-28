@@ -12,7 +12,8 @@ use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
-use muxa::reconcile::{Reconciler, TmuxLiveness};
+use muxa::reconcile::Reconciler;
+use muxa::TmuxBackend;
 use muxa::sinks::OhMyPromptSink;
 use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
 use muxa::tmux::scanner::PaneCache;
@@ -372,9 +373,12 @@ fn spawn_reconciler_task(
         tracing::info!("reconciler disabled by config");
         return;
     }
+    // Drives reconciliation through the trait-based backend instead of
+    // the legacy `TmuxLiveness` so the same hook point picks up zellij
+    // (and any future host) once their `PaneBackend` impls land.
     let runner = Reconciler::new(
         store.clone(),
-        TmuxLiveness,
+        TmuxBackend::new(),
         std::time::Duration::from_secs(cfg.reconciler.interval_secs),
     );
     let shutdown_rx = shutdown_tx.subscribe();
