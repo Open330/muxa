@@ -327,7 +327,7 @@ attach-session` for you instead of `switch-client`.
 | --------------------- | ---------------------------------------------------------------------- |
 | `↑` / `↓` / `k` / `j` | Move the selection cursor.                                             |
 | `Enter`               | Attach to the selected pane (`tmux select-pane` + `switch-client`).    |
-| `p`                   | Pop open a full-screen preview of the selected row's prompt + response — useful when the detail line gets truncated. `q` / `Esc` / `p` returns to the table; `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll. |
+| `p`                   | Pop open a centred preview popup of the selected row's prompt + response — useful when the detail line gets truncated. `f` toggles popup ↔ full-screen for very long content. `q` / `Esc` / `p` returns to the table; `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll. |
 | `r`                   | Force an immediate refresh.                                            |
 | `q` / `Esc`           | Quit.                                                                  |
 | `Ctrl-C`              | Quit.                                                                  |

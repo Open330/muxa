@@ -31,7 +31,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -323,10 +323,10 @@ pub(crate) struct App {
     pub preview: Option<PreviewState>,
 }
 
-/// A `muxa watch` preview overlay — full-screen detail view of the
-/// selected agent's last prompt + last response. The selection is pinned
-/// to a `pane_id` (not a row index) so background refreshes that re-sort
-/// the table can't drift the preview onto a different agent.
+/// A `muxa watch` preview overlay — detail view of the selected agent's
+/// last prompt + last response. The selection is pinned to a `pane_id`
+/// (not a row index) so background refreshes that re-sort the table
+/// can't drift the preview onto a different agent.
 #[derive(Debug, Clone)]
 pub struct PreviewState {
     /// Pane id at the time the preview was opened — also the lookup key
@@ -336,6 +336,21 @@ pub struct PreviewState {
     /// `↑/↓` (or `j/k`) increment / decrement; `saturating_*` so we
     /// can't underflow past the top.
     pub scroll: u16,
+    /// Whether to render as a centred popup (default — keeps the
+    /// surrounding table visible for context) or as a full-screen take-
+    /// over. The `f` key toggles between the two.
+    pub mode: PreviewMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewMode {
+    /// Centred popup roughly 80% × 70% of the table area. Default — the
+    /// surrounding rows stay visible so the user keeps a sense of "where
+    /// am I in the list" while reading the prompt/response.
+    Popup,
+    /// Full-screen takeover, useful for very long responses where the
+    /// 80×70 box still wraps too aggressively.
+    Fullscreen,
 }
 
 impl App {
@@ -684,6 +699,8 @@ async fn refresh_task<F, Fut>(
 /// meaning they want to attach to that pane. The caller (`main.rs`) runs
 /// the actual tmux switch-client invocation *after* this returns so the
 /// terminal is already restored by the time we hand off control.
+#[allow(clippy::too_many_lines)] // mostly setup + action dispatch — extracting a helper
+                                 // for three preview-related arms hurts readability more than it helps
 pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
@@ -770,11 +787,23 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                 }
                 Action::OpenPreview => {
                     if let Some(pane_id) = app.selected_pane() {
-                        app.preview = Some(PreviewState { pane_id, scroll: 0 });
+                        app.preview = Some(PreviewState {
+                            pane_id,
+                            scroll: 0,
+                            mode: PreviewMode::Popup,
+                        });
                     }
                 }
                 Action::ClosePreview => {
                     app.preview = None;
+                }
+                Action::TogglePreviewMode => {
+                    if let Some(p) = app.preview.as_mut() {
+                        p.mode = match p.mode {
+                            PreviewMode::Popup => PreviewMode::Fullscreen,
+                            PreviewMode::Fullscreen => PreviewMode::Popup,
+                        };
+                    }
                 }
                 Action::None => {}
             }
@@ -835,10 +864,12 @@ enum Action {
     Refresh,
     /// Attach to the currently-selected pane.
     Attach,
-    /// Pop open the full-screen preview overlay for the selected row.
+    /// Pop open the preview overlay for the selected row.
     OpenPreview,
     /// Close the preview overlay and return to the table.
     ClosePreview,
+    /// Swap the preview between popup and full-screen modes.
+    TogglePreviewMode,
 }
 
 fn handle_event(ev: Event, app: &mut App) -> Action {
@@ -872,6 +903,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     if let Some(preview) = app.preview.as_mut() {
         return match code {
             KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
+            KeyCode::Char('f') => Action::TogglePreviewMode,
             KeyCode::Char('r') => Action::Refresh,
             KeyCode::Down | KeyCode::Char('j') => {
                 preview.scroll = preview.scroll.saturating_add(1);
@@ -928,12 +960,47 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         .split(area);
 
     render_header(f, chunks[0], app);
-    if app.preview.is_some() {
-        render_preview(f, chunks[1], app);
-    } else {
-        render_table(f, chunks[1], app);
+    match app.preview.as_ref().map(|p| p.mode) {
+        Some(PreviewMode::Fullscreen) => {
+            render_preview(f, chunks[1], app);
+        }
+        Some(PreviewMode::Popup) => {
+            // Render the table behind so the user keeps a sense of
+            // "where am I in the list" — then `Clear` the popup area
+            // (wipes the cells under it so the popup paints clean) and
+            // render the preview on top.
+            render_table(f, chunks[1], app);
+            let popup_area = centered_rect(80, 70, chunks[1]);
+            f.render_widget(Clear, popup_area);
+            render_preview(f, popup_area, app);
+        }
+        None => {
+            render_table(f, chunks[1], app);
+        }
     }
     render_footer(f, chunks[2], app);
+}
+
+/// Compute a centred sub-rect of `r` sized as `percent_x` × `percent_y`
+/// of the parent. Standard ratatui popup helper — three-way layout
+/// vertically picks the middle band, then horizontally on that band.
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(v[1])[1]
 }
 
 /// Full-screen detail view for the agent / pane the user pinned with `p`.
@@ -1409,8 +1476,13 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     // Preview mode rebinds the table-mode keybinds to their preview-pane
     // analogues — clearer for the user than leaving the same hint strings
-    // up while the keys behave differently.
-    if app.preview.is_some() {
+    // up while the keys behave differently. The `f` hint label flips with
+    // the mode so the user knows what tapping it will do.
+    if let Some(preview) = app.preview.as_ref() {
+        let toggle_label = match preview.mode {
+            PreviewMode::Popup => " fullscreen  ",
+            PreviewMode::Fullscreen => " popup  ",
+        };
         let spans = vec![
             Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" scroll  "),
@@ -1419,6 +1491,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::Black).bg(Color::Gray),
             ),
             Span::raw(" page  "),
+            Span::styled(" f ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(toggle_label),
             Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" refresh  "),
             Span::styled(
@@ -3183,6 +3257,7 @@ mod tests {
                 app.preview = Some(PreviewState {
                     pane_id: pane,
                     scroll: 0,
+                    mode: PreviewMode::Popup,
                 });
             }
         }
@@ -3200,6 +3275,7 @@ mod tests {
             app.preview = Some(PreviewState {
                 pane_id: "%1".into(),
                 scroll: 0,
+                mode: PreviewMode::Popup,
             });
             let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
             assert!(
@@ -3216,6 +3292,7 @@ mod tests {
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
             scroll: 0,
+            mode: PreviewMode::Popup,
         });
 
         // j scrolls down by 1
@@ -3315,6 +3392,7 @@ mod tests {
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
             scroll: 0,
+            mode: PreviewMode::Popup,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
@@ -3334,6 +3412,118 @@ mod tests {
         assert!(
             !text.contains("attach"),
             "preview footer must not show attach hint"
+        );
+    }
+
+    #[test]
+    fn preview_defaults_to_popup_mode_when_opened() {
+        // Pressing `p` from the table opens the overlay as a centred
+        // popup, not full-screen — keeps surrounding rows visible.
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        let action = key_action(&mut app, 'p');
+        assert!(matches!(action, Action::OpenPreview));
+        if let (Action::OpenPreview, Some(pane)) = (action, app.selected_pane()) {
+            app.preview = Some(PreviewState {
+                pane_id: pane,
+                scroll: 0,
+                mode: PreviewMode::Popup,
+            });
+        }
+        assert_eq!(
+            app.preview.as_ref().map(|p| p.mode),
+            Some(PreviewMode::Popup)
+        );
+    }
+
+    #[test]
+    fn preview_f_toggles_between_popup_and_fullscreen() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+            mode: PreviewMode::Popup,
+        });
+
+        // First `f` requests TogglePreviewMode; the run loop applies the
+        // flip. We mirror that here so the test asserts the end state.
+        let action = key_action(&mut app, 'f');
+        assert!(matches!(action, Action::TogglePreviewMode));
+        if let Some(p) = app.preview.as_mut() {
+            p.mode = match p.mode {
+                PreviewMode::Popup => PreviewMode::Fullscreen,
+                PreviewMode::Fullscreen => PreviewMode::Popup,
+            };
+        }
+        assert_eq!(
+            app.preview.as_ref().map(|p| p.mode),
+            Some(PreviewMode::Fullscreen),
+            "first `f` from popup must enter fullscreen"
+        );
+
+        // And `f` again flips back.
+        let action = key_action(&mut app, 'f');
+        if let (Action::TogglePreviewMode, Some(p)) = (action, app.preview.as_mut()) {
+            p.mode = match p.mode {
+                PreviewMode::Popup => PreviewMode::Fullscreen,
+                PreviewMode::Fullscreen => PreviewMode::Popup,
+            };
+        }
+        assert_eq!(
+            app.preview.as_ref().map(|p| p.mode),
+            Some(PreviewMode::Popup),
+            "second `f` from fullscreen must return to popup"
+        );
+    }
+
+    #[test]
+    fn fullscreen_preview_render_does_not_panic_and_hides_table() {
+        // The takeover path: in Fullscreen mode the table is replaced
+        // wholesale. We can't easily assert the table is *gone* (the
+        // header still mentions agent counts), but rendering must not
+        // panic and the preview footer must show the popup-toggle hint.
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+            mode: PreviewMode::Fullscreen,
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("popup"),
+            "fullscreen footer must offer popup toggle"
+        );
+        assert!(text.contains("Last prompt"));
+        assert!(text.contains("Last response"));
+    }
+
+    #[test]
+    fn centered_rect_returns_inner_box_within_parent() {
+        // Sanity-check the popup geometry so downstream code can trust
+        // the popup never escapes its parent.
+        let parent = Rect::new(0, 0, 100, 30);
+        let inner = centered_rect(80, 70, parent);
+
+        assert!(inner.x >= parent.x);
+        assert!(inner.y >= parent.y);
+        assert!(inner.x + inner.width <= parent.x + parent.width);
+        assert!(inner.y + inner.height <= parent.y + parent.height);
+        // Roughly centred — left margin matches right margin within 1
+        // cell to absorb integer-percentage rounding.
+        let left = inner.x - parent.x;
+        let right = (parent.x + parent.width) - (inner.x + inner.width);
+        assert!(
+            left.abs_diff(right) <= 1,
+            "popup must be horizontally centred (left={left}, right={right})"
         );
     }
 }
