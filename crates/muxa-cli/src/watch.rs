@@ -310,6 +310,11 @@ pub(crate) struct App {
     /// background ticks intentionally don't toggle this — only the
     /// user's deliberate action lights it up.
     pub refresh_pending: bool,
+    /// Pane to focus on the first non-empty data load — `$TMUX_PANE`
+    /// when invoked from inside tmux. Consumed by `clamp_selection`
+    /// the first time it sees rows, so subsequent refreshes don't
+    /// keep snapping the cursor away from the user's manual selection.
+    initial_pane: Option<String>,
 }
 
 impl App {
@@ -329,7 +334,15 @@ impl App {
             columns,
             panes: Vec::new(),
             refresh_pending: false,
+            initial_pane: None,
         }
+    }
+
+    /// Hint which pane should be highlighted on first load — typically
+    /// `$TMUX_PANE` so launching `muxa watch` from inside tmux lands the
+    /// cursor on the user's current pane instead of always row 0.
+    pub(crate) fn set_initial_pane(&mut self, pane: Option<String>) {
+        self.initial_pane = pane;
     }
 
     /// Replace the row set. `agents` (tracked) are listed first in stable
@@ -385,7 +398,17 @@ impl App {
             Some(i) if i >= self.rows.len() => {
                 self.table_state.select(Some(self.rows.len() - 1));
             }
-            None => self.table_state.select(Some(0)),
+            None => {
+                // First non-empty load: prefer the row matching the pane the
+                // user invoked muxa from, so the cursor lands on context.
+                // `take()` ensures later refreshes don't re-snap selection.
+                let hint = self.initial_pane.take();
+                let initial = hint
+                    .as_deref()
+                    .and_then(|id| self.rows.iter().position(|r| r.pane_id() == Some(id)))
+                    .unwrap_or(0);
+                self.table_state.select(Some(initial));
+            }
             Some(_) => {}
         }
     }
@@ -396,8 +419,9 @@ impl App {
         }
         let i = match self.table_state.selected() {
             Some(i) if i + 1 < self.rows.len() => i + 1,
-            Some(_) => self.rows.len() - 1,
-            None => 0,
+            // wrap from the bottom row back to the top; `None` (no prior
+            // selection) also lands here and starts at row 0
+            Some(_) | None => 0,
         };
         self.table_state.select(Some(i));
     }
@@ -408,7 +432,9 @@ impl App {
         }
         let i = match self.table_state.selected() {
             Some(i) if i > 0 => i - 1,
-            _ => 0,
+            // wrap from the top row back to the bottom
+            Some(_) => self.rows.len() - 1,
+            None => 0,
         };
         self.table_state.select(Some(i));
     }
@@ -641,6 +667,9 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     let mut guard = TerminalGuard::new(terminal);
 
     let mut app = App::with_config(watch_cfg);
+    // When invoked from inside tmux, land the cursor on the user's current
+    // pane on first load instead of always row 0.
+    app.set_initial_pane(tmux::current_pane());
 
     // Prime the initial snapshot so the first frame already has data —
     // otherwise the user sees an empty table for ~one tick.
@@ -1151,9 +1180,8 @@ fn resolve_var_chain(
         }
     }
     // All alternatives produced placeholder values, but at least one was a
-    // known variable. Surface the dash so the placeholder isn't mistaken
-    // for an unknown-variable typo; the outer `format_detail` then
-    // suppresses the whole detail row via its trim check.
+    // known variable. Surface the dash so the row still reads as "this
+    // field is currently empty" rather than as a typo.
     if saw_known {
         Some("—".into())
     } else {
@@ -1700,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_movement_is_bounded() {
+    fn selection_movement_wraps_at_boundaries() {
         let mut app = App::new();
         app.set_data(
             vec![
@@ -1730,12 +1758,170 @@ mod tests {
         assert_eq!(app.table_state.selected(), Some(0));
         app.move_down();
         assert_eq!(app.table_state.selected(), Some(1));
+        // bottom → top
         app.move_down();
+        assert_eq!(app.table_state.selected(), Some(0));
+        // top → bottom
+        app.move_up();
         assert_eq!(app.table_state.selected(), Some(1));
         app.move_up();
         assert_eq!(app.table_state.selected(), Some(0));
-        app.move_up();
-        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn initial_pane_preselects_matching_row_on_first_load() {
+        // Lock to PaneId sort: this test cares about which row matches
+        // `set_initial_pane`, not the default sort interleaving.
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::PaneId],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_initial_pane(Some("%2".into()));
+        app.set_data(
+            vec![
+                fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s2",
+                    Some("%2"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s3",
+                    Some("%3"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+
+        // Hint is one-shot: a refresh that brings new rows must not re-snap
+        // the cursor away from where the user moved it.
+        app.move_down();
+        assert_eq!(app.selected_pane().as_deref(), Some("%3"));
+        app.set_data(
+            vec![
+                fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s2",
+                    Some("%2"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "s3",
+                    Some("%3"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(app.selected_pane().as_deref(), Some("%3"));
+    }
+
+    #[test]
+    fn render_scrolls_viewport_to_initial_pane_when_far_down_the_list() {
+        // Reproduces the user-visible scenario: 30 agents listed, the
+        // active pane is way below the viewport. We need the table to
+        // auto-scroll so the highlighted row is actually on screen.
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        let agents: Vec<Agent> = (0..30)
+            .map(|i| {
+                let pane = format!("%{i}");
+                let session = format!("s{i:02}");
+                fake_agent(
+                    &session,
+                    Some(&pane),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+
+        app.set_initial_pane(Some("%25".into()));
+        app.set_data(agents, vec![]);
+        assert_eq!(app.selected_pane().as_deref(), Some("%25"));
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let mut dump = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                dump.push_str(buf[(x, y)].symbol());
+            }
+            dump.push('\n');
+        }
+
+        assert!(
+            dump.contains("> %25"),
+            "expected the highlighted '%25' row to be scrolled into view, got:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn initial_pane_falls_back_to_row_zero_when_unknown() {
+        let mut app = App::new();
+        app.set_initial_pane(Some("%does-not-exist".into()));
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        assert_eq!(app.selected_pane().as_deref(), Some("%1"));
     }
 
     #[test]
