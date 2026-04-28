@@ -252,7 +252,7 @@ muxa watch          # 실시간 TUI
 |                                            |                                                                          |
 | ------------------------------------------ | ------------------------------------------------------------------------ |
 | `muxa status`                              | 추적 중인 모든 에이전트를 사람이 읽기 쉬운 테이블로 출력.                |
-| `muxa watch`                               | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고.                    |
+| `muxa watch [--include-paneless]`          | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그를 주면 1회 호출에 한해 `[watch] hide_paneless`를 무시합니다. |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
 | `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
@@ -269,6 +269,20 @@ CLI(`claude`, `codex`, `gemini` / `gemini-cli`)와 매칭하고, 데몬에 합�
 실행되므로 데몬을 재시작해도 페인에 살아 있는 에이전트가 사라지지 않습니다.
 멱등(idempotent)이며, 합성 항목은 실제 훅이 도착하면 그 자리에서 교체됩니다.
 `[discovery] enabled = false`로 끌 수 있습니다.
+
+기동 경로는 풍부한 복원을 위해 layered 구조로 동작 — 합성 placeholder는
+주 메커니즘이 아니라 마지막 fallback입니다:
+
+1. **`state.json`에서 hydrate.** 데몬이 매 이벤트마다 in-memory 레지스트리를
+   디스크에 미러링(이벤트 기반 + debounce, [상태 스냅샷](#상태-스냅샷)
+   참고)하므로, 재시작 시 모든 살아있는 에이전트의 real `session_id`,
+   `last_prompt`/`last_response`, model + cost 메타데이터까지 복원됩니다.
+2. **`prompts.ndjson`으로 enrich.** 스냅샷에 못 들어갔지만 prompt를
+   훅한 페인(예: 이전 데몬이 첫 debounce 윈도우 전에 죽음)에 대해서는
+   가장 최근 prompt-history 항목을 real `Idle` 에이전트로 재구성해서
+   첫 paint부터 풍부한 row가 보이게 합니다.
+3. **Discovery가 placeholder를 합성**합니다 — 그래도 남는 페인
+   (에이전트 CLI가 도는데 디스크 기록이 전혀 없는 경우) 에 한해서.
 
 ## 실시간 TUI
 
@@ -295,9 +309,14 @@ prompt + 응답이 80% × 70% 박스에 렌더링되고 `↑`/`↓` / `PgUp`/`Pg
 
 페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
 Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지
-못한 경우)는 PANE 컬럼에 `(no pane)`을 dim으로 표시하고, 해당 행이 선택될
-때 footer에 노란 `no tmux pane — attach unavailable` 힌트가 떠서 Enter가
-무반응인 이유를 보여줍니다.
+못한 경우)는 **기본적으로 picker에서 숨겨집니다** — `Enter`로 attach 할
+대상이 없어서 액션이 안 되기 때문입니다. footer에 dim
+`+N paneless (use --include-paneless to show)` 카운트가 떠서 행이 조용히
+사라지지 않게 알려줍니다. `muxa watch --include-paneless`(또는
+`[watch] hide_paneless = false`)로 다시 보이게 하면 PANE 컬럼에
+`(no pane)`을 dim으로 표시하고, 해당 행이 선택될 때 footer에 노란
+`no tmux pane — attach unavailable` 힌트가 떠서 Enter가 무반응인 이유를
+보여줍니다.
 
 가장 좋은 사용법은 tmux 팝업을 통하는 것입니다(위 [tmux 연결](#3-tmux-연결)
 참고). 어떤 페인에서든 `prefix + s`를 누르면 → 실시간 대시보드가 팝업으로 뜨고
@@ -485,6 +504,40 @@ compact_interval_secs = 3600
 있는 경우만 — 안 그러면 `muxa recap` 의 과거 조회 능력 자체가
 사라집니다.
 
+audit log 는 chmod 0600 — IPC 소켓과 동일한 자세 (prompt 내용은
+민감 정보) 입니다.
+
+### 상태 스냅샷
+
+`muxad` 는 in-memory 에이전트 레지스트리를 단일 JSON 파일
+(`$XDG_DATA_HOME/muxa/state.json` 기본값) 에 미러링하므로, 재시작 시
+real `session_id`, `last_prompt`/`last_response`, 그리고 전체 state +
+메타데이터까지 복원됩니다 — discovery 의 `synthetic-%X` placeholder 에
+의존하지 않아도 됩니다.
+
+쓰기는 이벤트 기반: 매 `Store::apply` (그리고 `gc` / `reconcile`) 가
+`tokio::sync::Notify` 로 writer task 를 깨우고, writer 는 debounce 후
+임시파일 + atomic rename + parent-dir fsync 로 디스크에 씁니다. 데몬이
+idle 일 땐 디스크 트래픽 0; tool-heavy turn 이 ms 안에 4개 이벤트를
+쏴도 1개 disk write 로 합쳐집니다.
+
+```toml
+[state]
+enabled     = true
+# path        = "$XDG_DATA_HOME/muxa/state.json"   # 기본값
+debounce_ms = 200
+```
+
+snapshotter 는 종료 시 가장 마지막에 죽습니다 — `muxad` 가 IPC 핸들러를
+먼저 drain 해서 종료 도중 도착한 이벤트들도 final flush 에 포함되도록
+합니다. SIGKILL 은 final flush 를 스킵하지만, 매 이벤트 debounce-write
+덕에 디스크 상태가 실시간에서 ~200 ms 이상 벗어나지 않습니다.
+
+파일은 chmod 0600 — `prompts.ndjson` 과 IPC 소켓과 동일. Loader 는
+관대 — 파일 없음 / corrupt / 미지의 schema version 모두 warn 후 빈
+초기 상태로 fallback 하므로, 디스크의 잘못된 state.json 이 daemon 을
+wedge 시키지 않습니다.
+
 ### 리컨실러
 
 주기적인 control loop 가 in-memory 레지스트리를 tmux ground truth 와
@@ -524,10 +577,17 @@ agent CLIs (Claude, Codex, Gemini)
     muxad  ───  0600 unix socket  ───  muxa CLI
       │                                  │
       ├── in-memory agent registry       └── status / watch TUI / status-line / recap
+      ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (이벤트 기반, debounce, 0600)
+      ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
+      ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)
-      └── graceful SIGTERM → drain → unlink socket
+      └── SIGTERM → IPC 핸들러 drain → snapshotter final flush → 소켓 unlink
 ```
+
+재시작 흐름: `state.json` 이 먼저 hydrate, `prompts.ndjson` 이 스냅샷이
+놓친 페인을 enrich, discovery 가 그래도 남는 페인에 placeholder 합성.
+reconciler 가 첫 tick 에 drift 를 수렴.
 
 3개 크레이트 워크스페이스:
 

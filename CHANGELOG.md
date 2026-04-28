@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Event-driven snapshot of the agent registry to
+  `$XDG_DATA_HOME/muxa/state.json`. `Store::apply` (plus `gc` /
+  `reconcile`) wakes a writer task via `tokio::sync::Notify`; the
+  writer debounces (default 200 ms) and writes via temp-file +
+  atomic rename + parent-dir fsync. Idle daemons produce zero disk
+  traffic; bursts collapse into one write. Configurable via
+  `[state]` (`enabled` / `path` / `debounce_ms`).
+- Restart rehydrate is layered: `state.json` hydrates first, then
+  `enrich_from_history` replays the most recent `prompts.ndjson`
+  entry for any pane the snapshot missed (real `session_id` +
+  `last_prompt` recovered without waiting for a fresh hook), and
+  finally discovery synthesizes placeholders for whatever's left.
+  Synthetics are now the fallback, not the primary mechanism.
+- `[watch] hide_paneless = true` (default): hide agents that aren't
+  bound to a tmux pane from `muxa watch`. They're not actionable
+  anyway (`Enter` is a no-op), so the picker stays focused; the
+  footer surfaces a `+N paneless` count so the rows aren't lost.
+  `muxa watch --include-paneless` flips the filter for one
+  invocation without editing config.
+- IPC handler drain on shutdown. `Server::run` tracks handlers on a
+  `JoinSet` and drains them with a 5 s bounded timeout before
+  returning, so `Store::apply` calls landing during shutdown make
+  it into the snapshotter's final flush. The snapshotter listens on
+  a dedicated channel so it's the literal last task to die.
+
+### Changed
+
+- `state.json` and `prompts.ndjson` are chmod 0600 — same posture as
+  the IPC socket, since both files carry user prompts/responses.
+  Tempfiles inherit the mode through `rename(2)`.
+- `Server::run` shutdown path now drains in-flight handlers before
+  unlinking the socket. The previous behavior was fire-and-forget,
+  which left a small lost-update window when an ingest landed mid-
+  shutdown.
+
 ## [0.1.0] - 2026-04-26
 
 First tagged release. End-to-end agent observability for tmux: a daemon

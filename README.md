@@ -255,7 +255,7 @@ muxa watch          # live TUI
 |                                            |                                                                        |
 | ------------------------------------------ | ---------------------------------------------------------------------- |
 | `muxa status`                              | Human-readable table of all tracked agents.                            |
-| `muxa watch`                               | Full-screen live TUI — see [Live TUI](#live-tui).                      |
+| `muxa watch [--include-paneless]`          | Full-screen live TUI — see [Live TUI](#live-tui). The flag overrides `[watch] hide_paneless` for one invocation. |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
 | `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
@@ -273,6 +273,20 @@ automatically on `muxad` startup so a daemon restart doesn't blank out
 agents that are still alive in their panes. Idempotent: synthetic entries
 are replaced in place when a real hook later fires. Toggle via
 `[discovery] enabled = false`.
+
+The startup path is layered for richer recovery — synthetic placeholders
+are the last fallback, not the primary mechanism:
+
+1. **Hydrate from `state.json`.** The daemon mirrors its in-memory
+   registry to disk on every event (debounced; see [State snapshot](#state-snapshot)),
+   so a restart restores real `session_id`s, `last_prompt`/`last_response`,
+   model + cost metadata for every agent that was alive at shutdown.
+2. **Enrich from `prompts.ndjson`.** For panes that hooked a prompt but
+   never made it into the snapshot (e.g. the previous run died before
+   its first debounce window), the most recent prompt-history entry is
+   replayed as a real `Idle` agent so its row is rich on first paint.
+3. **Discovery synthesizes placeholders** for whatever's left — panes
+   running an agent CLI with no on-disk record at all.
 
 ## Live TUI
 
@@ -316,9 +330,13 @@ screen for very long content where the popup wraps too aggressively.
 
 Agents whose pane is unknown — usually Claude Code SDK sub-processes
 whose env didn't carry `TMUX_PANE` and whose process-ancestry walk
-didn't recover one — render `(no pane)` dim in the PANE column, and the
-footer surfaces a yellow `no tmux pane — attach unavailable` hint when
-one is selected, so an unresponsive `Enter` is never silent.
+didn't recover one — are **hidden from the picker by default** because
+`Enter` can't attach to them anyway. The footer surfaces a dim
+`+N paneless (use --include-paneless to show)` hint so the rows aren't
+silently lost. Pass `muxa watch --include-paneless` (or set
+`[watch] hide_paneless = false`) to bring them back; when visible they
+render `(no pane)` in the PANE column with a yellow
+`no tmux pane — attach unavailable` footer hint on selection.
 
 The best way to use it is via a tmux popup (see the
 [tmux wiring](#3-wire-tmux) above). Press `prefix + s` from any pane →
@@ -532,6 +550,43 @@ Set `enabled = false` only if you're routing history exclusively
 through a sink (e.g. oh-my-prompt) — otherwise you lose `muxa recap`'s
 ability to look back after a daemon restart or pane close.
 
+The audit log is chmod 0600 — same posture as the IPC socket, since
+prompt content is sensitive.
+
+### State snapshot
+
+`muxad` mirrors its in-memory agent registry to a single JSON file
+(`$XDG_DATA_HOME/muxa/state.json` by default) so a restart rehydrates
+real `session_id`s, `last_prompt`/`last_response`, and full state +
+metadata instead of falling back to discovery's `synthetic-%X`
+placeholders.
+
+Writes are event-driven: every `Store::apply` (and every `gc` /
+`reconcile`) wakes a writer task via `tokio::sync::Notify`, which
+debounces and writes the registry to disk via temp-file + atomic
+rename + parent-dir fsync. Idle steady-state produces zero disk
+traffic; a tool-heavy turn that fires four events in milliseconds
+collapses into one disk write.
+
+```toml
+[state]
+enabled     = true
+# path        = "$XDG_DATA_HOME/muxa/state.json"   # default
+debounce_ms = 200
+```
+
+The snapshotter is the last task to die on shutdown — `muxad` drains
+its in-flight IPC handlers first so events that landed mid-shutdown
+make it into the final flush. SIGKILL skips that final flush, but
+the per-event debounce-write keeps the on-disk picture within ~200 ms
+of reality.
+
+The file is chmod 0600 — same as `prompts.ndjson` and the IPC socket.
+Loader is tolerant: missing / corrupt / unknown-schema-version all
+warn and fall through to an empty initial state, so a bad state.json
+on disk degrades cleanly to the synthetic-placeholder baseline rather
+than wedging the daemon.
+
 ### Reconciler
 
 A periodic control loop that converges the in-memory registry against
@@ -572,10 +627,17 @@ agent CLIs (Claude, Codex, Gemini)
     muxad  ───  0600 unix socket  ───  muxa CLI
       │                                  │
       ├── in-memory agent registry       └── status / watch TUI / status-line / recap
+      ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (event-driven, debounced, 0600)
+      ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
+      ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)
-      └── graceful SIGTERM → drain → unlink socket
+      └── SIGTERM → drain in-flight IPC handlers → snapshotter final flush → unlink socket
 ```
+
+Restart shape: `state.json` rehydrates first, `prompts.ndjson` enriches
+panes the snapshot missed, discovery synthesizes placeholders for the
+remainder. The reconciler converges any drift on its first tick.
 
 Three-crate workspace:
 
