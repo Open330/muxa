@@ -286,6 +286,13 @@ fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-r
 에이전트가 위로 올라옵니다. 정렬 기준은 `[watch] sort` 로 변경 가능
 (`session`, `activity`, `pane`, `pane_id` — [설정 > 정렬](#watch-sort) 참고).
 
+detail 라인 한 줄로 부족할 때 — 긴 prompt, 여러 단락의 응답 — 선택된
+행에서 **`p`** 키를 누르면 가운데 정렬된 preview 팝업이 뜹니다. 전체
+prompt + 응답이 80% × 70% 박스에 렌더링되고 `↑`/`↓` / `PgUp`/`PgDn` /
+`Home` 으로 스크롤됩니다. 팝업 뒤로 주변 행이 그대로 보여 맥락을 잃지
+않고, 정말 긴 콘텐츠는 **`f`** 로 풀스크린으로 토글할 수 있습니다.
+`q` / `Esc` / `p` 로 picker 로 복귀.
+
 페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
 Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지
 못한 경우)는 PANE 컬럼에 `(no pane)`을 dim으로 표시하고, 해당 행이 선택될

@@ -305,6 +305,15 @@ floated to the top of each group. Reorder via `[watch] sort` (see
 [Configuration](#watch-sort)) — useful sort keys: `session`, `activity`,
 `pane`, `pane_id`.
 
+When the detail line isn't enough — long prompt, multi-paragraph
+assistant response — press **`p`** on the selected row to pop open a
+centred preview window. The full last prompt + last response render in
+a 80% × 70% box over the table, scrollable with the usual `↑`/`↓` /
+`PgUp`/`PgDn` / `Home` keys. The popup keeps the surrounding rows
+visible behind it so you don't lose context; **`f`** toggles full-
+screen for very long content where the popup wraps too aggressively.
+`q` / `Esc` / `p` returns to the picker.
+
 Agents whose pane is unknown — usually Claude Code SDK sub-processes
 whose env didn't carry `TMUX_PANE` and whose process-ancestry walk
 didn't recover one — render `(no pane)` dim in the PANE column, and the
