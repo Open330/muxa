@@ -45,10 +45,26 @@ pub enum RuntimeError {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RequestBody {
-    Ingest { event: AgentEvent },
+    Ingest {
+        event: AgentEvent,
+    },
     Snapshot,
-    ByPane { pane: String },
-    BySession { session_id: String },
+    ByPane {
+        pane: String,
+    },
+    BySession {
+        session_id: String,
+    },
+    /// Disk-backed prompt audit log. `pane = None` returns prompts across
+    /// every tracked pane, sorted newest-first; otherwise filtered to one
+    /// pane. `limit = 0` (or absent) returns everything available, capped
+    /// by the daemon's in-memory retention.
+    RecentPrompts {
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Health,
 }
 
@@ -70,6 +86,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<Agent>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<crate::history::HistoryEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthInfo>,
 }
 
@@ -86,6 +104,7 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             error: None,
             agents: None,
+            prompts: None,
             health: None,
         }
     }
@@ -95,12 +114,18 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             error: Some(msg.into()),
             agents: None,
+            prompts: None,
             health: None,
         }
     }
     fn with_agents(agents: Vec<Agent>) -> Self {
         let mut r = Self::ok();
         r.agents = Some(agents);
+        r
+    }
+    fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
+        let mut r = Self::ok();
+        r.prompts = Some(prompts);
         r
     }
     fn health() -> Self {
@@ -212,6 +237,12 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                         .collect::<Vec<_>>();
                     Response::with_agents(v)
                 }
+                RequestBody::RecentPrompts { pane, limit } => {
+                    let prompts = store
+                        .recent_prompts(pane.as_deref(), limit.unwrap_or(0))
+                        .await;
+                    Response::with_prompts(prompts)
+                }
                 RequestBody::Health => Response::health(),
             },
             Err(e) => Response::err(format!("bad request: {e}")),
@@ -269,6 +300,32 @@ impl Client {
         });
         let resp = self.call(&req).await?;
         Ok(resp["agents"]
+            .as_array()
+            .cloned()
+            .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
+            .unwrap_or_default())
+    }
+
+    /// Query the daemon's prompt history. `pane = None` returns prompts
+    /// across every tracked pane (newest first); otherwise filters to
+    /// one pane. `limit = None` or 0 returns everything available.
+    pub async fn recent_prompts(
+        &self,
+        pane: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::history::HistoryEntry>, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "recent_prompts",
+        });
+        if let Some(p) = pane {
+            req["pane"] = serde_json::Value::String(p.to_string());
+        }
+        if let Some(l) = limit {
+            req["limit"] = serde_json::Value::from(l);
+        }
+        let resp = self.call(&req).await?;
+        Ok(resp["prompts"]
             .as_array()
             .cloned()
             .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())

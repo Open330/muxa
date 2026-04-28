@@ -39,10 +39,23 @@ enum Cmd {
         #[arg(long)]
         pane: Option<String>,
     },
-    /// Show the last prompt for the given pane (default: `$TMUX_PANE`).
+    /// Show recent prompts for the given pane (default: `$TMUX_PANE`).
+    ///
+    /// Combines the live agent record (current `last_prompt`) with the
+    /// disk-backed history audit log, so prompts persist across pane
+    /// closes, agent restarts, and daemon restarts.
     Recap {
+        /// Pane id to recap. Defaults to `$TMUX_PANE` when omitted.
         #[arg(long)]
         pane: Option<String>,
+        /// Number of historical prompts to show. Defaults to 10.
+        /// Use `--all` to ignore the cap.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Show every prompt the daemon has on file for this pane.
+        /// Overrides `--limit`.
+        #[arg(long, conflicts_with = "limit")]
+        all: bool,
     },
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
     Hook {
@@ -110,7 +123,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Status => cmd_status(&client).await,
         Cmd::StatusLine { pane } => cmd_status_line(&client, pane).await,
-        Cmd::Recap { pane } => cmd_recap(&client, pane).await,
+        Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
         Cmd::Watch => cmd_watch(&client, cfg).await,
@@ -398,15 +411,23 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_recap(client: &Client, pane: Option<String>) -> Result<()> {
+async fn cmd_recap(client: &Client, pane: Option<String>, limit: usize, all: bool) -> Result<()> {
     let pane = pane
         .or_else(tmux::current_pane)
         .context("no pane given and could not determine current tmux pane")?;
+
     let agents = client.by_pane(&pane).await?;
-    if agents.is_empty() {
-        println!("no agent in pane {pane}");
+    let history_limit = if all { Some(0) } else { Some(limit) };
+    let history = client
+        .recent_prompts(Some(&pane), history_limit)
+        .await
+        .unwrap_or_default();
+
+    if agents.is_empty() && history.is_empty() {
+        println!("no agent or recorded prompts in pane {pane}");
         return Ok(());
     }
+
     for a in agents {
         let kind = a.kind.to_string();
         let state = a.state.to_string();
@@ -414,6 +435,27 @@ async fn cmd_recap(client: &Client, pane: Option<String>) -> Result<()> {
         println!("── {kind}  [{state}] ────────────");
         println!("{prompt}");
         println!();
+    }
+
+    if !history.is_empty() {
+        let count = history.len();
+        let header = if all {
+            format!("── recent prompts ({count} total) ────────────")
+        } else {
+            format!("── recent prompts (showing up to {limit}) ────────────")
+        };
+        println!("{header}");
+        for entry in history {
+            // Concise, scannable row: "<rfc3339-short>  <kind>  <prompt-first-line>"
+            let stamp = entry
+                .at
+                .format(time::macros::format_description!(
+                    "[year]-[month]-[day] [hour]:[minute]"
+                ))
+                .unwrap_or_else(|_| entry.at.to_string());
+            let first_line = entry.prompt.lines().next().unwrap_or("");
+            println!("{stamp}  {}  {first_line}", entry.kind);
+        }
     }
     Ok(())
 }

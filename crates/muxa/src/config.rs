@@ -18,6 +18,8 @@ pub struct Config {
     pub watch: WatchConfig,
     pub dashboard: DashboardTomlConfig,
     pub discovery: DiscoveryConfig,
+    pub reconciler: ReconcilerConfig,
+    pub history: HistoryConfig,
     pub sinks: SinksConfig,
 }
 
@@ -119,6 +121,99 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// `[reconciler]` config — controls the periodic control loop that
+/// converges the in-memory agent registry against tmux ground truth.
+///
+/// The reconciler runs in the daemon and uses tmux as the authoritative
+/// source for which panes exist. Each pass reaps stale records, drops
+/// synthetic placeholders that have been superseded by real entries, and
+/// collapses duplicate rows for the same pane. It's idempotent — the
+/// `interval_secs` knob is a tuning parameter, not a correctness one.
+///
+/// Disable only if you're driving reconciliation externally (e.g. an
+/// integration test plugging in a fake `LivenessSource`); the daemon's
+/// view of the world will rot otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReconcilerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cadence of reconciliation passes. Defaults to 30s — frequent enough
+    /// that closed panes disappear from `muxa watch` within seconds, slow
+    /// enough that the cost of shelling out to tmux is negligible.
+    #[serde(default = "default_reconciler_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for ReconcilerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_reconciler_interval_secs(),
+        }
+    }
+}
+
+fn default_reconciler_interval_secs() -> u64 {
+    30
+}
+
+/// `[history]` config — controls the disk-backed prompt audit log.
+///
+/// The daemon records every `PromptSubmitted` event in a bounded NDJSON
+/// file plus an in-memory ring per pane. This is what powers `muxa recap
+/// --all` even after the live agent record has been reaped.
+///
+/// Disable only if you're routing history exclusively through a sink
+/// (e.g. oh-my-prompt) — otherwise you lose the ability to look back at
+/// old prompts after a daemon restart or pane close.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override the default `$XDG_DATA_HOME/muxa/prompts.ndjson` path.
+    /// Useful for tests and for users who want history on a different
+    /// filesystem (e.g. tmpfs for ephemeral, NFS for cross-machine).
+    pub path: Option<PathBuf>,
+    /// Cap on entries kept per pane in memory and on disk. Tuned to
+    /// "comfortable for `recap` browsing" — bump if you want longer
+    /// per-pane history.
+    #[serde(default = "default_history_max_per_pane")]
+    pub max_per_pane: usize,
+    /// Compaction drops entries older than this. Defaults to 30 days,
+    /// roughly one development sprint of context.
+    #[serde(default = "default_history_max_age_days")]
+    pub max_age_days: u32,
+    /// How often the compaction task rewrites the file. The compaction
+    /// pass is cheap (rewrites a few hundred lines), but doing it more
+    /// often than necessary only burns disk I/O.
+    #[serde(default = "default_history_compact_interval_secs")]
+    pub compact_interval_secs: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            max_per_pane: default_history_max_per_pane(),
+            max_age_days: default_history_max_age_days(),
+            compact_interval_secs: default_history_compact_interval_secs(),
+        }
+    }
+}
+
+fn default_history_max_per_pane() -> usize {
+    50
+}
+fn default_history_max_age_days() -> u32 {
+    30
+}
+fn default_history_compact_interval_secs() -> u64 {
+    3600
 }
 
 fn default_true() -> bool {
