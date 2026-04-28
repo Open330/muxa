@@ -321,6 +321,11 @@ pub(crate) struct App {
     /// preview (key `p`). The table is hidden behind the preview while
     /// this is set; `q`/`Esc`/`p` clears it.
     pub preview: Option<PreviewState>,
+    /// Count of paneless agents that were filtered out of `rows` because
+    /// `watch_cfg.hide_paneless` is true. Surfaced as a footer hint so
+    /// users know the rows aren't lost — they just aren't actionable from
+    /// the picker. Always 0 when `hide_paneless = false`.
+    pub paneless_hidden: usize,
 }
 
 /// A `muxa watch` preview overlay — detail view of the selected agent's
@@ -372,6 +377,7 @@ impl App {
             refresh_pending: false,
             initial_pane: None,
             preview: None,
+            paneless_hidden: 0,
         }
     }
 
@@ -386,6 +392,18 @@ impl App {
     /// order; `panes` minus any pane already represented by an agent are
     /// appended as `BarePane` rows.
     pub(crate) fn set_data(&mut self, mut agents: Vec<Agent>, panes: Vec<PaneInfo>) {
+        // Filter out paneless agents up front when the user has opted in
+        // (the default). They can't be attached to from the picker — Enter
+        // is a no-op — so listing them just clutters the actionable view.
+        // The count is preserved on `paneless_hidden` so the footer can
+        // surface a `+N paneless` hint and the rows aren't silently lost.
+        self.paneless_hidden = 0;
+        if self.watch_cfg.hide_paneless {
+            let before = agents.len();
+            agents.retain(|a| a.pane.is_some());
+            self.paneless_hidden = before - agents.len();
+        }
+
         // Sort agent rows according to the user's `[watch] sort` config.
         // Stale agents (pane already closed, i.e. lookup miss against the
         // panes inventory) always bucket at the end so live agents stay
@@ -1527,6 +1545,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             "no tmux pane — attach unavailable",
             Style::default()
                 .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ));
+    }
+    // When paneless agents were hidden by config, surface the count so
+    // they remain discoverable. `--include-paneless` (or
+    // `[watch] hide_paneless = false`) brings them back.
+    if app.paneless_hidden > 0 {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            format!(
+                "+{} paneless (use --include-paneless to show)",
+                app.paneless_hidden
+            ),
+            Style::default()
+                .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }
@@ -2781,9 +2814,16 @@ mod tests {
         // (the SDK sub-agent case). Selecting it must put a yellow
         // "no tmux pane — attach unavailable" hint in the footer, where
         // a regular agent would just show the keybinds.
+        //
+        // Default config hides paneless agents — we explicitly include
+        // them here because that's the very thing under test.
         let backend = TestBackend::new(140, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::new();
+        let cfg = WatchConfig {
+            hide_paneless: false,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
         app.set_data(
             vec![fake_agent(
                 "s-no-pane",
@@ -2849,7 +2889,9 @@ mod tests {
 
     #[test]
     fn selected_pane_returns_none_for_no_pane_agent() {
-        let mut app = App::new();
+        let mut cfg = WatchConfig::default();
+        cfg.hide_paneless = false; // include the paneless row under test
+        let mut app = App::with_config(cfg);
         app.set_data(
             vec![fake_agent(
                 "s",
@@ -2868,6 +2910,140 @@ mod tests {
         // The footer hint added above is the user-facing fix; this
         // assertion just nails down the underlying contract.
         assert_eq!(app.selected_pane(), None);
+    }
+
+    /// Default config hides paneless agents so the picker only lists
+    /// rows the user can actually attach to. The row count must reflect
+    /// only the pane-bound agent, and `paneless_hidden` must record the
+    /// count of filtered rows so the footer can surface them.
+    #[test]
+    fn hide_paneless_filters_agents_by_default() {
+        let mut app = App::new();
+        app.set_data(
+            vec![
+                fake_agent(
+                    "with-pane",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "no-pane",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.paneless_hidden, 1);
+    }
+
+    /// `--include-paneless` (or `[watch] hide_paneless = false`) keeps
+    /// every agent visible and zeroes the filter counter.
+    #[test]
+    fn include_paneless_keeps_every_agent() {
+        let cfg = WatchConfig {
+            hide_paneless: false,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent(
+                    "with-pane",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "no-pane",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(app.rows.len(), 2);
+        assert_eq!(app.paneless_hidden, 0);
+    }
+
+    /// Footer surfaces the hidden-paneless count so the rows aren't
+    /// silently lost. The hint also tells the user how to reveal them.
+    #[test]
+    fn footer_shows_paneless_hidden_count() {
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(); // default hides paneless
+        app.set_data(
+            vec![
+                fake_agent(
+                    "with-pane",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "no-pane-1",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "no-pane-2",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            dump.contains("+2 paneless"),
+            "footer must surface the hidden paneless count",
+        );
+        assert!(
+            dump.contains("--include-paneless"),
+            "footer must hint at the override flag",
+        );
     }
 
     /// `apply_outcome` is the only path data flows back into `App`. It

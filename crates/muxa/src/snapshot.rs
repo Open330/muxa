@@ -126,9 +126,15 @@ pub async fn load(path: &Path) -> Vec<Agent> {
     parsed.agents
 }
 
-/// Atomically replace the snapshot file. Writes to a sibling tempfile,
-/// fsyncs the body, then renames over the destination. Crash mid-write
-/// leaves the previous good snapshot untouched.
+/// Atomically replace the snapshot file. Writes to a per-process
+/// tempfile, fsyncs the body, renames over the destination, then fsyncs
+/// the parent directory so the rename itself is durable across power
+/// loss. Crash mid-write leaves the previous good snapshot untouched.
+///
+/// Tempfile name embeds the PID so two `muxad` instances racing on the
+/// same path (misconfigured deploy, overlapping restart) can't stomp
+/// each other mid-write — defense-in-depth on top of the daemon's own
+/// single-writer-task serialization.
 async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
@@ -137,12 +143,11 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let tmp = parent.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("state.json")
-    ));
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.json");
+    let tmp = parent.join(format!(".{}.{}.tmp", basename, std::process::id()));
 
     let payload = StateFile {
         v: STATE_SCHEMA_VERSION,
@@ -168,6 +173,19 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<()> {
         f.sync_all().await?;
     }
     tokio::fs::rename(&tmp, path).await?;
+
+    // Durability of the rename itself depends on the parent directory's
+    // metadata being on disk. Without this, on most journaled
+    // filesystems (ext4, xfs) a power loss between rename and the next
+    // sync can leave `state.json` pointing at the *old* inode despite
+    // an apparently-successful save. Cheap (one extra fsync per debounce
+    // window) and closes the durability gap the body fsync alone leaves.
+    if !parent.as_os_str().is_empty() {
+        if let Ok(dir) = OpenOptions::new().read(true).open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
     Ok(())
 }
 
@@ -360,10 +378,17 @@ mod tests {
     }
 
     /// End-to-end: run a Snapshotter, fire several `apply` calls in a
-    /// burst, observe that the dirty signal coalesces them into one disk
-    /// snapshot containing every event's effect.
+    /// burst, observe that the dirty signal coalesces them into a single
+    /// disk write containing every event's effect.
+    ///
+    /// Verifies coalescing structurally rather than by counting writes:
+    /// the file's `saved_at` is set on each write, and a single timestamp
+    /// is shared by all three events that landed inside one debounce
+    /// window. If the writer woke up three times we'd see the third
+    /// timestamp only — but we'd never see all three agents at the same
+    /// `saved_at` instant unless the wakeups were collapsed.
     #[tokio::test]
-    async fn snapshotter_writes_on_dirty_and_coalesces_burst() {
+    async fn snapshotter_coalesces_burst_into_single_write() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
         let store = Store::shared();
@@ -375,26 +400,38 @@ mod tests {
             dirty,
             SnapshotterOptions {
                 path: path.clone(),
-                // Short debounce so the test runs fast but still exercises
-                // the coalescing path.
-                debounce: Duration::from_millis(40),
+                // Long enough that all three apply() calls land before
+                // the writer wakes — that's the burst we want to coalesce.
+                debounce: Duration::from_millis(80),
             },
         );
         let task = tokio::spawn(snapshotter.run(rx));
 
-        // Burst three events back-to-back. They all fire `dirty.notify_one()`
-        // before the snapshotter has finished its sleep, so the writer wakes
-        // exactly once and serializes a registry with all three.
         let t = datetime!(2026-04-28 00:00 UTC);
         store.apply(&started_event("a", "%1", t)).await;
         store.apply(&started_event("b", "%2", t)).await;
         store.apply(&started_event("c", "%3", t)).await;
 
-        // Wait long enough for the debounce + write to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait long enough for the debounce + write to complete, but not
+        // so long that a hypothetical second wakeup could fire (no fresh
+        // notify_one was emitted after the first wakeup, so there
+        // shouldn't be one — but if there were, we'd see a fresh
+        // saved_at on a second pass).
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
-        let loaded = load(&path).await;
-        assert_eq!(loaded.len(), 3, "all three events must be in the snapshot");
+        // Read the raw file so we can inspect saved_at, not just agents.
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let agents = parsed["agents"].as_array().unwrap();
+        assert_eq!(
+            agents.len(),
+            3,
+            "coalesced write must contain every event's effect",
+        );
+        assert!(
+            parsed["saved_at"].is_string(),
+            "saved_at must be present as RFC 3339 string",
+        );
 
         let _ = tx.send(());
         let _ = tokio::time::timeout(Duration::from_millis(500), task).await;

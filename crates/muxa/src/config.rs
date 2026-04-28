@@ -311,6 +311,17 @@ pub struct WatchConfig {
     /// Default: `["session", "activity"]` — groups by tmux session, then
     /// floats the most-recently-active agent inside each group to the top.
     pub sort: Vec<WatchSortKey>,
+    /// Hide agents that aren't bound to a tmux pane.
+    ///
+    /// Paneless agents (Claude SDK sub-processes whose env didn't carry
+    /// `$TMUX_PANE`, agents launched outside tmux, etc.) can't be attached
+    /// to from the picker — Enter is a no-op — so they default to hidden
+    /// to keep the row list focused on actionable targets. The footer
+    /// surfaces a `+N paneless` count so they remain discoverable, and
+    /// `muxa watch --include-paneless` reveals them for one invocation.
+    /// Set `false` here to flip the default the other way.
+    #[serde(default = "default_true")]
+    pub hide_paneless: bool,
 }
 
 /// A single sort key for the `muxa watch` agent row ordering. The keys
@@ -359,6 +370,7 @@ impl Default for WatchConfig {
             // "where is it" at a glance, without losing the grouping
             // shipped in c9a6572.
             sort: vec![WatchSortKey::Session, WatchSortKey::Activity],
+            hide_paneless: true,
         }
     }
 }

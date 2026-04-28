@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
     // Prompt history must exist before the store: every PromptSubmitted
     // event fans out into history alongside the live agent record.
     let history = build_history(&cfg, &shutdown_tx).await;
-    let store = Store::shared_with_history(history);
+    let store = Store::shared_with_history(history.clone());
 
     // Rehydrate the agent registry from the previous run's snapshot, if
     // any. Done before the IPC server starts accepting events so no
@@ -124,6 +124,13 @@ async fn main() -> Result<()> {
     // spawns so the first save isn't a no-op overwrite of the file we
     // just read.
     hydrate_state(&cfg, &store).await;
+    // Then layer in any panes that have prompt history on disk but
+    // aren't represented in state.json (typically because the previous
+    // run died before its first debounce window). This recovers the
+    // real `session_id` + `last_prompt` from prompts.ndjson, so the
+    // operator sees rich rows for those panes immediately on restart
+    // instead of `synthetic-%X` placeholders.
+    enrich_from_history(&store, &history).await;
 
     spawn_gc_task(&store, &shutdown_tx);
     spawn_reconciler_task(&cfg, &store, &shutdown_tx);
@@ -417,6 +424,76 @@ async fn hydrate_state(cfg: &Config, store: &muxa::SharedStore) {
         return;
     }
     store.hydrate(initial).await;
+}
+
+/// Bridge `prompts.ndjson` into the live registry on startup.
+///
+/// `state.json` is the authoritative restart-recovery surface, but the
+/// daemon may have died before its first debounce window — leaving panes
+/// whose hooks already populated `prompts.ndjson` but never made it into
+/// state. For each live tmux pane that *has* a prompt-history record but
+/// no real agent (i.e. only a synthetic placeholder, or nothing), seed
+/// an `Idle` agent under the real `session_id` from history so the
+/// operator sees rich rows immediately.
+///
+/// Skipped silently when tmux isn't available, when history is empty, or
+/// when state snapshotting is disabled (in which case we'd rather not
+/// resurrect agents the operator opted out of persisting).
+async fn enrich_from_history(store: &muxa::SharedStore, history: &Arc<PromptHistory>) {
+    use muxa::tmux;
+    if history.is_empty().await {
+        return;
+    }
+    let Ok(Ok(panes)) = tokio::task::spawn_blocking(tmux::list_panes).await else {
+        return;
+    };
+    if panes.is_empty() {
+        return;
+    }
+
+    // Snapshot the current registry to decide which panes need
+    // enrichment. A pane is "covered" iff a *real* (non-synthetic) live
+    // agent already represents it — synthetic placeholders are the
+    // exact thing this pass is trying to upgrade away from.
+    let snapshot = store.snapshot().await;
+
+    let mut candidates: Vec<muxa::Agent> = Vec::new();
+    for pane in &panes {
+        let has_real = snapshot.iter().any(|a| {
+            a.pane.as_deref() == Some(pane.pane_id.as_str())
+                && !a
+                    .session_id
+                    .starts_with(muxa::state::SYNTHETIC_SESSION_PREFIX)
+                && a.state != muxa::AgentState::Stopped
+        });
+        if has_real {
+            continue;
+        }
+        let recents = history.recent_for_pane(&pane.pane_id, 1).await;
+        let Some(entry) = recents.into_iter().next() else {
+            continue;
+        };
+        candidates.push(muxa::Agent {
+            kind: entry.kind,
+            session_id: entry.session_id,
+            pane: Some(pane.pane_id.clone()),
+            cwd: None,
+            state: muxa::AgentState::Idle,
+            last_prompt: Some(entry.prompt),
+            last_response: None,
+            last_notification: None,
+            model: entry.model,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: entry.at,
+            last_activity_at: entry.at,
+        });
+    }
+
+    let inserted = store.seed_if_absent(candidates).await;
+    if inserted > 0 {
+        tracing::info!(inserted, "enriched registry from prompt history");
+    }
 }
 
 /// Collapse the daemon's CLI args + env vars + TOML into a resolved

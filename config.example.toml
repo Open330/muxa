@@ -59,6 +59,12 @@
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
 # columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+# Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
+# agents launched outside tmux). Default true because Enter on the picker
+# can't attach to them anyway; the footer surfaces a `+N paneless` count
+# so they remain discoverable. `muxa watch --include-paneless` reveals
+# them for one invocation without flipping this flag.
+# hide_paneless = true
 
 # Sort order for agent rows. Keys are evaluated left-to-right with
 # `pane_id` as a final stable tiebreaker. Stale agents (pane closed)

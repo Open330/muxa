@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ContentArrangement, Table};
 use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
+use muxa::config::WatchConfig;
 use muxa::ipc::Client;
 use muxa::state::Agent;
 use muxa::{discovery, paths, tmux, AgentState, Config};
@@ -65,7 +66,16 @@ enum Cmd {
     /// Debug: print tmux pane inventory.
     Panes,
     /// Fullscreen TUI dashboard of all tracked agents.
-    Watch,
+    Watch {
+        /// Show agents that have no tmux pane attached. Default behavior
+        /// (governed by `[watch] hide_paneless = true`) hides them
+        /// because Enter on the picker can't attach to them anyway —
+        /// the footer surfaces a count instead. This flag flips the
+        /// filter off for one invocation, e.g. when debugging a
+        /// detached SDK session.
+        #[arg(long)]
+        include_paneless: bool,
+    },
     /// Backfill the registry by scanning tmux panes for agent processes.
     Sync,
 }
@@ -126,7 +136,7 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
-        Cmd::Watch => cmd_watch(&client, cfg).await,
+        Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
     }
 }
@@ -178,11 +188,18 @@ async fn cmd_sync(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_watch(client: &Client, cfg: Config) -> Result<()> {
+async fn cmd_watch(client: &Client, cfg: Config, include_paneless: bool) -> Result<()> {
     // watch::run restores the terminal before returning, so by the time we
     // get here it's safe to exec tmux commands that mutate the client's
     // attached session / pane.
-    if let Some(pane_id) = watch::run(client, cfg.watch).await? {
+    //
+    // CLI flag wins over config — one-shot override for the current
+    // invocation without touching the user's ~/.config/muxa/config.toml.
+    let watch_cfg = WatchConfig {
+        hide_paneless: cfg.watch.hide_paneless && !include_paneless,
+        ..cfg.watch
+    };
+    if let Some(pane_id) = watch::run(client, watch_cfg).await? {
         jump_to_pane(&pane_id);
     }
     Ok(())

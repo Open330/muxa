@@ -190,16 +190,44 @@ impl Store {
     /// Install an initial set of agents — used on daemon startup to
     /// rehydrate the registry from a previous run's snapshot.
     ///
-    /// Replaces any existing entries with the same `session_id`. Idempotent:
-    /// safe to call multiple times, though the typical path calls it once
-    /// before the IPC server starts accepting events. The reconciler will
-    /// reap any panes that no longer exist on the next pass, so loading a
-    /// stale snapshot is forgiving.
+    /// Upsert by `session_id`: existing entries are overwritten. The daemon
+    /// startup path calls this exactly once on an empty store, so the
+    /// upsert behavior is moot in practice; callers driving multiple
+    /// hydrate passes should de-dup their inputs first. The reconciler
+    /// will reap any panes that no longer exist on the next pass, so
+    /// loading a stale snapshot is forgiving.
     pub async fn hydrate(&self, initial: Vec<Agent>) {
         let mut agents = self.agents.write().await;
         for a in initial {
             agents.insert(a.session_id.clone(), a);
         }
+    }
+
+    /// Seed agents that are missing from the registry but have leftovers
+    /// in the prompt-history file. Used on startup, after `hydrate`, to
+    /// rebuild rich rows for panes that the previous run never managed
+    /// to snapshot — typically because the daemon died before its first
+    /// debounce window — but for which we *do* have a recent prompt on
+    /// disk.
+    ///
+    /// Inserts only when the candidate's `session_id` isn't already in
+    /// the registry, so a hydrated state.json always wins over a
+    /// possibly-staler history reconstruction. Returns the number of
+    /// agents actually inserted.
+    pub async fn seed_if_absent(&self, candidates: Vec<Agent>) -> usize {
+        let mut inserted = 0usize;
+        let mut agents = self.agents.write().await;
+        for a in candidates {
+            if !agents.contains_key(&a.session_id) {
+                agents.insert(a.session_id.clone(), a);
+                inserted += 1;
+            }
+        }
+        if inserted > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+        }
+        inserted
     }
 
     /// Handle to the dirty-signal Notify. Snapshotter tasks subscribe via
@@ -1241,6 +1269,65 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].session_id, "newer");
+    }
+
+    /// `seed_if_absent` is the entry point used by the daemon's
+    /// `enrich_from_history` path: it must insert candidates whose
+    /// `session_id` isn't yet in the registry, and skip any that are
+    /// already present (so a `state.json` rehydrate always wins over a
+    /// possibly-staler reconstruction from `prompts.ndjson`).
+    #[tokio::test]
+    async fn seed_if_absent_inserts_only_new_session_ids() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-28 00:00 UTC);
+        // Pre-populate with session "live".
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "live".into(),
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+
+        // Two candidates: "live" already exists (must skip),
+        // "fresh" is new (must insert).
+        let mk = |sid: &str, pane: &str, prompt: &str| Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: sid.into(),
+            pane: Some(pane.into()),
+            cwd: None,
+            state: AgentState::Idle,
+            last_prompt: Some(prompt.into()),
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: t0,
+            last_activity_at: t0,
+        };
+        let inserted = store
+            .seed_if_absent(vec![
+                mk("live", "%1", "should not overwrite"),
+                mk("fresh", "%2", "history-derived"),
+            ])
+            .await;
+
+        assert_eq!(inserted, 1, "only the new session_id should be inserted");
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        // The pre-existing "live" agent must keep its original
+        // last_prompt (None from the Started event), proving seed
+        // didn't clobber it.
+        let live = snap.iter().find(|a| a.session_id == "live").unwrap();
+        assert!(live.last_prompt.is_none());
+        // The fresh seed must carry the candidate's last_prompt.
+        let fresh = snap.iter().find(|a| a.session_id == "fresh").unwrap();
+        assert_eq!(fresh.last_prompt.as_deref(), Some("history-derived"));
     }
 
     #[tokio::test]
