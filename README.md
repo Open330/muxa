@@ -328,6 +328,16 @@ visible behind it so you don't lose context; **`f`** toggles full-
 screen for very long content where the popup wraps too aggressively.
 `q` / `Esc` / `p` returns to the picker.
 
+While the preview is open, **`c`** toggles the content between
+prompt/response and a **live tmux pane snapshot** — same shape as
+tmux's `prefix + s` choose-tree preview. Internally it shells out to
+`tmux capture-pane -ep`, parses the ANSI escapes through
+[`ansi-to-tui`](https://crates.io/crates/ansi-to-tui), and re-fetches
+on every refresh tick (≤2 Hz, debounced) so you see what the pane
+actually looks like — colors, prompt glyphs, mid-turn output. `f` and
+`c` are independent axes: e.g. `c` then `f` gives you a fullscreen
+live pane view.
+
 Agents whose pane is unknown — usually Claude Code SDK sub-processes
 whose env didn't carry `TMUX_PANE` and whose process-ancestry walk
 didn't recover one — are **hidden from the picker by default** because
@@ -354,7 +364,7 @@ attach-session` for you instead of `switch-client`.
 | --------------------- | ---------------------------------------------------------------------- |
 | `↑` / `↓` / `k` / `j` | Move the selection cursor.                                             |
 | `Enter`               | Attach to the selected pane (`tmux select-pane` + `switch-client`).    |
-| `p`                   | Pop open a centred preview popup of the selected row's prompt + response — useful when the detail line gets truncated. `f` toggles popup ↔ full-screen for very long content. `q` / `Esc` / `p` returns to the table; `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll. |
+| `p`                   | Pop open a centred preview popup of the selected row's prompt + response — useful when the detail line gets truncated. `f` toggles popup ↔ full-screen for very long content; `c` toggles content between prompt/response and a live `tmux capture-pane` snapshot of the actual pane contents (ANSI colors preserved). `q` / `Esc` / `p` returns to the table; `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll. |
 | `r`                   | Force an immediate refresh.                                            |
 | `q` / `Esc`           | Quit.                                                                  |
 | `Ctrl-C`              | Quit.                                                                  |

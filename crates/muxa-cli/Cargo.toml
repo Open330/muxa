@@ -34,6 +34,10 @@ owo-colors = { version = "4", features = ["supports-colors"] }
 # TUI — `muxa watch`.
 ratatui = "0.30"
 crossterm = "0.29"
+# Parses ANSI escape sequences (colors / attributes) from tmux's
+# `capture-pane -e` output into ratatui `Text`/`Lines`, so the live pane
+# preview keeps the source pane's coloring.
+ansi-to-tui = "8"
 
 [dev-dependencies]
 tempfile = "3"

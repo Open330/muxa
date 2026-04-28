@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa watch` preview popup gains a content-axis toggle (`c`): flip
+  between the existing prompt + response view and a live snapshot of
+  the tmux pane itself, captured via `tmux capture-pane -ep` and
+  rendered with ANSI colors preserved through `ansi-to-tui`. Same
+  shape as tmux's `prefix + s` choose-tree preview. Re-captures on
+  every refresh tick (debounced to ≤2 Hz) while the preview stays
+  open. Geometry (popup ↔ fullscreen, `f`) and content (prompt ↔ live
+  pane, `c`) are independent axes — both compose freely.
+- `muxa::tmux::capture_pane(pane_id)` — minimal wrapper around
+  `tmux capture-pane -ep -t <pane>` for callers that need the live
+  pane contents with ANSI escapes intact.
+
 ## [0.2.0] - 2026-04-28
 
 ### Added

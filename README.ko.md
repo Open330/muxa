@@ -307,6 +307,15 @@ prompt + 응답이 80% × 70% 박스에 렌더링되고 `↑`/`↓` / `PgUp`/`Pg
 않고, 정말 긴 콘텐츠는 **`f`** 로 풀스크린으로 토글할 수 있습니다.
 `q` / `Esc` / `p` 로 picker 로 복귀.
 
+preview 가 열린 상태에서 **`c`** 를 누르면 컨텐츠가 prompt/response ↔
+**실제 tmux 페인 라이브 캡처** 사이로 토글됩니다 — tmux 의 `prefix + s`
+choose-tree preview 와 같은 형태. 내부적으로 `tmux capture-pane -ep` 로
+shell out 해서 ANSI escape 를 [`ansi-to-tui`](https://crates.io/crates/ansi-to-tui)
+로 파싱하고, refresh tick 마다 (≤ 2 Hz, debounce 적용) 다시 캡처해서
+페인이 실제로 어떻게 보이는지를 그대로 보여줍니다 — 컬러, prompt
+글리프, 진행 중인 출력까지. `f` 와 `c` 는 독립 축이라 자유롭게 조합
+가능 (예: `c` 후 `f` 면 풀스크린 라이브 페인 뷰).
+
 페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
 Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지
 못한 경우)는 **기본적으로 picker에서 숨겨집니다** — `Enter`로 attach 할
@@ -333,7 +342,7 @@ Enter 동작도 동일합니다. 다만 muxa가 `switch-client` 대신
 | --------------------- | --------------------------------------------------------------------- |
 | `↑` / `↓` / `k` / `j` | 선택 커서 이동.                                                        |
 | `Enter`               | 선택한 페인에 어태치 (`tmux select-pane` + `switch-client`).           |
-| `p`                   | 선택된 행의 prompt + response 를 가운데 정렬된 popup 으로 띄움 — detail 라인이 잘려서 안 보일 때 유용. `f` 로 popup ↔ 풀스크린 토글. `q` / `Esc` / `p` 로 표로 복귀, `↑` / `↓` / `PgUp` / `PgDn` / `Home` 으로 스크롤. |
+| `p`                   | 선택된 행의 prompt + response 를 가운데 정렬된 popup 으로 띄움 — detail 라인이 잘려서 안 보일 때 유용. `f` 로 popup ↔ 풀스크린 토글, `c` 로 prompt/response ↔ 실제 페인 라이브 캡처 토글 (`tmux capture-pane`, ANSI 컬러 보존). `q` / `Esc` / `p` 로 표로 복귀, `↑` / `↓` / `PgUp` / `PgDn` / `Home` 으로 스크롤. |
 | `r`                   | 즉시 리프레시 강제.                                                    |
 | `q` / `Esc`           | 종료.                                                                  |
 | `Ctrl-C`              | 종료.                                                                  |

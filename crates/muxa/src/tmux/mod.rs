@@ -77,6 +77,31 @@ pub fn inside_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
 
+/// Capture the visible contents of a tmux pane, preserving ANSI escape
+/// sequences so the caller can render colors / attributes faithfully.
+///
+/// Wraps `tmux capture-pane -ep -t <pane_id>`:
+///   - `-p` writes to stdout instead of a paste buffer.
+///   - `-e` keeps escape sequences for color and attribute codes — without
+///     this the output is plain text and we lose all color information.
+///
+/// Errors map onto `TmuxError`: spawn failure (no tmux at all), non-zero
+/// exit (pane no longer exists, or no tmux server), or non-UTF-8 stdout.
+/// The "pane gone" case is the most common in practice — tmux's exit
+/// status is non-zero, the stderr is short — so callers should treat
+/// `NonZero` as "ephemeral, retry next tick" rather than fatal.
+pub fn capture_pane(pane_id: &str) -> Result<String, TmuxError> {
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-ep", "-t", pane_id])
+        .output()?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
 /// Best-effort resolution of the user's active pane.
 ///
 /// `$TMUX_PANE` covers the common case (a shell running inside that pane).

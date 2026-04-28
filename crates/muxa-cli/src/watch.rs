@@ -326,12 +326,22 @@ pub(crate) struct App {
     /// users know the rows aren't lost — they just aren't actionable from
     /// the picker. Always 0 when `hide_paneless = false`.
     pub paneless_hidden: usize,
+    /// Most recent `tmux capture-pane -ep` result, keyed by `pane_id`.
+    /// Populated on demand when the preview is in
+    /// [`PreviewContent::PaneCapture`] and re-captured on every refresh
+    /// tick while the preview stays open in that mode. `None` when the
+    /// preview is closed or showing prompt/response content.
+    pub pane_capture: Option<CapturedPane>,
 }
 
-/// A `muxa watch` preview overlay — detail view of the selected agent's
-/// last prompt + last response. The selection is pinned to a `pane_id`
-/// (not a row index) so background refreshes that re-sort the table
-/// can't drift the preview onto a different agent.
+/// A `muxa watch` preview overlay — detail view of the selected agent.
+/// Geometry (popup vs fullscreen) and content (prompt/response vs live
+/// pane capture) are independent axes so the two toggles compose: a
+/// user can read the prompt in a popup, then `c` to flip to a live pane
+/// view in the same popup, then `f` to fullscreen that. The selection
+/// is pinned to a `pane_id` (not a row index) so background refreshes
+/// that re-sort the table can't drift the preview onto a different
+/// agent.
 #[derive(Debug, Clone)]
 pub struct PreviewState {
     /// Pane id at the time the preview was opened — also the lookup key
@@ -345,6 +355,10 @@ pub struct PreviewState {
     /// surrounding table visible for context) or as a full-screen take-
     /// over. The `f` key toggles between the two.
     pub mode: PreviewMode,
+    /// What's being shown inside the box: prompt + response (default,
+    /// text-only) or a live capture of the actual tmux pane contents.
+    /// `c` toggles between the two.
+    pub content: PreviewContent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +370,36 @@ pub enum PreviewMode {
     /// Full-screen takeover, useful for very long responses where the
     /// 80×70 box still wraps too aggressively.
     Fullscreen,
+}
+
+/// Content axis of the preview overlay. Independent of [`PreviewMode`]'s
+/// geometry — both compose freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewContent {
+    /// Default: render the agent's last prompt + last response from the
+    /// in-memory store. Cheap (zero shell-out), text-only.
+    PromptResponse,
+    /// Live snapshot of the tmux pane's visible screen, captured via
+    /// `tmux capture-pane -ep` on each refresh tick. Preserves ANSI
+    /// colors via [`ansi_to_tui`], so the user sees what the pane
+    /// actually looks like — same shape as tmux's choose-tree preview.
+    PaneCapture,
+}
+
+/// Cached pane-capture result. One slot per `App` since only the
+/// currently-previewed pane needs a capture; flipping rows or closing
+/// the preview invalidates by `pane_id` mismatch and the next refresh
+/// repopulates.
+#[derive(Debug, Clone)]
+pub struct CapturedPane {
+    pub pane_id: String,
+    /// Raw stdout from `tmux capture-pane -ep`, ANSI escapes intact.
+    /// Decoded to ratatui `Text` lazily at render time so a stale row
+    /// re-render never re-parses the same bytes.
+    pub text: String,
+    /// Monotonic timestamp; the main loop uses `elapsed()` to gate the
+    /// next re-capture so we don't shell out every frame.
+    pub fetched_at: std::time::Instant,
 }
 
 impl App {
@@ -378,6 +422,7 @@ impl App {
             initial_pane: None,
             preview: None,
             paneless_hidden: 0,
+            pane_capture: None,
         }
     }
 
@@ -809,11 +854,17 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                             pane_id,
                             scroll: 0,
                             mode: PreviewMode::Popup,
+                            content: PreviewContent::PromptResponse,
                         });
                     }
                 }
                 Action::ClosePreview => {
                     app.preview = None;
+                    // Drop any cached pane capture — keeping it would
+                    // pin a stale snapshot in memory across preview
+                    // sessions and might leak across tmux pane reuse
+                    // within the same `pane_id`.
+                    app.pane_capture = None;
                 }
                 Action::TogglePreviewMode => {
                     if let Some(p) = app.preview.as_mut() {
@@ -823,7 +874,56 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                         };
                     }
                 }
+                Action::TogglePreviewContent => {
+                    if let Some(p) = app.preview.as_mut() {
+                        p.content = match p.content {
+                            PreviewContent::PromptResponse => PreviewContent::PaneCapture,
+                            PreviewContent::PaneCapture => PreviewContent::PromptResponse,
+                        };
+                        // Reset scroll so the new content starts from
+                        // the top — re-using the prompt-mode scroll
+                        // offset on a wholly-different content surface
+                        // tends to land mid-line.
+                        p.scroll = 0;
+                        // Drop the cache when leaving PaneCapture so the
+                        // next entry starts with a fresh capture.
+                        if matches!(p.content, PreviewContent::PromptResponse) {
+                            app.pane_capture = None;
+                        }
+                    }
+                }
                 Action::None => {}
+            }
+        }
+
+        // Live pane capture: when the preview is open in PaneCapture
+        // mode and the cache is missing or stale (>500 ms), shell out
+        // to `tmux capture-pane -ep -t <pane>` on a worker thread.
+        // Bounded by the existing 500 ms TTL so we never fork more
+        // than ~2 Hz, regardless of how fast the input loop spins.
+        if let Some(p) = &app.preview {
+            if p.content == PreviewContent::PaneCapture {
+                let stale = app
+                    .pane_capture
+                    .as_ref()
+                    .is_none_or(|c| {
+                        c.pane_id != p.pane_id
+                            || c.fetched_at.elapsed() >= Duration::from_millis(500)
+                    });
+                if stale {
+                    let pane_id = p.pane_id.clone();
+                    let captured = tokio::task::spawn_blocking(move || {
+                        muxa::tmux::capture_pane(&pane_id)
+                    })
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                    app.pane_capture = Some(CapturedPane {
+                        pane_id: p.pane_id.clone(),
+                        text: captured.unwrap_or_default(),
+                        fetched_at: std::time::Instant::now(),
+                    });
+                }
             }
         }
 
@@ -888,6 +988,9 @@ enum Action {
     ClosePreview,
     /// Swap the preview between popup and full-screen modes.
     TogglePreviewMode,
+    /// Swap the preview content between prompt/response and live pane
+    /// capture. Composes with `TogglePreviewMode` (geometry).
+    TogglePreviewContent,
 }
 
 fn handle_event(ev: Event, app: &mut App) -> Action {
@@ -922,6 +1025,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return match code {
             KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
             KeyCode::Char('f') => Action::TogglePreviewMode,
+            KeyCode::Char('c') => Action::TogglePreviewContent,
             KeyCode::Char('r') => Action::Refresh,
             KeyCode::Down | KeyCode::Char('j') => {
                 preview.scroll = preview.scroll.saturating_add(1);
@@ -1037,7 +1141,11 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .expect("render_preview without preview");
 
-    let title = format!(" preview · {} ", preview.pane_id);
+    let mode_tag = match preview.content {
+        PreviewContent::PromptResponse => "prompt",
+        PreviewContent::PaneCapture => "live",
+    };
+    let title = format!(" preview · {} · {} ", preview.pane_id, mode_tag);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -1049,12 +1157,60 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
 
+    // Live-capture mode: render the cached `tmux capture-pane -ep`
+    // output through `ansi-to-tui` so the source pane's colors / bold /
+    // dim styling are preserved. Wrapping is OFF because tmux already
+    // wrapped at the source pane's width — turning it on a second time
+    // breaks alignment of TUIs running inside the captured pane.
+    if matches!(preview.content, PreviewContent::PaneCapture) {
+        let body = build_pane_capture_body(app, &preview.pane_id);
+        let paragraph = Paragraph::new(body)
+            .block(block)
+            .scroll((preview.scroll, 0));
+        f.render_widget(paragraph, area);
+        return;
+    }
+
     let lines = build_preview_lines(app, &preview.pane_id);
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((preview.scroll, 0));
     f.render_widget(paragraph, area);
+}
+
+/// Materialize the capture cache into ratatui `Text`. Errors degrade
+/// to a one-line placeholder rather than blowing up the render — a
+/// half-rendered capture is easier to debug than a panic deep in the
+/// frame path.
+fn build_pane_capture_body<'a>(app: &'a App, pane_id: &str) -> ratatui::text::Text<'a> {
+    use ansi_to_tui::IntoText;
+
+    let placeholder = |msg: &str| {
+        ratatui::text::Text::from(ratatui::text::Line::from(Span::styled(
+            msg.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )))
+    };
+
+    let Some(cached) = app.pane_capture.as_ref() else {
+        return placeholder("(capturing pane…)");
+    };
+    if cached.pane_id != pane_id {
+        // Stale entry from a previous selection — the main loop will
+        // re-fetch on the next iteration.
+        return placeholder("(capturing pane…)");
+    }
+    if cached.text.is_empty() {
+        return placeholder("(pane gone or capture failed)");
+    }
+    cached
+        .text
+        .as_bytes()
+        .into_text()
+        .unwrap_or_else(|_| placeholder("(could not parse pane content)"))
 }
 
 /// Compose the textual body of the preview pane. Pulled out so unit tests
@@ -1501,6 +1657,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             PreviewMode::Popup => " fullscreen  ",
             PreviewMode::Fullscreen => " popup  ",
         };
+        // Content toggle reads as the *target* state (where `c` would
+        // take you) so the hint stays actionable rather than describing
+        // where you already are.
+        let content_label = match preview.content {
+            PreviewContent::PromptResponse => " live pane  ",
+            PreviewContent::PaneCapture => " prompt  ",
+        };
         let spans = vec![
             Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" scroll  "),
@@ -1511,6 +1674,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(" page  "),
             Span::styled(" f ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(toggle_label),
+            Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(content_label),
             Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" refresh  "),
             Span::styled(
@@ -2889,8 +3054,11 @@ mod tests {
 
     #[test]
     fn selected_pane_returns_none_for_no_pane_agent() {
-        let mut cfg = WatchConfig::default();
-        cfg.hide_paneless = false; // include the paneless row under test
+        // include the paneless row under test
+        let cfg = WatchConfig {
+            hide_paneless: false,
+            ..WatchConfig::default()
+        };
         let mut app = App::with_config(cfg);
         app.set_data(
             vec![fake_agent(
@@ -3417,6 +3585,50 @@ mod tests {
         )
     }
 
+    /// Press a key and apply the resulting `Action` to `app` the same
+    /// way the main run loop does. Mirrors the dispatch table in
+    /// `watch::run` so tests can read as "press X, expect Y" without
+    /// inlining the open/close/toggle book-keeping every time.
+    fn press(app: &mut App, c: char) {
+        match key_action(app, c) {
+            Action::OpenPreview => {
+                if let Some(pane) = app.selected_pane() {
+                    app.preview = Some(PreviewState {
+                        pane_id: pane,
+                        scroll: 0,
+                        mode: PreviewMode::Popup,
+                        content: PreviewContent::PromptResponse,
+                    });
+                }
+            }
+            Action::ClosePreview => {
+                app.preview = None;
+                app.pane_capture = None;
+            }
+            Action::TogglePreviewMode => {
+                if let Some(p) = app.preview.as_mut() {
+                    p.mode = match p.mode {
+                        PreviewMode::Popup => PreviewMode::Fullscreen,
+                        PreviewMode::Fullscreen => PreviewMode::Popup,
+                    };
+                }
+            }
+            Action::TogglePreviewContent => {
+                if let Some(p) = app.preview.as_mut() {
+                    p.content = match p.content {
+                        PreviewContent::PromptResponse => PreviewContent::PaneCapture,
+                        PreviewContent::PaneCapture => PreviewContent::PromptResponse,
+                    };
+                    p.scroll = 0;
+                    if matches!(p.content, PreviewContent::PromptResponse) {
+                        app.pane_capture = None;
+                    }
+                }
+            }
+            Action::None | Action::Quit | Action::Refresh | Action::Attach => {}
+        }
+    }
+
     #[test]
     fn preview_opens_with_p_and_pins_selected_pane_id() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
@@ -3434,6 +3646,7 @@ mod tests {
                     pane_id: pane,
                     scroll: 0,
                     mode: PreviewMode::Popup,
+                    content: PreviewContent::PromptResponse,
                 });
             }
         }
@@ -3452,6 +3665,7 @@ mod tests {
                 pane_id: "%1".into(),
                 scroll: 0,
                 mode: PreviewMode::Popup,
+                    content: PreviewContent::PromptResponse,
             });
             let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
             assert!(
@@ -3469,6 +3683,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
+                    content: PreviewContent::PromptResponse,
         });
 
         // j scrolls down by 1
@@ -3569,6 +3784,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
+                    content: PreviewContent::PromptResponse,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
@@ -3604,6 +3820,7 @@ mod tests {
                 pane_id: pane,
                 scroll: 0,
                 mode: PreviewMode::Popup,
+                    content: PreviewContent::PromptResponse,
             });
         }
         assert_eq!(
@@ -3619,6 +3836,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
+                    content: PreviewContent::PromptResponse,
         });
 
         // First `f` requests TogglePreviewMode; the run loop applies the
@@ -3665,6 +3883,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Fullscreen,
+                    content: PreviewContent::PromptResponse,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
@@ -3700,6 +3919,201 @@ mod tests {
         assert!(
             left.abs_diff(right) <= 1,
             "popup must be horizontally centred (left={left}, right={right})"
+        );
+    }
+
+    /// `c` toggles the preview content axis: `PromptResponse` → `PaneCapture`
+    /// → `PromptResponse`. Geometry mode (popup vs fullscreen) is unaffected
+    /// — the two axes compose. Scroll resets so the new content surface
+    /// starts at the top instead of mid-line.
+    #[test]
+    fn c_toggles_preview_content_and_resets_scroll() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        // Open the preview and scroll into the body.
+        press(&mut app, 'p');
+        app.preview.as_mut().unwrap().scroll = 7;
+        assert_eq!(
+            app.preview.as_ref().unwrap().content,
+            PreviewContent::PromptResponse,
+        );
+
+        press(&mut app, 'c');
+        let p = app.preview.as_ref().unwrap();
+        assert_eq!(p.content, PreviewContent::PaneCapture);
+        assert_eq!(p.scroll, 0, "content toggle must reset scroll");
+        assert_eq!(p.mode, PreviewMode::Popup, "geometry must not flip");
+
+        press(&mut app, 'c');
+        assert_eq!(
+            app.preview.as_ref().unwrap().content,
+            PreviewContent::PromptResponse,
+            "second `c` must flip back to prompt/response",
+        );
+    }
+
+    /// `f` (geometry) and `c` (content) are independent — composing them
+    /// must produce all four combinations without one clobbering the
+    /// other. This is the user-visible promise of the two-axis design.
+    #[test]
+    fn f_and_c_compose_independently() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        press(&mut app, 'p');
+
+        // (Popup, PromptResponse) → press f → (Fullscreen, PromptResponse)
+        press(&mut app, 'f');
+        let p = app.preview.as_ref().unwrap();
+        assert_eq!(p.mode, PreviewMode::Fullscreen);
+        assert_eq!(p.content, PreviewContent::PromptResponse);
+
+        // → press c → (Fullscreen, PaneCapture)
+        press(&mut app, 'c');
+        let p = app.preview.as_ref().unwrap();
+        assert_eq!(p.mode, PreviewMode::Fullscreen);
+        assert_eq!(p.content, PreviewContent::PaneCapture);
+
+        // → press f again → (Popup, PaneCapture) — content survives
+        // geometry flip
+        press(&mut app, 'f');
+        let p = app.preview.as_ref().unwrap();
+        assert_eq!(p.mode, PreviewMode::Popup);
+        assert_eq!(p.content, PreviewContent::PaneCapture);
+    }
+
+    /// Closing the preview must drop the cached pane capture so a stale
+    /// snapshot doesn't leak into the next preview session (which might
+    /// be on a different pane that happened to reuse the same `pane_id`
+    /// across a tmux pane close + recreate).
+    #[test]
+    fn close_preview_clears_pane_capture_cache() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        press(&mut app, 'p');
+        // Stuff the cache by hand — the actual capture path needs a real
+        // tmux server, but the close-clears-cache invariant is purely
+        // about the App field's lifecycle.
+        app.pane_capture = Some(CapturedPane {
+            pane_id: "%1".into(),
+            text: "old screen".into(),
+            fetched_at: std::time::Instant::now(),
+        });
+        press(&mut app, 'q');
+        assert!(app.preview.is_none());
+        assert!(app.pane_capture.is_none(), "cache must drop with preview");
+    }
+
+    /// Toggling content from `PaneCapture` back to `PromptResponse` drops
+    /// the cache too — re-entering capture mode should fetch a fresh
+    /// view rather than flash the last cached frame for half a second.
+    #[test]
+    fn toggle_to_prompt_drops_cache() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        press(&mut app, 'p');
+        press(&mut app, 'c'); // → PaneCapture
+        app.pane_capture = Some(CapturedPane {
+            pane_id: "%1".into(),
+            text: "old".into(),
+            fetched_at: std::time::Instant::now(),
+        });
+        press(&mut app, 'c'); // → PromptResponse
+        assert!(
+            app.pane_capture.is_none(),
+            "leaving capture mode must invalidate cache",
+        );
+    }
+
+    /// Capture-mode renderer must not panic on a missing or pane-id-
+    /// mismatched cache: it returns a placeholder instead. Covers the
+    /// "(capturing pane…)" first-frame path and the "(pane gone or
+    /// capture failed)" empty-text path.
+    #[test]
+    fn pane_capture_body_falls_back_when_cache_missing_or_empty() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        // No cache yet → "(capturing pane…)"
+        let body = build_pane_capture_body(&app, "%1");
+        let dump: String = body
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(dump.contains("capturing pane"));
+
+        // Cache present but for a different pane → still placeholder.
+        app.pane_capture = Some(CapturedPane {
+            pane_id: "%999".into(),
+            text: "irrelevant".into(),
+            fetched_at: std::time::Instant::now(),
+        });
+        let body = build_pane_capture_body(&app, "%1");
+        let dump: String = body
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(dump.contains("capturing pane"));
+
+        // Cache present, correct pane, but empty text → pane-gone hint.
+        app.pane_capture = Some(CapturedPane {
+            pane_id: "%1".into(),
+            text: String::new(),
+            fetched_at: std::time::Instant::now(),
+        });
+        let body = build_pane_capture_body(&app, "%1");
+        let dump: String = body
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            dump.contains("pane gone") || dump.contains("capture failed"),
+            "expected empty-cache placeholder, got {dump:?}",
+        );
+    }
+
+    /// Footer in preview mode advertises the `c` content toggle. The
+    /// label should reflect the *target* state so users see what the
+    /// next press would do, not where they already are.
+    #[test]
+    fn preview_footer_advertises_c_toggle() {
+        let backend = TestBackend::new(160, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+            mode: PreviewMode::Popup,
+            content: PreviewContent::PromptResponse,
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(dump.contains(" c "), "footer must surface the c key");
+        assert!(
+            dump.contains("live pane"),
+            "footer in PromptResponse mode must hint at flipping to live pane",
+        );
+
+        // Flip to PaneCapture and re-render — label should now point
+        // back to "prompt".
+        app.preview.as_mut().unwrap().content = PreviewContent::PaneCapture;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            dump.contains(" prompt"),
+            "footer in PaneCapture mode must hint at flipping back to prompt",
         );
     }
 }
