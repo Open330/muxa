@@ -278,9 +278,13 @@ CLI(`claude`, `codex`, `gemini` / `gemini-cli`)와 매칭하고, 데몬에 합�
 
 선택된 행은 두 줄로 확장되어 dim italic `↳ <detail>` 힌트가 아래에 깔립니다.
 에이전트가 `WaitingInput` 상태일 때 attach 안 하고도 마지막 응답을 한눈에
-확인하기 위함입니다. detail 라인은 템플릿이라 — 기본값은 `{last_response}` —
-컬럼은 "무엇을 물었나", 아래 줄은 "무엇이라 답했나"가 됩니다. 자세한 설정은
-[설정 > 디테일 행](#watch-detail-row) 참고.
+확인하기 위함입니다. detail 라인은 템플릿이라 — 기본값은
+`{last_response|last_prompt}` 로 응답이 있으면 응답을, 없으면 prompt 로
+fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-row) 참고.
+
+행은 기본적으로 tmux 세션별로 그룹핑되고, 그룹 내에서는 가장 최근에 활동한
+에이전트가 위로 올라옵니다. 정렬 기준은 `[watch] sort` 로 변경 가능
+(`session`, `activity`, `pane`, `pane_id` — [설정 > 정렬](#watch-sort) 참고).
 
 페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
 Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지
@@ -397,6 +401,34 @@ activity = 10
 `prompt`, `activity`. 모르는 키는 경고만 남기고 무시되며, muxa 실행을
 막지는 않습니다.
 
+<a name="watch-sort"></a>
+### 정렬
+
+에이전트 행은 정렬 키 리스트로 정렬되며, 왼쪽부터 차례로 비교하고 마지막
+tiebreaker 는 `pane_id` 입니다. 페인이 닫힌 stale 에이전트는 키와 무관
+항상 최하단으로 가라앉습니다.
+
+```toml
+[watch]
+# 기본값: 세션별 그룹핑 + 그룹 내 최신 활동 위
+sort = ["session", "activity"]
+
+# sort = ["activity"]            # 그룹핑 없이 글로벌 최신순
+# sort = ["session", "pane"]     # 세션 내 tmux-네이티브 (window/pane index) 순서
+# sort = ["pane_id"]             # 페인 id 알파벳 순 (스크린샷 친화적)
+```
+
+사용 가능한 키:
+
+| 키        | 효과                                                            |
+| --------- | --------------------------------------------------------------- |
+| `session` | tmux 세션 이름 오름차순 (같은 세션끼리 묶임)                    |
+| `activity`| `last_activity_at` 내림차순 — 가장 최근 업데이트가 위           |
+| `pane`    | window 그 다음 pane index, 숫자로 파싱 (`10` 이 `2` 뒤)         |
+| `pane_id` | 원본 pane id (`%42`) 알파벳 오름차순                            |
+
+모르는 키는 parse error 로 surface — 오타가 silent 하게 무시되지 않습니다.
+
 <a name="watch-detail-row"></a>
 ### 디테일 행
 
@@ -407,9 +439,10 @@ activity = 10
 ```toml
 [watch.detail]
 enabled  = true
-template = "{last_response}"            # 기본값 — 에이전트가 방금 한 답
-# template = "{last_prompt} → {last_response}"   # 합쳐서 보기 (둘 다 심하게 잘림)
-# template = "{cwd} · {last_prompt}"             # 워크플로우 맞춰 자유롭게
+template = "{last_response|last_prompt}"        # 기본값 — 응답 있으면 응답, 없으면 prompt
+# template = "{last_response}"                  # 응답만 (첫 turn 끝나기 전엔 숨김)
+# template = "{last_prompt} → {last_response}"  # 합쳐서 보기 (둘 다 심하게 잘림)
+# template = "{cwd} · {last_prompt}"            # 워크플로우 맞춰 자유롭게
 ```
 
 사용 가능한 placeholder: `pane`, `kind`, `state`, `model`, `ctx`,
@@ -417,11 +450,12 @@ template = "{last_response}"            # 기본값 — 에이전트가 방금 �
 `last_notification`, `cwd`. 모르는 placeholder는 그대로 남아 오타가
 시각적으로 드러납니다.
 
-`{last_response}`는 Claude Code의 `Stop` hook 발화 시 트랜스크립트에서
-캡처되므로 — 첫 turn이 끝나기 전엔 detail 라인이 자동으로 숨겨집니다.
-정상 동작입니다. Codex / Gemini 어댑터는 아직 트랜스크립트를 안 읽어서
-`last_response`가 비어있으니, 그쪽 행에서 힌트를 보고 싶으면
-`template = "{last_prompt}"`로 덮어쓰면 됩니다.
+파이프(`|`)로 구분된 alternative (`{a|b|c}`) 는 왼쪽부터 차례로 평가해
+첫 번째 non-dash 값을 선택합니다. 기본 템플릿은 이걸 이용해 `last_response`
+가 비어있을 때 `last_prompt` 로 graceful fallback 합니다 — 트랜스크립트를
+아직 안 읽는 어댑터 (Codex / Gemini) 나 turn 진행 중 / 옛날 에이전트 모두
+detail 라인이 의미있는 값을 보여줍니다. 두 alternative 모두 비어있으면
+detail 라인이 자동 suppression — 갓 발견된 무활동 페인의 정상 동작입니다.
 
 <details>
 <summary>환경 변수</summary>

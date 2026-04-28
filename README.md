@@ -295,9 +295,15 @@ Both kinds are selectable. `Enter` on either attaches you to that pane.
 The selected row expands to two visual lines: a dim italic `↳ <detail>`
 hint underneath, useful for glancing at the agent's last response while
 it's in `WaitingInput` without leaving the picker. The detail line is
-templated — by default it shows `{last_response}`, so the column tells
-you what was asked and the row underneath tells you what was answered.
-Configure via `[watch.detail]` (see [Configuration](#watch-detail-row)).
+templated — the default `{last_response|last_prompt}` falls back from
+the assistant's reply to the user's prompt, so the row stays useful
+both during a turn and after one. Configure via `[watch.detail]` (see
+[Configuration](#watch-detail-row)).
+
+Rows are grouped by tmux session, with the most recently active agent
+floated to the top of each group. Reorder via `[watch] sort` (see
+[Configuration](#watch-sort)) — useful sort keys: `session`, `activity`,
+`pane`, `pane_id`.
 
 Agents whose pane is unknown — usually Claude Code SDK sub-processes
 whose env didn't carry `TMUX_PANE` and whose process-ancestry walk
@@ -438,6 +444,35 @@ Valid column keys: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `prompt`, `activity`. Unknown keys log a warning and are skipped — they
 don't prevent muxa from starting.
 
+<a name="watch-sort"></a>
+### Sort order
+
+Agent rows are sorted by an ordered list of keys, evaluated left-to-right
+with `pane_id` as a final stable tiebreaker. Stale agents (pane already
+closed) always sink to the bottom regardless of the sort keys.
+
+```toml
+[watch]
+# Default: group by session, then float the most recently active agent
+# in each group to the top.
+sort = ["session", "activity"]
+
+# sort = ["activity"]            # global newest-first, no grouping
+# sort = ["session", "pane"]     # tmux-native order within session
+# sort = ["pane_id"]             # raw pane id lex asc (screenshot-friendly)
+```
+
+Available keys:
+
+| Key       | Effect                                                          |
+| --------- | --------------------------------------------------------------- |
+| `session` | tmux session name ascending (groups same-session panes)         |
+| `activity`| `last_activity_at` descending — most recently updated first     |
+| `pane`    | window then pane index, parsed numerically (`10` after `2`)     |
+| `pane_id` | raw pane id (`%42`) lexicographic ascending                     |
+
+Unknown keys surface as a parse error — typos don't fail silently.
+
 <a name="watch-detail-row"></a>
 ### Detail row
 
@@ -448,21 +483,23 @@ content on top, a dim `↳ <detail>` hint below. Templated via
 ```toml
 [watch.detail]
 enabled  = true
-template = "{last_response}"            # default — what the agent just said
-# template = "{last_prompt} → {last_response}"   # combined view (heavily truncated)
-# template = "{cwd} · {last_prompt}"             # whatever fits your workflow
+template = "{last_response|last_prompt}"        # default — response, falling back to prompt
+# template = "{last_response}"                  # response only (suppresses until first turn)
+# template = "{last_prompt} → {last_response}"  # combined view (heavily truncated)
+# template = "{cwd} · {last_prompt}"            # whatever fits your workflow
 ```
 
 Available placeholders: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `activity`, `last_prompt`, `last_response`, `last_notification`, `cwd`.
 Unknown placeholders are preserved verbatim so typos surface visually.
 
-`{last_response}` is captured from the Claude Code transcript on every
-`Stop` hook — until an agent completes its first turn the detail line
-suppresses itself. That's normal, not a bug. Codex and Gemini adapters
-don't read transcripts yet, so they never populate `last_response`;
-override `template` to use `{last_prompt}` instead if you want a hint
-under those rows.
+Pipe-separated alternatives (`{a|b|c}`) resolve left-to-right and pick
+the first non-dash value. The default template uses this to gracefully
+fall back from `last_response` to `last_prompt` so the detail row stays
+useful for older agents, agents mid-turn, and adapters that don't read
+transcripts yet (Codex / Gemini today). When every alternative is empty
+the detail line suppresses itself — that's normal for a freshly-
+discovered pane with no activity yet, not a bug.
 
 <details>
 <summary>Environment variables</summary>

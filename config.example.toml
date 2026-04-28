@@ -30,6 +30,25 @@
 [watch]
 # columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
 
+# Sort order for agent rows. Keys are evaluated left-to-right with
+# `pane_id` as a final stable tiebreaker. Stale agents (pane closed)
+# always sink to the bottom regardless of what's listed here.
+#
+# Default: ["session", "activity"] — groups by tmux session, floats
+# the most recently active agent inside each group to the top.
+#
+# Available keys:
+#   session   — tmux session name asc (groups same-session panes)
+#   activity  — last_activity_at desc (most recently updated first)
+#   pane      — window then pane index, parsed numerically
+#   pane_id   — raw pane id lex asc (predictable; useful for screenshots)
+#
+# Examples:
+#   sort = ["activity"]              # global newest-first, no grouping
+#   sort = ["session", "pane"]       # tmux-native order within session
+#   sort = ["session", "activity"]   # default — grouping + recency
+# sort = ["session", "activity"]
+
 # Per-column widths. Three accepted forms:
 #   integer  -> fixed length      (Constraint::Length)
 #   "min:N"  -> minimum length    (Constraint::Min, takes leftover space)
@@ -45,21 +64,24 @@
 # is currently highlighted. Useful for glancing at the agent's last
 # response while it's in WaitingInput state without attaching to the pane.
 #
-# Default `template = "{last_response}"` — the PROMPT column already
-# shows the prompt, so the detail row defaults to its complement.
-# When `last_response` is empty (Starting/Working state, or non-Claude
-# adapters that don't read transcripts yet) the detail line suppresses
-# itself, so a freshly-installed muxa with no completed turns shows
-# nothing here — that's normal, not a bug.
+# Default `template = "{last_response|last_prompt}"` — pipe-separated
+# alternatives resolve left-to-right and pick the first non-dash value.
+# When the agent has captured a response that wins; otherwise the user's
+# last prompt is shown so the detail row stays useful for older agents,
+# agents mid-turn, and adapters that don't read transcripts yet
+# (Codex / Gemini today). When BOTH are empty the detail line suppresses
+# itself — that's normal for a freshly-discovered pane, not a bug.
 #
 # Available variables: pane, kind, state, model, ctx, cost, activity,
 # last_prompt, last_response, last_notification, cwd. Unknown
 # placeholders are preserved verbatim so typos surface visually.
 # [watch.detail]
 # enabled  = true
-# template = "{last_response}"
+# template = "{last_response|last_prompt}"
 # # Combined view (heavily truncated since each side gets half the room):
 # # template = "{last_prompt} → {last_response}"
+# # Just the user's prompt:
+# # template = "{last_prompt}"
 
 # HTTP dashboard. Off by default. When enabled, muxad serves a small
 # read-only web UI + JSON/SSE API alongside its unix-socket IPC.
