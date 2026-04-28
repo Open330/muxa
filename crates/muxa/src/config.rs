@@ -208,11 +208,20 @@ impl Default for DetailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // The PROMPT column already shows the user's last prompt, so
-            // the detail row defaults to its complement — the assistant's
-            // last response. Users who want both can override with e.g.
+            // Prefer the assistant's last response (the PROMPT column
+            // already surfaces the user's last prompt), but fall back to
+            // `last_prompt` when no response has been captured yet — older
+            // agents that pre-date transcript tailing, agents mid-turn,
+            // or hooks that fire `PromptSubmitted` without ever reaching
+            // `TurnStopped`. Without the fallback the detail row vanishes
+            // entirely in those cases, which reads as "the feature is
+            // broken" rather than "no response yet".
+            //
+            // Pipe-separated alternatives in `format_detail` resolve
+            // left-to-right and pick the first non-dash value. Users who
+            // want both visible can override with e.g.
             // `template = "{last_prompt} → {last_response}"`.
-            template: "{last_response}".to_string(),
+            template: "{last_response|last_prompt}".to_string(),
         }
     }
 }
@@ -361,10 +370,10 @@ broken = "what"
     }
 
     #[test]
-    fn detail_defaults_to_last_response_template() {
+    fn detail_defaults_to_last_response_fallback_to_last_prompt_template() {
         let cfg = WatchConfig::default();
         assert!(cfg.detail.enabled);
-        assert_eq!(cfg.detail.template, "{last_response}");
+        assert_eq!(cfg.detail.template, "{last_response|last_prompt}");
     }
 
     #[test]
@@ -380,8 +389,9 @@ template = "{cwd} · {last_prompt}"
     }
 
     /// Missing `[watch.detail]` section -> defaults applied (enabled +
-    /// `{last_response}` template). The `default = WatchConfig::default`
-    /// machinery on the parent struct must kick in.
+    /// `{last_response|last_prompt}` fallback template). The
+    /// `default = WatchConfig::default` machinery on the parent struct
+    /// must kick in.
     #[test]
     fn missing_watch_detail_section_uses_defaults() {
         let toml = r#"
@@ -390,7 +400,7 @@ columns = ["pane", "prompt"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.watch.detail.enabled);
-        assert_eq!(cfg.watch.detail.template, "{last_response}");
+        assert_eq!(cfg.watch.detail.template, "{last_response|last_prompt}");
     }
 
     /// Partial `[watch.detail]` (only `enabled`, no `template`) — the
@@ -404,7 +414,7 @@ enabled = false
 ";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(!cfg.watch.detail.enabled);
-        assert_eq!(cfg.watch.detail.template, "{last_response}");
+        assert_eq!(cfg.watch.detail.template, "{last_response|last_prompt}");
     }
 
     /// `deny_unknown_fields` is in force on `DetailConfig` — a stray

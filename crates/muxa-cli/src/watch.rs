@@ -1019,7 +1019,16 @@ fn format_detail(
         }
         // Unknown placeholder: leave the literal so the user sees it
         // and can fix the typo, rather than silently producing empty.
-        if let Some(v) = resolve_var(&name, row, panes, now) {
+        //
+        // Pipe-separated alternatives (`{a|b|c}`) resolve left-to-right
+        // and pick the first variable that produces a non-placeholder
+        // value — used to keep the detail row useful when the preferred
+        // field hasn't been populated yet (e.g. `{last_response|last_prompt}`
+        // gracefully falls back to the user's prompt while the agent is
+        // still mid-turn or for older agents that pre-date transcript
+        // tailing). If every alternative is empty/dash the literal is
+        // left in place, mirroring the unknown-placeholder behaviour.
+        if let Some(v) = resolve_var_chain(&name, row, panes, now) {
             out.push_str(&collapse_lines(&v));
         } else {
             out.push('{');
@@ -1078,6 +1087,43 @@ fn resolve_var(
             | "last_notification" | "cwd" => "—".into(),
             _ => return None,
         }),
+    }
+}
+
+/// Resolve a placeholder spec that may contain pipe-separated alternatives
+/// (e.g. `last_response|last_prompt`). Returns the first variable that
+/// produces a non-empty, non-dash value. If every alternative is unknown
+/// or empty, returns `None` so the caller leaves the literal placeholder
+/// in place.
+fn resolve_var_chain(
+    spec: &str,
+    row: &WatchRow,
+    panes: &[PaneInfo],
+    now: OffsetDateTime,
+) -> Option<String> {
+    let mut saw_known = false;
+    for name in spec.split('|') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(value) = resolve_var(name, row, panes, now) else {
+            continue;
+        };
+        saw_known = true;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && trimmed != "—" && trimmed != "-" {
+            return Some(value);
+        }
+    }
+    // All alternatives produced placeholder values, but at least one was a
+    // known variable. Surface the dash so the placeholder isn't mistaken
+    // for an unknown-variable typo; the outer `format_detail` then
+    // suppresses the whole detail row via its trim check.
+    if saw_known {
+        Some("—".into())
+    } else {
+        None
     }
 }
 
@@ -1792,6 +1838,73 @@ mod tests {
     }
 
     #[test]
+    fn format_detail_falls_back_to_alternative_when_primary_is_dash() {
+        // Pipe-separated alternatives should resolve left-to-right and
+        // pick the first non-dash variable. This is the path the default
+        // `{last_response|last_prompt}` template takes when an agent has
+        // submitted a prompt but no `TurnStopped` response has landed —
+        // covers the common "muxa watch right after typing" case.
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("review the diff"),
+            None,
+            None,
+            None,
+        );
+        a.last_response = None;
+        let row = WatchRow::Agent(a);
+        let s = format_detail("{last_response|last_prompt}", &row, &[], now).unwrap();
+        assert_eq!(s, "review the diff");
+    }
+
+    #[test]
+    fn format_detail_picks_primary_when_present_in_chain() {
+        // When the first alternative resolves to a real value, later
+        // alternatives are ignored — `last_response` wins over `last_prompt`.
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            Some("the prompt"),
+            None,
+            None,
+            None,
+        );
+        a.last_response = Some("the response".into());
+        let row = WatchRow::Agent(a);
+        let s = format_detail("{last_response|last_prompt}", &row, &[], now).unwrap();
+        assert_eq!(s, "the response");
+    }
+
+    #[test]
+    fn format_detail_chain_returns_dash_when_all_alternatives_empty() {
+        // All alternatives produced placeholder dashes — outer
+        // `format_detail` then suppresses the whole detail row, matching
+        // the existing fresh-install behaviour. The chain helper itself
+        // surfaces a dash (rather than `None`) so the placeholder isn't
+        // mistaken for an unknown variable typo.
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+        );
+        let row = WatchRow::Agent(a);
+        assert!(format_detail("{last_response|last_prompt}", &row, &[], now).is_none());
+    }
+
+    #[test]
     fn format_detail_preserves_unknown_placeholder_literal() {
         let now = OffsetDateTime::now_utc();
         let a = fake_agent(
@@ -1887,14 +2000,13 @@ mod tests {
         assert!(!text.contains("↳"), "detail line must be suppressed");
     }
 
-    /// Fresh-install case: default config + an agent that hasn't completed
-    /// a turn yet (no `last_response` captured). The default template
-    /// `{last_response}` resolves to `—`, which the suppression rule in
-    /// `format_detail` turns into `None`, so the row stays one line tall
-    /// and no `↳` glyph appears. This is the path a brand-new user sees
-    /// on first launch — an empty detail is intentional, not a bug.
+    /// Mid-turn case: default config + an agent that has submitted a
+    /// prompt but not yet captured a response. The default template's
+    /// fallback (`{last_response|last_prompt}`) must surface the prompt
+    /// on the detail line so the user sees what's currently in flight
+    /// instead of an empty row.
     #[test]
-    fn default_template_suppresses_detail_when_no_response_captured() {
+    fn default_template_falls_back_to_last_prompt_when_no_response() {
         let backend = TestBackend::new(140, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
@@ -1919,8 +2031,48 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
+            text.contains("↳"),
+            "default template must show the prompt as a fallback when last_response is None"
+        );
+        assert!(
+            text.contains("a prompt the user just submitted"),
+            "the actual fallback content (last_prompt) must be visible in the rendered buffer"
+        );
+    }
+
+    /// Truly-empty case: an agent with neither `last_response` nor
+    /// `last_prompt`. Both alternatives in the default template resolve
+    /// to dashes, the suppression rule kicks in, the row stays one line
+    /// tall and no `↳` glyph appears. Preserves the fresh-install /
+    /// freshly-discovered-pane behaviour from before the fallback fix.
+    #[test]
+    fn default_template_suppresses_detail_when_no_response_or_prompt() {
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
             !text.contains("↳"),
-            "default template must suppress detail when last_response is None"
+            "default template must suppress detail when both last_response and last_prompt are None"
         );
     }
 
