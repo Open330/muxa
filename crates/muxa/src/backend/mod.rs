@@ -177,32 +177,56 @@ pub trait PaneBackend: Send + Sync + 'static {
     }
 }
 
-/// Inspect the environment for an active host. Returns the innermost
-/// host when nested (e.g. `zellij` inside `tmux`) — whichever was set
-/// last wins, since that's the one whose pane we're actually inside.
+/// Inspect the environment for an active host.
+///
+/// Resolution order:
+///
+/// 1. **`MUXA_HOST`** — if set to `"tmux"` or `"zellij"` (case-insensitive),
+///    that wins regardless of what `TMUX` / `ZELLIJ` look like. Provides
+///    an unambiguous override for nested-multiplexer setups (e.g. zellij
+///    inside tmux, or `tmux new-session` from inside zellij) where
+///    auto-detect can't tell which host the current shell really lives in.
+///    Other values are ignored (treated as unset) so a typo doesn't pin
+///    the daemon to the wrong host silently.
+/// 2. **`ZELLIJ`** set → [`HostKind::Zellij`].
+/// 3. **`TMUX`** set → [`HostKind::Tmux`].
+///
+/// When both `TMUX` and `ZELLIJ` are present, zellij wins by default.
+/// The env doesn't carry "which one was set last" ordering, so this is
+/// a pragmatic pick rather than a principled one — `MUXA_HOST` is the
+/// escape hatch for the case where the auto-detect picks wrong.
 ///
 /// Returns `None` outside both hosts; callers fall through to a no-op
 /// backend in that case.
 pub fn detect_host_env() -> Option<HostKind> {
-    detect_from(|name| std::env::var_os(name).is_some())
+    detect_from(|name| std::env::var(name).ok())
 }
 
 /// Decoupled-from-process-env variant of [`detect_host_env`] for tests.
-/// `is_set("VAR")` returns true iff the named env var is considered
-/// present. Production calls go through [`detect_host_env`] which
-/// inspects the real process environment; tests pass a closure so we
-/// don't mutate `std::env` (forbidden by the workspace's
-/// `forbid(unsafe_code)` posture).
-fn detect_from(is_set: impl Fn(&str) -> bool) -> Option<HostKind> {
-    // `ZELLIJ` is set inside zellij; `TMUX` inside tmux. When both are
-    // present (tmux wrapping zellij or vice versa), the design doc says
-    // prefer the innermost — but the env doesn't carry ordering.
-    // Pragmatic compromise: prefer zellij since that's the more
-    // recent / opt-in setup; the operator can override via config.
-    if is_set("ZELLIJ") {
+/// `read("VAR")` returns the env var's value if set, else `None`.
+/// Production calls go through [`detect_host_env`] which inspects the
+/// real process environment; tests pass a closure so we don't mutate
+/// `std::env` (forbidden by the workspace's `forbid(unsafe_code)`
+/// posture).
+fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
+    // 1. `MUXA_HOST` override — explicit operator intent always wins.
+    if let Some(raw) = read("MUXA_HOST") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "tmux" => return Some(HostKind::Tmux),
+            "zellij" => return Some(HostKind::Zellij),
+            // Empty / unknown / typo → fall through to auto-detect.
+            // Logging the bad value here would be noisy at startup;
+            // the daemon traces the resolved host kind on the first
+            // backend call, which is enough to diagnose mismatches.
+            _ => {}
+        }
+    }
+
+    // 2. & 3. Auto-detect from host-set env vars.
+    if read("ZELLIJ").is_some() {
         return Some(HostKind::Zellij);
     }
-    if is_set("TMUX") {
+    if read("TMUX").is_some() {
         return Some(HostKind::Tmux);
     }
     None
@@ -212,29 +236,101 @@ fn detect_from(is_set: impl Fn(&str) -> bool) -> Option<HostKind> {
 mod tests {
     use super::*;
 
-    /// Both env vars unset → `None`. The daemon uses this signal to
+    /// Helper that builds a `read` closure from a static lookup table.
+    /// Tests pass `&[("TMUX", "1"), ...]`; missing keys read as
+    /// `None`. Keeps the call sites short.
+    fn env_reader(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// All host env vars unset → `None`. The daemon uses this signal to
     /// fall back to a no-op backend rather than spamming `tmux` calls
     /// on a host without a multiplexer running.
     #[test]
     fn detect_returns_none_when_no_host_env_set() {
-        assert!(detect_from(|_| false).is_none());
+        assert!(detect_from(env_reader(&[])).is_none());
     }
 
     /// Only `TMUX` set → tmux. Only `ZELLIJ` set → zellij. Locks the
     /// happy-path mapping for both backends.
     #[test]
     fn detect_picks_tmux_or_zellij_from_env() {
-        assert_eq!(detect_from(|n| n == "TMUX"), Some(HostKind::Tmux));
-        assert_eq!(detect_from(|n| n == "ZELLIJ"), Some(HostKind::Zellij));
+        assert_eq!(
+            detect_from(env_reader(&[("TMUX", "1")])),
+            Some(HostKind::Tmux),
+        );
+        assert_eq!(
+            detect_from(env_reader(&[("ZELLIJ", "1")])),
+            Some(HostKind::Zellij),
+        );
     }
 
     /// When both env vars are present (nested multiplexers — rare but
-    /// possible), zellij wins per the design doc's "innermost / more
-    /// recently opted-in" rule. Locks down the precedence so a future
-    /// flip is intentional.
+    /// possible), zellij wins by default. The `MUXA_HOST` override
+    /// covers the case where this default picks wrong.
     #[test]
     fn detect_prefers_zellij_when_both_env_vars_set() {
-        assert_eq!(detect_from(|_| true), Some(HostKind::Zellij));
+        assert_eq!(
+            detect_from(env_reader(&[("TMUX", "1"), ("ZELLIJ", "1")])),
+            Some(HostKind::Zellij),
+        );
+    }
+
+    /// `MUXA_HOST=tmux` wins over `ZELLIJ` being set — the escape hatch
+    /// for the "I'm in tmux even though my env still carries the parent
+    /// zellij's vars" case. Mirror test for `MUXA_HOST=zellij`.
+    #[test]
+    fn detect_muxa_host_overrides_auto_detect() {
+        assert_eq!(
+            detect_from(env_reader(&[("MUXA_HOST", "tmux"), ("ZELLIJ", "1")])),
+            Some(HostKind::Tmux),
+            "MUXA_HOST=tmux must beat a present ZELLIJ env var",
+        );
+        assert_eq!(
+            detect_from(env_reader(&[("MUXA_HOST", "zellij"), ("TMUX", "1")])),
+            Some(HostKind::Zellij),
+            "MUXA_HOST=zellij must beat a present TMUX env var",
+        );
+    }
+
+    /// Override is case-insensitive and tolerates whitespace — users
+    /// hand-type these in shell rcfiles where `MUXA_HOST=Zellij`,
+    /// `MUXA_HOST=" tmux "`, etc., are realistic.
+    #[test]
+    fn detect_muxa_host_is_case_and_whitespace_tolerant() {
+        assert_eq!(
+            detect_from(env_reader(&[("MUXA_HOST", "TMUX")])),
+            Some(HostKind::Tmux),
+        );
+        assert_eq!(
+            detect_from(env_reader(&[("MUXA_HOST", " Zellij ")])),
+            Some(HostKind::Zellij),
+        );
+    }
+
+    /// Unknown / empty `MUXA_HOST` falls through to auto-detect rather
+    /// than pinning the daemon to a "no host" decision. Typos surface
+    /// as auto-detect outcomes — consistent with the daemon picking
+    /// up *some* working host rather than refusing to run.
+    #[test]
+    fn detect_unknown_muxa_host_falls_through_to_auto() {
+        // Unknown value, no host env → None (no host running).
+        assert!(detect_from(env_reader(&[("MUXA_HOST", "screen")])).is_none());
+        // Unknown value, but TMUX is up → tmux wins via auto-detect.
+        assert_eq!(
+            detect_from(env_reader(&[("MUXA_HOST", "screen"), ("TMUX", "1")])),
+            Some(HostKind::Tmux),
+        );
+        // Empty MUXA_HOST is ignored too.
+        assert_eq!(
+            detect_from(env_reader(&[("MUXA_HOST", ""), ("ZELLIJ", "1")])),
+            Some(HostKind::Zellij),
+        );
     }
 
     /// `HostKind` round-trips through its `Display` impl as a stable
