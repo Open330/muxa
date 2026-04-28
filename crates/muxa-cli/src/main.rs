@@ -225,6 +225,14 @@ async fn cmd_watch(client: &Client, cfg: Config, include_paneless: bool) -> Resu
 /// switching — `select-window`/`select-pane` are plain control messages to
 /// the tmux server and don't need an attached client.
 fn jump_to_pane(pane_id: &str) {
+    let backend = muxa::default_backend();
+    match backend.kind() {
+        muxa::HostKind::Tmux => jump_to_pane_tmux(pane_id),
+        muxa::HostKind::Zellij => jump_to_pane_zellij(backend.as_ref(), pane_id),
+    }
+}
+
+fn jump_to_pane_tmux(pane_id: &str) {
     let Some(info) = tmux::resolve_pane(pane_id) else {
         eprintln!("muxa: pane {pane_id} not found in tmux — it may have closed");
         return;
@@ -253,6 +261,19 @@ fn jump_to_pane(pane_id: &str) {
             ),
             Err(e) => eprintln!("muxa: failed to spawn tmux attach-session: {e}"),
         }
+    }
+}
+
+/// Jump on zellij: a single `zellij action focus-pane-with-id <id>`
+/// covers the whole story. There's no session/window analog to
+/// pre-select, and no "outside zellij" attach equivalent — running
+/// `muxa watch` from a bare shell on a zellij host would land here
+/// only if the user explicitly set `MUXA_HOST=zellij`, in which case
+/// failing to focus is just a "couldn't reach the zellij server"
+/// stderr warning.
+fn jump_to_pane_zellij(backend: &dyn muxa::PaneBackend, pane_id: &str) {
+    if !backend.focus_pane(pane_id) {
+        eprintln!("muxa: zellij focus-pane-with-id {pane_id} failed — pane may have closed");
     }
 }
 
@@ -389,18 +410,21 @@ async fn cmd_status(client: &Client) -> Result<()> {
         println!("no active agents");
         return Ok(());
     }
-    // Resolve the full pane inventory once so `pane_display` does N
-    // lookups against a slice instead of N `tmux list-panes -a`
-    // shell-outs (each ~5 ms, observable as ~170 ms total at 30+
-    // agents).
-    let panes = tmux::list_panes().unwrap_or_default();
+    // Resolve the full pane inventory once via the active backend so
+    // `pane_display` does N lookups against a slice instead of N
+    // backend calls. Empty on backends without pane metadata (zellij
+    // CLI without the WASM plugin) — table still renders, just with
+    // raw pane ids in the location column.
+    let backend = muxa::default_backend();
+    let panes = backend.list_panes();
     print_table(&agents, &panes, OffsetDateTime::now_utc(), use_colors());
     Ok(())
 }
 
 async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
-    let panes_snapshot = tmux::list_panes().unwrap_or_default();
-    let pane = pane.or_else(tmux::current_pane);
+    let backend = muxa::default_backend();
+    let panes_snapshot = backend.list_panes();
+    let pane = pane.or_else(|| backend.current_pane());
     let agents = match &pane {
         Some(p) => client.by_pane(p).await?,
         None => client.snapshot().await?,
@@ -434,8 +458,8 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
 
 async fn cmd_recap(client: &Client, pane: Option<String>, limit: usize, all: bool) -> Result<()> {
     let pane = pane
-        .or_else(tmux::current_pane)
-        .context("no pane given and could not determine current tmux pane")?;
+        .or_else(|| muxa::default_backend().current_pane())
+        .context("no pane given and could not determine current pane (set $TMUX_PANE / $ZELLIJ_PANE_ID, or pass --pane)")?;
 
     let agents = client.by_pane(&pane).await?;
     let history_limit = if all { Some(0) } else { Some(limit) };
@@ -482,11 +506,23 @@ async fn cmd_recap(client: &Client, pane: Option<String>, limit: usize, all: boo
 }
 
 fn cmd_panes() -> Result<()> {
-    if !tmux::inside_tmux() {
-        println!("not inside tmux");
+    let backend = muxa::default_backend();
+    let panes = backend.list_panes();
+    if panes.is_empty() {
+        // Two ways to get here: the host (tmux/zellij) has no panes,
+        // or the backend's `caps()` says metadata is plugin-only and
+        // not pushed yet. The hint differentiates so users diagnosing
+        // a misconfigured zellij plugin see something useful.
+        match backend.kind() {
+            muxa::HostKind::Tmux => println!("(no tmux panes — server may be down)"),
+            muxa::HostKind::Zellij if !backend.caps().current_command => println!(
+                "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
+            ),
+            muxa::HostKind::Zellij => println!("(no zellij panes)"),
+        }
         return Ok(());
     }
-    for p in tmux::list_panes()? {
+    for p in panes {
         println!(
             "{:<8} {}:{}.{}  tty={}  cmd={}  title={}",
             p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title

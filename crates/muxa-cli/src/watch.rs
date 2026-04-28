@@ -25,7 +25,7 @@ use crossterm::terminal::{
 use muxa::config::{WatchConfig, WatchSortKey, WidthSpec};
 use muxa::ipc::{Client, RuntimeError};
 use muxa::state::Agent;
-use muxa::tmux::{self, PaneInfo};
+use muxa::tmux::PaneInfo;
 use muxa::AgentState;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -680,18 +680,18 @@ pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
     app.set_data(outcome.agents, outcome.panes);
 }
 
-/// Compute one refresh outcome: tmux pane inventory (off-runtime via
-/// `spawn_blocking`) plus a daemon snapshot. Kept independent of `App` so
-/// the work can run on a worker thread without holding any UI state.
-async fn compute_refresh(client: &Client) -> RefreshOutcome {
-    // tmux pane inventory is independent of the daemon — fetch it even
-    // when muxad is down so `muxa watch` stays useful as a session picker.
-    // `tmux::list_panes` shells out (~few ms) and must NOT run on a tokio
-    // worker — that's the whole point of this refactor.
-    let panes = tokio::task::spawn_blocking(tmux::list_panes)
+/// Compute one refresh outcome: pane inventory from the active backend
+/// (off-runtime via `spawn_blocking` so any shell-out doesn't block the
+/// runtime) plus a daemon snapshot. Kept independent of `App` so the
+/// work can run on a worker thread without holding any UI state.
+async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> RefreshOutcome {
+    // Pane inventory is independent of the daemon — fetch it even when
+    // muxad is down so `muxa watch` stays useful as a session picker.
+    // The backend's `list_panes` may shell out (tmux) or hit a cache
+    // (zellij + plugin); either way it MUST NOT run on a tokio worker.
+    let backend_for_blocking = backend.clone();
+    let panes = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes())
         .await
-        .ok()
-        .and_then(Result::ok)
         .unwrap_or_default();
 
     match client.snapshot().await {
@@ -765,25 +765,33 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     let mut guard = TerminalGuard::new(terminal);
 
     let mut app = App::with_config(watch_cfg);
-    // When invoked from inside tmux, land the cursor on the user's current
-    // pane on first load instead of always row 0.
-    app.set_initial_pane(tmux::current_pane());
+    // Resolve the host once at startup — same Arc threads through the
+    // priming refresh, the background task, and the live capture path.
+    let backend: muxa::SharedBackend = muxa::default_backend();
+
+    // When invoked from inside a host (tmux / zellij), land the cursor
+    // on the user's current pane on first load instead of always
+    // row 0.
+    app.set_initial_pane(backend.current_pane());
 
     // Prime the initial snapshot so the first frame already has data —
     // otherwise the user sees an empty table for ~one tick.
-    apply_outcome(&mut app, compute_refresh(client).await);
+    apply_outcome(&mut app, compute_refresh(client, &backend).await);
 
     // Background refresh task owns its own Client clone so the borrowed
     // `client: &Client` doesn't have to outlive the task. The clone is
     // cheap (a single `PathBuf`) and avoids needing an `Arc`/lifetime
-    // wrapper for what is effectively immutable data.
+    // wrapper for what is effectively immutable data. The backend is
+    // already an `Arc<dyn …>` so cloning it is just a refcount bump.
     let bg_client = client.clone();
+    let bg_backend = backend.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
     let bg = tokio::spawn(refresh_task(
         move || {
             let client = bg_client.clone();
-            async move { compute_refresh(&client).await }
+            let backend = bg_backend.clone();
+            async move { compute_refresh(&client, &backend).await }
         },
         wake_rx,
         outcome_tx,
@@ -897,12 +905,15 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         }
 
         // Live pane capture: when the preview is open in LivePane
-        // mode and the cache is missing or stale (>500 ms), shell out
-        // to `tmux capture-pane -ep -t <pane>` on a worker thread.
-        // Bounded by the existing 500 ms TTL so we never fork more
-        // than ~2 Hz, regardless of how fast the input loop spins.
+        // mode and the cache is missing or stale (>500 ms), call into
+        // the active backend on a worker thread. Bounded by the
+        // existing 500 ms TTL so we never fork more than ~2 Hz,
+        // regardless of how fast the input loop spins. Capability-
+        // gated: backends that report `caps().capture_pane == false`
+        // (zellij CLI today) skip the call and the renderer shows a
+        // "(not supported)" placeholder.
         if let Some(p) = &app.preview {
-            if p.content == PreviewContent::LivePane {
+            if p.content == PreviewContent::LivePane && backend.caps().capture_pane {
                 let stale = app
                     .pane_capture
                     .as_ref()
@@ -912,12 +923,13 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                     });
                 if stale {
                     let pane_id = p.pane_id.clone();
+                    let backend_for_blocking = backend.clone();
                     let captured = tokio::task::spawn_blocking(move || {
-                        muxa::tmux::capture_pane(&pane_id)
+                        backend_for_blocking.capture_pane(&pane_id)
                     })
                     .await
                     .ok()
-                    .and_then(Result::ok);
+                    .flatten();
                     app.pane_capture = Some(CapturedPane {
                         pane_id: p.pane_id.clone(),
                         text: captured.unwrap_or_default(),

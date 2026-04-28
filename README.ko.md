@@ -568,6 +568,41 @@ Idempotent 라 타이머로 돌려도 안전 — `interval_secs` 는 정확성�
 아니라 튜닝 knob 입니다. 외부에서 reconciliation 을 직접 driving
 하는 경우 (통합 테스트에서 fake `LivenessSource` 주입 등) 만 끄세요.
 
+### Zellij 지원
+
+muxa 는 기본으로 **tmux** 에서 동작하고 **zellij** 에서도 CLI 베이스라인
+모드로 즉시 동작합니다 (별도 플러그인 설치 불필요). 호스트 결정 우선순위:
+`MUXA_HOST` → `$ZELLIJ` → `$TMUX`.
+
+| 기능                       | tmux | zellij CLI | zellij + 플러그인 (예정) |
+| -------------------------- | :--: | :--------: | :-----------------------: |
+| `muxa status` 에이전트 테이블 | ✅   | ✅         | ✅                        |
+| `muxa watch` picker         | ✅   | ✅ (페인 라벨 단순) | ✅                |
+| Enter 로 jump               | ✅   | ✅         | ✅                        |
+| Discovery (커맨드 기반 분류) | ✅   | ❌         | ✅                        |
+| 라이브 페인 미리보기 (`p`+`c`) | ✅ | ❌ (zellij `dump-screen` 은 focus 필요) | ✅ |
+| Hook ancestry walk          | ✅   | ❌         | ✅                        |
+| 다중 서버 `/api/panes`      | ✅   | n/a (single server) | n/a              |
+
+지원 안 되는 zellij 기능들은 깨진 게 아니라 **구조적 gating**입니다.
+`muxa watch` 는 라이브 미리보기 affordance 를 숨기고 (`c` 가 no-op),
+auto-discovery 가 빈 결과를 반환하지만 — agent state 는 hook → daemon
+경로로 그대로 흐릅니다 (hook adapter 가 `$ZELLIJ_PANE_ID` 도 읽음).
+
+곧 출시될 **muxa zellij 플러그인** (Rust → WASM) 이 위 표의 ❌ 들을
+모두 해결합니다 — zellij plugin API 의 `PaneUpdate`/`TabUpdate` 이벤트를
+구독해 daemon 으로 push. 트래킹 브랜치: `feat/zellij-plugin` (미완료).
+
+호스트를 명시적으로 고정하려면 (중첩 multiplexer setup 등 auto-detect
+가 잘못 잡는 경우):
+
+```sh
+export MUXA_HOST=zellij   # 또는 "tmux"
+muxa watch
+```
+
+Zellij layout 시작 예제: [`examples/muxa.zellij.kdl`](examples/muxa.zellij.kdl).
+
 <details>
 <summary>환경 변수</summary>
 
@@ -575,6 +610,7 @@ Idempotent 라 타이머로 돌려도 안전 — `interval_secs` 는 정확성�
 | --------------- | ----------------------------------------------------- |
 | `MUXA_SOCKET`   | 유닉스 소켓 경로 오버라이드.                           |
 | `MUXA_CONFIG`   | 설정 파일 경로 오버라이드.                             |
+| `MUXA_HOST`     | 백엔드 강제 지정: `tmux` 또는 `zellij`. auto-detect 보다 우선. |
 | `RUST_LOG`      | 트레이싱 필터. 예: `muxa=debug,tokio=warn`.            |
 | `NO_COLOR`      | `muxa status`에서 ANSI 컬러 비활성화.                  |
 
