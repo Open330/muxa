@@ -31,7 +31,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -336,12 +336,40 @@ impl App {
     /// order; `panes` minus any pane already represented by an agent are
     /// appended as `BarePane` rows.
     pub(crate) fn set_data(&mut self, mut agents: Vec<Agent>, panes: Vec<PaneInfo>) {
-        agents.sort_by(|a, b| {
-            a.pane
+        // Group agent rows by tmux session (then window / pane index) so
+        // panes belonging to the same session sit next to each other —
+        // matches the bare-pane sort below and keeps the dashboard
+        // readable when one user has agents spread across many sessions.
+        //
+        // Agent records carry only `pane_id`; we resolve session and
+        // window/pane indices via the panes inventory collected this
+        // refresh. Stale agents (pane already closed, i.e. lookup miss)
+        // bucket at the end since there's no session to slot them into.
+        let pane_by_id: HashMap<&str, &PaneInfo> =
+            panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+        agents.sort_by_cached_key(|ag| {
+            let info = ag
+                .pane
                 .as_deref()
-                .unwrap_or("")
-                .cmp(b.pane.as_deref().unwrap_or(""))
-                .then_with(|| a.session_id.cmp(&b.session_id))
+                .and_then(|id| pane_by_id.get(id).copied());
+            match info {
+                Some(p) => (
+                    false,
+                    p.session.clone(),
+                    // Parse numerically so "10" sorts after "2" within a
+                    // window — string-comparison would invert that.
+                    p.window_index.parse::<u32>().unwrap_or(u32::MAX),
+                    p.pane_index.parse::<u32>().unwrap_or(u32::MAX),
+                    ag.pane.clone().unwrap_or_default(),
+                ),
+                None => (
+                    true,
+                    String::new(),
+                    0,
+                    0,
+                    ag.pane.clone().unwrap_or_default(),
+                ),
+            }
         });
 
         let known: HashSet<String> = agents.iter().filter_map(|a| a.pane.clone()).collect();
@@ -1221,6 +1249,95 @@ mod tests {
         );
 
         terminal.draw(|f| render(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn agents_group_by_session_then_window_pane_index() {
+        // Agents from sessions "alpha" and "beta" interleaved by pane id,
+        // plus one stale agent whose pane no longer exists. Expect:
+        //   1. all alpha agents grouped, then all beta agents grouped
+        //   2. within a session, ordered by window then pane index
+        //   3. stale agent at the end
+        let mut app = App::new();
+        let mk = |session_id: &str, pane: &str| {
+            fake_agent(
+                session_id,
+                Some(pane),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        app.set_data(
+            vec![
+                mk("s-beta-1", "%50"),
+                mk("s-alpha-2", "%20"),
+                mk("s-stale", "%999"), // pane not in inventory
+                mk("s-alpha-1", "%10"),
+                mk("s-beta-2", "%40"),
+            ],
+            vec![
+                fake_pane("%10", "alpha", 0, 0, "claude"),
+                fake_pane("%20", "alpha", 1, 0, "claude"),
+                fake_pane("%40", "beta", 0, 0, "claude"),
+                fake_pane("%50", "beta", 0, 1, "claude"),
+            ],
+        );
+
+        let agent_pane_ids: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            agent_pane_ids,
+            vec!["%10", "%20", "%40", "%50", "%999"],
+            "expected grouping: alpha (w0p0, w1p0), beta (w0p0, w0p1), then stale"
+        );
+    }
+
+    #[test]
+    fn agent_window_pane_indices_sort_numerically_not_lex() {
+        // "10" must sort AFTER "2" within a session — string comparison
+        // would invert that. Regression guard for the parse::<u32>() path.
+        let mut app = App::new();
+        let mk = |session_id: &str, pane: &str| {
+            fake_agent(
+                session_id,
+                Some(pane),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        app.set_data(
+            vec![mk("a", "%2"), mk("a", "%10"), mk("a", "%1")],
+            vec![
+                fake_pane("%1", "main", 0, 0, "x"),
+                fake_pane("%2", "main", 0, 1, "x"),
+                fake_pane("%10", "main", 0, 10, "x"),
+            ],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["%1", "%2", "%10"]);
     }
 
     #[test]
