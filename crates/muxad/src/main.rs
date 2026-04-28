@@ -9,8 +9,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use muxa::config::NotifierBackend;
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
+use muxa::history::{HistoryOptions, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
+use muxa::reconcile::{Reconciler, TmuxLiveness};
 use muxa::sinks::OhMyPromptSink;
 use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
@@ -90,37 +92,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(paths::default_socket);
     tracing::info!(socket = %socket.display(), "starting muxad");
 
-    let store = Store::shared();
-
-    // GC task: evict long-stopped agents.
-    {
-        let store = store.clone();
-        let ttl = time::Duration::minutes(STOPPED_AGENT_TTL_MINUTES);
-        let tick = std::time::Duration::from_secs(GC_SWEEP_INTERVAL_SECONDS);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tick);
-            loop {
-                interval.tick().await;
-                let removed = store.gc(ttl).await;
-                if removed > 0 {
-                    tracing::debug!(removed, "gc swept stopped agents");
-                }
-            }
-        });
-    }
-
-    // Desktop notifier: spawned only when opted in. We subscribe BEFORE
-    // the server starts accepting events so no early transition is lost.
-    if cfg.notifier.enabled && matches!(cfg.notifier.backend, NotifierBackend::Libnotify) {
-        let rx = store.subscribe();
-        tokio::spawn(async move {
-            if let Err(e) = Notifier::new().run(rx).await {
-                tracing::warn!(error = %e, "notifier task exited");
-            }
-        });
-        tracing::info!("desktop notifier enabled");
-    }
-
+    // Construct the shutdown broadcast up-front so every background task
+    // we spawn below can subscribe and exit cleanly. The signal handler
+    // lights it up on SIGTERM/SIGINT; the IPC server treats it as the
+    // authoritative drain signal.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // Signal handler — translates SIGTERM/SIGINT into a broadcast.
@@ -134,6 +109,27 @@ async fn main() -> Result<()> {
         }
         let _ = shutdown_for_signals.send(());
     });
+
+    // Prompt history must exist before the store: every PromptSubmitted
+    // event fans out into history alongside the live agent record.
+    let history = build_history(&cfg, &shutdown_tx).await;
+    let store = Store::shared_with_history(history);
+
+    spawn_gc_task(&store, &shutdown_tx);
+    spawn_reconciler_task(&cfg, &store, &shutdown_tx);
+    spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
+
+    // Desktop notifier: spawned only when opted in. We subscribe BEFORE
+    // the server starts accepting events so no early transition is lost.
+    if cfg.notifier.enabled && matches!(cfg.notifier.backend, NotifierBackend::Libnotify) {
+        let rx = store.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = Notifier::new().run(rx).await {
+                tracing::warn!(error = %e, "notifier task exited");
+            }
+        });
+        tracing::info!("desktop notifier enabled");
+    }
 
     // HTTP dashboard. Resolved from cfg + CLI/env overrides; non-fatal if
     // it fails to bind (the unix-socket IPC keeps running).
@@ -183,6 +179,172 @@ async fn main() -> Result<()> {
 
     handle.await??;
     Ok(())
+}
+
+/// Spawn the GC task: evicts long-stopped agents on a periodic timer.
+///
+/// Listens to the shutdown broadcast so a clean SIGTERM tears it down
+/// rather than relying on the runtime falling out from under it.
+fn spawn_gc_task(store: &muxa::SharedStore, shutdown_tx: &broadcast::Sender<()>) {
+    let store = store.clone();
+    let ttl = time::Duration::minutes(STOPPED_AGENT_TTL_MINUTES);
+    let tick = std::time::Duration::from_secs(GC_SWEEP_INTERVAL_SECONDS);
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let removed = store.gc(ttl).await;
+                    if removed > 0 {
+                        tracing::debug!(removed, "gc swept stopped agents");
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::debug!("gc task shutting down");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Initialize the prompt history layer.
+///
+/// When `[history] enabled = true` we hydrate the in-memory cache from
+/// the configured NDJSON file (creating the parent dir if needed) and
+/// spawn the writer task that owns the file handle. When disabled —
+/// either via config or because the path can't be resolved — we hand
+/// back an in-memory-only instance so `Store::apply` always has somewhere
+/// to fan out, but nothing touches disk.
+async fn build_history(
+    cfg: &Config,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> std::sync::Arc<PromptHistory> {
+    let opts_template = HistoryOptions {
+        path: cfg
+            .history
+            .path
+            .clone()
+            .or_else(paths::default_history_file),
+        max_per_pane: cfg.history.max_per_pane,
+        max_age: time::Duration::days(i64::from(cfg.history.max_age_days)),
+        ..HistoryOptions::default()
+    };
+
+    if !cfg.history.enabled {
+        tracing::info!("history disabled by config (in-memory only)");
+        return PromptHistory::in_memory_only(HistoryOptions {
+            path: None,
+            ..opts_template
+        });
+    }
+
+    let Some(path) = opts_template.path.clone() else {
+        tracing::warn!("history enabled but no path resolvable; falling back to in-memory only");
+        return PromptHistory::in_memory_only(HistoryOptions {
+            path: None,
+            ..opts_template
+        });
+    };
+
+    match PromptHistory::spawn(opts_template.clone(), shutdown_tx.subscribe()).await {
+        Ok((history, _writer_handle)) => {
+            // The writer task drains itself on shutdown via its own
+            // broadcast receiver, so we don't need to await the handle
+            // here — the IPC server's await_shutdown call is the join
+            // point for the daemon as a whole.
+            tracing::info!(
+                path = %path.display(),
+                max_per_pane = cfg.history.max_per_pane,
+                max_age_days = cfg.history.max_age_days,
+                "prompt history enabled",
+            );
+            history
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "could not open history file; falling back to in-memory only",
+            );
+            PromptHistory::in_memory_only(HistoryOptions {
+                path: None,
+                ..opts_template
+            })
+        }
+    }
+}
+
+/// Spawn the periodic prompt-history compaction task.
+///
+/// Compaction drops aged-out entries from memory and rewrites the disk
+/// file from the surviving snapshot. Cheap, idempotent, and the only
+/// codepath that physically removes records from disk.
+fn spawn_history_compaction_task(
+    cfg: &Config,
+    store: &muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    if !cfg.history.enabled {
+        return;
+    }
+    let history = store.history().clone();
+    let interval_secs = cfg.history.compact_interval_secs;
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick so the loop's cadence matches
+        // `interval_secs` rather than running once at t=0 (when there's
+        // nothing to compact anyway).
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let report = history.compact().await;
+                    if report.aged_out > 0 || report.rewrite_skipped {
+                        tracing::debug!(
+                            aged_out = report.aged_out,
+                            rewrite_skipped = report.rewrite_skipped,
+                            "history compaction pass",
+                        );
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::debug!("history compaction task shutting down");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Spawn the periodic reconciler: convergent control loop that uses tmux
+/// as ground truth. Reaps records for closed panes, demotes orphaned
+/// synthetic placeholders, and collapses duplicate rows so `muxa watch`
+/// and `muxa status` stay in sync with the user's actual tmux state.
+fn spawn_reconciler_task(
+    cfg: &Config,
+    store: &muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    if !cfg.reconciler.enabled {
+        tracing::info!("reconciler disabled by config");
+        return;
+    }
+    let runner = Reconciler::new(
+        store.clone(),
+        TmuxLiveness,
+        std::time::Duration::from_secs(cfg.reconciler.interval_secs),
+    );
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(runner.run(shutdown_rx));
+    tracing::info!(
+        interval_secs = cfg.reconciler.interval_secs,
+        "reconciler enabled",
+    );
 }
 
 /// Collapse the daemon's CLI args + env vars + TOML into a resolved
