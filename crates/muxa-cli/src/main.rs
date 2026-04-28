@@ -141,11 +141,15 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Backfill the daemon's registry from tmux panes. Idempotent.
+/// Backfill the daemon's registry from host panes. Idempotent.
 async fn cmd_sync(client: &Client) -> Result<()> {
     use std::fmt::Write as _;
 
-    let report = discovery::run_discovery(client)
+    // Each CLI invocation builds its own backend so `MUXA_HOST` etc.
+    // resolve at the user's environment rather than the daemon's
+    // (which may have been started under a different shell).
+    let backend = muxa::default_backend();
+    let report = discovery::run_discovery(client, backend.as_ref())
         .await
         .context("running discovery")?;
 

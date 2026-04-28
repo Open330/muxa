@@ -21,7 +21,10 @@ pub mod snapshot;
 pub mod state;
 pub mod tmux;
 
-pub use backend::{tmux::TmuxBackend, BackendCaps, HostKind, PaneBackend};
+pub use backend::{
+    default_backend, tmux::TmuxBackend, zellij::ZellijBackend, BackendCaps, HostKind, PaneBackend,
+    SharedBackend,
+};
 pub use config::Config;
 pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 pub use error::{CoreError, Result};

@@ -53,10 +53,43 @@
 //! [`BackendCaps`] returned by [`PaneBackend::caps`] before degrading.
 
 pub mod tmux;
+pub mod zellij;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::tmux::PaneInfo;
+
+/// Shared, multi-thread-safe handle to a pane backend.
+///
+/// The daemon constructs one of these at startup based on
+/// [`detect_host_env`] and threads it to every consumer that previously
+/// imported `crate::tmux::*` directly — reconciler liveness, discovery,
+/// the hook ancestry walker, the watch refresh task, the daemon's
+/// `enrich_from_history` step. CLI commands either receive an `Arc`
+/// from the caller or build a fresh one through [`default_backend`].
+///
+/// `Arc` rather than `Box` so background tokio tasks can each hold a
+/// clone without contending on a lock; the trait is `Send + Sync` so
+/// concurrent calls into the same backend are safe.
+pub type SharedBackend = Arc<dyn PaneBackend>;
+
+/// Build the backend that matches the current process environment.
+///
+/// Resolution mirrors [`detect_host_env`]: `MUXA_HOST` override first,
+/// then `ZELLIJ`, then `TMUX`, then a default. When no host is
+/// detectable we fall back to [`tmux::TmuxBackend`] — its methods
+/// degrade gracefully on a host with no tmux server (`list_panes`
+/// returns empty, `capture_pane` returns `None`) and most operators
+/// running muxa outside a multiplexer at all are debugging the
+/// daemon, not driving it. A future "noop" backend could replace
+/// this fallback if that assumption stops holding.
+pub fn default_backend() -> SharedBackend {
+    match detect_host_env() {
+        Some(HostKind::Zellij) => Arc::new(zellij::ZellijBackend::new()),
+        _ => Arc::new(tmux::TmuxBackend::new()),
+    }
+}
 
 /// Identity of the pane host. Surfaced through telemetry and log lines so
 /// operators running both backends can tell which one a given event went
@@ -174,6 +207,46 @@ pub trait PaneBackend: Send + Sync + 'static {
     /// model their gaps as exceptions to that baseline.
     fn caps(&self) -> BackendCaps {
         BackendCaps::default()
+    }
+}
+
+/// `Arc<dyn PaneBackend>` is itself a backend — every method
+/// delegates to the inner trait object. Lets the daemon construct one
+/// `Arc` at startup and hand `.clone()`s to the reconciler, the watch
+/// refresh task, the IPC server, etc., without each consumer having
+/// to learn a different signature. Also unblocks
+/// [`crate::reconcile::LivenessSource`]'s blanket impl: an
+/// `Arc<dyn PaneBackend>` flows through as a `LivenessSource`
+/// transparently because it is a `PaneBackend`.
+///
+/// `?Sized` so the impl covers `Arc<dyn PaneBackend>` directly, not
+/// just `Arc<ConcreteBackend>`. The default `caps()` impl is
+/// overridden here so `Arc::caps()` reaches into the concrete
+/// implementation rather than returning the trait default.
+impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
+    fn kind(&self) -> HostKind {
+        (**self).kind()
+    }
+    fn list_panes(&self) -> Vec<PaneInfo> {
+        (**self).list_panes()
+    }
+    fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+        (**self).resolve_pane(pane_id)
+    }
+    fn capture_pane(&self, pane_id: &str) -> Option<String> {
+        (**self).capture_pane(pane_id)
+    }
+    fn pane_pid_map(&self) -> HashMap<u32, String> {
+        (**self).pane_pid_map()
+    }
+    fn current_pane(&self) -> Option<String> {
+        (**self).current_pane()
+    }
+    fn focus_pane(&self, pane_id: &str) -> bool {
+        (**self).focus_pane(pane_id)
+    }
+    fn caps(&self) -> BackendCaps {
+        (**self).caps()
     }
 }
 

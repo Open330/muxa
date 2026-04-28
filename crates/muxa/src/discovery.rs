@@ -1,26 +1,36 @@
-//! Backfill discovery: scan tmux panes and synthesize `Started` events for
+//! Backfill discovery: scan host panes and synthesize `Started` events for
 //! agent processes the daemon doesn't know about yet.
 //!
 //! When `muxad` restarts mid-session, agents that were already running keep
-//! going inside their tmux panes but stop appearing in `muxa status` until
-//! they emit a fresh hook. That can take minutes if the agent is idle.
+//! going inside their panes but stop appearing in `muxa status` until they
+//! emit a fresh hook. That can take minutes if the agent is idle.
 //!
-//! This module bridges the gap by inspecting `pane_current_command` for each
-//! tmux pane and synthesizing a minimal `AgentEvent::Started` for any pane
-//! whose command matches a known agent CLI. The synthetic entry uses a
-//! `synthetic-<pane_id>` session id so re-running discovery is idempotent;
-//! when a real hook later fires for the same pane, the store replaces the
-//! synthetic entry in place — see `Store::apply`.
+//! This module bridges the gap by inspecting each pane's
+//! `current_command` field via [`PaneBackend`] and synthesizing a minimal
+//! `AgentEvent::Started` for any pane whose command matches a known
+//! agent CLI. The synthetic entry uses a `synthetic-<pane_id>` session
+//! id so re-running discovery is idempotent; when a real hook later
+//! fires for the same pane, the store replaces the synthetic entry in
+//! place — see `Store::apply`.
 //!
-//! Detection is intentionally simple: just `pane_current_command`. We don't
-//! walk process trees because that's noisy across kernels (`/proc` on Linux,
-//! `ps` on macOS) and the foreground command is good enough at the resolution
-//! we need.
+//! Detection is intentionally simple: just `current_command`. We don't
+//! walk process trees because that's noisy across kernels (`/proc` on
+//! Linux, `ps` on macOS) and the foreground command is good enough at
+//! the resolution we need.
+//!
+//! ## Capability gating
+//!
+//! Backends whose `caps().current_command == false` (zellij CLI without
+//! the WASM plugin, today) cannot classify panes by command. Discovery
+//! collapses to a no-op on those hosts rather than producing
+//! all-`Unknown` rows: agent registration falls back to "trust whatever
+//! pane the stdin hook self-reports" until the plugin lands.
 
+use crate::backend::PaneBackend;
 use crate::event::{AgentEvent, AgentId, AgentKind};
 use crate::ipc::{Client, RuntimeError};
 use crate::state::SYNTHETIC_SESSION_PREFIX;
-use crate::tmux::{self, PaneInfo, TmuxError};
+use crate::tmux::PaneInfo;
 use time::OffsetDateTime;
 
 /// One discovered agent pane.
@@ -59,10 +69,15 @@ pub fn discover_from_panes(panes: &[PaneInfo]) -> Vec<Discovered> {
         .collect()
 }
 
-/// Live scan: shell out to `tmux list-panes` and classify each entry.
-pub fn scan_panes() -> Result<Vec<Discovered>, TmuxError> {
-    let panes = tmux::list_panes()?;
-    Ok(discover_from_panes(&panes))
+/// Live scan: ask the backend for the current pane inventory and
+/// classify each entry. Returns an empty vec when the backend has no
+/// panes (host down) or when `caps().current_command == false` —
+/// classification is meaningless without the foreground-command field.
+pub fn scan_panes(backend: &dyn PaneBackend) -> Vec<Discovered> {
+    if !backend.caps().current_command {
+        return Vec::new();
+    }
+    discover_from_panes(&backend.list_panes())
 }
 
 /// Build a synthetic `AgentEvent::Started` for one discovered pane.
@@ -121,16 +136,17 @@ impl DiscoveryReport {
 ///
 /// Errors from individual ingest calls are counted but don't abort the pass —
 /// best-effort matches the rest of the daemon's surface.
-pub async fn run_discovery(client: &Client) -> Result<DiscoveryReport, RuntimeError> {
-    let discovered = match scan_panes() {
-        Ok(v) => v,
-        Err(e) => {
-            // No tmux, no panes — treat as an empty report rather than an
-            // error so `muxad` startup keeps working on hosts without tmux.
-            tracing::debug!(error = %e, "tmux list-panes failed; skipping discovery");
-            return Ok(DiscoveryReport::default());
-        }
-    };
+pub async fn run_discovery(
+    client: &Client,
+    backend: &dyn PaneBackend,
+) -> Result<DiscoveryReport, RuntimeError> {
+    let discovered = scan_panes(backend);
+    if discovered.is_empty() {
+        // Either no panes (host down / outside multiplexer) or the
+        // backend can't classify by command (zellij CLI-only). Skip
+        // the IPC chatter — there's nothing to ingest.
+        return Ok(DiscoveryReport::default());
+    }
 
     let snapshot = client.snapshot().await?;
     let mut report = DiscoveryReport::default();
