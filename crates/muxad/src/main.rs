@@ -135,7 +135,15 @@ async fn main() -> Result<()> {
     spawn_gc_task(&store, &shutdown_tx);
     spawn_reconciler_task(&cfg, &store, &shutdown_tx);
     spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
-    spawn_snapshotter_task(&cfg, &store, &shutdown_tx);
+
+    // The snapshotter listens on its own dedicated channel rather than
+    // the main shutdown broadcast: it has to be the last thing to die
+    // so its final flush captures every committed `Store::apply`. Main
+    // signals this channel only after the IPC server has fully drained
+    // its in-flight handlers — see the shutdown sequence at the bottom
+    // of this function.
+    let (snap_shutdown_tx, _) = broadcast::channel::<()>(1);
+    let snap_handle = spawn_snapshotter_task(&cfg, &store, &snap_shutdown_tx);
 
     // Desktop notifier: spawned only when opted in. We subscribe BEFORE
     // the server starts accepting events so no early transition is lost.
@@ -195,7 +203,19 @@ async fn main() -> Result<()> {
         spawn_startup_discovery(&cfg, socket.clone());
     }
 
+    // Shutdown sequence (each step depends on the previous):
+    //   1. `handle.await` — IPC server drains its in-flight handlers and
+    //      returns. After this point no further `Store::apply` can land.
+    //   2. Signal `snap_shutdown_tx` so the snapshotter wakes from its
+    //      `dirty.notified()` await and runs its final flush. State on
+    //      disk now reflects every committed event up to shutdown.
+    //   3. Await the snapshotter's JoinHandle (with a small timeout) so
+    //      we don't drop the runtime mid-write.
     handle.await??;
+    let _ = snap_shutdown_tx.send(());
+    if let Some(h) = snap_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    }
     Ok(())
 }
 
@@ -374,10 +394,10 @@ fn spawn_snapshotter_task(
     cfg: &Config,
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.state.enabled {
         tracing::info!("state snapshot disabled by config");
-        return;
+        return None;
     }
     let Some(path) = cfg
         .state
@@ -388,7 +408,7 @@ fn spawn_snapshotter_task(
         tracing::warn!(
             "state snapshot enabled but no path resolvable; restarts will lose state"
         );
-        return;
+        return None;
     };
     let opts = SnapshotterOptions {
         path: path.clone(),
@@ -396,12 +416,13 @@ fn spawn_snapshotter_task(
     };
     let snapshotter = Snapshotter::new(store.clone(), store.dirty(), opts);
     let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(snapshotter.run(shutdown_rx));
+    let handle = tokio::spawn(snapshotter.run(shutdown_rx));
     tracing::info!(
         path = %path.display(),
         debounce_ms = cfg.state.debounce_ms,
         "state snapshotter enabled",
     );
+    Some(handle)
 }
 
 /// Rehydrate the registry from disk on startup. No-op when state

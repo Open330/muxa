@@ -57,6 +57,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Notify};
 use tracing::{debug, info, warn};
 
+/// File mode applied to the snapshot file (and its in-flight tempfile).
+/// Snapshots include user prompts, responses, and `cwd`s — sensitive
+/// enough that the file should not be world-readable. Mirrors the
+/// posture used for the IPC socket via `harden_permissions`.
+#[cfg(unix)]
+const STATE_FILE_MODE: u32 = 0o600;
+
 use crate::state::{Agent, SharedStore};
 
 /// On-disk schema version. Bump when an incompatible field shape lands;
@@ -158,12 +165,15 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)
-            .await?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        // 0600 on the tempfile so an `ls` between create and rename can't
+        // expose contents to other local users; the rename preserves the
+        // tempfile's mode, so the destination inherits it automatically.
+        // `tokio::fs::OpenOptions::mode` is gated to Unix platforms.
+        #[cfg(unix)]
+        opts.mode(STATE_FILE_MODE);
+        let mut f = opts.open(&tmp).await?;
         f.write_all(&bytes).await?;
         // fsync the body before the rename — we want the file's contents
         // durable before any crash window opens between rename and the
@@ -357,6 +367,24 @@ mod tests {
         let mut sids: Vec<_> = loaded.iter().map(|a| a.session_id.clone()).collect();
         sids.sort();
         assert_eq!(sids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// `state.json` carries user prompts, responses, and cwds — it must
+    /// not be world-readable. Locks down the chmod-after-create
+    /// invariant on the file we wrote on this Unix host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_writes_file_with_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        save(&path, &[]).await.unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
     }
 
     /// Atomic-rename guarantees: an in-flight write that crashes between

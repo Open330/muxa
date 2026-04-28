@@ -12,17 +12,30 @@
 //! binding so only the owning user can send events.
 //!
 //! **Shutdown.** The server accepts a `CancellationToken`-style signal via
-//! the `shutdown` channel and stops accepting new connections; in-flight
-//! connections finish naturally.
+//! the `shutdown` channel and stops accepting new connections, then drains
+//! its tracked in-flight handlers (with a bounded timeout) before
+//! returning. The drain is what gives the snapshotter task its
+//! "last-to-die" guarantee: by the time `Server::run` returns, no handler
+//! can call `Store::apply` afterwards, so the daemon's final flush
+//! captures every state change the user actually triggered.
 
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::state::{Agent, SharedStore};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
+
+/// Maximum time `Server::run` will wait for in-flight handlers to finish
+/// after the shutdown signal lands. Sized for the longest plausible
+/// handler — a `recap_all` query reading several MB of NDJSON — plus
+/// generous slack. If a handler hangs past this we abort it rather than
+/// blocking the daemon's exit indefinitely.
+const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -150,27 +163,61 @@ impl Server {
     }
 
     /// Run until `shutdown` fires or an I/O error occurs.
+    ///
+    /// In-flight connection handlers are tracked on a `JoinSet` so a
+    /// clean shutdown can drain them before returning. Without that
+    /// drain, an ingest landing during shutdown could call
+    /// `Store::apply` *after* the snapshotter task has already done its
+    /// final flush, losing that event on the next restart. Drained with
+    /// a bounded timeout so a hung handler can't block daemon exit.
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<(), RuntimeError> {
         self.bind_with_perms()?;
         let listener = UnixListener::bind(&self.socket_path)?;
         tracing::info!(socket = %self.socket_path.display(), "listening");
+
+        let mut handlers: JoinSet<()> = JoinSet::new();
 
         loop {
             tokio::select! {
                 accept = listener.accept() => {
                     let (stream, _) = accept?;
                     let store = self.store.clone();
-                    tokio::spawn(async move {
+                    handlers.spawn(async move {
                         if let Err(e) = handle(stream, store).await {
                             tracing::warn!(error = %e, "connection handler failed");
                         }
                     });
+                    // Reap finished handlers opportunistically so the JoinSet
+                    // doesn't grow unboundedly under steady traffic.
+                    while handlers.try_join_next().is_some() {}
                 }
                 _ = shutdown.recv() => {
                     tracing::info!("shutdown signal received; closing listener");
                     break;
                 }
             }
+        }
+
+        // Drain in-flight handlers with a bounded timeout. Closes the
+        // lost-update window where a handler could call `Store::apply`
+        // after the daemon's snapshotter has already exited.
+        let drain = async {
+            while handlers.join_next().await.is_some() {}
+        };
+        if tokio::time::timeout(HANDLER_DRAIN_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                timeout_secs = HANDLER_DRAIN_TIMEOUT.as_secs(),
+                remaining = handlers.len(),
+                "ipc handlers did not drain within timeout; aborting",
+            );
+            handlers.abort_all();
+            // Best-effort: let the abort propagate.
+            while handlers.join_next().await.is_some() {}
+        } else {
+            tracing::debug!("ipc handlers drained cleanly");
         }
 
         // Remove our own socket file so next startup is clean.
@@ -447,6 +494,101 @@ mod tests {
         }
         // Either way, the call must not succeed.
         assert!(res.is_err());
+    }
+
+    /// `Server::run` must wait for in-flight handlers to finish before
+    /// returning. Otherwise, an ingest landing during shutdown could
+    /// call `Store::apply` *after* the snapshotter's final flush, losing
+    /// the event on next restart.
+    ///
+    /// We exercise this by piping a slow request through a handler:
+    /// fire shutdown while the handler is mid-read, then verify
+    /// `server.run` returns only after the handler has finished applying
+    /// its event (visible in the store snapshot).
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_handlers_before_returning() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-drain.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+
+        let server_handle = tokio::spawn(server.run(rx));
+
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Open a raw stream and write the request *header* but withhold
+        // the trailing newline so the handler is stuck inside
+        // `read_line`. This simulates an in-flight handler at the moment
+        // shutdown lands.
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ingest",
+            "event": {
+                "type": "started",
+                "id": {
+                    "kind": "claude_code",
+                    "session_id": "drain-test",
+                    "pane": "%9",
+                    "cwd": null,
+                },
+                "at": "2026-04-28T00:00:00Z",
+            },
+        });
+        let bytes = serde_json::to_vec(&req).unwrap();
+        // Note: no trailing '\n' yet.
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Yield to give the spawned handler a chance to enter `read_line`.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Fire shutdown. Server stops accepting; existing handler is
+        // still blocked on its read.
+        tx.send(()).unwrap();
+
+        // Now finish the request (newline) so the handler can complete,
+        // then close the stream so the handler's read loop sees EOF and
+        // returns. Without the close, `handle()` would happily wait for
+        // a follow-up request and the drain timeout would fire.
+        stream.write_all(b"\n").await.unwrap();
+        stream.flush().await.unwrap();
+        // Read the single response so we know the apply landed before
+        // we drop the stream — this also gives the handler enough time
+        // to write its reply.
+        let mut response_buf = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response_buf),
+        )
+        .await;
+        drop(stream);
+
+        // `server.run` must wait for the handler to finish before
+        // returning. The bounded timeout here is the test's deadline,
+        // not the production drain timeout — we expect this to complete
+        // in milliseconds.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_handle,
+        )
+        .await
+        .expect("server.run did not return after handler finished")
+        .expect("server task panicked");
+        outcome.expect("server.run returned an error");
+
+        // The drained handler must have applied its event before
+        // server.run returned. If we'd returned without waiting, the
+        // store could be empty and we'd race the assertion.
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1, "drained handler must have applied event");
+        assert_eq!(snap[0].session_id, "drain-test");
     }
 
     #[tokio::test]

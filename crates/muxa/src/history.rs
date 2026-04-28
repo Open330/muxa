@@ -431,12 +431,19 @@ async fn run_writer(
     }
 }
 
+/// File mode applied to `prompts.ndjson` — and the tempfile that
+/// compaction renames over it. The audit log records full prompt text,
+/// which is sensitive enough that the file should not be world-readable.
+/// Mirrors `state.json`'s posture and the IPC socket's chmod 0600.
+#[cfg(unix)]
+const HISTORY_FILE_MODE: u32 = 0o600;
+
 async fn open_appender(path: &Path) -> std::io::Result<tokio::fs::File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(HISTORY_FILE_MODE);
+    opts.open(path).await
 }
 
 async fn write_one(file: &mut tokio::fs::File, entry: &HistoryEntry) -> std::io::Result<()> {
@@ -461,12 +468,11 @@ async fn atomic_rewrite(path: &Path, snapshot: &[HistoryEntry]) -> std::io::Resu
             .unwrap_or("prompts.ndjson")
     ));
     {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)
-            .await?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        opts.mode(HISTORY_FILE_MODE);
+        let mut f = opts.open(&tmp).await?;
         for entry in snapshot {
             write_one(&mut f, entry).await?;
         }
@@ -595,6 +601,34 @@ mod tests {
         assert_eq!(got[0].prompt, "persisted");
         let _ = tx2.send(());
         let _ = writer2.await;
+    }
+
+    /// Audit log carries full prompt text — must not be world-readable.
+    /// Locks down the chmod-after-create invariant on the file the writer
+    /// task creates on first append.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn append_writes_file_with_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("prompts.ndjson");
+        let opts = HistoryOptions {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let (tx, _) = broadcast::channel::<()>(1);
+        let (h, writer) = PromptHistory::spawn(opts, tx.subscribe()).await.unwrap();
+        h.append(entry("%1", "p", datetime!(2026-04-28 0:00 UTC))).await;
+        // Quiesce so the writer has actually flushed the line to disk.
+        let _ = tx.send(());
+        let _ = writer.await;
+
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
     }
 
     /// A truncated/garbage line at the end of the file (e.g. crash mid-write)
