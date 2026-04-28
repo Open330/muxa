@@ -3,7 +3,9 @@
 //! Polls the daemon via `Client::snapshot()` every 500 ms and renders a
 //! live-updating table of tracked agents. Input is handled via crossterm
 //! events (`q`/`Esc`/`Ctrl-C` to quit, `r` to force-refresh, `↑/↓` or
-//! `j/k` for selection, `Enter` to attach into the selected pane).
+//! `j/k` for selection, `Enter` to attach into the selected pane,
+//! `p` to pop open a full-screen preview of the selected row's prompt
+//! and response — `q`/`Esc`/`p` returns to the table).
 //!
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
@@ -315,6 +317,25 @@ pub(crate) struct App {
     /// the first time it sees rows, so subsequent refreshes don't
     /// keep snapping the cursor away from the user's manual selection.
     initial_pane: Option<String>,
+    /// `Some` when the user has popped open the full-screen detail
+    /// preview (key `p`). The table is hidden behind the preview while
+    /// this is set; `q`/`Esc`/`p` clears it.
+    pub preview: Option<PreviewState>,
+}
+
+/// A `muxa watch` preview overlay — full-screen detail view of the
+/// selected agent's last prompt + last response. The selection is pinned
+/// to a `pane_id` (not a row index) so background refreshes that re-sort
+/// the table can't drift the preview onto a different agent.
+#[derive(Debug, Clone)]
+pub struct PreviewState {
+    /// Pane id at the time the preview was opened — also the lookup key
+    /// every render frame uses to find the live agent record.
+    pub pane_id: String,
+    /// Vertical scroll offset in *lines from the top of the content*.
+    /// `↑/↓` (or `j/k`) increment / decrement; `saturating_*` so we
+    /// can't underflow past the top.
+    pub scroll: u16,
 }
 
 impl App {
@@ -335,6 +356,7 @@ impl App {
             panes: Vec::new(),
             refresh_pending: false,
             initial_pane: None,
+            preview: None,
         }
     }
 
@@ -746,6 +768,14 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                     let _ = wake_tx.try_send(());
                     app.refresh_pending = true;
                 }
+                Action::OpenPreview => {
+                    if let Some(pane_id) = app.selected_pane() {
+                        app.preview = Some(PreviewState { pane_id, scroll: 0 });
+                    }
+                }
+                Action::ClosePreview => {
+                    app.preview = None;
+                }
                 Action::None => {}
             }
         }
@@ -805,6 +835,10 @@ enum Action {
     Refresh,
     /// Attach to the currently-selected pane.
     Attach,
+    /// Pop open the full-screen preview overlay for the selected row.
+    OpenPreview,
+    /// Close the preview overlay and return to the table.
+    ClosePreview,
 }
 
 fn handle_event(ev: Event, app: &mut App) -> Action {
@@ -825,14 +859,49 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return Action::None;
     }
 
+    // Ctrl-C is global — quits regardless of mode.
     if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         return Action::Quit;
+    }
+
+    // Preview mode: arrow keys scroll the overlay instead of moving the
+    // table cursor; quit/back collapses the overlay rather than the app.
+    // We mutate `app.preview` inline (mirroring how table-mode arrows
+    // mutate `table_state` directly) so the run loop only has to handle
+    // open/close transitions.
+    if let Some(preview) = app.preview.as_mut() {
+        return match code {
+            KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
+            KeyCode::Char('r') => Action::Refresh,
+            KeyCode::Down | KeyCode::Char('j') => {
+                preview.scroll = preview.scroll.saturating_add(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                preview.scroll = preview.scroll.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                preview.scroll = preview.scroll.saturating_add(10);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                preview.scroll = preview.scroll.saturating_sub(10);
+                Action::None
+            }
+            KeyCode::Home => {
+                preview.scroll = 0;
+                Action::None
+            }
+            _ => Action::None,
+        };
     }
 
     match code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Enter => Action::Attach,
+        KeyCode::Char('p') => Action::OpenPreview,
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_down();
             Action::None
@@ -859,8 +928,134 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         .split(area);
 
     render_header(f, chunks[0], app);
-    render_table(f, chunks[1], app);
+    if app.preview.is_some() {
+        render_preview(f, chunks[1], app);
+    } else {
+        render_table(f, chunks[1], app);
+    }
     render_footer(f, chunks[2], app);
+}
+
+/// Full-screen detail view for the agent / pane the user pinned with `p`.
+///
+/// Lays out as: title (pane label + kind/state) → bold "Last prompt"
+/// section → bold "Last response" section → optional notification block.
+/// The whole pane is scrollable via the `PreviewState.scroll` offset that
+/// `handle_event` mutates when the user hits `↑/↓` / `j/k` / `PageUp` /
+/// `PageDown` / `Home`.
+///
+/// Looks up the row by `pane_id` every frame so background refreshes that
+/// re-sort the table can't bump us onto a different agent's content.
+fn render_preview(f: &mut Frame, area: Rect, app: &App) {
+    let preview = app
+        .preview
+        .as_ref()
+        .expect("render_preview without preview");
+
+    let title = format!(" preview · {} ", preview.pane_id);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let lines = build_preview_lines(app, &preview.pane_id);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((preview.scroll, 0));
+    f.render_widget(paragraph, area);
+}
+
+/// Compose the textual body of the preview pane. Pulled out so unit tests
+/// can assert on the rendered structure without going through ratatui.
+fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
+    let mut out: Vec<Line<'a>> = Vec::new();
+
+    let row = app
+        .rows
+        .iter()
+        .find(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id)));
+
+    let pane_label = pane_display(Some(pane_id), &app.panes);
+    if let Some(WatchRow::Agent(agent)) = row {
+        // Header line — pane label + kind + state, all on one row.
+        out.push(Line::from(vec![
+            Span::styled("pane: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(pane_label, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("    "),
+            Span::styled("kind: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(agent.kind.to_string()),
+            Span::raw("    "),
+            Span::styled("state: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(agent.state.to_string()),
+        ]));
+        out.push(Line::from(""));
+
+        push_section(&mut out, "Last prompt", agent.last_prompt.as_deref());
+        out.push(Line::from(""));
+        push_section(&mut out, "Last response", agent.last_response.as_deref());
+
+        if agent.last_notification.is_some() {
+            out.push(Line::from(""));
+            push_section(
+                &mut out,
+                "Last notification",
+                agent.last_notification.as_deref(),
+            );
+        }
+    } else {
+        // Pane no longer in the row set — agent finished, pane closed,
+        // or the user pressed `p` on a bare-pane row that has no agent
+        // metadata to surface. Tell them rather than rendering empty.
+        out.push(Line::from(Span::styled(
+            format!("pane {pane_label}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "no agent record for this pane.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
+        out.push(Line::from(Span::styled(
+            "(press q / Esc / p to return to the picker)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    out
+}
+
+/// Append a `<title>:` heading then either the body lines (one per
+/// `\n`-separated line in the source) or a dim "—" placeholder when the
+/// field is empty / missing.
+fn push_section<'a>(out: &mut Vec<Line<'a>>, title: &str, body: Option<&'a str>) {
+    out.push(Line::from(Span::styled(
+        format!("{title}:"),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    match body {
+        Some(s) if !s.trim().is_empty() => {
+            for line in s.lines() {
+                out.push(Line::from(line.to_string()));
+            }
+        }
+        _ => {
+            out.push(Line::from(Span::styled(
+                "—",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+    }
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
@@ -1212,11 +1407,37 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    // Preview mode rebinds the table-mode keybinds to their preview-pane
+    // analogues — clearer for the user than leaving the same hint strings
+    // up while the keys behave differently.
+    if app.preview.is_some() {
+        let spans = vec![
+            Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" scroll  "),
+            Span::styled(
+                " PgUp/PgDn ",
+                Style::default().fg(Color::Black).bg(Color::Gray),
+            ),
+            Span::raw(" page  "),
+            Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" refresh  "),
+            Span::styled(
+                " p/q/Esc ",
+                Style::default().fg(Color::Black).bg(Color::Gray),
+            ),
+            Span::raw(" back"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let mut spans = vec![
         Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" move  "),
         Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
         Span::raw(" attach  "),
+        Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" preview  "),
         Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" refresh  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -2932,5 +3153,187 @@ mod tests {
         // viewport offset than the second (TableState retains state).
         terminal.draw(|f| render(f, &mut app)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
+    }
+
+    // ---- preview overlay (key `p`) ----------------------------------------
+
+    /// Drive `handle_event` with a single `Char(c)` keystroke and return
+    /// the resulting Action. Centralises the boilerplate so each preview
+    /// test reads as "press X, expect Y".
+    fn key_action(app: &mut App, c: char) -> Action {
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            app,
+        )
+    }
+
+    #[test]
+    fn preview_opens_with_p_and_pins_selected_pane_id() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(1)); // %2
+
+        assert!(app.preview.is_none());
+        let action = key_action(&mut app, 'p');
+        assert!(matches!(action, Action::OpenPreview));
+
+        // run loop applies OpenPreview by reading selected_pane(); we
+        // inline the same effect here.
+        if let Action::OpenPreview = action {
+            if let Some(pane) = app.selected_pane() {
+                app.preview = Some(PreviewState {
+                    pane_id: pane,
+                    scroll: 0,
+                });
+            }
+        }
+        assert_eq!(
+            app.preview.as_ref().map(|p| p.pane_id.as_str()),
+            Some("%2"),
+            "preview should pin the pane id of the selected row"
+        );
+    }
+
+    #[test]
+    fn preview_closes_with_q_esc_or_p() {
+        for key in [KeyCode::Char('q'), KeyCode::Esc, KeyCode::Char('p')] {
+            let mut app = three_agent_app(muxa::config::DetailConfig::default());
+            app.preview = Some(PreviewState {
+                pane_id: "%1".into(),
+                scroll: 0,
+            });
+            let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
+            assert!(
+                matches!(action, Action::ClosePreview),
+                "key {key:?} must request ClosePreview while in preview mode"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_arrow_keys_scroll_instead_of_moving_table_cursor() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+        });
+
+        // j scrolls down by 1
+        let _ = key_action(&mut app, 'j');
+        assert_eq!(app.preview.as_ref().unwrap().scroll, 1);
+        // PageDown jumps by 10
+        let _ = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert_eq!(app.preview.as_ref().unwrap().scroll, 11);
+        // Home returns to top
+        let _ = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert_eq!(app.preview.as_ref().unwrap().scroll, 0);
+        // k saturates at 0 — must not underflow
+        let _ = key_action(&mut app, 'k');
+        assert_eq!(app.preview.as_ref().unwrap().scroll, 0);
+        // Table cursor must NOT have moved during any of the above —
+        // arrow keys belong to the preview while it's open.
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn preview_lines_show_prompt_response_and_notification_for_active_agent() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        // a1 was built with prompt "ALPHAprompt" + response "ALPHAresp".
+        let lines = build_preview_lines(&app, "%1");
+        let dump = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(dump.contains("Last prompt:"), "missing prompt heading");
+        assert!(dump.contains("ALPHAprompt"), "missing prompt body");
+        assert!(dump.contains("Last response:"), "missing response heading");
+        assert!(dump.contains("ALPHAresp"), "missing response body");
+        // Sanity-check that other agents' content didn't leak into the
+        // preview for %1 — pane pinning must isolate.
+        assert!(
+            !dump.contains("BETAprompt"),
+            "preview leaked content from a different agent"
+        );
+
+        // With a notification set, that section appears too. Force it on
+        // the matching row and re-render.
+        if let WatchRow::Agent(a) = &mut app.rows[0] {
+            a.last_notification = Some("ready".into());
+        }
+        let dump2 = build_preview_lines(&app, "%1")
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump2.contains("Last notification:"));
+        assert!(dump2.contains("ready"));
+    }
+
+    #[test]
+    fn preview_for_unknown_pane_renders_fallback_message() {
+        let app = three_agent_app(muxa::config::DetailConfig::default());
+        let lines = build_preview_lines(&app, "%does-not-exist");
+        let dump = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump.contains("no agent record"),
+            "expected fallback hint, got: {dump}"
+        );
+    }
+
+    #[test]
+    fn preview_render_does_not_panic() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        // Footer must show the preview-mode hints, not the table-mode
+        // ones — `attach` is only meaningful with a row selected.
+        let buf = terminal.backend().buffer();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("scroll"),
+            "preview footer must show scroll hint"
+        );
+        assert!(text.contains("back"), "preview footer must show back hint");
+        assert!(
+            !text.contains("attach"),
+            "preview footer must not show attach hint"
+        );
     }
 }
