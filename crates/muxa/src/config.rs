@@ -164,6 +164,35 @@ pub struct WatchConfig {
     pub widths: HashMap<String, WidthSpec>,
     /// Expanded detail line shown under the currently-selected row.
     pub detail: DetailConfig,
+    /// Ordered list of sort keys applied to the agent rows in `muxa watch`.
+    /// Stale agents (pane closed) always bucket at the end, regardless of
+    /// what's listed here.
+    ///
+    /// Default: `["session", "activity"]` — groups by tmux session, then
+    /// floats the most-recently-active agent inside each group to the top.
+    pub sort: Vec<WatchSortKey>,
+}
+
+/// A single sort key for the `muxa watch` agent row ordering. The keys
+/// are evaluated in the order listed in `WatchConfig::sort` and the first
+/// non-equal comparison wins, with `pane_id` as a final stable tiebreaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchSortKey {
+    /// tmux session name, ascending. Resolved against the panes inventory
+    /// because agent records only carry `pane_id`.
+    Session,
+    /// `last_activity_at` descending — most recently updated first. The
+    /// useful default to surface "what's moving right now" without
+    /// scrolling.
+    Activity,
+    /// tmux window index, then pane index, both ascending and parsed
+    /// numerically so `10` sorts after `2`. Combined with `Session`, this
+    /// reproduces the tmux-native pane ordering.
+    Pane,
+    /// Raw `pane_id` (e.g. `%42`) lexicographic ascending. Mostly useful
+    /// as a stable, predictable order for screenshots / docs.
+    PaneId,
 }
 
 impl Default for WatchConfig {
@@ -185,6 +214,11 @@ impl Default for WatchConfig {
             columns,
             widths,
             detail: DetailConfig::default(),
+            // Group by session, then bring the most recently active agent
+            // in each group to the top — covers both "what's moving" and
+            // "where is it" at a glance, without losing the grouping
+            // shipped in c9a6572.
+            sort: vec![WatchSortKey::Session, WatchSortKey::Activity],
         }
     }
 }
@@ -374,6 +408,50 @@ broken = "what"
         let cfg = WatchConfig::default();
         assert!(cfg.detail.enabled);
         assert_eq!(cfg.detail.template, "{last_response|last_prompt}");
+    }
+
+    #[test]
+    fn watch_sort_default_keeps_session_grouping_then_activity() {
+        let cfg = WatchConfig::default();
+        assert_eq!(
+            cfg.sort,
+            vec![WatchSortKey::Session, WatchSortKey::Activity]
+        );
+    }
+
+    #[test]
+    fn parses_watch_sort_section() {
+        let toml = r#"
+[watch]
+sort = ["activity"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.watch.sort, vec![WatchSortKey::Activity]);
+    }
+
+    #[test]
+    fn parses_watch_sort_with_multiple_keys() {
+        let toml = r#"
+[watch]
+sort = ["session", "pane"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.watch.sort,
+            vec![WatchSortKey::Session, WatchSortKey::Pane]
+        );
+    }
+
+    #[test]
+    fn unknown_watch_sort_key_is_rejected() {
+        // serde rejects unknown enum variants — typos surface as parse
+        // errors rather than silently dropping the key, matching the
+        // `deny_unknown_fields` posture elsewhere in the config.
+        let toml = r#"
+[watch]
+sort = ["nope"]
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     #[test]

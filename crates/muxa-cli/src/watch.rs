@@ -20,7 +20,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa::config::{WatchConfig, WidthSpec};
+use muxa::config::{WatchConfig, WatchSortKey, WidthSpec};
 use muxa::ipc::{Client, RuntimeError};
 use muxa::state::Agent;
 use muxa::tmux::{self, PaneInfo};
@@ -336,41 +336,18 @@ impl App {
     /// order; `panes` minus any pane already represented by an agent are
     /// appended as `BarePane` rows.
     pub(crate) fn set_data(&mut self, mut agents: Vec<Agent>, panes: Vec<PaneInfo>) {
-        // Group agent rows by tmux session (then window / pane index) so
-        // panes belonging to the same session sit next to each other —
-        // matches the bare-pane sort below and keeps the dashboard
-        // readable when one user has agents spread across many sessions.
+        // Sort agent rows according to the user's `[watch] sort` config.
+        // Stale agents (pane already closed, i.e. lookup miss against the
+        // panes inventory) always bucket at the end so live agents stay
+        // visually grouped at the top regardless of the sort keys.
         //
-        // Agent records carry only `pane_id`; we resolve session and
-        // window/pane indices via the panes inventory collected this
-        // refresh. Stale agents (pane already closed, i.e. lookup miss)
-        // bucket at the end since there's no session to slot them into.
+        // Agent records carry only `pane_id`; session / window / pane
+        // indices are resolved via the panes inventory collected this
+        // refresh.
         let pane_by_id: HashMap<&str, &PaneInfo> =
             panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
-        agents.sort_by_cached_key(|ag| {
-            let info = ag
-                .pane
-                .as_deref()
-                .and_then(|id| pane_by_id.get(id).copied());
-            match info {
-                Some(p) => (
-                    false,
-                    p.session.clone(),
-                    // Parse numerically so "10" sorts after "2" within a
-                    // window — string-comparison would invert that.
-                    p.window_index.parse::<u32>().unwrap_or(u32::MAX),
-                    p.pane_index.parse::<u32>().unwrap_or(u32::MAX),
-                    ag.pane.clone().unwrap_or_default(),
-                ),
-                None => (
-                    true,
-                    String::new(),
-                    0,
-                    0,
-                    ag.pane.clone().unwrap_or_default(),
-                ),
-            }
-        });
+        let sort_keys = &self.watch_cfg.sort;
+        agents.sort_by(|a, b| sort_agents(a, b, sort_keys, &pane_by_id));
 
         let known: HashSet<String> = agents.iter().filter_map(|a| a.pane.clone()).collect();
 
@@ -441,6 +418,63 @@ impl App {
         let i = self.table_state.selected()?;
         self.rows.get(i)?.pane_id().map(String::from)
     }
+}
+
+/// Compare two agents according to the user-configured sort keys.
+///
+/// Comparison flow (each step exits as soon as one agent is "less than"
+/// the other — the rest are tiebreakers):
+/// 1. Live agents always sort before stale agents (pane closed).
+/// 2. Each `WatchSortKey` from the config, in order.
+/// 3. `pane_id` lex ascending — final stable tiebreaker so the order is
+///    deterministic across refreshes when every other key ties (matters
+///    most for `Activity` when timestamps quantize to the same second).
+fn sort_agents(
+    a: &Agent,
+    b: &Agent,
+    keys: &[WatchSortKey],
+    pane_by_id: &HashMap<&str, &PaneInfo>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let info_a = a.pane.as_deref().and_then(|id| pane_by_id.get(id).copied());
+    let info_b = b.pane.as_deref().and_then(|id| pane_by_id.get(id).copied());
+
+    // Stale (pane gone) → Ordering::Greater so it sinks to the bottom.
+    match (info_a.is_some(), info_b.is_some()) {
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        _ => {}
+    }
+
+    for key in keys {
+        let cmp = match key {
+            WatchSortKey::Session => info_a
+                .map(|p| p.session.as_str())
+                .cmp(&info_b.map(|p| p.session.as_str())),
+            WatchSortKey::Activity => {
+                // Reverse so newer (= larger timestamp) ends up first.
+                b.last_activity_at.cmp(&a.last_activity_at)
+            }
+            WatchSortKey::Pane => {
+                let key_for = |info: Option<&PaneInfo>| {
+                    info.map(|p| {
+                        (
+                            p.window_index.parse::<u32>().unwrap_or(u32::MAX),
+                            p.pane_index.parse::<u32>().unwrap_or(u32::MAX),
+                        )
+                    })
+                };
+                key_for(info_a).cmp(&key_for(info_b))
+            }
+            WatchSortKey::PaneId => a.pane.as_deref().cmp(&b.pane.as_deref()),
+        };
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+
+    a.pane.as_deref().cmp(&b.pane.as_deref())
 }
 
 /// Render a `pane_id` as `session:window.pane` when we can resolve it
@@ -1304,7 +1338,15 @@ mod tests {
         //   1. all alpha agents grouped, then all beta agents grouped
         //   2. within a session, ordered by window then pane index
         //   3. stale agent at the end
-        let mut app = App::new();
+        //
+        // Uses an explicit `[Session, Pane]` sort so the assertion stays
+        // independent of `last_activity_at` jitter from `fake_agent`. The
+        // default `[Session, Activity]` is exercised by separate tests.
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::Session, WatchSortKey::Pane],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
         let mk = |session_id: &str, pane: &str| {
             fake_agent(
                 session_id,
@@ -1353,7 +1395,12 @@ mod tests {
     fn agent_window_pane_indices_sort_numerically_not_lex() {
         // "10" must sort AFTER "2" within a session — string comparison
         // would invert that. Regression guard for the parse::<u32>() path.
-        let mut app = App::new();
+        // Uses explicit `Pane` sort so activity-jitter doesn't matter.
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::Session, WatchSortKey::Pane],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
         let mk = |session_id: &str, pane: &str| {
             fake_agent(
                 session_id,
@@ -1384,6 +1431,168 @@ mod tests {
             })
             .collect();
         assert_eq!(order, vec!["%1", "%2", "%10"]);
+    }
+
+    /// Build an agent with an explicit `last_activity_at` so sort tests
+    /// don't depend on `fake_agent`'s wall-clock jitter.
+    fn fake_agent_at(session_id: &str, pane: &str, last_activity_at: OffsetDateTime) -> Agent {
+        let mut a = fake_agent(
+            session_id,
+            Some(pane),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.last_activity_at = last_activity_at;
+        a
+    }
+
+    #[test]
+    fn default_sort_keeps_session_grouping_and_floats_latest_activity_in_each_group() {
+        // Default config = [Session, Activity]. Two sessions with two
+        // agents each at staggered timestamps. Expect:
+        //   - alpha group first, then beta group (session asc)
+        //   - newest agent at top within each group
+        let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
+        let t3 = time::macros::datetime!(2026-04-28 12:00:00 UTC);
+
+        let mut app = App::new();
+        app.set_data(
+            vec![
+                fake_agent_at("a-old", "%10", t0),
+                fake_agent_at("a-new", "%11", t2),
+                fake_agent_at("b-old", "%20", t1),
+                fake_agent_at("b-new", "%21", t3),
+            ],
+            vec![
+                fake_pane("%10", "alpha", 0, 0, "claude"),
+                fake_pane("%11", "alpha", 0, 1, "claude"),
+                fake_pane("%20", "beta", 0, 0, "claude"),
+                fake_pane("%21", "beta", 0, 1, "claude"),
+            ],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                _ => None,
+            })
+            .collect();
+        // alpha: %11 (newer t2) before %10 (older t0); then beta: %21
+        // (newer t3) before %20 (older t1).
+        assert_eq!(order, vec!["%11", "%10", "%21", "%20"]);
+    }
+
+    #[test]
+    fn activity_only_sort_floats_globally_newest_agent_to_the_top() {
+        // sort = [Activity] — drops session grouping entirely. Expected
+        // order is strict newest-first across all sessions.
+        let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
+
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::Activity],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent_at("alpha", "%10", t0),
+                fake_agent_at("beta", "%20", t2),
+                fake_agent_at("gamma", "%30", t1),
+            ],
+            vec![
+                fake_pane("%10", "alpha", 0, 0, "x"),
+                fake_pane("%20", "beta", 0, 0, "x"),
+                fake_pane("%30", "gamma", 0, 0, "x"),
+            ],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["%20", "%30", "%10"]);
+    }
+
+    #[test]
+    fn pane_id_sort_produces_lexicographic_order() {
+        // sort = [PaneId] — useful for screenshots / docs where stable
+        // alphabetic order is preferred over recency.
+        let now = OffsetDateTime::now_utc();
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::PaneId],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent_at("a", "%30", now),
+                fake_agent_at("a", "%1", now),
+                fake_agent_at("a", "%200", now),
+            ],
+            vec![
+                fake_pane("%1", "a", 0, 0, "x"),
+                fake_pane("%30", "a", 0, 1, "x"),
+                fake_pane("%200", "a", 0, 2, "x"),
+            ],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                _ => None,
+            })
+            .collect();
+        // Lexicographic — "%1" < "%200" < "%30" because '2' < '3'.
+        assert_eq!(order, vec!["%1", "%200", "%30"]);
+    }
+
+    #[test]
+    fn stale_agents_always_sink_to_bottom_regardless_of_sort_keys() {
+        // Stale = pane no longer in the inventory. Even when the sort
+        // key would otherwise float them up (e.g. very recent activity),
+        // the live/stale split takes precedence.
+        let now = OffsetDateTime::now_utc();
+        let very_recent = now;
+        let older = now - time::Duration::hours(1);
+
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::Activity],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent_at("stale-but-recent", "%999", very_recent),
+                fake_agent_at("live-but-older", "%10", older),
+            ],
+            vec![fake_pane("%10", "main", 0, 0, "claude")],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["%10", "%999"]);
     }
 
     #[test]
@@ -1424,7 +1633,14 @@ mod tests {
 
     #[test]
     fn selected_pane_returns_pane_id_for_selected_row() {
-        let mut app = App::new();
+        // Lock to PaneId sort so this test stays focused on the
+        // selected_pane() contract — not on the default sort behaviour
+        // covered by other tests.
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::PaneId],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
         app.set_data(
             vec![
                 fake_agent(
@@ -2219,8 +2435,12 @@ mod tests {
     /// Build an `App` configured to put the detail line on the Prompt
     /// column with three rows of agents. Returns the constructed app.
     fn three_agent_app(detail: muxa::config::DetailConfig) -> App {
+        // Pin sort to PaneId so the assertions about which row is at
+        // which index don't drift with the default [Session, Activity]
+        // sort once `fake_agent` timestamps differ across runs.
         let cfg = WatchConfig {
             detail,
+            sort: vec![WatchSortKey::PaneId],
             ..Default::default()
         };
         let mut app = App::with_config(cfg);
