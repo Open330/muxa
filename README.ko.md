@@ -254,7 +254,7 @@ muxa watch          # 실시간 TUI
 | `muxa status`                              | 추적 중인 모든 에이전트를 사람이 읽기 쉬운 테이블로 출력.                |
 | `muxa watch`                               | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고.                    |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
-| `muxa recap [--pane %N]`                   | 해당 페인의 마지막 프롬프트를 보여줌.                                    |
+| `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
 | `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
 | `muxa panes`                               | 디버그용: tmux 페인 목록 덤프.                                            |
 | `muxa hook <agent> --event <e>`            | 훅 어댑터 진입점 — 에이전트 CLI가 직접 호출.                             |
@@ -456,6 +456,42 @@ template = "{last_response|last_prompt}"        # 기본값 — 응답 있으면
 아직 안 읽는 어댑터 (Codex / Gemini) 나 turn 진행 중 / 옛날 에이전트 모두
 detail 라인이 의미있는 값을 보여줍니다. 두 alternative 모두 비어있으면
 detail 라인이 자동 suppression — 갓 발견된 무활동 페인의 정상 동작입니다.
+
+### 프롬프트 히스토리
+
+`muxad` 는 모든 `PromptSubmitted` 이벤트를 bounded NDJSON audit log
++ pane 별 in-memory ring 에 기록합니다. `muxa recap --all` / `--limit N`
+이 이걸 사용하므로 — 데몬 재시작이나 페인 종료 후에도 prompt 들을
+조회 가능 (live `Agent.last_prompt` 는 레코드와 함께 사라지는 데 반해).
+
+```toml
+[history]
+enabled               = true
+# path                = "$XDG_DATA_HOME/muxa/prompts.ndjson"   # 기본값
+max_per_pane          = 200
+max_age_days          = 30
+compact_interval_secs = 3600
+```
+
+`enabled = false` 로 끌 때는 sink (예: oh-my-prompt) 로 따로 보내고
+있는 경우만 — 안 그러면 `muxa recap` 의 과거 조회 능력 자체가
+사라집니다.
+
+### 리컨실러
+
+주기적인 control loop 가 in-memory 레지스트리를 tmux ground truth 와
+동기화합니다. 매 패스마다 stale 레코드 reap, 진짜 세션에 진 synthetic
+placeholder drop, 같은 페인의 중복 row collapse 를 수행합니다.
+
+```toml
+[reconciler]
+enabled       = true
+interval_secs = 30
+```
+
+Idempotent 라 타이머로 돌려도 안전 — `interval_secs` 는 정확성이
+아니라 튜닝 knob 입니다. 외부에서 reconciliation 을 직접 driving
+하는 경우 (통합 테스트에서 fake `LivenessSource` 주입 등) 만 끄세요.
 
 <details>
 <summary>환경 변수</summary>

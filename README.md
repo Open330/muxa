@@ -257,7 +257,7 @@ muxa watch          # live TUI
 | `muxa status`                              | Human-readable table of all tracked agents.                            |
 | `muxa watch`                               | Full-screen live TUI — see [Live TUI](#live-tui).                      |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
-| `muxa recap [--pane %N]`                   | Show the last prompt for the given pane.                               |
+| `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
 | `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
 | `muxa panes`                               | Debug: dump tmux pane inventory.                                       |
 | `muxa hook <agent> --event <e>`            | Hook adapter entry point. Invoked by the agent CLIs themselves.        |
@@ -500,6 +500,44 @@ useful for older agents, agents mid-turn, and adapters that don't read
 transcripts yet (Codex / Gemini today). When every alternative is empty
 the detail line suppresses itself — that's normal for a freshly-
 discovered pane with no activity yet, not a bug.
+
+### Prompt history
+
+`muxad` records every `PromptSubmitted` event into a bounded NDJSON
+audit log plus an in-memory ring per pane. Powers `muxa recap --all` /
+`--limit N` so prompts survive daemon restarts and pane closes
+(unlike the live `Agent.last_prompt` field, which gets reaped with the
+record).
+
+```toml
+[history]
+enabled               = true
+# path                = "$XDG_DATA_HOME/muxa/prompts.ndjson"   # default
+max_per_pane          = 200
+max_age_days          = 30
+compact_interval_secs = 3600
+```
+
+Set `enabled = false` only if you're routing history exclusively
+through a sink (e.g. oh-my-prompt) — otherwise you lose `muxa recap`'s
+ability to look back after a daemon restart or pane close.
+
+### Reconciler
+
+A periodic control loop that converges the in-memory registry against
+tmux ground truth. Each pass reaps stale records, drops synthetic
+placeholders that lost to a real session, and collapses duplicate rows
+for the same pane.
+
+```toml
+[reconciler]
+enabled       = true
+interval_secs = 30
+```
+
+Idempotent and safe to run on a timer; the cadence is a tuning knob,
+not a correctness one. Disable only when driving reconciliation
+externally (e.g. integration tests with a fake `LivenessSource`).
 
 <details>
 <summary>Environment variables</summary>

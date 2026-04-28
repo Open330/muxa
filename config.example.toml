@@ -18,6 +18,26 @@
 [discovery]
 # enabled = true
 
+# Periodic reconciler: a control-loop pass that converges the in-memory
+# agent registry against tmux ground truth. Reaps records whose pane is
+# gone, drops synthetic placeholders that lost to a real session, and
+# collapses duplicate rows for the same pane. Idempotent — `interval_secs`
+# is a tuning knob, not a correctness one.
+[reconciler]
+# enabled       = true
+# interval_secs = 30                # 30s default — closed panes disappear from `muxa watch` within seconds
+
+# Prompt audit log: every PromptSubmitted event is appended to a bounded
+# NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`
+# even after the live agent record has been reaped (daemon restart, pane
+# close, etc.). Default path lives in $XDG_DATA_HOME.
+[history]
+# enabled               = true
+# path                  = "/home/$USER/.local/share/muxa/prompts.ndjson"
+# max_per_pane          = 200       # cap entries kept per pane (memory + disk)
+# max_age_days          = 30        # compaction drops anything older
+# compact_interval_secs = 3600      # rewrites the file every hour
+
 # Logging is controlled via the standard RUST_LOG env var, e.g.:
 #   RUST_LOG=muxa=debug,tokio=warn muxad
 # Default when unset: "muxa=info".
