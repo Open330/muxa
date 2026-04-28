@@ -56,18 +56,46 @@ BASHRC
 "$TM" -L "$TMUX_LBL" select-window -t main:0
 
 # 3) Seed muxad. Pick the first three pane ids so the agent rows resolve to
-#    real session:window.pane labels in muxa watch.
+#    real session:window.pane labels in muxa watch. Each pane gets a
+#    realistic prompt + (where the adapter supports it) a captured
+#    `last_response`, so the preview popup has actual content to show
+#    instead of the "no agent record" fallback.
+
 mapfile -t PANES < <("$TM" -L "$TMUX_LBL" list-panes -a -F '#{pane_id}')
 PA=${PANES[0]}
 PB=${PANES[1]}
 PC=${PANES[2]}
 
+# --- Claude transcript fixture ---------------------------------------------
+# Claude's `Stop` hook only carries a `transcript_path` — the response body
+# itself is read from the JSONL file. We stage a small fake transcript that
+# matches Claude Code's on-disk format closely enough for
+# `transcript::last_assistant_text` to find the assistant turn.
+TRANSCRIPT_DIR=/tmp/muxa-demo-transcripts
+mkdir -p "$TRANSCRIPT_DIR"
+CLAUDE_TRANSCRIPT="$TRANSCRIPT_DIR/claude-s-a.jsonl"
+cat > "$CLAUDE_TRANSCRIPT" <<'JSONL'
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"refactor the ipc module to use length-prefixed frames"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Switched the on-the-wire framing from newline-delimited JSON to length-prefixed (u32 BE + body) frames. The old framing assumed payloads never contained literal newlines, which broke the moment we started ingesting transcript snippets. Updated:\n  • crates/muxa/src/ipc.rs — Server::handle_conn / Client::recv now share a length_prefixed::read_frame helper that returns Result<Vec<u8>, FrameError>.\n  • Migrated every existing call site, including the dashboard SSE bridge.\n  • Added round-trip tests for empty / 1-byte / 4 KiB / 4 MiB payloads.\n\nLet me know if you want me to also bump the protocol version constant in event.rs — strictly speaking this is wire-incompatible with older clients."}]}}
+JSONL
+
 TMUX_PANE="$PA" muxa hook claude --event user_prompt_submit \
   <<<'{"session_id":"s-a","prompt":"refactor the ipc module to use length-prefixed frames"}'
+TMUX_PANE="$PA" muxa hook claude --event stop \
+  <<<"{\"session_id\":\"s-a\",\"transcript_path\":\"$CLAUDE_TRANSCRIPT\"}"
+
+# --- Codex: prompt + permission request ------------------------------------
+# Codex's adapter doesn't read transcripts, so `last_response` stays None;
+# the preview's `{last_response|last_prompt}` template still renders rich
+# content via the `last_prompt` fallback we wired up in 59312be.
+TMUX_PANE="$PB" muxa hook codex --event user_prompt_submit \
+  <<<'{"session_id":"s-b","prompt":"audit the legacy auth middleware for token handling — flag anything that stores raw bearer tokens at rest, and propose a redaction layer that survives the `pre_tool_use` hook fan-out."}'
 TMUX_PANE="$PB" muxa hook codex --event permission_request \
   <<<'{"session_id":"s-b","tool_name":"shell"}'
+
+# --- Gemini: prompt + after_agent (no transcript reader) -------------------
 TMUX_PANE="$PC" muxa hook gemini --event before_agent \
-  <<<'{"session_id":"s-c","prompt":"summarize this PR"}'
+  <<<'{"session_id":"s-c","prompt":"review PR #482 — focus on the new sorting knob in muxa watch and whether the [Session, Activity] default surprises power users with many short-lived panes."}'
 TMUX_PANE="$PC" muxa hook gemini --event after_agent \
   <<<'{"session_id":"s-c"}'
 
