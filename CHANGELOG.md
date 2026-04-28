@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-28
+
 ### Added
 
 - Event-driven snapshot of the agent registry to
@@ -133,4 +135,6 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Open330/muxa/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Open330/muxa/releases/tag/v0.1.0
