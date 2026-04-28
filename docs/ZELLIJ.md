@@ -96,25 +96,89 @@ no-op for this backend.
 
 ### Step 4 — CLI wiring
 
-`muxa status`, `muxa watch`, `muxa hook <agent>` pick the backend based on
-which env var is set. If both `$TMUX` and `$ZELLIJ` are present (rare but
-possible if nested), prefer the innermost — i.e. whichever was set last.
-Document the precedence.
+`muxa status`, `muxa watch`, `muxa hook <agent>` pick the backend through
+[`backend::detect_host_env`]. The resolution order is:
+
+1. `MUXA_HOST=tmux|zellij` — explicit operator override; wins regardless
+   of which host env vars are present. Useful for nested-multiplexer
+   setups where `tmux new-session` from inside zellij leaves `ZELLIJ`
+   set in the new shell's env even though the actual host is tmux.
+2. `ZELLIJ` set → zellij.
+3. `TMUX` set → tmux.
+4. Neither set → no-op backend (operator running outside any
+   multiplexer; CLI commands that don't need a backend keep working).
+
+When both `$TMUX` and `$ZELLIJ` are present, zellij wins by default —
+this is a pragmatic pick rather than a principled one (the env doesn't
+carry "set last" ordering). `MUXA_HOST` is the escape hatch.
+
+## Capability story (CLI-only zellij)
+
+Several `PaneBackend` methods are **plugin-only on zellij** because the
+zellij CLI doesn't expose pane metadata at parity with tmux's
+`list-panes -F`. The trait surfaces this through [`BackendCaps`] so
+callers can branch on what's actually available rather than silently
+degrading on empty results:
+
+| Capability             | tmux backend | zellij CLI-only | zellij + plugin |
+| ---------------------- | ------------ | --------------- | --------------- |
+| `list_panes` (any rows) | ✅           | ⚠️ via `list-clients` only | ✅       |
+| `current_command` field | ✅           | ❌ never        | ✅              |
+| `pane_pid_map`          | ✅           | ❌ never        | ✅              |
+| `capture_pane`          | ✅           | ✅ via `dump-screen` | ✅          |
+| `focus_pane`            | ✅           | ✅              | ✅              |
+
+The "CLI-only" column is what users get out of the box if they don't
+install the WASM plugin. It's intentionally degraded — agent
+auto-discovery falls back to "trust whatever pane the stdin hook
+self-reports" because there's no way to classify panes by foreground
+command. The plugin is what closes that gap; the CLI-only mode exists
+mainly so an operator who installs the muxa binary on a zellij host
+gets *something* working immediately, even if it's not full parity.
+
+Hook ancestry (`adapters/hook.rs`), discovery (`discovery.rs`), and
+the watch loop should consult `caps()` before walking pid chains or
+classifying by command, and pick the appropriate fallback for the
+"structurally unsupported" case (vs the existing "transient empty"
+case which the trait already handles via best-effort returns).
+
+## Pane ID wire format
+
+**Decision: backend-prefixed strings (`tmux:%4`, `zellij:3`).**
+
+tmux's `%N` and zellij's numeric ids would collide if we tried to put
+them in the same on-wire `PaneId` namespace. We pick prefixed strings
+over a `(host, raw_id)` tuple because:
+
+- The wire format already has `pane_id: String` everywhere — IPC
+  schema, `state.json`, `prompts.ndjson`, `Agent.pane`. Switching to a
+  tuple is a breaking schema change for every consumer; prefixing is
+  an additive convention that just looks like a longer string to old
+  readers.
+- `state.json` and `prompts.ndjson` are already on disk in production;
+  retroactively prefixing is a one-shot migration in
+  [`crate::snapshot::load`] / [`crate::history::load_from_disk`]
+  rather than a breaking version bump. Plan for that migration is to
+  treat any unprefixed pane id as `tmux:` since pre-zellij operators
+  only ever ran tmux.
+
+Lock this in **before** the watch migration lands so the daemon's IPC
+schema doesn't have to flip mid-transition.
 
 ## Open questions
 
-- **Pane IDs across hosts.** tmux uses `%N` (e.g. `%4`); zellij uses numeric
-  pane IDs scoped by tab. Are we OK with a backend-prefixed string format
-  (`tmux:%4`, `zellij:3`) for the on-wire `PaneId`? This bleeds into the
-  daemon DB schema — needs a migration plan if so.
-- **Plugin distribution.** Ship the `.wasm` in the GitHub release, or expect
-  users to `cargo build` it? First option is friendlier; second avoids us
-  signing/hosting a WASM blob.
-- **UX for "go to this pane".** zellij's focus model (tabs + floating panes +
-  stacked panes) doesn't map 1:1 onto tmux's session/window/pane. The watch
-  TUI's "press Enter to jump" needs a separate design pass.
-- **Plugin API stability.** zellij plugin API is pre-1.0; assume one breaking
-  bump per zellij minor release and pin a minimum supported version.
+- **Plugin distribution.** Ship the `.wasm` in the GitHub release, or
+  expect users to `cargo build` it? First option is friendlier; second
+  avoids us signing/hosting a WASM blob.
+- **UX for "go to this pane".** zellij's focus model (tabs + floating
+  panes + stacked panes) doesn't map 1:1 onto tmux's session/window/
+  pane. The watch TUI's "press Enter to jump" needs a separate design
+  pass — the trait method `focus_pane(&str) -> bool` is the seam, but
+  what the daemon shows in the picker for a zellij floating pane is
+  open.
+- **Plugin API stability.** zellij plugin API is pre-1.0; assume one
+  breaking bump per zellij minor release and pin a minimum supported
+  version.
 
 ## Rough effort
 
