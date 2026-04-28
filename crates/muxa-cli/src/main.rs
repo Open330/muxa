@@ -401,7 +401,7 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
 async fn cmd_recap(client: &Client, pane: Option<String>) -> Result<()> {
     let pane = pane
         .or_else(tmux::current_pane)
-        .context("no pane given and $TMUX_PANE is unset")?;
+        .context("no pane given and could not determine current tmux pane")?;
     let agents = client.by_pane(&pane).await?;
     if agents.is_empty() {
         println!("no agent in pane {pane}");

@@ -77,8 +77,50 @@ pub fn inside_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
 
+/// Best-effort resolution of the user's active pane.
+///
+/// `$TMUX_PANE` covers the common case (a shell running inside that pane).
+/// But tmux does NOT propagate it to processes spawned by `run-shell`, key
+/// bindings, or `display-popup` — including the
+/// `bind-key s display-popup -E "muxa watch"` recipe shipped in
+/// `examples/muxa.tmux.conf`. In those contexts we ask tmux directly,
+/// scoping the query to the session id parsed out of `$TMUX` so that with
+/// multiple attached clients we still return the active pane of the
+/// session that triggered the binding (rather than tmux's most-recently-
+/// active client, which `display-message` defaults to).
 pub fn current_pane() -> Option<String> {
-    std::env::var("TMUX_PANE").ok()
+    if let Some(p) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) {
+        return Some(p);
+    }
+    let target = parse_tmux_session_target(&std::env::var("TMUX").ok()?)?;
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", "-t", &target, "#{pane_id}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let pane = stdout.lines().next().unwrap_or("").trim();
+    if pane.is_empty() {
+        None
+    } else {
+        Some(pane.to_string())
+    }
+}
+
+/// Parse a tmux target spec for the session this client is attached to,
+/// out of the `$TMUX` env var. `$TMUX` is `socket_path,server_pid,session_id`
+/// where `session_id` is numeric; tmux accepts `$<id>` as a session target.
+///
+/// Returns `None` when the env var is malformed or the trailing field isn't
+/// a plain decimal id, so callers fall back to "no target known".
+fn parse_tmux_session_target(tmux_env: &str) -> Option<String> {
+    let sid = tmux_env.rsplit(',').next()?;
+    if sid.is_empty() || !sid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("${sid}"))
 }
 
 /// Resolve a raw tmux `pane_id` (e.g. `%42`) to its full `PaneInfo`.
@@ -166,5 +208,22 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].pane_id, "%10");
         assert_eq!(panes[0].current_command, "claude");
+    }
+
+    #[test]
+    fn parses_session_id_from_tmux_env() {
+        assert_eq!(
+            parse_tmux_session_target("/tmp/tmux-1044/default,82477,475"),
+            Some("$475".into())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_tmux_env() {
+        // Missing fields, non-numeric session id, empty string — all fall
+        // through to None so the caller knows it can't scope the query.
+        assert_eq!(parse_tmux_session_target(""), None);
+        assert_eq!(parse_tmux_session_target("/tmp/sock,82477,abc"), None);
+        assert_eq!(parse_tmux_session_target("/tmp/sock,82477,"), None);
     }
 }
