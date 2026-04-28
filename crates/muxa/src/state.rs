@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Notify, RwLock};
 
 /// Prefix used by `muxa sync` / startup discovery for the `session_id` of a
 /// synthesized `Started` event. The store recognizes this prefix to keep
@@ -141,6 +141,12 @@ pub struct Store {
     /// history with it. Tests and consumers that want a no-op history use
     /// [`PromptHistory::in_memory_only`].
     history: Arc<PromptHistory>,
+    /// Edge-triggered "registry changed" signal. `Store::apply` (and any
+    /// other mutator) calls `notify_one()` after dropping the agents lock;
+    /// the snapshotter task wakes, debounces, then writes the registry to
+    /// disk. Cheap atomic on the hot path — disk I/O never touches it.
+    /// Subscribers that don't care can simply never call `notified()`.
+    dirty: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Store {
@@ -171,6 +177,7 @@ impl Store {
             transitions: tx,
             prompts: prompts_tx,
             history,
+            dirty: Arc::new(Notify::new()),
         }
     }
 
@@ -178,6 +185,30 @@ impl Store {
     /// [`Self::shared`].
     pub fn shared_with_history(history: Arc<PromptHistory>) -> SharedStore {
         Arc::new(Self::with_history(history))
+    }
+
+    /// Install an initial set of agents — used on daemon startup to
+    /// rehydrate the registry from a previous run's snapshot.
+    ///
+    /// Replaces any existing entries with the same `session_id`. Idempotent:
+    /// safe to call multiple times, though the typical path calls it once
+    /// before the IPC server starts accepting events. The reconciler will
+    /// reap any panes that no longer exist on the next pass, so loading a
+    /// stale snapshot is forgiving.
+    pub async fn hydrate(&self, initial: Vec<Agent>) {
+        let mut agents = self.agents.write().await;
+        for a in initial {
+            agents.insert(a.session_id.clone(), a);
+        }
+    }
+
+    /// Handle to the dirty-signal Notify. Snapshotter tasks subscribe via
+    /// `dirty().notified().await` to learn when the registry has mutated
+    /// without polling. Every mutator in this module calls `notify_one()`
+    /// after releasing the agents lock; redundant signals are coalesced by
+    /// `Notify`'s saturating-to-1 semantics.
+    pub fn dirty(&self) -> Arc<Notify> {
+        self.dirty.clone()
     }
 }
 
@@ -403,6 +434,12 @@ impl Store {
         if let Some(entry) = history_entry {
             self.history.append(entry).await;
         }
+
+        // Wake the snapshotter (if any). Lock-free atomic; no I/O on the
+        // hot path — disk write happens off-path after the writer's
+        // debounce window. Saturates to 1 pending wakeup so a burst of
+        // events coalesces into one disk write.
+        self.dirty.notify_one();
     }
 
     pub async fn snapshot(&self) -> Vec<Agent> {
@@ -444,10 +481,16 @@ impl Store {
     /// cadence; daemon runs this on a timer.
     pub async fn gc(&self, max_age: time::Duration) -> usize {
         let cutoff = OffsetDateTime::now_utc() - max_age;
-        let mut agents = self.agents.write().await;
-        let before = agents.len();
-        agents.retain(|_, a| a.state != AgentState::Stopped || a.last_activity_at >= cutoff);
-        before - agents.len()
+        let removed = {
+            let mut agents = self.agents.write().await;
+            let before = agents.len();
+            agents.retain(|_, a| a.state != AgentState::Stopped || a.last_activity_at >= cutoff);
+            before - agents.len()
+        };
+        if removed > 0 {
+            self.dirty.notify_one();
+        }
+        removed
     }
 
     /// Converge the registry against ground truth from tmux.
@@ -537,6 +580,11 @@ impl Store {
                 RemovalReason::SyntheticDemoted => report.synthetic_demoted += 1,
                 RemovalReason::DuplicateCollapsed => report.duplicates_collapsed += 1,
             }
+        }
+
+        drop(agents);
+        if !report.is_noop() {
+            self.dirty.notify_one();
         }
 
         report

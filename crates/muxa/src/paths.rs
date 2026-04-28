@@ -6,6 +6,7 @@ pub const SOCKET_FILENAME: &str = "muxa.sock";
 pub const CONFIG_DIRNAME: &str = "muxa";
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const HISTORY_FILENAME: &str = "prompts.ndjson";
+pub const STATE_FILENAME: &str = "state.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -28,6 +29,13 @@ pub fn default_config_file() -> Option<PathBuf> {
 /// operator may want to back up or grep through.
 pub fn default_history_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(HISTORY_FILENAME))
+}
+
+/// Default agent-registry snapshot file: `$XDG_DATA_HOME/muxa/state.json`,
+/// falling back to `$HOME/.local/share/muxa/state.json`. Co-located with
+/// the prompt history so a single backup or rotation policy covers both.
+pub fn default_state_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
 }
 
 fn posix_uid() -> u32 {

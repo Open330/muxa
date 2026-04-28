@@ -14,6 +14,7 @@ use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
 use muxa::reconcile::{Reconciler, TmuxLiveness};
 use muxa::sinks::OhMyPromptSink;
+use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
 use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
 use std::io::IsTerminal;
@@ -115,9 +116,19 @@ async fn main() -> Result<()> {
     let history = build_history(&cfg, &shutdown_tx).await;
     let store = Store::shared_with_history(history);
 
+    // Rehydrate the agent registry from the previous run's snapshot, if
+    // any. Done before the IPC server starts accepting events so no
+    // adapter ingest can race a half-loaded store; before discovery so
+    // its `already_known` filter sees the hydrated entries and skips
+    // panes we already have rich state for; before the snapshotter
+    // spawns so the first save isn't a no-op overwrite of the file we
+    // just read.
+    hydrate_state(&cfg, &store).await;
+
     spawn_gc_task(&store, &shutdown_tx);
     spawn_reconciler_task(&cfg, &store, &shutdown_tx);
     spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
+    spawn_snapshotter_task(&cfg, &store, &shutdown_tx);
 
     // Desktop notifier: spawned only when opted in. We subscribe BEFORE
     // the server starts accepting events so no early transition is lost.
@@ -345,6 +356,67 @@ fn spawn_reconciler_task(
         interval_secs = cfg.reconciler.interval_secs,
         "reconciler enabled",
     );
+}
+
+/// Spawn the snapshotter: writes the live agent registry to disk on
+/// every dirty signal from the store, debounced so a burst of events
+/// produces one disk write. Survives daemon restarts so `muxa watch`
+/// rehydrates with real `session_id`s, `last_prompt`s, and full
+/// state/metadata instead of synthetic placeholders.
+fn spawn_snapshotter_task(
+    cfg: &Config,
+    store: &muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    if !cfg.state.enabled {
+        tracing::info!("state snapshot disabled by config");
+        return;
+    }
+    let Some(path) = cfg
+        .state
+        .path
+        .clone()
+        .or_else(paths::default_state_file)
+    else {
+        tracing::warn!(
+            "state snapshot enabled but no path resolvable; restarts will lose state"
+        );
+        return;
+    };
+    let opts = SnapshotterOptions {
+        path: path.clone(),
+        debounce: std::time::Duration::from_millis(cfg.state.debounce_ms),
+    };
+    let snapshotter = Snapshotter::new(store.clone(), store.dirty(), opts);
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(snapshotter.run(shutdown_rx));
+    tracing::info!(
+        path = %path.display(),
+        debounce_ms = cfg.state.debounce_ms,
+        "state snapshotter enabled",
+    );
+}
+
+/// Rehydrate the registry from disk on startup. No-op when state
+/// snapshotting is disabled or the file is missing — first-run daemons
+/// just start empty and let discovery + live hooks populate the store.
+async fn hydrate_state(cfg: &Config, store: &muxa::SharedStore) {
+    if !cfg.state.enabled {
+        return;
+    }
+    let Some(path) = cfg
+        .state
+        .path
+        .clone()
+        .or_else(paths::default_state_file)
+    else {
+        return;
+    };
+    let initial = snapshot::load(&path).await;
+    if initial.is_empty() {
+        return;
+    }
+    store.hydrate(initial).await;
 }
 
 /// Collapse the daemon's CLI args + env vars + TOML into a resolved

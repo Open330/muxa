@@ -16,6 +16,7 @@ pub mod notify;
 pub mod paths;
 pub mod reconcile;
 pub mod sinks;
+pub mod snapshot;
 pub mod state;
 pub mod tmux;
 
@@ -27,4 +28,5 @@ pub use history::{
     CompactReport, HistoryEntry, HistoryOptions, PromptHistory, HISTORY_SCHEMA_VERSION,
 };
 pub use reconcile::{LivenessSource, Reconciler, TmuxLiveness};
+pub use snapshot::{Snapshotter, SnapshotterOptions, STATE_SCHEMA_VERSION};
 pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};

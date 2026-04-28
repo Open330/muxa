@@ -38,6 +38,16 @@
 # max_age_days          = 30        # compaction drops anything older
 # compact_interval_secs = 3600      # rewrites the file every hour
 
+# Agent registry snapshot: mirrors the live in-memory registry to a single
+# JSON file so a daemon restart rehydrates real `session_id`s, last
+# prompt/response, and full state/metadata instead of falling back to
+# discovery's synthetic-%X placeholders. Writes are event-driven (debounced
+# to coalesce bursts), so idle daemons make zero disk traffic.
+[state]
+# enabled     = true
+# path        = "/home/$USER/.local/share/muxa/state.json"
+# debounce_ms = 200                  # coalesce window between dirty signal and write
+
 # Logging is controlled via the standard RUST_LOG env var, e.g.:
 #   RUST_LOG=muxa=debug,tokio=warn muxad
 # Default when unset: "muxa=info".

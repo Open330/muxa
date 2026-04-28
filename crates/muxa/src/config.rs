@@ -20,6 +20,7 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
     pub reconciler: ReconcilerConfig,
     pub history: HistoryConfig,
+    pub state: StateConfig,
     pub sinks: SinksConfig,
 }
 
@@ -204,6 +205,50 @@ impl Default for HistoryConfig {
             compact_interval_secs: default_history_compact_interval_secs(),
         }
     }
+}
+
+/// `[state]` config — controls the agent-registry snapshot file.
+///
+/// The daemon mirrors its in-memory `agents` map to a single JSON file so a
+/// restart can rehydrate every tracked session — real `session_id`,
+/// `last_prompt`, `last_response`, `state`, model/cost metadata — instead of
+/// falling back to discovery's `synthetic-%X` placeholders. Discovery still
+/// runs on top of this for panes that started while the daemon was down.
+///
+/// Writes are event-driven (a `tokio::sync::Notify` from `Store::apply` wakes
+/// a writer task) and debounced so bursts of events coalesce into a single
+/// disk write. Idle steady-state produces zero I/O.
+///
+/// Disable only if you'd rather lose state on every restart — the file is
+/// small (tens of KB) and the writes are already off the hot path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override the default `$XDG_DATA_HOME/muxa/state.json` path.
+    pub path: Option<PathBuf>,
+    /// Time to wait after a notify before snapshotting, so a burst of
+    /// events (e.g. a tool-heavy turn firing `PromptSubmitted` →
+    /// `ToolStarted` → `ToolCompleted` → `TurnStopped` within ms)
+    /// coalesces into one write. Default 200ms — small enough to feel
+    /// instant on a kill-and-restart, large enough to absorb most bursts.
+    #[serde(default = "default_state_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            debounce_ms: default_state_debounce_ms(),
+        }
+    }
+}
+
+fn default_state_debounce_ms() -> u64 {
+    200
 }
 
 fn default_history_max_per_pane() -> usize {
