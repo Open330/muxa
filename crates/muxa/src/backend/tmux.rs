@@ -10,9 +10,9 @@
 //! refactor lands as a strict superset of v0.2.0 behavior.
 
 use std::collections::HashMap;
+use std::process::Command;
 
 use crate::backend::{HostKind, PaneBackend};
-use crate::reconcile::LivenessSource;
 use crate::tmux::{self, PaneInfo};
 
 /// Production tmux backend. Stateless — every method shells out fresh
@@ -61,18 +61,24 @@ impl PaneBackend for TmuxBackend {
     fn current_pane(&self) -> Option<String> {
         tmux::current_pane()
     }
-}
 
-/// Reconciler integration. The reconciler treats whatever the backend
-/// returns from `list_panes` as ground truth for "which panes are
-/// alive"; for tmux that's exactly the trait method, so the impl is a
-/// one-line delegation. Replaces [`crate::reconcile::TmuxLiveness`] in
-/// the production daemon — `TmuxLiveness` is kept around only for the
-/// existing reconciler unit tests until they migrate over.
-impl LivenessSource for TmuxBackend {
-    fn list_panes(&self) -> Vec<PaneInfo> {
-        PaneBackend::list_panes(self)
+    fn focus_pane(&self, pane_id: &str) -> bool {
+        // Just the focus step — `switch-client` / `attach-session` in
+        // the CLI is a separate concern (it crosses the process
+        // boundary and depends on whether the user is *inside* tmux
+        // already). Best-effort: a non-zero exit (pane closed mid-call)
+        // collapses to `false` so the caller can show a "couldn't
+        // jump" hint instead of bubbling a TmuxError up.
+        Command::new("tmux")
+            .args(["select-pane", "-t", pane_id])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
+
+    // `caps()` uses the default impl from the trait — tmux supports
+    // every method the trait exposes, so spelling out the table here
+    // would just be noise.
 }
 
 #[cfg(test)]

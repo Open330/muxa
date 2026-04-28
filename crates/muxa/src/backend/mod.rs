@@ -39,12 +39,18 @@
 //! | `capture_pane`    | watch preview live mode (`c` toggle)             |
 //! | `pane_pid_map`    | hook ancestry walk fallback                      |
 //! | `current_pane`    | watch initial-pane hint, status-line             |
+//! | `focus_pane`      | watch attach action (`Enter` to jump)            |
 //! | `kind`            | telemetry, log lines, debug                      |
+//! | `caps`            | callers that need to know "method is plugin-only |
+//! |                   | and would be a silent no-op" up front            |
 //!
 //! Backends that don't naturally support a method (e.g. zellij has no
 //! multi-server enumeration concept) return an empty vec or `None`
 //! rather than `Result::Err` — callers already treat host-down /
-//! pane-gone as ephemeral.
+//! pane-gone as ephemeral. Where "transient empty" and "structurally
+//! unsupported" matter (e.g. the hook adapter wants to log differently
+//! when zellij CLI cannot populate `pane_pid_map`), call sites consult
+//! [`BackendCaps`] returned by [`PaneBackend::caps`] before degrading.
 
 pub mod tmux;
 
@@ -60,6 +66,58 @@ use crate::tmux::PaneInfo;
 pub enum HostKind {
     Tmux,
     Zellij,
+}
+
+/// Static capability descriptor. Callers that *need to know* whether a
+/// method is structurally available (vs transiently failing) consult
+/// this before degrading. The fields name specific behaviors rather
+/// than methods because some methods are partial — `list_panes`
+/// always works on zellij CLI but its `current_command` field is
+/// always empty without the WASM plugin.
+///
+/// All fields default to "supported" so the tmux backend (and any
+/// fully-featured future backend) doesn't have to spell out the
+/// capability table — only backends with gaps zero out the relevant
+/// flag.
+///
+/// The four-bool shape trips clippy's `struct_excessive_bools` lint;
+/// allowed here because each flag really is an independent capability
+/// (no state-machine ordering between them) and a `bitflags!` macro
+/// would be overkill at this scale. Add an enum if a fifth flag lands
+/// — until then, named bools are the most grep-able shape.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCaps {
+    /// Whether `list_panes()`'s `PaneInfo.current_command` is populated.
+    /// Zellij CLI returns the field empty until the WASM plugin lands;
+    /// discovery falls back to "trust the stdin hook" when this is
+    /// false instead of trying to classify panes by command.
+    pub current_command: bool,
+    /// Whether `pane_pid_map()` returns real data. Hook ancestry only
+    /// walks the parent-pid chain when this is true; otherwise it
+    /// trusts the env (`TMUX_PANE` / `ZELLIJ_PANE_ID`) and gives up
+    /// quietly if that's missing too.
+    pub pane_pid_map: bool,
+    /// Whether `capture_pane()` returns real screen contents. The
+    /// `muxa watch` live preview falls back to the prompt/response
+    /// view when this is false.
+    pub capture_pane: bool,
+    /// Whether `focus_pane()` actually moves the user's view.
+    /// Backends that can't focus (e.g. a future read-only adapter)
+    /// return false here and the watch picker hides the "Enter to
+    /// jump" hint accordingly.
+    pub focus_pane: bool,
+}
+
+impl Default for BackendCaps {
+    fn default() -> Self {
+        Self {
+            current_command: true,
+            pane_pid_map: true,
+            capture_pane: true,
+            focus_pane: true,
+        }
+    }
 }
 
 /// Operations the daemon and CLI perform against the pane host.
@@ -100,6 +158,23 @@ pub trait PaneBackend: Send + Sync + 'static {
     /// (`TMUX_PANE` / `ZELLIJ_PANE_ID`) plus whatever fallback the
     /// host exposes.
     fn current_pane(&self) -> Option<String>;
+
+    /// Move the user's view to `pane_id` — `select-pane -t <id>` on
+    /// tmux, `zellij action focus-pane-with-id <id>` on zellij. The
+    /// trait method is only the *navigation* step; full attach
+    /// semantics (tmux `switch-client` / `attach-session`) stay in the
+    /// CLI because they cross the daemon/CLI process boundary in ways
+    /// the backend can't see. Returns `true` when the focus call
+    /// succeeded; `false` (best-effort) when the pane is gone or the
+    /// host couldn't action the request.
+    fn focus_pane(&self, pane_id: &str) -> bool;
+
+    /// Static capability descriptor. Default impl returns "everything
+    /// supported" because that's the tmux shape and most backends
+    /// model their gaps as exceptions to that baseline.
+    fn caps(&self) -> BackendCaps {
+        BackendCaps::default()
+    }
 }
 
 /// Inspect the environment for an active host. Returns the innermost
@@ -170,49 +245,132 @@ mod tests {
         assert_eq!(HostKind::Zellij.to_string(), "zellij");
     }
 
-    /// Sanity-check the trait is usable via a hand-rolled fake — the
-    /// shape future zellij tests will follow before the WASM plugin
-    /// can stand up a real backend in CI. If the trait grows a new
-    /// required method this test breaks loudly.
-    #[test]
-    fn fake_backend_implements_trait_end_to_end() {
-        struct Fake;
-        impl PaneBackend for Fake {
-            fn kind(&self) -> HostKind {
-                HostKind::Zellij
-            }
-            fn list_panes(&self) -> Vec<PaneInfo> {
-                vec![PaneInfo {
-                    pane_id: "zj-1".into(),
-                    session: "z".into(),
-                    window_index: "0".into(),
-                    pane_index: "0".into(),
-                    tty: String::new(),
-                    current_command: "claude".into(),
-                    title: String::new(),
-                }]
-            }
-            fn resolve_pane(&self, id: &str) -> Option<PaneInfo> {
-                self.list_panes().into_iter().find(|p| p.pane_id == id)
-            }
-            fn capture_pane(&self, _: &str) -> Option<String> {
-                Some("hello\n".into())
-            }
-            fn pane_pid_map(&self) -> HashMap<u32, String> {
-                HashMap::from([(42, "zj-1".to_string())])
-            }
-            fn current_pane(&self) -> Option<String> {
-                Some("zj-1".into())
+    /// A minimal fake the rest of the test module reuses — keeps
+    /// the boilerplate of a full `PaneBackend` impl out of every
+    /// individual test body.
+    struct FakeBackend {
+        panes: Vec<PaneInfo>,
+        caps: BackendCaps,
+    }
+
+    impl FakeBackend {
+        fn with_panes(panes: Vec<PaneInfo>) -> Self {
+            Self {
+                panes,
+                caps: BackendCaps::default(),
             }
         }
+    }
 
-        let b: Box<dyn PaneBackend> = Box::new(Fake);
+    impl PaneBackend for FakeBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Zellij
+        }
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+        fn resolve_pane(&self, id: &str) -> Option<PaneInfo> {
+            self.panes.iter().find(|p| p.pane_id == id).cloned()
+        }
+        fn capture_pane(&self, _: &str) -> Option<String> {
+            Some("hello\n".into())
+        }
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            self.panes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (u32::try_from(100 + i).unwrap_or(u32::MAX), p.pane_id.clone()))
+                .collect()
+        }
+        fn current_pane(&self) -> Option<String> {
+            self.panes.first().map(|p| p.pane_id.clone())
+        }
+        fn focus_pane(&self, _: &str) -> bool {
+            true
+        }
+        fn caps(&self) -> BackendCaps {
+            self.caps
+        }
+    }
+
+    fn fake_pane(id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: id.into(),
+            session: "z".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+        }
+    }
+
+    /// Trait surface contract: every method on a hand-rolled fake
+    /// behaves as documented. Adding a new required method to
+    /// `PaneBackend` breaks this test loudly.
+    #[test]
+    fn fake_backend_satisfies_trait_contract() {
+        let b: Box<dyn PaneBackend> =
+            Box::new(FakeBackend::with_panes(vec![fake_pane("zj-1")]));
         assert_eq!(b.kind(), HostKind::Zellij);
         assert_eq!(b.list_panes().len(), 1);
         assert_eq!(b.resolve_pane("zj-1").unwrap().pane_id, "zj-1");
         assert!(b.resolve_pane("nope").is_none());
         assert_eq!(b.capture_pane("zj-1").as_deref(), Some("hello\n"));
-        assert_eq!(b.pane_pid_map().get(&42).map(String::as_str), Some("zj-1"));
+        assert_eq!(b.pane_pid_map().get(&100).map(String::as_str), Some("zj-1"));
         assert_eq!(b.current_pane().as_deref(), Some("zj-1"));
+        assert!(b.focus_pane("zj-1"));
+        assert_eq!(b.caps(), BackendCaps::default());
+    }
+
+    /// End-to-end through the reconciler: a `PaneBackend` plugged into
+    /// `Reconciler::new` drives stale-pane reaping exactly the way the
+    /// daemon expects. Locks the bridge between the two abstractions
+    /// so a future change to either side surfaces here instead of in
+    /// production.
+    #[tokio::test]
+    async fn pane_backend_drives_reconciler_via_blanket_liveness_impl() {
+        use crate::event::{AgentEvent, AgentId, AgentKind};
+        use crate::reconcile::Reconciler;
+        use crate::state::Store;
+        use std::time::Duration;
+        use time::macros::datetime;
+
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-28 12:00:00 UTC);
+        for sid in ["alive", "ghost"] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        kind: AgentKind::ClaudeCode,
+                        session_id: sid.into(),
+                        pane: Some(format!("%{sid}")),
+                        cwd: None,
+                    },
+                    at: t0,
+                })
+                .await;
+        }
+        // Backend reports only %alive as live; %ghost should be reaped.
+        let backend = FakeBackend::with_panes(vec![fake_pane("%alive")]);
+        let r = Reconciler::new(store.clone(), backend, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+        assert_eq!(report.stale_panes_reaped, 1);
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "alive");
+    }
+
+    /// `caps()` defaults to "everything supported" so backends with
+    /// gaps must opt out explicitly. Locks down the default-impl
+    /// behavior so future fields land with backwards-compatible
+    /// semantics.
+    #[test]
+    fn backend_caps_default_is_all_true() {
+        let caps = BackendCaps::default();
+        assert!(caps.current_command);
+        assert!(caps.pane_pid_map);
+        assert!(caps.capture_pane);
+        assert!(caps.focus_pane);
     }
 }

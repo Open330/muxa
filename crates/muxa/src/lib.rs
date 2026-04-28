@@ -21,7 +21,7 @@ pub mod snapshot;
 pub mod state;
 pub mod tmux;
 
-pub use backend::{tmux::TmuxBackend, HostKind, PaneBackend};
+pub use backend::{tmux::TmuxBackend, BackendCaps, HostKind, PaneBackend};
 pub use config::Config;
 pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 pub use error::{CoreError, Result};
@@ -29,6 +29,6 @@ pub use event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, P
 pub use history::{
     CompactReport, HistoryEntry, HistoryOptions, PromptHistory, HISTORY_SCHEMA_VERSION,
 };
-pub use reconcile::{LivenessSource, Reconciler, TmuxLiveness};
+pub use reconcile::{LivenessSource, Reconciler};
 pub use snapshot::{Snapshotter, SnapshotterOptions, STATE_SCHEMA_VERSION};
 pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
