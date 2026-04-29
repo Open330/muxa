@@ -67,9 +67,13 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let config_path = args.config.clone().or_else(paths::default_config_file);
-    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
-
+    // Initialize tracing BEFORE loading config so any `tracing::warn!`
+    // emitted by `Config::load` (unknown `[watch] columns` keys, unknown
+    // detail-template placeholders, …) actually reaches stderr.
+    // Previously the subscriber was installed after `Config::load_or_default`
+    // and those warnings were silently swallowed on the daemon path. The
+    // log filter comes from `RUST_LOG` (env), not config, so there's no
+    // chicken-and-egg.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -85,6 +89,14 @@ async fn main() -> Result<()> {
         // grep-ing piped logs (the e2e tests included).
         .with_ansi(std::io::stderr().is_terminal())
         .init();
+
+    let config_path = args.config.clone().or_else(paths::default_config_file);
+    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    // Daemon-only invariants — the dashboard wire-up and sink fan-out
+    // checks the CLI deliberately skips. Failing here is preferable to
+    // crashing mid-startup once we try to bind the dashboard socket.
+    cfg.validate_for_daemon()
+        .context("validating daemon-only config")?;
 
     let socket = args
         .socket

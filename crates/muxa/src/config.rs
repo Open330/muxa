@@ -60,7 +60,9 @@ pub enum ConfigError {
 
     #[error(
         "dashboard.bind: {addr} is non-loopback; a bearer token is required \
-         (set dashboard.token, --dashboard-token, or MUXA_DASHBOARD_TOKEN)"
+         — set `dashboard.token` in config OR `MUXA_DASHBOARD_TOKEN` in the \
+         running daemon's environment (note: under systemd the unit's \
+         `Environment=` is what counts, not your interactive shell)"
     )]
     DashboardRequiresToken { addr: SocketAddr },
 
@@ -333,11 +335,14 @@ impl Config {
     /// `load_or_default` if you want silent fallback.
     ///
     /// Runs [`Self::validate`] after deserialization so semantic errors
-    /// (bad bind address, public dashboard without a token, oh-my-prompt
-    /// enabled without an endpoint, …) surface here rather than mid-startup.
-    /// Soft issues (unknown `[watch]` column key, unknown detail-template
-    /// placeholder) emit `tracing::warn!` but do not fail the load — config
-    /// compatibility matters more than strict validation for those.
+    /// that apply to *every* consumer surface here. Daemon-only checks
+    /// (dashboard bind/token, sink endpoints) are *not* run here — those
+    /// live behind [`Self::validate_for_daemon`] so CLI commands like
+    /// `muxa watch` and `muxa status` are unaffected by daemon-only
+    /// misconfiguration. Soft issues (unknown `[watch]` column key,
+    /// unknown detail-template placeholder) emit `tracing::warn!` but do
+    /// not fail the load — config compatibility matters more than strict
+    /// validation for those.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let cfg: Self = toml::from_str(&text).map_err(|e| CoreError::ConfigParse {
@@ -362,14 +367,34 @@ impl Config {
         Ok(Self::default())
     }
 
-    /// Run all hard semantic checks. Idempotent and side-effect-free; safe
-    /// to call from tests against a synthesized `Config`.
+    /// Run hard semantic checks that apply to *every* consumer (CLI and
+    /// daemon alike). Idempotent and side-effect-free; safe to call from
+    /// tests against a synthesized `Config`.
+    ///
+    /// Currently this is a no-op — every check we have today is
+    /// daemon-specific (dashboard wire-up, sink fan-out) and lives in
+    /// [`Self::validate_for_daemon`]. The method is kept (rather than
+    /// inlined away) so future cross-consumer invariants have an obvious
+    /// home, and so the always-on / daemon-only split stays legible to
+    /// callers.
+    pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        Ok(())
+    }
+
+    /// Run hard semantic checks that only matter when the daemon is
+    /// actually starting up: the dashboard server wire-up
+    /// (`bind` / `token` / `allow_public`) and sink fan-out
+    /// (`[sinks.oh_my_prompt]` endpoint). Called by `muxad/main.rs` from
+    /// inside `tokio::main` after `Config::load` returns; deliberately
+    /// *not* called from the CLI's load path because `muxa watch` /
+    /// `muxa status` / `muxa recap` etc. don't touch the dashboard or
+    /// sinks at all and shouldn't fail on dashboard-only misconfig.
     ///
     /// The runtime resolvers (`DashboardConfig::resolve`,
     /// `OhMyPromptSink::resolve`) repeat the same checks so CLI/env
     /// overrides applied later still get validated — this method only
     /// covers what we can determine from the TOML alone.
-    pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+    pub fn validate_for_daemon(&self) -> std::result::Result<(), ConfigError> {
         validate_dashboard(&self.dashboard)?;
         validate_oh_my_prompt(&self.sinks.oh_my_prompt)?;
         Ok(())
@@ -432,10 +457,15 @@ fn validate_dashboard(cfg: &DashboardTomlConfig) -> std::result::Result<(), Conf
         return Err(ConfigError::DashboardRequiresAllowPublic { addr: bind });
     }
 
-    let toml_token = cfg.token.as_deref().filter(|s| !s.is_empty());
+    // Whitespace-only tokens (`"   "`) are pathological — they pass a
+    // naive non-empty check but the dashboard's bearer-token comparator
+    // will never accept a real client. Treat them as unset on both
+    // sides (TOML and env) so the user gets a config-time error
+    // instead of a "why won't anyone authenticate" runtime mystery.
+    let toml_token = cfg.token.as_deref().filter(|s| !s.trim().is_empty());
     let env_token = std::env::var(DASHBOARD_TOKEN_ENV)
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.trim().is_empty());
     if toml_token.is_none() && env_token.is_none() {
         return Err(ConfigError::DashboardRequiresToken { addr: bind });
     }
@@ -967,7 +997,7 @@ default_content = "nope"
         assert!(toml::from_str::<Config>(toml).is_err());
     }
 
-    // ---- semantic validation (Config::validate) ----
+    // ---- semantic validation (Config::validate_for_daemon) ----
 
     /// A non-loopback `dashboard.bind` without `allow_public = true` must
     /// fail validation with a `DashboardRequiresAllowPublic` error so the
@@ -982,7 +1012,7 @@ default_content = "nope"
             },
             ..Config::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate_for_daemon().unwrap_err();
         assert!(
             matches!(err, ConfigError::DashboardRequiresAllowPublic { .. }),
             "got {err:?}",
@@ -1008,7 +1038,7 @@ default_content = "nope"
             },
             ..Config::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate_for_daemon().unwrap_err();
         assert!(
             matches!(err, ConfigError::DashboardRequiresToken { .. }),
             "got {err:?}",
@@ -1028,7 +1058,7 @@ default_content = "nope"
             },
             ..Config::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate_for_daemon().is_ok());
     }
 
     /// A malformed `dashboard.bind` ("not-an-address") fails validation
@@ -1043,7 +1073,7 @@ default_content = "nope"
             },
             ..Config::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate_for_daemon().unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidDashboardBind { .. }),
             "got {err:?}",
@@ -1055,7 +1085,69 @@ default_content = "nope"
     #[test]
     fn validate_accepts_default_loopback_dashboard() {
         let cfg = Config::default();
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// IPv6 loopback (`[::1]`) must be treated identically to `127.0.0.1`
+    /// — no token / `allow_public` required. `Ipv6Addr::is_loopback`
+    /// already returns true for `::1`, but we lock it down here so a
+    /// future refactor that mishandles the v4/v6 split can't silently
+    /// break the laptop-default case for v6-first hosts.
+    #[test]
+    fn validate_accepts_ipv6_loopback_bind() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("[::1]:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// IPv6 unspecified (`[::]`) is the v6 equivalent of `0.0.0.0` — it
+    /// binds every interface — and must be rejected without
+    /// `allow_public`. Otherwise a user typing `[::]:7878` thinking
+    /// "loopback by another name" would silently get a publicly-exposed
+    /// dashboard.
+    #[test]
+    fn validate_rejects_ipv6_unspecified_bind_without_allow_public() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("[::]:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DashboardRequiresAllowPublic { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Whitespace-only tokens (`"   "`) are treated as unset, the same
+    /// way empty strings already are. A token that's all spaces would
+    /// pass a naive "non-empty" check but never authenticate any real
+    /// client — surface that as a config-time error rather than a
+    /// runtime mystery.
+    #[test]
+    fn validate_rejects_whitespace_only_token() {
+        std::env::set_var(DASHBOARD_TOKEN_ENV, "");
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                allow_public: Some(true),
+                token: Some("   ".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DashboardRequiresToken { .. }),
+            "got {err:?}",
+        );
     }
 
     /// `[sinks.oh_my_prompt] enabled = true` with no endpoint must fail
@@ -1071,7 +1163,7 @@ default_content = "nope"
             },
             ..Config::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate_for_daemon().unwrap_err();
         assert!(
             matches!(err, ConfigError::OhMyPromptMissingEndpoint),
             "got {err:?}",
@@ -1094,7 +1186,7 @@ default_content = "nope"
             },
             ..Config::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate_for_daemon().is_ok());
     }
 
     /// `enabled = false` with an empty endpoint is fine — disabled sinks
@@ -1102,7 +1194,40 @@ default_content = "nope"
     #[test]
     fn validate_accepts_disabled_oh_my_prompt_without_endpoint() {
         let cfg = Config::default();
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// CLI commands like `muxa watch` only call `Config::validate()`,
+    /// never `validate_for_daemon()`. A config that's *only*
+    /// daemon-misconfigured (e.g. `dashboard.bind = "0.0.0.0:7878"` with
+    /// no token, intended for a future `muxad --dashboard` run, or a
+    /// stale leftover from a test) must NOT block the CLI from loading
+    /// — `muxa status` / `muxa recap` / `muxa watch` don't even touch
+    /// the dashboard. This test pins that gating: the daemon validator
+    /// rejects, the CLI validator accepts.
+    #[test]
+    fn validate_accepts_config_that_validate_for_daemon_rejects() {
+        std::env::set_var(DASHBOARD_TOKEN_ENV, "");
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            sinks: SinksConfig {
+                oh_my_prompt: OhMyPromptToml {
+                    enabled: Some(true),
+                    ..OhMyPromptToml::default()
+                },
+            },
+            ..Config::default()
+        };
+        // CLI path: load + validate must succeed. The CLI doesn't open
+        // the dashboard or instantiate sinks, so dashboard-only and
+        // sink-only misconfig are harmless.
         assert!(cfg.validate().is_ok());
+        // Daemon path: same config must fail — the daemon would try to
+        // bind a public socket without a token.
+        assert!(cfg.validate_for_daemon().is_err());
     }
 
     /// Unknown `[watch] columns` keys are NOT a hard error — they parse,
