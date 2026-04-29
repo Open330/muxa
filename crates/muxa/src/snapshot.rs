@@ -48,7 +48,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -56,6 +56,8 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Notify};
 use tracing::{debug, info, warn};
+
+use crate::metrics::Metrics;
 
 /// File mode applied to the snapshot file (and its in-flight tempfile).
 /// Snapshots include user prompts, responses, and `cwd`s — sensitive
@@ -147,7 +149,19 @@ pub async fn load(path: &Path) -> Vec<Agent> {
 /// same path (misconfigured deploy, overlapping restart) can't stomp
 /// each other mid-write — defense-in-depth on top of the daemon's own
 /// single-writer-task serialization.
-async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<()> {
+/// Result of a successful [`save`]: how many bytes hit disk and how
+/// long the full write (serialize + temp create + fsync + rename +
+/// parent dir fsync) took. Surfaced into metrics + tracing by the
+/// snapshotter so operators can correlate disk-write latency with
+/// other daemon timings.
+#[derive(Debug, Clone, Copy)]
+pub struct SaveStats {
+    pub bytes: u64,
+    pub elapsed: Duration,
+}
+
+async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<SaveStats> {
+    let started = Instant::now();
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
@@ -201,7 +215,10 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(SaveStats {
+        bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        elapsed: started.elapsed(),
+    })
 }
 
 /// Configuration knobs the daemon hands to [`Snapshotter`]. Mirrors the
@@ -225,11 +242,31 @@ pub struct Snapshotter {
     store: SharedStore,
     dirty: Arc<Notify>,
     opts: SnapshotterOptions,
+    /// Lock-free counters bumped after every successful disk write.
+    /// Optional so existing call sites (notably the unit tests in this
+    /// file) can construct a `Snapshotter` without weaving a `Metrics`
+    /// through; the daemon always wires one in via [`Self::with_metrics`].
+    metrics: Option<Metrics>,
 }
 
 impl Snapshotter {
     pub fn new(store: SharedStore, dirty: Arc<Notify>, opts: SnapshotterOptions) -> Self {
-        Self { store, dirty, opts }
+        Self {
+            store,
+            dirty,
+            opts,
+            metrics: None,
+        }
+    }
+
+    /// Builder-style override that wires a [`Metrics`] handle into the
+    /// snapshotter. Daemon uses this so `/api/metrics` reflects every
+    /// successful write. Tests can omit it — the snapshot path is
+    /// otherwise unchanged.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Run the writer loop until `shutdown` fires.
@@ -284,12 +321,31 @@ impl Snapshotter {
     /// the daemon, and the next dirty signal will retry naturally.
     async fn flush(&self) {
         let agents = self.store.snapshot().await;
-        if let Err(e) = save(&self.opts.path, &agents).await {
-            warn!(
-                error = %e,
-                path = %self.opts.path.display(),
-                "state snapshot write failed",
-            );
+        match save(&self.opts.path, &agents).await {
+            Ok(stats) => {
+                if let Some(m) = &self.metrics {
+                    m.record_snapshot_write(stats.elapsed);
+                }
+                // debug-level: the rate is config-bounded by
+                // `debounce_ms`, not code-bounded, so a small value
+                // could flood at info. Operators who want to see writes
+                // can opt in with `RUST_LOG=muxa=debug` — the
+                // `/api/metrics` endpoint exposes the counters at info
+                // anyway.
+                tracing::debug!(
+                    elapsed_ms = u64::try_from(stats.elapsed.as_millis()).unwrap_or(u64::MAX),
+                    bytes = stats.bytes,
+                    agents = agents.len(),
+                    "snapshot.write",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %self.opts.path.display(),
+                    "state snapshot write failed",
+                );
+            }
         }
     }
 }

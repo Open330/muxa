@@ -15,11 +15,13 @@
 
 use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel};
 use crate::history::{HistoryEntry, HistoryOptions, PromptHistory};
+use crate::metrics::Metrics;
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, Notify, RwLock};
 
@@ -147,6 +149,11 @@ pub struct Store {
     /// disk. Cheap atomic on the hot path — disk I/O never touches it.
     /// Subscribers that don't care can simply never call `notified()`.
     dirty: Arc<Notify>,
+    /// Lock-free runtime counters surfaced via `/api/metrics`. Cloning
+    /// is cheap (`Arc`-based); the dashboard's `AppState` shares the
+    /// same instance so SSE subscriber bumps and event-apply bumps land
+    /// in the same atomics.
+    metrics: Metrics,
 }
 
 impl std::fmt::Debug for Store {
@@ -178,7 +185,17 @@ impl Store {
             prompts: prompts_tx,
             history,
             dirty: Arc::new(Notify::new()),
+            metrics: Metrics::new(),
         }
+    }
+
+    /// Borrow the runtime metrics handle. Daemon hands this off to the
+    /// dashboard `AppState` so the `/api/metrics` endpoint can read the
+    /// same atomics that `Store::apply` (and the snapshotter, etc.)
+    /// bump. Cloning the returned value is cheap.
+    #[must_use]
+    pub fn metrics(&self) -> Metrics {
+        self.metrics.clone()
     }
 
     /// `Arc`-wrapped variant of [`Self::with_history`] mirroring
@@ -402,10 +419,34 @@ impl Store {
         self.prompts.subscribe()
     }
 
+    #[tracing::instrument(level = "debug", skip(self, ev), fields(event_type))]
     pub async fn apply(&self, ev: &AgentEvent) {
+        // Wall-clock start of the apply, used for the elapsed-time
+        // emit at the bottom. Cheap monotonic clock read; no syscall on
+        // Linux, just a `vDSO` call.
+        let t = Instant::now();
+        // Bump the events-received counter as early as possible so a
+        // panic mid-apply still reflects in the metric. Lock-free atomic
+        // add — invisible on the hot path.
+        self.metrics.record_event();
         let mut agents = self.agents.write().await;
         let id = ev.id();
         let at = ev.at();
+        // Tag the span with a stable string identifier for the variant
+        // so trace consumers can group without leaking large fields
+        // (prompts, response bodies). `tracing::Span::current` is cheap
+        // when the span is disabled because the macro short-circuits.
+        let event_type = match ev {
+            AgentEvent::Started { .. } => "started",
+            AgentEvent::PromptSubmitted { .. } => "prompt_submitted",
+            AgentEvent::ToolStarted { .. } => "tool_started",
+            AgentEvent::ToolCompleted { .. } => "tool_completed",
+            AgentEvent::NotificationFired { .. } => "notification_fired",
+            AgentEvent::TurnStopped { .. } => "turn_stopped",
+            AgentEvent::SessionEnded { .. } => "session_ended",
+            AgentEvent::Heartbeat { .. } => "heartbeat",
+        };
+        tracing::Span::current().record("event_type", event_type);
 
         if matches!(ev, AgentEvent::Started { .. }) {
             if let Some(pane) = id.pane.as_deref() {
@@ -468,6 +509,18 @@ impl Store {
         // debounce window. Saturates to 1 pending wakeup so a burst of
         // events coalesces into one disk write.
         self.dirty.notify_one();
+
+        // Emit a structured per-apply timing line. `debug!` is filtered
+        // out by the default subscriber level (`info`), so this costs
+        // nothing in production unless an operator opts in via
+        // `RUST_LOG=muxa=debug`. Field syntax keeps every value
+        // structured so log scrapers can pivot without parsing.
+        tracing::debug!(
+            elapsed_us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX),
+            session_id = %id.session_id,
+            event_type,
+            "store.apply",
+        );
     }
 
     pub async fn snapshot(&self) -> Vec<Agent> {

@@ -42,6 +42,7 @@ pub mod error;
 pub mod event;
 pub mod history;
 pub mod ipc;
+pub mod metrics;
 pub mod notify;
 pub mod paths;
 pub mod reconcile;
@@ -88,6 +89,8 @@ pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 pub use error::{CoreError, Result};
 #[doc(hidden)]
 pub use history::{CompactReport, HistoryOptions};
+#[doc(hidden)]
+pub use metrics::{Metrics, MetricsSnapshot};
 #[doc(hidden)]
 pub use reconcile::{LivenessSource, Reconciler};
 #[doc(hidden)]

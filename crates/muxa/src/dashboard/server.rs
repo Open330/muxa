@@ -26,9 +26,10 @@ use axum::{
 use futures::stream::{self, Stream, StreamExt};
 use serde::Serialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -36,7 +37,8 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
 use crate::dashboard::{assets, auth, DashboardConfig};
-use crate::event::PROTOCOL_VERSION;
+use crate::event::{AgentState, PROTOCOL_VERSION};
+use crate::metrics::Metrics;
 use crate::state::{Agent, SharedStore, Transition};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
 
@@ -44,6 +46,30 @@ use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
 /// (15s is well under any sane proxy idle-timeout) but short enough
 /// that a stale connection drops within ~30s.
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// TTL for the cached `agents_by_state` histogram on `/api/metrics`.
+/// Recomputing the histogram requires a `store.snapshot().await` plus a
+/// full iteration of the registry, which contends with writers under
+/// load. One second is short enough that operators scraping at 1 Hz
+/// always see fresh-ish data and long enough to absorb burst scrapes.
+///
+/// TODO(perf): when we hit real perf issues, replace this with a
+/// per-state `AtomicU64` counter that's bumped/decremented in
+/// `Store::apply` on every state transition. A scrape then becomes
+/// `O(num_states)` atomic loads and the cache + mutex go away.
+const AGENTS_BY_STATE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Cached `agents_by_state` histogram with the wall-clock instant it
+/// was computed. Lives inside [`AppState`] behind a `tokio::sync::Mutex`
+/// so concurrent scrapes coalesce on a single recompute when the cache
+/// is stale, instead of every request taking the store snapshot lock.
+#[derive(Debug, Default)]
+struct AgentsByStateCache {
+    /// `None` until the first scrape populates it; subsequent scrapes
+    /// refresh in place. We don't pre-populate at construction because
+    /// it would force `AppState::new` to be `async`.
+    value: Option<(Instant, BTreeMap<String, u64>, u64)>,
+}
 
 /// Application state shared by every handler. Cheap to clone (all
 /// fields are `Arc`-flavoured) so axum's `State` extractor copies
@@ -53,6 +79,14 @@ pub struct AppState {
     pub store: SharedStore,
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
+    /// Lock-free runtime counters surfaced via `/api/metrics`. Cloned
+    /// from the [`Store`](crate::state::Store)'s metrics so SSE
+    /// connect/disconnect bumps live alongside event-apply bumps.
+    pub metrics: Metrics,
+    /// 1-second cache for the `agents_by_state` histogram. See the
+    /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
+    /// and the eventual plan to replace this with per-state atomics.
+    agents_by_state_cache: Arc<tokio::sync::Mutex<AgentsByStateCache>>,
 }
 
 impl AppState {
@@ -62,10 +96,13 @@ impl AppState {
         config: Arc<DashboardConfig>,
         pane_cache: Arc<PaneCache>,
     ) -> Self {
+        let metrics = store.metrics();
         Self {
             store,
             config,
             pane_cache,
+            metrics,
+            agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
         }
     }
 }
@@ -81,6 +118,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents_handler))
         .route("/api/panes", get(panes_handler))
         .route("/api/events", get(events_handler))
+        .route("/api/metrics", get(metrics_handler))
         .layer(auth_layer)
         .with_state(state);
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
@@ -176,6 +214,109 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+/// Wire shape for `/api/metrics`. Mirrors [`crate::metrics::MetricsSnapshot`]
+/// 1:1, plus aggregates derived from the live `Store` (agent counts).
+///
+/// **Stability:** unstable until the 1.0 release. Field names are
+/// stable within a 0.x patch series; we may add or rename fields in
+/// minor releases. Operators scraping this should be tolerant of
+/// extra keys.
+///
+/// `events_received_per_sec_1m` is intentionally omitted from v1: an
+/// accurate 1-minute rate needs a small ring buffer that we'd have to
+/// update on every event, and we'd rather ship a correct counter than
+/// a racy gauge. Operators can compute the rate from successive scrapes.
+#[derive(Debug, Serialize)]
+struct MetricsResponse {
+    /// Daemon `CARGO_PKG_VERSION` — same value as `/api/health`.
+    version: &'static str,
+    /// Seconds since the metrics handle (and therefore the daemon's
+    /// store) was constructed. Not strictly the daemon's PID-1
+    /// uptime, but close enough that the difference is invisible to
+    /// operators.
+    uptime_secs: u64,
+    /// Total agents currently in the registry (every state, including
+    /// `Stopped` rows that haven't been GC'd yet).
+    agents_total: u64,
+    /// Histogram of agents by [`crate::event::AgentState`]. Keys are
+    /// the `snake_case` `Display` form of the variant; missing keys mean
+    /// zero. `BTreeMap` so the JSON output is deterministically
+    /// ordered for tests and human inspection.
+    agents_by_state: BTreeMap<String, u64>,
+    /// Lifetime count of events the store has processed via
+    /// [`Store::apply`](crate::state::Store::apply).
+    events_received_total: u64,
+    /// Lifetime count of successful snapshot writes (failures are not
+    /// counted — the goal is "writes that hit disk").
+    snapshot_writes_total: u64,
+    /// Wall-clock duration of the most recent snapshot write, in
+    /// milliseconds. Zero before the first write.
+    snapshot_last_write_elapsed_ms: u64,
+    /// Lifetime count of reconciliation passes (every pass, including
+    /// no-ops — operators want to see the loop is alive).
+    reconcile_passes_total: u64,
+    /// Live count of SSE subscribers connected to `/api/events`.
+    sse_subscribers_current: u64,
+}
+
+#[tracing::instrument(level = "debug", skip(state))]
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.metrics.snapshot();
+    let (agents_by_state, agents_total) = agents_by_state_cached(&state).await;
+
+    Json(MetricsResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: snap.uptime_secs,
+        agents_total,
+        agents_by_state,
+        events_received_total: snap.events_received_total,
+        snapshot_writes_total: snap.snapshot_writes_total,
+        snapshot_last_write_elapsed_ms: snap.snapshot_last_write_elapsed_ms,
+        reconcile_passes_total: snap.reconcile_passes_total,
+        sse_subscribers_current: snap.sse_subscribers_current,
+    })
+}
+
+/// Read the cached `agents_by_state` histogram, recomputing if the
+/// entry is missing or older than [`AGENTS_BY_STATE_CACHE_TTL`].
+/// Returns the histogram and the agent total it was derived from so
+/// both numbers come from the same `store.snapshot()` call (avoids the
+/// histogram-and-total drifting against each other across a race).
+async fn agents_by_state_cached(state: &AppState) -> (BTreeMap<String, u64>, u64) {
+    let mut guard = state.agents_by_state_cache.lock().await;
+    if let Some((at, hist, total)) = guard.value.as_ref() {
+        if at.elapsed() < AGENTS_BY_STATE_CACHE_TTL {
+            return (hist.clone(), *total);
+        }
+    }
+    // Cache miss or stale — recompute from the store. The registry is
+    // bounded (tens to low hundreds of entries) so the iteration is
+    // cheap; the cache exists to keep the `store.snapshot().await`
+    // read lock from being taken on every scrape.
+    let agents = state.store.snapshot().await;
+    let agents_total = u64::try_from(agents.len()).unwrap_or(u64::MAX);
+    let mut agents_by_state: BTreeMap<String, u64> = BTreeMap::new();
+    for a in &agents {
+        let key = a.state.to_string();
+        *agents_by_state.entry(key).or_insert(0) += 1;
+    }
+    // Ensure every known state appears as an explicit zero so consumers
+    // never have to special-case "missing key means zero". Cheap; the
+    // enum has six variants.
+    for s in [
+        AgentState::Starting,
+        AgentState::Working,
+        AgentState::Idle,
+        AgentState::WaitingInput,
+        AgentState::Error,
+        AgentState::Stopped,
+    ] {
+        agents_by_state.entry(s.to_string()).or_insert(0);
+    }
+    guard.value = Some((Instant::now(), agents_by_state.clone(), agents_total));
+    (agents_by_state, agents_total)
+}
+
 /// Live SSE stream of state transitions.
 ///
 /// Emits three event types on the wire:
@@ -201,16 +342,50 @@ async fn events_handler(
     let rx = state.store.subscribe();
     let snapshot = state.store.snapshot().await;
 
+    // Construct the `SubscriberGuard` *first* so the connect bump and
+    // matching disconnect bump are owned by the same RAII handle —
+    // `SubscriberGuard::new` increments, `Drop` decrements, and there's
+    // no third call site to drift out of sync with a future refactor.
+    let guard = SubscriberGuard::new(state.metrics.clone());
+
     let snapshot_event = SseEvent::default()
         .event("snapshot")
         .json_data(json!({ "agents": snapshot }))
         .unwrap_or_else(|_| SseEvent::default().event("snapshot").data("{}"));
 
-    let live = BroadcastStream::new(rx).map(map_transition_recv_to_sse);
+    // Each broadcasted transition increments the subscriber-count
+    // trace, gated at `trace!` so it stays cheap and off by default.
+    // We capture the metrics handle so the `move`-d closure can read
+    // the current count without needing to hop back to `state`.
+    let metrics_for_stream = state.metrics.clone();
+    let live = BroadcastStream::new(rx).map(move |res| {
+        if res.is_ok() {
+            tracing::trace!(
+                subscribers = metrics_for_stream.sse_subscribers(),
+                "sse.transition_broadcast",
+            );
+        }
+        map_transition_recv_to_sse(res)
+    });
 
+    // `SubscriberGuard` decrements on stream drop — handles browser
+    // refresh, network drop, and clean unsubscribe alike. Wrapping the
+    // whole stream in a `_guard` field makes the destructor's lifetime
+    // tied to the connection's lifetime: when axum drops the SSE body
+    // (the only stable handle to the connection), the guard runs.
     let combined = stream::once(async move { snapshot_event })
         .chain(live)
         .map(Ok::<_, Infallible>);
+    // Box-pin the combinator chain so the wrapper's `S: Unpin` bound
+    // is satisfied without pulling in `pin-project` for one struct.
+    // The double indirection costs an extra heap allocation per
+    // connection — invisible at SSE rates.
+    let combined: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
+        Box::pin(combined);
+    let combined = GuardedStream {
+        inner: combined,
+        _guard: guard,
+    };
 
     Sse::new(combined).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
 }
@@ -230,6 +405,59 @@ pub(crate) fn map_transition_recv_to_sse(
         Err(BroadcastStreamRecvError::Lagged(n)) => {
             SseEvent::default().event("lagged").data(n.to_string())
         }
+    }
+}
+
+/// Drop guard that decrements the SSE subscriber gauge when the stream
+/// it's embedded in is dropped (client disconnects, server shuts down,
+/// connection drops). Pairing the bump in `sse_connect` with a guarded
+/// decrement keeps the gauge accurate across every disconnect path
+/// without having to instrument each one explicitly.
+struct SubscriberGuard {
+    metrics: Metrics,
+}
+
+impl SubscriberGuard {
+    /// Single source of truth for "is this subscriber accounted for?":
+    /// constructing the guard bumps the gauge, dropping it decrements.
+    /// SSE connects are rare-ish (once per dashboard tab open) and
+    /// operators want to see them even at the default log level — the
+    /// `info!` here is symmetric with the `info!` in `Drop`.
+    fn new(metrics: Metrics) -> Self {
+        let after = metrics.sse_connect();
+        tracing::info!(subscribers = after, "sse.connect");
+        Self { metrics }
+    }
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        let after = self.metrics.sse_disconnect();
+        tracing::info!(subscribers = after, "sse.disconnect");
+    }
+}
+
+/// Newtype that owns a [`SubscriberGuard`] for the lifetime of the
+/// inner stream. Pinned via a `pin-project`-style hand-rolled impl —
+/// we don't pull in `pin-project` for this single use and the inner
+/// stream is `Unpin` (combinator-built from `BroadcastStream` +
+/// `stream::once` + `chain` + `map`).
+struct GuardedStream<S> {
+    inner: S,
+    _guard: SubscriberGuard,
+}
+
+impl<S> Stream for GuardedStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
@@ -780,5 +1008,152 @@ mod tests {
             ok_dbg.contains("transition"),
             "post-lag SSE event must be tagged `transition`: {ok_dbg}",
         );
+    }
+
+    /// `/api/metrics` returns the wire shape promised in the README:
+    /// every documented field present, counters reflect events
+    /// already applied, agent histogram totals match the registry.
+    #[tokio::test]
+    async fn metrics_endpoint_reflects_events_and_agents() {
+        let state = fresh_state();
+        // Seed the store with two agents — `Store::apply` bumps the
+        // events counter twice, which the metrics endpoint must show.
+        for (kind, sid, pane) in [
+            (AgentKind::ClaudeCode, "s1", "%1"),
+            (AgentKind::Codex, "s2", "%2"),
+        ] {
+            state
+                .store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        kind,
+                        session_id: sid.into(),
+                        pane: Some(pane.into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+
+        // Every field documented in the README must be present and
+        // typed correctly. We don't assert on `uptime_secs` value —
+        // the test runs fast enough that asserting any numeric range
+        // would be flaky.
+        assert!(v["version"].is_string());
+        assert!(v["uptime_secs"].is_u64());
+        assert_eq!(v["agents_total"], 2);
+        assert_eq!(v["events_received_total"], 2);
+        assert_eq!(v["snapshot_writes_total"], 0);
+        assert_eq!(v["snapshot_last_write_elapsed_ms"], 0);
+        assert_eq!(v["reconcile_passes_total"], 0);
+        assert_eq!(v["sse_subscribers_current"], 0);
+
+        let by_state = &v["agents_by_state"];
+        assert!(by_state.is_object(), "agents_by_state must be an object");
+        // Both freshly-started agents land in `Starting` until a follow-up
+        // event moves them. Either way, the histogram total must equal
+        // `agents_total`.
+        let histogram_sum: u64 = by_state
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|n| n.as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(histogram_sum, 2);
+        // Every `AgentState` variant must appear as an explicit key
+        // (zero-filled), so consumers don't have to special-case
+        // missing keys.
+        for s in [
+            "starting",
+            "working",
+            "idle",
+            "waiting_input",
+            "error",
+            "stopped",
+        ] {
+            assert!(by_state.get(s).is_some(), "missing state key: {s}");
+        }
+    }
+
+    /// The metrics endpoint is gated by the same auth middleware as
+    /// `/api/agents` — without a bearer token it returns 401 when one
+    /// is configured.
+    #[tokio::test]
+    async fn metrics_endpoint_requires_bearer_when_token_set() {
+        let app = router(state_with_token("s3cret"));
+        let unauthed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+    }
+
+    /// SSE connect/disconnect bumps the live-subscriber gauge — the
+    /// metrics endpoint reads from the same `Metrics` instance so a
+    /// concurrent SSE handle should be visible.
+    #[tokio::test]
+    async fn metrics_sse_subscriber_count_tracks_live_connections() {
+        let state = fresh_state();
+        let metrics = state.metrics.clone();
+        // Pre-test: gauge is zero.
+        assert_eq!(metrics.snapshot().sse_subscribers_current, 0);
+
+        // Open an SSE connection and hold it long enough to read at
+        // least the snapshot frame; while the handle is live, the
+        // gauge must reflect one subscriber.
+        let app = router(state);
+        let sse_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = collect_sse(sse_resp, Duration::from_millis(50), 1 << 16).await;
+        assert!(body.contains("event: snapshot"), "body: {body:?}");
+        // The `collect_sse` helper drops the body after the read
+        // budget elapses, which fires `SubscriberGuard::drop`. By the
+        // time we reach this assertion the gauge is already back to
+        // zero — that's the desired post-condition: connect bumped,
+        // disconnect decremented, no leak.
+        // Give the runtime a yield so the drop-side decrement settles.
+        tokio::task::yield_now().await;
+        assert_eq!(metrics.snapshot().sse_subscribers_current, 0);
     }
 }

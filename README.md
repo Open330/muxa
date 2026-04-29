@@ -420,6 +420,7 @@ JSON / SSE endpoints (under `/api/*`):
 | GET    | `/api/agents`   | Current `Store` snapshot.                                        |
 | GET    | `/api/panes`    | Global tmux pane list (every readable socket), TTL-cached.       |
 | GET    | `/api/events`   | SSE: `snapshot` (initial), `transition` (live), `lagged` (drop). |
+| GET    | `/api/metrics`  | JSON counters and timings — see source for full schema (unstable until 1.0). |
 
 Full operator guide — config reference, security model rationale, the
 "global tmux" mechanism, and the SSE wire contract — in

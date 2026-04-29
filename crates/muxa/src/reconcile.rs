@@ -26,12 +26,13 @@
 //! a remote-host probe — all without touching `Reconciler` or `Store`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::debug;
 
+use crate::metrics::Metrics;
 use crate::state::{ReconcileReport, SharedStore};
 use crate::tmux::PaneInfo;
 
@@ -73,6 +74,10 @@ pub struct Reconciler<L: LivenessSource> {
     store: SharedStore,
     source: Arc<L>,
     interval: Duration,
+    /// Optional metrics handle. Daemon wires one in via
+    /// [`Self::with_metrics`]; tests can leave it `None` to avoid
+    /// plumbing through a `Metrics` they never inspect.
+    metrics: Option<Metrics>,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -81,20 +86,46 @@ impl<L: LivenessSource> Reconciler<L> {
             store,
             source: Arc::new(source),
             interval,
+            metrics: None,
         }
+    }
+
+    /// Attach a runtime [`Metrics`] handle so the reconciler bumps
+    /// `reconcile_passes_total` after every pass.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Run a single reconciliation pass on demand. Useful for tests, for
     /// surfacing a "force reconcile" CLI command later, and for triggering
     /// a pass right after startup discovery so the user doesn't wait a full
     /// tick to see a clean view.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn reconcile_once(&self) -> ReconcileReport {
+        let started = Instant::now();
         // `list_panes` shells out to tmux and must not block the runtime.
         let src = self.source.clone();
         let panes = tokio::task::spawn_blocking(move || src.list_panes())
             .await
             .unwrap_or_default();
-        self.store.reconcile(&panes).await
+        let report = self.store.reconcile(&panes).await;
+        if let Some(m) = &self.metrics {
+            m.record_reconcile_pass();
+        }
+        // Always emit the timing line at debug (cheap, off by default)
+        // even on no-op passes — operators want to see the loop is alive
+        // when investigating a stuck reconciler.
+        debug!(
+            elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            panes = panes.len(),
+            stale = report.stale_panes_reaped,
+            synthetic = report.synthetic_demoted,
+            duplicates = report.duplicates_collapsed,
+            "reconciler.tick",
+        );
+        report
     }
 
     /// Run the periodic loop until `shutdown` fires.
@@ -112,15 +143,10 @@ impl<L: LivenessSource> Reconciler<L> {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let report = self.reconcile_once().await;
-                    if !report.is_noop() {
-                        debug!(
-                            stale = report.stale_panes_reaped,
-                            synthetic = report.synthetic_demoted,
-                            duplicates = report.duplicates_collapsed,
-                            "reconciler swept registry",
-                        );
-                    }
+                    // `reconcile_once` already emits a debug-level
+                    // `reconciler.tick` line with timing + report
+                    // breakdown; no need to log again here.
+                    let _ = self.reconcile_once().await;
                 }
                 _ = shutdown.recv() => {
                     debug!("reconciler shutting down");
