@@ -406,6 +406,12 @@ close and browser restart — paste once per browser profile.
 Generate a token with `openssl rand -hex 32`. Front with nginx/Caddy if
 you need TLS — it's intentionally out of scope.
 
+> **Note:** `MUXA_DASHBOARD_TOKEN` is read at config-load time, in the
+> running daemon's environment. If you set the variable in your shell
+> but run `muxad` under a systemd service, the systemd unit's
+> environment is what counts — set the var via `Environment=` (or
+> `EnvironmentFile=`) in the unit file, not in your `~/.bashrc`.
+
 JSON / SSE endpoints (under `/api/*`):
 
 | Method | Path            | What it returns                                                  |

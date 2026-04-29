@@ -65,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NotificationLevel`, plus the `PaneBackend`/`HostKind` family.
   `PROTOCOL_VERSION` / `HISTORY_SCHEMA_VERSION` / `STATE_SCHEMA_VERSION`
   remain pub but are documented as unstable wire formats.
+- `Config::load` now validates dashboard bind / token / sink endpoint
+  rules at load time and emits a clear error instead of crashing later
+  during daemon startup. Dashboard-specific rules are gated behind a
+  `validate_for_daemon()` so CLI commands like `muxa watch` and
+  `muxa status` are unaffected by daemon-only misconfiguration.
+- `[watch] columns` / `widths` / `[watch.detail] template` placeholders
+  emit a `tracing::warn!` when unknown keys are encountered, instead
+  of silently dropping them at render time.
 
 ### Removed
 
