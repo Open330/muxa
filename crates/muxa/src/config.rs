@@ -476,7 +476,7 @@ fn validate_oh_my_prompt(cfg: &OhMyPromptToml) -> std::result::Result<(), Config
     if !cfg.enabled.unwrap_or(false) {
         return Ok(());
     }
-    if cfg.endpoint.as_deref().filter(|s| !s.is_empty()).is_none() {
+    if cfg.endpoint.as_deref().is_none_or(str::is_empty) {
         return Err(ConfigError::OhMyPromptMissingEndpoint);
     }
     Ok(())
