@@ -252,4 +252,120 @@ mod tests {
         let exited = tokio::time::timeout(Duration::from_millis(500), task).await;
         assert!(exited.is_ok(), "reconciler did not honor shutdown");
     }
+
+    /// Two real `Started`s on the same pane (e.g. user closed the agent
+    /// and relaunched without `SessionEnded` ever firing) leave the store
+    /// holding two records — the older flipped to `Stopped` by
+    /// `Store::apply`'s pane-occupancy reconciliation. The periodic
+    /// reconciler must collapse these onto the canonical (alive, most
+    /// recent) row when the pane is still live.
+    #[tokio::test]
+    async fn reconcile_once_collapses_duplicates_for_same_live_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:05:00 UTC);
+
+        store.apply(&started("first", "%1", t0)).await;
+        store.apply(&started("second", "%1", t1)).await;
+        // Sanity: both records are present pre-reconcile — `Store::apply`
+        // only flips the older to `Stopped`, it doesn't evict.
+        assert_eq!(store.snapshot().await.len(), 2);
+
+        let fake = FakeLiveness::new(vec![pane("%1")]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert_eq!(report.synthetic_demoted, 0);
+        assert_eq!(
+            report.duplicates_collapsed, 1,
+            "the older `Stopped` real row should have been collapsed",
+        );
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "second");
+    }
+
+    /// Synthetic placeholders from `muxa sync` must yield to a real hook
+    /// event for the same pane. `Store::apply` evicts the synthetic on
+    /// the real `Started`; a follow-up reconcile pass should be a no-op
+    /// — no demotion, no collapse, no reaping — proving the registry is
+    /// already converged once the real event lands.
+    #[tokio::test]
+    async fn reconcile_once_observes_synthetic_to_real_promotion() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:01:00 UTC);
+
+        // Discovery synthesizes a placeholder for pane %2.
+        store.apply(&started("synthetic-%2", "%2", t0)).await;
+        assert_eq!(store.snapshot().await.len(), 1);
+
+        // Real hook arrives — synthetic must be evicted at apply time.
+        store.apply(&started("real-sess", "%2", t1)).await;
+        let post_apply = store.snapshot().await;
+        assert_eq!(post_apply.len(), 1);
+        assert_eq!(post_apply[0].session_id, "real-sess");
+        assert!(store.by_session("synthetic-%2").await.is_none());
+
+        // A reconcile pass over the still-live pane must be a no-op.
+        let fake = FakeLiveness::new(vec![pane("%2")]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+        assert!(
+            report.is_noop(),
+            "post-promotion registry should already be converged: {report:?}",
+        );
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "real-sess");
+    }
+
+    /// Defense-in-depth: even if a synthetic somehow ends up coexisting
+    /// with a real entry on the same pane (e.g. an order-of-arrival edge
+    /// case or a future code path that bypasses `apply`'s pane-reconcile),
+    /// the reconciler must demote the synthetic on its next pass. We use
+    /// the public `hydrate` seam to plant both rows without going through
+    /// `Store::apply`'s pane-occupancy reconciliation.
+    #[tokio::test]
+    async fn reconcile_once_demotes_orphan_synthetic_via_reconciler() {
+        use crate::event::AgentState;
+        use crate::state::Agent;
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+
+        let mk = |sid: &str, state: AgentState| Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: sid.into(),
+            pane: Some("%3".into()),
+            cwd: None,
+            state,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: t0,
+            last_activity_at: t0,
+        };
+        store
+            .hydrate(vec![
+                mk("real", AgentState::Idle),
+                mk("synthetic-%3", AgentState::Idle),
+            ])
+            .await;
+        assert_eq!(store.snapshot().await.len(), 2);
+
+        let fake = FakeLiveness::new(vec![pane("%3")]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert_eq!(report.synthetic_demoted, 1);
+        assert_eq!(report.duplicates_collapsed, 0);
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "real");
+    }
 }
