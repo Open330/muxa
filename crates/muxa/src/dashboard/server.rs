@@ -473,6 +473,79 @@ mod tests {
         assert!(body.contains("claude_code"), "body: {body:?}");
     }
 
+    /// End-to-end: hit `/api/events` via `Router::oneshot` and verify the
+    /// FIRST SSE event emitted is `event: snapshot` with a JSON payload that
+    /// matches `Store::snapshot()` at the time of subscription. Complements
+    /// `sse_endpoint_emits_initial_snapshot` (substring match) by parsing
+    /// the `data:` line and round-tripping the agents through
+    /// `serde_json` — pins the wire contract clients depend on.
+    #[tokio::test]
+    async fn events_handler_emits_initial_snapshot_event() {
+        let state = fresh_state();
+        // Seed the store so the snapshot event has a non-empty payload to
+        // round-trip — empty arrays would pass even a broken serializer.
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "snap-1".into(),
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let expected = state.store.snapshot().await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+
+        // Locate the first SSE event block — events are separated by `\n\n`.
+        let first_block = body
+            .split("\n\n")
+            .find(|b| !b.trim().is_empty())
+            .expect("SSE body should contain at least one event block");
+        assert!(
+            first_block.contains("event: snapshot"),
+            "first SSE event must be `snapshot`, got: {first_block:?}",
+        );
+
+        // Concatenate the `data:` lines (SSE allows multi-line data) and
+        // confirm the payload deserializes to the live `Store::snapshot()`.
+        let data_payload: String = first_block
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("");
+        let v: Value = serde_json::from_str(&data_payload)
+            .unwrap_or_else(|e| panic!("snapshot data must be JSON: {e} (raw: {data_payload})"));
+        let agents = v["agents"]
+            .as_array()
+            .expect("snapshot payload must carry `agents` array");
+        assert_eq!(
+            agents.len(),
+            expected.len(),
+            "snapshot agents count must match Store::snapshot()",
+        );
+        let parsed: Vec<Agent> = serde_json::from_value(v["agents"].clone())
+            .expect("snapshot agents must round-trip into Vec<Agent>");
+        assert_eq!(parsed.len(), expected.len());
+        assert_eq!(parsed[0].session_id, expected[0].session_id);
+        assert_eq!(parsed[0].kind, expected[0].kind);
+    }
+
     #[tokio::test]
     async fn sse_endpoint_streams_transitions_after_snapshot() {
         use crate::event::{AgentState, NotificationLevel};
@@ -531,35 +604,97 @@ mod tests {
         assert!(body.contains("waiting_input"), "body: {body:?}");
     }
 
-    /// `Store::apply` should fan out a `Transition` on the broadcast that
-    /// the dashboard SSE handler subscribes to. We exercise the exact
-    /// channel the handler uses (via `Store::subscribe`) to confirm the
-    /// delivery contract end-to-end without the HTTP plumbing.
+    /// Drive `map_transition_recv_to_sse` end-to-end on its happy path: a
+    /// real `Transition` arrives from a `broadcast::Receiver`, the function
+    /// must encode it as `event: transition` with a JSON payload that
+    /// matches the `Transition` wire shape (`from`, `to`, `agent`).
+    ///
+    /// This is the analogous "happy path" companion to
+    /// [`map_transition_recv_emits_lagged_event_on_overflow`], covering the
+    /// `Ok(_)` arm of the same `pub(crate)` test seam. Going through the
+    /// seam (rather than just `Store::subscribe`) is what makes this a
+    /// dashboard-layer test rather than a state-layer one — it asserts the
+    /// SSE encoding rules (`event:` tag + JSON payload shape), not just
+    /// the broadcast plumbing.
     #[tokio::test]
-    async fn store_subscribe_delivers_transition_for_sse_handler() {
-        let store = Store::shared();
-        // Subscribe BEFORE applying — same ordering the SSE handler uses
-        // (subscribe-then-snapshot) so a transition that lands between
-        // the two is never missed.
-        let mut rx = store.subscribe();
+    async fn map_transition_recv_emits_transition_event_for_active_subscriber() {
+        use crate::event::AgentState;
+        use tokio_stream::StreamExt as _TokioStreamExt;
 
-        store
-            .apply(&AgentEvent::Started {
-                id: AgentId {
-                    kind: AgentKind::ClaudeCode,
-                    session_id: "s1".into(),
-                    pane: Some("%1".into()),
-                    cwd: None,
-                },
-                at: OffsetDateTime::now_utc(),
-            })
-            .await;
+        let (tx, rx) = broadcast::channel::<Transition>(8);
+        let mut stream = BroadcastStream::new(rx);
 
-        let t = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        let agent = Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            pane: Some("%1".into()),
+            cwd: None,
+            state: AgentState::Idle,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: OffsetDateTime::now_utc(),
+            last_activity_at: OffsetDateTime::now_utc(),
+        };
+        tx.send(Transition {
+            from: AgentState::Starting,
+            to: AgentState::Idle,
+            agent: agent.clone(),
+        })
+        .expect("subscriber alive, send must succeed");
+
+        let next = _TokioStreamExt::next(&mut stream)
             .await
-            .expect("transition should be broadcast within the timeout")
-            .expect("broadcast channel should not error");
-        assert_eq!(t.agent.session_id, "s1");
+            .expect("stream should yield the buffered Transition")
+            .expect("Ok(Transition), not Lagged");
+        let sse = map_transition_recv_to_sse(Ok(next));
+
+        // To assert the on-the-wire shape (event-type tag + JSON payload),
+        // hand the encoded `SseEvent` to `Sse::new` and consume the resulting
+        // HTTP response body. That's the same path the production handler
+        // takes from `map_transition_recv_to_sse` to bytes — round-tripping
+        // through it is what makes this a real "wire shape" assertion.
+        let app = Router::new().route(
+            "/once",
+            get(|| async move { Sse::new(stream::once(async move { Ok::<_, Infallible>(sse) })) }),
+        );
+        let resp = app
+            .oneshot(Request::builder().uri("/once").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+
+        assert!(
+            body.contains("event: transition"),
+            "transition SSE must carry the `transition` event-type tag: {body:?}",
+        );
+        assert!(
+            !body.contains("event: lagged"),
+            "happy-path event must not be tagged `lagged`: {body:?}",
+        );
+
+        // Peel the `data:` line(s) out of the rendered SSE block and confirm
+        // they deserialize to the `Transition` wire shape (`from`, `to`,
+        // `agent.session_id`). `Transition` itself isn't `Deserialize` (it's
+        // an outbound-only type), so we verify shape via `serde_json::Value`.
+        let data_payload: String = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            !data_payload.is_empty(),
+            "rendered SSE should contain at least one `data:` line: {body:?}",
+        );
+        let v: Value = serde_json::from_str(&data_payload)
+            .unwrap_or_else(|e| panic!("data payload must be JSON: {e} (raw: {data_payload})"));
+        assert_eq!(v["from"], "starting");
+        assert_eq!(v["to"], "idle");
+        assert_eq!(v["agent"]["session_id"], "s1");
+        assert_eq!(v["agent"]["kind"], "claude_code");
     }
 
     /// When a subscriber falls behind the broadcast ring buffer, the SSE
