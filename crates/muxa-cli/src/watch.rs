@@ -1909,7 +1909,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
 
@@ -1956,7 +1956,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%1", "%2", "%10"]);
@@ -2011,7 +2011,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         // alpha: %11 (newer t2) before %10 (older t0); then beta: %21
@@ -2050,7 +2050,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%20", "%30", "%10"]);
@@ -2084,7 +2084,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         // Lexicographic — "%1" < "%200" < "%30" because '2' < '3'.
@@ -2098,7 +2098,7 @@ mod tests {
         // the live/stale split takes precedence.
         let now = OffsetDateTime::now_utc();
         let very_recent = now;
-        let older = now - time::Duration::hours(1);
+        let older_at = now - time::Duration::hours(1);
 
         let cfg = WatchConfig {
             sort: vec![WatchSortKey::Activity],
@@ -2108,7 +2108,7 @@ mod tests {
         app.set_data(
             vec![
                 fake_agent_at("stale-but-recent", "%999", very_recent),
-                fake_agent_at("live-but-older", "%10", older),
+                fake_agent_at("live-but-older", "%10", older_at),
             ],
             vec![fake_pane("%10", "main", 0, 0, "claude")],
         );
@@ -2118,7 +2118,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%10", "%999"]);
@@ -3942,7 +3942,7 @@ mod tests {
     /// → `PromptResponse`. Geometry mode (popup vs fullscreen) is unaffected
     /// — the two axes compose. Scroll resets so the new content surface
     /// starts at the top instead of mid-line.
-    /// Overlay preset that opens to PromptResponse — used by tests that
+    /// Overlay preset that opens to `PromptResponse` — used by tests that
     /// want to pin the starting content axis instead of inheriting whatever
     /// the global default happens to be. Keeps test intent stable across
     /// future default flips.

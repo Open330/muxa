@@ -135,7 +135,10 @@ async fn main() -> Result<()> {
         Cmd::StatusLine { pane } => cmd_status_line(&client, pane).await,
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
-        Cmd::Panes => cmd_panes(),
+        Cmd::Panes => {
+            cmd_panes();
+            Ok(())
+        }
         Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
     }
@@ -505,7 +508,7 @@ async fn cmd_recap(client: &Client, pane: Option<String>, limit: usize, all: boo
     Ok(())
 }
 
-fn cmd_panes() -> Result<()> {
+fn cmd_panes() {
     let backend = muxa::default_backend();
     let panes = backend.list_panes();
     if panes.is_empty() {
@@ -520,7 +523,7 @@ fn cmd_panes() -> Result<()> {
             ),
             muxa::HostKind::Zellij => println!("(no zellij panes)"),
         }
-        return Ok(());
+        return;
     }
     for p in panes {
         println!(
@@ -528,7 +531,6 @@ fn cmd_panes() -> Result<()> {
             p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title
         );
     }
-    Ok(())
 }
 
 /// Decide whether to emit ANSI color. We check `NO_COLOR` (per the de-facto
