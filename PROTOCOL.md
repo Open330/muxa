@@ -3,10 +3,18 @@
 This document describes the wire protocol spoken between
 `muxa` (the CLI), third-party adapters, and `muxad` (the daemon).
 
-The protocol is **stable within a major version**. Breaking changes bump
-`PROTOCOL_VERSION` (defined in `muxa-core/src/event.rs`).
+Current version: **`1`** (defined in `muxa-core/src/event.rs`).
 
-Current version: **`1`**.
+## Stability
+
+Pre-1.0 (current): the wire protocol may change between **minor** releases
+(0.x → 0.x+1). Adapters should pin a specific muxa version while we iterate
+on the schema; the constants below (`PROTOCOL_VERSION`,
+`HISTORY_SCHEMA_VERSION`, `STATE_SCHEMA_VERSION`) are negotiation tokens, not
+stable API.
+
+Post-1.0: the protocol is stable within a major version; breaking changes bump
+`PROTOCOL_VERSION`'s major component and the crate's major version.
 
 ---
 
