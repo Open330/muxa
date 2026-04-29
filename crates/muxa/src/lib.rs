@@ -9,10 +9,14 @@
 //! The following items are considered the **stable** library surface and
 //! follow semver from the beta release onward:
 //!
-//! - [`Config`]
-//! - [`Agent`], [`PromptRecord`], [`Store`], [`SharedStore`], [`Transition`]
+//! - [`Config`], [`Error`]
+//! - [`Agent`], [`PromptRecord`], [`Store`], [`SharedStore`], [`Transition`],
+//!   [`ReconcileReport`]
 //! - [`AgentEvent`], [`AgentId`], [`AgentKind`], [`AgentState`],
 //!   [`NotificationLevel`]
+//! - [`PromptHistory`], [`HistoryEntry`] (return / argument types of stable
+//!   `Store` methods such as [`Store::with_history`] and
+//!   [`Store::recent_prompts`])
 //! - The pane backend abstraction: [`PaneBackend`], [`SharedBackend`],
 //!   [`BackendCaps`], [`HostKind`], [`TmuxBackend`], [`ZellijBackend`],
 //!   [`default_backend`]
@@ -55,8 +59,10 @@ pub use backend::{
     SharedBackend,
 };
 pub use config::Config;
+pub use error::CoreError as Error;
 pub use event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel};
-pub use state::{Agent, PromptRecord, SharedStore, Store, Transition};
+pub use history::{HistoryEntry, PromptHistory};
+pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
 
 // ---------------------------------------------------------------------------
 // Unstable wire-format constants — `pub` so daemon/readers can negotiate
@@ -81,10 +87,8 @@ pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 #[doc(hidden)]
 pub use error::{CoreError, Result};
 #[doc(hidden)]
-pub use history::{CompactReport, HistoryEntry, HistoryOptions, PromptHistory};
+pub use history::{CompactReport, HistoryOptions};
 #[doc(hidden)]
 pub use reconcile::{LivenessSource, Reconciler};
 #[doc(hidden)]
 pub use snapshot::{Snapshotter, SnapshotterOptions};
-#[doc(hidden)]
-pub use state::ReconcileReport;
