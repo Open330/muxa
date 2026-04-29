@@ -83,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[watch] columns` / `widths` / `[watch.detail] template` placeholders
   emit a `tracing::warn!` when unknown keys are encountered, instead
   of silently dropping them at render time.
+- README and CLI now reflect that opencode integration is deferred —
+  the four-adapter claim was inaccurate. Existing three-adapter coverage
+  (Claude Code, Codex, Gemini CLI) is unchanged.
 
 ### Removed
 

@@ -109,6 +109,17 @@ enum HookCmd {
         #[arg(long)]
         event: String,
     },
+    /// opencode hook handler — not yet implemented.
+    ///
+    /// Kept visible in `--help` so users who try it get a friendly,
+    /// targeted error rather than a generic "unrecognized subcommand".
+    /// Dispatched in `handle_hook` to return a non-zero exit with a
+    /// message pointing at the tracking issue. See
+    /// `crates/muxa/src/adapters/opencode.rs` for the deferred design.
+    Opencode {
+        #[arg(long)]
+        event: String,
+    },
 }
 
 #[tokio::main]
@@ -402,6 +413,18 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+        }
+        HookCmd::Opencode { event: _ } => {
+            // The `opencode` adapter is deferred — see
+            // `crates/muxa/src/adapters/opencode.rs` and the README's
+            // "Agent support" table. Print a friendly, actionable
+            // error and exit non-zero so users hitting this aren't
+            // left wondering why nothing happened.
+            eprintln!(
+                "error: 'opencode' adapter is not yet implemented. \
+                 See https://github.com/Open330/muxa/issues for status."
+            );
+            std::process::exit(2);
         }
     }
     Ok(())
