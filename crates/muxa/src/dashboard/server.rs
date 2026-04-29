@@ -37,7 +37,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::PROTOCOL_VERSION;
-use crate::state::{Agent, SharedStore};
+use crate::state::{Agent, SharedStore, Transition};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
@@ -206,7 +206,23 @@ async fn events_handler(
         .json_data(json!({ "agents": snapshot }))
         .unwrap_or_else(|_| SseEvent::default().event("snapshot").data("{}"));
 
-    let live = BroadcastStream::new(rx).map(|res| match res {
+    let live = BroadcastStream::new(rx).map(map_transition_recv_to_sse);
+
+    let combined = stream::once(async move { snapshot_event })
+        .chain(live)
+        .map(Ok::<_, Infallible>);
+
+    Sse::new(combined).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+}
+
+/// Map a single `BroadcastStream` poll result into the SSE event emitted on
+/// the wire. Extracted from [`events_handler`] so tests can drive both
+/// branches — `Ok(Transition)` and `Err(Lagged)` — without spinning up a
+/// full HTTP roundtrip and without duplicating the encoding rules.
+pub(crate) fn map_transition_recv_to_sse(
+    res: Result<Transition, BroadcastStreamRecvError>,
+) -> SseEvent {
+    match res {
         Ok(t) => SseEvent::default()
             .event("transition")
             .json_data(&t)
@@ -214,13 +230,7 @@ async fn events_handler(
         Err(BroadcastStreamRecvError::Lagged(n)) => {
             SseEvent::default().event("lagged").data(n.to_string())
         }
-    });
-
-    let combined = stream::once(async move { snapshot_event })
-        .chain(live)
-        .map(Ok::<_, Infallible>);
-
-    Sse::new(combined).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +473,79 @@ mod tests {
         assert!(body.contains("claude_code"), "body: {body:?}");
     }
 
+    /// End-to-end: hit `/api/events` via `Router::oneshot` and verify the
+    /// FIRST SSE event emitted is `event: snapshot` with a JSON payload that
+    /// matches `Store::snapshot()` at the time of subscription. Complements
+    /// `sse_endpoint_emits_initial_snapshot` (substring match) by parsing
+    /// the `data:` line and round-tripping the agents through
+    /// `serde_json` — pins the wire contract clients depend on.
+    #[tokio::test]
+    async fn events_handler_emits_initial_snapshot_event() {
+        let state = fresh_state();
+        // Seed the store so the snapshot event has a non-empty payload to
+        // round-trip — empty arrays would pass even a broken serializer.
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "snap-1".into(),
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let expected = state.store.snapshot().await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+
+        // Locate the first SSE event block — events are separated by `\n\n`.
+        let first_block = body
+            .split("\n\n")
+            .find(|b| !b.trim().is_empty())
+            .expect("SSE body should contain at least one event block");
+        assert!(
+            first_block.contains("event: snapshot"),
+            "first SSE event must be `snapshot`, got: {first_block:?}",
+        );
+
+        // Concatenate the `data:` lines (SSE allows multi-line data) and
+        // confirm the payload deserializes to the live `Store::snapshot()`.
+        let data_payload: String = first_block
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("");
+        let v: Value = serde_json::from_str(&data_payload)
+            .unwrap_or_else(|e| panic!("snapshot data must be JSON: {e} (raw: {data_payload})"));
+        let agents = v["agents"]
+            .as_array()
+            .expect("snapshot payload must carry `agents` array");
+        assert_eq!(
+            agents.len(),
+            expected.len(),
+            "snapshot agents count must match Store::snapshot()",
+        );
+        let parsed: Vec<Agent> = serde_json::from_value(v["agents"].clone())
+            .expect("snapshot agents must round-trip into Vec<Agent>");
+        assert_eq!(parsed.len(), expected.len());
+        assert_eq!(parsed[0].session_id, expected[0].session_id);
+        assert_eq!(parsed[0].kind, expected[0].kind);
+    }
+
     #[tokio::test]
     async fn sse_endpoint_streams_transitions_after_snapshot() {
         use crate::event::{AgentState, NotificationLevel};
@@ -519,5 +602,183 @@ mod tests {
         assert!(body.contains("event: snapshot"), "body: {body:?}");
         assert!(body.contains("event: transition"), "body: {body:?}");
         assert!(body.contains("waiting_input"), "body: {body:?}");
+    }
+
+    /// Drive `map_transition_recv_to_sse` end-to-end on its happy path: a
+    /// real `Transition` arrives from a `broadcast::Receiver`, the function
+    /// must encode it as `event: transition` with a JSON payload that
+    /// matches the `Transition` wire shape (`from`, `to`, `agent`).
+    ///
+    /// This is the analogous "happy path" companion to
+    /// [`map_transition_recv_emits_lagged_event_on_overflow`], covering the
+    /// `Ok(_)` arm of the same `pub(crate)` test seam. Going through the
+    /// seam (rather than just `Store::subscribe`) is what makes this a
+    /// dashboard-layer test rather than a state-layer one — it asserts the
+    /// SSE encoding rules (`event:` tag + JSON payload shape), not just
+    /// the broadcast plumbing.
+    #[tokio::test]
+    async fn map_transition_recv_emits_transition_event_for_active_subscriber() {
+        use crate::event::AgentState;
+        use tokio_stream::StreamExt as _TokioStreamExt;
+
+        let (tx, rx) = broadcast::channel::<Transition>(8);
+        let mut stream = BroadcastStream::new(rx);
+
+        let agent = Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            pane: Some("%1".into()),
+            cwd: None,
+            state: AgentState::Idle,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: OffsetDateTime::now_utc(),
+            last_activity_at: OffsetDateTime::now_utc(),
+        };
+        tx.send(Transition {
+            from: AgentState::Starting,
+            to: AgentState::Idle,
+            agent: agent.clone(),
+        })
+        .expect("subscriber alive, send must succeed");
+
+        let next = _TokioStreamExt::next(&mut stream)
+            .await
+            .expect("stream should yield the buffered Transition")
+            .expect("Ok(Transition), not Lagged");
+        let sse = map_transition_recv_to_sse(Ok(next));
+
+        // To assert the on-the-wire shape (event-type tag + JSON payload),
+        // hand the encoded `SseEvent` to `Sse::new` and consume the resulting
+        // HTTP response body. That's the same path the production handler
+        // takes from `map_transition_recv_to_sse` to bytes — round-tripping
+        // through it is what makes this a real "wire shape" assertion.
+        let app = Router::new().route(
+            "/once",
+            get(|| async move { Sse::new(stream::once(async move { Ok::<_, Infallible>(sse) })) }),
+        );
+        let resp = app
+            .oneshot(Request::builder().uri("/once").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+
+        assert!(
+            body.contains("event: transition"),
+            "transition SSE must carry the `transition` event-type tag: {body:?}",
+        );
+        assert!(
+            !body.contains("event: lagged"),
+            "happy-path event must not be tagged `lagged`: {body:?}",
+        );
+
+        // Peel the `data:` line(s) out of the rendered SSE block and confirm
+        // they deserialize to the `Transition` wire shape (`from`, `to`,
+        // `agent.session_id`). `Transition` itself isn't `Deserialize` (it's
+        // an outbound-only type), so we verify shape via `serde_json::Value`.
+        let data_payload: String = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            !data_payload.is_empty(),
+            "rendered SSE should contain at least one `data:` line: {body:?}",
+        );
+        let v: Value = serde_json::from_str(&data_payload)
+            .unwrap_or_else(|e| panic!("data payload must be JSON: {e} (raw: {data_payload})"));
+        assert_eq!(v["from"], "starting");
+        assert_eq!(v["to"], "idle");
+        assert_eq!(v["agent"]["session_id"], "s1");
+        assert_eq!(v["agent"]["kind"], "claude_code");
+    }
+
+    /// When a subscriber falls behind the broadcast ring buffer, the SSE
+    /// handler must surface that as `event: lagged` so clients know to
+    /// resync via `/api/agents`. We drive the same map function the
+    /// handler uses with a real `BroadcastStreamRecvError::Lagged` to
+    /// avoid timing-dependent backpressure choreography over HTTP.
+    #[tokio::test]
+    async fn map_transition_recv_emits_lagged_event_on_overflow() {
+        use crate::event::AgentState;
+        // Disambiguate `next` — both `futures::StreamExt` and
+        // `tokio_stream::StreamExt` are imported by this module.
+        use tokio_stream::StreamExt as _TokioStreamExt;
+
+        // Tiny channel so we can lag the receiver deterministically.
+        let (tx, rx) = broadcast::channel::<Transition>(2);
+        // Build the stream BEFORE sending, but never poll until after we
+        // overflow — that's what the BroadcastStream impl requires to
+        // produce a Lagged error on the next poll.
+        let mut stream = BroadcastStream::new(rx);
+
+        // Fill + overflow the buffer. Capacity is 2; we send 5 so the
+        // receiver is now 3 messages behind.
+        let agent = Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: "lag".into(),
+            pane: Some("%1".into()),
+            cwd: None,
+            state: AgentState::Idle,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: OffsetDateTime::now_utc(),
+            last_activity_at: OffsetDateTime::now_utc(),
+        };
+        for _ in 0..5 {
+            tx.send(Transition {
+                from: AgentState::Starting,
+                to: AgentState::Idle,
+                agent: agent.clone(),
+            })
+            .expect("subscriber alive, send must succeed");
+        }
+
+        // First poll yields Lagged, which the handler maps to `event: lagged`.
+        let next = _TokioStreamExt::next(&mut stream)
+            .await
+            .expect("stream should yield the Lagged error");
+        assert!(
+            matches!(next, Err(BroadcastStreamRecvError::Lagged(_))),
+            "expected Lagged after overflowing capacity-2 channel with 5 sends, got {next:?}",
+        );
+        let lagged_sse = map_transition_recv_to_sse(next);
+        // axum's `Event` Debug renders the on-the-wire SSE bytes
+        // (e.g. `event: lagged\ndata: 3\n\n`), so a substring match on the
+        // formatted Debug output asserts the encoded event-type tag.
+        let lagged_dbg = format!("{lagged_sse:?}");
+        assert!(
+            lagged_dbg.contains("lagged"),
+            "lagged SSE event must render its event-type tag: {lagged_dbg}",
+        );
+        assert!(
+            !lagged_dbg.contains("transition"),
+            "lagged event must not be tagged as a transition: {lagged_dbg}",
+        );
+
+        // Drain the rest of the buffered messages — they're real
+        // `Transition`s, so the map function should emit `event: transition`.
+        // Confirms the handler keeps producing well-formed events after a lag.
+        let recovered = _TokioStreamExt::next(&mut stream)
+            .await
+            .expect("stream should keep yielding after the lag is reported");
+        assert!(
+            recovered.is_ok(),
+            "post-lag poll should yield a regular Transition: {recovered:?}",
+        );
+        let ok_sse = map_transition_recv_to_sse(recovered);
+        let ok_dbg = format!("{ok_sse:?}");
+        assert!(
+            ok_dbg.contains("transition"),
+            "post-lag SSE event must be tagged `transition`: {ok_dbg}",
+        );
     }
 }

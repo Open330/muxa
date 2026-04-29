@@ -133,6 +133,20 @@ impl<L: LivenessSource> Reconciler<L> {
 
 #[cfg(test)]
 mod tests {
+    //! Reconciler test scope.
+    //!
+    //! Synthetic-to-real promotion happens at apply-time inside
+    //! `Store::apply` (real `Started` evicts a synthetic on the same pane
+    //! before the row ever reaches the registry's persistent state) — it is
+    //! NOT a `reconcile_once` responsibility. That contract is covered by
+    //! `state.rs::tests::real_started_replaces_synthetic_on_same_pane`, so
+    //! we deliberately do not duplicate it here.
+    //!
+    //! What this module DOES cover for the reconciler:
+    //! - reaping rows whose pane is no longer alive,
+    //! - collapsing duplicate real rows on the same live pane,
+    //! - demoting orphan synthetics that somehow coexist with a real row
+    //!   (defense-in-depth, planted via the public `Store::hydrate` seam).
     use super::*;
     use crate::event::{AgentEvent, AgentId, AgentKind};
     use crate::state::Store;
@@ -255,5 +269,95 @@ mod tests {
         // Task must observe shutdown; bounded wait so the test doesn't hang.
         let exited = tokio::time::timeout(Duration::from_millis(500), task).await;
         assert!(exited.is_ok(), "reconciler did not honor shutdown");
+    }
+
+    /// Two real `Started`s on the same pane (e.g. user closed the agent
+    /// and relaunched without `SessionEnded` ever firing) leave the store
+    /// holding two records — the older flipped to `Stopped` by
+    /// `Store::apply`'s pane-occupancy reconciliation. The periodic
+    /// reconciler must collapse these onto the canonical (alive, most
+    /// recent) row when the pane is still live.
+    #[tokio::test]
+    async fn reconcile_once_collapses_duplicates_for_same_live_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:05:00 UTC);
+
+        store.apply(&started("first", "%1", t0)).await;
+        store.apply(&started("second", "%1", t1)).await;
+        // Sanity: both records are present pre-reconcile — `Store::apply`
+        // only flips the older to `Stopped`, it doesn't evict.
+        assert_eq!(store.snapshot().await.len(), 2);
+
+        let fake = FakeLiveness::new(vec![pane("%1")]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert_eq!(report.synthetic_demoted, 0);
+        assert_eq!(
+            report.duplicates_collapsed, 1,
+            "the older `Stopped` real row should have been collapsed",
+        );
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "second");
+    }
+
+    // NOTE: a previous revision of this file carried a
+    // `reconcile_once_observes_synthetic_to_real_promotion` test that
+    // asserted a noop reconcile pass after a real `Started` had already
+    // evicted a synthetic at apply-time. It was a tautology — promotion
+    // is a `Store::apply` responsibility, not a `reconcile_once` one — and
+    // is now covered honestly by
+    // `state.rs::tests::real_started_replaces_synthetic_on_same_pane`. See
+    // the module-level comment above for the reconciler's actual scope.
+
+    /// Defense-in-depth: even if a synthetic somehow ends up coexisting
+    /// with a real entry on the same pane (e.g. an order-of-arrival edge
+    /// case or a future code path that bypasses `apply`'s pane-reconcile),
+    /// the reconciler must demote the synthetic on its next pass. We use
+    /// the public `hydrate` seam to plant both rows without going through
+    /// `Store::apply`'s pane-occupancy reconciliation.
+    #[tokio::test]
+    async fn reconcile_once_demotes_orphan_synthetic_via_reconciler() {
+        use crate::event::AgentState;
+        use crate::state::Agent;
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+
+        let mk = |sid: &str, state: AgentState| Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: sid.into(),
+            pane: Some("%3".into()),
+            cwd: None,
+            state,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            started_at: t0,
+            last_activity_at: t0,
+        };
+        store
+            .hydrate(vec![
+                mk("real", AgentState::Idle),
+                mk("synthetic-%3", AgentState::Idle),
+            ])
+            .await;
+        assert_eq!(store.snapshot().await.len(), 2);
+
+        let fake = FakeLiveness::new(vec![pane("%3")]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert_eq!(report.synthetic_demoted, 1);
+        assert_eq!(report.duplicates_collapsed, 0);
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "real");
     }
 }
