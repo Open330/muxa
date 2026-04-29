@@ -396,9 +396,13 @@ JSON / SSE 엔드포인트 (`/api/*`):
 ## 데스크톱 알림
 
 설정에서 옵트인하면 됩니다. `*→WaitingInput`, `*→Error`, 또는
-`Working→Stopped`(작업 완료) 전이 시 `muxa`가 네이티브 알림을 띄웁니다 —
-Linux는 libnotify, macOS는 NSUserNotification, Windows는 WinRT 토스트.
-에이전트가 10분 동안 돌다가 드디어 사용자의 입력을 기다릴 때 유용합니다.
+`Working→Stopped`(작업 완료) 전이 시 `muxa`가
+[`notify-rust`](https://crates.io/crates/notify-rust)을 통해 네이티브 알림을
+띄웁니다 — Linux는 DBus / libnotify (CI에서 검증됨), macOS는
+NSUserNotification / UNUserNotificationCenter, Windows는 WinRT 토스트.
+macOS와 Windows 경로는 컴파일 검증만 거친 상태이므로, 사용 중인 플랫폼에서
+정상 동작하지 않으면 이슈를 남겨주세요. 에이전트가 10분 동안 돌다가 드디어
+사용자의 입력을 기다릴 때 유용합니다.
 
 `~/.config/muxa/config.toml`에서 활성화:
 

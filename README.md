@@ -406,6 +406,12 @@ close and browser restart — paste once per browser profile.
 Generate a token with `openssl rand -hex 32`. Front with nginx/Caddy if
 you need TLS — it's intentionally out of scope.
 
+> **Note:** `MUXA_DASHBOARD_TOKEN` is read at config-load time, in the
+> running daemon's environment. If you set the variable in your shell
+> but run `muxad` under a systemd service, the systemd unit's
+> environment is what counts — set the var via `Environment=` (or
+> `EnvironmentFile=`) in the unit file, not in your `~/.bashrc`.
+
 JSON / SSE endpoints (under `/api/*`):
 
 | Method | Path            | What it returns                                                  |
@@ -422,8 +428,11 @@ Full operator guide — config reference, security model rationale, the
 ## Desktop notifications
 
 Opt in via config. On `*→WaitingInput` and `*→Error`, or `Working→Stopped`
-(task complete), `muxa` fires a native notification — libnotify on Linux,
-NSUserNotification on macOS, WinRT toast on Windows. Useful when an agent has
+(task complete), `muxa` fires a native notification via
+[`notify-rust`](https://crates.io/crates/notify-rust) — DBus / libnotify on
+Linux (verified in CI), NSUserNotification / UNUserNotificationCenter on
+macOS, WinRT toast on Windows. macOS and Windows paths compile-test only —
+please file an issue if your platform misbehaves. Useful when an agent has
 been crunching for 10 minutes and finally needs your attention.
 
 Enable in `~/.config/muxa/config.toml`:

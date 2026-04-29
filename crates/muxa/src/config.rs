@@ -6,7 +6,72 @@
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
+
+/// Env var consulted at config-load time to satisfy the "non-loopback bind
+/// requires a token" invariant when the TOML doesn't carry one. Mirrors the
+/// `--dashboard-token` CLI flag in `muxad`.
+const DASHBOARD_TOKEN_ENV: &str = "MUXA_DASHBOARD_TOKEN";
+
+/// All known `[watch] columns` keys. Used at load time to warn on typos.
+const WATCH_COLUMN_KEYS: &[&str] = &[
+    "pane", "kind", "state", "model", "ctx", "cost", "prompt", "activity",
+];
+
+/// All known placeholder names accepted in `[watch.detail] template`. A
+/// placeholder is any `{name}` (or `{a|b|c}`) sequence; the resolver in
+/// `muxa-cli` accepts these names. Unknown ones still pass through verbatim
+/// at render time — we only warn at load.
+const WATCH_DETAIL_PLACEHOLDERS: &[&str] = &[
+    "pane",
+    "kind",
+    "state",
+    "model",
+    "ctx",
+    "cost",
+    "activity",
+    "last_prompt",
+    "last_response",
+    "last_notification",
+    "cwd",
+];
+
+/// Semantic validation errors raised by [`Config::validate`] — i.e. shapes
+/// that pass TOML deserialization but violate cross-field invariants we
+/// want to surface at load time rather than during late startup. Each
+/// variant points at the offending field with a path-style name so the
+/// user can find it quickly.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("dashboard.bind: {addr:?} is not a valid socket address: {source}")]
+    InvalidDashboardBind {
+        addr: String,
+        #[source]
+        source: AddrParseError,
+    },
+
+    #[error(
+        "dashboard.bind: {addr} is non-loopback; set dashboard.allow_public = true \
+         (or pass --allow-public) to confirm you want to expose the dashboard \
+         beyond this host"
+    )]
+    DashboardRequiresAllowPublic { addr: SocketAddr },
+
+    #[error(
+        "dashboard.bind: {addr} is non-loopback; a bearer token is required \
+         — set `dashboard.token` in config OR `MUXA_DASHBOARD_TOKEN` in the \
+         running daemon's environment (note: under systemd the unit's \
+         `Environment=` is what counts, not your interactive shell)"
+    )]
+    DashboardRequiresToken { addr: SocketAddr },
+
+    #[error(
+        "sinks.oh_my_prompt: enabled = true but [sinks.oh_my_prompt].endpoint is \
+         not set (no default endpoint by design)"
+    )]
+    OhMyPromptMissingEndpoint,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -268,12 +333,27 @@ fn default_true() -> bool {
 impl Config {
     /// Load a config from the given file. Missing file is an error — use
     /// `load_or_default` if you want silent fallback.
+    ///
+    /// Runs [`Self::validate`] after deserialization so semantic errors
+    /// that apply to *every* consumer surface here. Daemon-only checks
+    /// (dashboard bind/token, sink endpoints) are *not* run here — those
+    /// live behind [`Self::validate_for_daemon`] so CLI commands like
+    /// `muxa watch` and `muxa status` are unaffected by daemon-only
+    /// misconfiguration. Soft issues (unknown `[watch]` column key,
+    /// unknown detail-template placeholder) emit `tracing::warn!` but do
+    /// not fail the load — config compatibility matters more than strict
+    /// validation for those.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let cfg: Self = toml::from_str(&text).map_err(|e| CoreError::ConfigParse {
             path: path.to_path_buf(),
             source: e,
         })?;
+        cfg.validate().map_err(|source| CoreError::ConfigValidate {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        cfg.warn_soft_issues();
         Ok(cfg)
     }
 
@@ -286,6 +366,156 @@ impl Config {
         }
         Ok(Self::default())
     }
+
+    /// Run hard semantic checks that apply to *every* consumer (CLI and
+    /// daemon alike). Idempotent and side-effect-free; safe to call from
+    /// tests against a synthesized `Config`.
+    ///
+    /// Currently this is a no-op — every check we have today is
+    /// daemon-specific (dashboard wire-up, sink fan-out) and lives in
+    /// [`Self::validate_for_daemon`]. The method is kept (rather than
+    /// inlined away) so future cross-consumer invariants have an obvious
+    /// home, and so the always-on / daemon-only split stays legible to
+    /// callers.
+    pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        Ok(())
+    }
+
+    /// Run hard semantic checks that only matter when the daemon is
+    /// actually starting up: the dashboard server wire-up
+    /// (`bind` / `token` / `allow_public`) and sink fan-out
+    /// (`[sinks.oh_my_prompt]` endpoint). Called by `muxad/main.rs` from
+    /// inside `tokio::main` after `Config::load` returns; deliberately
+    /// *not* called from the CLI's load path because `muxa watch` /
+    /// `muxa status` / `muxa recap` etc. don't touch the dashboard or
+    /// sinks at all and shouldn't fail on dashboard-only misconfig.
+    ///
+    /// The runtime resolvers (`DashboardConfig::resolve`,
+    /// `OhMyPromptSink::resolve`) repeat the same checks so CLI/env
+    /// overrides applied later still get validated — this method only
+    /// covers what we can determine from the TOML alone.
+    pub fn validate_for_daemon(&self) -> std::result::Result<(), ConfigError> {
+        validate_dashboard(&self.dashboard)?;
+        validate_oh_my_prompt(&self.sinks.oh_my_prompt)?;
+        Ok(())
+    }
+
+    /// Emit `tracing::warn!` for soft validation issues — typos in
+    /// `[watch] columns`, unknown placeholders in
+    /// `[watch.detail] template`. Never errors. Keeping these as warnings
+    /// means a config written for a newer/older `muxa` version still loads.
+    fn warn_soft_issues(&self) {
+        for key in &self.watch.columns {
+            if !WATCH_COLUMN_KEYS.contains(&key.as_str()) {
+                tracing::warn!(
+                    column = %key,
+                    known = ?WATCH_COLUMN_KEYS,
+                    "watch.columns: unknown key — it will be skipped at render time",
+                );
+            }
+        }
+        for key in self.watch.widths.keys() {
+            if !WATCH_COLUMN_KEYS.contains(&key.as_str()) {
+                tracing::warn!(
+                    column = %key,
+                    known = ?WATCH_COLUMN_KEYS,
+                    "watch.widths: unknown key — it will be ignored at render time",
+                );
+            }
+        }
+        for placeholder in unknown_detail_placeholders(&self.watch.detail.template) {
+            tracing::warn!(
+                placeholder = %placeholder,
+                known = ?WATCH_DETAIL_PLACEHOLDERS,
+                "watch.detail.template: unknown placeholder — it will be left verbatim at render time",
+            );
+        }
+    }
+}
+
+fn validate_dashboard(cfg: &DashboardTomlConfig) -> std::result::Result<(), ConfigError> {
+    let Some(bind_str) = cfg.bind.as_deref() else {
+        return Ok(());
+    };
+    let bind: SocketAddr =
+        bind_str
+            .parse()
+            .map_err(|source| ConfigError::InvalidDashboardBind {
+                addr: bind_str.to_string(),
+                source,
+            })?;
+
+    if bind.ip().is_loopback() {
+        return Ok(());
+    }
+
+    // Non-loopback path mirrors `DashboardConfig::resolve`: both
+    // allow_public AND a non-empty token are required. We honor the env
+    // var here because `muxad` reads it via clap; without it we'd emit
+    // false positives for users whose only token source is the env.
+    if !cfg.allow_public.unwrap_or(false) {
+        return Err(ConfigError::DashboardRequiresAllowPublic { addr: bind });
+    }
+
+    // Whitespace-only tokens (`"   "`) are pathological — they pass a
+    // naive non-empty check but the dashboard's bearer-token comparator
+    // will never accept a real client. Treat them as unset on both
+    // sides (TOML and env) so the user gets a config-time error
+    // instead of a "why won't anyone authenticate" runtime mystery.
+    let toml_token = cfg.token.as_deref().filter(|s| !s.trim().is_empty());
+    let env_token = std::env::var(DASHBOARD_TOKEN_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if toml_token.is_none() && env_token.is_none() {
+        return Err(ConfigError::DashboardRequiresToken { addr: bind });
+    }
+    Ok(())
+}
+
+fn validate_oh_my_prompt(cfg: &OhMyPromptToml) -> std::result::Result<(), ConfigError> {
+    if !cfg.enabled.unwrap_or(false) {
+        return Ok(());
+    }
+    if cfg.endpoint.as_deref().is_none_or(str::is_empty) {
+        return Err(ConfigError::OhMyPromptMissingEndpoint);
+    }
+    Ok(())
+}
+
+/// Walk a `[watch.detail] template` string and yield each placeholder name
+/// (or pipe-fallback name) that isn't in [`WATCH_DETAIL_PLACEHOLDERS`].
+/// Unbalanced `{` / missing `}` are tolerated silently — the runtime
+/// renderer treats them as literal text.
+fn unknown_detail_placeholders(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '{' {
+            continue;
+        }
+        let mut name = String::new();
+        let mut closed = false;
+        for nc in chars.by_ref() {
+            if nc == '}' {
+                closed = true;
+                break;
+            }
+            name.push(nc);
+        }
+        if !closed {
+            continue;
+        }
+        for part in name.split('|') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !WATCH_DETAIL_PLACEHOLDERS.contains(&part) {
+                out.push(part.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `[watch]` config — controls the `muxa watch` TUI columns.
@@ -765,5 +995,291 @@ default_content = "live_pane"
 default_content = "nope"
 "#;
         assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    // ---- semantic validation (Config::validate_for_daemon) ----
+
+    /// A non-loopback `dashboard.bind` without `allow_public = true` must
+    /// fail validation with a `DashboardRequiresAllowPublic` error so the
+    /// user sees a deliberate "you need to opt in" message at load time
+    /// instead of a runtime crash.
+    #[test]
+    fn validate_rejects_non_loopback_bind_without_allow_public() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DashboardRequiresAllowPublic { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// `allow_public = true` alone is not enough — a token (TOML or env)
+    /// is also required for non-loopback binds.
+    #[test]
+    fn validate_rejects_non_loopback_bind_without_token() {
+        // Make sure the env-var fallback isn't masking the intent of the
+        // test. `remove_var` is unsafe-by-spec under multi-threading; the
+        // test runner itself is multi-threaded, so we set a known-empty
+        // string instead. Empty strings are treated as unset by the
+        // validator (matching `DashboardConfig::resolve`).
+        std::env::set_var(DASHBOARD_TOKEN_ENV, "");
+
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                allow_public: Some(true),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DashboardRequiresToken { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Non-loopback bind + `allow_public = true` + non-empty token →
+    /// validation passes. The happy path for a publicly-bound dashboard.
+    #[test]
+    fn validate_accepts_non_loopback_bind_with_allow_public_and_token() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                allow_public: Some(true),
+                token: Some("s3cret".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// A malformed `dashboard.bind` ("not-an-address") fails validation
+    /// with a parse-error variant rather than passing through to a late
+    /// `SocketAddr::parse()` blow-up.
+    #[test]
+    fn validate_rejects_unparseable_dashboard_bind() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("not-an-address".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidDashboardBind { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Loopback default bind passes validation with no token/no
+    /// `allow_public` — the laptop-default case must keep working.
+    #[test]
+    fn validate_accepts_default_loopback_dashboard() {
+        let cfg = Config::default();
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// IPv6 loopback (`[::1]`) must be treated identically to `127.0.0.1`
+    /// — no token / `allow_public` required. `Ipv6Addr::is_loopback`
+    /// already returns true for `::1`, but we lock it down here so a
+    /// future refactor that mishandles the v4/v6 split can't silently
+    /// break the laptop-default case for v6-first hosts.
+    #[test]
+    fn validate_accepts_ipv6_loopback_bind() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("[::1]:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// IPv6 unspecified (`[::]`) is the v6 equivalent of `0.0.0.0` — it
+    /// binds every interface — and must be rejected without
+    /// `allow_public`. Otherwise a user typing `[::]:7878` thinking
+    /// "loopback by another name" would silently get a publicly-exposed
+    /// dashboard.
+    #[test]
+    fn validate_rejects_ipv6_unspecified_bind_without_allow_public() {
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("[::]:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DashboardRequiresAllowPublic { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Whitespace-only tokens (`"   "`) are treated as unset, the same
+    /// way empty strings already are. A token that's all spaces would
+    /// pass a naive "non-empty" check but never authenticate any real
+    /// client — surface that as a config-time error rather than a
+    /// runtime mystery.
+    #[test]
+    fn validate_rejects_whitespace_only_token() {
+        std::env::set_var(DASHBOARD_TOKEN_ENV, "");
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                allow_public: Some(true),
+                token: Some("   ".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DashboardRequiresToken { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// `[sinks.oh_my_prompt] enabled = true` with no endpoint must fail
+    /// at load — there is no default endpoint by design.
+    #[test]
+    fn validate_rejects_oh_my_prompt_enabled_without_endpoint() {
+        let cfg = Config {
+            sinks: SinksConfig {
+                oh_my_prompt: OhMyPromptToml {
+                    enabled: Some(true),
+                    ..OhMyPromptToml::default()
+                },
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::OhMyPromptMissingEndpoint),
+            "got {err:?}",
+        );
+    }
+
+    /// `enabled = true` with a non-empty endpoint passes validation. The
+    /// token check happens later in `OhMyPromptSink::resolve` (env var
+    /// only — not part of the TOML invariant) and is intentionally not
+    /// duplicated here.
+    #[test]
+    fn validate_accepts_oh_my_prompt_enabled_with_endpoint() {
+        let cfg = Config {
+            sinks: SinksConfig {
+                oh_my_prompt: OhMyPromptToml {
+                    enabled: Some(true),
+                    endpoint: Some("https://example.dev".into()),
+                    ..OhMyPromptToml::default()
+                },
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// `enabled = false` with an empty endpoint is fine — disabled sinks
+    /// don't need to resolve.
+    #[test]
+    fn validate_accepts_disabled_oh_my_prompt_without_endpoint() {
+        let cfg = Config::default();
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// CLI commands like `muxa watch` only call `Config::validate()`,
+    /// never `validate_for_daemon()`. A config that's *only*
+    /// daemon-misconfigured (e.g. `dashboard.bind = "0.0.0.0:7878"` with
+    /// no token, intended for a future `muxad --dashboard` run, or a
+    /// stale leftover from a test) must NOT block the CLI from loading
+    /// — `muxa status` / `muxa recap` / `muxa watch` don't even touch
+    /// the dashboard. This test pins that gating: the daemon validator
+    /// rejects, the CLI validator accepts.
+    #[test]
+    fn validate_accepts_config_that_validate_for_daemon_rejects() {
+        std::env::set_var(DASHBOARD_TOKEN_ENV, "");
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                ..DashboardTomlConfig::default()
+            },
+            sinks: SinksConfig {
+                oh_my_prompt: OhMyPromptToml {
+                    enabled: Some(true),
+                    ..OhMyPromptToml::default()
+                },
+            },
+            ..Config::default()
+        };
+        // CLI path: load + validate must succeed. The CLI doesn't open
+        // the dashboard or instantiate sinks, so dashboard-only and
+        // sink-only misconfig are harmless.
+        assert!(cfg.validate().is_ok());
+        // Daemon path: same config must fail — the daemon would try to
+        // bind a public socket without a token.
+        assert!(cfg.validate_for_daemon().is_err());
+    }
+
+    /// Unknown `[watch] columns` keys are NOT a hard error — they parse,
+    /// validate, and survive verbatim on the resolved struct so the
+    /// render layer can warn-and-skip. We log a warning in
+    /// `warn_soft_issues` (not asserted here without `tracing-test` in
+    /// deps; the behavior contract is "load succeeds, value preserved").
+    #[test]
+    fn validate_allows_unknown_watch_columns_key_with_warning() {
+        let toml = r#"
+[watch]
+columns = ["pane", "definitely_not_real", "prompt"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // Hard validation passes.
+        assert!(cfg.validate().is_ok());
+        // Soft-warn pass also doesn't error.
+        cfg.warn_soft_issues();
+        // Unknown key is preserved verbatim on the struct so the renderer
+        // can decide what to do at render time.
+        assert!(cfg.watch.columns.iter().any(|c| c == "definitely_not_real"));
+    }
+
+    /// `[watch.detail] template` with an unknown placeholder loads fine
+    /// and preserves the placeholder verbatim. Render-time behavior
+    /// (literal pass-through) is unchanged; only a warning is added.
+    #[test]
+    fn validate_allows_unknown_detail_placeholder_with_warning() {
+        let toml = r#"
+[watch.detail]
+template = "{nope} {last_prompt}"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_ok());
+        cfg.warn_soft_issues();
+        assert_eq!(cfg.watch.detail.template, "{nope} {last_prompt}");
+    }
+
+    /// The placeholder scanner must accept every name the renderer knows
+    /// about — otherwise a perfectly legal default template would warn.
+    #[test]
+    fn unknown_detail_placeholders_recognizes_default_template() {
+        // Default template uses a pipe fallback; both names are legal.
+        let unknown = unknown_detail_placeholders("{last_response|last_prompt}");
+        assert!(unknown.is_empty(), "got {unknown:?}");
+    }
+
+    /// `unknown_detail_placeholders` must flag each unknown name in a
+    /// pipe chain individually, not just the first.
+    #[test]
+    fn unknown_detail_placeholders_flags_each_unknown_alternative() {
+        let unknown = unknown_detail_placeholders("{nope|also_nope|last_prompt}");
+        assert_eq!(unknown, vec!["nope".to_string(), "also_nope".to_string()]);
     }
 }
