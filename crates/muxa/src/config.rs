@@ -16,7 +16,7 @@ const DASHBOARD_TOKEN_ENV: &str = "MUXA_DASHBOARD_TOKEN";
 
 /// All known `[watch] columns` keys. Used at load time to warn on typos.
 const WATCH_COLUMN_KEYS: &[&str] = &[
-    "pane", "kind", "state", "model", "ctx", "cost", "prompt", "activity",
+    "pane", "kind", "state", "model", "ctx", "cost", "limits", "prompt", "activity",
 ];
 
 /// All known placeholder names accepted in `[watch.detail] template`. A
@@ -35,6 +35,9 @@ const WATCH_DETAIL_PLACEHOLDERS: &[&str] = &[
     "last_response",
     "last_notification",
     "cwd",
+    "rate_limit",
+    "rate_limit_resets_at",
+    "rate_limit_scope",
 ];
 
 /// Semantic validation errors raised by [`Config::validate`] — i.e. shapes
@@ -654,8 +657,9 @@ impl Default for WatchConfig {
 ///
 /// `template` is interpolated with `{name}` placeholders. Supported names:
 /// `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`,
-/// `last_prompt`, `last_response`, `last_notification`, `cwd`. Unknown placeholders are
-/// preserved verbatim.
+/// `last_prompt`, `last_response`, `last_notification`, `cwd`,
+/// `rate_limit`, `rate_limit_resets_at`, `rate_limit_scope`. Unknown
+/// placeholders are preserved verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DetailConfig {
