@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tracing::instrument` + structured `debug!`/`trace!` events on hot paths
+  (`Store::apply`, snapshot writes, reconciler ticks, IPC handlers, SSE
+  fanout). All fields are structured (no `format!` in hot paths).
+- `GET /api/metrics` JSON endpoint exposing agent counts, event/snapshot/
+  reconcile counters, and SSE subscriber count. Lock-free atomics in
+  `AppState`. Reuses the existing dashboard auth middleware. JSON shape
+  unstable until 1.0; `#[doc(hidden)]` at the crate root.
+- `events_received_per_sec_1m` deliberately omitted from the metrics
+  payload — accurate 1-minute rates need a ring buffer; operators can
+  compute rates from successive scrapes instead.
 - **Zellij CLI baseline** (`feat/zellij` branch). muxa now runs against
   zellij as a first-class host alongside tmux. The CLI baseline (no
   plugin install required) supports `muxa status`, `muxa watch`,
