@@ -326,12 +326,13 @@ impl Snapshotter {
                 if let Some(m) = &self.metrics {
                     m.record_snapshot_write(stats.elapsed);
                 }
-                // info-level: snapshot writes are rare (≤5/sec under
-                // sustained activity, far less at steady state), so
-                // emitting at info costs ~nothing in production while
-                // giving operators a useful "yes the disk path is
-                // working" signal.
-                info!(
+                // debug-level: the rate is config-bounded by
+                // `debounce_ms`, not code-bounded, so a small value
+                // could flood at info. Operators who want to see writes
+                // can opt in with `RUST_LOG=muxa=debug` — the
+                // `/api/metrics` endpoint exposes the counters at info
+                // anyway.
+                tracing::debug!(
                     elapsed_ms = u64::try_from(stats.elapsed.as_millis()).unwrap_or(u64::MAX),
                     bytes = stats.bytes,
                     agents = agents.len(),

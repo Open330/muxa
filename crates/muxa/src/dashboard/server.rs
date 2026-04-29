@@ -29,7 +29,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -47,6 +47,30 @@ use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
 /// that a stale connection drops within ~30s.
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// TTL for the cached `agents_by_state` histogram on `/api/metrics`.
+/// Recomputing the histogram requires a `store.snapshot().await` plus a
+/// full iteration of the registry, which contends with writers under
+/// load. One second is short enough that operators scraping at 1 Hz
+/// always see fresh-ish data and long enough to absorb burst scrapes.
+///
+/// TODO(perf): when we hit real perf issues, replace this with a
+/// per-state `AtomicU64` counter that's bumped/decremented in
+/// `Store::apply` on every state transition. A scrape then becomes
+/// `O(num_states)` atomic loads and the cache + mutex go away.
+const AGENTS_BY_STATE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Cached `agents_by_state` histogram with the wall-clock instant it
+/// was computed. Lives inside [`AppState`] behind a `tokio::sync::Mutex`
+/// so concurrent scrapes coalesce on a single recompute when the cache
+/// is stale, instead of every request taking the store snapshot lock.
+#[derive(Debug, Default)]
+struct AgentsByStateCache {
+    /// `None` until the first scrape populates it; subsequent scrapes
+    /// refresh in place. We don't pre-populate at construction because
+    /// it would force `AppState::new` to be `async`.
+    value: Option<(Instant, BTreeMap<String, u64>, u64)>,
+}
+
 /// Application state shared by every handler. Cheap to clone (all
 /// fields are `Arc`-flavoured) so axum's `State` extractor copies
 /// freely.
@@ -59,6 +83,10 @@ pub struct AppState {
     /// from the [`Store`](crate::state::Store)'s metrics so SSE
     /// connect/disconnect bumps live alongside event-apply bumps.
     pub metrics: Metrics,
+    /// 1-second cache for the `agents_by_state` histogram. See the
+    /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
+    /// and the eventual plan to replace this with per-state atomics.
+    agents_by_state_cache: Arc<tokio::sync::Mutex<AgentsByStateCache>>,
 }
 
 impl AppState {
@@ -74,6 +102,7 @@ impl AppState {
             config,
             pane_cache,
             metrics,
+            agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
         }
     }
 }
@@ -233,10 +262,37 @@ struct MetricsResponse {
 #[tracing::instrument(level = "debug", skip(state))]
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let snap = state.metrics.snapshot();
-    // Compute per-state agent counts on demand. Cheap — the registry
-    // is bounded (tens to low hundreds of entries) and the read lock
-    // is contended only during a write, which the snapshot path takes
-    // briefly.
+    let (agents_by_state, agents_total) = agents_by_state_cached(&state).await;
+
+    Json(MetricsResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: snap.uptime_secs,
+        agents_total,
+        agents_by_state,
+        events_received_total: snap.events_received_total,
+        snapshot_writes_total: snap.snapshot_writes_total,
+        snapshot_last_write_elapsed_ms: snap.snapshot_last_write_elapsed_ms,
+        reconcile_passes_total: snap.reconcile_passes_total,
+        sse_subscribers_current: snap.sse_subscribers_current,
+    })
+}
+
+/// Read the cached `agents_by_state` histogram, recomputing if the
+/// entry is missing or older than [`AGENTS_BY_STATE_CACHE_TTL`].
+/// Returns the histogram and the agent total it was derived from so
+/// both numbers come from the same `store.snapshot()` call (avoids the
+/// histogram-and-total drifting against each other across a race).
+async fn agents_by_state_cached(state: &AppState) -> (BTreeMap<String, u64>, u64) {
+    let mut guard = state.agents_by_state_cache.lock().await;
+    if let Some((at, hist, total)) = guard.value.as_ref() {
+        if at.elapsed() < AGENTS_BY_STATE_CACHE_TTL {
+            return (hist.clone(), *total);
+        }
+    }
+    // Cache miss or stale — recompute from the store. The registry is
+    // bounded (tens to low hundreds of entries) so the iteration is
+    // cheap; the cache exists to keep the `store.snapshot().await`
+    // read lock from being taken on every scrape.
     let agents = state.store.snapshot().await;
     let agents_total = u64::try_from(agents.len()).unwrap_or(u64::MAX);
     let mut agents_by_state: BTreeMap<String, u64> = BTreeMap::new();
@@ -257,18 +313,8 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     ] {
         agents_by_state.entry(s.to_string()).or_insert(0);
     }
-
-    Json(MetricsResponse {
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_secs: snap.uptime_secs,
-        agents_total,
-        agents_by_state,
-        events_received_total: snap.events_received_total,
-        snapshot_writes_total: snap.snapshot_writes_total,
-        snapshot_last_write_elapsed_ms: snap.snapshot_last_write_elapsed_ms,
-        reconcile_passes_total: snap.reconcile_passes_total,
-        sse_subscribers_current: snap.sse_subscribers_current,
-    })
+    guard.value = Some((Instant::now(), agents_by_state.clone(), agents_total));
+    (agents_by_state, agents_total)
 }
 
 /// Live SSE stream of state transitions.
@@ -296,12 +342,11 @@ async fn events_handler(
     let rx = state.store.subscribe();
     let snapshot = state.store.snapshot().await;
 
-    // Bump the live-subscriber gauge on connect and emit at info — SSE
-    // connects are rare-ish (once per dashboard tab open) and operators
-    // want to see them even at the default log level. The matching
-    // disconnect bump is wired below via `SubscriberGuard`.
-    let after = state.metrics.sse_connect();
-    tracing::info!(subscribers = after, "sse.connect");
+    // Construct the `SubscriberGuard` *first* so the connect bump and
+    // matching disconnect bump are owned by the same RAII handle —
+    // `SubscriberGuard::new` increments, `Drop` decrements, and there's
+    // no third call site to drift out of sync with a future refactor.
+    let guard = SubscriberGuard::new(state.metrics.clone());
 
     let snapshot_event = SseEvent::default()
         .event("snapshot")
@@ -328,7 +373,6 @@ async fn events_handler(
     // whole stream in a `_guard` field makes the destructor's lifetime
     // tied to the connection's lifetime: when axum drops the SSE body
     // (the only stable handle to the connection), the guard runs.
-    let guard = SubscriberGuard::new(state.metrics.clone());
     let combined = stream::once(async move { snapshot_event })
         .chain(live)
         .map(Ok::<_, Infallible>);
@@ -374,7 +418,14 @@ struct SubscriberGuard {
 }
 
 impl SubscriberGuard {
+    /// Single source of truth for "is this subscriber accounted for?":
+    /// constructing the guard bumps the gauge, dropping it decrements.
+    /// SSE connects are rare-ish (once per dashboard tab open) and
+    /// operators want to see them even at the default log level — the
+    /// `info!` here is symmetric with the `info!` in `Drop`.
     fn new(metrics: Metrics) -> Self {
+        let after = metrics.sse_connect();
+        tracing::info!(subscribers = after, "sse.connect");
         Self { metrics }
     }
 }
