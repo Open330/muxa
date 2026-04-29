@@ -90,8 +90,8 @@ pub use error::{CoreError, Result};
 #[doc(hidden)]
 pub use history::{CompactReport, HistoryOptions};
 #[doc(hidden)]
+pub use metrics::{Metrics, MetricsSnapshot};
+#[doc(hidden)]
 pub use reconcile::{LivenessSource, Reconciler};
 #[doc(hidden)]
 pub use snapshot::{Snapshotter, SnapshotterOptions};
-#[doc(hidden)]
-pub use metrics::{Metrics, MetricsSnapshot};
