@@ -1783,6 +1783,12 @@ mod tests {
             model: model.map(Into::into),
             context_used_pct: ctx,
             cost_usd: cost,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
             started_at: now,
             last_activity_at: now,
         }

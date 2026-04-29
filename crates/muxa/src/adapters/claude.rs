@@ -175,6 +175,10 @@ pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> Age
         model: input.model.and_then(|m| m.display_name),
         context_used_pct: input.context_window.and_then(|c| c.used_percentage),
         cost_usd: input.cost.and_then(|c| c.total_cost_usd),
+        rate_limit_5h_pct: None,
+        rate_limit_5h_resets_at: None,
+        rate_limit_7d_pct: None,
+        rate_limit_7d_resets_at: None,
         at: OffsetDateTime::now_utc(),
     }
 }

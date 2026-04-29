@@ -537,6 +537,12 @@ async fn enrich_from_history(
             model: entry.model,
             context_used_pct: None,
             cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
             started_at: entry.at,
             last_activity_at: entry.at,
         });
