@@ -129,6 +129,20 @@ impl<L: LivenessSource> Reconciler<L> {
 
 #[cfg(test)]
 mod tests {
+    //! Reconciler test scope.
+    //!
+    //! Synthetic-to-real promotion happens at apply-time inside
+    //! `Store::apply` (real `Started` evicts a synthetic on the same pane
+    //! before the row ever reaches the registry's persistent state) — it is
+    //! NOT a `reconcile_once` responsibility. That contract is covered by
+    //! `state.rs::tests::real_started_replaces_synthetic_on_same_pane`, so
+    //! we deliberately do not duplicate it here.
+    //!
+    //! What this module DOES cover for the reconciler:
+    //! - reaping rows whose pane is no longer alive,
+    //! - collapsing duplicate real rows on the same live pane,
+    //! - demoting orphan synthetics that somehow coexist with a real row
+    //!   (defense-in-depth, planted via the public `Store::hydrate` seam).
     use super::*;
     use crate::event::{AgentEvent, AgentId, AgentKind};
     use crate::state::Store;
@@ -286,40 +300,14 @@ mod tests {
         assert_eq!(snap[0].session_id, "second");
     }
 
-    /// Synthetic placeholders from `muxa sync` must yield to a real hook
-    /// event for the same pane. `Store::apply` evicts the synthetic on
-    /// the real `Started`; a follow-up reconcile pass should be a no-op
-    /// — no demotion, no collapse, no reaping — proving the registry is
-    /// already converged once the real event lands.
-    #[tokio::test]
-    async fn reconcile_once_observes_synthetic_to_real_promotion() {
-        let store = Store::shared();
-        let t0 = datetime!(2026-04-24 12:00:00 UTC);
-        let t1 = datetime!(2026-04-24 12:01:00 UTC);
-
-        // Discovery synthesizes a placeholder for pane %2.
-        store.apply(&started("synthetic-%2", "%2", t0)).await;
-        assert_eq!(store.snapshot().await.len(), 1);
-
-        // Real hook arrives — synthetic must be evicted at apply time.
-        store.apply(&started("real-sess", "%2", t1)).await;
-        let post_apply = store.snapshot().await;
-        assert_eq!(post_apply.len(), 1);
-        assert_eq!(post_apply[0].session_id, "real-sess");
-        assert!(store.by_session("synthetic-%2").await.is_none());
-
-        // A reconcile pass over the still-live pane must be a no-op.
-        let fake = FakeLiveness::new(vec![pane("%2")]);
-        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
-        let report = r.reconcile_once().await;
-        assert!(
-            report.is_noop(),
-            "post-promotion registry should already be converged: {report:?}",
-        );
-        let snap = store.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].session_id, "real-sess");
-    }
+    // NOTE: a previous revision of this file carried a
+    // `reconcile_once_observes_synthetic_to_real_promotion` test that
+    // asserted a noop reconcile pass after a real `Started` had already
+    // evicted a synthetic at apply-time. It was a tautology — promotion
+    // is a `Store::apply` responsibility, not a `reconcile_once` one — and
+    // is now covered honestly by
+    // `state.rs::tests::real_started_replaces_synthetic_on_same_pane`. See
+    // the module-level comment above for the reconciler's actual scope.
 
     /// Defense-in-depth: even if a synthetic somehow ends up coexisting
     /// with a real entry on the same pane (e.g. an order-of-arrival edge
