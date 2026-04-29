@@ -1,3 +1,7 @@
+//! **Internal:** this module's items are `#[doc(hidden)]` — they're
+//! `pub` for the workspace binaries (`muxad`) but excluded from
+//! the public API surface and semver-exempt.
+//!
 //! Periodic reconciliation against ground truth.
 //!
 //! The agent registry is event-driven: it accumulates state from hook

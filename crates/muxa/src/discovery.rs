@@ -1,3 +1,7 @@
+//! **Internal:** this module's items are `#[doc(hidden)]` — they're
+//! `pub` for the workspace binaries (`muxad`) but excluded from
+//! the public API surface and semver-exempt.
+//!
 //! Backfill discovery: scan host panes and synthesize `Started` events for
 //! agent processes the daemon doesn't know about yet.
 //!

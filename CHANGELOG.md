@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one-keystroke toggle (`c`) away, and `[watch.preview]
   default_content = "prompt_response"` opts back into the previous
   default for users on text-focused workflows.
+- Tighten public API surface for the upcoming beta. Internal task
+  wiring (`Snapshotter`, `Reconciler`, discovery helpers) is now
+  `#[doc(hidden)]` — still callable from the workspace bins, but
+  excluded from rustdoc and treated as semver-exempt. The stable
+  surface is `Config`, `Error`, `Agent`, `Store`/`SharedStore`,
+  `Transition`, `ReconcileReport`, `PromptRecord`, `PromptHistory`,
+  `HistoryEntry`, `AgentEvent`/`AgentId`/`AgentKind`/`AgentState`,
+  `NotificationLevel`, plus the `PaneBackend`/`HostKind` family.
+  `PROTOCOL_VERSION` / `HISTORY_SCHEMA_VERSION` / `STATE_SCHEMA_VERSION`
+  remain pub but are documented as unstable wire formats.
 
 ### Removed
 
