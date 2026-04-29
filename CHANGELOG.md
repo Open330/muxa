@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-29
+
+First **beta** release. Pan-agent observability across Claude Code,
+Codex, and Gemini CLI is feature-complete; APIs are stabilizing but
+minor breaking changes are still possible until 1.0. opencode
+integration deferred — see [#14](https://github.com/Open330/muxa/issues/14).
+
 ### Added
 
 - `tracing::instrument` + structured `debug!`/`trace!` events on hot paths
@@ -221,6 +228,7 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Open330/muxa/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Open330/muxa/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Open330/muxa/releases/tag/v0.1.0
