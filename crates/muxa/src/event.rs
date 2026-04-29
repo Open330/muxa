@@ -173,7 +173,7 @@ pub enum AgentEvent {
     /// from `Heartbeat` so the watch UI can flip the row red and the
     /// notifier can wake the user. `resets_at` is best-effort: present
     /// when the source carries it (statusline, transcript message),
-    /// `None` when not (StopFailure 429).
+    /// `None` when not (`StopFailure` 429).
     RateLimited {
         id: AgentId,
         scope: RateLimitScope,

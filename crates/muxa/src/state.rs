@@ -13,9 +13,7 @@
 //! by the daemon's desktop-notifier task to wake users when an agent moves
 //! into `WaitingInput` or `Error`.
 
-use crate::event::{
-    AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope,
-};
+use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope};
 use crate::history::{HistoryEntry, HistoryOptions, PromptHistory};
 use crate::metrics::Metrics;
 use crate::tmux::PaneInfo;
@@ -100,7 +98,7 @@ pub struct Agent {
     /// the same row (a fresh session means the wall has been cleared)
     /// or rendered as elapsed by the watch UI once `now > resets_at`.
     /// `None` when no limit hit has been observed, or when the source
-    /// (e.g., StopFailure 429) didn't carry a reset time.
+    /// (e.g., `StopFailure` 429) didn't carry a reset time.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -374,74 +372,81 @@ fn mutate_for_event(
         AgentEvent::SessionEnded { .. } => {
             agent.state = AgentState::Stopped;
         }
-        AgentEvent::Heartbeat {
-            model,
-            context_used_pct,
-            cost_usd,
-            rate_limit_5h_pct,
-            rate_limit_5h_resets_at,
-            rate_limit_7d_pct,
-            rate_limit_7d_resets_at,
-            ..
-        } => {
-            if let Some(m) = model {
-                agent.model = Some(m.clone());
-            }
-            if let Some(p) = context_used_pct {
-                agent.context_used_pct = Some(*p);
-            }
-            if let Some(c) = cost_usd {
-                agent.cost_usd = Some(*c);
-            }
-            if let Some(p) = rate_limit_5h_pct {
-                agent.rate_limit_5h_pct = Some(*p);
-            }
-            if let Some(t) = rate_limit_5h_resets_at {
-                agent.rate_limit_5h_resets_at = Some(*t);
-            }
-            if let Some(p) = rate_limit_7d_pct {
-                agent.rate_limit_7d_pct = Some(*p);
-            }
-            if let Some(t) = rate_limit_7d_resets_at {
-                agent.rate_limit_7d_resets_at = Some(*t);
-            }
-        }
-        AgentEvent::RateLimited {
-            scope,
-            source,
-            resets_at,
-            message,
-            ..
-        } => {
-            agent.rate_limit_scope = Some(*scope);
-            // Only update `rate_limited_until` when the source carries
-            // one — a `StopFailure` 429 has no reset timestamp, but we
-            // still want to mark the row as capped. In that case keep
-            // any prior `resets_at` we'd already learned from a richer
-            // source (statusline, transcript) rather than blanking it.
-            if resets_at.is_some() {
-                agent.rate_limited_until = *resets_at;
-            } else if agent.rate_limited_until.is_none() {
-                // No prior reset known and none in this event — leave
-                // `None`; the UI renders a generic "rate limited" badge.
-                agent.rate_limited_until = None;
-            }
-            if let Some(m) = message {
-                agent.last_notification = Some(m.clone());
-            }
-            // Tag the source on a debug span so log scrapers can pivot
-            // on which signal first surfaced the cap.
-            tracing::debug!(
-                source = ?source,
-                scope = ?scope,
-                resets_at = ?resets_at,
-                "rate_limited event applied",
-            );
-            agent.state = AgentState::Error;
-        }
+        AgentEvent::Heartbeat { .. } => apply_heartbeat(agent, ev),
+        AgentEvent::RateLimited { .. } => apply_rate_limited(agent, ev),
     }
 
     (prompt_record, history_entry)
+}
+
+/// Copy the model/cost/limit fields from a `Heartbeat` onto the agent
+/// row. Each field is independently optional — adapters may emit some
+/// without others, and absent fields preserve the row's prior value.
+fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
+    let AgentEvent::Heartbeat {
+        model,
+        context_used_pct,
+        cost_usd,
+        rate_limit_5h_pct,
+        rate_limit_5h_resets_at,
+        rate_limit_7d_pct,
+        rate_limit_7d_resets_at,
+        ..
+    } = ev
+    else {
+        return;
+    };
+    if let Some(m) = model {
+        agent.model = Some(m.clone());
+    }
+    if let Some(p) = context_used_pct {
+        agent.context_used_pct = Some(*p);
+    }
+    if let Some(c) = cost_usd {
+        agent.cost_usd = Some(*c);
+    }
+    if let Some(p) = rate_limit_5h_pct {
+        agent.rate_limit_5h_pct = Some(*p);
+    }
+    if let Some(t) = rate_limit_5h_resets_at {
+        agent.rate_limit_5h_resets_at = Some(*t);
+    }
+    if let Some(p) = rate_limit_7d_pct {
+        agent.rate_limit_7d_pct = Some(*p);
+    }
+    if let Some(t) = rate_limit_7d_resets_at {
+        agent.rate_limit_7d_resets_at = Some(*t);
+    }
+}
+
+/// Mark the agent as currently capped. `resets_at = None` means the
+/// source (e.g., `StopFailure` 429) didn't carry a reset time — keep
+/// any prior value learned from a richer source rather than blanking it.
+fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
+    let AgentEvent::RateLimited {
+        scope,
+        source,
+        resets_at,
+        message,
+        ..
+    } = ev
+    else {
+        return;
+    };
+    agent.rate_limit_scope = Some(*scope);
+    if resets_at.is_some() {
+        agent.rate_limited_until = *resets_at;
+    }
+    if let Some(m) = message {
+        agent.last_notification = Some(m.clone());
+    }
+    tracing::debug!(
+        source = ?source,
+        scope = ?scope,
+        resets_at = ?resets_at,
+        "rate_limited event applied",
+    );
+    agent.state = AgentState::Error;
 }
 
 /// Reconcile pane occupants for an incoming `Started` event.
