@@ -19,9 +19,11 @@ required credentials.
 
 [oh-my-prompt](https://github.com/jiunbae/oh-my-prompt) (omp) is a small
 self-hostable service that stores prompts from coding-agent CLIs for
-search and analytics. muxa already watches the same agent set
-(Claude Code, Codex, Gemini CLI, OpenCode), so the sink ships the
-prompts it's already capturing — omp owns history, muxa owns realtime.
+search and analytics. muxa already watches the same three-adapter set
+(Claude Code, Codex, Gemini CLI), so the sink ships the prompts it's
+already capturing — omp owns history, muxa owns realtime. opencode
+integration is deferred — see the README's Agent support table for
+status.
 
 ### What leaves the box
 

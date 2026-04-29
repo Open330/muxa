@@ -10,7 +10,6 @@ See which agents are working, waiting, or idle — right from your status line, 
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
-![tests](https://img.shields.io/badge/tests-262%20green-brightgreen)
 
 **English** · [한국어](README.ko.md)
 
@@ -44,7 +43,7 @@ via `MUXA_HOST=tmux|zellij`.
 
 > [!IMPORTANT]
 > Beta. Event ingest, three adapters (Claude/Codex/Gemini), daemon, CLI, live TUI,
-> and desktop notifications work end-to-end with 262 tests green. APIs are stabilizing
+> and desktop notifications work end-to-end with all tests green. APIs are stabilizing
 > but minor breaking changes still possible until 1.0. opencode integration deferred.
 
 ## Contents
@@ -86,7 +85,7 @@ via `MUXA_HOST=tmux|zellij`.
 | Claude Code         | ✓ shell hooks + status-line Heartbeat              | `~/.claude/settings.json`   |
 | OpenAI Codex        | ✓ shell hooks (Claude-protocol clone upstream)     | `~/.codex/config.toml`      |
 | Google Gemini CLI   | ✓ shell hooks (Claude-compatible upstream)         | `~/.gemini/settings.json`   |
-| opencode            | not yet supported — see [tracking](https://github.com/Open330/muxa/issues) | —                           |
+| opencode            | not yet supported — see [tracking](https://github.com/Open330/muxa/issues/14) | —                           |
 
 ## Quickstart for Agents
 

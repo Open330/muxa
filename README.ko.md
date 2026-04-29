@@ -10,7 +10,6 @@
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
-![tests](https://img.shields.io/badge/tests-262%20green-brightgreen)
 
 [English](README.md) · **한국어**
 
@@ -40,7 +39,7 @@ tmux를 포크하지 않습니다. tmux와는 tmux CLI를 통해, 각 에이전�
 
 > [!IMPORTANT]
 > 베타 단계입니다. 이벤트 인제스트, 어댑터 3종 (Claude/Codex/Gemini), 데몬, CLI,
-> 실시간 TUI, 데스크톱 알림이 모두 엔드투엔드로 동작하며 262개 테스트가 통과합니다.
+> 실시간 TUI, 데스크톱 알림이 모두 엔드투엔드로 동작하며 모든 테스트가 통과합니다.
 > API는 안정화 단계지만 1.0 전까지 minor breaking change 가능성은 남아 있습니다.
 > opencode 통합은 보류되었습니다.
 
@@ -81,7 +80,7 @@ tmux를 포크하지 않습니다. tmux와는 tmux CLI를 통해, 각 에이전�
 | Claude Code         | ✓ 셸 훅 + status-line Heartbeat                    | `~/.claude/settings.json`   |
 | OpenAI Codex        | ✓ 셸 훅 (Claude 프로토콜 클론, 업스트림)           | `~/.codex/config.toml`      |
 | Google Gemini CLI   | ✓ 셸 훅 (Claude 호환, 업스트림)                    | `~/.gemini/settings.json`   |
-| opencode            | 아직 미지원 — [트래킹](https://github.com/Open330/muxa/issues) 참고 | —                           |
+| opencode            | 아직 미지원 — [트래킹](https://github.com/Open330/muxa/issues/14) 참고 | —                           |
 
 ## 에이전트로 빠르게 시작하기
 
