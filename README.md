@@ -19,12 +19,15 @@ See which agents are working, waiting, or idle — right from your status line, 
 ---
 
 `muxa` is a small daemon that watches agent CLIs — **Claude Code, OpenAI Codex,
-Google Gemini CLI, opencode** — running inside tmux panes and surfaces their
-state to the tmux status line, a live TUI dashboard, desktop notifications, and
-a thin CLI.
+Google Gemini CLI, opencode** — running inside terminal-multiplexer panes and
+surfaces their state to the multiplexer's status line, a live TUI dashboard,
+desktop notifications, and a thin CLI.
 
-It does **not** fork tmux. It talks to tmux via the tmux CLI and to each agent
-via that agent's own hook / event-emission system.
+It does **not** fork the multiplexer. It talks to **tmux** (default, full
+support) and **zellij** (CLI baseline; richer metadata via the muxa zellij
+plugin) via their respective CLIs, and to each agent via that agent's own
+hook / event-emission system. The host is auto-detected at startup or pinned
+via `MUXA_HOST=tmux|zellij`.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa demo — status table, tmux status-right glyphs, fullscreen watch TUI" width="900" />
@@ -618,6 +621,48 @@ Idempotent and safe to run on a timer; the cadence is a tuning knob,
 not a correctness one. Disable only when driving reconciliation
 externally (e.g. integration tests with a fake `LivenessSource`).
 
+### Zellij support
+
+muxa runs against **tmux** out of the box and **zellij** in a
+CLI-baseline mode that doesn't need any extra setup beyond the
+`muxa` and `muxad` binaries. Resolution honors `MUXA_HOST` first,
+then `$ZELLIJ`, then `$TMUX`.
+
+| Capability                | tmux | zellij CLI | zellij + plugin (planned) |
+| ------------------------- | :--: | :--------: | :-----------------------: |
+| `muxa status` agent table | ✅   | ✅         | ✅                        |
+| `muxa watch` picker       | ✅   | ✅ (no rich pane labels) | ✅ |
+| Press-Enter to jump       | ✅   | ✅          | ✅                        |
+| Discovery (auto-classify panes by command) | ✅ | ❌ | ✅ |
+| Live pane preview (`p`+`c`) | ✅ | ❌ (zellij `dump-screen` requires focus) | ✅ |
+| Hook ancestry walk        | ✅   | ❌          | ✅                        |
+| Multi-server `/api/panes` | ✅   | n/a (single server) | n/a            |
+
+The unsupported zellij rows aren't broken — they're structurally
+gated. `muxa watch` hides the live-preview affordance (`c` is a
+no-op) and the auto-discovery synthesizes nothing on zellij CLI;
+agents still flow through the regular hook → daemon → status path
+because the hook adapter reads `$ZELLIJ_PANE_ID` the same way it
+reads `$TMUX_PANE`.
+
+The forthcoming **muxa zellij plugin** (Rust → WASM) closes every
+remaining row of the table by subscribing to zellij's plugin-API
+`PaneUpdate`/`TabUpdate` events and pushing snapshots to the
+daemon. Tracking issue / branch: `feat/zellij-plugin` (not yet
+landed).
+
+To pin the host explicitly — useful for nested setups (e.g. zellij
+inside tmux, or `tmux new-session` from inside zellij) where
+auto-detect picks wrong:
+
+```sh
+export MUXA_HOST=zellij   # or "tmux"
+muxa watch
+```
+
+A starter zellij layout is at
+[`examples/muxa.zellij.kdl`](examples/muxa.zellij.kdl).
+
 <details>
 <summary>Environment variables</summary>
 
@@ -625,6 +670,7 @@ externally (e.g. integration tests with a fake `LivenessSource`).
 | -------------- | ------------------------------------------------------ |
 | `MUXA_SOCKET`  | Override the unix socket path.                         |
 | `MUXA_CONFIG`  | Override the config file path.                         |
+| `MUXA_HOST`    | Pin the pane backend: `tmux` or `zellij`. Wins over auto-detect. |
 | `RUST_LOG`     | Tracing filter. Example: `muxa=debug,tokio=warn`.      |
 | `NO_COLOR`     | Disable ANSI color in `muxa status`.                   |
 

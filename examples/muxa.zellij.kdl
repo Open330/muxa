@@ -1,0 +1,46 @@
+// Starter zellij layout for muxa users.
+//
+// Drop this into `~/.config/zellij/layouts/muxa.kdl` and run
+// `zellij --layout muxa` to launch a session pre-wired with:
+//   * an agent pane on the left (where you'll run `claude`, `codex`, …)
+//   * a `muxa watch` pane on the right that shows the live agent table
+//
+// muxa's CLI baseline runs against zellij with no plugin install:
+// `muxa watch` will list panes once agents start hooking events, and
+// pressing `Enter` jumps to the selected pane via
+// `zellij action focus-pane-with-id`.
+//
+// To pin the host explicitly (useful for nested setups, e.g. zellij
+// inside tmux), export `MUXA_HOST=zellij` before launching zellij.
+//
+// Future: once the muxa zellij plugin (`muxa-zellij-plugin.wasm`,
+// shipped from `feat/zellij-plugin`) is published, replace this layout
+// with one that loads the plugin so pane-level metadata (foreground
+// command, screen capture, pid map) flows back to the daemon. The
+// plugin is purely additive — this layout keeps working unchanged
+// after install, you'll just see richer rows in `muxa watch`.
+
+layout {
+    default_tab_template {
+        children
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="muxa" {
+        pane split_direction="vertical" {
+            // Left: 60% width, where you launch agents.
+            pane name="agent" size="60%" {
+                command "bash"
+            }
+            // Right: 40% width, live agent table. Refreshes at 2 Hz.
+            // `muxa watch` reads $ZELLIJ_PANE_ID to land the cursor on
+            // the agent pane when it has activity to show.
+            pane name="muxa watch" {
+                command "muxa"
+                args "watch"
+            }
+        }
+    }
+}

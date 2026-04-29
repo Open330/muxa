@@ -25,7 +25,7 @@ use crossterm::terminal::{
 use muxa::config::{WatchConfig, WatchSortKey, WidthSpec};
 use muxa::ipc::{Client, RuntimeError};
 use muxa::state::Agent;
-use muxa::tmux::{self, PaneInfo};
+use muxa::tmux::PaneInfo;
 use muxa::AgentState;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -680,18 +680,18 @@ pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
     app.set_data(outcome.agents, outcome.panes);
 }
 
-/// Compute one refresh outcome: tmux pane inventory (off-runtime via
-/// `spawn_blocking`) plus a daemon snapshot. Kept independent of `App` so
-/// the work can run on a worker thread without holding any UI state.
-async fn compute_refresh(client: &Client) -> RefreshOutcome {
-    // tmux pane inventory is independent of the daemon — fetch it even
-    // when muxad is down so `muxa watch` stays useful as a session picker.
-    // `tmux::list_panes` shells out (~few ms) and must NOT run on a tokio
-    // worker — that's the whole point of this refactor.
-    let panes = tokio::task::spawn_blocking(tmux::list_panes)
+/// Compute one refresh outcome: pane inventory from the active backend
+/// (off-runtime via `spawn_blocking` so any shell-out doesn't block the
+/// runtime) plus a daemon snapshot. Kept independent of `App` so the
+/// work can run on a worker thread without holding any UI state.
+async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> RefreshOutcome {
+    // Pane inventory is independent of the daemon — fetch it even when
+    // muxad is down so `muxa watch` stays useful as a session picker.
+    // The backend's `list_panes` may shell out (tmux) or hit a cache
+    // (zellij + plugin); either way it MUST NOT run on a tokio worker.
+    let backend_for_blocking = backend.clone();
+    let panes = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes())
         .await
-        .ok()
-        .and_then(Result::ok)
         .unwrap_or_default();
 
     match client.snapshot().await {
@@ -765,25 +765,33 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     let mut guard = TerminalGuard::new(terminal);
 
     let mut app = App::with_config(watch_cfg);
-    // When invoked from inside tmux, land the cursor on the user's current
-    // pane on first load instead of always row 0.
-    app.set_initial_pane(tmux::current_pane());
+    // Resolve the host once at startup — same Arc threads through the
+    // priming refresh, the background task, and the live capture path.
+    let backend: muxa::SharedBackend = muxa::default_backend();
+
+    // When invoked from inside a host (tmux / zellij), land the cursor
+    // on the user's current pane on first load instead of always
+    // row 0.
+    app.set_initial_pane(backend.current_pane());
 
     // Prime the initial snapshot so the first frame already has data —
     // otherwise the user sees an empty table for ~one tick.
-    apply_outcome(&mut app, compute_refresh(client).await);
+    apply_outcome(&mut app, compute_refresh(client, &backend).await);
 
     // Background refresh task owns its own Client clone so the borrowed
     // `client: &Client` doesn't have to outlive the task. The clone is
     // cheap (a single `PathBuf`) and avoids needing an `Arc`/lifetime
-    // wrapper for what is effectively immutable data.
+    // wrapper for what is effectively immutable data. The backend is
+    // already an `Arc<dyn …>` so cloning it is just a refcount bump.
     let bg_client = client.clone();
+    let bg_backend = backend.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
     let bg = tokio::spawn(refresh_task(
         move || {
             let client = bg_client.clone();
-            async move { compute_refresh(&client).await }
+            let backend = bg_backend.clone();
+            async move { compute_refresh(&client, &backend).await }
         },
         wake_rx,
         outcome_tx,
@@ -897,27 +905,27 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         }
 
         // Live pane capture: when the preview is open in LivePane
-        // mode and the cache is missing or stale (>500 ms), shell out
-        // to `tmux capture-pane -ep -t <pane>` on a worker thread.
-        // Bounded by the existing 500 ms TTL so we never fork more
-        // than ~2 Hz, regardless of how fast the input loop spins.
+        // mode and the cache is missing or stale (>500 ms), call into
+        // the active backend on a worker thread. Bounded by the
+        // existing 500 ms TTL so we never fork more than ~2 Hz,
+        // regardless of how fast the input loop spins. Capability-
+        // gated: backends that report `caps().capture_pane == false`
+        // (zellij CLI today) skip the call and the renderer shows a
+        // "(not supported)" placeholder.
         if let Some(p) = &app.preview {
-            if p.content == PreviewContent::LivePane {
-                let stale = app
-                    .pane_capture
-                    .as_ref()
-                    .is_none_or(|c| {
-                        c.pane_id != p.pane_id
-                            || c.fetched_at.elapsed() >= Duration::from_millis(500)
-                    });
+            if p.content == PreviewContent::LivePane && backend.caps().capture_pane {
+                let stale = app.pane_capture.as_ref().is_none_or(|c| {
+                    c.pane_id != p.pane_id || c.fetched_at.elapsed() >= Duration::from_millis(500)
+                });
                 if stale {
                     let pane_id = p.pane_id.clone();
+                    let backend_for_blocking = backend.clone();
                     let captured = tokio::task::spawn_blocking(move || {
-                        muxa::tmux::capture_pane(&pane_id)
+                        backend_for_blocking.capture_pane(&pane_id)
                     })
                     .await
                     .ok()
-                    .and_then(Result::ok);
+                    .flatten();
                     app.pane_capture = Some(CapturedPane {
                         pane_id: p.pane_id.clone(),
                         text: captured.unwrap_or_default(),
@@ -1901,7 +1909,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
 
@@ -1948,7 +1956,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%1", "%2", "%10"]);
@@ -2003,7 +2011,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         // alpha: %11 (newer t2) before %10 (older t0); then beta: %21
@@ -2042,7 +2050,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%20", "%30", "%10"]);
@@ -2076,7 +2084,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         // Lexicographic — "%1" < "%200" < "%30" because '2' < '3'.
@@ -2090,7 +2098,7 @@ mod tests {
         // the live/stale split takes precedence.
         let now = OffsetDateTime::now_utc();
         let very_recent = now;
-        let older = now - time::Duration::hours(1);
+        let older_at = now - time::Duration::hours(1);
 
         let cfg = WatchConfig {
             sort: vec![WatchSortKey::Activity],
@@ -2100,7 +2108,7 @@ mod tests {
         app.set_data(
             vec![
                 fake_agent_at("stale-but-recent", "%999", very_recent),
-                fake_agent_at("live-but-older", "%10", older),
+                fake_agent_at("live-but-older", "%10", older_at),
             ],
             vec![fake_pane("%10", "main", 0, 0, "claude")],
         );
@@ -2110,7 +2118,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                _ => None,
+                WatchRow::BarePane(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%10", "%999"]);
@@ -3673,7 +3681,7 @@ mod tests {
                 pane_id: "%1".into(),
                 scroll: 0,
                 mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+                content: PreviewContent::PromptResponse,
             });
             let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
             assert!(
@@ -3691,7 +3699,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
 
         // j scrolls down by 1
@@ -3792,7 +3800,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
@@ -3828,7 +3836,7 @@ mod tests {
                 pane_id: pane,
                 scroll: 0,
                 mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+                content: PreviewContent::PromptResponse,
             });
         }
         assert_eq!(
@@ -3844,7 +3852,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
 
         // First `f` requests TogglePreviewMode; the run loop applies the
@@ -3891,7 +3899,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Fullscreen,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
@@ -3934,7 +3942,7 @@ mod tests {
     /// → `PromptResponse`. Geometry mode (popup vs fullscreen) is unaffected
     /// — the two axes compose. Scroll resets so the new content surface
     /// starts at the top instead of mid-line.
-    /// Overlay preset that opens to PromptResponse — used by tests that
+    /// Overlay preset that opens to `PromptResponse` — used by tests that
     /// want to pin the starting content axis instead of inheriting whatever
     /// the global default happens to be. Keeps test intent stable across
     /// future default flips.

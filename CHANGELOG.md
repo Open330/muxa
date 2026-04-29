@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Zellij CLI baseline** (`feat/zellij` branch). muxa now runs against
+  zellij as a first-class host alongside tmux. The CLI baseline (no
+  plugin install required) supports `muxa status`, `muxa watch`,
+  `muxa hook`, `muxa recap`, and Enter-to-jump via
+  `zellij action focus-pane-with-id`. Pane-classification discovery,
+  live pane preview, and hook ancestry walks are gated off via
+  `BackendCaps` until the WASM plugin lands in `feat/zellij-plugin`.
+- **`PaneBackend` trait + `Arc<dyn>` plumbing.** `crate::backend` now
+  hosts `PaneBackend`, `BackendCaps`, `HostKind`, `TmuxBackend`,
+  `ZellijBackend`, and a `default_backend()` constructor. Reconciler,
+  discovery, hook ancestry, watch refresh + live capture, daemon
+  enrichment, and the read-side CLI commands all consult the shared
+  backend instead of `crate::tmux::*` directly. `Arc<dyn PaneBackend>`
+  is itself a `PaneBackend` so the daemon constructs one at startup
+  and threads `.clone()`s without juggling lifetimes.
+- **`MUXA_HOST=tmux|zellij`** env override. Wins over auto-detect from
+  `$ZELLIJ` / `$TMUX` for nested-multiplexer setups.
+- **Hook adapter reads `$ZELLIJ_PANE_ID`** in addition to `$TMUX_PANE`.
+  Ancestry walk consults `caps().pane_pid_map` and skips on hosts
+  where the lookup is structurally unsupported.
+- **`examples/muxa.zellij.kdl`** layout starter for zellij users.
 - `muxa watch` preview popup gains a content-axis toggle (`c`): flip
   between the agent's last prompt + last response and a live snapshot
   of the tmux pane itself, captured via `tmux capture-pane -ep` and
@@ -34,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one-keystroke toggle (`c`) away, and `[watch.preview]
   default_content = "prompt_response"` opts back into the previous
   default for users on text-focused workflows.
+
+### Removed
+
+- `reconcile::TmuxLiveness` (back-compat shim with no remaining
+  callers). Backends are themselves `LivenessSource` via a blanket
+  impl on `PaneBackend`.
 
 ## [0.2.0] - 2026-04-28
 

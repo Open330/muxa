@@ -12,7 +12,7 @@ use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
-use muxa::reconcile::{Reconciler, TmuxLiveness};
+use muxa::reconcile::Reconciler;
 use muxa::sinks::OhMyPromptSink;
 use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
 use muxa::tmux::scanner::PaneCache;
@@ -116,6 +116,15 @@ async fn main() -> Result<()> {
     let history = build_history(&cfg, &shutdown_tx).await;
     let store = Store::shared_with_history(history.clone());
 
+    // One backend, shared across every consumer that previously spoke
+    // to tmux directly. Resolution honors `MUXA_HOST` then auto-detects
+    // from `ZELLIJ` / `TMUX`, falling back to `TmuxBackend` when no host
+    // is detectable. Cheap to clone — the underlying `Arc` lets the
+    // reconciler, discovery, enrichment, and snapshotter each hold a
+    // handle without contention.
+    let backend: muxa::SharedBackend = muxa::default_backend();
+    tracing::info!(host = %backend.kind(), "pane backend selected");
+
     // Rehydrate the agent registry from the previous run's snapshot, if
     // any. Done before the IPC server starts accepting events so no
     // adapter ingest can race a half-loaded store; before discovery so
@@ -124,16 +133,21 @@ async fn main() -> Result<()> {
     // spawns so the first save isn't a no-op overwrite of the file we
     // just read.
     hydrate_state(&cfg, &store).await;
+    // Capability-gated: enrichment classifies panes by foreground
+    // command, which the zellij CLI baseline doesn't expose. The
+    // function itself respects `caps()` so it's safe to always call;
+    // the explicit log line just makes the skip-on-zellij case
+    // legible in operator traces.
     // Then layer in any panes that have prompt history on disk but
     // aren't represented in state.json (typically because the previous
     // run died before its first debounce window). This recovers the
     // real `session_id` + `last_prompt` from prompts.ndjson, so the
     // operator sees rich rows for those panes immediately on restart
     // instead of `synthetic-%X` placeholders.
-    enrich_from_history(&store, &history).await;
+    enrich_from_history(&store, &history, &backend).await;
 
     spawn_gc_task(&store, &shutdown_tx);
-    spawn_reconciler_task(&cfg, &store, &shutdown_tx);
+    spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
     spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
 
     // The snapshotter listens on its own dedicated channel rather than
@@ -200,7 +214,7 @@ async fn main() -> Result<()> {
     // tmux panes from before the daemon (re)started. Configurable; default
     // on. Does not block server readiness — spawned in the background.
     if listener_ready {
-        spawn_startup_discovery(&cfg, socket.clone());
+        spawn_startup_discovery(&cfg, socket.clone(), backend.clone());
     }
 
     // Shutdown sequence (each step depends on the previous):
@@ -367,14 +381,20 @@ fn spawn_reconciler_task(
     cfg: &Config,
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
+    backend: muxa::SharedBackend,
 ) {
     if !cfg.reconciler.enabled {
         tracing::info!("reconciler disabled by config");
         return;
     }
+    // The shared backend is what the rest of the daemon uses too —
+    // everyone agreeing on one host means the reconciler reaps panes
+    // by the same definition the watch loop, hook ancestry, and
+    // discovery do. `LivenessSource` reaches the reconciler via the
+    // blanket impl on `PaneBackend`.
     let runner = Reconciler::new(
         store.clone(),
-        TmuxLiveness,
+        backend,
         std::time::Duration::from_secs(cfg.reconciler.interval_secs),
     );
     let shutdown_rx = shutdown_tx.subscribe();
@@ -399,15 +419,8 @@ fn spawn_snapshotter_task(
         tracing::info!("state snapshot disabled by config");
         return None;
     }
-    let Some(path) = cfg
-        .state
-        .path
-        .clone()
-        .or_else(paths::default_state_file)
-    else {
-        tracing::warn!(
-            "state snapshot enabled but no path resolvable; restarts will lose state"
-        );
+    let Some(path) = cfg.state.path.clone().or_else(paths::default_state_file) else {
+        tracing::warn!("state snapshot enabled but no path resolvable; restarts will lose state");
         return None;
     };
     let opts = SnapshotterOptions {
@@ -432,12 +445,7 @@ async fn hydrate_state(cfg: &Config, store: &muxa::SharedStore) {
     if !cfg.state.enabled {
         return;
     }
-    let Some(path) = cfg
-        .state
-        .path
-        .clone()
-        .or_else(paths::default_state_file)
-    else {
+    let Some(path) = cfg.state.path.clone().or_else(paths::default_state_file) else {
         return;
     };
     let initial = snapshot::load(&path).await;
@@ -460,12 +468,21 @@ async fn hydrate_state(cfg: &Config, store: &muxa::SharedStore) {
 /// Skipped silently when tmux isn't available, when history is empty, or
 /// when state snapshotting is disabled (in which case we'd rather not
 /// resurrect agents the operator opted out of persisting).
-async fn enrich_from_history(store: &muxa::SharedStore, history: &Arc<PromptHistory>) {
-    use muxa::tmux;
+async fn enrich_from_history(
+    store: &muxa::SharedStore,
+    history: &Arc<PromptHistory>,
+    backend: &muxa::SharedBackend,
+) {
     if history.is_empty().await {
         return;
     }
-    let Ok(Ok(panes)) = tokio::task::spawn_blocking(tmux::list_panes).await else {
+    // Wrap the (potentially blocking) backend call so the runtime
+    // doesn't stall while tmux shells out. Cloning the `Arc` is the
+    // cheapest way to give `spawn_blocking`'s closure the `'static`
+    // handle it needs.
+    let backend_for_blocking = backend.clone();
+    let Ok(panes) = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes()).await
+    else {
         return;
     };
     if panes.is_empty() {
@@ -596,7 +613,7 @@ fn spawn_oh_my_prompt_sink(
 /// Returns `true` when a task was spawned. Extracted from `main` so tests
 /// can drive both branches of the `discovery.enabled` flag without having
 /// to spawn the real daemon.
-fn spawn_startup_discovery(cfg: &Config, socket: PathBuf) -> bool {
+fn spawn_startup_discovery(cfg: &Config, socket: PathBuf, backend: muxa::SharedBackend) -> bool {
     if !cfg.discovery.enabled {
         tracing::debug!("startup discovery disabled by config");
         return false;
@@ -608,7 +625,7 @@ fn spawn_startup_discovery(cfg: &Config, socket: PathBuf) -> bool {
         // delays the visible backfill needlessly.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let client = Client::new(socket);
-        match discovery::run_discovery(&client).await {
+        match discovery::run_discovery(&client, backend.as_ref()).await {
             Ok(report) => {
                 tracing::info!(
                     claude_code = report.claude_code,
@@ -636,7 +653,11 @@ mod tests {
             discovery: DiscoveryConfig { enabled: true },
             ..Config::default()
         };
-        let spawned = spawn_startup_discovery(&cfg, PathBuf::from("/tmp/never-bound.sock"));
+        let spawned = spawn_startup_discovery(
+            &cfg,
+            PathBuf::from("/tmp/never-bound.sock"),
+            muxa::default_backend(),
+        );
         assert!(spawned, "discovery should spawn when enabled");
     }
 
@@ -646,7 +667,11 @@ mod tests {
             discovery: DiscoveryConfig { enabled: false },
             ..Config::default()
         };
-        let spawned = spawn_startup_discovery(&cfg, PathBuf::from("/tmp/never-bound.sock"));
+        let spawned = spawn_startup_discovery(
+            &cfg,
+            PathBuf::from("/tmp/never-bound.sock"),
+            muxa::default_backend(),
+        );
         assert!(!spawned, "discovery must not spawn when disabled");
     }
 }

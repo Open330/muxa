@@ -201,9 +201,7 @@ impl Server {
         // Drain in-flight handlers with a bounded timeout. Closes the
         // lost-update window where a handler could call `Store::apply`
         // after the daemon's snapshotter has already exited.
-        let drain = async {
-            while handlers.join_next().await.is_some() {}
-        };
+        let drain = async { while handlers.join_next().await.is_some() {} };
         if tokio::time::timeout(HANDLER_DRAIN_TIMEOUT, drain)
             .await
             .is_err()
@@ -574,13 +572,10 @@ mod tests {
         // returning. The bounded timeout here is the test's deadline,
         // not the production drain timeout — we expect this to complete
         // in milliseconds.
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server_handle,
-        )
-        .await
-        .expect("server.run did not return after handler finished")
-        .expect("server task panicked");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+            .await
+            .expect("server.run did not return after handler finished")
+            .expect("server task panicked");
         outcome.expect("server.run returned an error");
 
         // The drained handler must have applied its event before

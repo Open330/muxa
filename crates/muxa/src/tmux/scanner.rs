@@ -11,6 +11,18 @@
 //! All `tmux` invocations carry a 1-second timeout — a hung server (e.g.
 //! a wedged `attach-session` losing the controlling terminal) cannot
 //! stall the dashboard.
+//!
+//! ## Zellij hosts
+//!
+//! Zellij is a single-server-per-user model with no multi-socket
+//! analog, so the dashboard's `/api/panes` route — which calls
+//! [`scan`] to populate its rows — naturally returns an empty result
+//! on a zellij-only host. Cross-host enumeration in the dashboard
+//! waits on the WASM plugin landing (the plugin is the only surface
+//! that exposes zellij pane metadata at all); until then the
+//! dashboard's panes view is tmux-only and the agents view (`/api/agents`,
+//! `/api/events`) is host-agnostic. This is intentional and matches
+//! the design doc's "Zellij has no multi-server enumeration" note.
 
 use crate::tmux::{parse_pane_lines, PaneInfo, PANE_FMT};
 use serde::Serialize;

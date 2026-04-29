@@ -36,13 +36,19 @@ pub trait HookAdapter {
 ///
 /// Reads stdin to EOF, parses as `A::Input`, normalizes to `AgentEvent`.
 ///
-/// `pane` resolution: prefer the `TMUX_PANE` env var (set by tmux for
-/// any process running inside a pane). When that's missing — most
-/// commonly because the hook fired from a Claude Code SDK sub-process
-/// whose env didn't inherit it — fall back to walking the process
-/// ancestry and matching against `tmux list-panes`'s `pane_pid` map.
-/// The fallback is best-effort: any failure (no tmux, /proc unreadable,
-/// no match) yields `pane: None` exactly as before.
+/// `pane` resolution, in order:
+/// 1. `$TMUX_PANE` (tmux sets this on every shell inside a pane).
+/// 2. `$ZELLIJ_PANE_ID` (zellij's analog).
+/// 3. Walk the parent-pid chain and match against the active backend's
+///    `pane_pid_map()`. Useful when a SDK sub-process didn't inherit
+///    the host env var. Skipped when the backend's `caps().pane_pid_map`
+///    reports the lookup is structurally unsupported (zellij CLI today)
+///    rather than transiently empty — saves a fruitless walk on every
+///    sub-process hook.
+///
+/// Any failure (no host, /proc unreadable, no match) yields
+/// `pane: None`. The daemon's IPC layer accepts paneless events; agent
+/// state still flows, the watch UI just hides them by default.
 pub fn run_hook<A, R>(event_flag: &str, stdin: &mut R) -> Result<AgentEvent, AdapterError>
 where
     A: HookAdapter,
@@ -52,21 +58,40 @@ where
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
-    let pane = std::env::var("TMUX_PANE")
-        .ok()
-        .or_else(resolve_pane_via_ancestry);
+    let pane = host_pane_env()
+        .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()));
     Ok(A::normalize(event, input, pane))
 }
 
-/// Walk our parent PID chain and look each ancestor up in the tmux
-/// pane-pid map. Returns the matching `pane_id` string when an
-/// ancestor is the shell of a known tmux pane.
+/// Read whichever host-set "this pane" env var is present, in
+/// `TMUX_PANE` then `ZELLIJ_PANE_ID` order. Empty string is treated as
+/// unset; see also `crate::backend::detect_host_env` for the host-
+/// selection precedence.
+fn host_pane_env() -> Option<String> {
+    for name in ["TMUX_PANE", "ZELLIJ_PANE_ID"] {
+        if let Ok(v) = std::env::var(name) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Walk our parent PID chain and look each ancestor up in the
+/// backend's pane-pid map. Returns the matching `pane_id` string
+/// when an ancestor is the shell of a known pane.
 ///
-/// Skips entirely when tmux returns no panes (no server running, etc).
-fn resolve_pane_via_ancestry() -> Option<String> {
+/// Skips entirely when the backend reports `caps().pane_pid_map ==
+/// false` — for zellij CLI-only the map is structurally never going
+/// to populate, so walking the chain is just `/proc` traffic for no
+/// reward. Tmux backends keep the existing behaviour.
+fn resolve_pane_via_ancestry(backend: &dyn crate::backend::PaneBackend) -> Option<String> {
     use crate::adapters::proc_ancestry::{ancestor_in_set, parent_pid};
-    use crate::tmux::pane_pid_map;
-    let pid_map = pane_pid_map();
+    if !backend.caps().pane_pid_map {
+        return None;
+    }
+    let pid_map = backend.pane_pid_map();
     if pid_map.is_empty() {
         return None;
     }

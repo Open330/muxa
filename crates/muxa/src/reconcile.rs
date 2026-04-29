@@ -29,7 +29,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::debug;
 
 use crate::state::{ReconcileReport, SharedStore};
-use crate::tmux::{self, PaneInfo};
+use crate::tmux::PaneInfo;
 
 /// Source of truth for which panes are currently alive.
 ///
@@ -38,21 +38,23 @@ use crate::tmux::{self, PaneInfo};
 /// own one inside a long-lived spawned task; `list_panes` is sync-blocking
 /// because the production impl shells out to `tmux` and the reconciler
 /// wraps the call in `spawn_blocking` itself.
+///
+/// Every [`PaneBackend`](crate::backend::PaneBackend) is automatically a
+/// `LivenessSource` via the blanket impl below — backends don't need to
+/// re-spell their `list_panes` for the reconciler. Tests that want to
+/// drive the reconciler with a hand-rolled fake can either implement
+/// `LivenessSource` directly (lightweight) or implement `PaneBackend`
+/// and inherit the blanket impl (more realistic).
 pub trait LivenessSource: Send + Sync + 'static {
     fn list_panes(&self) -> Vec<PaneInfo>;
 }
 
-/// Production [`LivenessSource`] backed by `tmux list-panes -a`.
-///
-/// Failures (no tmux server, command error) collapse to an empty vec —
-/// safer than panicking inside a background loop. An empty result lets the
-/// reconciler reap stale records aggressively if tmux is gone, which is
-/// usually what the user wants after a tmux crash.
-pub struct TmuxLiveness;
-
-impl LivenessSource for TmuxLiveness {
+/// Every pane backend is a liveness source. Saves every backend impl
+/// from repeating a one-line delegation, and keeps the reconciler
+/// integration colocated with the trait whose contract it leans on.
+impl<B: crate::backend::PaneBackend> LivenessSource for B {
     fn list_panes(&self) -> Vec<PaneInfo> {
-        tmux::list_panes().unwrap_or_default()
+        crate::backend::PaneBackend::list_panes(self)
     }
 }
 
