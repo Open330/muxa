@@ -422,8 +422,11 @@ Full operator guide — config reference, security model rationale, the
 ## Desktop notifications
 
 Opt in via config. On `*→WaitingInput` and `*→Error`, or `Working→Stopped`
-(task complete), `muxa` fires a native notification — libnotify on Linux,
-NSUserNotification on macOS, WinRT toast on Windows. Useful when an agent has
+(task complete), `muxa` fires a native notification via
+[`notify-rust`](https://crates.io/crates/notify-rust) — DBus / libnotify on
+Linux (verified in CI), NSUserNotification / UNUserNotificationCenter on
+macOS, WinRT toast on Windows. macOS and Windows paths compile-test only —
+please file an issue if your platform misbehaves. Useful when an agent has
 been crunching for 10 minutes and finally needs your attention.
 
 Enable in `~/.config/muxa/config.toml`:
