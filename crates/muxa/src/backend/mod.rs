@@ -312,7 +312,9 @@ mod tests {
     /// Helper that builds a `read` closure from a static lookup table.
     /// Tests pass `&[("TMUX", "1"), ...]`; missing keys read as
     /// `None`. Keeps the call sites short.
-    fn env_reader(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_reader(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
         move |name| {
             pairs
                 .iter()
@@ -448,7 +450,12 @@ mod tests {
             self.panes
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (u32::try_from(100 + i).unwrap_or(u32::MAX), p.pane_id.clone()))
+                .map(|(i, p)| {
+                    (
+                        u32::try_from(100 + i).unwrap_or(u32::MAX),
+                        p.pane_id.clone(),
+                    )
+                })
                 .collect()
         }
         fn current_pane(&self) -> Option<String> {
@@ -479,8 +486,7 @@ mod tests {
     /// `PaneBackend` breaks this test loudly.
     #[test]
     fn fake_backend_satisfies_trait_contract() {
-        let b: Box<dyn PaneBackend> =
-            Box::new(FakeBackend::with_panes(vec![fake_pane("zj-1")]));
+        let b: Box<dyn PaneBackend> = Box::new(FakeBackend::with_panes(vec![fake_pane("zj-1")]));
         assert_eq!(b.kind(), HostKind::Zellij);
         assert_eq!(b.list_panes().len(), 1);
         assert_eq!(b.resolve_pane("zj-1").unwrap().pane_id, "zj-1");

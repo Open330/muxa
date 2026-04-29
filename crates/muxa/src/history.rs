@@ -261,7 +261,7 @@ impl PromptHistory {
             .values()
             .flat_map(|d| d.iter().cloned())
             .collect();
-        all.sort_by(|a, b| b.at.cmp(&a.at));
+        all.sort_by_key(|e| std::cmp::Reverse(e.at));
         if limit > 0 {
             all.truncate(limit);
         }
@@ -618,7 +618,8 @@ mod tests {
         };
         let (tx, _) = broadcast::channel::<()>(1);
         let (h, writer) = PromptHistory::spawn(opts, tx.subscribe()).await.unwrap();
-        h.append(entry("%1", "p", datetime!(2026-04-28 0:00 UTC))).await;
+        h.append(entry("%1", "p", datetime!(2026-04-28 0:00 UTC)))
+            .await;
         // Quiesce so the writer has actually flushed the line to disk.
         let _ = tx.send(());
         let _ = writer.await;

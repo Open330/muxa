@@ -914,13 +914,9 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         // "(not supported)" placeholder.
         if let Some(p) = &app.preview {
             if p.content == PreviewContent::LivePane && backend.caps().capture_pane {
-                let stale = app
-                    .pane_capture
-                    .as_ref()
-                    .is_none_or(|c| {
-                        c.pane_id != p.pane_id
-                            || c.fetched_at.elapsed() >= Duration::from_millis(500)
-                    });
+                let stale = app.pane_capture.as_ref().is_none_or(|c| {
+                    c.pane_id != p.pane_id || c.fetched_at.elapsed() >= Duration::from_millis(500)
+                });
                 if stale {
                     let pane_id = p.pane_id.clone();
                     let backend_for_blocking = backend.clone();
@@ -3685,7 +3681,7 @@ mod tests {
                 pane_id: "%1".into(),
                 scroll: 0,
                 mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+                content: PreviewContent::PromptResponse,
             });
             let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
             assert!(
@@ -3703,7 +3699,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
 
         // j scrolls down by 1
@@ -3804,7 +3800,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
@@ -3840,7 +3836,7 @@ mod tests {
                 pane_id: pane,
                 scroll: 0,
                 mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+                content: PreviewContent::PromptResponse,
             });
         }
         assert_eq!(
@@ -3856,7 +3852,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Popup,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
 
         // First `f` requests TogglePreviewMode; the run loop applies the
@@ -3903,7 +3899,7 @@ mod tests {
             pane_id: "%1".into(),
             scroll: 0,
             mode: PreviewMode::Fullscreen,
-                    content: PreviewContent::PromptResponse,
+            content: PreviewContent::PromptResponse,
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
 

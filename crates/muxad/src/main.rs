@@ -419,15 +419,8 @@ fn spawn_snapshotter_task(
         tracing::info!("state snapshot disabled by config");
         return None;
     }
-    let Some(path) = cfg
-        .state
-        .path
-        .clone()
-        .or_else(paths::default_state_file)
-    else {
-        tracing::warn!(
-            "state snapshot enabled but no path resolvable; restarts will lose state"
-        );
+    let Some(path) = cfg.state.path.clone().or_else(paths::default_state_file) else {
+        tracing::warn!("state snapshot enabled but no path resolvable; restarts will lose state");
         return None;
     };
     let opts = SnapshotterOptions {
@@ -452,12 +445,7 @@ async fn hydrate_state(cfg: &Config, store: &muxa::SharedStore) {
     if !cfg.state.enabled {
         return;
     }
-    let Some(path) = cfg
-        .state
-        .path
-        .clone()
-        .or_else(paths::default_state_file)
-    else {
+    let Some(path) = cfg.state.path.clone().or_else(paths::default_state_file) else {
         return;
     };
     let initial = snapshot::load(&path).await;
@@ -625,11 +613,7 @@ fn spawn_oh_my_prompt_sink(
 /// Returns `true` when a task was spawned. Extracted from `main` so tests
 /// can drive both branches of the `discovery.enabled` flag without having
 /// to spawn the real daemon.
-fn spawn_startup_discovery(
-    cfg: &Config,
-    socket: PathBuf,
-    backend: muxa::SharedBackend,
-) -> bool {
+fn spawn_startup_discovery(cfg: &Config, socket: PathBuf, backend: muxa::SharedBackend) -> bool {
     if !cfg.discovery.enabled {
         tracing::debug!("startup discovery disabled by config");
         return false;

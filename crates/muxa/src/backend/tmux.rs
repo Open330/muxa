@@ -72,8 +72,7 @@ impl PaneBackend for TmuxBackend {
         Command::new("tmux")
             .args(["select-pane", "-t", pane_id])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 
     // `caps()` uses the default impl from the trait — tmux supports

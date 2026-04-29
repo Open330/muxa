@@ -93,10 +93,7 @@ impl PaneBackend for ZellijBackend {
         // RwLock poisoning collapses to "empty list" rather than
         // panicking on a hot path; the daemon already treats
         // host-down as ephemeral.
-        self.snapshot
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.snapshot.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
@@ -137,8 +134,7 @@ impl PaneBackend for ZellijBackend {
         Command::new("zellij")
             .args(["action", "focus-pane-with-id", pane_id])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 
     fn caps(&self) -> BackendCaps {
