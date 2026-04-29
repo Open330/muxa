@@ -408,7 +408,8 @@ fn spawn_reconciler_task(
         store.clone(),
         backend,
         std::time::Duration::from_secs(cfg.reconciler.interval_secs),
-    );
+    )
+    .with_metrics(store.metrics());
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(runner.run(shutdown_rx));
     tracing::info!(
@@ -439,7 +440,8 @@ fn spawn_snapshotter_task(
         path: path.clone(),
         debounce: std::time::Duration::from_millis(cfg.state.debounce_ms),
     };
-    let snapshotter = Snapshotter::new(store.clone(), store.dirty(), opts);
+    let snapshotter =
+        Snapshotter::new(store.clone(), store.dirty(), opts).with_metrics(store.metrics());
     let shutdown_rx = shutdown_tx.subscribe();
     let handle = tokio::spawn(snapshotter.run(shutdown_rx));
     tracing::info!(

@@ -42,6 +42,7 @@ pub mod error;
 pub mod event;
 pub mod history;
 pub mod ipc;
+pub mod metrics;
 pub mod notify;
 pub mod paths;
 pub mod reconcile;
@@ -92,3 +93,5 @@ pub use history::{CompactReport, HistoryOptions};
 pub use reconcile::{LivenessSource, Reconciler};
 #[doc(hidden)]
 pub use snapshot::{Snapshotter, SnapshotterOptions};
+#[doc(hidden)]
+pub use metrics::{Metrics, MetricsSnapshot};

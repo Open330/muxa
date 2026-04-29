@@ -24,7 +24,7 @@ use crate::state::{Agent, SharedStore};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -243,6 +243,7 @@ impl Server {
     }
 }
 
+#[tracing::instrument(level = "debug", skip(stream, store))]
 async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -259,8 +260,22 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
             continue;
         }
 
+        // Per-message timer. Start after the read so we don't bake
+        // client-side blocking time into the handler latency we're
+        // trying to measure. `Instant::now()` is a vDSO call on Linux
+        // — effectively free.
+        let started = Instant::now();
+        // Track which message kind we just dispatched so the timing
+        // line below can include it as a structured field. Initialised
+        // to a sentinel that every match arm overwrites — the
+        // assignment is preserved deliberately so an added arm that
+        // forgets to label itself shows up as `dispatch_unknown` in
+        // logs rather than mis-attributing the timing.
+        #[allow(unused_assignments)]
+        let mut kind: &'static str = "dispatch_unknown";
         let resp = match serde_json::from_str::<Request>(trimmed) {
             Ok(req) if req.protocol != 0 && req.protocol != PROTOCOL_VERSION => {
+                kind = "protocol_mismatch";
                 Response::err(format!(
                     "protocol mismatch: server={PROTOCOL_VERSION} client={}",
                     req.protocol
@@ -268,13 +283,21 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
             }
             Ok(req) => match req.body {
                 RequestBody::Ingest { event } => {
+                    kind = "ingest";
                     tracing::debug!(?event, "ingest");
                     store.apply(&event).await;
                     Response::ok()
                 }
-                RequestBody::Snapshot => Response::with_agents(store.snapshot().await),
-                RequestBody::ByPane { pane } => Response::with_agents(store.by_pane(&pane).await),
+                RequestBody::Snapshot => {
+                    kind = "snapshot";
+                    Response::with_agents(store.snapshot().await)
+                }
+                RequestBody::ByPane { pane } => {
+                    kind = "by_pane";
+                    Response::with_agents(store.by_pane(&pane).await)
+                }
                 RequestBody::BySession { session_id } => {
+                    kind = "by_session";
                     let v = store
                         .by_session(&session_id)
                         .await
@@ -283,20 +306,37 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                     Response::with_agents(v)
                 }
                 RequestBody::RecentPrompts { pane, limit } => {
+                    kind = "recent_prompts";
                     let prompts = store
                         .recent_prompts(pane.as_deref(), limit.unwrap_or(0))
                         .await;
                     Response::with_prompts(prompts)
                 }
-                RequestBody::Health => Response::health(),
+                RequestBody::Health => {
+                    kind = "health";
+                    Response::health()
+                }
             },
-            Err(e) => Response::err(format!("bad request: {e}")),
+            Err(e) => {
+                kind = "parse_error";
+                Response::err(format!("bad request: {e}"))
+            }
         };
 
         let mut bytes = serde_json::to_vec(&resp)?;
         bytes.push(b'\n');
         writer.write_all(&bytes).await?;
         writer.flush().await?;
+
+        // Per-message timing. `debug!` so it's filtered out by default
+        // (production: `info`); the field-style call defers any
+        // formatting until the subscriber actually wants the line.
+        tracing::debug!(
+            elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            kind,
+            ok = resp.ok,
+            "ipc.handle",
+        );
     }
 }
 
