@@ -1,3 +1,5 @@
+//! **Status:** not yet implemented. See README "Agent support" table.
+//!
 //! opencode — deferred.
 //!
 //! opencode does not expose a shell-hook surface. Its integration approach
