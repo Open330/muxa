@@ -63,6 +63,11 @@ use crate::event::AgentKind;
 
 /// On-disk schema version. Incremented when a future change makes older
 /// records unreadable; readers ignore lines with unknown `v`.
+///
+/// **Unstable wire format** — this value may change between minor releases
+/// when the persisted prompt-history record shape evolves. External readers
+/// should treat unknown `v` values as "skip" rather than pinning to a
+/// specific version.
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
 
 /// One persisted prompt. Fields are deliberately flat for grep-ability

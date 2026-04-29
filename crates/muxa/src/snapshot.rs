@@ -69,6 +69,11 @@ use crate::state::{Agent, SharedStore};
 /// On-disk schema version. Bump when an incompatible field shape lands;
 /// readers ignore files with an unknown `v` and start from empty rather
 /// than crashing the daemon on a malformed payload.
+///
+/// **Unstable wire format** — this value may change between minor releases
+/// when the persisted state snapshot shape evolves. External readers should
+/// treat unknown `v` values as "skip" rather than pinning to a specific
+/// version.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
 /// Wire format for the on-disk snapshot. Flat JSON so `jq` works without
