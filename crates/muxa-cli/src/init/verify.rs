@@ -17,7 +17,6 @@ use tokio::time::timeout;
 pub struct VerifyReport {
     pub muxad_responsive: Option<bool>,
     pub current_pane_seen: Option<bool>,
-    pub tmux_status_ok: Option<bool>,
     pub notes: Vec<String>,
 }
 
@@ -25,7 +24,6 @@ pub async fn run(plan: &Plan, socket: PathBuf) -> Result<VerifyReport> {
     let mut report = VerifyReport {
         muxad_responsive: None,
         current_pane_seen: None,
-        tmux_status_ok: None,
         notes: Vec::new(),
     };
 
@@ -38,14 +36,6 @@ pub async fn run(plan: &Plan, socket: PathBuf) -> Result<VerifyReport> {
         if report.muxad_responsive == Some(true) {
             report.current_pane_seen = Some(check_current_pane(socket.as_path()).await);
         }
-    }
-
-    let want_tmux = plan
-        .components
-        .iter()
-        .any(|c| matches!(c, Component::TmuxPopup | Component::TmuxStatusLine));
-    if want_tmux {
-        report.tmux_status_ok = Some(check_tmux_config_parses());
     }
 
     Ok(report)
@@ -81,32 +71,17 @@ async fn check_current_pane(socket: &Path) -> bool {
     )
 }
 
-/// Cheap parse-only check: `tmux start-server \; source-file -q ~/.tmux.conf`
-/// would actually evaluate it, but we just want to know syntax is OK.
-fn check_tmux_config_parses() -> bool {
-    use std::process::Command;
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    let path = home.join(".tmux.conf");
-    if !path.is_file() {
-        return false;
-    }
-    // `is_ok_and` would default to `false` on Err, but here we want
-    // the opposite — a missing tmux is "not our problem" and should
-    // not flag a config-syntax error. Explicit `match` keeps the
-    // intent obvious to a future reader.
-    match Command::new("tmux")
-        .args([
-            "-f",
-            path.to_str().unwrap_or(""),
-            "start-server",
-            ";",
-            "kill-server",
-        ])
-        .output()
-    {
-        Ok(o) => o.status.success(),
-        Err(_) => true,
-    }
-}
+// NOTE — `check_tmux_config_parses()` was removed in v0.4.1 after a
+// reported incident: the previous implementation shelled out to
+// `tmux -f <conf> start-server \; kill-server` which kills the
+// running tmux server on the *default* socket — i.e. the user's
+// real sessions. The `-f` flag scopes the config but NOT the
+// socket; isolating it would have required `-L <name>` / `-S <path>`.
+//
+// Given the catastrophic failure mode (silently wiping every session)
+// vs. the modest upside (a syntax check after a write we already
+// control end-to-end), we removed the check entirely instead of
+// trying to harden it. Users see the diff in the review step before
+// apply, our marker-block content is fixed, and `tmux source-file`
+// will surface any error itself when it runs. The "tmux config
+// syntax check" line in the final summary is gone too.
