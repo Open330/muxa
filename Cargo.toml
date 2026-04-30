@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -12,7 +12,7 @@ authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-muxa = { path = "crates/muxa", version = "0.4.1" }
+muxa = { path = "crates/muxa", version = "0.4.2" }
 
 # external
 anyhow = "1"

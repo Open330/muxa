@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-30
+
 ### Added
 
-- **`muxad-launchd` component** — macOS auto-start parity with the
+- **`muxad-launchd` component** (#19). — macOS auto-start parity with the
   Linux `muxad-systemd` component. `muxa init` writes
   `~/Library/LaunchAgents/dev.open330.muxad.plist`, then runs
   `launchctl bootstrap gui/<uid>` + `kickstart -k` so the agent is

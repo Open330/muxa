@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "muxa"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "dirs",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "muxad"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
