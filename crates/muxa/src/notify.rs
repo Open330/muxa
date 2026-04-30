@@ -153,6 +153,13 @@ mod tests {
             model: None,
             context_used_pct: None,
             cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
             started_at: datetime!(2026-04-24 12:00:00 UTC),
             last_activity_at: datetime!(2026-04-24 12:00:00 UTC),
         }

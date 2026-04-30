@@ -58,6 +58,38 @@ pub enum NotificationLevel {
     Error,
 }
 
+/// Which Claude Code rate-limit window was hit. Pro/Max plans expose two:
+/// a 5-hour rolling session window and a 7-day weekly window. Sources that
+/// don't distinguish (e.g., the `StopFailure` hook reports `error:"rate_limit"`
+/// without a window tag) emit [`RateLimitScope::Unknown`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitScope {
+    FiveHour,
+    SevenDay,
+    Unknown,
+}
+
+/// Which signal in the Claude Code surface uncovered the rate-limit hit.
+/// Tracked so operators can tell why a row went red and so log scrapers
+/// can pivot on the root cause.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitSource {
+    /// Picked up from the documented `rate_limits` object in Claude
+    /// Code's statusline JSON. Fires whenever the statusline refreshes,
+    /// so this is the primary "you're approaching / past the limit"
+    /// signal even before the user sees the in-TUI banner.
+    Statusline,
+    /// Picked up from the `StopFailure` hook firing with
+    /// `error == "rate_limit"`. Indicates an in-flight 429.
+    StopFailure,
+    /// Picked up by parsing the transcript JSONL — fallback for cases
+    /// the hooks didn't catch (e.g., older Claude Code versions, sub-agent
+    /// rate limits surfaced as `tool_result` text).
+    Transcript,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -114,6 +146,49 @@ pub enum AgentEvent {
         model: Option<String>,
         context_used_pct: Option<f32>,
         cost_usd: Option<f64>,
+        /// 5-hour rolling rate-limit window utilization (0–100), when the
+        /// adapter was able to read it. Optional + `#[serde(default)]` so
+        /// older peers stay wire-compatible and adapters that don't carry
+        /// the field (Codex/Gemini today) emit `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit_5h_pct: Option<f32>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "time::serde::rfc3339::option"
+        )]
+        rate_limit_5h_resets_at: Option<OffsetDateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit_7d_pct: Option<f32>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "time::serde::rfc3339::option"
+        )]
+        rate_limit_7d_resets_at: Option<OffsetDateTime>,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+    /// User has been told they've hit a usage cap — surfaced separately
+    /// from `Heartbeat` so the watch UI can flip the row red and the
+    /// notifier can wake the user. `resets_at` is best-effort: present
+    /// when the source carries it (statusline, transcript message),
+    /// `None` when not (`StopFailure` 429).
+    RateLimited {
+        id: AgentId,
+        scope: RateLimitScope,
+        source: RateLimitSource,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "time::serde::rfc3339::option"
+        )]
+        resets_at: Option<OffsetDateTime>,
+        /// Verbatim user-facing text from the source, when one exists
+        /// (e.g., transcript "You've hit your limit · resets 2:40pm
+        /// (Asia/Seoul)"). Useful for log lines and the dashboard tooltip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
@@ -129,7 +204,8 @@ impl AgentEvent {
             | Self::NotificationFired { id, .. }
             | Self::TurnStopped { id, .. }
             | Self::SessionEnded { id, .. }
-            | Self::Heartbeat { id, .. } => id,
+            | Self::Heartbeat { id, .. }
+            | Self::RateLimited { id, .. } => id,
         }
     }
 
@@ -142,7 +218,8 @@ impl AgentEvent {
             | Self::NotificationFired { at, .. }
             | Self::TurnStopped { at, .. }
             | Self::SessionEnded { at, .. }
-            | Self::Heartbeat { at, .. } => *at,
+            | Self::Heartbeat { at, .. }
+            | Self::RateLimited { at, .. } => *at,
         }
     }
 }

@@ -23,6 +23,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use muxa::config::{WatchConfig, WatchSortKey, WidthSpec};
+use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
 use muxa::state::Agent;
 use muxa::tmux::PaneInfo;
@@ -68,6 +69,7 @@ pub(crate) enum WatchColumn {
     Model,
     Ctx,
     Cost,
+    Limits,
     Prompt,
     Activity,
 }
@@ -83,6 +85,7 @@ impl WatchColumn {
             "model" => Self::Model,
             "ctx" => Self::Ctx,
             "cost" => Self::Cost,
+            "limits" => Self::Limits,
             "prompt" => Self::Prompt,
             "activity" => Self::Activity,
             _ => return None,
@@ -97,6 +100,7 @@ impl WatchColumn {
             Self::Model => "MODEL",
             Self::Ctx => "CTX%",
             Self::Cost => "COST$",
+            Self::Limits => "LIMITS",
             Self::Prompt => "LAST PROMPT",
             Self::Activity => "ACTIVITY",
         }
@@ -111,6 +115,11 @@ impl WatchColumn {
             Self::Model => Constraint::Length(16),
             Self::Ctx => Constraint::Length(5),
             Self::Cost => Constraint::Length(7),
+            // LIMITS — widest realistic payload is `⛔ 7d in 23h 59m`
+            // (~17 cells with a wide-cell emoji). Wider columns crowd the
+            // prompt; narrower ones clip the duration suffix on
+            // emoji-greedy fonts.
+            Self::Limits => Constraint::Length(18),
             Self::Prompt => Constraint::Min(20),
             Self::Activity => Constraint::Length(10),
         }
@@ -161,6 +170,7 @@ impl WatchColumn {
                 .cost_usd
                 .map_or_else(|| "-".into(), |c| format!("${c:.2}"))
                 .into(),
+            Self::Limits => limits_text(a, now),
             Self::Prompt => a
                 .last_prompt
                 .as_deref()
@@ -198,7 +208,7 @@ impl WatchColumn {
                 Text::from(Span::styled(summary, dim))
             }
             Self::Kind | Self::State => Text::from(Span::styled("—", dim)),
-            Self::Model | Self::Ctx | Self::Cost | Self::Activity => {
+            Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
                 Text::from(Span::styled("-", dim))
             }
         }
@@ -252,6 +262,7 @@ impl WatchColumn {
             Self::Model => "model",
             Self::Ctx => "ctx",
             Self::Cost => "cost",
+            Self::Limits => "limits",
             Self::Prompt => "prompt",
             Self::Activity => "activity",
         }
@@ -1578,6 +1589,28 @@ fn resolve_var(
             "last_response" => a.last_response.clone().unwrap_or_else(|| "—".into()),
             "last_notification" => a.last_notification.clone().unwrap_or_else(|| "—".into()),
             "cwd" => a.cwd.clone().unwrap_or_else(|| "—".into()),
+            "rate_limit" => limits_string(a, now),
+            // `rate_limit_resets_at` prefers an active cap's reset time
+            // (matches the badge the user sees), falling back to whichever
+            // window has utilisation data so the placeholder stays useful
+            // pre-cap.
+            "rate_limit_resets_at" => a
+                .rate_limited_until
+                .or(a.rate_limit_5h_resets_at)
+                .or(a.rate_limit_7d_resets_at)
+                .map_or_else(
+                    || "-".into(),
+                    |t| {
+                        t.format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_else(|_| t.to_string())
+                    },
+                ),
+            "rate_limit_scope" => match a.rate_limit_scope {
+                Some(RateLimitScope::FiveHour) => "5h".into(),
+                Some(RateLimitScope::SevenDay) => "7d".into(),
+                Some(RateLimitScope::Unknown) => "unknown".into(),
+                None => "-".into(),
+            },
             _ => return None,
         }),
         WatchRow::BarePane(p) => Some(match name {
@@ -1590,8 +1623,17 @@ fn resolve_var(
                     p.title.clone()
                 }
             }
-            "state" | "model" | "ctx" | "cost" | "activity" | "last_response"
-            | "last_notification" | "cwd" => "—".into(),
+            "state"
+            | "model"
+            | "ctx"
+            | "cost"
+            | "activity"
+            | "last_response"
+            | "last_notification"
+            | "cwd"
+            | "rate_limit"
+            | "rate_limit_resets_at"
+            | "rate_limit_scope" => "—".into(),
             _ => return None,
         }),
     }
@@ -1630,6 +1672,146 @@ fn resolve_var_chain(
         Some("—".into())
     } else {
         None
+    }
+}
+
+/// True when the agent is *currently* rate-limited from the renderer's
+/// point of view. Two sources can mark a row capped:
+///
+/// 1. `rate_limit_scope` set — every `RateLimited` event sets this,
+///    regardless of whether a reset timestamp was on the wire. Cleared
+///    on the next `Started`. This is the load-bearing signal: a
+///    `StopFailure` 429 carries no `resets_at`, so without this gate
+///    the user would see the row flip to `Error` but the LIMITS column
+///    stay blank.
+/// 2. `rate_limited_until` in the future — for sources that did carry
+///    a reset time, treat the cap as auto-expired once that moment
+///    passes (the daemon clears the field lazily on the next `Started`,
+///    but in-flight snapshots can still carry a stale value).
+///
+/// Logic: capped iff scope is set AND (no reset known OR reset is in
+/// the future).
+fn is_currently_capped(a: &Agent, now: OffsetDateTime) -> bool {
+    if a.rate_limit_scope.is_none() {
+        return false;
+    }
+    a.rate_limited_until.is_none_or(|until| until > now)
+}
+
+/// Plain-string form of the LIMITS column payload — used both by the
+/// styled cell renderer (`limits_text`) and the detail-line template's
+/// `{rate_limit}` placeholder. Returns `"-"` when no rate-limit info is
+/// known so the detail row reads like every other "no data" field.
+fn limits_string(a: &Agent, now: OffsetDateTime) -> String {
+    if is_currently_capped(a, now) {
+        return format!(
+            "⛔ {}",
+            format_cap_body(a.rate_limit_scope, a.rate_limited_until, now)
+        );
+    }
+    match (a.rate_limit_5h_pct, a.rate_limit_7d_pct) {
+        (Some(five), Some(seven)) => {
+            if seven > five {
+                format!("7d {seven:.0}%")
+            } else {
+                format!("5h {five:.0}%")
+            }
+        }
+        (Some(p), None) => format!("5h {p:.0}%"),
+        (None, Some(p)) => format!("7d {p:.0}%"),
+        (None, None) => "-".into(),
+    }
+}
+
+/// Body of the cap badge, after the `⛔ ` glyph: `[scope-prefix] [reset]`.
+/// Reset is rendered as a relative duration ("in 2h 14m") rather than a
+/// wall-clock time — locale-free, no syscall, and unambiguous when the
+/// daemon can't surface a local offset (multi-threaded tokio runtime
+/// without the `time/local-offset` feature). When no reset time is
+/// known (`StopFailure` 429), prints just the scope.
+fn format_cap_body(
+    scope: Option<RateLimitScope>,
+    until: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> String {
+    let scope_prefix = match scope {
+        Some(RateLimitScope::FiveHour) => "5h",
+        Some(RateLimitScope::SevenDay) => "7d",
+        Some(RateLimitScope::Unknown) | None => "",
+    };
+    match until {
+        Some(t) => {
+            let suffix = format_relative_until(t, now);
+            if scope_prefix.is_empty() {
+                suffix
+            } else {
+                format!("{scope_prefix} {suffix}")
+            }
+        }
+        None => {
+            if scope_prefix.is_empty() {
+                "rate limited".into()
+            } else {
+                format!("{scope_prefix} capped")
+            }
+        }
+    }
+}
+
+/// Render the gap from `now` to `until` as a compact relative string.
+/// Always positive: callers gate on `until > now` before invoking, but
+/// the saturating arithmetic below guarantees safe output even if a
+/// stale snapshot slips through.
+///
+/// Examples: `"in 2h 14m"`, `"in 47m"`, `"in 30s"`, `"now"`.
+fn format_relative_until(until: OffsetDateTime, now: OffsetDateTime) -> String {
+    let total_secs = (until - now).whole_seconds();
+    if total_secs <= 0 {
+        return "now".into();
+    }
+    let hours = total_secs / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("in {hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("in {minutes}m")
+    } else {
+        format!("in {seconds}s")
+    }
+}
+
+/// Build the styled `Text` for the LIMITS cell. Red when the agent has
+/// actually been told it's capped; yellow when utilisation is ≥ 80%;
+/// dim grey for the empty fallback so the column reads as "no data" at
+/// a glance.
+fn limits_text(a: &Agent, now: OffsetDateTime) -> Text<'static> {
+    if is_currently_capped(a, now) {
+        return Text::from(Span::styled(
+            limits_string(a, now),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let max_pct = match (a.rate_limit_5h_pct, a.rate_limit_7d_pct) {
+        (Some(p5), Some(p7)) => Some(p5.max(p7)),
+        (Some(p), None) | (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+    match max_pct {
+        Some(p) => {
+            let style = if p >= 80.0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            Text::from(Span::styled(limits_string(a, now), style))
+        }
+        None => Text::from(Span::styled(
+            "-",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )),
     }
 }
 
@@ -1783,6 +1965,13 @@ mod tests {
             model: model.map(Into::into),
             context_used_pct: ctx,
             cost_usd: cost,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
             started_at: now,
             last_activity_at: now,
         }
@@ -2536,11 +2725,224 @@ mod tests {
             WatchColumn::Model,
             WatchColumn::Ctx,
             WatchColumn::Cost,
+            WatchColumn::Limits,
             WatchColumn::Prompt,
             WatchColumn::Activity,
         ] {
             let _ = col.agent_text(&a, now, &[]);
         }
+    }
+
+    /// Helper: pull the rendered LIMITS cell down to a single concatenated
+    /// string so tests can assert on substrings without juggling spans.
+    fn limits_cell_string(a: &Agent, now: OffsetDateTime) -> String {
+        let text = WatchColumn::Limits.agent_text(a, now, &[]);
+        text.lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>()
+    }
+
+    /// Helper: pull the foreground colour of the first span — sufficient
+    /// for the cell tests since LIMITS only ever emits a single span.
+    fn limits_cell_fg(a: &Agent, now: OffsetDateTime) -> Option<Color> {
+        WatchColumn::Limits
+            .agent_text(a, now, &[])
+            .lines
+            .first()
+            .and_then(|l| l.spans.first())
+            .and_then(|s| s.style.fg)
+    }
+
+    #[test]
+    fn limits_renders_red_cap_badge_when_rate_limit_active_with_reset_time() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limited_until = Some(now + time::Duration::hours(2) + time::Duration::minutes(14));
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        let s = limits_cell_string(&a, now);
+        assert_eq!(s, "⛔ 5h in 2h 14m", "got {s:?}");
+        assert_eq!(limits_cell_fg(&a, now), Some(Color::Red));
+    }
+
+    /// P0 fix: a `RateLimited` event from `StopFailure` carries no reset
+    /// timestamp, but the row must still render the red cap badge —
+    /// otherwise the user sees no visual indication that they're capped.
+    #[test]
+    fn limits_renders_red_cap_badge_when_scope_set_without_reset_time() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Error,
+            None,
+            None,
+            None,
+            None,
+        );
+        // Simulate StopFailure-only signal: scope set, until unknown.
+        a.rate_limit_scope = Some(RateLimitScope::Unknown);
+        a.rate_limited_until = None;
+        let s = limits_cell_string(&a, now);
+        assert!(s.starts_with("⛔ "), "expected cap glyph: {s:?}");
+        assert_eq!(limits_cell_fg(&a, now), Some(Color::Red));
+    }
+
+    #[test]
+    fn limits_ignores_expired_cap_and_falls_through_to_pct() {
+        // A `rate_limited_until` in the past shouldn't drag the cell into
+        // red — we want the row to recover to the utilisation view as soon
+        // as the window rolls over (the daemon clears the field on the
+        // next `Started`, but in-flight snapshots may still carry it).
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        a.rate_limited_until = Some(now - time::Duration::minutes(1));
+        a.rate_limit_5h_pct = Some(42.0);
+        let s = limits_cell_string(&a, now);
+        assert!(!s.contains('⛔'), "expected no cap glyph: {s:?}");
+        assert!(s.contains("5h"), "expected utilisation text: {s:?}");
+        // < 80% — default colour, not yellow.
+        assert_eq!(limits_cell_fg(&a, now), None);
+    }
+
+    #[test]
+    fn limits_renders_utilization_when_only_pct_is_set() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limit_5h_pct = Some(84.0);
+        assert_eq!(limits_cell_string(&a, now), "5h 84%");
+        // ≥ 80 — yellow warning colour.
+        assert_eq!(limits_cell_fg(&a, now), Some(Color::Yellow));
+    }
+
+    #[test]
+    fn limits_picks_higher_pct_window_when_both_set() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limit_5h_pct = Some(31.0);
+        a.rate_limit_7d_pct = Some(72.0);
+        // 7d wins (higher), and < 80 keeps the default colour.
+        assert_eq!(limits_cell_string(&a, now), "7d 72%");
+        assert_eq!(limits_cell_fg(&a, now), None);
+    }
+
+    #[test]
+    fn limits_renders_dim_dash_when_nothing_is_set() {
+        let now = OffsetDateTime::now_utc();
+        let a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(limits_cell_string(&a, now), "-");
+        assert_eq!(limits_cell_fg(&a, now), Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn limits_cap_badge_prefix_matches_scope() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limited_until = Some(now + time::Duration::hours(1));
+
+        a.rate_limit_scope = Some(RateLimitScope::SevenDay);
+        assert!(
+            limits_cell_string(&a, now).contains("7d "),
+            "SevenDay should prefix with `7d `"
+        );
+
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        assert!(
+            limits_cell_string(&a, now).contains("5h "),
+            "FiveHour should prefix with `5h `"
+        );
+
+        // Unknown scope still renders the cap (scope is set), but
+        // without a window-prefix string.
+        a.rate_limit_scope = Some(RateLimitScope::Unknown);
+        let s = limits_cell_string(&a, now);
+        assert!(s.starts_with("⛔ "), "Unknown should still show cap: {s:?}");
+        assert!(!s.contains("5h "), "Unknown should not prefix `5h `");
+        assert!(!s.contains("7d "), "Unknown should not prefix `7d `");
+
+        // No scope at all → no cap (the renderer's load-bearing gate).
+        a.rate_limit_scope = None;
+        let s = limits_cell_string(&a, now);
+        assert!(!s.contains('⛔'), "None scope should drop the cap: {s:?}");
+    }
+
+    /// Capped without a reset timestamp — rendered with a bare scope or
+    /// the literal "rate limited" suffix, no relative-time string.
+    #[test]
+    fn limits_cap_badge_without_reset_uses_capped_label() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Error,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        a.rate_limited_until = None;
+        assert_eq!(limits_cell_string(&a, now), "⛔ 5h capped");
+
+        a.rate_limit_scope = Some(RateLimitScope::Unknown);
+        assert_eq!(limits_cell_string(&a, now), "⛔ rate limited");
     }
 
     #[test]

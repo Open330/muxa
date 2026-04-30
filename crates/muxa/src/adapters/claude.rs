@@ -10,13 +10,16 @@
 //!   "PostToolUse":      [{ "hooks": [{ "type":"command", "command":"muxa hook claude --event post_tool_use"      }]}],
 //!   "Notification":     [{ "hooks": [{ "type":"command", "command":"muxa hook claude --event notification"       }]}],
 //!   "Stop":             [{ "hooks": [{ "type":"command", "command":"muxa hook claude --event stop"               }]}],
+//!   "StopFailure":      [{ "hooks": [{ "type":"command", "command":"muxa hook claude --event stop_failure"       }]}],
 //!   "SessionEnd":       [{ "hooks": [{ "type":"command", "command":"muxa hook claude --event session_end"        }]}]
 //! }
 //! ```
 
 use super::hook::{truncate, AdapterError, HookAdapter};
 use super::transcript;
-use crate::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
+use crate::event::{
+    AgentEvent, AgentId, AgentKind, NotificationLevel, RateLimitScope, RateLimitSource,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -40,6 +43,22 @@ pub struct Input {
     /// last response since the hook payload itself doesn't carry one.
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
+    /// `StopFailure` hook only: which API error class triggered the
+    /// failure. Documented values include `rate_limit`,
+    /// `authentication_failed`, `billing_error`, `invalid_request`,
+    /// `server_error`, `max_output_tokens`, `unknown`.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// `StopFailure` hook only: free-form details from the upstream
+    /// API response (e.g., `"429 Too Many Requests"`).
+    #[serde(default)]
+    pub error_details: Option<String>,
+    /// `StopFailure` hook only: assistant text rendered in-TUI just
+    /// before the failure (e.g., `"You've hit your limit · resets …"`).
+    /// Echoes content the transcript also captures, but is cheaper to
+    /// read here and avoids racing the JSONL flush.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +69,7 @@ pub enum Event {
     PostToolUse,
     Notification,
     Stop,
+    StopFailure,
     SessionEnd,
 }
 
@@ -66,6 +86,7 @@ impl HookAdapter for ClaudeAdapter {
             "post_tool_use" => Event::PostToolUse,
             "notification" => Event::Notification,
             "stop" => Event::Stop,
+            "stop_failure" => Event::StopFailure,
             "session_end" => Event::SessionEnd,
             other => return Err(AdapterError::UnknownEvent(other.into())),
         })
@@ -114,12 +135,78 @@ impl HookAdapter for ClaudeAdapter {
                 }
             }
             Event::Stop => {
-                let response = input
+                // Walk the transcript tail. If the last recognizable
+                // entry is a rate-limit synthetic, treat the Stop hook
+                // as a rate-limit signal (fallback for installs that
+                // don't have the StopFailure hook wired). Otherwise
+                // emit a normal `TurnStopped` with the assistant text.
+                match input
                     .transcript_path
                     .as_deref()
-                    .and_then(transcript::last_assistant_text)
-                    .map(|t| truncate(t, 4_000));
-                AgentEvent::TurnStopped { id, response, at }
+                    .and_then(transcript::last_turn_outcome)
+                {
+                    Some(transcript::TurnOutcome::RateLimited(text)) => AgentEvent::RateLimited {
+                        id,
+                        scope: RateLimitScope::Unknown,
+                        source: RateLimitSource::Transcript,
+                        // No reset timestamp: parsing "resets 2:40pm
+                        // (Asia/Seoul)" reliably is fragile (locale,
+                        // 12-hour ambiguity, whitespace). The watch UI
+                        // renders the message verbatim until a richer
+                        // signal lands.
+                        resets_at: None,
+                        message: Some(truncate(text, 4_000)),
+                        at,
+                    },
+                    Some(transcript::TurnOutcome::Response(text)) => AgentEvent::TurnStopped {
+                        id,
+                        response: Some(truncate(text, 4_000)),
+                        at,
+                    },
+                    None => AgentEvent::TurnStopped {
+                        id,
+                        response: None,
+                        at,
+                    },
+                }
+            }
+            Event::StopFailure => {
+                let error_kind = input.error.as_deref().unwrap_or("unknown");
+                if error_kind == "rate_limit" {
+                    AgentEvent::RateLimited {
+                        id,
+                        // The hook payload doesn't tell us which window
+                        // tripped — that's only on the statusline / per-
+                        // request response headers.
+                        scope: RateLimitScope::Unknown,
+                        source: RateLimitSource::StopFailure,
+                        // Same reason — no reset timestamp from this
+                        // signal alone. The store keeps any prior
+                        // `rate_limited_until` it learned from a richer
+                        // source.
+                        resets_at: None,
+                        message: input
+                            .last_assistant_message
+                            .or(input.error_details)
+                            .map(|m| truncate(m, 4_000)),
+                        at,
+                    }
+                } else {
+                    // Non-rate-limit StopFailures (auth, billing, server
+                    // error, …) flip the row to Error so the user can't
+                    // miss the dead session. Surface the human-readable
+                    // message when one is provided.
+                    let message = input
+                        .last_assistant_message
+                        .or(input.error_details)
+                        .unwrap_or_else(|| format!("StopFailure: {error_kind}"));
+                    AgentEvent::NotificationFired {
+                        id,
+                        level: NotificationLevel::Error,
+                        message: truncate(message, 4_000),
+                        at,
+                    }
+                }
             }
             Event::SessionEnd => AgentEvent::SessionEnded { id, at },
         }
@@ -140,6 +227,11 @@ pub struct StatusLineInput {
     pub context_window: Option<StatusContext>,
     #[serde(default)]
     pub cost: Option<StatusCost>,
+    /// Pro/Max usage windows. Documented schema (CC 2.1.80+):
+    /// `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`.
+    /// Always optional — API-key sessions don't populate it.
+    #[serde(default)]
+    pub rate_limits: Option<StatusRateLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +249,27 @@ pub struct StatusCost {
     pub total_cost_usd: Option<f64>,
 }
 
+/// `rate_limits` object emitted by Claude Code's statusline JSON.
+#[derive(Debug, Deserialize, Default)]
+pub struct StatusRateLimits {
+    #[serde(default)]
+    pub five_hour: Option<StatusRateLimitWindow>,
+    #[serde(default)]
+    pub seven_day: Option<StatusRateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StatusRateLimitWindow {
+    /// 0..100 — Claude Code documents this as a percentage.
+    #[serde(default)]
+    pub used_percentage: Option<f32>,
+    /// Unix epoch *seconds*. Optional even when `used_percentage` is
+    /// known — the documented schema lets the two fields move
+    /// independently.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
 /// Parse the Claude Code status-line JSON from stdin and build a Heartbeat.
 pub fn parse_statusline<R: std::io::Read>(r: &mut R) -> Result<StatusLineInput, AdapterError> {
     let mut buf = String::new();
@@ -165,6 +278,25 @@ pub fn parse_statusline<R: std::io::Read>(r: &mut R) -> Result<StatusLineInput, 
 }
 
 pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> AgentEvent {
+    fn extract(window: Option<&StatusRateLimitWindow>) -> (Option<f32>, Option<OffsetDateTime>) {
+        let pct = window.and_then(|w| w.used_percentage);
+        let reset = window
+            .and_then(|w| w.resets_at)
+            .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok());
+        (pct, reset)
+    }
+    let (five_hour_pct, five_hour_reset) = extract(
+        input
+            .rate_limits
+            .as_ref()
+            .and_then(|rl| rl.five_hour.as_ref()),
+    );
+    let (seven_day_pct, seven_day_reset) = extract(
+        input
+            .rate_limits
+            .as_ref()
+            .and_then(|rl| rl.seven_day.as_ref()),
+    );
     AgentEvent::Heartbeat {
         id: AgentId {
             kind: AgentKind::ClaudeCode,
@@ -175,6 +307,10 @@ pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> Age
         model: input.model.and_then(|m| m.display_name),
         context_used_pct: input.context_window.and_then(|c| c.used_percentage),
         cost_usd: input.cost.and_then(|c| c.total_cost_usd),
+        rate_limit_5h_pct: five_hour_pct,
+        rate_limit_5h_resets_at: five_hour_reset,
+        rate_limit_7d_pct: seven_day_pct,
+        rate_limit_7d_resets_at: seven_day_reset,
         at: OffsetDateTime::now_utc(),
     }
 }
@@ -194,6 +330,179 @@ mod tests {
             message: None,
             prompt: None,
             transcript_path,
+            error: None,
+            error_details: None,
+            last_assistant_message: None,
+        }
+    }
+
+    fn stop_failure_input(error: &str, last_assistant_message: Option<&str>) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: None,
+            notification_type: None,
+            message: None,
+            prompt: None,
+            transcript_path: None,
+            error: Some(error.into()),
+            error_details: Some(format!("{error} details")),
+            last_assistant_message: last_assistant_message.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn stop_failure_rate_limit_emits_rate_limited_event() {
+        let ev = ClaudeAdapter::normalize(
+            Event::StopFailure,
+            stop_failure_input(
+                "rate_limit",
+                Some("You've hit your limit · resets 9:30pm (Asia/Seoul)"),
+            ),
+            None,
+        );
+        match ev {
+            AgentEvent::RateLimited {
+                scope,
+                source,
+                resets_at,
+                message,
+                ..
+            } => {
+                assert_eq!(scope, RateLimitScope::Unknown);
+                assert_eq!(source, RateLimitSource::StopFailure);
+                // StopFailure carries no reset timestamp by design.
+                assert!(resets_at.is_none());
+                assert_eq!(
+                    message.as_deref(),
+                    Some("You've hit your limit · resets 9:30pm (Asia/Seoul)")
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_failure_non_rate_limit_emits_error_notification() {
+        let ev = ClaudeAdapter::normalize(
+            Event::StopFailure,
+            stop_failure_input("server_error", Some("upstream 502")),
+            None,
+        );
+        match ev {
+            AgentEvent::NotificationFired { level, message, .. } => {
+                assert_eq!(level, NotificationLevel::Error);
+                assert_eq!(message, "upstream 502");
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_failure_unknown_error_falls_back_to_kind_label() {
+        // No `last_assistant_message` and no `error_details` — the
+        // adapter should still surface a meaningful notification.
+        let mut input = stop_failure_input("billing_error", None);
+        input.error_details = None;
+        let ev = ClaudeAdapter::normalize(Event::StopFailure, input, None);
+        match ev {
+            AgentEvent::NotificationFired { level, message, .. } => {
+                assert_eq!(level, NotificationLevel::Error);
+                assert!(
+                    message.contains("billing_error"),
+                    "fallback message should name the error kind, got {message:?}",
+                );
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn statusline_passes_through_rate_limits() {
+        let json = r#"{
+            "session_id": "s1",
+            "rate_limits": {
+                "five_hour":  { "used_percentage": 84.0, "resets_at": 1745948400 },
+                "seven_day":  { "used_percentage": 31.5, "resets_at": 1746466800 }
+            }
+        }"#;
+        let mut cur = std::io::Cursor::new(json);
+        let parsed = parse_statusline(&mut cur).unwrap();
+        let ev = statusline_heartbeat(parsed, None);
+        match ev {
+            AgentEvent::Heartbeat {
+                rate_limit_5h_pct,
+                rate_limit_5h_resets_at,
+                rate_limit_7d_pct,
+                rate_limit_7d_resets_at,
+                ..
+            } => {
+                assert!((rate_limit_5h_pct.unwrap() - 84.0).abs() < f32::EPSILON);
+                assert!((rate_limit_7d_pct.unwrap() - 31.5).abs() < f32::EPSILON);
+                assert_eq!(
+                    rate_limit_5h_resets_at.unwrap().unix_timestamp(),
+                    1_745_948_400
+                );
+                assert_eq!(
+                    rate_limit_7d_resets_at.unwrap().unix_timestamp(),
+                    1_746_466_800
+                );
+            }
+            _ => panic!("expected Heartbeat"),
+        }
+    }
+
+    #[test]
+    fn statusline_without_rate_limits_emits_none() {
+        let json = r#"{ "session_id": "s1" }"#;
+        let mut cur = std::io::Cursor::new(json);
+        let parsed = parse_statusline(&mut cur).unwrap();
+        let ev = statusline_heartbeat(parsed, None);
+        match ev {
+            AgentEvent::Heartbeat {
+                rate_limit_5h_pct,
+                rate_limit_5h_resets_at,
+                rate_limit_7d_pct,
+                rate_limit_7d_resets_at,
+                ..
+            } => {
+                assert!(rate_limit_5h_pct.is_none());
+                assert!(rate_limit_5h_resets_at.is_none());
+                assert!(rate_limit_7d_pct.is_none());
+                assert!(rate_limit_7d_resets_at.is_none());
+            }
+            _ => panic!("expected Heartbeat"),
+        }
+    }
+
+    #[test]
+    fn statusline_partial_rate_limits_each_field_independent() {
+        // 5h has only the percentage, 7d has only the timestamp — both
+        // legal per the documented schema.
+        let json = r#"{
+            "session_id": "s1",
+            "rate_limits": {
+                "five_hour":  { "used_percentage": 12.0 },
+                "seven_day":  { "resets_at": 1746466800 }
+            }
+        }"#;
+        let mut cur = std::io::Cursor::new(json);
+        let parsed = parse_statusline(&mut cur).unwrap();
+        let ev = statusline_heartbeat(parsed, None);
+        match ev {
+            AgentEvent::Heartbeat {
+                rate_limit_5h_pct,
+                rate_limit_5h_resets_at,
+                rate_limit_7d_pct,
+                rate_limit_7d_resets_at,
+                ..
+            } => {
+                assert!(rate_limit_5h_pct.is_some());
+                assert!(rate_limit_5h_resets_at.is_none());
+                assert!(rate_limit_7d_pct.is_none());
+                assert!(rate_limit_7d_resets_at.is_some());
+            }
+            _ => panic!("expected Heartbeat"),
         }
     }
 
@@ -243,6 +552,26 @@ mod tests {
                 assert!(text.ends_with('…'));
             }
             _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_transcript_rate_limit_emits_rate_limited_event() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":"You've hit your limit · resets 2:40pm (Asia/Seoul)"}}]}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}}"#
+        )
+        .unwrap();
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(f.path().into())), None);
+        match ev {
+            AgentEvent::RateLimited {
+                source, message, ..
+            } => {
+                assert_eq!(source, RateLimitSource::Transcript);
+                assert!(message.unwrap().contains("You've hit your limit"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
         }
     }
 
