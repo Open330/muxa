@@ -216,6 +216,12 @@ table.data tr.lagged td { background: rgba(248, 81, 73, 0.08); }
 .state-pill.idle, .state-pill.stopped { background: var(--fg-dim); color: var(--bg); }
 .state-pill.starting { background: var(--cyan); color: var(--bg); }
 
+/* LIMITS column — three render states matching the CLI watch column. */
+.limits { white-space: nowrap; }
+.limits-cap { color: var(--red); font-weight: 600; }
+.limits-warn { color: var(--yellow); }
+.limits-empty { color: var(--fg-muted); }
+
 .attach-btn {
   font: inherit;
   background: transparent;
