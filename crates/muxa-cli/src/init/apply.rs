@@ -118,8 +118,7 @@ fn apply_one(action: &Action, dry_run: bool, stamp: i64, report: &mut ApplyRepor
             let server_up = Command::new("tmux")
                 .arg("info")
                 .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+                .is_ok_and(|o| o.status.success());
             if !server_up {
                 return Ok(());
             }

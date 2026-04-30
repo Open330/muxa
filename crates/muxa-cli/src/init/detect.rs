@@ -120,8 +120,7 @@ fn muxad_is_running() -> bool {
     Command::new("pgrep")
         .args(["-u", &uid_string(), "-x", "muxad"])
         .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
 fn uid_string() -> String {

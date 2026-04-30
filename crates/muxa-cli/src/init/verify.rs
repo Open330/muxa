@@ -92,7 +92,11 @@ fn check_tmux_config_parses() -> bool {
     if !path.is_file() {
         return false;
     }
-    Command::new("tmux")
+    // `is_ok_and` would default to `false` on Err, but here we want
+    // the opposite — a missing tmux is "not our problem" and should
+    // not flag a config-syntax error. Explicit `match` keeps the
+    // intent obvious to a future reader.
+    match Command::new("tmux")
         .args([
             "-f",
             path.to_str().unwrap_or(""),
@@ -101,6 +105,8 @@ fn check_tmux_config_parses() -> bool {
             "kill-server",
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(true) // tmux missing → don't claim a problem
+    {
+        Ok(o) => o.status.success(),
+        Err(_) => true,
+    }
 }
