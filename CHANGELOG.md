@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Critical: `muxa init` no longer kills running tmux sessions.** The
+  v0.4.0 post-apply verification step shelled out to
+  `tmux -f <conf> start-server \; kill-server` to syntax-check the
+  edited `~/.tmux.conf`. The `-f` flag only scopes the config file —
+  the command still attached to the user's *default* tmux socket and
+  the trailing `kill-server` killed every running session on the box.
+  The check has been removed entirely; the modest upside (parse
+  validation after a write we control end-to-end) was not worth the
+  catastrophic blast radius. Users see the diff in the review step
+  before apply, and `tmux source-file` surfaces any error when it
+  runs. The "tmux config syntax check" line in the final summary is
+  gone too.
+
 ## [0.4.0] - 2026-04-30
 
 ### Added

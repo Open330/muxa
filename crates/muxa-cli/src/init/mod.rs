@@ -192,9 +192,6 @@ fn summarize_verify(v: &verify::VerifyReport) -> Vec<String> {
     if v.current_pane_seen == Some(true) {
         extra.push("✔ current pane registered with muxad".into());
     }
-    if v.tmux_status_ok == Some(false) {
-        extra.push("⚠ tmux config syntax check failed — review the diff".into());
-    }
     for n in &v.notes {
         extra.push(n.clone());
     }
