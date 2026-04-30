@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-30
+
+### Added
+
+- **Web dashboard `LIMITS` column** (#16). Brings the dashboard to
+  parity with the CLI `muxa watch` rate-limit rendering shipped in
+  v0.3.1. The data was already on `/api/agents` — only the frontend
+  was missing. Three render states matching the CLI:
+  - red `⛔ 5h in 2h 14m` — currently capped (with tooltip surfacing
+    `last_notification` so hover shows the upstream message).
+  - yellow `5h 84%` — utilisation ≥ 80% on either window.
+  - dim `5h 31%` / `—` — non-warning utilisation / no data.
+- JS helpers (`isCurrentlyCapped`, `scopePrefix`, `formatRelativeUntil`)
+  mirror the Rust renderer 1:1 so behaviour drift between the two
+  surfaces stays trivially portable.
+
 ## [0.3.1] - 2026-04-30
 
 ### Added
@@ -279,7 +295,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/Open330/muxa/releases/tag/v0.3.2
 [0.3.1]: https://github.com/Open330/muxa/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Open330/muxa/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Open330/muxa/releases/tag/v0.2.0
