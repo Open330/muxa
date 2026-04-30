@@ -115,11 +115,11 @@ impl WatchColumn {
             Self::Model => Constraint::Length(16),
             Self::Ctx => Constraint::Length(5),
             Self::Cost => Constraint::Length(7),
-            // LIMITS — `⛔ 5h 1234pm` fits in 14, but the emoji's wide-cell
-            // rendering varies across terminals so we leave a one-cell
-            // margin to keep the column from clipping the `pm` suffix on
+            // LIMITS — widest realistic payload is `⛔ 7d in 23h 59m`
+            // (~17 cells with a wide-cell emoji). Wider columns crowd the
+            // prompt; narrower ones clip the duration suffix on
             // emoji-greedy fonts.
-            Self::Limits => Constraint::Length(15),
+            Self::Limits => Constraint::Length(18),
             Self::Prompt => Constraint::Min(20),
             Self::Activity => Constraint::Length(10),
         }
@@ -1675,15 +1675,39 @@ fn resolve_var_chain(
     }
 }
 
+/// True when the agent is *currently* rate-limited from the renderer's
+/// point of view. Two sources can mark a row capped:
+///
+/// 1. `rate_limit_scope` set — every `RateLimited` event sets this,
+///    regardless of whether a reset timestamp was on the wire. Cleared
+///    on the next `Started`. This is the load-bearing signal: a
+///    `StopFailure` 429 carries no `resets_at`, so without this gate
+///    the user would see the row flip to `Error` but the LIMITS column
+///    stay blank.
+/// 2. `rate_limited_until` in the future — for sources that did carry
+///    a reset time, treat the cap as auto-expired once that moment
+///    passes (the daemon clears the field lazily on the next `Started`,
+///    but in-flight snapshots can still carry a stale value).
+///
+/// Logic: capped iff scope is set AND (no reset known OR reset is in
+/// the future).
+fn is_currently_capped(a: &Agent, now: OffsetDateTime) -> bool {
+    if a.rate_limit_scope.is_none() {
+        return false;
+    }
+    a.rate_limited_until.is_none_or(|until| until > now)
+}
+
 /// Plain-string form of the LIMITS column payload — used both by the
 /// styled cell renderer (`limits_text`) and the detail-line template's
 /// `{rate_limit}` placeholder. Returns `"-"` when no rate-limit info is
 /// known so the detail row reads like every other "no data" field.
 fn limits_string(a: &Agent, now: OffsetDateTime) -> String {
-    if let Some(until) = a.rate_limited_until {
-        if until > now {
-            return format!("⛔ {}", format_cap_body(a.rate_limit_scope, until));
-        }
+    if is_currently_capped(a, now) {
+        return format!(
+            "⛔ {}",
+            format_cap_body(a.rate_limit_scope, a.rate_limited_until, now)
+        );
     }
     match (a.rate_limit_5h_pct, a.rate_limit_7d_pct) {
         (Some(five), Some(seven)) => {
@@ -1699,31 +1723,62 @@ fn limits_string(a: &Agent, now: OffsetDateTime) -> String {
     }
 }
 
-/// Body of the cap badge, after the `⛔ ` glyph: `[scope-prefix] HHMMam/pm`.
-fn format_cap_body(scope: Option<RateLimitScope>, until: OffsetDateTime) -> String {
+/// Body of the cap badge, after the `⛔ ` glyph: `[scope-prefix] [reset]`.
+/// Reset is rendered as a relative duration ("in 2h 14m") rather than a
+/// wall-clock time — locale-free, no syscall, and unambiguous when the
+/// daemon can't surface a local offset (multi-threaded tokio runtime
+/// without the `time/local-offset` feature). When no reset time is
+/// known (`StopFailure` 429), prints just the scope.
+fn format_cap_body(
+    scope: Option<RateLimitScope>,
+    until: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> String {
     let scope_prefix = match scope {
-        Some(RateLimitScope::FiveHour) => "5h ",
-        Some(RateLimitScope::SevenDay) => "7d ",
+        Some(RateLimitScope::FiveHour) => "5h",
+        Some(RateLimitScope::SevenDay) => "7d",
         Some(RateLimitScope::Unknown) | None => "",
     };
-    format!("{scope_prefix}{}", format_local_hhmm(until))
+    match until {
+        Some(t) => {
+            let suffix = format_relative_until(t, now);
+            if scope_prefix.is_empty() {
+                suffix
+            } else {
+                format!("{scope_prefix} {suffix}")
+            }
+        }
+        None => {
+            if scope_prefix.is_empty() {
+                "rate limited".into()
+            } else {
+                format!("{scope_prefix} capped")
+            }
+        }
+    }
 }
 
-/// Render `until` as `HHMMam/pm` in the user's local timezone, falling
-/// back to UTC when the local offset can't be determined (e.g., the
-/// `time` crate's `local-offset` feature is off, or the platform refuses
-/// to surface a TZ to a multi-threaded process).
-fn format_local_hhmm(until: OffsetDateTime) -> String {
-    let local = time::UtcOffset::current_local_offset()
-        .map(|o| until.to_offset(o))
-        .unwrap_or(until);
-    let hour24 = local.hour();
-    let suffix = if hour24 < 12 { "am" } else { "pm" };
-    let hour12 = match hour24 % 12 {
-        0 => 12,
-        h => h,
-    };
-    format!("{:02}{:02}{suffix}", hour12, local.minute())
+/// Render the gap from `now` to `until` as a compact relative string.
+/// Always positive: callers gate on `until > now` before invoking, but
+/// the saturating arithmetic below guarantees safe output even if a
+/// stale snapshot slips through.
+///
+/// Examples: `"in 2h 14m"`, `"in 47m"`, `"in 30s"`, `"now"`.
+fn format_relative_until(until: OffsetDateTime, now: OffsetDateTime) -> String {
+    let total_secs = (until - now).whole_seconds();
+    if total_secs <= 0 {
+        return "now".into();
+    }
+    let hours = total_secs / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("in {hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("in {minutes}m")
+    } else {
+        format!("in {seconds}s")
+    }
 }
 
 /// Build the styled `Text` for the LIMITS cell. Red when the agent has
@@ -1731,13 +1786,11 @@ fn format_local_hhmm(until: OffsetDateTime) -> String {
 /// dim grey for the empty fallback so the column reads as "no data" at
 /// a glance.
 fn limits_text(a: &Agent, now: OffsetDateTime) -> Text<'static> {
-    if let Some(until) = a.rate_limited_until {
-        if until > now {
-            return Text::from(Span::styled(
-                limits_string(a, now),
-                Style::default().fg(Color::Red),
-            ));
-        }
+    if is_currently_capped(a, now) {
+        return Text::from(Span::styled(
+            limits_string(a, now),
+            Style::default().fg(Color::Red),
+        ));
     }
     let max_pct = match (a.rate_limit_5h_pct, a.rate_limit_7d_pct) {
         (Some(p5), Some(p7)) => Some(p5.max(p7)),
@@ -2701,7 +2754,7 @@ mod tests {
     }
 
     #[test]
-    fn limits_renders_red_cap_badge_when_rate_limited_until_is_in_future() {
+    fn limits_renders_red_cap_badge_when_rate_limit_active_with_reset_time() {
         let now = OffsetDateTime::now_utc();
         let mut a = fake_agent(
             "s",
@@ -2713,15 +2766,34 @@ mod tests {
             None,
             None,
         );
-        a.rate_limited_until = Some(now + time::Duration::hours(2));
+        a.rate_limited_until = Some(now + time::Duration::hours(2) + time::Duration::minutes(14));
         a.rate_limit_scope = Some(RateLimitScope::FiveHour);
         let s = limits_cell_string(&a, now);
-        assert!(s.starts_with("⛔ "), "expected cap glyph: {s:?}");
-        assert!(s.contains("5h "), "expected scope prefix: {s:?}");
-        assert!(
-            s.ends_with("am") || s.ends_with("pm"),
-            "expected am/pm suffix: {s:?}"
+        assert_eq!(s, "⛔ 5h in 2h 14m", "got {s:?}");
+        assert_eq!(limits_cell_fg(&a, now), Some(Color::Red));
+    }
+
+    /// P0 fix: a `RateLimited` event from `StopFailure` carries no reset
+    /// timestamp, but the row must still render the red cap badge —
+    /// otherwise the user sees no visual indication that they're capped.
+    #[test]
+    fn limits_renders_red_cap_badge_when_scope_set_without_reset_time() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Error,
+            None,
+            None,
+            None,
+            None,
         );
+        // Simulate StopFailure-only signal: scope set, until unknown.
+        a.rate_limit_scope = Some(RateLimitScope::Unknown);
+        a.rate_limited_until = None;
+        let s = limits_cell_string(&a, now);
+        assert!(s.starts_with("⛔ "), "expected cap glyph: {s:?}");
         assert_eq!(limits_cell_fg(&a, now), Some(Color::Red));
     }
 
@@ -2742,6 +2814,7 @@ mod tests {
             None,
             None,
         );
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
         a.rate_limited_until = Some(now - time::Duration::minutes(1));
         a.rate_limit_5h_pct = Some(42.0);
         let s = limits_cell_string(&a, now);
@@ -2828,15 +2901,47 @@ mod tests {
             "SevenDay should prefix with `7d `"
         );
 
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        assert!(
+            limits_cell_string(&a, now).contains("5h "),
+            "FiveHour should prefix with `5h `"
+        );
+
+        // Unknown scope still renders the cap (scope is set), but
+        // without a window-prefix string.
         a.rate_limit_scope = Some(RateLimitScope::Unknown);
         let s = limits_cell_string(&a, now);
+        assert!(s.starts_with("⛔ "), "Unknown should still show cap: {s:?}");
         assert!(!s.contains("5h "), "Unknown should not prefix `5h `");
         assert!(!s.contains("7d "), "Unknown should not prefix `7d `");
 
+        // No scope at all → no cap (the renderer's load-bearing gate).
         a.rate_limit_scope = None;
         let s = limits_cell_string(&a, now);
-        assert!(!s.contains("5h "), "None should not prefix `5h `");
-        assert!(!s.contains("7d "), "None should not prefix `7d `");
+        assert!(!s.contains('⛔'), "None scope should drop the cap: {s:?}");
+    }
+
+    /// Capped without a reset timestamp — rendered with a bare scope or
+    /// the literal "rate limited" suffix, no relative-time string.
+    #[test]
+    fn limits_cap_badge_without_reset_uses_capped_label() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Error,
+            None,
+            None,
+            None,
+            None,
+        );
+        a.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        a.rate_limited_until = None;
+        assert_eq!(limits_cell_string(&a, now), "⛔ 5h capped");
+
+        a.rate_limit_scope = Some(RateLimitScope::Unknown);
+        assert_eq!(limits_cell_string(&a, now), "⛔ rate limited");
     }
 
     #[test]

@@ -660,6 +660,14 @@ impl Default for WatchConfig {
 /// `last_prompt`, `last_response`, `last_notification`, `cwd`,
 /// `rate_limit`, `rate_limit_resets_at`, `rate_limit_scope`. Unknown
 /// placeholders are preserved verbatim.
+///
+/// **Rate-limit placeholder formats**:
+/// * `{rate_limit}` mirrors the LIMITS column — human-friendly, e.g.
+///   `⛔ 5h in 2h 14m`, `5h 84%`, or `-`.
+/// * `{rate_limit_resets_at}` is RFC 3339 (e.g. `2026-04-30T12:30:00Z`)
+///   so users wiring the detail line into scripts get a machine-readable
+///   timestamp; the column already covers the at-a-glance case.
+/// * `{rate_limit_scope}` is `5h` / `7d` / `unknown` / `-`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DetailConfig {

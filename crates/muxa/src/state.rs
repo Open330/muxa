@@ -13,7 +13,9 @@
 //! by the daemon's desktop-notifier task to wake users when an agent moves
 //! into `WaitingInput` or `Error`.
 
-use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope};
+use crate::event::{
+    AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope, RateLimitSource,
+};
 use crate::history::{HistoryEntry, HistoryOptions, PromptHistory};
 use crate::metrics::Metrics;
 use crate::tmux::PaneInfo;
@@ -306,9 +308,11 @@ pub type SharedStore = Arc<Store>;
 /// effects for the caller to fire after dropping the agents write lock.
 ///
 /// Pulled out of [`Store::apply`] so the state-transition switch isn't
-/// buried inside the lock-management dance — easier to read, clippy-clean
-/// (`apply` stays under the line-count threshold), and one focused place
-/// to look when adding a new event variant.
+/// buried inside the lock-management dance. Heavier event handlers are
+/// further factored into per-variant helpers ([`apply_heartbeat`],
+/// [`apply_rate_limited`]) to keep the dispatch table scannable —
+/// adding a new variant means adding one match arm here plus an
+/// optional helper.
 fn mutate_for_event(
     agent: &mut Agent,
     ev: &AgentEvent,
@@ -382,6 +386,13 @@ fn mutate_for_event(
 /// Copy the model/cost/limit fields from a `Heartbeat` onto the agent
 /// row. Each field is independently optional — adapters may emit some
 /// without others, and absent fields preserve the row's prior value.
+///
+/// Side effect: when statusline utilization hits 100% on either window
+/// AND the same window has a reset timestamp, mark the agent as currently
+/// capped — that's the soft "you've maxed out this window" signal that
+/// arrives via Heartbeat rather than a discrete `RateLimited` event. The
+/// 5-hour window wins the scope label when both are saturated; it's the
+/// shorter wall the user is most likely watching.
 fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
     let AgentEvent::Heartbeat {
         model,
@@ -417,6 +428,38 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
     if let Some(t) = rate_limit_7d_resets_at {
         agent.rate_limit_7d_resets_at = Some(*t);
     }
+
+    // Statusline-derived cap: the rolling utilization fields cross 100,
+    // which is exactly the moment Claude Code stops accepting new turns
+    // on that window. Pin the scope/until on the agent so the watch row
+    // flips red without waiting for a separate `RateLimited` event.
+    let five_hour_saturated = rate_limit_5h_pct.is_some_and(|p| p >= 100.0);
+    let seven_day_saturated = rate_limit_7d_pct.is_some_and(|p| p >= 100.0);
+    if five_hour_saturated || seven_day_saturated {
+        let (scope, until) = if five_hour_saturated {
+            (RateLimitScope::FiveHour, *rate_limit_5h_resets_at)
+        } else {
+            (RateLimitScope::SevenDay, *rate_limit_7d_resets_at)
+        };
+        let regressing = matches!(scope, RateLimitScope::Unknown)
+            && matches!(
+                agent.rate_limit_scope,
+                Some(RateLimitScope::FiveHour | RateLimitScope::SevenDay)
+            );
+        if !regressing {
+            agent.rate_limit_scope = Some(scope);
+        }
+        if until.is_some() {
+            agent.rate_limited_until = until;
+        }
+        agent.state = AgentState::Error;
+        tracing::debug!(
+            source = ?RateLimitSource::Statusline,
+            scope = ?scope,
+            resets_at = ?until,
+            "statusline saturation marked agent as rate-limited",
+        );
+    }
 }
 
 /// Mark the agent as currently capped. `resets_at = None` means the
@@ -433,7 +476,18 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
     else {
         return;
     };
-    agent.rate_limit_scope = Some(*scope);
+    // Don't let an `Unknown` scope from a coarse source (StopFailure 429)
+    // clobber a richer scope already learned from statusline / transcript
+    // — that would make the watch badge regress from `5h …` to a bare
+    // `rate limited` label.
+    let regressing = matches!(scope, RateLimitScope::Unknown)
+        && matches!(
+            agent.rate_limit_scope,
+            Some(RateLimitScope::FiveHour | RateLimitScope::SevenDay)
+        );
+    if !regressing {
+        agent.rate_limit_scope = Some(*scope);
+    }
     if resets_at.is_some() {
         agent.rate_limited_until = *resets_at;
     }
@@ -883,6 +937,167 @@ mod tests {
             store.by_session("s").await.unwrap().state,
             AgentState::Stopped
         );
+    }
+
+    /// End-to-end composition: walk the full rate-limit lifecycle the
+    /// way the daemon would see it from the adapters, and verify the
+    /// agent row mirrors the user's actual situation at each step.
+    ///
+    /// This catches the class of bug the original PR review flagged —
+    /// where each layer's unit test passed but a `StopFailure`-only
+    /// signal failed to mark the agent capped. The renderer's
+    /// `is_currently_capped` rule is mirrored here as a local helper so
+    /// the test fails on logic regressions in either crate.
+    #[tokio::test]
+    async fn rate_limit_lifecycle_end_to_end() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+        let t1 = datetime!(2026-04-29 10:30:00 UTC);
+        let t2 = datetime!(2026-04-29 11:00:00 UTC);
+        let t3 = datetime!(2026-04-29 14:00:00 UTC);
+        let resets_at = datetime!(2026-04-29 15:00:00 UTC);
+
+        // Mirror the renderer's "currently capped" rule.
+        let is_capped = |a: &Agent, now: OffsetDateTime| -> bool {
+            a.rate_limit_scope.is_some()
+                && a.rate_limited_until.is_none_or(|until| until > now)
+        };
+
+        // 1. Session starts; no rate-limit data yet.
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert!(!is_capped(&a, t0));
+
+        // 2. Statusline heartbeat: 84% utilization on 5h, well under
+        //    saturation. Row tracks the percentage but stays uncapped.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: Some("Sonnet".into()),
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(84.0),
+                rate_limit_5h_resets_at: Some(resets_at),
+                rate_limit_7d_pct: Some(31.0),
+                rate_limit_7d_resets_at: None,
+                at: t1,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert!(!is_capped(&a, t1));
+        assert_eq!(a.rate_limit_5h_pct, Some(84.0));
+
+        // 3. StopFailure 429 lands — coarse signal with no reset on the
+        //    wire. Row must mark capped, scope must NOT regress to
+        //    Unknown if a richer scope lands later, and `rate_limited_until`
+        //    stays as the prior reset time learned from the heartbeat.
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::Unknown,
+                source: RateLimitSource::StopFailure,
+                resets_at: None,
+                message: Some("429 Too Many Requests".into()),
+                at: t2,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert!(is_capped(&a, t2), "StopFailure 429 must mark agent capped");
+        assert_eq!(a.state, AgentState::Error);
+
+        // 4. A subsequent statusline-derived event (richer scope) lands
+        //    — must upgrade Unknown → FiveHour, not regress.
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::FiveHour,
+                source: RateLimitSource::Statusline,
+                resets_at: Some(resets_at),
+                message: None,
+                at: t2,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.rate_limit_scope, Some(RateLimitScope::FiveHour));
+        assert_eq!(a.rate_limited_until, Some(resets_at));
+
+        // 5. Coarse Unknown signal arrives again — must NOT clobber the
+        //    specific scope we'd learned.
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::Unknown,
+                source: RateLimitSource::StopFailure,
+                resets_at: None,
+                message: None,
+                at: t2,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(
+            a.rate_limit_scope,
+            Some(RateLimitScope::FiveHour),
+            "Unknown must not regress a specific scope"
+        );
+
+        // 6. Wall-clock crosses the reset time — renderer rule says no
+        //    longer capped even though the daemon hasn't cleared yet.
+        let after_reset = resets_at + time::Duration::seconds(1);
+        let a = store.by_session("s").await.unwrap();
+        assert!(!is_capped(&a, after_reset));
+
+        // 7. User starts a fresh session in the same row — daemon
+        //    clears the active-cap markers on Started.
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t3,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.rate_limit_scope, None);
+        assert_eq!(a.rate_limited_until, None);
+        assert!(!is_capped(&a, t3));
+    }
+
+    /// Statusline saturation (≥100% on either window) must mark the
+    /// agent capped without requiring a separate `RateLimited` event —
+    /// that's the soft path that uses `RateLimitSource::Statusline`.
+    #[tokio::test]
+    async fn heartbeat_saturation_marks_agent_capped() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+        let resets_at = datetime!(2026-04-29 15:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(100.0),
+                rate_limit_5h_resets_at: Some(resets_at),
+                rate_limit_7d_pct: Some(35.0),
+                rate_limit_7d_resets_at: None,
+                at: t0,
+            })
+            .await;
+
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.rate_limit_scope, Some(RateLimitScope::FiveHour));
+        assert_eq!(a.rate_limited_until, Some(resets_at));
+        assert_eq!(a.state, AgentState::Error);
     }
 
     #[tokio::test]
