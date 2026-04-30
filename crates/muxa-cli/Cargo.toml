@@ -17,6 +17,7 @@ muxa = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
+dirs = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
@@ -38,6 +39,21 @@ crossterm = "0.29"
 # `capture-pane -e` output into ratatui `Text`/`Lines`, so the live pane
 # preview keeps the source pane's coloring.
 ansi-to-tui = "8"
+
+# `muxa init` interactive wizard.
+# cliclack is the Rust port of clack.cc — gives us the modern boxed-flow
+# look (◇ ✔ ⚠ glyphs, multi-select, spinners) without rolling our own.
+cliclack = "0.3"
+console = "0.15"
+# Locate cargo / tmux / claude / codex / gemini binaries on PATH for
+# pre-flight detection.
+which = "7"
+# Round-trip TOML edits that preserve user formatting + comments — used
+# by codex hook merger and dashboard token writer. Plain `toml` would
+# rewrite the whole file from scratch.
+toml_edit = "0.22"
+# Cryptographically-strong dashboard tokens via the OS RNG.
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

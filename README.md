@@ -141,12 +141,35 @@ Prefer to do it yourself? Keep reading.
 Requires **Rust 1.88+**, **tmux 3.x**, and a Unix-y OS.
 
 <details open>
+<summary><strong>One-shot (recommended)</strong></summary>
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
+```
+
+Builds + installs `muxa` and `muxad` from source, then hands off to
+the `muxa init` wizard for tmux/agent/systemd wiring. Forward args to
+the wizard with `sh -s --`:
+
+```bash
+# Non-interactive (CI / dotfile bootstrap):
+curl -fsSL https://… | sh -s -- --preset standard --yes
+
+# Preview only — write nothing:
+curl -fsSL https://… | sh -s -- --dry-run
+```
+
+</details>
+
+<details>
 <summary><strong>From source</strong></summary>
 
 ```bash
 git clone https://github.com/Open330/muxa.git && cd muxa
 cargo install --path crates/muxad --locked
 cargo install --path crates/muxa-cli --locked
+muxa init                       # interactive wizard
+# muxa init --preset standard --yes   # for headless installs
 ```
 
 Installs to `~/.cargo/bin/`. Make sure it's on your `PATH`.
@@ -157,8 +180,9 @@ Installs to `~/.cargo/bin/`. Make sure it's on your `PATH`.
 <summary><strong>Pre-built binaries</strong></summary>
 
 Grab the archive for your platform from the
-[Releases page](https://github.com/Open330/muxa/releases) and drop `muxa` +
-`muxad` somewhere on your `PATH`.
+[Releases page](https://github.com/Open330/muxa/releases), drop `muxa`
++ `muxad` somewhere on your `PATH`, then run `muxa init` to wire up
+tmux / agent hooks / systemd / dashboard.
 
 Artifacts are built for:
 
@@ -168,6 +192,54 @@ Artifacts are built for:
 - `aarch64-apple-darwin`
 
 </details>
+
+### Install wizard (`muxa init`)
+
+```text
+┌  muxa init
+│
+◇  Pre-flight
+│  ✔ cargo: cargo 1.92.0
+│  ✔ tmux: tmux 3.4
+│  ✔ Claude Code config: ~/.claude/settings.json
+│  ✔ systemctl --user available
+│
+◇  What should I set up?
+│  ◼ tmux: replace prefix+s with muxa watch popup
+│  ◼ tmux: per-pane agent glyphs in status-right
+│  ◼ Claude Code: shell hooks + statusLine    ← auto-detected
+│  ◻ muxad: systemd user service
+│  ◻ Web dashboard: generate token + enable
+│
+◇  Review changes
+│  + edit  ~/.tmux.conf (tmux-popup) [+6 lines]
+│  + edit  ~/.tmux.conf (tmux-statusline) [+7 lines]
+│  ~ edit  ~/.claude/settings.json (claude-hooks) [+24 lines]
+│  ⟳ tmux source-file ~/.tmux.conf
+│
+└  Done. Try `prefix + s` for the muxa picker.
+```
+
+Every edit is wrapped in a per-component marker block
+(`# >>> muxa managed (tmux-popup) >>>` … `# <<< muxa managed (tmux-popup) <<<`)
+or a command-prefix match (in JSON / TOML), so `muxa init --uninstall`
+is a clean reverse — your hand-edited config around our blocks stays
+intact. Originals are backed up to `<file>.muxa-backup-<unix_ts>`
+before any write.
+
+Common flag combos:
+
+| Goal | Command |
+| --- | --- |
+| Interactive wizard | `muxa init` |
+| Headless / CI | `muxa init --preset standard --yes` |
+| Preview only | `muxa init --dry-run` |
+| Reverse install | `muxa init --uninstall` |
+| Just one thing | `muxa init --component tmux-popup --yes` |
+| Preset minus a piece | `muxa init --preset standard --no muxad-systemd --yes` |
+
+Presets: `minimal` (tmux only), `standard` (+ auto-detected agents +
+systemd), `full` (+ dashboard).
 
 ## Quick start
 

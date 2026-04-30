@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`muxa init` install wizard.** Interactive (cliclack-styled flow:
+  pre-flight → multi-select → review → apply → verify) and
+  non-interactive (`--preset {minimal,standard,full}`, `--yes`,
+  `--component`, `--no <id>`, `--dry-run`, `--uninstall`) entry points
+  cover both the "first install" and "in CI / dotfile bootstrap" cases.
+  Components: tmux popup + status-line, Claude / Codex / Gemini hook
+  merge, `muxad` systemd user service, web dashboard token. Each
+  component owns a `# >>> muxa managed (id) >>>` marker block (or a
+  command-prefix match in JSON / TOML), so `--uninstall` is a clean
+  surgical reverse rather than a delete-all. Auto-detects existing
+  agent configs and pre-checks the matching components in the picker.
+  Backups land at `<file>.muxa-backup-<unix_ts>` before any write.
+  Companion `scripts/install.sh` is a 30-line `curl | sh` bootstrap
+  that hands off to `muxa init`, so all real install logic stays in
+  one auditable place.
+
 ## [0.3.2] - 2026-04-30
 
 ### Added

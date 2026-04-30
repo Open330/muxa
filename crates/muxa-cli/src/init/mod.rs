@@ -1,0 +1,253 @@
+//! `muxa init` — interactive install wizard.
+//!
+//! Modular layout:
+//!
+//! - `components`  — the catalog of selectable items + presets
+//! - `marker`      — generic comment-fenced "managed block" editor
+//! - `files/*`     — per-target content layers (tmux, claude, codex, …)
+//! - `detect`      — pre-flight environment probing
+//! - `plan`/`apply`/`verify` — three phases of the install pipeline
+//! - `ui`          — cliclack wrappers + non-interactive printer
+
+pub mod apply;
+pub mod components;
+pub mod detect;
+pub mod files;
+pub mod marker;
+pub mod plan;
+pub mod ui;
+pub mod verify;
+
+use crate::init::components::{Component, Preset};
+use crate::init::detect::Detection;
+use crate::init::plan::Direction;
+use crate::init::ui::Mode;
+use anyhow::{Context, Result};
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Debug, Parser, Default)]
+// Each bool is a distinct, well-known CLI flag. Collapsing them into a
+// state-machine enum (clippy's suggestion) would be substantially less
+// usable than the documented flag surface.
+#[allow(clippy::struct_excessive_bools)]
+pub struct Args {
+    /// Apply a named preset instead of opening the wizard.
+    #[arg(long, value_parser = parse_preset)]
+    pub preset: Option<Preset>,
+
+    /// Auto-confirm every prompt. CI environments (CI=true) imply this.
+    #[arg(long, short = 'y', env = "MUXA_INIT_YES")]
+    pub yes: bool,
+
+    /// Compute and render the plan, but do not write or run anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Reverse a previous install — strip every muxa-managed block.
+    #[arg(long)]
+    pub uninstall: bool,
+
+    /// Force the wizard to re-prompt even if the components look already
+    /// configured.
+    #[arg(long)]
+    pub reconfigure: bool,
+
+    /// Comma-separated component ids (`tmux-popup,claude-hooks,…`).
+    /// When set, `--preset` and the wizard are bypassed.
+    #[arg(long, value_delimiter = ',')]
+    pub component: Vec<String>,
+
+    /// Skip every component whose id starts with the given prefix.
+    /// Repeatable (`--no tmux-popup --no claude-hooks`). Useful for
+    /// preset+exclusion combos like `--preset standard --no muxad-systemd`.
+    #[arg(long = "no", value_name = "ID")]
+    pub no: Vec<String>,
+}
+
+fn parse_preset(s: &str) -> Result<Preset, String> {
+    Preset::parse(s).ok_or_else(|| format!("unknown preset '{s}' (try minimal | standard | full)"))
+}
+
+pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
+    let mode = Mode::detect(args.yes);
+    ui::intro(mode);
+
+    let detect = Detection::run();
+    if !preflight_ok(mode, &detect, args.uninstall) {
+        anyhow::bail!("pre-flight blockers");
+    }
+
+    let chosen = pick(args.uninstall, &args, &detect, mode)?;
+    if chosen.is_empty() {
+        ui::outro(mode, "Nothing to do.");
+        return Ok(());
+    }
+
+    let direction = if args.uninstall {
+        Direction::Uninstall
+    } else {
+        Direction::Install
+    };
+    let plan = plan::build(direction, &chosen, &detect)?;
+    for w in &plan.warnings {
+        ui::warn_line(mode, w);
+    }
+
+    // Always render the plan — interactive users see the diff before
+    // confirm, --yes / dry-run see it as logged context.
+    let dry = apply::render_dry_run(&plan);
+    ui::note(mode, "Review changes", dry.trim_end());
+
+    if args.dry_run {
+        ui::outro(mode, "Dry run — no changes written.");
+        return Ok(());
+    }
+
+    if !plan.has_changes() {
+        ui::outro(mode, "Already in the desired state.");
+        return Ok(());
+    }
+
+    if !ui::confirm_apply(mode, plan.actions.len())? {
+        ui::outro(mode, "Cancelled.");
+        return Ok(());
+    }
+
+    let report = apply::run(&plan, false).context("applying plan")?;
+    render_apply_steps(mode, &report);
+
+    let v = verify::run(&plan, socket).await?;
+    let extra = summarize_verify(&v);
+    let dashboard = report
+        .dashboard
+        .as_ref()
+        .map(|d| (d.bind.as_str(), d.token.as_str()));
+    ui::final_summary(
+        mode,
+        report.edited.len(),
+        report.backups.len(),
+        dashboard,
+        &extra,
+    );
+
+    let outro_msg = if args.uninstall {
+        "Uninstalled."
+    } else {
+        "Done. Try `prefix + s` for the muxa picker."
+    };
+    ui::outro(mode, outro_msg);
+    Ok(())
+}
+
+/// Render pre-flight, surface warnings, and signal whether we should
+/// proceed. `false` means a hard blocker fired (caller bails).
+fn preflight_ok(mode: Mode, detect: &Detection, uninstall: bool) -> bool {
+    let blockers = detect.blockers();
+    if !blockers.is_empty() && !uninstall {
+        for b in &blockers {
+            ui::error_line(mode, b);
+        }
+        ui::outro(mode, "Aborting — install the missing tools and try again.");
+        return false;
+    }
+    ui::render_detection(mode, detect);
+    for w in detect.warnings() {
+        ui::warn_line(mode, &w);
+    }
+    true
+}
+
+fn render_apply_steps(mode: Mode, report: &apply::ApplyReport) {
+    for path in &report.edited {
+        ui::step(mode, &format!("wrote {}", path.display()));
+    }
+    for path in &report.deleted {
+        ui::step(mode, &format!("removed {}", path.display()));
+    }
+    for backup in &report.backups {
+        ui::step(mode, &format!("backup → {}", backup.display()));
+    }
+    if report.systemd_enabled {
+        ui::step(mode, "systemctl --user enable --now muxad.service");
+    }
+    if report.systemd_disabled {
+        ui::step(mode, "systemctl --user disable --now muxad.service");
+    }
+    if report.tmux_sourced {
+        ui::step(mode, "tmux source-file (config reloaded live)");
+    }
+    for w in &report.warnings {
+        ui::warn_line(mode, w);
+    }
+}
+
+fn summarize_verify(v: &verify::VerifyReport) -> Vec<String> {
+    let mut extra = Vec::new();
+    match v.muxad_responsive {
+        Some(true) => extra.push("✔ muxad responding".into()),
+        Some(false) => extra.push("⚠ muxad not responding (try `muxad &`)".into()),
+        None => {}
+    }
+    if v.current_pane_seen == Some(true) {
+        extra.push("✔ current pane registered with muxad".into());
+    }
+    if v.tmux_status_ok == Some(false) {
+        extra.push("⚠ tmux config syntax check failed — review the diff".into());
+    }
+    for n in &v.notes {
+        extra.push(n.clone());
+    }
+    extra
+}
+
+/// Resolve which components to install/uninstall. Precedence:
+///
+/// 1. `--component` (explicit list — wins over everything)
+/// 2. `--preset`
+/// 3. Interactive multi-select (only on `Mode::Interactive`)
+/// 4. Detection's default selection (in non-interactive mode without preset)
+fn pick(uninstall: bool, args: &Args, detect: &Detection, mode: Mode) -> Result<Vec<Component>> {
+    if !args.component.is_empty() {
+        let mut picked = Vec::new();
+        for id in &args.component {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let c = Component::parse(id).with_context(|| format!("unknown component: {id}"))?;
+            picked.push(c);
+        }
+        return Ok(filter_excluded(picked, &args.no));
+    }
+
+    if let Some(p) = args.preset {
+        let picked = Component::preset(p);
+        return Ok(filter_excluded(picked, &args.no));
+    }
+
+    // Uninstall without a preset means "remove everything we can detect"
+    // — but only blocks/edits we actually own (the file editors are
+    // idempotent on already-clean files, so this is safe).
+    if uninstall {
+        return Ok(Component::ALL.to_vec());
+    }
+
+    match mode {
+        Mode::Interactive => Ok(filter_excluded(ui::pick_components(detect)?, &args.no)),
+        Mode::NonInteractive => {
+            // No preset, no flags, can't prompt → use detection defaults.
+            Ok(filter_excluded(detect.default_selection(), &args.no))
+        }
+    }
+}
+
+fn filter_excluded(components: Vec<Component>, no: &[String]) -> Vec<Component> {
+    if no.is_empty() {
+        return components;
+    }
+    components
+        .into_iter()
+        .filter(|c| !no.iter().any(|n| n == c.id()))
+        .collect()
+}

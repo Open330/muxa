@@ -1,5 +1,6 @@
 //! muxa CLI — user-facing entry point.
 
+mod init;
 mod watch;
 
 use anyhow::{Context, Result};
@@ -78,6 +79,10 @@ enum Cmd {
     },
     /// Backfill the registry by scanning tmux panes for agent processes.
     Sync,
+    /// Interactive install wizard — wires tmux, agent hooks, systemd,
+    /// and the dashboard. Use `--preset standard --yes` for one-shot
+    /// non-interactive installs.
+    Init(init::Args),
 }
 
 #[derive(Debug, Subcommand)]
@@ -139,7 +144,7 @@ async fn main() -> Result<()> {
         .socket
         .or_else(|| cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
-    let client = Client::new(socket);
+    let client = Client::new(socket.clone());
 
     match args.cmd {
         Cmd::Status => cmd_status(&client).await,
@@ -152,6 +157,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
+        Cmd::Init(init_args) => init::run(init_args, socket).await,
     }
 }
 
