@@ -136,24 +136,15 @@ fn home_join(rel: &str) -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(rel)
 }
 
-/// Best-effort check for a running muxad. We just look for any
-/// `muxad` process owned by the current uid via `pgrep`. False on
-/// systems without `pgrep` (e.g. minimal containers); the verify
-/// stage will retry against the daemon's IPC socket anyway.
+/// Is muxad actually serving requests? We probe its IPC socket
+/// directly rather than asking `pgrep` whether *some* process named
+/// `muxad` exists. The pgrep approach was misleading after a v0.4.0
+/// incident: a stale muxad pid lingered with its socket gone, pgrep
+/// said "running", IPC clients then couldn't connect. Socket-connect
+/// is a strict superset of "the daemon you actually want to talk to
+/// is up".
 fn muxad_is_running() -> bool {
-    Command::new("pgrep")
-        .args(["-u", &uid_string(), "-x", "muxad"])
-        .output()
-        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
-}
-
-fn uid_string() -> String {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "0".into(), |s| s.trim().to_string())
+    super::util::muxad_responsive(&super::util::default_muxad_socket())
 }
 
 #[cfg(test)]

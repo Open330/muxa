@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa init` daemon-liveness check now probes the IPC socket
+  instead of `pgrep`** — both pre-flight ("muxad already running"
+  green tick) and the `--start-daemon` action's "is it already up?"
+  short-circuit. The pgrep approach was misleading after a v0.4.0
+  incident where a stale muxad pid lingered with its socket gone:
+  pgrep said "running", we skipped the spawn, and the user's next
+  `muxa status` still failed with `daemon not reachable`. Socket-
+  connect captures the only thing that actually matters — "is the
+  daemon answering" — and a true cold-start errors in microseconds.
+- **Replaced the static 300 ms post-spawn sleep with bounded
+  polling** (3 s timeout, 20 ms interval). Slow VMs / CI runners
+  used to race muxad's socket bind and surface a misleading "muxad
+  not responding" warning right after a successful spawn; the poll
+  loop adapts.
+- **`locate_muxad` (macOS launchd plist) now also checks
+  `/opt/homebrew/bin/muxad` and `/usr/local/bin/muxad`** so a
+  brew-installed muxad lands at the correct path on first install.
+  Cargo path stays first.
+
+### Internal
+
+- New `init::util` module deduplicates `uid_string()` (was in both
+  `detect.rs` and `files/launchd.rs`) and hosts the new
+  `default_muxad_socket()` / `muxad_responsive()` /
+  `wait_for_muxad()` helpers. Six new unit tests cover the polling
+  helper end-to-end against a real `UnixListener`.
+
 ## [0.4.2] - 2026-04-30
 
 ### Added

@@ -16,6 +16,7 @@ pub mod files;
 pub mod marker;
 pub mod plan;
 pub mod ui;
+pub mod util;
 pub mod verify;
 
 use crate::init::components::{Component, Preset};
