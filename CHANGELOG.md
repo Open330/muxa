@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-04-30
+
 ### Fixed
 
 - **`muxa init` daemon-liveness check now probes the IPC socket
-  instead of `pgrep`** — both pre-flight ("muxad already running"
+  instead of `pgrep`** (#20). — both pre-flight ("muxad already running"
   green tick) and the `--start-daemon` action's "is it already up?"
   short-circuit. The pgrep approach was misleading after a v0.4.0
   incident where a stale muxad pid lingered with its socket gone:
