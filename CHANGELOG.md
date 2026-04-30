@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-30
+
 ### Added
 
-- **`muxa init` install wizard.** Interactive (cliclack-styled flow:
+- **`muxa init` install wizard** (#17). Interactive (cliclack-styled flow:
   pre-flight → multi-select → review → apply → verify) and
   non-interactive (`--preset {minimal,standard,full}`, `--yes`,
   `--component`, `--no <id>`, `--dry-run`, `--uninstall`) entry points
