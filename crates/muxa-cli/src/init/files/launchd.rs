@@ -77,22 +77,34 @@ pub fn launchctl_available() -> bool {
 }
 
 /// Best-effort lookup of `muxad` for the plist's `ProgramArguments`.
-/// Falls back to `$HOME/.cargo/bin/muxad` when `which` can't find it.
+/// `which::which` covers the standard case; the static fallbacks
+/// behind it pick up the common cargo / Homebrew layouts in priority
+/// order so a brew-installed muxad on macOS doesn't silently land at
+/// the wrong path on first install.
 pub fn locate_muxad() -> String {
     if let Ok(path) = which::which("muxad") {
         return path.to_string_lossy().into_owned();
     }
-    dirs::home_dir().map_or_else(
-        || "muxad".into(),
-        |h| h.join(".cargo/bin/muxad").to_string_lossy().into_owned(),
-    )
+    let candidates: &[PathBuf] = &[
+        dirs::home_dir()
+            .map(|h| h.join(".cargo/bin/muxad"))
+            .unwrap_or_default(),
+        PathBuf::from("/opt/homebrew/bin/muxad"),
+        PathBuf::from("/usr/local/bin/muxad"),
+    ];
+    for cand in candidates {
+        if cand.is_file() {
+            return cand.to_string_lossy().into_owned();
+        }
+    }
+    "muxad".into()
 }
 
 /// `launchctl bootstrap gui/<uid> <plist>` then `kickstart -k` so the
 /// agent comes up immediately even if it was already loaded with a
 /// stale path.
 pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
-    let target = format!("gui/{}", uid_string());
+    let target = format!("gui/{}", super::super::util::uid_string());
     // Bootstrapping when already loaded fails with "service already
     // bootstrapped" — bootout first, ignore errors.
     let _ = Command::new("launchctl")
@@ -120,19 +132,10 @@ pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
 /// `launchctl bootout gui/<uid>/<label>`. Idempotent — non-zero exit
 /// when the agent isn't loaded is treated as success.
 pub fn disable_service() {
-    let target = format!("gui/{}/{LABEL}", uid_string());
+    let target = format!("gui/{}/{LABEL}", super::super::util::uid_string());
     let _ = Command::new("launchctl")
         .args(["bootout", &target])
         .status();
-}
-
-fn uid_string() -> String {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "501".into(), |s| s.trim().to_string())
 }
 
 #[cfg(test)]

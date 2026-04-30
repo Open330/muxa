@@ -261,17 +261,26 @@ fn describe(a: &Action) -> String {
 
 /// Spawn `muxad` as a detached background process. Returns `Ok(true)`
 /// when we actually launched a new one, `Ok(false)` when the daemon
-/// was already up. We probe via `pgrep -x muxad` because we don't have
-/// the IPC socket here — pgrep is a strict superset of "definitely
-/// running"; a false positive (some other binary called muxad) is
-/// harmless because the user already chose to install muxa.
+/// was already serving requests on its IPC socket.
+///
+/// We probe the socket directly rather than `pgrep -x muxad`. The
+/// pgrep approach was the source of the v0.4.0 confusion: a stale
+/// muxad pid lingered with its socket gone, pgrep said "already
+/// running", we skipped the spawn, and the user's next `muxa status`
+/// still failed. Socket-connect captures the only thing that actually
+/// matters — "is the daemon answering" — and on a true cold-start
+/// (no muxad anywhere) it errors out in microseconds anyway.
+///
+/// After spawn we *poll* for the socket to come up rather than
+/// sleeping a flat 300 ms. Hot path returns in 20-40 ms; slow
+/// hardware / VMs / CI runners get up to a generous 3 s grace before
+/// we give up and surface the failure as a warning to the caller.
 fn start_muxad_detached() -> Result<bool> {
     use std::process::Stdio;
-    let already = Command::new("pgrep")
-        .args(["-x", "muxad"])
-        .output()
-        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
-    if already {
+    use std::time::Duration;
+
+    let socket = super::util::default_muxad_socket();
+    if super::util::muxad_responsive(&socket) {
         return Ok(false);
     }
     // Detach: fork-and-forget via the shell so we don't keep the
@@ -293,9 +302,16 @@ fn start_muxad_detached() -> Result<bool> {
                 .map_or_else(|| "signal".into(), |c| c.to_string())
         ));
     }
-    // Give muxad a beat to bind its socket so a follow-up `muxa
-    // status` succeeds.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Wait for the socket to appear so a follow-up `muxa status`
+    // doesn't race the daemon's startup. Returns false if the
+    // process didn't bind in time, in which case the orchestrator's
+    // verify step will surface a "muxad not responding" warning.
+    if !super::util::wait_for_muxad(&socket, Duration::from_secs(3)) {
+        return Err(anyhow!(
+            "muxad started but did not bind {} within 3s; check /tmp/muxad.log",
+            socket.display()
+        ));
+    }
     Ok(true)
 }
 
