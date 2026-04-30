@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-30
+
+### Added
+
+- **Claude Code rate-limit detection** in `muxa watch` (#15). Three-layer
+  signal pipeline:
+  - **Statusline `rate_limits` JSON** (primary, official): parses
+    `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}` from
+    Claude Code 2.1.80+'s documented statusline schema. Plumbs both
+    windows' percentage + reset times through `Heartbeat` onto the
+    agent row.
+  - **`StopFailure` hook** (mid-turn 429s): new
+    `muxa hook claude --event stop_failure` entrypoint.
+    `error == "rate_limit"` emits the new `AgentEvent::RateLimited`;
+    other error kinds (auth, billing, server) flip the row to `Error`
+    with the upstream message.
+  - **Transcript fallback** (older Claude Code, sub-agent caps): scans
+    the JSONL tail for `error:"rate_limit"` + `apiErrorStatus:429`
+    markers on synthetic assistant entries, plus the legacy
+    `"You've hit your limit"` / `"Claude usage limit reached"`
+    `tool_result` form. Two-tracker walk so a normal turn after a
+    `continue` correctly clears the cap signal.
+- New `limits` column for `[watch] columns`. Renders three states:
+  red `⛔ 5h in 2h 14m` cap badge (rate-limit active), yellow
+  `5h 84%` warning (≥80% utilisation), default-or-dim
+  utilisation/empty fallback. Uses relative-time formatting — no
+  syscall, no locale dependency, no UTC fallback ambiguity.
+- New detail-line placeholders: `{rate_limit}` (mirrors the column,
+  human-readable), `{rate_limit_resets_at}` (RFC 3339, machine-
+  readable), `{rate_limit_scope}` (`5h` / `7d` / `unknown` / `-`).
+- `RateLimitScope` and `RateLimitSource` enums on the public API.
+  `Agent` gains `rate_limit_5h_pct`, `rate_limit_5h_resets_at`,
+  `rate_limit_7d_pct`, `rate_limit_7d_resets_at`, `rate_limited_until`,
+  `rate_limit_scope`, `rate_limit_source`. `AgentEvent::RateLimited`
+  is a new variant; `AgentEvent::Heartbeat` gains optional rate-limit
+  fields. All additions are serde-additive — old peers and on-disk
+  `state.json` keep loading without a `STATE_SCHEMA_VERSION` bump.
+
+### Changed
+
+- `apply_heartbeat` now derives a soft cap when statusline utilisation
+  hits 100% on either window, and auto-clears it the moment the next
+  heartbeat reports utilisation back below saturation. Hard caps
+  (`StopFailure` / `Transcript`) persist until the next `Started` or
+  a successful `TurnStopped` (a successful turn is empirical proof
+  the cap isn't blocking).
+- `TurnStopped` with a captured response now lifts the row out of
+  `Error` state and clears any active cap. Previously a transient
+  429 followed by a successful retry left the row stuck red until a
+  full session restart.
+
 ## [0.3.0] - 2026-04-29
 
 First **beta** release. Pan-agent observability across Claude Code,
@@ -228,7 +279,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Open330/muxa/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Open330/muxa/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Open330/muxa/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Open330/muxa/releases/tag/v0.1.0
