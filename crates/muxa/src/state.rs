@@ -380,7 +380,20 @@ fn mutate_for_event(
             if let Some(text) = response {
                 agent.last_response = Some(text.clone());
             }
-            if agent.state != AgentState::Error {
+            // A successful turn (response captured) is empirical proof
+            // that the cap isn't blocking right now — clear any active
+            // cap, hard or soft, and lift the row out of Error. Without
+            // this the recovery path for a hard cap would be a session
+            // restart, which `continue` after a transient 429 doesn't
+            // produce. `response.is_none()` doesn't qualify: the
+            // adapter may simply have failed to read the transcript,
+            // including the case where the turn itself was rate-limited.
+            if response.is_some() {
+                agent.rate_limit_scope = None;
+                agent.rate_limited_until = None;
+                agent.rate_limit_source = None;
+                agent.state = AgentState::Idle;
+            } else if agent.state != AgentState::Error {
                 agent.state = AgentState::Idle;
             }
         }
@@ -1308,6 +1321,96 @@ mod tests {
             Some(RateLimitSource::Transcript),
             "hard source must not be overwritten by saturation",
         );
+    }
+
+    /// Round-3 P1 regression: a successful turn after a hard cap must
+    /// clear it. Without this the recovery path for a transient
+    /// `StopFailure` 429 was a full session restart — typing
+    /// "continue" and getting a real response would leave the row
+    /// stuck red despite empirical evidence the cap was gone.
+    #[tokio::test]
+    async fn successful_turn_clears_hard_cap() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+        let t1 = datetime!(2026-04-29 10:15:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        // Hard cap from a transient 429.
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::Unknown,
+                source: RateLimitSource::StopFailure,
+                resets_at: None,
+                message: Some("429".into()),
+                at: t0,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.state, AgentState::Error);
+        assert_eq!(a.rate_limit_source, Some(RateLimitSource::StopFailure));
+
+        // User retries; Claude Code serves a real response. Stop hook
+        // emits TurnStopped with the captured assistant text.
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                response: Some("recovered".into()),
+                at: t1,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.state, AgentState::Idle, "successful turn must lift Error");
+        assert_eq!(a.rate_limit_scope, None);
+        assert_eq!(a.rate_limited_until, None);
+        assert_eq!(a.rate_limit_source, None);
+        assert_eq!(a.last_response.as_deref(), Some("recovered"));
+    }
+
+    /// `TurnStopped` *without* a response means the adapter couldn't
+    /// read the transcript — that includes the case where the turn
+    /// itself was rate-limited and the synthetic message replaced the
+    /// expected assistant text. We must NOT auto-clear in that case.
+    #[tokio::test]
+    async fn empty_turn_stopped_does_not_clear_hard_cap() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::Unknown,
+                source: RateLimitSource::StopFailure,
+                resets_at: None,
+                message: None,
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                response: None,
+                at: t0,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(
+            a.rate_limit_source,
+            Some(RateLimitSource::StopFailure),
+            "empty turn must not clear an active hard cap",
+        );
+        assert_eq!(a.state, AgentState::Error);
     }
 
     #[tokio::test]
