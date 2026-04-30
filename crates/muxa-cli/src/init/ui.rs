@@ -138,10 +138,14 @@ fn check_path(label: &str, p: Option<&std::path::PathBuf>) -> String {
 
 /// Multi-select component picker with auto-detected defaults. In
 /// non-interactive mode this is bypassed (caller picks via preset).
+/// Components that don't apply to this host (e.g. `MuxadSystemd` on
+/// macOS, `MuxadLaunchd` on Linux) are filtered out so the picker
+/// shows a clean, host-specific menu instead of forcing the user to
+/// reason about which option is the right one for them.
 pub fn pick_components(detect: &Detection) -> Result<Vec<Component>> {
     let defaults = detect.default_selection();
     let mut ms = cliclack::multiselect("What should I set up?").required(false);
-    for c in Component::ALL {
+    for c in Component::ALL.iter().filter(|c| c.applicable_here()) {
         ms = ms.item(*c, c.label(), c.hint());
     }
     let chosen = ms.initial_values(defaults).interact()?;
