@@ -19,8 +19,14 @@ pub enum Component {
     CodexHooks,
     /// Gemini CLI shell hooks
     GeminiHooks,
-    /// `muxad` user-level systemd service
+    /// `muxad` user-level systemd service (Linux only)
     MuxadSystemd,
+    /// `muxad` `launchd` `LaunchAgent` (macOS only)
+    MuxadLaunchd,
+    /// `muxad` autostart hook in `~/.zshrc` / `~/.bashrc`
+    /// (fallback for systems without systemd or launchd —
+    /// containers, BSD, WSL1, minimal Linux)
+    MuxadShellrc,
     /// Web dashboard: generate token, enable in config
     Dashboard,
 }
@@ -33,6 +39,8 @@ impl Component {
         Component::CodexHooks,
         Component::GeminiHooks,
         Component::MuxadSystemd,
+        Component::MuxadLaunchd,
+        Component::MuxadShellrc,
         Component::Dashboard,
     ];
 
@@ -45,6 +53,8 @@ impl Component {
             Component::CodexHooks => "codex-hooks",
             Component::GeminiHooks => "gemini-hooks",
             Component::MuxadSystemd => "muxad-systemd",
+            Component::MuxadLaunchd => "muxad-launchd",
+            Component::MuxadShellrc => "muxad-shellrc",
             Component::Dashboard => "dashboard",
         }
     }
@@ -62,6 +72,8 @@ impl Component {
             Component::CodexHooks => "OpenAI Codex: shell hooks",
             Component::GeminiHooks => "Gemini CLI: shell hooks",
             Component::MuxadSystemd => "muxad: systemd user service (auto-start on login)",
+            Component::MuxadLaunchd => "muxad: launchd LaunchAgent (auto-start on login)",
+            Component::MuxadShellrc => "muxad: shellrc autostart hook (no service manager)",
             Component::Dashboard => "Web dashboard: generate token + enable",
         }
     }
@@ -74,13 +86,41 @@ impl Component {
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
             Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",
-            Component::MuxadSystemd => "Linux only — skipped on macOS",
+            Component::MuxadSystemd => "Linux only; skipped on macOS / launchd hosts",
+            Component::MuxadLaunchd => "macOS only; skipped on Linux / systemd hosts",
+            Component::MuxadShellrc => "appends to ~/.zshrc or ~/.bashrc; cross-platform",
             Component::Dashboard => "loopback :7878 by default; token in config",
+        }
+    }
+
+    /// The OS-appropriate "auto-start muxad" component for this host.
+    /// Returned at runtime so the *same* binary running under a Linux
+    /// container vs. on macOS metal picks correctly without rebuild.
+    pub fn recommended_daemon_manager() -> Component {
+        match std::env::consts::OS {
+            "macos" => Component::MuxadLaunchd,
+            "linux" => Component::MuxadSystemd,
+            // BSDs, illumos, WSL1, anything else — fall back to the
+            // shellrc hook since it has no platform prereqs.
+            _ => Component::MuxadShellrc,
+        }
+    }
+
+    /// True if this component makes sense on this host. Used by the
+    /// wizard to hide cross-platform-irrelevant options (e.g. don't
+    /// offer `MuxadSystemd` on macOS).
+    pub fn applicable_here(self) -> bool {
+        match self {
+            Component::MuxadSystemd => std::env::consts::OS == "linux",
+            Component::MuxadLaunchd => std::env::consts::OS == "macos",
+            // shellrc + everything else is OS-agnostic.
+            _ => true,
         }
     }
 
     /// Components shipped by each preset.
     pub fn preset(p: Preset) -> Vec<Component> {
+        let dm = Component::recommended_daemon_manager();
         match p {
             Preset::Minimal => vec![Component::TmuxPopup, Component::TmuxStatusLine],
             Preset::Standard => vec![
@@ -89,9 +129,13 @@ impl Component {
                 Component::ClaudeHooks,
                 Component::CodexHooks,
                 Component::GeminiHooks,
-                Component::MuxadSystemd,
+                dm,
             ],
-            Preset::Full => Component::ALL.to_vec(),
+            Preset::Full => {
+                let mut v = Component::preset(Preset::Standard);
+                v.push(Component::Dashboard);
+                v
+            }
         }
     }
 }
@@ -160,5 +204,36 @@ mod tests {
         for c in &s {
             assert!(f.contains(c), "full should include all of standard");
         }
+    }
+
+    #[test]
+    fn standard_preset_includes_one_daemon_manager() {
+        let s = Component::preset(Preset::Standard);
+        let dm_count = s
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Component::MuxadSystemd | Component::MuxadLaunchd | Component::MuxadShellrc
+                )
+            })
+            .count();
+        assert_eq!(
+            dm_count, 1,
+            "standard should pick exactly one daemon-manager"
+        );
+    }
+
+    #[test]
+    fn applicable_here_filters_per_os() {
+        // The two OS-locked managers can't both be true on the same host.
+        let systemd_ok = Component::MuxadSystemd.applicable_here();
+        let launchd_ok = Component::MuxadLaunchd.applicable_here();
+        assert!(
+            !(systemd_ok && launchd_ok),
+            "systemd and launchd are mutually exclusive per host"
+        );
+        // The OS-agnostic shellrc fallback is always applicable.
+        assert!(Component::MuxadShellrc.applicable_here());
     }
 }

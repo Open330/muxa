@@ -37,6 +37,15 @@ pub enum Action {
     EnableSystemdUnit,
     /// Run `systemctl --user disable --now muxad.service`.
     DisableSystemdUnit,
+    /// `launchctl bootstrap gui/<uid> <plist>` and kickstart.
+    EnableLaunchdUnit { plist_path: PathBuf },
+    /// `launchctl bootout gui/<uid>/<label>`.
+    DisableLaunchdUnit,
+    /// Start `muxad` in the background if it isn't already responding
+    /// on the IPC socket. Cross-platform — works regardless of which
+    /// (or no) daemon-manager component was selected. Honours
+    /// `--start-daemon=false`.
+    StartDaemonIfNeeded,
     /// Reload the user's tmux config in place if a tmux server is up.
     /// No-op when not inside tmux + no live server.
     SourceTmuxConf { path: PathBuf },
@@ -60,9 +69,12 @@ impl Plan {
     pub fn has_changes(&self) -> bool {
         self.actions.iter().any(|a| match a {
             Action::EditFile { outcome, .. } => outcome.changed(),
-            Action::DeleteFile { .. } | Action::EnableSystemdUnit | Action::DisableSystemdUnit => {
-                true
-            }
+            Action::DeleteFile { .. }
+            | Action::EnableSystemdUnit
+            | Action::DisableSystemdUnit
+            | Action::EnableLaunchdUnit { .. }
+            | Action::DisableLaunchdUnit
+            | Action::StartDaemonIfNeeded => true,
             Action::SourceTmuxConf { .. } | Action::PrintDashboard { .. } => false,
         })
     }
@@ -86,37 +98,9 @@ pub fn build(direction: Direction, components: &[Component], detect: &Detection)
             Component::ClaudeHooks => plan_claude(direction, *c, &mut actions, &mut warnings)?,
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
             Component::GeminiHooks => plan_gemini(direction, *c, &mut actions)?,
-            Component::MuxadSystemd => {
-                let Some(path) = files::systemd::default_unit_path() else {
-                    continue;
-                };
-                match direction {
-                    Direction::Install => {
-                        if !detect.systemd_user_available {
-                            continue;
-                        }
-                        let before = read_to_string_opt(&path)?;
-                        let (after, outcome) = files::systemd::upsert(before.as_deref());
-                        actions.push(Action::EditFile {
-                            component: *c,
-                            path,
-                            before,
-                            after,
-                            outcome,
-                        });
-                        actions.push(Action::EnableSystemdUnit);
-                    }
-                    Direction::Uninstall => {
-                        actions.push(Action::DisableSystemdUnit);
-                        if path.is_file() {
-                            actions.push(Action::DeleteFile {
-                                component: *c,
-                                path,
-                            });
-                        }
-                    }
-                }
-            }
+            Component::MuxadSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
+            Component::MuxadLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
+            Component::MuxadShellrc => plan_shellrc(direction, *c, &mut actions)?,
             Component::Dashboard => {
                 let Some(path) = files::dashboard::default_path() else {
                     continue;
@@ -276,6 +260,97 @@ fn plan_gemini(direction: Direction, c: Component, actions: &mut Vec<Action>) ->
         Direction::Uninstall => {
             files::gemini::remove(&original).context("scrubbing gemini settings.json")?
         }
+    };
+    actions.push(Action::EditFile {
+        component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+fn plan_systemd(
+    direction: Direction,
+    c: Component,
+    detect: &Detection,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let Some(path) = files::systemd::default_unit_path() else {
+        return Ok(());
+    };
+    match direction {
+        Direction::Install => {
+            if !detect.systemd_user_available {
+                return Ok(());
+            }
+            let before = read_to_string_opt(&path)?;
+            let (after, outcome) = files::systemd::upsert(before.as_deref());
+            actions.push(Action::EditFile {
+                component: c,
+                path,
+                before,
+                after,
+                outcome,
+            });
+            actions.push(Action::EnableSystemdUnit);
+        }
+        Direction::Uninstall => {
+            actions.push(Action::DisableSystemdUnit);
+            if path.is_file() {
+                actions.push(Action::DeleteFile { component: c, path });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_launchd(
+    direction: Direction,
+    c: Component,
+    detect: &Detection,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let Some(path) = files::launchd::default_unit_path() else {
+        return Ok(());
+    };
+    match direction {
+        Direction::Install => {
+            if !detect.launchctl_available {
+                return Ok(());
+            }
+            let before = read_to_string_opt(&path)?;
+            let want = files::launchd::render_plist(&files::launchd::locate_muxad());
+            let (after, outcome) = files::launchd::upsert(before.as_deref(), &want);
+            actions.push(Action::EditFile {
+                component: c,
+                path: path.clone(),
+                before,
+                after,
+                outcome,
+            });
+            actions.push(Action::EnableLaunchdUnit { plist_path: path });
+        }
+        Direction::Uninstall => {
+            actions.push(Action::DisableLaunchdUnit);
+            if path.is_file() {
+                actions.push(Action::DeleteFile { component: c, path });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_shellrc(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::shellrc::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => files::shellrc::upsert(&original),
+        Direction::Uninstall => files::shellrc::remove(&original),
     };
     actions.push(Action::EditFile {
         component: c,

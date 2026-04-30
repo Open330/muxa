@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`muxad-launchd` component** — macOS auto-start parity with the
+  Linux `muxad-systemd` component. `muxa init` writes
+  `~/Library/LaunchAgents/dev.open330.muxad.plist`, then runs
+  `launchctl bootstrap gui/<uid>` + `kickstart -k` so the agent is
+  loaded immediately and re-launched on every login. Uninstall does
+  the inverse (`launchctl bootout` + plist removal). Resolved through
+  the standard marker-block / outcome flow, so dry-run + uninstall
+  work the same as everywhere else.
+- **`muxad-shellrc` component** — cross-platform fallback for hosts
+  with no service manager (containers, BSD, WSL1, minimal Linux,
+  CI sandboxes). Appends a `# >>> muxa managed (muxad-shellrc) >>>`
+  block to the user's primary shell rc (auto-detected from `$SHELL`
+  → `~/.zshrc` for zsh, `~/.bashrc` for bash, fish config dir for
+  fish, `~/.profile` otherwise) that lazy-starts `muxad` from the
+  next interactive shell.
+- **`--start-daemon` flag (default `true`)** — at the end of `muxa
+  init`, if `muxad` isn't already running, spawn it detached. Closes
+  the gap reported on macOS where the wizard finished cleanly but
+  `muxa status` / `muxa watch` failed because the daemon had never
+  been started. Override with `--start-daemon=false` for dotfile
+  bootstraps that prefer to manage the daemon out-of-band.
+
+### Changed
+
+- **Smart daemon-manager selection.** `Preset::Standard` /
+  `Preset::Full` now pick exactly one daemon-manager component
+  (`muxad-systemd` / `muxad-launchd` / `muxad-shellrc`) based on the
+  host OS, and the wizard's multi-select hides the OS-irrelevant
+  candidates (no more "muxad: systemd user service" option on
+  macOS). `Detection::recommended_daemon_manager()` further degrades
+  to `muxad-shellrc` when systemctl/launchctl is missing on a host
+  that would normally support them — the `Preset::Standard` ⇒
+  working install invariant holds even in stripped-down envs.
+
 ## [0.4.1] - 2026-04-30
 
 ### Fixed

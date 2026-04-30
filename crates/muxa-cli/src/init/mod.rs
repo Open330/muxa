@@ -63,6 +63,16 @@ pub struct Args {
     /// preset+exclusion combos like `--preset standard --no muxad-systemd`.
     #[arg(long = "no", value_name = "ID")]
     pub no: Vec<String>,
+
+    /// After applying, start `muxad` if it isn't already running.
+    /// Default on — this is what makes the wizard "leave the system
+    /// in a working state" on hosts where no service-manager component
+    /// is selected (containers, BSDs, WSL1) or where the chosen
+    /// manager hasn't kicked in yet. Pass `--start-daemon=false` to
+    /// suppress (e.g. dotfile bootstrap that prefers to do it
+    /// out-of-band).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub start_daemon: bool,
 }
 
 fn parse_preset(s: &str) -> Result<Preset, String> {
@@ -89,7 +99,13 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     } else {
         Direction::Install
     };
-    let plan = plan::build(direction, &chosen, &detect)?;
+    let mut plan = plan::build(direction, &chosen, &detect)?;
+    if matches!(direction, Direction::Install) && args.start_daemon {
+        // Append last so disk edits + service enablement happen first;
+        // by the time we try to start muxad the file/socket layout it
+        // expects is fully in place.
+        plan.actions.push(plan::Action::StartDaemonIfNeeded);
+    }
     for w in &plan.warnings {
         ui::warn_line(mode, w);
     }
@@ -173,6 +189,15 @@ fn render_apply_steps(mode: Mode, report: &apply::ApplyReport) {
     }
     if report.systemd_disabled {
         ui::step(mode, "systemctl --user disable --now muxad.service");
+    }
+    if report.launchd_enabled {
+        ui::step(mode, "launchctl bootstrap dev.open330.muxad");
+    }
+    if report.launchd_disabled {
+        ui::step(mode, "launchctl bootout dev.open330.muxad");
+    }
+    if report.daemon_started {
+        ui::step(mode, "started muxad");
     }
     if report.tmux_sourced {
         ui::step(mode, "tmux source-file (config reloaded live)");

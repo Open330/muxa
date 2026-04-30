@@ -9,5 +9,7 @@ pub mod claude;
 pub mod codex;
 pub mod dashboard;
 pub mod gemini;
+pub mod launchd;
+pub mod shellrc;
 pub mod systemd;
 pub mod tmux;

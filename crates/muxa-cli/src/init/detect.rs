@@ -24,6 +24,7 @@ pub struct Detection {
     pub gemini_settings: Option<PathBuf>,
     pub muxad_running: bool,
     pub systemd_user_available: bool,
+    pub launchctl_available: bool,
 }
 
 impl Detection {
@@ -37,6 +38,7 @@ impl Detection {
             gemini_settings: existing_file(home_join(".gemini/settings.json")),
             muxad_running: muxad_is_running(),
             systemd_user_available: super::files::systemd::systemd_available(),
+            launchctl_available: super::files::launchd::launchctl_available(),
         }
     }
 
@@ -57,8 +59,24 @@ impl Detection {
         if self.gemini_settings.is_some() {
             out.push(Component::GeminiHooks);
         }
-        // Don't pre-check systemd / dashboard — they're opt-in.
+        // Pre-check the daemon-manager that fits this host so the
+        // wizard's default produces a working install. The picker
+        // hides the others (filtered via `Component::applicable_here`).
+        out.push(self.recommended_daemon_manager());
+        // Dashboard stays opt-in — costs a port and a token.
         out
+    }
+
+    /// The OS-appropriate auto-start manager for this host. Defers to
+    /// the static `Component::recommended_daemon_manager()` but degrades
+    /// to `MuxadShellrc` when systemctl/launchctl is missing on a host
+    /// that would normally support them (containers, CI sandboxes).
+    pub fn recommended_daemon_manager(&self) -> Component {
+        match Component::recommended_daemon_manager() {
+            Component::MuxadSystemd if !self.systemd_user_available => Component::MuxadShellrc,
+            Component::MuxadLaunchd if !self.launchctl_available => Component::MuxadShellrc,
+            other => other,
+        }
     }
 
     /// Hard-gate the wizard. Empty Vec means "go ahead".
@@ -76,9 +94,15 @@ impl Detection {
     /// Soft warnings — render but don't block.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        if !self.systemd_user_available {
+        // Only nag about a missing daemon-manager *if it's the one we
+        // would have recommended for this host*. Linux without
+        // systemctl is interesting; macOS without systemctl is normal.
+        let dm = self.recommended_daemon_manager();
+        if dm == Component::MuxadShellrc
+            && Component::recommended_daemon_manager() != Component::MuxadShellrc
+        {
             warnings.push(
-                "systemctl --user unavailable — `muxad-systemd` component will be skipped if selected".into(),
+                "no service manager available — falling back to shellrc autostart for muxad".into(),
             );
         }
         if self.tmux.is_none() && self.zellij.is_some() {
@@ -145,9 +169,15 @@ mod tests {
     }
 
     #[test]
-    fn default_selection_is_empty_when_nothing_detected() {
+    fn default_selection_with_no_tools_only_picks_daemon_manager() {
+        // `Detection::default()` represents a host with no tmux,
+        // no agents, no service managers. We still pre-check the
+        // OS-fallback daemon-manager (`MuxadShellrc`) so a default
+        // install still produces a working muxad — that's the whole
+        // point of the post-v0.4.1 wizard.
         let d = Detection::default();
-        assert!(d.default_selection().is_empty());
+        let sel = d.default_selection();
+        assert_eq!(sel, vec![Component::MuxadShellrc]);
     }
 
     #[test]
