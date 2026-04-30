@@ -235,15 +235,17 @@ function renderAgents() {
   rows.sort((x, y) => (y.last_activity_at || "").localeCompare(x.last_activity_at || ""));
 
   if (rows.length === 0) {
-    dom.agentsBody.innerHTML = `<tr class="empty"><td colspan="8">no matching agents</td></tr>`;
+    dom.agentsBody.innerHTML = `<tr class="empty"><td colspan="9">no matching agents</td></tr>`;
     return;
   }
 
+  const now = Date.now();
   const html = rows
     .map((a) => {
       const pane = resolvePaneLabel(a.pane);
       const ctx = a.context_used_pct == null ? "—" : `${Math.round(a.context_used_pct)}%`;
       const cost = a.cost_usd == null ? "—" : `$${a.cost_usd.toFixed(2)}`;
+      const limits = renderLimitsCell(a, now);
       const prompt = (a.last_prompt || "—").split("\n")[0].slice(0, 120);
       const activity = relTime(a.last_activity_at);
       return `<tr>
@@ -253,12 +255,82 @@ function renderAgents() {
         <td>${esc(a.model || "—")}</td>
         <td class="num">${esc(ctx)}</td>
         <td class="num">${esc(cost)}</td>
+        <td class="${limits.cls}" title="${esc(limits.title)}">${esc(limits.text)}</td>
         <td>${esc(prompt)}</td>
         <td>${esc(activity)}</td>
       </tr>`;
     })
     .join("");
   dom.agentsBody.innerHTML = html;
+}
+
+/// Build the LIMITS cell for one agent row. Mirrors the CLI watch
+/// renderer's three-state rule:
+///   - red `⛔ <scope> in 2h 14m` — currently capped (rate_limit_scope set,
+///     and either no reset known or reset is in the future).
+///   - yellow `5h 84%` — utilisation ≥ 80% on either window (warning).
+///   - default-or-dim `5h 31%` / `—` otherwise.
+/// Returns {text, cls, title} so the caller can splice into the row.
+function renderLimitsCell(a, now) {
+  if (isCurrentlyCapped(a, now)) {
+    const scope = scopePrefix(a.rate_limit_scope);
+    const until = a.rate_limited_until ? Date.parse(a.rate_limited_until) : null;
+    const tail = until && until > now
+      ? formatRelativeUntil(until - now)
+      : "capped";
+    const body = scope ? `${scope} ${tail}` : (tail === "capped" ? "rate limited" : tail);
+    return {
+      text: `⛔ ${body}`,
+      cls: "limits limits-cap",
+      title: a.last_notification || "rate limited",
+    };
+  }
+  const p5 = a.rate_limit_5h_pct;
+  const p7 = a.rate_limit_7d_pct;
+  const both = p5 != null && p7 != null;
+  let chosen = null;
+  let label = null;
+  if (both) {
+    if (p7 > p5) { chosen = p7; label = "7d"; } else { chosen = p5; label = "5h"; }
+  } else if (p5 != null) {
+    chosen = p5; label = "5h";
+  } else if (p7 != null) {
+    chosen = p7; label = "7d";
+  }
+  if (chosen == null) {
+    return { text: "—", cls: "limits limits-empty", title: "" };
+  }
+  const cls = chosen >= 80 ? "limits limits-warn" : "limits";
+  return {
+    text: `${label} ${Math.round(chosen)}%`,
+    cls,
+    title: "",
+  };
+}
+
+function isCurrentlyCapped(a, now) {
+  if (!a.rate_limit_scope) return false;
+  if (!a.rate_limited_until) return true;
+  return Date.parse(a.rate_limited_until) > now;
+}
+
+function scopePrefix(scope) {
+  switch (scope) {
+    case "five_hour": return "5h";
+    case "seven_day": return "7d";
+    default: return "";
+  }
+}
+
+/// Render millisecond gap as "in 2h 14m" / "in 47m" / "in 30s".
+function formatRelativeUntil(ms) {
+  const totalSecs = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSecs / 3600);
+  const minutes = Math.floor((totalSecs % 3600) / 60);
+  const seconds = totalSecs % 60;
+  if (hours > 0) return `in ${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0) return `in ${minutes}m`;
+  return `in ${seconds}s`;
 }
 
 function renderPanes() {
