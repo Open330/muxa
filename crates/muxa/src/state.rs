@@ -113,6 +113,15 @@ pub struct Agent {
     /// versa. Cleared together with `rate_limited_until`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_scope: Option<RateLimitScope>,
+    /// Which signal pinned the current cap, when one is active.
+    /// Distinguishes *soft* caps (statusline saturation — auto-clears
+    /// when the next heartbeat reports utilization back below 100) from
+    /// *hard* caps (`StopFailure` 429 / transcript synthetic — stay
+    /// pinned until the next `Started`). Without this distinction a
+    /// long-running session that hit the cap and then the window rolled
+    /// over would keep its row glowing red forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_source: Option<RateLimitSource>,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -145,6 +154,7 @@ impl Agent {
             rate_limit_7d_resets_at: None,
             rate_limited_until: None,
             rate_limit_scope: None,
+            rate_limit_source: None,
             started_at: at,
             last_activity_at: at,
         }
@@ -332,6 +342,7 @@ fn mutate_for_event(
             // can keep counting against the same window.
             agent.rate_limited_until = None;
             agent.rate_limit_scope = None;
+            agent.rate_limit_source = None;
         }
         AgentEvent::PromptSubmitted { prompt, .. } => {
             agent.last_prompt = Some(prompt.clone());
@@ -387,12 +398,21 @@ fn mutate_for_event(
 /// row. Each field is independently optional — adapters may emit some
 /// without others, and absent fields preserve the row's prior value.
 ///
-/// Side effect: when statusline utilization hits 100% on either window
-/// AND the same window has a reset timestamp, mark the agent as currently
-/// capped — that's the soft "you've maxed out this window" signal that
-/// arrives via Heartbeat rather than a discrete `RateLimited` event. The
-/// 5-hour window wins the scope label when both are saturated; it's the
-/// shorter wall the user is most likely watching.
+/// Saturation side effect: when either statusline window's utilization
+/// hits 100, mark the agent as currently capped from
+/// [`RateLimitSource::Statusline`] (a *soft* cap). The 5-hour window
+/// wins the scope label when both are saturated — it's the shorter
+/// wall the user is most likely watching. State is intentionally not
+/// flipped to `Error` here: the LIMITS column's red ⛔ badge is a
+/// stronger visual than crowding the State column too, and Heartbeat
+/// changing `state` would break the convention that only discrete
+/// lifecycle events drive state transitions.
+///
+/// Desaturation side effect: when neither window is saturated AND the
+/// active cap is soft, clear it. Hard caps (`StopFailure` /
+/// `Transcript`) are left intact and only `Started` clears them — a
+/// 429-confirmed cap still holds even if Claude Code's percentage
+/// reading later drops.
 fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
     let AgentEvent::Heartbeat {
         model,
@@ -429,10 +449,6 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
         agent.rate_limit_7d_resets_at = Some(*t);
     }
 
-    // Statusline-derived cap: the rolling utilization fields cross 100,
-    // which is exactly the moment Claude Code stops accepting new turns
-    // on that window. Pin the scope/until on the agent so the watch row
-    // flips red without waiting for a separate `RateLimited` event.
     let five_hour_saturated = rate_limit_5h_pct.is_some_and(|p| p >= 100.0);
     let seven_day_saturated = rate_limit_7d_pct.is_some_and(|p| p >= 100.0);
     if five_hour_saturated || seven_day_saturated {
@@ -441,25 +457,46 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
         } else {
             (RateLimitScope::SevenDay, *rate_limit_7d_resets_at)
         };
-        let regressing = matches!(scope, RateLimitScope::Unknown)
-            && matches!(
-                agent.rate_limit_scope,
-                Some(RateLimitScope::FiveHour | RateLimitScope::SevenDay)
-            );
-        if !regressing {
-            agent.rate_limit_scope = Some(scope);
-        }
+        // Saturation always picks a specific scope, so a plain assignment
+        // can never regress an existing scope here.
+        agent.rate_limit_scope = Some(scope);
         if until.is_some() {
             agent.rate_limited_until = until;
         }
-        agent.state = AgentState::Error;
+        // Don't downgrade a hard cap (StopFailure / Transcript) to the
+        // softer Statusline source — `Started` is the one and only
+        // signal that should clear those, even if the percentage on
+        // this heartbeat happens to confirm them.
+        if !is_hard_source(agent.rate_limit_source) {
+            agent.rate_limit_source = Some(RateLimitSource::Statusline);
+        }
         tracing::debug!(
             source = ?RateLimitSource::Statusline,
             scope = ?scope,
             resets_at = ?until,
             "statusline saturation marked agent as rate-limited",
         );
+    } else if agent.rate_limit_source == Some(RateLimitSource::Statusline) {
+        // Soft cap auto-clears the moment the percentage drops back
+        // below saturation — the only path that prevents a long-running
+        // session from glowing red forever after the window rolls over.
+        agent.rate_limit_scope = None;
+        agent.rate_limited_until = None;
+        agent.rate_limit_source = None;
+        tracing::debug!("statusline desaturation cleared soft rate-limit cap");
     }
+}
+
+/// True for sources that should persist until the next `Started` —
+/// `StopFailure` is a confirmed upstream 429 and `Transcript` is the
+/// fallback path that observed Claude Code's own synthetic message.
+/// Both are stronger evidence than statusline saturation alone, which
+/// is just a reading off Claude Code's local counter.
+fn is_hard_source(s: Option<RateLimitSource>) -> bool {
+    matches!(
+        s,
+        Some(RateLimitSource::StopFailure | RateLimitSource::Transcript)
+    )
 }
 
 /// Mark the agent as currently capped. `resets_at = None` means the
@@ -480,13 +517,22 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
     // clobber a richer scope already learned from statusline / transcript
     // — that would make the watch badge regress from `5h …` to a bare
     // `rate limited` label.
-    let regressing = matches!(scope, RateLimitScope::Unknown)
+    let regressing_scope = matches!(scope, RateLimitScope::Unknown)
         && matches!(
             agent.rate_limit_scope,
             Some(RateLimitScope::FiveHour | RateLimitScope::SevenDay)
         );
-    if !regressing {
+    if !regressing_scope {
         agent.rate_limit_scope = Some(*scope);
+    }
+    // Source precedence: hard signals (StopFailure / Transcript) must
+    // not be downgraded to soft (Statusline) by a later, weaker event.
+    let new_is_hard = matches!(
+        source,
+        RateLimitSource::StopFailure | RateLimitSource::Transcript
+    );
+    if !is_hard_source(agent.rate_limit_source) || new_is_hard {
+        agent.rate_limit_source = Some(*source);
     }
     if resets_at.is_some() {
         agent.rate_limited_until = *resets_at;
@@ -959,8 +1005,7 @@ mod tests {
 
         // Mirror the renderer's "currently capped" rule.
         let is_capped = |a: &Agent, now: OffsetDateTime| -> bool {
-            a.rate_limit_scope.is_some()
-                && a.rate_limited_until.is_none_or(|until| until > now)
+            a.rate_limit_scope.is_some() && a.rate_limited_until.is_none_or(|until| until > now)
         };
 
         // 1. Session starts; no rate-limit data yet.
@@ -1062,6 +1107,7 @@ mod tests {
         let a = store.by_session("s").await.unwrap();
         assert_eq!(a.rate_limit_scope, None);
         assert_eq!(a.rate_limited_until, None);
+        assert_eq!(a.rate_limit_source, None);
         assert!(!is_capped(&a, t3));
     }
 
@@ -1097,7 +1143,171 @@ mod tests {
         let a = store.by_session("s").await.unwrap();
         assert_eq!(a.rate_limit_scope, Some(RateLimitScope::FiveHour));
         assert_eq!(a.rate_limited_until, Some(resets_at));
-        assert_eq!(a.state, AgentState::Error);
+        assert_eq!(a.rate_limit_source, Some(RateLimitSource::Statusline));
+        // Saturation does NOT flip state — that would break the
+        // convention that only discrete lifecycle events drive state.
+        // The watch row glows red via the LIMITS column gate, not via
+        // a redundant State column flip.
+        assert_eq!(a.state, AgentState::Idle);
+    }
+
+    /// Regression for the second-round P0: a long-running session that
+    /// hit a *soft* cap (statusline saturation) and then the window
+    /// rolled over must stop showing red. Without auto-clear the row
+    /// would glow forever until the user happened to start a fresh
+    /// session.
+    #[tokio::test]
+    async fn heartbeat_desaturation_clears_soft_cap() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+        let t1 = datetime!(2026-04-29 15:01:00 UTC);
+        let old_reset = datetime!(2026-04-29 15:00:00 UTC);
+        let new_reset = datetime!(2026-04-29 20:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+
+        // Saturate.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(100.0),
+                rate_limit_5h_resets_at: Some(old_reset),
+                rate_limit_7d_pct: Some(35.0),
+                rate_limit_7d_resets_at: None,
+                at: t0,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.rate_limit_source, Some(RateLimitSource::Statusline));
+
+        // Window rolls over; next heartbeat reports utilisation back below 100.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(50.0),
+                rate_limit_5h_resets_at: Some(new_reset),
+                rate_limit_7d_pct: Some(35.0),
+                rate_limit_7d_resets_at: None,
+                at: t1,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.rate_limit_scope, None, "soft cap must auto-clear");
+        assert_eq!(a.rate_limited_until, None);
+        assert_eq!(a.rate_limit_source, None);
+        assert_eq!(a.rate_limit_5h_pct, Some(50.0), "rolling pct still tracked");
+    }
+
+    /// A *hard* cap (`StopFailure` 429 or transcript-derived) must
+    /// persist across a desaturation heartbeat — only `Started` clears
+    /// it. Without this the user would see the cap silently disappear
+    /// the next time Claude Code's local percentage reading dropped,
+    /// even though the upstream API hasn't unlocked them.
+    #[tokio::test]
+    async fn hard_cap_persists_across_desaturation_heartbeat() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+        let t1 = datetime!(2026-04-29 10:30:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        // Hard cap from StopFailure 429 — no reset on the wire, scope Unknown.
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::Unknown,
+                source: RateLimitSource::StopFailure,
+                resets_at: None,
+                message: Some("429".into()),
+                at: t0,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.rate_limit_source, Some(RateLimitSource::StopFailure));
+
+        // Heartbeat reports 50% — soft signal says no cap, but the
+        // hard one is still authoritative.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(50.0),
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: t1,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(
+            a.rate_limit_source,
+            Some(RateLimitSource::StopFailure),
+            "hard source must not be cleared by desaturation",
+        );
+        assert!(a.rate_limit_scope.is_some(), "hard cap scope must persist");
+    }
+
+    /// Saturation arriving on top of an already-active hard cap must
+    /// not downgrade the source from hard to soft — otherwise the very
+    /// next desaturation would auto-clear a confirmed 429.
+    #[tokio::test]
+    async fn saturation_does_not_downgrade_hard_source_to_soft() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("s"),
+                scope: RateLimitScope::FiveHour,
+                source: RateLimitSource::Transcript,
+                resets_at: None,
+                message: None,
+                at: t0,
+            })
+            .await;
+        // Saturating heartbeat lands.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(100.0),
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: t0,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(
+            a.rate_limit_source,
+            Some(RateLimitSource::Transcript),
+            "hard source must not be overwritten by saturation",
+        );
     }
 
     #[tokio::test]
@@ -1577,6 +1787,7 @@ mod tests {
                     rate_limit_7d_resets_at: None,
                     rate_limited_until: None,
                     rate_limit_scope: None,
+                    rate_limit_source: None,
                     started_at: mid,
                     last_activity_at: mid,
                 },
@@ -1601,6 +1812,7 @@ mod tests {
                     rate_limit_7d_resets_at: None,
                     rate_limited_until: None,
                     rate_limit_scope: None,
+                    rate_limit_source: None,
                     started_at: new,
                     last_activity_at: new,
                 },
@@ -1654,6 +1866,7 @@ mod tests {
                         rate_limit_7d_resets_at: None,
                         rate_limited_until: None,
                         rate_limit_scope: None,
+                        rate_limit_source: None,
                         started_at: at,
                         last_activity_at: at,
                     },
@@ -1710,6 +1923,7 @@ mod tests {
             rate_limit_7d_resets_at: None,
             rate_limited_until: None,
             rate_limit_scope: None,
+            rate_limit_source: None,
             started_at: t0,
             last_activity_at: t0,
         };
