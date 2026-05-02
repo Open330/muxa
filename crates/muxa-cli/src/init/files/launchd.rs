@@ -101,15 +101,44 @@ pub fn locate_muxad() -> String {
 }
 
 /// `launchctl bootstrap gui/<uid> <plist>` then `kickstart -k` so the
-/// agent comes up immediately even if it was already loaded with a
-/// stale path.
+/// agent comes up immediately. Two paths:
+///
+/// - **Fast path** — if the agent is already loaded (`launchctl print`
+///   succeeds), just `kickstart -k` to pick up any binary changes
+///   and return. This avoids the bootout→bootstrap teardown cycle on
+///   every `muxa init` re-run. Reported by a user who hit EIO from
+///   re-running the wizard against an already-installed setup.
+/// - **Standard path** — `bootout` (ignored if absent), wait for
+///   launchd to finish the teardown, then `bootstrap`. The sleep is
+///   load-bearing: under bootstrap-immediately-after-bootout
+///   launchd returns EIO ("Bootstrap failed: 5: Input/output
+///   error") because the previous agent's state hasn't been fully
+///   reaped. 1.5 s is empirically enough on Apple silicon + Intel.
 pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
     let target = format!("gui/{}", super::super::util::uid_string());
-    // Bootstrapping when already loaded fails with "service already
-    // bootstrapped" — bootout first, ignore errors.
+    let label_target = format!("{target}/{LABEL}");
+
+    // Fast path — agent is already loaded; kick it to pick up
+    // any new binary path / config and return clean.
+    if is_loaded(&label_target) {
+        let _ = Command::new("launchctl")
+            .args(["kickstart", "-k", &label_target])
+            .status();
+        return Ok(());
+    }
+
+    // Standard path — clean bootstrap. `bootout` is best-effort:
+    // returns "No such process" (errno 3) when the agent isn't
+    // loaded, which we treat as success.
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{target}/{LABEL}")])
+        .args(["bootout", &label_target])
         .output();
+    // Critical sleep — without it, bootstrap right after bootout
+    // hits EIO because launchd hasn't finished tearing down the
+    // previous agent. 1.5 s is a generous buffer; the no-bootout
+    // case (fresh install) doesn't hit this code path.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     let status = Command::new("launchctl")
         .args(["bootstrap", &target])
         .arg(plist_path)
@@ -124,9 +153,19 @@ pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
         ));
     }
     let _ = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("{target}/{LABEL}")])
+        .args(["kickstart", "-k", &label_target])
         .status();
     Ok(())
+}
+
+/// True iff `launchctl print <gui/uid/label>` succeeds — i.e. the
+/// agent is currently registered with launchd. Output is suppressed
+/// since we only care about the exit status.
+fn is_loaded(label_target: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", label_target])
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// `launchctl bootout gui/<uid>/<label>`. Idempotent — non-zero exit

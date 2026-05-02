@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-05-02
+
+### Fixed
+
+- **`muxa init` no longer hits `Bootstrap failed: 5: Input/output
+  error` on re-run against an already-installed launchd agent.**
+  Two changes:
+  - `launchctl bootstrap` immediately after `bootout` raced launchd's
+    teardown — the previous agent's state wasn't fully reaped before
+    we tried to re-register, and launchd returned EIO. Added a
+    1500 ms sleep between bootout and bootstrap. The fresh-install
+    path (no prior bootout) doesn't hit the sleep at all.
+  - Fast-path skip when the agent is already loaded (`launchctl
+    print` succeeds): just `kickstart -k` to pick up any binary path
+    changes and return. Avoids the teardown-then-rebuild cycle on
+    every `muxa init` re-run, and side-steps the EIO race entirely
+    for the common idempotent case. Reported by a user re-running
+    the wizard on a machine where v0.4.2 had already wired the
+    plist.
+
 ## [0.4.4] - 2026-05-02
 
 ### Fixed
