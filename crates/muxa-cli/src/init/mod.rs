@@ -101,10 +101,19 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
         Direction::Install
     };
     let mut plan = plan::build(direction, &chosen, &detect)?;
-    if matches!(direction, Direction::Install) && args.start_daemon {
+    if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;
         // by the time we try to start muxad the file/socket layout it
         // expects is fully in place.
+        //
+        // Suppressed when a real service manager (systemd / launchd)
+        // was selected: those components own the spawn lifecycle, and
+        // a parallel `nohup muxad &` here races their startup. The
+        // orphan we'd spawn wins the socket bind, the manager's child
+        // exits with EADDRINUSE, and `KeepAlive` / `Restart=on-failure`
+        // is dead-on-arrival. Reported by a user on macOS — `muxa
+        // status` worked but `pkill -9 muxad` left muxad gone with no
+        // auto-restart.
         plan.actions.push(plan::Action::StartDaemonIfNeeded);
     }
     for w in &plan.warnings {
@@ -263,6 +272,17 @@ fn pick(uninstall: bool, args: &Args, detect: &Detection, mode: Mode) -> Result<
             Ok(filter_excluded(detect.default_selection(), &args.no))
         }
     }
+}
+
+/// True iff one of the components owns the muxad spawn lifecycle.
+/// `MuxadShellrc` *does* start muxad lazily on the next interactive
+/// shell, but it doesn't run during `muxa init` itself — we still
+/// want `--start-daemon` to fire so the user has a working muxad in
+/// the same session.
+fn manages_daemon(components: &[Component]) -> bool {
+    components
+        .iter()
+        .any(|c| matches!(c, Component::MuxadSystemd | Component::MuxadLaunchd))
 }
 
 fn filter_excluded(components: Vec<Component>, no: &[String]) -> Vec<Component> {
