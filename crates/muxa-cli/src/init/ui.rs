@@ -115,10 +115,14 @@ pub fn render_detection(mode: Mode, d: &Detection) {
             "—"
         }
     ));
-    lines.push(format!(
-        "{} muxad already running",
-        if d.muxad_running { "✔" } else { "·" }
-    ));
+    // Distinct text per state — the previous "muxad already running"
+    // string was shown with a `·` glyph even when muxad was NOT
+    // running, which read as a contradiction at first glance.
+    lines.push(if d.muxad_running {
+        "✔ muxad responding".into()
+    } else {
+        "· muxad not running (will be started on apply)".into()
+    });
     note(mode, "Pre-flight", &lines.join("\n"));
 }
 

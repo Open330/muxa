@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-05-02
+
+### Fixed
+
+- **`muxa init` no longer races the service manager's spawn** — the
+  `--start-daemon` action is now suppressed when `muxad-systemd` or
+  `muxad-launchd` is in the plan. Previously both fired on every
+  install and the wizard's direct `nohup muxad &` won the socket-bind
+  race against the manager's child, producing an orphan muxad that
+  *worked* immediately but wasn't supervised — `pkill -9 muxad` left
+  it gone with no auto-restart, and `launchctl print` showed
+  `active count = 0 / state = spawn scheduled`. The shellrc-only path
+  (where no real manager owns the lifecycle) still gets the
+  start-daemon action so `muxa init` leaves muxad responsive in the
+  same session.
+- **Pre-flight label** — `muxad already running` rendered with a `·`
+  bullet even when muxad was *not* running, which read as a
+  contradiction. Replaced with state-dependent text:
+  `✔ muxad responding` vs `· muxad not running (will be started on apply)`.
+
 ## [0.4.3] - 2026-04-30
 
 ### Fixed
