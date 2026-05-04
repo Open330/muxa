@@ -78,6 +78,11 @@ pub struct Reconciler<L: LivenessSource> {
     /// [`Self::with_metrics`]; tests can leave it `None` to avoid
     /// plumbing through a `Metrics` they never inspect.
     metrics: Option<Metrics>,
+    /// If non-zero, agents stuck in `Working` for this long get
+    /// auto-flipped to `Idle` on every tick. `Duration::ZERO`
+    /// (default) disables the sweep so the historical
+    /// "state-on-events-only" semantics are preserved.
+    stuck_working_timeout: Duration,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -87,6 +92,7 @@ impl<L: LivenessSource> Reconciler<L> {
             source: Arc::new(source),
             interval,
             metrics: None,
+            stuck_working_timeout: Duration::ZERO,
         }
     }
 
@@ -95,6 +101,14 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Enable auto-downgrade of stuck `Working` agents to `Idle`.
+    /// `Duration::ZERO` (the default) keeps the sweep off.
+    #[must_use]
+    pub fn with_stuck_working_timeout(mut self, t: Duration) -> Self {
+        self.stuck_working_timeout = t;
         self
     }
 
@@ -111,8 +125,15 @@ impl<L: LivenessSource> Reconciler<L> {
             .await
             .unwrap_or_default();
         let report = self.store.reconcile(&panes).await;
+        let stuck_flipped = self.store.mark_stuck_idle(self.stuck_working_timeout).await;
         if let Some(m) = &self.metrics {
             m.record_reconcile_pass();
+        }
+        if stuck_flipped > 0 {
+            tracing::info!(
+                count = stuck_flipped,
+                "stuck-working sweep flipped {stuck_flipped} agent(s) to Idle"
+            );
         }
         // Always emit the timing line at debug (cheap, off by default)
         // even on no-op passes — operators want to see the loop is alive

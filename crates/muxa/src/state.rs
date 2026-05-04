@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, Notify, RwLock};
 
@@ -163,11 +163,15 @@ impl Agent {
 
 /// In-process notification emitted when an agent's `state` field changes.
 ///
-/// Not part of the IPC protocol — consumers must live in the daemon
-/// process. `agent` is the post-transition snapshot, suitable for rendering
-/// UI (desktop notification body, log line, etc.) without racing further
-/// mutations.
-#[derive(Debug, Clone, Serialize)]
+/// `agent` is the post-transition snapshot, suitable for rendering
+/// UI (desktop notification body, log line, status row) without
+/// racing further mutations.
+///
+/// Both in-process consumers (sinks, notifier) and IPC subscribers
+/// (`muxa watch`) receive the same payload — the type is
+/// `Serialize + Deserialize` so the daemon can stream it as
+/// newline-delimited JSON over the unix socket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transition {
     pub from: AgentState,
     pub to: AgentState,
@@ -792,6 +796,49 @@ impl Store {
             self.dirty.notify_one();
         }
         removed
+    }
+
+    /// Auto-downgrade `Working` agents to `Idle` if they've been
+    /// sitting in `Working` past `threshold` since their
+    /// `last_activity_at`. Returns the number of agents flipped.
+    ///
+    /// Insurance against missed `Stop`/`TurnStopped` hook firings —
+    /// without this a single dropped event would leave a row glowing
+    /// green forever. Every flip emits a synthetic `Transition` so
+    /// IPC subscribers (`muxa watch`) see the correction live.
+    ///
+    /// Off by default (`threshold == Duration::ZERO`) to preserve the
+    /// "state changes only on explicit events" guarantee. The
+    /// reconciler turns it on when
+    /// `[reconciler] stuck_working_timeout_secs` is set.
+    pub async fn mark_stuck_idle(&self, threshold: Duration) -> usize {
+        if threshold.is_zero() {
+            return 0;
+        }
+        let cutoff = OffsetDateTime::now_utc() - threshold;
+        let mut agents = self.agents.write().await;
+        let mut flipped = 0_usize;
+        for agent in agents.values_mut() {
+            if agent.state != AgentState::Working {
+                continue;
+            }
+            if agent.last_activity_at > cutoff {
+                continue;
+            }
+            let prev = agent.state;
+            agent.state = AgentState::Idle;
+            flipped += 1;
+            // Broadcast for IPC subscribers and in-process sinks.
+            // Identical shape to the broadcast in `apply` so consumers
+            // can't tell a stuck-working sweep from a real event —
+            // they just see an Idle row.
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: agent.clone(),
+            });
+        }
+        flipped
     }
 
     /// Converge the registry against ground truth from tmux.
@@ -1470,6 +1517,98 @@ mod tests {
             .await;
         let agent = store.by_session("s").await.unwrap();
         assert_eq!(agent.last_response.as_deref(), Some("first answer"));
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_idle_flips_old_working_to_idle() {
+        let store = Store::shared();
+        // Drive an agent into Working with a stale last_activity_at
+        // so it crosses the timeout cutoff.
+        let stale_at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: stale_at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("s"),
+                prompt: "long-running".into(),
+                at: stale_at,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("s").await.unwrap().state,
+            AgentState::Working
+        );
+
+        // Subscribe before the sweep so we can observe the broadcast.
+        let mut rx = store.subscribe();
+        let flipped = store.mark_stuck_idle(Duration::from_secs(60)).await;
+        assert_eq!(flipped, 1);
+        assert_eq!(store.by_session("s").await.unwrap().state, AgentState::Idle);
+
+        // Sweep emits a Transition matching the synthesized flip.
+        let t = rx.try_recv().expect("transition broadcast");
+        assert_eq!(t.from, AgentState::Working);
+        assert_eq!(t.to, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_idle_skips_recent_working() {
+        // An agent that just transitioned to Working should NOT be
+        // flipped: real long-running tasks would be falsely marked
+        // idle. The cutoff is `now - threshold`; recent activity
+        // beats the cutoff and survives.
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("s"),
+                prompt: "fresh".into(),
+                at: now,
+            })
+            .await;
+        let flipped = store.mark_stuck_idle(Duration::from_secs(60)).await;
+        assert_eq!(flipped, 0);
+        assert_eq!(
+            store.by_session("s").await.unwrap().state,
+            AgentState::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_idle_zero_threshold_is_noop() {
+        let store = Store::shared();
+        let stale_at = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: stale_at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("s"),
+                prompt: "ancient".into(),
+                at: stale_at,
+            })
+            .await;
+        // Even a hours-stale agent stays Working when the sweep is
+        // disabled (Duration::ZERO).
+        let flipped = store.mark_stuck_idle(Duration::ZERO).await;
+        assert_eq!(flipped, 0);
+        assert_eq!(
+            store.by_session("s").await.unwrap().state,
+            AgentState::Working
+        );
     }
 
     #[tokio::test]

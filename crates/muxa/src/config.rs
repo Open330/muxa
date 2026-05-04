@@ -214,6 +214,17 @@ pub struct ReconcilerConfig {
     /// enough that the cost of shelling out to tmux is negligible.
     #[serde(default = "default_reconciler_interval_secs")]
     pub interval_secs: u64,
+    /// If non-zero, agents stuck in `Working` for longer than this many
+    /// seconds get auto-downgraded to `Idle`. Insurance against missed
+    /// `Stop`/`TurnStopped` hook firings — without it a single dropped
+    /// hook leaves the row glowing green forever.
+    ///
+    /// Default `0` (disabled) preserves the historical "state changes
+    /// only on explicit events" guarantee. A reasonable opt-in value
+    /// is `300` (5 min) for interactive use; longer if your agents
+    /// routinely run multi-hour tasks.
+    #[serde(default = "default_zero")]
+    pub stuck_working_timeout_secs: u64,
 }
 
 impl Default for ReconcilerConfig {
@@ -221,12 +232,17 @@ impl Default for ReconcilerConfig {
         Self {
             enabled: true,
             interval_secs: default_reconciler_interval_secs(),
+            stuck_working_timeout_secs: 0,
         }
     }
 }
 
 fn default_reconciler_interval_secs() -> u64 {
     30
+}
+
+fn default_zero() -> u64 {
+    0
 }
 
 /// `[history]` config — controls the disk-backed prompt audit log.
