@@ -798,20 +798,29 @@ impl Store {
         removed
     }
 
-    /// Auto-downgrade `Working` agents to `Idle` if they've been
-    /// sitting in `Working` past `threshold` since their
+    /// Auto-downgrade agents in `from` to `Idle` if they've been
+    /// sitting in that state past `threshold` since their
     /// `last_activity_at`. Returns the number of agents flipped.
     ///
-    /// Insurance against missed `Stop`/`TurnStopped` hook firings —
-    /// without this a single dropped event would leave a row glowing
-    /// green forever. Every flip emits a synthetic `Transition` so
-    /// IPC subscribers (`muxa watch`) see the correction live.
+    /// Used by the reconciler to recover rows that a missed hook
+    /// would otherwise leave stuck:
+    /// - `from = Working` covers a missed `Stop`/`TurnStopped`
+    ///   (Claude/Codex/Gemini)
+    /// - `from = WaitingInput` covers Codex's permission-grant gap:
+    ///   `permission_request` flips the row to `WaitingInput`, the
+    ///   user grants permission, Codex resumes — but Codex never
+    ///   fires another hook to flip the state back, so the row
+    ///   stays yellow indefinitely.
     ///
-    /// Off by default (`threshold == Duration::ZERO`) to preserve the
+    /// Every flip emits a synthetic `Transition` so IPC subscribers
+    /// (`muxa watch`) see the correction live.
+    ///
+    /// Off when `threshold == Duration::ZERO` to preserve the
     /// "state changes only on explicit events" guarantee. The
-    /// reconciler turns it on when
-    /// `[reconciler] stuck_working_timeout_secs` is set.
-    pub async fn mark_stuck_idle(&self, threshold: Duration) -> usize {
+    /// reconciler turns each variant on independently via the
+    /// `stuck_working_timeout_secs` / `stuck_waiting_timeout_secs`
+    /// config keys.
+    pub async fn mark_stuck_idle_from(&self, from: AgentState, threshold: Duration) -> usize {
         if threshold.is_zero() {
             return 0;
         }
@@ -819,7 +828,7 @@ impl Store {
         let mut agents = self.agents.write().await;
         let mut flipped = 0_usize;
         for agent in agents.values_mut() {
-            if agent.state != AgentState::Working {
+            if agent.state != from {
                 continue;
             }
             if agent.last_activity_at > cutoff {
@@ -830,8 +839,8 @@ impl Store {
             flipped += 1;
             // Broadcast for IPC subscribers and in-process sinks.
             // Identical shape to the broadcast in `apply` so consumers
-            // can't tell a stuck-working sweep from a real event —
-            // they just see an Idle row.
+            // can't tell a sweep from a real event — they just see an
+            // Idle row.
             let _ = self.transitions.send(Transition {
                 from: prev,
                 to: agent.state,
@@ -1545,7 +1554,9 @@ mod tests {
 
         // Subscribe before the sweep so we can observe the broadcast.
         let mut rx = store.subscribe();
-        let flipped = store.mark_stuck_idle(Duration::from_secs(60)).await;
+        let flipped = store
+            .mark_stuck_idle_from(AgentState::Working, Duration::from_secs(60))
+            .await;
         assert_eq!(flipped, 1);
         assert_eq!(store.by_session("s").await.unwrap().state, AgentState::Idle);
 
@@ -1553,6 +1564,73 @@ mod tests {
         let t = rx.try_recv().expect("transition broadcast");
         assert_eq!(t.from, AgentState::Working);
         assert_eq!(t.to, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_idle_flips_old_waiting_input_to_idle() {
+        // Codex permission-grant case: row gets pinned to
+        // WaitingInput by `permission_request`, user grants and
+        // Codex resumes without firing another hook. The sweep
+        // recovers the row after `threshold` of inactivity.
+        let store = Store::shared();
+        let stale_at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("c"),
+                at: stale_at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("c"),
+                level: NotificationLevel::NeedsInput,
+                message: "codex permission: shell".into(),
+                at: stale_at,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::WaitingInput
+        );
+
+        let mut rx = store.subscribe();
+        let flipped = store
+            .mark_stuck_idle_from(AgentState::WaitingInput, Duration::from_secs(60))
+            .await;
+        assert_eq!(flipped, 1);
+        assert_eq!(store.by_session("c").await.unwrap().state, AgentState::Idle);
+        let t = rx.try_recv().expect("transition broadcast");
+        assert_eq!(t.from, AgentState::WaitingInput);
+        assert_eq!(t.to, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_idle_only_sweeps_target_state() {
+        // Asking for the WaitingInput sweep does not touch a
+        // Working row — the two timeouts must stay independent.
+        let store = Store::shared();
+        let stale_at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("w"),
+                at: stale_at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("w"),
+                prompt: "p".into(),
+                at: stale_at,
+            })
+            .await;
+        let flipped = store
+            .mark_stuck_idle_from(AgentState::WaitingInput, Duration::from_secs(60))
+            .await;
+        assert_eq!(flipped, 0);
+        assert_eq!(
+            store.by_session("w").await.unwrap().state,
+            AgentState::Working
+        );
     }
 
     #[tokio::test]
@@ -1576,7 +1654,9 @@ mod tests {
                 at: now,
             })
             .await;
-        let flipped = store.mark_stuck_idle(Duration::from_secs(60)).await;
+        let flipped = store
+            .mark_stuck_idle_from(AgentState::Working, Duration::from_secs(60))
+            .await;
         assert_eq!(flipped, 0);
         assert_eq!(
             store.by_session("s").await.unwrap().state,
@@ -1603,7 +1683,9 @@ mod tests {
             .await;
         // Even a hours-stale agent stays Working when the sweep is
         // disabled (Duration::ZERO).
-        let flipped = store.mark_stuck_idle(Duration::ZERO).await;
+        let flipped = store
+            .mark_stuck_idle_from(AgentState::Working, Duration::ZERO)
+            .await;
         assert_eq!(flipped, 0);
         assert_eq!(
             store.by_session("s").await.unwrap().state,

@@ -225,6 +225,18 @@ pub struct ReconcilerConfig {
     /// routinely run multi-hour tasks.
     #[serde(default = "default_zero")]
     pub stuck_working_timeout_secs: u64,
+    /// Same shape as `stuck_working_timeout_secs` but for the
+    /// `WaitingInput` state. Specifically targets Codex's
+    /// permission-grant gap: `permission_request` flips the row to
+    /// `WaitingInput`, the user grants permission, Codex resumes —
+    /// but Codex never fires another hook, so the row stays yellow
+    /// indefinitely.
+    ///
+    /// Default `0` (disabled). A reasonable opt-in is `600` (10 min)
+    /// — `WaitingInput` legitimately means the user is away from the
+    /// keyboard, so the cutoff should be generous.
+    #[serde(default = "default_zero")]
+    pub stuck_waiting_timeout_secs: u64,
 }
 
 impl Default for ReconcilerConfig {
@@ -233,6 +245,7 @@ impl Default for ReconcilerConfig {
             enabled: true,
             interval_secs: default_reconciler_interval_secs(),
             stuck_working_timeout_secs: 0,
+            stuck_waiting_timeout_secs: 0,
         }
     }
 }

@@ -83,6 +83,10 @@ pub struct Reconciler<L: LivenessSource> {
     /// (default) disables the sweep so the historical
     /// "state-on-events-only" semantics are preserved.
     stuck_working_timeout: Duration,
+    /// Same shape as `stuck_working_timeout` but for `WaitingInput`.
+    /// Covers Codex's permission-grant case where the row gets
+    /// pinned yellow with no follow-up hook to recover from.
+    stuck_waiting_timeout: Duration,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -93,6 +97,7 @@ impl<L: LivenessSource> Reconciler<L> {
             interval,
             metrics: None,
             stuck_working_timeout: Duration::ZERO,
+            stuck_waiting_timeout: Duration::ZERO,
         }
     }
 
@@ -112,6 +117,17 @@ impl<L: LivenessSource> Reconciler<L> {
         self
     }
 
+    /// Enable auto-downgrade of stuck `WaitingInput` agents to
+    /// `Idle`. Used to recover Codex rows that get pinned to
+    /// `WaitingInput` after the user grants permission and the
+    /// agent resumes without firing a follow-up hook.
+    /// `Duration::ZERO` (the default) keeps the sweep off.
+    #[must_use]
+    pub fn with_stuck_waiting_timeout(mut self, t: Duration) -> Self {
+        self.stuck_waiting_timeout = t;
+        self
+    }
+
     /// Run a single reconciliation pass on demand. Useful for tests, for
     /// surfacing a "force reconcile" CLI command later, and for triggering
     /// a pass right after startup discovery so the user doesn't wait a full
@@ -125,14 +141,29 @@ impl<L: LivenessSource> Reconciler<L> {
             .await
             .unwrap_or_default();
         let report = self.store.reconcile(&panes).await;
-        let stuck_flipped = self.store.mark_stuck_idle(self.stuck_working_timeout).await;
+        let stuck_w = self
+            .store
+            .mark_stuck_idle_from(
+                crate::event::AgentState::Working,
+                self.stuck_working_timeout,
+            )
+            .await;
+        let stuck_wi = self
+            .store
+            .mark_stuck_idle_from(
+                crate::event::AgentState::WaitingInput,
+                self.stuck_waiting_timeout,
+            )
+            .await;
         if let Some(m) = &self.metrics {
             m.record_reconcile_pass();
         }
-        if stuck_flipped > 0 {
+        if stuck_w + stuck_wi > 0 {
             tracing::info!(
-                count = stuck_flipped,
-                "stuck-working sweep flipped {stuck_flipped} agent(s) to Idle"
+                working = stuck_w,
+                waiting = stuck_wi,
+                "stuck-state sweep flipped {} agent(s) to Idle",
+                stuck_w + stuck_wi
             );
         }
         // Always emit the timing line at debug (cheap, off by default)

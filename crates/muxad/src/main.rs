@@ -412,12 +412,16 @@ fn spawn_reconciler_task(
     .with_metrics(store.metrics())
     .with_stuck_working_timeout(std::time::Duration::from_secs(
         cfg.reconciler.stuck_working_timeout_secs,
+    ))
+    .with_stuck_waiting_timeout(std::time::Duration::from_secs(
+        cfg.reconciler.stuck_waiting_timeout_secs,
     ));
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(runner.run(shutdown_rx));
     tracing::info!(
         interval_secs = cfg.reconciler.interval_secs,
         stuck_working_timeout_secs = cfg.reconciler.stuck_working_timeout_secs,
+        stuck_waiting_timeout_secs = cfg.reconciler.stuck_waiting_timeout_secs,
         "reconciler enabled",
     );
 }
