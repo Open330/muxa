@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-04
+
+### Added
+
+- **`muxa watch` is now push-based** instead of polling. New
+  streaming `Subscribe` IPC RPC: client opens a long-lived unix-
+  socket connection, daemon writes one JSON-encoded `Transition` per
+  state change. The TUI's background refresh task races the
+  subscription stream against a much slower fallback poll
+  (`STREAMING_FALLBACK_INTERVAL = 5s`, was 500 ms unconditionally).
+  State changes now hit the screen in ~milliseconds; idle CPU drops
+  to effectively zero. The fallback poll handles `Lagged` drops on
+  the broadcast and reconnects after daemon restarts. Falls back
+  cleanly to historical 500 ms polling against an old daemon that
+  doesn't speak the streaming variant.
+- **`Reconciler` stuck-Working sweep**: new
+  `[reconciler] stuck_working_timeout_secs = N` config (default `0`,
+  disabled). When non-zero, every reconciler tick auto-flips agents
+  whose `state == Working` and whose `last_activity_at` is older
+  than the threshold to `Idle`. Insurance against missed
+  `Stop`/`TurnStopped` hook firings — without it a single dropped
+  hook would leave a row glowing green forever. Each flip emits a
+  synthetic `Transition` so subscribed `muxa watch` instances see
+  the correction live. Off by default to preserve the historical
+  "state changes only on explicit events" guarantee; opt-in to a
+  reasonable value (`300` for 5 min) for interactive use.
+
+### Changed
+
+- `Transition` (was `Serialize`-only) is now also `Deserialize`. The
+  type is on the IPC wire as a result of the streaming subscribe
+  RPC. In-process consumers (sinks, notifier) are unaffected.
+- `lib::Client::subscribe()` (new method) returns `TransitionStream`,
+  a small async handle whose `recv()` yields the next `Transition`.
+
 ## [0.4.5] - 2026-05-02
 
 ### Fixed

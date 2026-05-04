@@ -39,7 +39,17 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
+/// Polling cadence when no streaming `Subscribe` is active. We still
+/// fall back to this if the daemon doesn't speak the streaming
+/// variant or the subscription drops mid-session.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Slower fallback cadence when streaming `Subscribe` is wired. Push
+/// updates land in ~milliseconds, so the polling tick only exists
+/// to catch up after broadcast `Lagged` drops or transient
+/// connection blips. 5 s gives plenty of headroom while keeping
+/// idle CPU effectively zero.
+const STREAMING_FALLBACK_INTERVAL: Duration = Duration::from_secs(5);
 /// Max time to wait for a single keystroke when the input buffer is
 /// empty. ~60 Hz so a press feels immediate without burning CPU on an
 /// idle terminal. Held keys / fast typing are absorbed by the
@@ -733,11 +743,22 @@ async fn refresh_task<F, Fut>(
     mut fetch: F,
     mut wake: mpsc::Receiver<()>,
     out: mpsc::Sender<RefreshOutcome>,
+    mut sub: Option<muxa::ipc::TransitionStream>,
 ) where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = RefreshOutcome> + Send,
 {
-    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    // When we have a streaming subscription, push updates handle the
+    // common case in milliseconds — the polling tick only exists for
+    // catch-up after `Lagged` drops or reconnect. Without the
+    // subscription we fall back to the historical 500 ms cadence so
+    // the watch still updates against an old daemon.
+    let interval_dur = if sub.is_some() {
+        STREAMING_FALLBACK_INTERVAL
+    } else {
+        POLL_INTERVAL
+    };
+    let mut tick = tokio::time::interval(interval_dur);
     // If a refresh runs longer than one tick (slow daemon, slow tmux),
     // don't pile up backlog ticks — skip them.
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -746,6 +767,11 @@ async fn refresh_task<F, Fut>(
     tick.tick().await;
 
     loop {
+        // Reduce subscribe-arm noise: the `if sub.is_some()` guard
+        // on the select branch keeps the helper out of the wait set
+        // entirely when we don't have a stream — `pending()` would
+        // never resolve but tokio still polls it once per loop, which
+        // would burn a tiny bit of CPU and obscure traces.
         tokio::select! {
             _ = tick.tick() => {}
             req = wake.recv() => {
@@ -754,12 +780,38 @@ async fn refresh_task<F, Fut>(
                     return;
                 }
             }
+            res = recv_transition(&mut sub), if sub.is_some() => {
+                // `Some(())` → a transition fired → fall through to
+                // `fetch().await` below. `None` → daemon closed the
+                // stream OR a parse/IO error; drop the subscription
+                // and continue with pure polling so the user keeps a
+                // working (if higher-latency) view.
+                if res.is_none() {
+                    sub = None;
+                    // Tighten the tick interval since push is gone.
+                    tick = tokio::time::interval(POLL_INTERVAL);
+                    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    tick.tick().await;
+                    continue; // skip the eager refresh — next tick will fetch
+                }
+            }
         }
         let outcome = fetch().await;
         if out.send(outcome).await.is_err() {
             // Main loop dropped its receiver (quit/attach) — go home.
             return;
         }
+    }
+}
+
+/// Helper for the select arm: await the next transition, mapping
+/// every "stream is dead" case (Ok(None) for clean shutdown, Err for
+/// IO/parse) to `None` so the caller can fall back uniformly.
+async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Option<()> {
+    let stream = sub.as_mut()?;
+    match stream.recv().await {
+        Ok(Some(_)) => Some(()),
+        Ok(None) | Err(_) => None,
     }
 }
 
@@ -798,6 +850,21 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     let bg_backend = backend.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
+
+    // Try to open a streaming subscribe so we get push updates from
+    // the daemon. Falls back gracefully when the daemon is older
+    // (no `subscribe` RPC), the socket is unreachable, or the
+    // connection is denied — in any of those cases we hand `None`
+    // to the refresh task and it stays on the historical 500 ms
+    // polling cadence.
+    let subscription = match client.subscribe().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::debug!(error = %e, "subscribe unavailable; falling back to polling");
+            None
+        }
+    };
+
     let bg = tokio::spawn(refresh_task(
         move || {
             let client = bg_client.clone();
@@ -806,6 +873,7 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         },
         wake_rx,
         outcome_tx,
+        subscription,
     ));
 
     let mut jump_target: Option<String> = None;
@@ -3017,6 +3085,7 @@ mod tests {
             },
             wake_rx,
             out_tx,
+            None,
         ));
 
         // The 500 ms tick is paused; force the wake path.
@@ -3052,6 +3121,7 @@ mod tests {
             },
             wake_rx,
             out_tx,
+            None,
         ));
 
         // Time is paused; advance past one full POLL_INTERVAL so the

@@ -79,6 +79,12 @@ enum RequestBody {
         limit: Option<usize>,
     },
     Health,
+    /// Long-lived streaming subscribe. Server replies with a one-shot
+    /// `ok` ack, then writes one JSON-encoded `Transition` per
+    /// state change (newline-delimited) until the client closes the
+    /// socket. Used by `muxa watch` to switch from 500 ms polling to
+    /// push-based updates.
+    Subscribe,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +249,44 @@ impl Server {
     }
 }
 
+/// Pump every state transition from `store` to `writer` as a JSON
+/// line. Runs until the broadcast channel closes (daemon shutting
+/// down) or the client closes its half of the socket — the first
+/// failed write returns Ok(()) so the per-connection task wraps
+/// cleanly.
+///
+/// `Lagged` errors are logged but do not terminate the stream:
+/// dropping a few transitions on a slow consumer is preferable to
+/// disconnecting them. The next snapshot the client takes (via the
+/// fallback polling tick) will reconcile any holes.
+async fn stream_transitions(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    store: SharedStore,
+) -> Result<(), RuntimeError> {
+    let mut rx = store.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(t) => {
+                let mut bytes = serde_json::to_vec(&t)?;
+                bytes.push(b'\n');
+                if writer.write_all(&bytes).await.is_err() {
+                    return Ok(());
+                }
+                if writer.flush().await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    dropped = n,
+                    "subscribe lagged; client will reconcile via fallback poll"
+                );
+            }
+        }
+    }
+}
+
 #[tracing::instrument(level = "debug", skip(stream, store))]
 async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
@@ -316,6 +360,25 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                     kind = "health";
                     Response::health()
                 }
+                RequestBody::Subscribe => {
+                    kind = "subscribe";
+                    // Stream takeover. Send ack, then write transitions
+                    // until the client disconnects or muxad shuts down.
+                    // We deliberately do NOT return to the request loop
+                    // — this connection is now owned by the streaming
+                    // pump.
+                    let ack_bytes = serde_json::to_vec(&Response::ok())?;
+                    writer.write_all(&ack_bytes).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                    tracing::debug!(
+                        elapsed_us =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        kind,
+                        "ipc.handle (stream takeover)",
+                    );
+                    return stream_transitions(writer, store).await;
+                }
             },
             Err(e) => {
                 kind = "parse_error";
@@ -350,6 +413,29 @@ pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
 #[derive(Clone)]
 pub struct Client {
     socket_path: PathBuf,
+}
+
+/// Long-lived handle returned by [`Client::subscribe`]. Calls to
+/// [`Self::recv`] yield successive `Transition`s as they happen on
+/// the daemon. Returns `Ok(None)` when the daemon closes the
+/// connection (shutdown) or `Err(_)` on a parse / IO failure that
+/// the caller will probably want to handle by reconnecting.
+pub struct TransitionStream {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    line: String,
+}
+
+impl TransitionStream {
+    /// Wait for and return the next streamed `Transition`.
+    pub async fn recv(&mut self) -> Result<Option<crate::state::Transition>, RuntimeError> {
+        self.line.clear();
+        let n = self.reader.read_line(&mut self.line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let t: crate::state::Transition = serde_json::from_str(self.line.trim())?;
+        Ok(Some(t))
+    }
 }
 
 impl Client {
@@ -417,6 +503,55 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// Open a long-lived subscription to state transitions. Returns
+    /// a stream-like handle whose `recv()` yields the next
+    /// `Transition` from the daemon, or `None` when the daemon
+    /// closes the connection (shutdown).
+    ///
+    /// Designed for `muxa watch` to drop polling latency from 500 ms
+    /// to ~1 ms while keeping a slower fallback poll for catch-up
+    /// after reconnects or `Lagged` drops on the server side.
+    pub async fn subscribe(&self) -> Result<TransitionStream, RuntimeError> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                    RuntimeError::NotConnected(self.socket_path.clone())
+                }
+                _ => RuntimeError::Io(e),
+            })?;
+        let (reader, mut writer) = stream.into_split();
+        let mut req = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "subscribe",
+        }))?;
+        req.push(b'\n');
+        writer.write_all(&req).await?;
+        writer.flush().await?;
+
+        // Server replies with a one-shot ack before the streaming
+        // pump takes over.
+        let mut reader = BufReader::new(reader);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).await?;
+        let ack: serde_json::Value = serde_json::from_str(ack.trim())?;
+        if !ack["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(format!(
+                "subscribe rejected: {}",
+                ack["error"].as_str().unwrap_or("(no error message)")
+            ))));
+        }
+
+        // Drop the writer immediately — we never send another byte
+        // on this connection. The server detects our close-when-done
+        // via EOF on its read half.
+        drop(writer);
+        Ok(TransitionStream {
+            reader,
+            line: String::new(),
+        })
+    }
+
     pub async fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, RuntimeError> {
         // Connect-time ECONNREFUSED/ENOENT mean the daemon socket isn't there
         // or nothing is listening — surface a friendly message that names the
@@ -446,7 +581,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AgentEvent, AgentId, AgentKind};
+    use crate::event::{AgentEvent, AgentId, AgentKind, AgentState};
     use crate::state::Store;
     use tempfile::tempdir;
     use time::OffsetDateTime;
@@ -493,6 +628,71 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_streams_transitions_to_client() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-sub.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Open subscription before any events fire.
+        let client = Client::new(sock.clone());
+        let mut stream = client.subscribe().await.expect("subscribe");
+
+        // Drive a state transition: Started → Idle (initial).
+        let id = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "sub-test".into(),
+            pane: Some("%9".into()),
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        // Then Idle → Working via PromptSubmitted.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id.clone(),
+                prompt: "hi".into(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        // Stream should deliver both transitions in order.
+        let t1 = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv())
+            .await
+            .expect("first transition arrives within timeout")
+            .expect("recv ok")
+            .expect("transition present");
+        assert_eq!(t1.from, AgentState::Starting);
+        assert_eq!(t1.to, AgentState::Idle);
+
+        let t2 = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv())
+            .await
+            .expect("second transition arrives within timeout")
+            .expect("recv ok")
+            .expect("transition present");
+        assert_eq!(t2.from, AgentState::Idle);
+        assert_eq!(t2.to, AgentState::Working);
+
+        // Drop the stream to close the connection, then shut down.
+        drop(stream);
+        tx.send(()).unwrap();
+        let _ = handle.await;
     }
 
     #[tokio::test]
