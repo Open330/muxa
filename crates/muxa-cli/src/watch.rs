@@ -739,15 +739,22 @@ async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> Refr
 ///
 /// Generic over the fetcher so unit tests can swap in a closure that
 /// returns a canned `RefreshOutcome` without touching tmux or the daemon.
-async fn refresh_task<F, Fut>(
+async fn refresh_task<F, Fut, S>(
     mut fetch: F,
     mut wake: mpsc::Receiver<()>,
     out: mpsc::Sender<RefreshOutcome>,
-    mut sub: Option<muxa::ipc::TransitionStream>,
+    sub_init: S,
 ) where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = RefreshOutcome> + Send,
+    S: Future<Output = Option<muxa::ipc::TransitionStream>> + Send + 'static,
 {
+    // Acquire the streaming subscription as the first thing the
+    // background task does — `run` doesn't await it any more, so the
+    // popup gets to paint its empty frame before we pay this latency.
+    // `None` falls back to historical polling.
+    let mut sub = sub_init.await;
+
     // When we have a streaming subscription, push updates handle the
     // common case in milliseconds — the polling tick only exists for
     // catch-up after `Lagged` drops or reconnect. Without the
@@ -837,9 +844,20 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     // row 0.
     app.set_initial_pane(backend.current_pane());
 
-    // Prime the initial snapshot so the first frame already has data —
-    // otherwise the user sees an empty table for ~one tick.
-    apply_outcome(&mut app, compute_refresh(client, &backend).await);
+    // Paint the first frame **before** any IPC. The popup
+    // (`prefix + s` → `display-popup -E muxa watch`) becomes visible
+    // the instant tmux finishes spawning us, so we want the user to
+    // see the table scaffold (header + empty body) immediately
+    // rather than a black rectangle for the ~50-100 ms it takes to
+    // shell out to `tmux list-panes` and round-trip a snapshot.
+    //
+    // The first real refresh fires from the background task right
+    // after this — we send a wake on the channel below so it doesn't
+    // wait for the 5 s fallback tick.
+    guard
+        .terminal_mut()
+        .draw(|f| render(f, &mut app))
+        .map_err(anyhow::Error::from)?;
 
     // Background refresh task owns its own Client clone so the borrowed
     // `client: &Client` doesn't have to outlive the task. The clone is
@@ -848,20 +866,20 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     // already an `Arc<dyn …>` so cloning it is just a refcount bump.
     let bg_client = client.clone();
     let bg_backend = backend.clone();
+    let sub_client = client.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
 
-    // Try to open a streaming subscribe so we get push updates from
-    // the daemon. Falls back gracefully when the daemon is older
-    // (no `subscribe` RPC), the socket is unreachable, or the
-    // connection is denied — in any of those cases we hand `None`
-    // to the refresh task and it stays on the historical 500 ms
-    // polling cadence.
-    let subscription = match client.subscribe().await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::debug!(error = %e, "subscribe unavailable; falling back to polling");
-            None
+    // Subscribe lazily inside the refresh task so its `await` doesn't
+    // block the first paint. Falls back to polling on any error
+    // (older daemon, socket unreachable, connection refused).
+    let subscription_init = async move {
+        match sub_client.subscribe().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::debug!(error = %e, "subscribe unavailable; falling back to polling");
+                None
+            }
         }
     };
 
@@ -873,8 +891,15 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         },
         wake_rx,
         outcome_tx,
-        subscription,
+        subscription_init,
     ));
+
+    // Force the priming refresh immediately so the empty frame above
+    // gets replaced by real data within ~50-100 ms instead of waiting
+    // for the next fallback tick. `try_send` is safe here — the
+    // channel is freshly created with capacity > 0, so the send can't
+    // block or fail.
+    let _ = wake_tx.try_send(());
 
     let mut jump_target: Option<String> = None;
 
@@ -3085,7 +3110,7 @@ mod tests {
             },
             wake_rx,
             out_tx,
-            None,
+            async { None },
         ));
 
         // The 500 ms tick is paused; force the wake path.
@@ -3121,7 +3146,7 @@ mod tests {
             },
             wake_rx,
             out_tx,
-            None,
+            async { None },
         ));
 
         // Time is paused; advance past one full POLL_INTERVAL so the

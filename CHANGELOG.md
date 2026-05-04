@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa watch` paints its first frame instantly** instead of
+  blocking on the priming snapshot (~50–100 ms tmux + IPC) and the
+  v0.5.0 streaming-subscribe ack (~5 ms). Reordered `run()` to draw
+  the empty table scaffold immediately after terminal setup and
+  defer both compute_refresh and `subscribe()` to the background
+  refresh task, with an immediate wake to force the first real
+  refresh. The total time-to-data is unchanged; the perceived popup
+  latency drops from "blank for ~80 ms then content" to "scaffold
+  instant, rows fill in within ~80 ms".
+
+### Added
+
+- **`stuck-WaitingInput` sweep** (Codex permission-grant recovery).
+  New config knob `[reconciler] stuck_waiting_timeout_secs` with
+  the same shape as `stuck_working_timeout_secs`. Specifically
+  fixes Codex's hook-surface gap: `permission_request` flips a row
+  to `WaitingInput`, the user grants permission, Codex resumes —
+  but Codex never fires another hook, so the row stays yellow
+  indefinitely. With `stuck_waiting_timeout_secs = 600` the
+  reconciler recovers it after 10 min of inactivity. Default `0`
+  (disabled).
+- `Store::mark_stuck_idle` was generalized to
+  `mark_stuck_idle_from(state, threshold)` so the reconciler runs
+  one pass for `Working` and another for `WaitingInput`, with
+  independent thresholds. `Reconciler::with_stuck_waiting_timeout()`
+  is the matching builder method.
+
 ## [0.5.0] - 2026-05-04
 
 ### Added
