@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa watch` quick actions** — the picker is no longer read-only.
+  Four new keybindings act on the currently-selected row:
+  - `c` — copy the agent's last prompt to the system clipboard
+    (`pbcopy` / `wl-copy` / `xclip` in order; falls back to a
+    `/tmp/muxa-clip-<ts>.txt` dump with a hint when none are
+    available).
+  - Capital `K` — kill the pane via `tmux kill-pane -t <pane_id>`,
+    behind a y/N confirm popup. Shift is required so a fat-fingered
+    `k` (which moves the cursor up) can't blow up a pane.
+  - Capital `R` — abort the agent's current turn by sending Ctrl-C
+    to the pane, also behind a confirm popup. Documented as "abort
+    current turn" rather than "restart" because we don't reliably
+    know the original launch command across the Claude / Codex /
+    Gemini wrappers.
+  - `?` — toggle a help overlay listing every binding (existing +
+    new). The default footer also gains a `?  help` hint so the
+    overlay is discoverable.
+
+  Confirm popups default to "No" (only `y` / `Y` / Enter accept;
+  Esc / Tab / arrows / any other key cancels). Action results land
+  in a transient ~2 s footer hint (`✔ killed pane main:2.0` /
+  `✗ kill-pane failed: …` / `✔ copied prompt via pbcopy`). Disabled
+  actions (e.g. `K` on a paneless row, `c` on a row with no last
+  prompt) surface a one-line "not applicable" hint instead of
+  silently doing nothing.
+
 - **`muxa logs`** — tail muxad's stdout/stderr without remembering
   `/tmp/muxad.log` and `/tmp/muxad.err`. Default streams the last 30
   lines of both files (configurable via `-n/--lines`) then follows
