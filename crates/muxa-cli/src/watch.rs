@@ -683,10 +683,34 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(backend)?)
 }
 
-/// One full result of a refresh — what the background task hands back to
-/// the main loop on every tick or wake. The main task holds nothing else
-/// daemon-related, so all the state diffs come through this single struct.
-pub(crate) struct RefreshOutcome {
+/// One result of a refresh handed back to the main loop. Two
+/// shapes:
+///
+/// - `Full` — emitted by the periodic fallback tick (and the very
+///   first refresh): full list of agents + pane inventory, replacing
+///   the App's data. Catches up after `Lagged` drops on the
+///   broadcast or when the stream reconnects.
+/// - `SingleAgent` — emitted on every push from the subscribe
+///   stream, carrying just the post-transition `Agent` payload. The
+///   App applies it in place to the matching `(kind, session_id)`
+///   row instead of replacing the whole list.
+///
+/// Routing transitions through `SingleAgent` is what stops the UI
+/// from "redrawing every row on every tick": only the one row that
+/// actually transitioned is touched. The fallback tick re-syncs
+/// everything else periodically.
+// `Full` is materially larger than `SingleAgent` (a Vec<Agent> + a
+// Vec<PaneInfo>). Boxing the variant would make the enum smaller but
+// adds an allocation per Full message; we send Full at most once per
+// 5 s, so the size disparity is benign — silence clippy's
+// large_enum_variant lint at the type definition.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RefreshOutcome {
+    Full(FullRefresh),
+    SingleAgent(Agent),
+}
+
+pub(crate) struct FullRefresh {
     pub agents: Vec<Agent>,
     pub panes: Vec<PaneInfo>,
     pub error: Option<DaemonError>,
@@ -723,11 +747,44 @@ pub(crate) struct RefreshOutcome {
 /// `set_data` re-sorts). Gone rows simply don't appear in the new
 /// snapshot and so drop.
 pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
-    let RefreshOutcome {
+    match outcome {
+        RefreshOutcome::Full(full) => apply_full(app, full),
+        RefreshOutcome::SingleAgent(agent) => apply_single_agent(app, agent),
+    }
+}
+
+/// Apply a single push-driven `Transition.agent` to the matching
+/// row in `app.rows`, leaving everything else untouched. If we don't
+/// find a row for `(kind, session_id)`, append it — that's the
+/// "first event for this session" case, where the next fallback
+/// tick will reconcile sort order and pane labels.
+fn apply_single_agent(app: &mut App, agent: Agent) {
+    let key = (agent.kind, agent.session_id.clone());
+    let mut updated = false;
+    for row in &mut app.rows {
+        if let WatchRow::Agent(a) = row {
+            if (a.kind, a.session_id.clone()) == key {
+                *a = agent.clone();
+                updated = true;
+                break;
+            }
+        }
+    }
+    if !updated {
+        app.rows.push(WatchRow::Agent(agent));
+    }
+    // Don't re-sort here: the fallback `Full` tick re-runs the sort
+    // every 5 s and that's plenty for keeping order roughly fresh.
+    // Re-sorting on every push would re-introduce the "all rows
+    // jumped" jitter we're trying to fix.
+}
+
+fn apply_full(app: &mut App, full: FullRefresh) {
+    let FullRefresh {
         agents: mut new_agents,
         panes,
         error,
-    } = outcome;
+    } = full;
 
     app.last_error = error;
 
@@ -775,13 +832,13 @@ async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> Refr
         .await
         .unwrap_or_default();
 
-    match client.snapshot().await {
-        Ok(agents) => RefreshOutcome {
+    let full = match client.snapshot().await {
+        Ok(agents) => FullRefresh {
             agents,
             panes,
             error: None,
         },
-        Err(e) => RefreshOutcome {
+        Err(e) => FullRefresh {
             agents: Vec::new(),
             panes,
             error: Some(DaemonError {
@@ -789,7 +846,8 @@ async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> Refr
                 message: e.to_string(),
             }),
         },
-    }
+    };
+    RefreshOutcome::Full(full)
 }
 
 /// Background task that owns its own `Client` clone and produces refresh
@@ -840,44 +898,63 @@ async fn refresh_task<F, Fut, S>(
         // never resolve but tokio still polls it once per loop, which
         // would burn a tiny bit of CPU and obscure traces.
         tokio::select! {
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                // Periodic full sync — catches up after lagged drops
+                // or any state we missed via the push stream.
+                let outcome = fetch().await;
+                if out.send(outcome).await.is_err() {
+                    return;
+                }
+            }
             req = wake.recv() => {
                 // None => the input loop dropped wake_tx, i.e. quit/attach.
                 if req.is_none() {
                     return;
                 }
+                // User-triggered (`r` key, or the priming wake from
+                // `run`) → also a full sync.
+                let outcome = fetch().await;
+                if out.send(outcome).await.is_err() {
+                    return;
+                }
             }
             res = recv_transition(&mut sub), if sub.is_some() => {
-                // `Some(())` → a transition fired → fall through to
-                // `fetch().await` below. `None` → daemon closed the
-                // stream OR a parse/IO error; drop the subscription
-                // and continue with pure polling so the user keeps a
-                // working (if higher-latency) view.
-                if res.is_none() {
+                if let Some(agent) = res {
+                    // Push-driven update: ship just the changed
+                    // row to the main loop. Avoids the "every tick
+                    // redraws every row" jitter where the full
+                    // snapshot would replace LAST PROMPT / STATE /
+                    // etc. for every agent on every transition.
+                    if out
+                        .send(RefreshOutcome::SingleAgent(agent))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else {
+                    // Daemon closed the stream OR parse/IO error.
+                    // Drop the subscription and continue with pure
+                    // polling so the user keeps a working (if
+                    // higher-latency) view.
                     sub = None;
-                    // Tighten the tick interval since push is gone.
                     tick = tokio::time::interval(POLL_INTERVAL);
                     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     tick.tick().await;
-                    continue; // skip the eager refresh — next tick will fetch
                 }
             }
-        }
-        let outcome = fetch().await;
-        if out.send(outcome).await.is_err() {
-            // Main loop dropped its receiver (quit/attach) — go home.
-            return;
         }
     }
 }
 
-/// Helper for the select arm: await the next transition, mapping
-/// every "stream is dead" case (Ok(None) for clean shutdown, Err for
-/// IO/parse) to `None` so the caller can fall back uniformly.
-async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Option<()> {
+/// Helper for the select arm: await the next transition. Returns
+/// `Some(agent)` when a push lands (the post-transition payload from
+/// the daemon), and `None` when the stream is dead — caller falls
+/// back to polling on `None`.
+async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Option<Agent> {
     let stream = sub.as_mut()?;
     match stream.recv().await {
-        Ok(Some(_)) => Some(()),
+        Ok(Some(t)) => Some(t.agent),
         Ok(None) | Err(_) => None,
     }
 }
@@ -3133,7 +3210,7 @@ mod tests {
     // ---- background refresh task -----------------------------------------
 
     fn outcome_with_marker(session: &str) -> RefreshOutcome {
-        RefreshOutcome {
+        RefreshOutcome::Full(FullRefresh {
             agents: vec![fake_agent(
                 session,
                 Some("%1"),
@@ -3146,7 +3223,7 @@ mod tests {
             )],
             panes: vec![],
             error: None,
-        }
+        })
     }
 
     /// A wake request sent from the input side must trigger a refresh on
@@ -3176,8 +3253,11 @@ mod tests {
         // The 500 ms tick is paused; force the wake path.
         wake_tx.try_send(()).expect("wake slot empty at start");
         let outcome = out_rx.recv().await.expect("refresh outcome on wake");
-        assert_eq!(outcome.agents.len(), 1);
-        assert_eq!(outcome.agents[0].session_id, "call-0");
+        let RefreshOutcome::Full(full) = outcome else {
+            panic!("wake path always sends a Full refresh");
+        };
+        assert_eq!(full.agents.len(), 1);
+        assert_eq!(full.agents[0].session_id, "call-0");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Dropping the wake sender ends the task cleanly.
@@ -3214,7 +3294,10 @@ mod tests {
         // refresh_task before the loop).
         tokio::time::advance(POLL_INTERVAL + Duration::from_millis(50)).await;
         let outcome = out_rx.recv().await.expect("refresh outcome on tick");
-        assert_eq!(outcome.agents[0].session_id, "tick");
+        let RefreshOutcome::Full(full) = outcome else {
+            panic!("periodic tick always sends a Full refresh");
+        };
+        assert_eq!(full.agents[0].session_id, "tick");
         assert!(calls.load(Ordering::SeqCst) >= 1);
 
         drop(wake_tx);
@@ -3785,7 +3868,7 @@ mod tests {
     #[test]
     fn apply_outcome_mirrors_old_refresh_helper() {
         let mut app = App::new();
-        let outcome = RefreshOutcome {
+        let outcome = RefreshOutcome::Full(FullRefresh {
             agents: vec![fake_agent(
                 "s1",
                 Some("%1"),
@@ -3801,7 +3884,7 @@ mod tests {
                 self_describing: false,
                 message: "boom".into(),
             }),
-        };
+        });
         apply_outcome(&mut app, outcome);
         assert_eq!(app.rows.len(), 2);
         assert!(app.last_error.is_some());
@@ -3823,7 +3906,7 @@ mod tests {
         // First refresh: row %1 lands in `Working`.
         apply_outcome(
             &mut app,
-            RefreshOutcome {
+            RefreshOutcome::Full(FullRefresh {
                 agents: vec![fake_agent(
                     "s1",
                     Some("%1"),
@@ -3836,7 +3919,7 @@ mod tests {
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 error: None,
-            },
+            }),
         );
         assert_eq!(app.rows.len(), 1);
         let WatchRow::Agent(a) = &app.rows[0] else {
@@ -3850,7 +3933,7 @@ mod tests {
         // table; the user sees `Working` continuously.
         apply_outcome(
             &mut app,
-            RefreshOutcome {
+            RefreshOutcome::Full(FullRefresh {
                 agents: vec![fake_agent(
                     "s1",
                     Some("%1"),
@@ -3863,7 +3946,7 @@ mod tests {
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 error: None,
-            },
+            }),
         );
         let WatchRow::Agent(a) = &app.rows[0] else {
             panic!("expected agent row");
@@ -3880,7 +3963,7 @@ mod tests {
         // not "state never changes".
         apply_outcome(
             &mut app,
-            RefreshOutcome {
+            RefreshOutcome::Full(FullRefresh {
                 agents: vec![fake_agent(
                     "s1",
                     Some("%1"),
@@ -3893,7 +3976,7 @@ mod tests {
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 error: None,
-            },
+            }),
         );
         let WatchRow::Agent(a) = &app.rows[0] else {
             panic!("expected agent row");
@@ -3910,7 +3993,7 @@ mod tests {
         let mut app = App::new();
         apply_outcome(
             &mut app,
-            RefreshOutcome {
+            RefreshOutcome::Full(FullRefresh {
                 agents: vec![fake_agent(
                     "s1",
                     Some("%1"),
@@ -3923,12 +4006,112 @@ mod tests {
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 error: None,
-            },
+            }),
         );
         let WatchRow::Agent(a) = &app.rows[0] else {
             panic!("expected agent row");
         };
         assert_eq!(a.state, AgentState::Starting);
+    }
+
+    /// `SingleAgent` push only touches the matching `(kind, session_id)`
+    /// row. Other rows keep their existing values byte-for-byte —
+    /// this is what stops the UI from "redrawing every row on every
+    /// tick".
+    #[test]
+    fn single_agent_outcome_only_updates_matching_row() {
+        let mut app = App::new();
+
+        // Seed two agent rows.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Full(FullRefresh {
+                agents: vec![
+                    fake_agent(
+                        "s1",
+                        Some("%1"),
+                        AgentKind::ClaudeCode,
+                        AgentState::Working,
+                        Some("first prompt"),
+                        None,
+                        None,
+                        None,
+                    ),
+                    fake_agent(
+                        "s2",
+                        Some("%2"),
+                        AgentKind::ClaudeCode,
+                        AgentState::Idle,
+                        Some("second prompt"),
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+                panes: vec![
+                    fake_pane("%1", "main", 0, 0, "claude"),
+                    fake_pane("%2", "side", 1, 0, "claude"),
+                ],
+                error: None,
+            }),
+        );
+        assert_eq!(app.rows.len(), 2);
+
+        // SingleAgent push for s2 only — last_prompt and state change.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::SingleAgent(fake_agent(
+                "s2",
+                Some("%2"),
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                Some("second prompt UPDATED"),
+                None,
+                None,
+                None,
+            )),
+        );
+
+        // s1 must be untouched.
+        let WatchRow::Agent(a1) = &app.rows[0] else {
+            panic!("row 0 should be agent s1");
+        };
+        assert_eq!(a1.session_id, "s1");
+        assert_eq!(a1.state, AgentState::Working);
+        assert_eq!(a1.last_prompt.as_deref(), Some("first prompt"));
+
+        // s2 reflects the push.
+        let WatchRow::Agent(a2) = &app.rows[1] else {
+            panic!("row 1 should be agent s2");
+        };
+        assert_eq!(a2.session_id, "s2");
+        assert_eq!(a2.state, AgentState::Working);
+        assert_eq!(a2.last_prompt.as_deref(), Some("second prompt UPDATED"));
+    }
+
+    /// `SingleAgent` push for an unknown `(kind, session_id)` appends.
+    /// The next periodic Full refresh handles sort order.
+    #[test]
+    fn single_agent_outcome_appends_unknown_row() {
+        let mut app = App::new();
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::SingleAgent(fake_agent(
+                "fresh",
+                Some("%9"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )),
+        );
+        assert_eq!(app.rows.len(), 1);
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        assert_eq!(a.session_id, "fresh");
     }
 
     // ---- detail row: precise visual layout --------------------------------
