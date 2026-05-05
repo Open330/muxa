@@ -13,7 +13,7 @@ use muxa::history::{HistoryOptions, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
 use muxa::reconcile::Reconciler;
-use muxa::sinks::OhMyPromptSink;
+use muxa::sinks::{webhook as webhook_sink, OhMyPromptSink, WebhookSink};
 use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
 use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
@@ -204,6 +204,7 @@ async fn main() -> Result<()> {
     }
 
     spawn_oh_my_prompt_sink(&cfg, &store, &shutdown_tx)?;
+    spawn_webhook_sink(&cfg, &store, &shutdown_tx)?;
 
     let server = Server::new(socket.clone(), store);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
@@ -631,6 +632,33 @@ fn spawn_oh_my_prompt_sink(
         Ok(None) => {}
         Err(e) => {
             return Err(anyhow::Error::new(e).context("resolving oh-my-prompt sink"));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the webhook (Slack/Discord) sink config and, if enabled,
+/// spawn its task. Mirrors `spawn_oh_my_prompt_sink`: failures to
+/// resolve are surfaced at startup so a typo in the URL doesn't lead
+/// to silent missed notifications.
+fn spawn_webhook_sink(
+    cfg: &Config,
+    store: &muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Result<()> {
+    match WebhookSink::resolve(&cfg.sinks.webhook) {
+        Ok(Some(sink)) => {
+            let transition_rx = store.subscribe();
+            let shutdown_rx = shutdown_tx.subscribe();
+            // `webhook_sink::spawn` returns the JoinHandle; we drop it
+            // because the sink lifetime is bounded by the shutdown
+            // broadcast (matching the ohmyprompt pattern).
+            std::mem::drop(webhook_sink::spawn(sink, transition_rx, shutdown_rx));
+            tracing::info!("webhook sink enabled");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("resolving webhook sink"));
         }
     }
     Ok(())
