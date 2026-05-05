@@ -369,9 +369,32 @@ fn mutate_for_event(
             }
         }
         AgentEvent::ToolStarted { .. } => {
-            agent.state = AgentState::Working;
+            // ToolStarted always means "agent is actively doing work" —
+            // covers the Idle → Working transition AND the
+            // WaitingInput → Working recovery (e.g. Codex resuming
+            // after a permission grant). Error stays Error so a
+            // legitimate failure isn't silently masked by tool activity
+            // — the next Stop or NotificationFired clears it.
+            if agent.state != AgentState::Error {
+                agent.state = AgentState::Working;
+            }
         }
-        AgentEvent::ToolCompleted { .. } => { /* state unchanged */ }
+        AgentEvent::ToolCompleted { .. } => {
+            // Tool activity proves the agent isn't waiting on the user
+            // any more. Specifically targets two cases:
+            //   - Codex grants permission, runs the tool, the
+            //     completion fires before any TurnStopped does.
+            //   - Claude's `AskUserQuestion` (routed through
+            //     NotificationFired { NeedsInput } in the adapter)
+            //     completes; the user answered.
+            // Other states are left alone — Working stays Working,
+            // Idle stays Idle (a stray ToolCompleted with no
+            // PromptSubmitted before it shouldn't fake activity),
+            // Error is preserved.
+            if agent.state == AgentState::WaitingInput {
+                agent.state = AgentState::Working;
+            }
+        }
         AgentEvent::NotificationFired { level, message, .. } => {
             agent.last_notification = Some(message.clone());
             match level {
@@ -993,6 +1016,159 @@ mod tests {
             pane: Some("%1".into()),
             cwd: None,
         }
+    }
+
+    #[tokio::test]
+    async fn tool_started_recovers_from_waiting_input() {
+        // Codex permission-grant scenario: Notification flips the row
+        // to WaitingInput, user grants, the next tool runs, and
+        // ToolStarted should auto-recover the row to Working without
+        // needing the timeout sweep.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("c"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("c"),
+                level: NotificationLevel::NeedsInput,
+                message: "permission".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::WaitingInput
+        );
+
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: id("c"),
+                tool: "Bash".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::Working,
+            "ToolStarted should recover WaitingInput → Working"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_completed_recovers_from_waiting_input() {
+        // Claude AskUserQuestion scenario: PreToolUse routes through
+        // NotificationFired so the row reads WaitingInput while the
+        // menu is up; the matching PostToolUse → ToolCompleted lands
+        // when the user answers and should flip the row back to
+        // Working.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("c"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("c"),
+                level: NotificationLevel::NeedsInput,
+                message: "ask".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::WaitingInput
+        );
+
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("c"),
+                tool: "AskUserQuestion".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::Working,
+            "ToolCompleted should recover WaitingInput → Working"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_started_preserves_error_state() {
+        // Errors aren't transient activity — a tool firing while a row
+        // is red shouldn't silently mask the failure.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("e"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("e"),
+                level: NotificationLevel::Error,
+                message: "boom".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("e").await.unwrap().state,
+            AgentState::Error
+        );
+
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: id("e"),
+                tool: "Read".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("e").await.unwrap().state,
+            AgentState::Error,
+            "ToolStarted must not clobber Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_completed_leaves_idle_alone() {
+        // A stray ToolCompleted with no PromptSubmitted before it
+        // shouldn't fake activity — only the WaitingInput → Working
+        // recovery path is special.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("i"),
+                at: now,
+            })
+            .await;
+        assert_eq!(store.by_session("i").await.unwrap().state, AgentState::Idle);
+
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("i"),
+                tool: "Read".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("i").await.unwrap().state,
+            AgentState::Idle,
+            "ToolCompleted must not flip Idle to Working on its own"
+        );
     }
 
     #[tokio::test]

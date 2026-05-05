@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **STATE column now reads `WaitingInput` while a Claude
+  `AskUserQuestion` menu is open**, not `Working`. The Claude
+  adapter routes `PreToolUse` for known user-blocking tools
+  (`AskUserQuestion`, `ExitPlanMode`) through
+  `NotificationFired { NeedsInput }` instead of `ToolStarted`, so
+  the row turns yellow while the operator is being asked something.
+  The matching `PostToolUse` lands as `ToolCompleted` and the
+  state machine flips back (see below).
+- **Tool activity recovers a row from `WaitingInput`** instead of
+  leaving it stuck. `mutate_for_event` now flips
+  `WaitingInput → Working` on either `ToolStarted` (Codex resuming
+  after a permission grant — the next tool fires) or
+  `ToolCompleted` (the matching post-hook for the
+  `AskUserQuestion` case above). Auto-recovers Codex's
+  permission-grant gap without needing the timeout sweep.
+  `Error` state is preserved through `ToolStarted` so a real
+  failure isn't masked.
+
 - **`muxa watch` paints its first frame instantly** instead of
   blocking on the priming snapshot (~50–100 ms tmux + IPC) and the
   v0.5.0 streaming-subscribe ack (~5 ms). Reordered `run()` to draw

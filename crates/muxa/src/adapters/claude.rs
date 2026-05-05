@@ -108,11 +108,7 @@ impl HookAdapter for ClaudeAdapter {
                 prompt: truncate(input.prompt.unwrap_or_default(), 4_000),
                 at,
             },
-            Event::PreToolUse => AgentEvent::ToolStarted {
-                id,
-                tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
-                at,
-            },
+            Event::PreToolUse => pre_tool_event(id, input.tool_name, at),
             Event::PostToolUse => AgentEvent::ToolCompleted {
                 id,
                 tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
@@ -211,6 +207,44 @@ impl HookAdapter for ClaudeAdapter {
             Event::SessionEnd => AgentEvent::SessionEnded { id, at },
         }
     }
+}
+
+/// Map a `PreToolUse` hook to the right `AgentEvent`. Most tools
+/// emit `ToolStarted` (state → Working); a small closed-set of
+/// user-blocking tools route through `NotificationFired { NeedsInput }`
+/// so the row reads `WaitingInput` while the menu is up. The
+/// matching `PostToolUse` → `ToolCompleted` recovers the row back
+/// to Working via `state::mutate_for_event`.
+fn pre_tool_event(id: AgentId, tool_name: Option<String>, at: OffsetDateTime) -> AgentEvent {
+    let tool_name = tool_name.unwrap_or_else(|| "unknown".into());
+    if is_user_blocking_tool(&tool_name) {
+        AgentEvent::NotificationFired {
+            id,
+            level: NotificationLevel::NeedsInput,
+            message: format!("waiting on {tool_name}"),
+            at,
+        }
+    } else {
+        AgentEvent::ToolStarted {
+            id,
+            tool: tool_name,
+            at,
+        }
+    }
+}
+
+/// Tools whose `PreToolUse` semantically means "block on the user
+/// for input" rather than "agent is doing work". Routing them
+/// through `NotificationFired { NeedsInput }` flips the row to
+/// `WaitingInput` while the menu is up, so the operator's mental
+/// model ("yellow = needs me") matches reality.
+///
+/// Add new entries here when Claude Code (or upstreams that share
+/// this hook surface) ship more user-blocking tools. The list is
+/// closed-set on purpose: an unknown tool default-routes to the
+/// "agent is working" path so we don't accidentally over-flip.
+fn is_user_blocking_tool(name: &str) -> bool {
+    matches!(name, "AskUserQuestion" | "ExitPlanMode")
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +354,59 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn pretool_input(tool_name: &str) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: Some(tool_name.into()),
+            notification_type: None,
+            message: None,
+            prompt: None,
+            transcript_path: None,
+            error: None,
+            error_details: None,
+            last_assistant_message: None,
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_ask_user_question_emits_needs_input_notification() {
+        // The numbered-menu case the user reported: AskUserQuestion
+        // shouldn't read as Working while the menu is open.
+        let ev =
+            ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("AskUserQuestion"), None);
+        match ev {
+            AgentEvent::NotificationFired { level, .. } => {
+                assert!(matches!(level, NotificationLevel::NeedsInput));
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_exit_plan_mode_also_blocks() {
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("ExitPlanMode"), None);
+        assert!(matches!(
+            ev,
+            AgentEvent::NotificationFired {
+                level: NotificationLevel::NeedsInput,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pre_tool_use_for_regular_tool_emits_tool_started() {
+        // Sanity: non-blocking tools must still go through the
+        // ToolStarted path — we don't want every pre-tool hook to
+        // read as WaitingInput.
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("Bash"), None);
+        match ev {
+            AgentEvent::ToolStarted { tool, .. } => assert_eq!(tool, "Bash"),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
 
     fn stop_input(transcript_path: Option<PathBuf>) -> Input {
         Input {
