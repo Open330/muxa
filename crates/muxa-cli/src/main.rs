@@ -2,6 +2,7 @@
 
 mod doctor;
 mod init;
+mod logs;
 mod watch;
 
 use anyhow::{Context, Result};
@@ -86,6 +87,10 @@ enum Cmd {
     Init(init::Args),
     /// Run end-to-end diagnostics and report any setup issues.
     Doctor,
+    /// Tail muxad's stdout/stderr logs without remembering paths.
+    /// Falls back to `journalctl --user -u muxad` on Linux when the
+    /// systemd unit is the source of truth.
+    Logs(logs::Args),
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,6 +167,7 @@ async fn main() -> Result<()> {
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run().await,
+        Cmd::Logs(logs_args) => logs::run(logs_args).await,
     }
 }
 
