@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Slack/Discord webhook sink** for state-transition push
+  notifications. New `[sinks.webhook]` config table with
+  `enabled` / `endpoint` / `endpoint_env` / `flavor` / `on_states`
+  / `rate_limit_secs` keys. Defaults forward only `WaitingInput`
+  and `Error` transitions — most agent transitions are routine
+  `Idle ↔ Working` and would spam. Auto-detects Slack
+  (`hooks.slack.com` → `{"text": "..."}`) and Discord
+  (`discord.com/api/webhooks` → `{"content": "..."}`) from the
+  URL; falls back to a generic flavor that posts the full
+  `Transition` JSON. Per-`(kind, session_id, state)` in-task
+  rate-limit (default 60s) prevents flapping permission loops
+  from paging the operator 30 times a minute. Best-effort by
+  design — failed POSTs log at WARN and drop, no on-disk queue,
+  no retry backoff. The webhook URL is the secret on Slack and
+  Discord, so prefer `endpoint_env` over inline TOML.
 - **`muxa logs`** — tail muxad's stdout/stderr without remembering
   `/tmp/muxad.log` and `/tmp/muxad.err`. Default streams the last 30
   lines of both files (configurable via `-n/--lines`) then follows
