@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa logs`** — tail muxad's stdout/stderr without remembering
+  `/tmp/muxad.log` and `/tmp/muxad.err`. Default streams the last 30
+  lines of both files (configurable via `-n/--lines`) then follows
+  `tail -f`-style until Ctrl-C. Flags: `-N/--no-follow` for one-shot
+  output, `--err-only` to skip the stdout log, and `--filter <substr>`
+  for case-insensitive substring filtering. Lines containing `ERROR`
+  or `panic` render red, `WARN` yellow, when stdout is a TTY (honors
+  `NO_COLOR`). On Linux hosts where the systemd user unit handles
+  muxad — and so logs go to journald rather than `/tmp` — falls back
+  to `journalctl --user -u muxad`, printing the exact command in the
+  header so users can run it themselves.
 - **`muxa upgrade`** — one-command source-build update flow.
   Walks up from the cwd to find the muxa source repo, then runs
   `git pull` → `cargo install --path crates/muxad --locked --force`
@@ -21,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--dry-run` prints the plan without doing anything.
 
 ### Fixed
+
+- **`muxa watch` no longer flickers the STATE column through
+  `Starting` for steady-state rows.** With v0.5.0's push-based
+  `Subscribe`, every transition triggers a fresh snapshot fetch; if
+  any of those snapshots momentarily contained a `Starting`
+  placeholder for an `(kind, session_id)` we already knew was in a
+  steady state (`Working` / `Idle` / `WaitingInput` / `Error` /
+  `Stopped`), the row briefly repainted cyan before settling back.
+  `apply_outcome` now keeps the previously-known steady state for
+  rows where the snapshot's `Starting` would otherwise overwrite
+  one — brand-new rows still come through as `Starting`, and real
+  daemon-driven transitions still propagate.
 
 - **STATE column now reads `WaitingInput` while a Claude
   `AskUserQuestion` menu is open**, not `Working`. The Claude
