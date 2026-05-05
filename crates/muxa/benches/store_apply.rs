@@ -257,7 +257,5 @@ fn main() {
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4)
+    std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
 }
