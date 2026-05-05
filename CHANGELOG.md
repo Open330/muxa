@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa doctor`** — end-to-end diagnostic command. Answers "is muxa
+  working correctly?" without making the user know paths or
+  service-manager incantations. Six checks render as cliclack-styled
+  lines with `✔ / ✗ / ⚠` glyphs and actionable hints: muxad IPC
+  responsiveness (1.5 s timeout), service-manager loaded state
+  (`launchctl print` on macOS, `systemctl --user is-active` on
+  Linux), unit/plist file present on disk, per-agent hook entry in
+  Claude/Codex/Gemini settings, tmux marker blocks (popup +
+  statusline) in `~/.tmux.conf`, and recent ERROR/panic lines in
+  `/tmp/muxad.err`. Exits 0 regardless of failures so it composes in
+  scripts; the summary footer counts issues and points at
+  `muxa init` / `muxa upgrade`.
 - **`stuck-WaitingInput` sweep** (Codex permission-grant recovery).
   New config knob `[reconciler] stuck_waiting_timeout_secs` with
   the same shape as `stuck_working_timeout_secs`. Specifically

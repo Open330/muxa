@@ -1,5 +1,6 @@
 //! muxa CLI — user-facing entry point.
 
+mod doctor;
 mod init;
 mod watch;
 
@@ -83,6 +84,8 @@ enum Cmd {
     /// and the dashboard. Use `--preset standard --yes` for one-shot
     /// non-interactive installs.
     Init(init::Args),
+    /// Run end-to-end diagnostics and report any setup issues.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,6 +161,7 @@ async fn main() -> Result<()> {
         Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
+        Cmd::Doctor => doctor::run().await,
     }
 }
 
