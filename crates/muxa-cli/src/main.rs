@@ -1,6 +1,7 @@
 //! muxa CLI — user-facing entry point.
 
 mod init;
+mod upgrade;
 mod watch;
 
 use anyhow::{Context, Result};
@@ -83,6 +84,10 @@ enum Cmd {
     /// and the dashboard. Use `--preset standard --yes` for one-shot
     /// non-interactive installs.
     Init(init::Args),
+    /// Update muxa from the source repo: `git pull` → cargo install
+    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
+    /// socket is responsive. One command for the full update flow.
+    Upgrade(upgrade::Args),
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,6 +163,7 @@ async fn main() -> Result<()> {
         Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
+        Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
     }
 }
 
