@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`muxa watch` no longer flickers the STATE column through
+  `Starting` for steady-state rows.** With v0.5.0's push-based
+  `Subscribe`, every transition triggers a fresh snapshot fetch; if
+  any of those snapshots momentarily contained a `Starting`
+  placeholder for an `(kind, session_id)` we already knew was in a
+  steady state (`Working` / `Idle` / `WaitingInput` / `Error` /
+  `Stopped`), the row briefly repainted cyan before settling back.
+  `apply_outcome` now keeps the previously-known steady state for
+  rows where the snapshot's `Starting` would otherwise overwrite
+  one — brand-new rows still come through as `Starting`, and real
+  daemon-driven transitions still propagate.
+
 - **STATE column now reads `WaitingInput` while a Claude
   `AskUserQuestion` menu is open**, not `Working`. The Claude
   adapter routes `PreToolUse` for known user-blocking tools

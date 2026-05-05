@@ -27,7 +27,7 @@ use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
 use muxa::state::Agent;
 use muxa::tmux::PaneInfo;
-use muxa::AgentState;
+use muxa::{AgentKind, AgentState};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -692,13 +692,73 @@ pub(crate) struct RefreshOutcome {
     pub error: Option<DaemonError>,
 }
 
-/// Apply a `RefreshOutcome` to `App` exactly the way the old inline
-/// `refresh` helper did. Kept as a free function so unit tests can build
-/// outcomes from a fake fetcher and assert on `App` afterwards without
-/// pulling in any networking.
+/// Apply a `RefreshOutcome` to `App`.
+///
+/// **Anti-flicker merge invariant** (added 2026-04-30): when a fresh
+/// snapshot lands carrying a row whose state is `Starting` for an
+/// `(kind, session_id)` we already track in a steady state
+/// (`Working` / `Idle` / `WaitingInput` / `Error` / `Stopped`), we
+/// keep the previously-known state and only adopt the snapshot's
+/// non-state fields (model, cost, `last_prompt`, …). Background:
+///
+///   - `state::Agent::new` initializes new entries to `Starting`,
+///     and `Store::apply` only flips off `Starting` for events that
+///     carry an explicit transition (`Started` → `Idle`,
+///     `PromptSubmitted` → `Working`, etc.). Events that *don't*
+///     change state (e.g. `ToolCompleted` against an `Idle` row, or
+///     a `Heartbeat`) leave a freshly-inserted entry stuck in
+///     `Starting` — and the v0.5.0 `Subscribe` push triggers a fresh
+///     snapshot fetch on every transition, so any such transient
+///     placeholder shows up in `muxa watch` as a single-tick row
+///     that looks like "everything is Starting" relative to its
+///     peers.
+///   - The user-visible symptom: "한 순간에 STATE가 모두 starting으로
+///     바뀌고 업데이트되는것같다" — the eye doesn't track which one row
+///     blipped, only that the column "flickered".
+///
+/// The merge keeps Agent identity (matched by `(kind, session_id)`)
+/// stable across refreshes, so `set_data`'s sort+selection logic
+/// runs on a list that already reflects the row-level UI invariant.
+/// New rows are appended (the snapshot's order is preserved before
+/// `set_data` re-sorts). Gone rows simply don't appear in the new
+/// snapshot and so drop.
 pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
-    app.last_error = outcome.error;
-    app.set_data(outcome.agents, outcome.panes);
+    let RefreshOutcome {
+        agents: mut new_agents,
+        panes,
+        error,
+    } = outcome;
+
+    app.last_error = error;
+
+    // Build a lookup of the previously-known state per
+    // `(kind, session_id)` so the merge can distinguish a genuine
+    // daemon-driven state change from a transient `Starting`
+    // placeholder. Only `WatchRow::Agent` rows carry agent state;
+    // bare panes are reconstructed from the panes inventory each
+    // refresh and don't participate in this merge.
+    let prev_state: HashMap<(AgentKind, String), AgentState> = app
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            WatchRow::Agent(a) => Some(((a.kind, a.session_id.clone()), a.state)),
+            WatchRow::BarePane(_) => None,
+        })
+        .collect();
+
+    for agent in &mut new_agents {
+        if agent.state == AgentState::Starting {
+            if let Some(&prior) = prev_state.get(&(agent.kind, agent.session_id.clone())) {
+                if prior != AgentState::Starting {
+                    // Steady-state row: don't let a transient
+                    // `Starting` placeholder repaint as cyan.
+                    agent.state = prior;
+                }
+            }
+        }
+    }
+
+    app.set_data(new_agents, panes);
 }
 
 /// Compute one refresh outcome: pane inventory from the active backend
@@ -3746,6 +3806,129 @@ mod tests {
         assert_eq!(app.rows.len(), 2);
         assert!(app.last_error.is_some());
         assert_eq!(app.last_error.as_ref().unwrap().message, "boom");
+    }
+
+    /// Regression for the "all rows flicker through Starting" report on
+    /// v0.5.0. The push-based `Subscribe` stream triggers a fresh
+    /// snapshot per transition; if any of those snapshots momentarily
+    /// returns a row in `Starting` (e.g. because a new entry was just
+    /// inserted by an event that didn't carry an explicit transition),
+    /// the row would visibly flicker cyan for one tick before settling
+    /// back. `apply_outcome` MUST keep the previously-known steady
+    /// state for an `(kind, session_id)` already in `app.rows`.
+    #[test]
+    fn apply_outcome_preserves_state_on_unchanged_rows() {
+        let mut app = App::new();
+
+        // First refresh: row %1 lands in `Working`.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Working,
+                    None,
+                    None,
+                    None,
+                    None,
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            },
+        );
+        assert_eq!(app.rows.len(), 1);
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        assert_eq!(a.state, AgentState::Working);
+
+        // Second refresh: same `(kind, session_id)`, but state has
+        // regressed to `Starting` — the daemon-side bug we're papering
+        // over here. `apply_outcome` must NOT propagate that to the
+        // table; the user sees `Working` continuously.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Starting,
+                    None,
+                    None,
+                    None,
+                    None,
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            },
+        );
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        assert_eq!(
+            a.state,
+            AgentState::Working,
+            "row that was Working must not flicker through Starting on a transient placeholder snapshot",
+        );
+
+        // Third refresh: legitimate transition Working → Idle. The
+        // merge MUST let real state changes through — the invariant
+        // is "Starting placeholder doesn't override steady state",
+        // not "state never changes".
+        apply_outcome(
+            &mut app,
+            RefreshOutcome {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            },
+        );
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        assert_eq!(a.state, AgentState::Idle);
+    }
+
+    /// A genuinely fresh agent (no prior row at the same
+    /// `(kind, session_id)`) is allowed to appear as `Starting` — the
+    /// merge only suppresses the `Starting` placeholder when we have
+    /// a steady state to fall back on.
+    #[test]
+    fn apply_outcome_lets_starting_through_for_brand_new_rows() {
+        let mut app = App::new();
+        apply_outcome(
+            &mut app,
+            RefreshOutcome {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Starting,
+                    None,
+                    None,
+                    None,
+                    None,
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            },
+        );
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        assert_eq!(a.state, AgentState::Starting);
     }
 
     // ---- detail row: precise visual layout --------------------------------
