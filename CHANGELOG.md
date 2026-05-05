@@ -33,6 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`muxa watch` no longer redraws every row on every transition.**
+  v0.5.0's push-based subscribe was only used as a "wake" signal:
+  each Transition triggered a fresh `client.snapshot()` call and the
+  watch replaced its entire agent list. Even though only one row had
+  changed on the daemon side, every row's STATE / LAST PROMPT /
+  model / cost values were rewritten — visually indistinguishable
+  from constant churn. The user perceived this as "all columns
+  updating even when nothing should be changing".
+
+  `RefreshOutcome` is now an enum: `Full(FullRefresh)` for the
+  periodic 5 s sync (and the priming wake from `run`), and
+  `SingleAgent(Agent)` for push deliveries. The subscribe arm in
+  `refresh_task` ships the `Transition.agent` payload directly via
+  `SingleAgent` instead of triggering a snapshot. `apply_outcome`
+  finds the matching `(kind, session_id)` row and replaces just
+  that one entry — every other row keeps its prior bytes. New rows
+  whose `session_id` we haven't seen are appended; the next `Full`
+  tick handles sort order. The fallback poll still catches up after
+  `Lagged` drops on the broadcast.
 - **STATE no longer gets stuck on `Starting` (cyan) for agents whose
   first event doesn't carry an explicit transition.** v0.5.0
   introduced row creation via `or_insert_with(Agent::new)` in
