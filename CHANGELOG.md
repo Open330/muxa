@@ -33,6 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **STATE no longer gets stuck on `Starting` (cyan) for agents whose
+  first event doesn't carry an explicit transition.** v0.5.0
+  introduced row creation via `or_insert_with(Agent::new)` in
+  `Store::apply` — a fresh row defaults to `state = Starting` and
+  most events flip it explicitly (`Started → Idle`,
+  `PromptSubmitted → Working`, etc.), but `Heartbeat`,
+  `ToolCompleted`, and (occasionally) `RateLimited` carry only side-
+  effect data with no transition. If one of those was the *first*
+  event for a session — most commonly Claude's statusLine
+  Heartbeat landing on a synthetic discovery placeholder — the row
+  stayed cyan indefinitely. `mutate_for_event` now ends with a
+  catch-all: any event for a `Starting` agent promotes to `Idle`.
+  Synthetic placeholders that have *never* received a hook event
+  remain `Starting` (the catch-all only fires once an event lands)
+  and explicit transitions (Working/WaitingInput/Error/Stopped)
+  still win because they leave the state non-`Starting` before the
+  catch-all runs.
+
+
 - **`muxa watch` no longer flickers the STATE column through
   `Starting` for steady-state rows.** With v0.5.0's push-based
   `Subscribe`, every transition triggers a fresh snapshot fetch; if

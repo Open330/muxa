@@ -431,6 +431,21 @@ fn mutate_for_event(
         AgentEvent::RateLimited { .. } => apply_rate_limited(agent, ev),
     }
 
+    // Catch-all: any event for a `Starting` agent demonstrates the
+    // agent is alive — promote to `Idle` so the row stops painting
+    // cyan. `Starting` is the default of `Agent::new()` (and so the
+    // initial state of any agent created via `or_insert_with` in
+    // `apply`); for events that don't carry an explicit state
+    // transition (`Heartbeat`, `ToolCompleted` on a fresh row,
+    // `RateLimited` arriving before `Started`) the agent would
+    // otherwise stay `Starting` indefinitely. Synthetic discovery
+    // placeholders that have *never* received a hook event are still
+    // accurately `Starting` — the catch-all only fires once an
+    // event lands.
+    if agent.state == AgentState::Starting {
+        agent.state = AgentState::Idle;
+    }
+
     (prompt_record, history_entry)
 }
 
@@ -1168,6 +1183,103 @@ mod tests {
             store.by_session("i").await.unwrap().state,
             AgentState::Idle,
             "ToolCompleted must not flip Idle to Working on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_promotes_starting_to_idle() {
+        // Common Claude case: a synthetic discovery placeholder (or
+        // a fresh row from `or_insert_with(Agent::new)`) starts at
+        // `Starting`. The first Heartbeat from the statusLine
+        // doesn't carry an explicit transition — without the
+        // catch-all promotion the row would paint cyan forever.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("hb"),
+                model: Some("opus".into()),
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("hb").await.unwrap().state,
+            AgentState::Idle,
+            "Heartbeat as the first event should promote Starting → Idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_completed_promotes_starting_to_idle() {
+        // Out-of-order case: PostToolUse lands before we've seen the
+        // matching PreToolUse / SessionStart. Without promotion the
+        // row would stay `Starting` until something else fires.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("tc"),
+                tool: "Read".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("tc").await.unwrap().state,
+            AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_sets_error_not_starting() {
+        // RateLimited triggers `apply_rate_limited` which sets
+        // state = Error. The catch-all promotion only fires for
+        // `Starting`, so Error wins (and the agent reads as red,
+        // which is the correct UX for a hit limit).
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: id("rl"),
+                scope: crate::event::RateLimitScope::Unknown,
+                source: crate::event::RateLimitSource::Transcript,
+                resets_at: None,
+                message: Some("hit".into()),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("rl").await.unwrap().state,
+            AgentState::Error,
+            "RateLimited explicitly sets Error — the Starting promotion must not interfere"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_does_not_clobber_explicit_states() {
+        // Sanity: events that DO set a state explicitly (Started →
+        // Idle, PromptSubmitted → Working, NotificationFired
+        // NeedsInput → WaitingInput, etc.) win — the catch-all is a
+        // no-op because the state is already non-`Starting`.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("ps"),
+                prompt: "hi".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("ps").await.unwrap().state,
+            AgentState::Working,
+            "PromptSubmitted explicitly sets Working — promotion must not interfere"
         );
     }
 
