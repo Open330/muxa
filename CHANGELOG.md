@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`muxa logs`** — tail muxad's stdout/stderr without remembering
+  `/tmp/muxad.log` and `/tmp/muxad.err`. Default streams the last 30
+  lines of both files (configurable via `-n/--lines`) then follows
+  `tail -f`-style until Ctrl-C. Flags: `-N/--no-follow` for one-shot
+  output, `--err-only` to skip the stdout log, and `--filter <substr>`
+  for case-insensitive substring filtering. Lines containing `ERROR`
+  or `panic` render red, `WARN` yellow, when stdout is a TTY (honors
+  `NO_COLOR`). On Linux hosts where the systemd user unit handles
+  muxad — and so logs go to journald rather than `/tmp` — falls back
+  to `journalctl --user -u muxad`, printing the exact command in the
+  header so users can run it themselves.
+
 ### Fixed
 
 - **`muxa watch` no longer flickers the STATE column through
