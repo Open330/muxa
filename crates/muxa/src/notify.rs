@@ -138,6 +138,7 @@ mod tests {
     use super::*;
     use crate::state::Agent;
     use crate::AgentKind;
+    use std::sync::Arc;
     use time::macros::datetime;
 
     fn agent(state: AgentState) -> Agent {
@@ -182,7 +183,7 @@ mod tests {
             let t = Transition {
                 from,
                 to,
-                agent: agent(to),
+                agent: Arc::new(agent(to)),
             };
             assert_eq!(should_notify(&t), expected, "{from:?} -> {to:?}");
         }
@@ -193,7 +194,7 @@ mod tests {
         let t = Transition {
             from: AgentState::Working,
             to: AgentState::WaitingInput,
-            agent: agent(AgentState::WaitingInput),
+            agent: Arc::new(agent(AgentState::WaitingInput)),
         };
         let (title, body) = render("muxa", &t);
         assert_eq!(title, "muxa · claude_code · waiting_input");
@@ -207,7 +208,7 @@ mod tests {
         let t = Transition {
             from: AgentState::Working,
             to: AgentState::WaitingInput,
-            agent: a,
+            agent: Arc::new(a),
         };
         let (_, body) = render("muxa", &t);
         // "pane %7: " is 9 chars; body then up to BODY_TRUNCATE chars incl. ellipsis.

@@ -954,7 +954,13 @@ async fn refresh_task<F, Fut, S>(
 async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Option<Agent> {
     let stream = sub.as_mut()?;
     match stream.recv().await {
-        Ok(Some(t)) => Some(t.agent),
+        // The wire payload deserializes as `Arc<Agent>` (the producer
+        // wraps once to make the broadcast fanout O(refcount) instead
+        // of O(sizeof(Agent))). On the client side the strong count is
+        // always 1 — this is a fresh `Arc` built by `serde` — so
+        // `Arc::try_unwrap` is guaranteed to succeed and avoids a
+        // pointless `Agent` clone here.
+        Ok(Some(t)) => Some(std::sync::Arc::try_unwrap(t.agent).unwrap_or_else(|a| (*a).clone())),
         Ok(None) | Err(_) => None,
     }
 }

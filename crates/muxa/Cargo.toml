@@ -36,5 +36,9 @@ http-body-util = "0.1"
 wiremock = "0.6"
 tracing-subscriber = { workspace = true }
 
+[[bench]]
+name = "store_apply"
+harness = false
+
 [lints]
 workspace = true

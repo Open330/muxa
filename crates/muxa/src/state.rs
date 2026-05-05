@@ -167,15 +167,26 @@ impl Agent {
 /// UI (desktop notification body, log line, status row) without
 /// racing further mutations.
 ///
+/// `agent` is wrapped in [`Arc`] specifically because the
+/// `tokio::sync::broadcast` channel clones the payload **once per
+/// subscriber per `recv()`** — with the daemon's notifier + sinks +
+/// every live `muxa watch` SSE/IPC subscriber, that fanout was
+/// dominating `Store::apply` wall time at modest subscriber counts
+/// (4–8). The Arc keeps the per-fanout cost a refcount bump instead
+/// of an `Agent`-sized memcpy of the up-to-8 KB-of-`String` payload.
+/// See `crates/muxa/benches/store_apply.rs` for the measurement.
+///
 /// Both in-process consumers (sinks, notifier) and IPC subscribers
 /// (`muxa watch`) receive the same payload — the type is
 /// `Serialize + Deserialize` so the daemon can stream it as
-/// newline-delimited JSON over the unix socket.
+/// newline-delimited JSON over the unix socket. `Arc<T>` serializes
+/// transparently as `T`, and on the deserializing side rebuilds a
+/// fresh, single-strong `Arc<T>` — so the wire format is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transition {
     pub from: AgentState,
     pub to: AgentState,
-    pub agent: Agent,
+    pub agent: Arc<Agent>,
 }
 
 /// In-process record emitted whenever a `PromptSubmitted` event lands.
@@ -741,10 +752,14 @@ impl Store {
         let (prompt_record, history_entry) = mutate_for_event(agent, ev, id, at);
 
         if agent.state != prev_state {
+            // Wrap the post-transition snapshot in an `Arc` exactly once
+            // here; the broadcast channel then bumps the refcount per
+            // subscriber instead of memcpy-ing the whole `Agent` (which
+            // can hold up to ~8 KB of `String` data on a busy session).
             let transition = Transition {
                 from: prev_state,
                 to: agent.state,
-                agent: agent.clone(),
+                agent: Arc::new(agent.clone()),
             };
             // `send` errors only when there are zero subscribers — that's
             // the common case (notifier disabled) and not worth logging.
@@ -878,11 +893,12 @@ impl Store {
             // Broadcast for IPC subscribers and in-process sinks.
             // Identical shape to the broadcast in `apply` so consumers
             // can't tell a sweep from a real event — they just see an
-            // Idle row.
+            // Idle row. Same `Arc::new(agent.clone())` discipline as
+            // `apply` — see the `Transition::agent` doc comment.
             let _ = self.transitions.send(Transition {
                 from: prev,
                 to: agent.state,
-                agent: agent.clone(),
+                agent: Arc::new(agent.clone()),
             });
         }
         flipped
