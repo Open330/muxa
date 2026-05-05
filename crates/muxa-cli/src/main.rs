@@ -1,5 +1,6 @@
 //! muxa CLI — user-facing entry point.
 
+mod doctor;
 mod init;
 mod logs;
 mod upgrade;
@@ -85,6 +86,8 @@ enum Cmd {
     /// and the dashboard. Use `--preset standard --yes` for one-shot
     /// non-interactive installs.
     Init(init::Args),
+    /// Run end-to-end diagnostics and report any setup issues.
+    Doctor,
     /// Tail muxad's stdout/stderr logs without remembering paths.
     /// Falls back to `journalctl --user -u muxad` on Linux when the
     /// systemd unit is the source of truth.
@@ -168,6 +171,7 @@ async fn main() -> Result<()> {
         Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
+        Cmd::Doctor => doctor::run().await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
     }
