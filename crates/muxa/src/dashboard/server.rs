@@ -877,7 +877,7 @@ mod tests {
         tx.send(Transition {
             from: AgentState::Starting,
             to: AgentState::Idle,
-            agent: agent.clone(),
+            agent: Arc::new(agent.clone()),
         })
         .expect("subscriber alive, send must succeed");
 
@@ -979,7 +979,7 @@ mod tests {
             tx.send(Transition {
                 from: AgentState::Starting,
                 to: AgentState::Idle,
-                agent: agent.clone(),
+                agent: Arc::new(agent.clone()),
             })
             .expect("subscriber alive, send must succeed");
         }

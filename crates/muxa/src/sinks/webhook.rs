@@ -500,7 +500,11 @@ mod tests {
     }
 
     fn transition(from: AgentState, to: AgentState, agent: Agent) -> Transition {
-        Transition { from, to, agent }
+        Transition {
+            from,
+            to,
+            agent: std::sync::Arc::new(agent),
+        }
     }
 
     #[test]

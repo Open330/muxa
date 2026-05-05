@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Transition.agent` is now `Arc<Agent>`** (was `Agent`). The in-process
+  `tokio::sync::broadcast` channel that fans out state-change events
+  to the notifier task, in-process sinks, and every live `muxa watch`
+  IPC subscriber clones the payload once per subscriber per `recv()`.
+  With the post-v0.5.0 dashboard SSE handler holding a long-lived
+  subscription on top of the existing notifier + watch CLIs, an `Agent`
+  carrying ~4 KB of `last_prompt` and ~4 KB of `last_response` was
+  showing up as a meaningful fraction of `Store::apply` wall time
+  under modest fanout (≥ 4 subscribers). Wrapping the agent in an
+  `Arc` keeps the per-subscriber cost a refcount bump instead of an
+  `Agent`-sized allocation + memcpy, and shrinks `Store::apply`
+  end-to-end time by ~30% at N = 16 subscribers on the
+  `crates/muxa/benches/store_apply.rs` microbenchmark.
+
+  **Wire format unchanged.** `serde::Serialize` on `Arc<T>` is
+  transparent (serializes as `T`), and `Arc::deserialize` always
+  produces a fresh, single-strong `Arc<T>` — so newline-delimited JSON
+  flowing over the unix socket between `muxad` and `muxa watch` /
+  dashboard SSE looks identical on the wire. No protocol bump.
+  Internal API consumers that match on `Transition.agent` will need
+  to deref through the `Arc` (e.g., via `&*t.agent` or implicit
+  `Deref`), which the in-tree consumers already do.
+- Workspace `serde` now enables the `rc` feature so `Arc<T>` derives
+  `Deserialize` automatically — required by the change above.
+
 ### Added
 
 - **`muxa watch` quick actions** — the picker is no longer read-only.
