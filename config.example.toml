@@ -176,3 +176,26 @@
 # device_id          = "laptop-01"
 # batch_size         = 50
 # flush_interval_ms  = 5000
+
+# [sinks.webhook] forwards `Transition` events to a Slack or Discord
+# webhook so you can be paged on your phone the moment an agent flips
+# to `WaitingInput` or `Error` while you're AFK from `muxa watch`.
+# Auto-detects the wire format from the URL: hooks.slack.com →
+# `{"text": "..."}`, discord.com/api/webhooks → `{"content": "..."}`,
+# anything else → the full `Transition` JSON.
+#
+# The webhook URL is itself the secret for Slack/Discord; prefer
+# `endpoint_env` over inline `endpoint` so it never lives in TOML.
+# `endpoint_env` wins when both are set.
+#
+# Best-effort by design: a failed POST logs and drops. No queue, no
+# backoff — Slack/Discord's own rate-limit handling is good enough,
+# and we'd rather lose a single page than thunder-herd 1000 buffered
+# alerts when an outage clears.
+[sinks.webhook]
+# enabled         = true
+# endpoint        = "https://hooks.slack.com/services/T0/B0/abc"
+# endpoint_env    = "MUXA_SLACK_URL"
+# flavor          = "slack"            # slack | discord | generic
+# on_states       = ["WaitingInput", "Error"]
+# rate_limit_secs = 60                 # per (kind, session, state)
