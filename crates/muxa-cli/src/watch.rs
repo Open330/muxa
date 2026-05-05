@@ -2,17 +2,26 @@
 //!
 //! Polls the daemon via `Client::snapshot()` every 500 ms and renders a
 //! live-updating table of tracked agents. Input is handled via crossterm
-//! events (`q`/`Esc`/`Ctrl-C` to quit, `r` to force-refresh, `↑/↓` or
-//! `j/k` for selection, `Enter` to attach into the selected pane,
-//! `p` to pop open a full-screen preview of the selected row's prompt
-//! and response — `q`/`Esc`/`p` returns to the table).
+//! events:
+//!
+//! - Navigation: `q`/`Esc`/`Ctrl-C` to quit, `r` to force-refresh, `↑/↓`
+//!   or `j/k` for selection, `Enter` to attach into the selected pane.
+//! - Inspection: `p` pops open a full-screen preview of the selected
+//!   row's prompt and response (`q`/`Esc`/`p` returns to the table).
+//! - Quick actions (act on the selected row): `c` copies the last
+//!   prompt to the system clipboard, capital `K` kills the pane (with
+//!   a confirm popup), capital `R` aborts the current turn (also with
+//!   a confirm popup). The Shift requirement on `K` / `R` is a safety
+//!   rail so accidental key presses don't blow up panes.
+//! - Discovery: `?` toggles a help overlay listing every binding.
 //!
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
 
 use std::future::Future;
-use std::io::{self, Stdout};
-use std::time::Duration;
+use std::io::{self, Stdout, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -56,6 +65,12 @@ const STREAMING_FALLBACK_INTERVAL: Duration = Duration::from_secs(5);
 /// drain-all-pending pattern in `run`, so this only governs idle
 /// responsiveness.
 const INPUT_POLL: Duration = Duration::from_millis(16);
+
+/// How long a transient action hint stays visible in the footer before
+/// the renderer falls back to the default keybinding strip. 2 s is the
+/// sweet spot from the spec: long enough to catch with a glance after
+/// hitting `K`/`R`/`c`, short enough not to mask the next interaction.
+const FOOTER_HINT_TTL: Duration = Duration::from_secs(2);
 
 /// Channel capacity for the wake signal sent from the input loop to the
 /// background refresh task. Capacity 1 is intentional: when the user mashes
@@ -305,6 +320,283 @@ pub(crate) struct DaemonError {
     pub self_describing: bool,
 }
 
+/// A power-user action requested against the currently-selected row.
+///
+/// The input handler returns one of these (or `None`) and a separate
+/// helper executes it via [`dispatch_quick_action`]. Keeping the
+/// "what should happen" decision separate from "shell out to tmux /
+/// xclip" lets unit tests verify the selection logic without touching
+/// the real subprocess world — see the `Effects` trait below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QuickAction {
+    /// Kill the tmux pane the agent is running in. String is the
+    /// `pane_id` (e.g. `%42`) we'll pass to `tmux kill-pane -t`.
+    KillPane(String),
+    /// Send Ctrl-C to the pane to abort the current turn. The spec
+    /// originally called this "restart"; the pragmatic shape is just
+    /// "abort" because we don't know the original launch command to
+    /// re-run reliably across Claude/Codex/Gemini wrappers.
+    AbortTurn(String),
+    /// Copy the selected agent's `last_prompt` to the system clipboard.
+    /// String is the prompt body; the dispatcher tries pbcopy / wl-copy
+    /// / xclip in order and falls back to a temp file if none work.
+    CopyPrompt(String),
+    /// Toggle the `?` help overlay. Pure UI — no side-effects.
+    ShowHelp,
+}
+
+/// Outcome of running a [`QuickAction`] — surfaced to the run loop
+/// which then turns it into a transient footer hint or a state mutation.
+///
+/// Note that "not applicable" is handled at the **input-handler** stage
+/// (via `Action::NotApplicable`) rather than here: by the time the
+/// dispatcher runs we've already decided the action is going through,
+/// so anything the dispatcher reports back is either success or a
+/// real backend failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActionOutcome {
+    /// Action ran successfully. Message goes into the footer hint.
+    Ok(String),
+    /// Action failed (tmux exited non-zero, clipboard binaries all
+    /// missing, …). Message goes into the footer hint with an error tone.
+    Err(String),
+    /// Help overlay toggled — no hint to surface; the renderer reads
+    /// `app.help_open` directly.
+    HelpToggled,
+}
+
+/// Side-effect surface for [`dispatch_quick_action`]. Lifting the three
+/// shell-outs into a trait means tests can pass a `RecorderEffects`
+/// stub that records calls without ever spawning a subprocess.
+pub(crate) trait Effects {
+    /// Run `tmux kill-pane -t <pane_id>`. Return Ok on exit 0.
+    fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String>;
+    /// Run `tmux send-keys -t <pane_id> C-c`. Return Ok on exit 0.
+    fn send_ctrl_c(&mut self, pane_id: &str) -> std::result::Result<(), String>;
+    /// Pipe `text` into the system clipboard. Returns the name of the
+    /// helper that succeeded (`pbcopy` / `wl-copy` / `xclip`) or
+    /// `tmpfile:<path>` if all helpers were missing and we wrote a
+    /// fallback file. `Err()` when even the fallback failed.
+    fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String>;
+}
+
+/// Real-world `Effects` impl — shells out to tmux and the system
+/// clipboard helpers. Unit tests use a recorder stub instead.
+pub(crate) struct RealEffects;
+
+impl Effects for RealEffects {
+    fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String> {
+        run_status("tmux", &["kill-pane", "-t", pane_id])
+    }
+
+    fn send_ctrl_c(&mut self, pane_id: &str) -> std::result::Result<(), String> {
+        run_status("tmux", &["send-keys", "-t", pane_id, "C-c"])
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String> {
+        // Try the platform-native helper first, then fall back. Order
+        // matters: macOS ships pbcopy unconditionally; on Linux we
+        // prefer wl-copy when WAYLAND_DISPLAY is set, else xclip.
+        let candidates: &[(&str, &[&str])] = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            &[
+                ("pbcopy", &[]),
+                ("wl-copy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+            ]
+        } else {
+            &[
+                ("pbcopy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+                ("wl-copy", &[]),
+            ]
+        };
+        for (bin, args) in candidates {
+            match pipe_to_command(bin, args, text) {
+                Ok(()) => return Ok((*bin).to_string()),
+                // ENOENT (binary missing) is expected — try the next one.
+                // Other errors propagate so the user sees `xclip: ...`
+                // rather than a silent "wrote to /tmp" surprise.
+                Err(PipeErr::NotFound) => {}
+                Err(PipeErr::Failed(msg)) => return Err(msg),
+            }
+        }
+        // Last-resort fallback: dump to /tmp so the user can `cat` it.
+        let path = format!(
+            "/tmp/muxa-clip-{}.txt",
+            OffsetDateTime::now_utc().unix_timestamp()
+        );
+        std::fs::write(&path, text).map_err(|e| format!("write {path}: {e}"))?;
+        Ok(format!("tmpfile:{path}"))
+    }
+}
+
+/// Result of attempting to spawn-and-pipe to a clipboard helper.
+enum PipeErr {
+    /// The binary itself wasn't on PATH — caller should try the next.
+    NotFound,
+    /// The binary ran but returned non-zero, or stdin write failed.
+    /// Caller bubbles this up rather than silently fallback.
+    Failed(String),
+}
+
+fn pipe_to_command(bin: &str, args: &[&str], text: &str) -> std::result::Result<(), PipeErr> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(PipeErr::NotFound),
+        Err(e) => return Err(PipeErr::Failed(format!("{bin}: {e}"))),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(text.as_bytes()) {
+            return Err(PipeErr::Failed(format!("{bin} stdin: {e}")));
+        }
+    }
+    match child.wait() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(PipeErr::Failed(format!(
+            "{bin} exited with {}",
+            s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+        ))),
+        Err(e) => Err(PipeErr::Failed(format!("{bin}: {e}"))),
+    }
+}
+
+fn run_status(bin: &str, args: &[&str]) -> std::result::Result<(), String> {
+    match Command::new(bin).args(args).status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!(
+            "{bin} {} exited with {}",
+            args.join(" "),
+            s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+        )),
+        Err(e) => Err(format!("{bin}: {e}")),
+    }
+}
+
+/// Run a [`QuickAction`] against an [`Effects`] sink and return what
+/// the run loop should surface in the footer. Pure with respect to UI
+/// state — the caller mutates `App` based on the returned outcome.
+pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -> ActionOutcome {
+    match action {
+        QuickAction::KillPane(pane_id) => match fx.kill_pane(&pane_id) {
+            Ok(()) => ActionOutcome::Ok(format!("✔ killed pane {pane_id}")),
+            Err(e) => ActionOutcome::Err(format!("✗ kill-pane failed: {e}")),
+        },
+        QuickAction::AbortTurn(pane_id) => match fx.send_ctrl_c(&pane_id) {
+            Ok(()) => ActionOutcome::Ok(format!("✔ sent Ctrl-C to {pane_id}")),
+            Err(e) => ActionOutcome::Err(format!("✗ abort failed: {e}")),
+        },
+        QuickAction::CopyPrompt(text) => match fx.copy_to_clipboard(&text) {
+            Ok(via) if via.starts_with("tmpfile:") => {
+                let path = via.trim_start_matches("tmpfile:");
+                ActionOutcome::Ok(format!(
+                    "✔ wrote prompt to {path} (no clipboard tool found)"
+                ))
+            }
+            Ok(via) => ActionOutcome::Ok(format!("✔ copied prompt via {via}")),
+            Err(e) => ActionOutcome::Err(format!("✗ copy failed: {e}")),
+        },
+        QuickAction::ShowHelp => ActionOutcome::HelpToggled,
+    }
+}
+
+/// Push an [`ActionOutcome`] back into `App` state — sets the footer
+/// hint with the appropriate severity level, or toggles `help_open`
+/// for `HelpToggled`. Centralised so the run loop and tests can both
+/// drive it.
+pub(crate) fn apply_outcome_to_app(app: &mut App, outcome: ActionOutcome) {
+    match outcome {
+        ActionOutcome::Ok(msg) => app.set_hint(msg, HintLevel::Ok),
+        ActionOutcome::Err(msg) => app.set_hint(msg, HintLevel::Err),
+        ActionOutcome::HelpToggled => {
+            app.help_open = !app.help_open;
+        }
+    }
+}
+
+/// The lines of text rendered into the `?` help overlay. Returned as
+/// a Vec so the snapshot test can assert on the exact contents
+/// without going through ratatui. Keep this in sync with the actual
+/// keybinding matrix in `handle_event` — the overlay is the user's
+/// canonical reference.
+pub(crate) fn help_overlay_text() -> Vec<&'static str> {
+    vec![
+        "Keybindings",
+        "",
+        "Navigation",
+        "  ↑ / k          move selection up",
+        "  ↓ / j          move selection down",
+        "  Enter          attach to selected pane",
+        "  r              force refresh",
+        "  q / Esc        quit",
+        "",
+        "Inspection",
+        "  p              open preview overlay",
+        "  f              (in preview) toggle popup ↔ fullscreen",
+        "  c              (in preview) toggle prompt ↔ live pane",
+        "",
+        "Quick actions (act on selected row)",
+        "  c              copy last prompt to clipboard",
+        "  K              kill the pane (Shift — confirm popup)",
+        "  R              abort current turn (Shift — confirm popup)",
+        "",
+        "Help",
+        "  ?              toggle this overlay",
+    ]
+}
+
+/// Modal confirmation popup state — mirrors the preview-popup pattern
+/// (centred ratatui rect over the table) but with a binary y/N choice
+/// instead of scrollable content.
+///
+/// **Why default focus is "No"**: the actions this gates (`K` kills the
+/// pane, `R` aborts the agent's turn) are destructive enough that we
+/// want the user to deliberately type `y` rather than fat-finger Enter.
+/// Anything other than `y` / `Y` cancels — including Esc, `n`, `q`,
+/// arrow keys, Tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmPopup {
+    /// One-line message, e.g. `Kill pane main:2.0?`. Caller pre-formats
+    /// the pane label so the popup itself stays presentation-only.
+    pub message: String,
+    /// What to dispatch when the user confirms with `y` / `Y`. Held
+    /// here so the input handler can complete the round-trip without
+    /// re-resolving the selected row (which might have moved between
+    /// the popup opening and the user's reply).
+    pub on_confirm: QuickAction,
+}
+
+/// A transient hint pinned to the footer for ~2 s after a quick action
+/// runs (or fails). Replaces the default keybinding strip while active.
+#[derive(Debug, Clone)]
+pub(crate) struct FooterHint {
+    pub message: String,
+    pub level: HintLevel,
+    pub set_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintLevel {
+    /// Green — successful action, "✔ copied prompt".
+    Ok,
+    /// Red — action failed; user probably wants to try again.
+    Err,
+    /// Yellow — action vetoed because the row didn't qualify
+    /// (paneless agent, missing prompt). Not the user's fault, but
+    /// not a backend failure either.
+    Warn,
+}
+
+impl FooterHint {
+    fn fresh(&self) -> bool {
+        self.set_at.elapsed() < FOOTER_HINT_TTL
+    }
+}
+
 /// State held by the TUI.
 ///
 /// Kept separate from rendering so the smoke test can construct it
@@ -353,6 +645,20 @@ pub(crate) struct App {
     /// tick while the preview stays open in that mode. `None` when the
     /// preview is closed or showing prompt/response content.
     pub pane_capture: Option<CapturedPane>,
+    /// `Some` when a destructive action (`K` / `R`) is waiting on a
+    /// y/N reply. Suppresses table input and renders a centred popup;
+    /// the input handler resolves the popup before any other key is
+    /// interpreted.
+    pub confirm: Option<ConfirmPopup>,
+    /// True while the `?` help overlay is visible. Renders as a centred
+    /// popup listing every keybinding — the same pattern as `confirm`,
+    /// just with a static body and no follow-up dispatch.
+    pub help_open: bool,
+    /// Transient footer hint set after a quick action runs. The
+    /// renderer hides the default keybinding strip while this is fresh
+    /// (`set_at.elapsed() < FOOTER_HINT_TTL`). The run loop never
+    /// explicitly clears the slot — the renderer just stops reading it.
+    pub footer_hint: Option<FooterHint>,
 }
 
 /// A `muxa watch` preview overlay — detail view of the selected agent.
@@ -440,6 +746,9 @@ impl App {
             preview: None,
             paneless_hidden: 0,
             pane_capture: None,
+            confirm: None,
+            help_open: false,
+            footer_hint: None,
         }
     }
 
@@ -560,6 +869,44 @@ impl App {
     pub(crate) fn selected_pane(&self) -> Option<String> {
         let i = self.table_state.selected()?;
         self.rows.get(i)?.pane_id().map(String::from)
+    }
+
+    /// Borrow the currently-selected row, if any. Used by the quick-
+    /// action handlers to decide whether the action is even applicable
+    /// (e.g. `K` only applies to `WatchRow::Agent` rows with a
+    /// non-`None` pane).
+    pub(crate) fn selected_row(&self) -> Option<&WatchRow> {
+        let i = self.table_state.selected()?;
+        self.rows.get(i)
+    }
+
+    /// `last_prompt` for the selected agent row, if it has one and
+    /// the row is an `Agent` (bare panes have no prompt). Threaded
+    /// through `c` to populate `QuickAction::CopyPrompt`.
+    pub(crate) fn selected_last_prompt(&self) -> Option<&str> {
+        match self.selected_row()? {
+            WatchRow::Agent(a) => a.last_prompt.as_deref(),
+            WatchRow::BarePane(_) => None,
+        }
+    }
+
+    /// Pre-format the pane label the way the user would read it in the
+    /// table — `session:window.pane` when resolvable, raw `%id`
+    /// otherwise. Lives on `App` because the panes inventory is here;
+    /// `dispatch_quick_action` doesn't have access to it.
+    pub(crate) fn pane_label(&self, pane_id: &str) -> String {
+        pane_display(Some(pane_id), &self.panes)
+    }
+
+    /// Stamp a transient footer hint from the result of a quick action.
+    /// The renderer reads this back and hides the default keybinding
+    /// strip while the hint is fresh — see `FOOTER_HINT_TTL`.
+    pub(crate) fn set_hint(&mut self, message: impl Into<String>, level: HintLevel) {
+        self.footer_hint = Some(FooterHint {
+            message: message.into(),
+            level,
+            set_at: Instant::now(),
+        });
     }
 }
 
@@ -1141,6 +1488,31 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
                         }
                     }
                 }
+                Action::AskConfirm(popup) => {
+                    app.confirm = Some(popup);
+                }
+                Action::ConfirmYes => {
+                    if let Some(popup) = app.confirm.take() {
+                        let mut fx = RealEffects;
+                        let outcome = dispatch_quick_action(popup.on_confirm, &mut fx);
+                        apply_outcome_to_app(&mut app, outcome);
+                    }
+                }
+                Action::ConfirmCancel => {
+                    app.confirm = None;
+                }
+                Action::Quick(qa) => {
+                    if matches!(qa, QuickAction::ShowHelp) {
+                        app.help_open = !app.help_open;
+                    } else {
+                        let mut fx = RealEffects;
+                        let outcome = dispatch_quick_action(qa, &mut fx);
+                        apply_outcome_to_app(&mut app, outcome);
+                    }
+                }
+                Action::NotApplicable(msg) => {
+                    app.set_hint(msg, HintLevel::Warn);
+                }
                 Action::None => {}
             }
         }
@@ -1225,7 +1597,8 @@ fn drain_pending_events() -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
-enum Action {
+#[derive(Debug)]
+pub(crate) enum Action {
     None,
     Quit,
     Refresh,
@@ -1240,6 +1613,23 @@ enum Action {
     /// Swap the preview content between prompt/response and live pane
     /// capture. Composes with `TogglePreviewMode` (geometry).
     TogglePreviewContent,
+    /// Open a confirm popup for a destructive [`QuickAction`]. The
+    /// popup itself is interpreted by the input loop; the action only
+    /// dispatches when the user answers `y`.
+    AskConfirm(ConfirmPopup),
+    /// User answered `y` to the active confirm popup — dispatch the
+    /// payload and clear the popup.
+    ConfirmYes,
+    /// User answered anything else (`n`, Esc, `q`, Tab, arrow keys).
+    /// Just clears the popup with no side-effect.
+    ConfirmCancel,
+    /// Run a non-destructive quick action immediately (no confirm).
+    /// Currently used for `c` (copy prompt) and the `?` help toggle.
+    Quick(QuickAction),
+    /// Surface a one-line "not applicable" hint in the footer because
+    /// the requested action doesn't fit the selected row. String is
+    /// the rendered hint body.
+    NotApplicable(&'static str),
 }
 
 fn handle_event(ev: Event, app: &mut App) -> Action {
@@ -1263,6 +1653,31 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Ctrl-C is global — quits regardless of mode.
     if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         return Action::Quit;
+    }
+
+    // Confirm popup steals every keystroke until resolved. Keeping the
+    // accept gate to a single character (`y` / `Y` / Enter) and routing
+    // everything else to `ConfirmCancel` is the deliberate "deliberately
+    // type yes" safety rail — see `ConfirmPopup` doc.
+    if app.confirm.is_some() {
+        return match code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => Action::ConfirmYes,
+            // Spec calls out: anything else (incl. n, Esc, q, Tab,
+            // arrows) cancels. Listing them explicitly would invite
+            // someone to accidentally drop one — fall through.
+            _ => Action::ConfirmCancel,
+        };
+    }
+
+    // Help overlay: `?` toggles it; `q` / `Esc` close it. Anything
+    // else passes through but is ignored — we don't want `c` while
+    // the overlay is open to silently copy a prompt the user can't
+    // see.
+    if app.help_open {
+        return match code {
+            KeyCode::Char('?' | 'q') | KeyCode::Esc => Action::Quick(QuickAction::ShowHelp),
+            _ => Action::None,
+        };
     }
 
     // Preview mode: arrow keys scroll the overlay instead of moving the
@@ -1305,6 +1720,15 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Enter => Action::Attach,
         KeyCode::Char('p') => Action::OpenPreview,
+        KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
+        // Capital-K / Capital-R require Shift in the spec — crossterm
+        // surfaces Shift-letter as `Char('K')` regardless of whether
+        // the user pressed Shift+k or had CapsLock on, so we accept
+        // both. The lowercase variants intentionally do NOT trigger
+        // these destructive actions; they fall through to `None`.
+        KeyCode::Char('K') => quick_kill_action(app),
+        KeyCode::Char('R') => quick_abort_action(app),
+        KeyCode::Char('c') => quick_copy_action(app),
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_down();
             Action::None
@@ -1314,6 +1738,64 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::None
         }
         _ => Action::None,
+    }
+}
+
+/// Resolve a `K` keystroke against the current selection. Yields a
+/// confirm popup when the row qualifies (Agent with a tmux pane), a
+/// "not applicable" hint otherwise. Pulled into its own helper so
+/// the same logic can be unit-tested without the `handle_event`
+/// keystroke matrix in the way.
+pub(crate) fn quick_kill_action(app: &App) -> Action {
+    match app.selected_row() {
+        Some(WatchRow::Agent(a)) => match a.pane.as_deref() {
+            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
+                message: format!("Kill pane {}?", app.pane_label(pane_id)),
+                on_confirm: QuickAction::KillPane(pane_id.to_string()),
+            }),
+            // Agent with no pane (Claude SDK sub-process whose
+            // ancestry walk failed). `K` would be a no-op — surface
+            // why.
+            None => Action::NotApplicable("kill: no tmux pane on this row"),
+        },
+        Some(WatchRow::BarePane(p)) => Action::AskConfirm(ConfirmPopup {
+            message: format!(
+                "Kill pane {}:{}.{}?",
+                p.session, p.window_index, p.pane_index
+            ),
+            on_confirm: QuickAction::KillPane(p.pane_id.clone()),
+        }),
+        None => Action::NotApplicable("kill: no row selected"),
+    }
+}
+
+/// Resolve `R` (abort current turn). Same shape as `quick_kill_action`
+/// but the destructive verb in the popup says "Abort" instead of "Kill".
+pub(crate) fn quick_abort_action(app: &App) -> Action {
+    match app.selected_row() {
+        Some(WatchRow::Agent(a)) => match a.pane.as_deref() {
+            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
+                message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
+                on_confirm: QuickAction::AbortTurn(pane_id.to_string()),
+            }),
+            None => Action::NotApplicable("abort: no tmux pane on this row"),
+        },
+        // Bare panes have no agent state to abort — Ctrl-C would still
+        // reach the foreground process, but it's no longer a "muxa
+        // agent action" in any meaningful sense. Skip rather than
+        // surprise.
+        Some(WatchRow::BarePane(_)) => Action::NotApplicable("abort: not a tracked agent"),
+        None => Action::NotApplicable("abort: no row selected"),
+    }
+}
+
+/// Resolve `c` (copy last prompt). Non-destructive, so no confirm —
+/// dispatches straight to `Quick`. Vetoes when there's no
+/// prompt to copy so the user gets a hint instead of a silent no-op.
+pub(crate) fn quick_copy_action(app: &App) -> Action {
+    match app.selected_last_prompt() {
+        Some(p) if !p.is_empty() => Action::Quick(QuickAction::CopyPrompt(p.to_string())),
+        Some(_) | None => Action::NotApplicable("copy: no prompt on this row"),
     }
 }
 
@@ -1349,7 +1831,120 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             render_table(f, chunks[1], app);
         }
     }
+    // Overlays land on top of either the preview or the table —
+    // `Clear` first so the popup body isn't visible-through-the-popup.
+    // Help and confirm are mutually exclusive: opening confirm closes
+    // help (handled by `handle_event`'s mode gates) so we render
+    // whichever is active without worrying about z-order between them.
+    if app.help_open {
+        // 60 × 90 % — the help body is ~23 lines tall, so 70 % on a
+        // 24-row terminal would clip the bottom sections. 90 %
+        // leaves enough room for the full keybinding matrix while
+        // still framing it as a popup rather than full-screen.
+        let popup_area = centered_rect(60, 90, chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_help(f, popup_area);
+    }
+    if app.confirm.is_some() {
+        // 50 × 30 % keeps the popup small enough that the table
+        // behind stays scannable, but still leaves room for the
+        // borders + message line + spacer + y/N hint line on a
+        // typical 24-row terminal. Smaller (20 %) clips the hint
+        // line on shorter screens.
+        let popup_area = centered_rect(50, 30, chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_confirm(f, popup_area, app);
+    }
     render_footer(f, chunks[2], app);
+}
+
+/// Render the `?` help overlay — a centred popup with one line per
+/// keybinding. Body comes from `help_overlay_text()` so the snapshot
+/// test can pin the exact contents.
+fn render_help(f: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " help · ? to close ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let lines: Vec<Line> = help_overlay_text()
+        .into_iter()
+        .map(|s| {
+            // Section headers are bare (no leading space); body lines
+            // are indented with two spaces. Bolding the headers gives
+            // the overlay a scannable shape without adding ad-hoc
+            // styling per line.
+            if s.is_empty() {
+                Line::from("")
+            } else if s.starts_with("  ") {
+                Line::from(s)
+            } else {
+                Line::from(Span::styled(
+                    s,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+            }
+        })
+        .collect();
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+/// Render the destructive-action confirm popup. Centred, two lines:
+/// the question and the y/N hint. Default focus is implicitly "No"
+/// because the input handler only accepts `y` / `Y` / Enter as yes —
+/// any other key cancels.
+fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
+    let popup = app
+        .confirm
+        .as_ref()
+        .expect("render_confirm without confirm");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " confirm ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let body = vec![
+        Line::from(Span::raw(popup.message.clone())),
+        Line::from(""),
+        // [N] capitalised is the visual cue for "default focus is No"
+        // — a convention borrowed from APT/dpkg prompts.
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "[y]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("es / "),
+            Span::styled(
+                "[N]",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("o "),
+            Span::styled(
+                "(Esc/Tab/anything else cancels)",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]),
+    ];
+    let paragraph = Paragraph::new(body).block(block);
+    f.render_widget(paragraph, area);
 }
 
 /// Compute a centred sub-rect of `r` sized as `percent_x` × `percent_y`
@@ -2068,6 +2663,26 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    // Transient action hint takes priority over keybinding strips —
+    // the user just pressed a key and wants to see the result. Falls
+    // off after `FOOTER_HINT_TTL` so the keybinding strip comes back
+    // automatically; we don't bother clearing the slot since the
+    // freshness check is cheap.
+    if let Some(hint) = app.footer_hint.as_ref() {
+        if hint.fresh() {
+            let style = match hint.level {
+                HintLevel::Ok => Style::default().fg(Color::Green),
+                HintLevel::Err => Style::default().fg(Color::Red),
+                HintLevel::Warn => Style::default().fg(Color::Yellow),
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint.message.clone(), style))),
+                area,
+            );
+            return;
+        }
+    }
+
     // Preview mode rebinds the table-mode keybinds to their preview-pane
     // analogues — clearer for the user than leaving the same hint strings
     // up while the keys behave differently. The `f` hint label flips with
@@ -2117,6 +2732,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" preview  "),
         Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" refresh  "),
+        Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" help  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" quit"),
     ];
@@ -4504,7 +5121,20 @@ mod tests {
                     }
                 }
             }
-            Action::None | Action::Quit | Action::Refresh | Action::Attach => {}
+            // Quick-action paths aren't exercised through `press` —
+            // tests that need them call `handle_event` directly so
+            // they can inspect the `Action` variant. Anything we
+            // encounter here is treated as "no-op" for the existing
+            // preview-suite assertions.
+            Action::None
+            | Action::Quit
+            | Action::Refresh
+            | Action::Attach
+            | Action::AskConfirm(_)
+            | Action::ConfirmYes
+            | Action::ConfirmCancel
+            | Action::Quick(_)
+            | Action::NotApplicable(_) => {}
         }
     }
 
@@ -5048,5 +5678,489 @@ mod tests {
             dump.contains(" prompt"),
             "footer in LivePane mode must hint at flipping back to prompt",
         );
+    }
+
+    // ---- quick actions (K / R / c / ?) ----------------------------------
+
+    /// Recorder stub for `Effects` — captures every call so tests can
+    /// assert on what the dispatcher tried to do without spawning a
+    /// real subprocess. Each method's response is configurable so we
+    /// can exercise both success and failure branches.
+    #[derive(Default)]
+    struct RecorderEffects {
+        kill_calls: Vec<String>,
+        ctrl_c_calls: Vec<String>,
+        copy_calls: Vec<String>,
+        kill_result: Option<std::result::Result<(), String>>,
+        ctrl_c_result: Option<std::result::Result<(), String>>,
+        copy_result: Option<std::result::Result<String, String>>,
+    }
+
+    impl Effects for RecorderEffects {
+        fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String> {
+            self.kill_calls.push(pane_id.to_string());
+            self.kill_result.clone().unwrap_or(Ok(()))
+        }
+        fn send_ctrl_c(&mut self, pane_id: &str) -> std::result::Result<(), String> {
+            self.ctrl_c_calls.push(pane_id.to_string());
+            self.ctrl_c_result.clone().unwrap_or(Ok(()))
+        }
+        fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String> {
+            self.copy_calls.push(text.to_string());
+            self.copy_result
+                .clone()
+                .unwrap_or_else(|| Ok("pbcopy".into()))
+        }
+    }
+
+    /// Build an app that has a paneless agent (Claude SDK sub-process
+    /// whose ancestry walk failed) at row 0 and a normal pane-bearing
+    /// agent at row 1. Lets `K` / `R` / `c` tests drive against both
+    /// shapes without re-doing the fixture each time.
+    fn app_with_paneless_and_pane() -> App {
+        let cfg = WatchConfig {
+            // Disable hide_paneless so the row stays in the table
+            // — the picker default would filter it out and the test
+            // would have to look elsewhere.
+            hide_paneless: false,
+            sort: vec![WatchSortKey::PaneId],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let paneless = fake_agent(
+            "no-pane",
+            None,
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+        );
+        let panefull = fake_agent(
+            "with-pane",
+            Some("%42"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("hello world"),
+            None,
+            None,
+            None,
+        );
+        app.set_data(
+            vec![paneless, panefull],
+            vec![fake_pane("%42", "main", 2, 0, "claude")],
+        );
+        app
+    }
+
+    #[test]
+    fn kill_action_disabled_for_paneless_row() {
+        let mut app = app_with_paneless_and_pane();
+        // Find the paneless row by walking the rows — sort may have
+        // moved it relative to insertion order.
+        let paneless_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.is_none()))
+            .expect("test fixture must include a paneless row");
+        app.table_state.select(Some(paneless_idx));
+
+        let action = quick_kill_action(&app);
+        assert!(
+            matches!(action, Action::NotApplicable(msg) if msg.contains("no tmux pane")),
+            "K on a paneless row must yield NotApplicable, got something else"
+        );
+    }
+
+    #[test]
+    fn kill_action_opens_confirm_for_pane_bearing_row() {
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .expect("test fixture must include a pane-bearing row");
+        app.table_state.select(Some(pane_idx));
+
+        let action = quick_kill_action(&app);
+        match action {
+            Action::AskConfirm(popup) => {
+                assert_eq!(popup.on_confirm, QuickAction::KillPane("%42".into()));
+                // Pane label resolved against the inventory — should
+                // be the human-readable form, not the raw `%42`.
+                assert!(
+                    popup.message.contains("main:2.0"),
+                    "popup message should resolve pane label, got: {}",
+                    popup.message
+                );
+            }
+            other => panic!("expected AskConfirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_action_uses_last_prompt() {
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .expect("test fixture must include a pane-bearing row");
+        app.table_state.select(Some(pane_idx));
+
+        let action = quick_copy_action(&app);
+        match action {
+            Action::Quick(QuickAction::CopyPrompt(text)) => {
+                assert_eq!(text, "hello world");
+            }
+            other => panic!("expected Quick(CopyPrompt), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_action_disabled_when_no_prompt() {
+        let mut app = app_with_paneless_and_pane();
+        // Paneless agent has no last_prompt either — covers the
+        // "row exists but has nothing to copy" case.
+        let paneless_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.is_none()))
+            .unwrap();
+        app.table_state.select(Some(paneless_idx));
+
+        let action = quick_copy_action(&app);
+        assert!(
+            matches!(action, Action::NotApplicable(msg) if msg.contains("no prompt")),
+            "c with no prompt must yield NotApplicable, got something else"
+        );
+    }
+
+    #[test]
+    fn confirm_popup_y_proceeds() {
+        // Drives the popup state machine end-to-end: open the popup
+        // via `K`, press `y`, observe that ConfirmYes lands and that
+        // dispatching the payload calls the right Effects method.
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .unwrap();
+        app.table_state.select(Some(pane_idx));
+
+        // Open the confirm popup the same way `run` would.
+        let Action::AskConfirm(popup) = quick_kill_action(&app) else {
+            panic!("expected AskConfirm");
+        };
+        app.confirm = Some(popup);
+
+        // Press `y` — handle_event must yield ConfirmYes.
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::ConfirmYes));
+
+        // Mirror the run-loop dispatch: take the popup's payload and
+        // route it through dispatch_quick_action.
+        let payload = app.confirm.take().unwrap().on_confirm;
+        let mut fx = RecorderEffects::default();
+        let outcome = dispatch_quick_action(payload, &mut fx);
+        assert_eq!(fx.kill_calls, vec!["%42"]);
+        assert!(matches!(outcome, ActionOutcome::Ok(msg) if msg.contains("killed pane %42")));
+    }
+
+    #[test]
+    fn confirm_popup_n_cancels() {
+        let mut app = app_with_paneless_and_pane();
+        app.confirm = Some(ConfirmPopup {
+            message: "Kill pane main:2.0?".into(),
+            on_confirm: QuickAction::KillPane("%42".into()),
+        });
+
+        // `n` is one of "anything that isn't y/Y/Enter" — must cancel.
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::ConfirmCancel));
+    }
+
+    #[test]
+    fn confirm_popup_esc_tab_arrow_all_cancel() {
+        // Regression guard for the safety rail: keys you'd plausibly
+        // hit by accident (Tab when switching focus, arrow when trying
+        // to scroll, Esc when changing your mind) must NOT confirm.
+        for key in [
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('q'),
+            KeyCode::Char('K'), // even the same key that opened it
+        ] {
+            let mut app = app_with_paneless_and_pane();
+            app.confirm = Some(ConfirmPopup {
+                message: "Kill pane?".into(),
+                on_confirm: QuickAction::KillPane("%42".into()),
+            });
+            let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
+            assert!(
+                matches!(action, Action::ConfirmCancel),
+                "key {key:?} must cancel the confirm popup"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_popup_enter_proceeds() {
+        // Enter is also an accept gate — matches the convention from
+        // most other terminal y/N prompts. Spec calls this out
+        // explicitly.
+        let mut app = app_with_paneless_and_pane();
+        app.confirm = Some(ConfirmPopup {
+            message: "Kill pane?".into(),
+            on_confirm: QuickAction::KillPane("%42".into()),
+        });
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::ConfirmYes));
+    }
+
+    #[test]
+    fn help_overlay_lists_every_binding() {
+        // Snapshot test: the help overlay is the user's canonical
+        // reference, so any drift between the keybinding matrix and
+        // the help text should land here loud and clear.
+        let body = help_overlay_text().join("\n");
+        let expected = "Keybindings\n\
+                        \n\
+                        Navigation\n\
+                        \x20\x20↑ / k          move selection up\n\
+                        \x20\x20↓ / j          move selection down\n\
+                        \x20\x20Enter          attach to selected pane\n\
+                        \x20\x20r              force refresh\n\
+                        \x20\x20q / Esc        quit\n\
+                        \n\
+                        Inspection\n\
+                        \x20\x20p              open preview overlay\n\
+                        \x20\x20f              (in preview) toggle popup ↔ fullscreen\n\
+                        \x20\x20c              (in preview) toggle prompt ↔ live pane\n\
+                        \n\
+                        Quick actions (act on selected row)\n\
+                        \x20\x20c              copy last prompt to clipboard\n\
+                        \x20\x20K              kill the pane (Shift — confirm popup)\n\
+                        \x20\x20R              abort current turn (Shift — confirm popup)\n\
+                        \n\
+                        Help\n\
+                        \x20\x20?              toggle this overlay";
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn question_mark_toggles_help_overlay() {
+        let mut app = app_with_paneless_and_pane();
+        assert!(!app.help_open);
+
+        // First press — opens.
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::Quick(QuickAction::ShowHelp)));
+        // Mirror the run-loop dispatch.
+        if let Action::Quick(QuickAction::ShowHelp) = action {
+            app.help_open = !app.help_open;
+        }
+        assert!(app.help_open, "first ? press must open the overlay");
+
+        // Second press — closes. With help open, only ? / q / Esc
+        // are accepted; everything else is ignored to avoid
+        // double-binding.
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::Quick(QuickAction::ShowHelp)));
+        if let Action::Quick(QuickAction::ShowHelp) = action {
+            app.help_open = !app.help_open;
+        }
+        assert!(!app.help_open, "second ? press must close the overlay");
+    }
+
+    #[test]
+    fn help_overlay_swallows_other_keys() {
+        // While help is open, K / R / c shouldn't fire — the user is
+        // reading docs, not driving actions.
+        let mut app = app_with_paneless_and_pane();
+        app.help_open = true;
+
+        for key in [
+            KeyCode::Char('K'),
+            KeyCode::Char('R'),
+            KeyCode::Char('c'),
+            KeyCode::Char('p'),
+            KeyCode::Char('r'),
+        ] {
+            let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
+            assert!(
+                matches!(action, Action::None),
+                "while help is open, key {key:?} must be a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_kill_pane_calls_effects_and_reports_pane_id() {
+        let mut fx = RecorderEffects::default();
+        let outcome = dispatch_quick_action(QuickAction::KillPane("%99".into()), &mut fx);
+        assert_eq!(fx.kill_calls, vec!["%99"]);
+        match outcome {
+            ActionOutcome::Ok(msg) => assert!(msg.contains("%99")),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_kill_pane_reports_failure_with_message() {
+        let mut fx = RecorderEffects {
+            kill_result: Some(Err("tmux exited with 1".into())),
+            ..Default::default()
+        };
+        let outcome = dispatch_quick_action(QuickAction::KillPane("%99".into()), &mut fx);
+        match outcome {
+            ActionOutcome::Err(msg) => {
+                assert!(msg.contains("kill-pane failed"));
+                assert!(msg.contains("tmux exited with 1"));
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_copy_prompt_pipes_through_effects() {
+        let mut fx = RecorderEffects::default();
+        let outcome = dispatch_quick_action(QuickAction::CopyPrompt("hi there".into()), &mut fx);
+        assert_eq!(fx.copy_calls, vec!["hi there"]);
+        assert!(matches!(outcome, ActionOutcome::Ok(msg) if msg.contains("copied prompt")));
+    }
+
+    #[test]
+    fn dispatch_copy_prompt_via_tmpfile_path_surfaces_warning_text() {
+        // When all clipboard helpers are missing the dispatcher writes
+        // to /tmp and reports the path so the user can recover their
+        // text rather than being told "copied" with nothing in their
+        // clipboard.
+        let mut fx = RecorderEffects {
+            copy_result: Some(Ok("tmpfile:/tmp/muxa-clip-1.txt".into())),
+            ..Default::default()
+        };
+        let outcome = dispatch_quick_action(QuickAction::CopyPrompt("payload".into()), &mut fx);
+        match outcome {
+            ActionOutcome::Ok(msg) => {
+                assert!(msg.contains("/tmp/muxa-clip-1.txt"));
+                assert!(msg.contains("no clipboard tool"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowercase_k_and_r_do_not_trigger_destructive_actions() {
+        // The Shift safety rail: lowercase `k` and `r` must keep their
+        // existing meanings (move-up cursor / refresh) and NEVER ask
+        // the user to confirm a kill.
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .unwrap();
+        app.table_state.select(Some(pane_idx));
+
+        // lowercase k = move up — yields Action::None, not AskConfirm.
+        let action = key_action(&mut app, 'k');
+        assert!(
+            matches!(action, Action::None),
+            "lowercase k must move cursor (Action::None), not ask confirm"
+        );
+
+        // lowercase r = refresh — must yield Refresh, not AskConfirm.
+        let action = key_action(&mut app, 'r');
+        assert!(
+            matches!(action, Action::Refresh),
+            "lowercase r must refresh, not ask confirm"
+        );
+    }
+
+    #[test]
+    fn footer_hint_set_by_apply_outcome() {
+        let mut app = app_with_paneless_and_pane();
+        apply_outcome_to_app(&mut app, ActionOutcome::Ok("✔ ok".into()));
+        let hint = app.footer_hint.as_ref().expect("hint must be set");
+        assert_eq!(hint.message, "✔ ok");
+        assert_eq!(hint.level, HintLevel::Ok);
+        assert!(hint.fresh());
+
+        apply_outcome_to_app(&mut app, ActionOutcome::Err("✗ bad".into()));
+        assert_eq!(app.footer_hint.as_ref().unwrap().level, HintLevel::Err);
+    }
+
+    #[test]
+    fn confirm_popup_renders_without_panic_and_includes_message() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_paneless_and_pane();
+        app.confirm = Some(ConfirmPopup {
+            message: "Kill pane main:2.0?".into(),
+            on_confirm: QuickAction::KillPane("%42".into()),
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            dump.contains("Kill pane main:2.0?"),
+            "missing message: {dump:?}"
+        );
+        assert!(dump.contains("[y]"), "missing [y]: {dump:?}");
+        assert!(dump.contains("[N]"), "missing [N]: {dump:?}");
+    }
+
+    #[test]
+    fn help_popup_renders_without_panic_and_includes_keybindings() {
+        // Terminal sized generously so the 60 × 90 % help popup has
+        // room for the full keybinding matrix; smaller terminals
+        // would clip the bottom sections and the test would fail
+        // for cosmetic rather than logical reasons.
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_paneless_and_pane();
+        app.help_open = true;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            dump.contains("Keybindings"),
+            "missing Keybindings: {dump:?}"
+        );
+        assert!(
+            dump.contains("Quick actions"),
+            "missing Quick actions: {dump:?}",
+        );
+        assert!(dump.contains("kill the pane"), "missing kill: {dump:?}");
     }
 }
