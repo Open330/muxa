@@ -74,6 +74,12 @@ pub enum ConfigError {
          not set (no default endpoint by design)"
     )]
     OhMyPromptMissingEndpoint,
+
+    #[error(
+        "sinks.webhook: enabled = true but neither [sinks.webhook].endpoint \
+         nor [sinks.webhook].endpoint_env is set (one of the two is required)"
+    )]
+    WebhookMissingEndpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -102,6 +108,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct SinksConfig {
     pub oh_my_prompt: OhMyPromptToml,
+    pub webhook: WebhookToml,
 }
 
 /// `[sinks.oh_my_prompt]` raw TOML schema. The daemon resolves these
@@ -124,6 +131,36 @@ pub struct OhMyPromptToml {
     pub batch_size: Option<usize>,
     /// Time-based flush interval (ms). Defaults to 5000.
     pub flush_interval_ms: Option<u64>,
+}
+
+/// `[sinks.webhook]` raw TOML schema. The daemon resolves these fields
+/// against env vars + defaults via `WebhookSink::resolve` at startup.
+///
+/// Either `endpoint` (URL inline in TOML) OR `endpoint_env` (name of an
+/// env var holding the URL) is required when `enabled = true`. The
+/// env-var path is preferred for Slack/Discord webhooks because the URL
+/// itself is the secret — committing it to a shared dotfile is a leak.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookToml {
+    pub enabled: Option<bool>,
+    /// Full webhook URL. Mutually-optional with `endpoint_env`; the env
+    /// var wins when both are set.
+    pub endpoint: Option<String>,
+    /// Name of an env var holding the full webhook URL. Set this in
+    /// preference to `endpoint` so the secret URL never lives in TOML.
+    pub endpoint_env: Option<String>,
+    /// Wire-format flavor: `slack` | `discord` | `generic`. Auto-detected
+    /// from the URL when unset.
+    pub flavor: Option<String>,
+    /// State transitions to forward. Defaults to `["WaitingInput",
+    /// "Error"]` — the two states that mean "operator attention needed".
+    /// `PascalCase` or `snake_case` are both accepted at resolve time.
+    pub on_states: Option<Vec<String>>,
+    /// Per-`(kind, session_id, state)` rate-limit window in seconds.
+    /// Defaults to 60. Set to 0 to disable (one notification per
+    /// transition, even if the agent flaps).
+    pub rate_limit_secs: Option<u64>,
 }
 
 /// `[dashboard]` config — the user-facing TOML schema for the dashboard
@@ -429,6 +466,7 @@ impl Config {
     pub fn validate_for_daemon(&self) -> std::result::Result<(), ConfigError> {
         validate_dashboard(&self.dashboard)?;
         validate_oh_my_prompt(&self.sinks.oh_my_prompt)?;
+        validate_webhook(&self.sinks.webhook)?;
         Ok(())
     }
 
@@ -510,6 +548,18 @@ fn validate_oh_my_prompt(cfg: &OhMyPromptToml) -> std::result::Result<(), Config
     }
     if cfg.endpoint.as_deref().is_none_or(str::is_empty) {
         return Err(ConfigError::OhMyPromptMissingEndpoint);
+    }
+    Ok(())
+}
+
+fn validate_webhook(cfg: &WebhookToml) -> std::result::Result<(), ConfigError> {
+    if !cfg.enabled.unwrap_or(false) {
+        return Ok(());
+    }
+    let has_endpoint = cfg.endpoint.as_deref().is_some_and(|s| !s.is_empty());
+    let has_endpoint_env = cfg.endpoint_env.as_deref().is_some_and(|s| !s.is_empty());
+    if !has_endpoint && !has_endpoint_env {
+        return Err(ConfigError::WebhookMissingEndpoint);
     }
     Ok(())
 }
@@ -1201,6 +1251,7 @@ default_content = "nope"
                     enabled: Some(true),
                     ..OhMyPromptToml::default()
                 },
+                ..SinksConfig::default()
             },
             ..Config::default()
         };
@@ -1224,6 +1275,7 @@ default_content = "nope"
                     endpoint: Some("https://example.dev".into()),
                     ..OhMyPromptToml::default()
                 },
+                ..SinksConfig::default()
             },
             ..Config::default()
         };
@@ -1236,6 +1288,94 @@ default_content = "nope"
     fn validate_accepts_disabled_oh_my_prompt_without_endpoint() {
         let cfg = Config::default();
         assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// `[sinks.webhook] enabled = true` with neither endpoint nor
+    /// `endpoint_env` set must fail at load — there is no default URL,
+    /// and a sink that can't deliver alerts is worse than no sink at
+    /// all (operator thinks they're being watched).
+    #[test]
+    fn validate_rejects_webhook_enabled_without_endpoint() {
+        let cfg = Config {
+            sinks: SinksConfig {
+                webhook: WebhookToml {
+                    enabled: Some(true),
+                    ..WebhookToml::default()
+                },
+                ..SinksConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.validate_for_daemon().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::WebhookMissingEndpoint),
+            "got {err:?}",
+        );
+    }
+
+    /// Either `endpoint` or `endpoint_env` is sufficient. We don't
+    /// validate the env var contents here because that's a daemon-runtime
+    /// concern — the env var may be populated only inside the unit
+    /// `Environment=` and the user's interactive shell wouldn't see it.
+    #[test]
+    fn validate_accepts_webhook_with_endpoint() {
+        let cfg = Config {
+            sinks: SinksConfig {
+                webhook: WebhookToml {
+                    enabled: Some(true),
+                    endpoint: Some("https://hooks.slack.com/services/T0/B0/x".into()),
+                    ..WebhookToml::default()
+                },
+                ..SinksConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_webhook_with_endpoint_env_only() {
+        let cfg = Config {
+            sinks: SinksConfig {
+                webhook: WebhookToml {
+                    enabled: Some(true),
+                    endpoint_env: Some("MUXA_SLACK_URL".into()),
+                    ..WebhookToml::default()
+                },
+                ..SinksConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    /// Webhook section parses with the documented field set and
+    /// `deny_unknown_fields` rejects typos.
+    #[test]
+    fn parses_webhook_section() {
+        let toml = r#"
+[sinks.webhook]
+enabled = true
+endpoint = "https://hooks.slack.com/services/T0/B0/x"
+flavor = "slack"
+on_states = ["WaitingInput", "Error"]
+rate_limit_secs = 30
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.sinks.webhook.enabled, Some(true));
+        assert_eq!(cfg.sinks.webhook.flavor.as_deref(), Some("slack"));
+        assert_eq!(cfg.sinks.webhook.rate_limit_secs, Some(30));
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_webhook_section() {
+        let toml = r#"
+[sinks.webhook]
+enabled = true
+endpoint = "https://example.com"
+typoed_field = 1
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     /// CLI commands like `muxa watch` only call `Config::validate()`,
@@ -1259,6 +1399,7 @@ default_content = "nope"
                     enabled: Some(true),
                     ..OhMyPromptToml::default()
                 },
+                ..SinksConfig::default()
             },
             ..Config::default()
         };
