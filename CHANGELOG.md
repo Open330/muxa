@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   muxad — and so logs go to journald rather than `/tmp` — falls back
   to `journalctl --user -u muxad`, printing the exact command in the
   header so users can run it themselves.
+- **`muxa upgrade`** — one-command source-build update flow.
+  Walks up from the cwd to find the muxa source repo, then runs
+  `git pull` → `cargo install --path crates/muxad --locked --force`
+  → `cargo install --path crates/muxa-cli --locked --force` →
+  daemon restart (`launchctl kickstart -k` on macOS,
+  `systemctl --user restart muxad` on Linux, falling back to
+  `pkill -USR1` and a `nohup` respawn) → IPC socket probe to
+  verify the new daemon is responsive. Flags: `--no-pull` builds
+  from the current HEAD, `--no-restart` skips touching the daemon,
+  `--dry-run` prints the plan without doing anything.
 
 ### Fixed
 
