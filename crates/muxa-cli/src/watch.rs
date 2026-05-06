@@ -1164,7 +1164,56 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
     for row in &mut app.rows {
         if let WatchRow::Agent(a) = row {
             if (a.kind, a.session_id.clone()) == key {
-                *a = agent.clone();
+                // Preserve rich optional fields when the incoming push
+                // payload carries None. A Transition broadcast captures
+                // the Agent row exactly as it exists after the event,
+                // but events that don't touch a field leave it at its
+                // current value. The only way the payload has None is
+                // when the row was freshly created (Starting placeholder)
+                // or the event legitimately cleared the field. We
+                // distinguish the two cases by keeping the UI's prior
+                // value when the new one is None — a real clear would
+                // require an explicit Some("") or similar, which no
+                // event produces today.
+                let mut merged = agent.clone();
+                if merged.last_prompt.is_none() {
+                    merged.last_prompt.clone_from(&a.last_prompt);
+                }
+                if merged.last_response.is_none() {
+                    merged.last_response.clone_from(&a.last_response);
+                }
+                if merged.last_notification.is_none() {
+                    merged.last_notification.clone_from(&a.last_notification);
+                }
+                if merged.model.is_none() {
+                    merged.model.clone_from(&a.model);
+                }
+                if merged.context_used_pct.is_none() {
+                    merged.context_used_pct = a.context_used_pct;
+                }
+                if merged.cost_usd.is_none() {
+                    merged.cost_usd = a.cost_usd;
+                }
+                if merged.rate_limit_5h_pct.is_none() {
+                    merged.rate_limit_5h_pct = a.rate_limit_5h_pct;
+                }
+                if merged.rate_limit_5h_resets_at.is_none() {
+                    merged.rate_limit_5h_resets_at = a.rate_limit_5h_resets_at;
+                }
+                if merged.rate_limit_7d_pct.is_none() {
+                    merged.rate_limit_7d_pct = a.rate_limit_7d_pct;
+                }
+                if merged.rate_limit_7d_resets_at.is_none() {
+                    merged.rate_limit_7d_resets_at = a.rate_limit_7d_resets_at;
+                }
+                // NOTE: rate_limited_until, rate_limit_scope, and
+                // rate_limit_source are intentionally NOT merged.
+                // Events like `Started` and `TurnStopped` legitimately
+                // clear these fields (a new session or a successful
+                // turn means the cap is lifted), and preserving the
+                // old values would make the UI show stale rate-limit
+                // badges forever.
+                *a = merged;
                 updated = true;
                 break;
             }
@@ -1188,30 +1237,74 @@ fn apply_full(app: &mut App, full: FullRefresh) {
 
     app.last_error = error;
 
-    // Build a lookup of the previously-known state per
-    // `(kind, session_id)` so the merge can distinguish a genuine
-    // daemon-driven state change from a transient `Starting`
-    // placeholder. Only `WatchRow::Agent` rows carry agent state;
-    // bare panes are reconstructed from the panes inventory each
-    // refresh and don't participate in this merge.
-    let prev_state: HashMap<(AgentKind, String), AgentState> = app
+    // Build a lookup of the previously-known rows so the merge can
+    // distinguish a genuine daemon-driven change from a transient
+    // `Starting` placeholder that also regressed optional fields to
+    // None. Only `WatchRow::Agent` rows participate; bare panes are
+    // reconstructed from the inventory each refresh.
+    let prev_rows: HashMap<(AgentKind, String), &Agent> = app
         .rows
         .iter()
         .filter_map(|row| match row {
-            WatchRow::Agent(a) => Some(((a.kind, a.session_id.clone()), a.state)),
+            WatchRow::Agent(a) => Some(((a.kind, a.session_id.clone()), a)),
             WatchRow::BarePane(_) => None,
         })
         .collect();
 
     for agent in &mut new_agents {
-        if agent.state == AgentState::Starting {
-            if let Some(&prior) = prev_state.get(&(agent.kind, agent.session_id.clone())) {
-                if prior != AgentState::Starting {
-                    // Steady-state row: don't let a transient
-                    // `Starting` placeholder repaint as cyan.
-                    agent.state = prior;
-                }
+        let key = (agent.kind, agent.session_id.clone());
+        if let Some(&prior) = prev_rows.get(&key) {
+            // Anti-flicker: a `Starting` placeholder from a fresh
+            // snapshot must not override a steady state we already
+            // know. This covers the common case where a new store
+            // entry was inserted by an event that doesn't carry an
+            // explicit state transition (e.g. Heartbeat on a row
+            // created via `or_insert_with`).
+            if agent.state == AgentState::Starting && prior.state != AgentState::Starting {
+                agent.state = prior.state;
             }
+            // Anti-data-loss: when the snapshot regresses optional
+            // fields to None (synthetic placeholder, or a snapshot
+            // taken before the event that populated the field),
+            // preserve the richer prior values instead of blanking
+            // them in the UI.
+            if agent.last_prompt.is_none() {
+                agent.last_prompt.clone_from(&prior.last_prompt);
+            }
+            if agent.last_response.is_none() {
+                agent.last_response.clone_from(&prior.last_response);
+            }
+            if agent.last_notification.is_none() {
+                agent.last_notification.clone_from(&prior.last_notification);
+            }
+            if agent.model.is_none() {
+                agent.model.clone_from(&prior.model);
+            }
+            if agent.context_used_pct.is_none() {
+                agent.context_used_pct = prior.context_used_pct;
+            }
+            if agent.cost_usd.is_none() {
+                agent.cost_usd = prior.cost_usd;
+            }
+            if agent.rate_limit_5h_pct.is_none() {
+                agent.rate_limit_5h_pct = prior.rate_limit_5h_pct;
+            }
+            if agent.rate_limit_5h_resets_at.is_none() {
+                agent.rate_limit_5h_resets_at = prior.rate_limit_5h_resets_at;
+            }
+            if agent.rate_limit_7d_pct.is_none() {
+                agent.rate_limit_7d_pct = prior.rate_limit_7d_pct;
+            }
+            if agent.rate_limit_7d_resets_at.is_none() {
+                agent.rate_limit_7d_resets_at = prior.rate_limit_7d_resets_at;
+            }
+            // NOTE: rate_limited_until, rate_limit_scope, and
+            // rate_limit_source are intentionally NOT merged.
+            // Events like `Started` and `TurnStopped` legitimately
+            // clear these fields (a new session or a successful
+            // turn means the cap is lifted), and preserving the
+            // old values would make the UI show stale rate-limit
+            // badges forever.
         }
     }
 
@@ -4788,6 +4881,182 @@ mod tests {
             panic!("expected agent row");
         };
         assert_eq!(a.session_id, "fresh");
+    }
+
+    /// A `SingleAgent` push whose payload carries `last_prompt: None`
+    /// must not wipe the prompt the user already sees. This happens
+    /// when the daemon's broadcast captures a transition that didn't
+    /// touch the prompt field (e.g. `ToolStarted` → `Working`).
+    #[test]
+    fn single_agent_preserves_last_prompt_when_none() {
+        let mut app = App::new();
+        // Seed with a row that has a prompt.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Full(FullRefresh {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Working,
+                    Some("original prompt"),
+                    Some("Opus"),
+                    Some(34.0),
+                    Some(0.12),
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            }),
+        );
+
+        // Push a state-only update (no prompt).
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::SingleAgent(fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None, // last_prompt cleared in payload
+                None,
+                None,
+                None,
+            )),
+        );
+
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        assert_eq!(a.state, AgentState::Idle);
+        assert_eq!(a.last_prompt.as_deref(), Some("original prompt"));
+        // Other optional fields should also survive.
+        assert_eq!(a.model.as_deref(), Some("Opus"));
+        assert_eq!(a.context_used_pct, Some(34.0));
+        assert_eq!(a.cost_usd, Some(0.12));
+    }
+
+    /// A `Full` refresh that carries a `Starting` placeholder with
+    /// `last_prompt: None` must not blank the prompt we already know.
+    /// This is the fallback-tick path (5 s interval) hitting a daemon
+    /// that has a fresh store entry for a pane we've been tracking.
+    #[test]
+    fn apply_full_preserves_last_prompt_on_starting_placeholder() {
+        let mut app = App::new();
+        // First refresh: row is Working with a prompt.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Full(FullRefresh {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Working,
+                    Some("original prompt"),
+                    Some("Sonnet"),
+                    Some(50.0),
+                    Some(0.05),
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            }),
+        );
+
+        // Second refresh: snapshot regressed to Starting + blank optional fields.
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Full(FullRefresh {
+                agents: vec![fake_agent(
+                    "s1",
+                    Some("%1"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Starting,
+                    None,
+                    None,
+                    None,
+                    None,
+                )],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            }),
+        );
+
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        // Anti-flicker: state should stay Working.
+        assert_eq!(a.state, AgentState::Working);
+        // Anti-data-loss: prompt and metadata must survive.
+        assert_eq!(a.last_prompt.as_deref(), Some("original prompt"));
+        assert_eq!(a.model.as_deref(), Some("Sonnet"));
+        assert_eq!(a.context_used_pct, Some(50.0));
+        assert_eq!(a.cost_usd, Some(0.05));
+    }
+
+    /// A `SingleAgent` push whose payload carries cleared
+    /// rate-limit fields (`rate_limited_until`, `rate_limit_scope`,
+    /// `rate_limit_source`) must propagate the clear to the UI. These
+    /// three fields are NOT merge-preserved because events like
+    /// `Started` and `TurnStopped` legitimately clear them — a new
+    /// session or a successful turn means the cap has been lifted.
+    #[test]
+    fn single_agent_propagates_rate_limit_clear() {
+        let mut app = App::new();
+        use muxa::event::{RateLimitScope, RateLimitSource};
+
+        // Seed a row that is currently rate-limited.
+        let mut limited = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Error,
+            Some("prompt"),
+            Some("Opus"),
+            None,
+            None,
+        );
+        limited.rate_limited_until = Some(time::macros::datetime!(2026-05-06 15:00:00 UTC));
+        limited.rate_limit_scope = Some(RateLimitScope::FiveHour);
+        limited.rate_limit_source = Some(RateLimitSource::StopFailure);
+        limited.rate_limit_5h_pct = Some(100.0);
+
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Full(FullRefresh {
+                agents: vec![limited],
+                panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                error: None,
+            }),
+        );
+        assert_eq!(app.rows.len(), 1);
+
+        // Push a transition that clears the cap (e.g. TurnStopped after
+        // a successful turn, or Started for a fresh session).
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::SingleAgent(fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                None, // last_prompt should be preserved
+                None, // model should be preserved
+                None,
+                None,
+            )),
+        );
+
+        let WatchRow::Agent(a) = &app.rows[0] else {
+            panic!("expected agent row");
+        };
+        // Rate-limit markers must be gone.
+        assert!(a.rate_limited_until.is_none(), "rate_limited_until must be cleared");
+        assert!(a.rate_limit_scope.is_none(), "rate_limit_scope must be cleared");
+        assert!(a.rate_limit_source.is_none(), "rate_limit_source must be cleared");
+        // But last_prompt and model should survive (None means "don't touch").
+        assert_eq!(a.last_prompt.as_deref(), Some("prompt"));
+        assert_eq!(a.model.as_deref(), Some("Opus"));
+        // Rolling percentages should also survive (they're not cleared by events).
+        assert_eq!(a.rate_limit_5h_pct, Some(100.0));
     }
 
     // ---- detail row: precise visual layout --------------------------------
