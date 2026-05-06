@@ -119,6 +119,20 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // 5½. MUXA_SOCKET env — the variable that lets every pane agree
+    // on the daemon socket path after a restart.
+    match check_muxa_socket_env() {
+        CheckResult::Ok(msg) => log_ok(&msg),
+        CheckResult::Warn(msg) => {
+            log_warn(&msg);
+            issues += 1;
+        }
+        CheckResult::Fail(msg) => {
+            log_fail(&msg);
+            issues += 1;
+        }
+    }
+
     // 6. Recent muxad errors. These are surfaced as warnings (not
     //    failures) — a stale ERROR line from yesterday shouldn't make
     //    the whole doctor run look red.
@@ -428,6 +442,36 @@ fn check_tmux_blocks() -> CheckResult {
         (false, false) => {
             CheckResult::Fail("tmux: muxa managed blocks missing — run `muxa init`".into())
         }
+    }
+}
+
+/// Confirm that `MUXA_SOCKET` is set in the tmux server environment.
+/// Without it, status-right and new panes may use a stale/default
+/// socket path after muxad restarts, causing heartbeats to miss the
+/// daemon and leaving rows stuck in `Starting`.
+fn check_muxa_socket_env() -> CheckResult {
+    let out = Command::new("tmux")
+        .args(["show-environment", "-g", "MUXA_SOCKET"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let line = String::from_utf8_lossy(&o.stdout);
+            if line.trim().starts_with("MUXA_SOCKET=") {
+                CheckResult::Ok(format!(
+                    "tmux: MUXA_SOCKET={}",
+                    line.trim().strip_prefix("MUXA_SOCKET=").unwrap_or("?")
+                ))
+            } else {
+                CheckResult::Warn(
+                    "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation"
+                        .into(),
+                )
+            }
+        }
+        Ok(_) => CheckResult::Warn(
+            "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation".into(),
+        ),
+        Err(e) => CheckResult::Warn(format!("tmux: could not query environment ({e})")),
     }
 }
 

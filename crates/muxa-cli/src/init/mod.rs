@@ -143,6 +143,26 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let report = apply::run(&plan, false).context("applying plan")?;
     render_apply_steps(mode, &report);
 
+    // Propagate MUXA_SOCKET into the tmux server environment so that
+    // every pane — including the one that runs `muxa status-line` in
+    // `status-right` — uses the same socket path after a daemon restart.
+    // Without this, tmux panes started before `muxad` was first spun up
+    // inherit an empty MUXA_SOCKET and fall back to the default path,
+    // which races when the daemon is restarted on a different socket.
+    if report.tmux_sourced {
+        if let Some(s) = socket.to_str() {
+            let _ = std::process::Command::new("tmux")
+                .args(["set-environment", "-g", "MUXA_SOCKET", s])
+                .status();
+            // Push the new value down to existing panes so the current
+            // session's status-right (and any hook commands) picks it up
+            // immediately without requiring a pane restart.
+            let _ = std::process::Command::new("tmux")
+                .args(["update-environment", "MUXA_SOCKET"])
+                .status();
+        }
+    }
+
     let v = verify::run(&plan, socket).await?;
     let extra = summarize_verify(&v);
     let dashboard = report

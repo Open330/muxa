@@ -14,6 +14,12 @@ bind-key s display-popup -E -w 90% -h 85% "muxa watch""#;
 
 /// The body that goes inside the `tmux-statusline` marker block.
 pub const STATUSLINE_BODY: &str = r##"# Per-pane agent glyph (⚙ working / · idle / ! waiting / ✗ error)
+#
+# NOTE: `muxa init` sets MUXA_SOCKET in the tmux server environment so
+# that every pane — including the one that runs this status-right
+# command — uses the same socket path after a daemon restart. Without
+# it, heartbeats can silently miss the daemon and rows get stuck in
+# `Starting` indefinitely.
 set -g status-interval 2
 set -g status-right-length 140
 set -g status-right "#(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M""##;
