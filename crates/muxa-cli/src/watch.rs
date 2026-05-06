@@ -394,30 +394,79 @@ impl Effects for RealEffects {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String> {
-        // Try the platform-native helper first, then fall back. Order
-        // matters: macOS ships pbcopy unconditionally; on Linux we
-        // prefer wl-copy when WAYLAND_DISPLAY is set, else xclip.
-        let candidates: &[(&str, &[&str])] = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            &[
-                ("pbcopy", &[]),
-                ("wl-copy", &[]),
-                ("xclip", &["-selection", "clipboard"]),
-            ]
-        } else {
-            &[
-                ("pbcopy", &[]),
-                ("xclip", &["-selection", "clipboard"]),
-                ("wl-copy", &[]),
-            ]
-        };
-        for (bin, args) in candidates {
-            match pipe_to_command(bin, args, text) {
-                Ok(()) => return Ok((*bin).to_string()),
-                // ENOENT (binary missing) is expected — try the next one.
-                // Other errors propagate so the user sees `xclip: ...`
-                // rather than a silent "wrote to /tmp" surprise.
-                Err(PipeErr::NotFound) => {}
-                Err(PipeErr::Failed(msg)) => return Err(msg),
+        // Backend priority — first one that's *applicable* and
+        // succeeds wins. We cascade past Failed (not just
+        // NotFound) so an installed-but-broken backend (e.g.
+        // `xclip` present without an X server) doesn't strand the
+        // user; the /tmp fallback at the bottom is the safety
+        // net.
+        //
+        //   1. tmux load-buffer when $TMUX is set — works in pure
+        //      SSH/headless because tmux owns its own paste buffer
+        //      (`prefix + ]`) and on tmux 3.2+ with
+        //      `set -g set-clipboard on` it transparently forwards
+        //      to the host terminal's clipboard via OSC 52. Single
+        //      backend that covers most of the "remote dev" case.
+        //   2. pbcopy on macOS (unconditional — pbcopy is always
+        //      present on Apple shells).
+        //   3. wl-copy when $WAYLAND_DISPLAY is set.
+        //   4. xclip / xsel when $DISPLAY is set. Pre-flight env
+        //      check skips them entirely on headless hosts so we
+        //      don't even produce the misleading "exit 1" the user
+        //      hit before this fix.
+        //   5. /tmp/muxa-clip-<ts>.txt as the last resort.
+        struct Cand<'a> {
+            label: &'a str,
+            bin: &'a str,
+            args: &'a [&'a str],
+            applicable: bool,
+        }
+
+        let in_tmux = std::env::var_os("TMUX").is_some();
+        let in_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let in_x11 = std::env::var_os("DISPLAY").is_some();
+        let candidates: &[Cand] = &[
+            Cand {
+                label: "tmux",
+                bin: "tmux",
+                args: &["load-buffer", "-"],
+                applicable: in_tmux,
+            },
+            Cand {
+                label: "pbcopy",
+                bin: "pbcopy",
+                args: &[],
+                applicable: cfg!(target_os = "macos"),
+            },
+            Cand {
+                label: "wl-copy",
+                bin: "wl-copy",
+                args: &[],
+                applicable: in_wayland,
+            },
+            Cand {
+                label: "xclip",
+                bin: "xclip",
+                args: &["-selection", "clipboard"],
+                applicable: in_x11,
+            },
+            Cand {
+                label: "xsel",
+                bin: "xsel",
+                args: &["--clipboard", "--input"],
+                applicable: in_x11,
+            },
+        ];
+        for c in candidates {
+            if !c.applicable {
+                continue;
+            }
+            // Cascade past Failed AND NotFound — the user never saw
+            // a successful copy, so trying the next backend is
+            // strictly more useful than surfacing one backend's
+            // error.
+            if pipe_to_command(c.bin, c.args, text).is_ok() {
+                return Ok(c.label.to_string());
             }
         }
         // Last-resort fallback: dump to /tmp so the user can `cat` it.
@@ -435,7 +484,11 @@ enum PipeErr {
     /// The binary itself wasn't on PATH — caller should try the next.
     NotFound,
     /// The binary ran but returned non-zero, or stdin write failed.
-    /// Caller bubbles this up rather than silently fallback.
+    /// The String describes the failure for ad-hoc logging; current
+    /// callers cascade past `Failed` to the next backend so the
+    /// payload isn't surfaced anywhere user-visible — but it stays
+    /// for debug traces and future use.
+    #[allow(dead_code)]
     Failed(String),
 }
 
