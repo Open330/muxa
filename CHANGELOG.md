@@ -101,6 +101,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`muxa watch`'s `c` (copy prompt) action now works in headless
+  / remote / tmux sessions.** Previously the priority list
+  (`pbcopy` → `wl-copy` → `xclip`) treated `xclip` as viable
+  whenever the binary was on PATH — which surfaced
+  `xclip exited with 1` on SSH hosts where `$DISPLAY` is unset.
+  Two changes:
+  - **Priority list now leads with `tmux load-buffer`** when
+    `$TMUX` is set. Lands the prompt in tmux's paste buffer
+    (`prefix + ]`); on tmux 3.2+ with `set -g set-clipboard on`
+    it also forwards via OSC 52 to the host terminal's clipboard
+    — single backend covers most of the "remote dev over SSH"
+    case.
+  - **Pre-flight env checks + cascade on failure**: `wl-copy`
+    requires `$WAYLAND_DISPLAY`, `xclip` / `xsel` require
+    `$DISPLAY`. If any backend fails (NotFound or Failed) we move
+    to the next one instead of surfacing the failure. The
+    `/tmp/muxa-clip-<ts>.txt` fallback at the bottom is the
+    safety net.
+  - Added `xsel` as another X11 candidate for users who don't
+    install xclip.
 - **`muxa watch` no longer redraws every row on every transition.**
   v0.5.0's push-based subscribe was only used as a "wake" signal:
   each Transition triggered a fresh `client.snapshot()` call and the
