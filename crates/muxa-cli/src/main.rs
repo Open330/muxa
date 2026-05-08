@@ -593,6 +593,7 @@ fn state_icon(state: AgentState) -> &'static str {
         AgentState::Working => "⚙",
         AgentState::Idle => "·",
         AgentState::WaitingInput => "!",
+        AgentState::WaitingChoice => "?",
         AgentState::Error => "✗",
         AgentState::Stopped => "∅",
         AgentState::Starting => "…",
@@ -603,6 +604,7 @@ fn state_style(state: AgentState) -> Style {
     match state {
         AgentState::Working => Style::new().green(),
         AgentState::WaitingInput => Style::new().yellow(),
+        AgentState::WaitingChoice => Style::new().yellow().bold(),
         AgentState::Idle => Style::new().dimmed(),
         AgentState::Error => Style::new().red(),
         AgentState::Stopped => Style::new().dimmed().strikethrough(),

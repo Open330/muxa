@@ -148,22 +148,30 @@ impl<L: LivenessSource> Reconciler<L> {
                 self.stuck_working_timeout,
             )
             .await;
-        let stuck_wi = self
+        let stuck_input = self
             .store
             .mark_stuck_idle_from(
                 crate::event::AgentState::WaitingInput,
                 self.stuck_waiting_timeout,
             )
             .await;
+        let stuck_choice = self
+            .store
+            .mark_stuck_idle_from(
+                crate::event::AgentState::WaitingChoice,
+                self.stuck_waiting_timeout,
+            )
+            .await;
         if let Some(m) = &self.metrics {
             m.record_reconcile_pass();
         }
-        if stuck_w + stuck_wi > 0 {
+        let stuck_total = stuck_w + stuck_input + stuck_choice;
+        if stuck_total > 0 {
             tracing::info!(
                 working = stuck_w,
-                waiting = stuck_wi,
-                "stuck-state sweep flipped {} agent(s) to Idle",
-                stuck_w + stuck_wi
+                waiting_input = stuck_input,
+                waiting_choice = stuck_choice,
+                "stuck-state sweep flipped {stuck_total} agent(s) to Idle",
             );
         }
         // Always emit the timing line at debug (cheap, off by default)

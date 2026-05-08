@@ -85,8 +85,10 @@ impl Notifier {
 fn should_notify(t: &Transition) -> bool {
     matches!(
         (t.from, t.to),
-        (_, AgentState::WaitingInput | AgentState::Error)
-            | (AgentState::Working, AgentState::Stopped)
+        (
+            _,
+            AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error
+        ) | (AgentState::Working, AgentState::Stopped)
     )
 }
 
@@ -171,6 +173,8 @@ mod tests {
         let cases = [
             (AgentState::Working, AgentState::WaitingInput, true),
             (AgentState::Idle, AgentState::WaitingInput, true),
+            (AgentState::Working, AgentState::WaitingChoice, true),
+            (AgentState::Idle, AgentState::WaitingChoice, true),
             (AgentState::Working, AgentState::Error, true),
             (AgentState::Working, AgentState::Stopped, true),
             // Not attention-worthy:

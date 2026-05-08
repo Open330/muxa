@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 /// when the IPC envelope schema evolves. Pinning to a specific value across
 /// muxa upgrades is not supported; treat it as a runtime negotiation token,
 /// not a stable API constant.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +33,12 @@ pub enum AgentState {
     Working,
     Idle,
     WaitingInput,
+    /// Agent is blocked on a multiple-choice menu (e.g., Claude Code's
+    /// `AskUserQuestion` / `ExitPlanMode`). Distinct from `WaitingInput`
+    /// so the operator can tell at a glance "pick an option" vs
+    /// "type a reply / approve permission". Treated like `WaitingInput`
+    /// for "needs me" purposes (notifications, sink filters).
+    WaitingChoice,
     Error,
     Stopped,
 }
@@ -54,6 +60,10 @@ pub struct AgentId {
 pub enum NotificationLevel {
     Info,
     NeedsInput,
+    /// Like `NeedsInput`, but specifically signals a numbered/menu-style
+    /// prompt rather than free-text or permission yes/no. Routes to
+    /// `AgentState::WaitingChoice`.
+    NeedsChoice,
     Warning,
     Error,
 }

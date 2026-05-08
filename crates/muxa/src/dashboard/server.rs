@@ -302,12 +302,13 @@ async fn agents_by_state_cached(state: &AppState) -> (BTreeMap<String, u64>, u64
     }
     // Ensure every known state appears as an explicit zero so consumers
     // never have to special-case "missing key means zero". Cheap; the
-    // enum has six variants.
+    // enum has seven variants.
     for s in [
         AgentState::Starting,
         AgentState::Working,
         AgentState::Idle,
         AgentState::WaitingInput,
+        AgentState::WaitingChoice,
         AgentState::Error,
         AgentState::Stopped,
     ] {

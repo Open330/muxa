@@ -178,6 +178,7 @@ impl WatchColumn {
                 let style = match a.state {
                     AgentState::Working => Style::default().fg(Color::Green),
                     AgentState::WaitingInput => Style::default().fg(Color::Yellow),
+                    AgentState::WaitingChoice => Style::default().fg(Color::LightYellow),
                     AgentState::Error => Style::default().fg(Color::Red),
                     AgentState::Idle | AgentState::Stopped => Style::default()
                         .fg(Color::DarkGray)
@@ -1121,7 +1122,8 @@ pub(crate) struct FullRefresh {
 /// **Anti-flicker merge invariant** (added 2026-04-30): when a fresh
 /// snapshot lands carrying a row whose state is `Starting` for an
 /// `(kind, session_id)` we already track in a steady state
-/// (`Working` / `Idle` / `WaitingInput` / `Error` / `Stopped`), we
+/// (`Working` / `Idle` / `WaitingInput` / `WaitingChoice` / `Error`
+/// / `Stopped`), we
 /// keep the previously-known state and only adopt the snapshot's
 /// non-state fields (model, cost, `last_prompt`, …). Background:
 ///

@@ -336,6 +336,7 @@ fn parse_state(s: &str) -> Option<AgentState> {
         "Working" | "working" => Some(AgentState::Working),
         "Idle" | "idle" => Some(AgentState::Idle),
         "WaitingInput" | "waiting_input" => Some(AgentState::WaitingInput),
+        "WaitingChoice" | "waiting_choice" => Some(AgentState::WaitingChoice),
         "Error" | "error" => Some(AgentState::Error),
         "Stopped" | "stopped" => Some(AgentState::Stopped),
         _ => {
@@ -349,7 +350,11 @@ fn parse_state(s: &str) -> Option<AgentState> {
 }
 
 fn default_on_states() -> Vec<AgentState> {
-    vec![AgentState::WaitingInput, AgentState::Error]
+    vec![
+        AgentState::WaitingInput,
+        AgentState::WaitingChoice,
+        AgentState::Error,
+    ]
 }
 
 /// Filter predicate. Pulled out as a free function so the unit tests can
@@ -376,6 +381,7 @@ fn format_message(transition: &Transition) -> String {
     let to_glyph = state_glyph(transition.to);
     let tag = match transition.to {
         AgentState::WaitingInput => "needs input",
+        AgentState::WaitingChoice => "needs choice",
         AgentState::Error => "error",
         AgentState::Working => "working",
         AgentState::Idle => "idle",
@@ -412,6 +418,7 @@ fn state_glyph(state: AgentState) -> &'static str {
         AgentState::Working => "⚙",
         AgentState::Idle => "·",
         AgentState::WaitingInput => "!",
+        AgentState::WaitingChoice => "?",
         AgentState::Error => "✗",
         AgentState::Stopped => "■",
     }

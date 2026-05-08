@@ -392,17 +392,22 @@ fn mutate_for_event(
         }
         AgentEvent::ToolCompleted { .. } => {
             // Tool activity proves the agent isn't waiting on the user
-            // any more. Specifically targets two cases:
+            // any more. Specifically targets these cases:
             //   - Codex grants permission, runs the tool, the
             //     completion fires before any TurnStopped does.
-            //   - Claude's `AskUserQuestion` (routed through
-            //     NotificationFired { NeedsInput } in the adapter)
-            //     completes; the user answered.
+            //   - Claude's `AskUserQuestion` / `ExitPlanMode` (routed
+            //     through NotificationFired { NeedsChoice } in the
+            //     adapter, landing the row in WaitingChoice) complete;
+            //     the user picked an option.
+            //   - A free-text Notification prompt cleared.
             // Other states are left alone — Working stays Working,
             // Idle stays Idle (a stray ToolCompleted with no
             // PromptSubmitted before it shouldn't fake activity),
             // Error is preserved.
-            if agent.state == AgentState::WaitingInput {
+            if matches!(
+                agent.state,
+                AgentState::WaitingInput | AgentState::WaitingChoice
+            ) {
                 agent.state = AgentState::Working;
             }
         }
@@ -410,6 +415,7 @@ fn mutate_for_event(
             agent.last_notification = Some(message.clone());
             match level {
                 NotificationLevel::NeedsInput => agent.state = AgentState::WaitingInput,
+                NotificationLevel::NeedsChoice => agent.state = AgentState::WaitingChoice,
                 NotificationLevel::Error => agent.state = AgentState::Error,
                 NotificationLevel::Info | NotificationLevel::Warning => {}
             }
@@ -1092,10 +1098,9 @@ mod tests {
 
     #[tokio::test]
     async fn tool_completed_recovers_from_waiting_input() {
-        // Claude AskUserQuestion scenario: PreToolUse routes through
-        // NotificationFired so the row reads WaitingInput while the
-        // menu is up; the matching PostToolUse → ToolCompleted lands
-        // when the user answers and should flip the row back to
+        // Generic Notification flow (e.g., free-text permission prompt):
+        // NeedsInput lands the row in WaitingInput; the matching
+        // PostToolUse → ToolCompleted should flip the row back to
         // Working.
         let store = Store::shared();
         let now = datetime!(2026-05-05 12:00:00 UTC);
@@ -1130,6 +1135,49 @@ mod tests {
             store.by_session("c").await.unwrap().state,
             AgentState::Working,
             "ToolCompleted should recover WaitingInput → Working"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_completed_recovers_from_waiting_choice() {
+        // Claude AskUserQuestion scenario: PreToolUse routes through
+        // NotificationFired { NeedsChoice } so the row reads
+        // WaitingChoice while the menu is up; the matching PostToolUse
+        // → ToolCompleted lands when the user picks an option and
+        // should flip the row back to Working.
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("c"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("c"),
+                level: NotificationLevel::NeedsChoice,
+                message: "waiting on AskUserQuestion".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::WaitingChoice
+        );
+
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("c"),
+                tool: "AskUserQuestion".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("c").await.unwrap().state,
+            AgentState::Working,
+            "ToolCompleted should recover WaitingChoice → Working"
         );
     }
 

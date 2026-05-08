@@ -211,16 +211,18 @@ impl HookAdapter for ClaudeAdapter {
 
 /// Map a `PreToolUse` hook to the right `AgentEvent`. Most tools
 /// emit `ToolStarted` (state → Working); a small closed-set of
-/// user-blocking tools route through `NotificationFired { NeedsInput }`
-/// so the row reads `WaitingInput` while the menu is up. The
-/// matching `PostToolUse` → `ToolCompleted` recovers the row back
-/// to Working via `state::mutate_for_event`.
+/// user-blocking tools route through `NotificationFired { NeedsChoice }`
+/// so the row reads `WaitingChoice` while the menu is up — both
+/// `AskUserQuestion` and `ExitPlanMode` present numbered/menu UIs,
+/// distinct from a free-text `Notification` prompt. The matching
+/// `PostToolUse` → `ToolCompleted` recovers the row back to Working
+/// via `state::mutate_for_event`.
 fn pre_tool_event(id: AgentId, tool_name: Option<String>, at: OffsetDateTime) -> AgentEvent {
     let tool_name = tool_name.unwrap_or_else(|| "unknown".into());
     if is_user_blocking_tool(&tool_name) {
         AgentEvent::NotificationFired {
             id,
-            level: NotificationLevel::NeedsInput,
+            level: NotificationLevel::NeedsChoice,
             message: format!("waiting on {tool_name}"),
             at,
         }
@@ -371,14 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_for_ask_user_question_emits_needs_input_notification() {
-        // The numbered-menu case the user reported: AskUserQuestion
-        // shouldn't read as Working while the menu is open.
+    fn pre_tool_use_for_ask_user_question_emits_needs_choice_notification() {
+        // The numbered-menu case: AskUserQuestion presents a menu, so
+        // the row should land in WaitingChoice (via NeedsChoice), not
+        // free-text WaitingInput.
         let ev =
             ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("AskUserQuestion"), None);
         match ev {
             AgentEvent::NotificationFired { level, .. } => {
-                assert!(matches!(level, NotificationLevel::NeedsInput));
+                assert!(matches!(level, NotificationLevel::NeedsChoice));
             }
             other => panic!("expected NotificationFired, got {other:?}"),
         }
@@ -390,7 +393,7 @@ mod tests {
         assert!(matches!(
             ev,
             AgentEvent::NotificationFired {
-                level: NotificationLevel::NeedsInput,
+                level: NotificationLevel::NeedsChoice,
                 ..
             }
         ));
