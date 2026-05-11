@@ -10,7 +10,7 @@ use crate::init::detect::Detection;
 use crate::init::files;
 use crate::init::marker::Outcome;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Direction of a plan: install (upsert) or uninstall (remove).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,20 +80,24 @@ impl Plan {
     }
 }
 
-pub fn build(direction: Direction, components: &[Component], detect: &Detection) -> Result<Plan> {
+pub fn build(
+    direction: Direction,
+    components: &[Component],
+    detect: &Detection,
+    socket: &Path,
+) -> Result<Plan> {
     let mut actions = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let comps = components.to_vec();
 
     let tmux_path = files::tmux::default_path();
-    let mut tmux_touched = false;
+    let mut tmux_selected = false;
 
     for c in &comps {
         match c {
             Component::TmuxPopup | Component::TmuxStatusLine => {
-                if plan_tmux(direction, *c, tmux_path.as_ref(), &mut actions)? {
-                    tmux_touched = true;
-                }
+                tmux_selected = true;
+                plan_tmux(direction, *c, tmux_path.as_ref(), &mut actions)?;
             }
             Component::ClaudeHooks => plan_claude(direction, *c, &mut actions, &mut warnings)?,
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
@@ -139,9 +143,16 @@ pub fn build(direction: Direction, components: &[Component], detect: &Detection)
         }
     }
 
-    // Re-source tmux config if we changed it and a tmux server is reachable.
-    if tmux_touched {
+    // Whenever any tmux component is selected, also upsert/remove the
+    // auto-managed `tmux-env` block that pins MUXA_SOCKET. This is the
+    // only path that survives `tmux kill-server` — without it, the
+    // runtime `set-environment` issued at init time is lost the next time
+    // the tmux server restarts and every fresh pane ends up unable to
+    // find muxad. We always include SourceTmuxConf here because the env
+    // block may be brand-new even when popup/statusline are unchanged.
+    if tmux_selected {
         if let Some(path) = tmux_path {
+            plan_tmux_env(direction, &path, socket, &mut actions)?;
             actions.push(Action::SourceTmuxConf { path });
         }
     }
@@ -154,16 +165,57 @@ pub fn build(direction: Direction, components: &[Component], detect: &Detection)
     })
 }
 
-/// Returns `true` if the tmux config was changed (caller appends a
-/// `SourceTmuxConf` action).
+/// Append an `EditFile` for the auto-managed `tmux-env` block. Uses the
+/// `TmuxStatusLine` component slot only as a label/grouping hint — it
+/// isn't user-selectable and doesn't appear in the components catalog.
+fn plan_tmux_env(
+    direction: Direction,
+    tmux_conf: &Path,
+    socket: &Path,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let path = tmux_conf.to_path_buf();
+    // Re-read tmux.conf from disk fresh: an earlier `plan_tmux` action
+    // for popup/statusline only carries its post-edit content in the
+    // `Action`, not on disk. Pulling from disk would race with the
+    // earlier edit when apply.rs runs sequentially. Instead, fold our
+    // change on top of that pending content by replaying the earlier
+    // `EditFile` outputs targeting the same path.
+    let mut latest = read_to_string_opt(&path)?.unwrap_or_default();
+    for action in actions.iter() {
+        if let Action::EditFile {
+            path: p, after, ..
+        } = action
+        {
+            if p == &path {
+                latest = after.clone();
+            }
+        }
+    }
+    let (after, outcome) = match direction {
+        Direction::Install => files::tmux::upsert_env(&latest, socket),
+        Direction::Uninstall => files::tmux::remove_env(&latest),
+    };
+    actions.push(Action::EditFile {
+        // Group under TmuxStatusLine for the dry-run label — the env
+        // pin is conceptually a sibling of the status-right glyph.
+        component: Component::TmuxStatusLine,
+        path,
+        before: Some(latest),
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
 fn plan_tmux(
     direction: Direction,
     c: Component,
     tmux_path: Option<&PathBuf>,
     actions: &mut Vec<Action>,
-) -> Result<bool> {
+) -> Result<()> {
     let Some(path) = tmux_path.cloned() else {
-        return Ok(false);
+        return Ok(());
     };
     let before = read_to_string_opt(&path)?;
     let original = before.clone().unwrap_or_default();
@@ -171,7 +223,6 @@ fn plan_tmux(
         Direction::Install => files::tmux::upsert(&original, c),
         Direction::Uninstall => files::tmux::remove(&original, c),
     };
-    let changed = outcome.changed();
     actions.push(Action::EditFile {
         component: c,
         path,
@@ -179,7 +230,7 @@ fn plan_tmux(
         after,
         outcome,
     });
-    Ok(changed)
+    Ok(())
 }
 
 fn plan_claude(
@@ -375,30 +426,64 @@ mod tests {
     use super::*;
     use crate::init::components::Component;
 
+    fn fake_socket() -> PathBuf {
+        PathBuf::from("/tmp/muxa-test.sock")
+    }
+
     #[test]
     fn empty_components_yields_empty_plan() {
         let d = Detection::default();
-        let plan = build(Direction::Install, &[], &d).unwrap();
+        let plan = build(Direction::Install, &[], &d, &fake_socket()).unwrap();
         assert!(plan.actions.is_empty());
         assert!(!plan.has_changes());
     }
 
     #[test]
-    fn tmux_install_produces_edit_then_source() {
+    fn tmux_install_produces_edit_then_env_then_source() {
         // Detection irrelevant for tmux components — they don't gate on it.
         let d = Detection::default();
-        let plan = build(Direction::Install, &[Component::TmuxPopup], &d).unwrap();
-        // First action is EditFile; if it produced changes, last is SourceTmuxConf.
-        assert!(matches!(
-            plan.actions.first(),
-            Some(Action::EditFile { .. })
-        ));
-        let last = plan.actions.last().unwrap();
-        // SourceTmuxConf appears only if the edit actually changed
-        // something. On systems without ~/.tmux.conf it always does
-        // (file is created).
-        let saw_source = matches!(last, Action::SourceTmuxConf { .. })
-            || matches!(plan.actions.last(), Some(Action::EditFile { .. }));
-        assert!(saw_source);
+        let plan = build(
+            Direction::Install,
+            &[Component::TmuxPopup],
+            &d,
+            &fake_socket(),
+        )
+        .unwrap();
+
+        // Expected action order: popup edit → tmux-env edit → source.
+        // The env edit guarantees socket propagation lands in conf even
+        // when only the popup component was selected.
+        assert!(
+            matches!(plan.actions.first(), Some(Action::EditFile { .. })),
+            "first action must be the popup EditFile"
+        );
+
+        let env_after = plan.actions.iter().any(|a| {
+            matches!(a, Action::EditFile { after, .. } if after.contains("MUXA_SOCKET"))
+        });
+        assert!(
+            env_after,
+            "tmux-env block must be auto-included with any tmux component"
+        );
+
+        assert!(
+            matches!(plan.actions.last(), Some(Action::SourceTmuxConf { .. })),
+            "last action must be SourceTmuxConf so the new env line takes effect live"
+        );
+    }
+
+    #[test]
+    fn tmux_install_pins_provided_socket_path() {
+        let d = Detection::default();
+        let socket = PathBuf::from("/run/user/501/muxa.sock");
+        let plan = build(Direction::Install, &[Component::TmuxStatusLine], &d, &socket).unwrap();
+        let pinned = plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::EditFile { after, .. }
+                    if after.contains(r#"set-environment -g MUXA_SOCKET "/run/user/501/muxa.sock""#)
+            )
+        });
+        assert!(pinned, "env block must pin the resolved socket path");
     }
 }

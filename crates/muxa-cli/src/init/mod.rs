@@ -100,7 +100,7 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     } else {
         Direction::Install
     };
-    let mut plan = plan::build(direction, &chosen, &detect)?;
+    let mut plan = plan::build(direction, &chosen, &detect, &socket)?;
     if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;
         // by the time we try to start muxad the file/socket layout it
@@ -146,19 +146,19 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     // Propagate MUXA_SOCKET into the tmux server environment so that
     // every pane — including the one that runs `muxa status-line` in
     // `status-right` — uses the same socket path after a daemon restart.
-    // Without this, tmux panes started before `muxad` was first spun up
-    // inherit an empty MUXA_SOCKET and fall back to the default path,
-    // which races when the daemon is restarted on a different socket.
-    if report.tmux_sourced {
+    // We do this unconditionally (not gated on `report.tmux_sourced`) so
+    // that re-running `muxa init` on an already-configured host still
+    // heals the runtime env if the tmux server was restarted since the
+    // last init. The conf-file persistence added by `tmux-env` handles
+    // fresh server boots; this live injection handles existing servers.
+    let server_up = std::process::Command::new("tmux")
+        .arg("info")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if server_up {
         if let Some(s) = socket.to_str() {
             let _ = std::process::Command::new("tmux")
                 .args(["set-environment", "-g", "MUXA_SOCKET", s])
-                .status();
-            // Push the new value down to existing panes so the current
-            // session's status-right (and any hook commands) picks it up
-            // immediately without requiring a pane restart.
-            let _ = std::process::Command::new("tmux")
-                .args(["update-environment", "MUXA_SOCKET"])
                 .status();
         }
     }

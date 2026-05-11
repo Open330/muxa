@@ -223,10 +223,15 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    // One-shot startup discovery: backfill agents that are still running in
-    // tmux panes from before the daemon (re)started. Configurable; default
-    // on. Does not block server readiness — spawned in the background.
+    // Self-heal: if a tmux server is already running, inject our socket
+    // path into its environment so that every pane — including any that
+    // were started before this muxad instance — can reach us. This
+    // complements the `tmux-env` managed block in `~/.tmux.conf` which
+    // handles fresh server boots; together they cover both cold-start and
+    // warm-restart scenarios without requiring the user to re-run
+    // `muxa init` after every daemon or tmux server restart.
     if listener_ready {
+        heal_tmux_socket_env(&socket);
         spawn_startup_discovery(&cfg, socket.clone(), backend.clone());
     }
 
@@ -662,6 +667,42 @@ fn spawn_webhook_sink(
         }
     }
     Ok(())
+}
+
+/// Inject MUXA_SOCKET into an already-running tmux server's global
+/// environment. Called once at daemon startup so panes that were
+/// spawned before this muxad instance can still reach it via hooks.
+fn heal_tmux_socket_env(socket: &std::path::Path) {
+    let server_up = std::process::Command::new("tmux")
+        .arg("info")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !server_up {
+        tracing::debug!("tmux server not running — skipping socket env heal");
+        return;
+    }
+    let Some(s) = socket.to_str() else {
+        tracing::debug!("socket path is not UTF-8 — skipping socket env heal");
+        return;
+    };
+    match std::process::Command::new("tmux")
+        .args(["set-environment", "-g", "MUXA_SOCKET", s])
+        .status()
+    {
+        Ok(st) if st.success() => {
+            tracing::info!(socket = s, "healed MUXA_SOCKET in tmux server env");
+        }
+        Ok(st) => {
+            tracing::warn!(
+                socket = s,
+                status = ?st.code(),
+                "tmux set-environment MUXA_SOCKET failed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not run tmux set-environment");
+        }
+    }
 }
 
 /// Decide whether to fire the one-shot discovery pass and, if so, spawn it
