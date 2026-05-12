@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`PROTOCOL_VERSION` bumped 1 → 2.** Adding new variants to wire-visible
+  enums (`AgentState`, `NotificationLevel`) is breaking because serde
+  rejects unknown variant values on deserialize — an old client receiving
+  `waiting_choice` from a new daemon (or vice versa) would crash rather
+  than ignore. The daemon `chmod`s the new protocol on its socket and
+  rejects mismatched requests with `{"ok":false,"error":"protocol mismatch: …"}`.
+  **`muxad` and `muxa` (the CLI) must upgrade together.** Existing adapters
+  that pin `protocol: 1` keep working only against a v1 daemon.
 - **`Transition.agent` is now `Arc<Agent>`** (was `Agent`). The in-process
   `tokio::sync::broadcast` channel that fans out state-change events
   to the notifier task, in-process sinks, and every live `muxa watch`
@@ -36,6 +44,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`AgentState::waiting_choice` + `NotificationLevel::needs_choice`** —
+  menu-style user blocks (Claude Code's `AskUserQuestion` and
+  `ExitPlanMode`) now land in `waiting_choice` instead of being lumped
+  in with free-text `waiting_input`. The operator can tell at a glance
+  "pick an option" vs "type a reply / approve permission". The Claude
+  adapter routes both `AskUserQuestion` and `ExitPlanMode` `PreToolUse`
+  hooks through `needs_choice`; the matching `PostToolUse` →
+  `ToolCompleted` recovers `waiting_choice` → `working` (same recovery
+  path that already existed for `waiting_input`). Carries through to
+  the notifier (still wakes you), webhook sink (`default_on_states`
+  includes both; tag `"needs choice"`, glyph `?`), dashboard
+  `/metrics` (counted as its own bucket), the reconciler stuck-state
+  sweeper (uses the same `stuck_waiting_timeout`), and the `muxa
+  watch` TUI (`LightYellow` next to `WaitingInput`'s `Yellow`). See
+  PROTOCOL.md "v1 → v2" for the wire-format delta.
 - **`muxa watch` quick actions** — the picker is no longer read-only.
   Four new keybindings act on the currently-selected row:
   - `c` — copy the agent's last prompt to the system clipboard

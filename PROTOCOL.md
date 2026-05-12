@@ -3,7 +3,7 @@
 This document describes the wire protocol spoken between
 `muxa` (the CLI), third-party adapters, and `muxad` (the daemon).
 
-Current version: **`1`** (defined in `muxa-core/src/event.rs`).
+Current version: **`2`** (defined in `muxa-core/src/event.rs`).
 
 ## Stability
 
@@ -125,7 +125,13 @@ Tagged union. `type` field is the discriminant.
 ```
 
 `level`:
-`"info" | "needs_input" | "warning" | "error"`.
+`"info" | "needs_input" | "needs_choice" | "warning" | "error"`.
+
+`needs_choice` (since protocol v2) is `needs_input`'s menu-style sibling:
+it signals the agent is blocked on a numbered selection (e.g., Claude
+Code's `AskUserQuestion` / `ExitPlanMode`) rather than free-text input
+or a yes/no permission. Adapters that can't distinguish should use
+`needs_input`.
 
 `at`: RFC 3339 UTC timestamp (`"2026-04-24T12:00:00Z"`).
 
@@ -141,7 +147,7 @@ Same fields as stored in the registry:
   "session_id": "sess-abc",
   "pane": "%12",
   "cwd": "/home/user/proj",
-  "state": "working" | "idle" | "waiting_input" | "error" | "stopped" | "starting",
+  "state": "working" | "idle" | "waiting_input" | "waiting_choice" | "error" | "stopped" | "starting",
   "last_prompt": "string | null",
   "last_notification": "string | null",
   "model": "string | null",
@@ -171,8 +177,20 @@ Same fields as stored in the registry:
 
 ## Versioning policy
 
-- Additive changes (new event types, new optional fields) are minor and
-  do **not** bump `PROTOCOL_VERSION`. Clients MUST ignore unknown fields.
+- Additive **field** changes (new event types, new optional fields) are
+  minor and do **not** bump `PROTOCOL_VERSION`. Clients MUST ignore
+  unknown fields.
+- Adding a new **enum variant** to a wire-visible enum (e.g.,
+  `AgentState`, `NotificationLevel`) **does** bump `PROTOCOL_VERSION`,
+  because serde's default behavior on an unknown variant value is to
+  fail deserialization — an old client receiving a new variant would
+  crash rather than ignore. The bump forces a daemon/CLI co-upgrade.
 - Removing or renaming fields, changing the meaning of a field, or
   changing wire framing bumps `PROTOCOL_VERSION`. The daemon rejects
   requests whose `protocol` does not match.
+
+### v1 → v2 (2026-05-08)
+
+- Added `AgentState::waiting_choice` — menu-style user block, distinct
+  from `waiting_input`.
+- Added `NotificationLevel::needs_choice` — routes to `waiting_choice`.
