@@ -132,10 +132,7 @@ pub struct Agent {
     /// snapshots written before this field existed deserialize with the
     /// rehydrate timestamp — the duration restarts at restart, which is
     /// less misleading than a 1970-anchored multi-decade reading.
-    #[serde(
-        default = "default_state_entered_at",
-        with = "time::serde::rfc3339"
-    )]
+    #[serde(default = "default_state_entered_at", with = "time::serde::rfc3339")]
     pub state_entered_at: OffsetDateTime,
 }
 

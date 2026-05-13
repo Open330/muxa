@@ -670,7 +670,7 @@ fn spawn_webhook_sink(
     Ok(())
 }
 
-/// Inject MUXA_SOCKET into an already-running tmux server's global
+/// Inject `MUXA_SOCKET` into an already-running tmux server's global
 /// environment. Called once at daemon startup so panes that were
 /// spawned before this muxad instance can still reach it via hooks.
 fn heal_tmux_socket_env(socket: &std::path::Path) {

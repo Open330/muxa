@@ -5036,8 +5036,8 @@ mod tests {
     /// session or a successful turn means the cap has been lifted.
     #[test]
     fn single_agent_propagates_rate_limit_clear() {
-        let mut app = App::new();
         use muxa::event::{RateLimitScope, RateLimitSource};
+        let mut app = App::new();
 
         // Seed a row that is currently rate-limited.
         let mut limited = fake_agent(
@@ -5085,9 +5085,18 @@ mod tests {
             panic!("expected agent row");
         };
         // Rate-limit markers must be gone.
-        assert!(a.rate_limited_until.is_none(), "rate_limited_until must be cleared");
-        assert!(a.rate_limit_scope.is_none(), "rate_limit_scope must be cleared");
-        assert!(a.rate_limit_source.is_none(), "rate_limit_source must be cleared");
+        assert!(
+            a.rate_limited_until.is_none(),
+            "rate_limited_until must be cleared"
+        );
+        assert!(
+            a.rate_limit_scope.is_none(),
+            "rate_limit_scope must be cleared"
+        );
+        assert!(
+            a.rate_limit_source.is_none(),
+            "rate_limit_source must be cleared"
+        );
         // But last_prompt and model should survive (None means "don't touch").
         assert_eq!(a.last_prompt.as_deref(), Some("prompt"));
         assert_eq!(a.model.as_deref(), Some("Opus"));
@@ -6548,7 +6557,8 @@ mod tests {
         pub(super) fn buffer_string(terminal: &Terminal<TestBackend>) -> String {
             let buf = terminal.backend().buffer();
             let area = buf.area();
-            let mut out = String::with_capacity(usize::from(area.width + 1) * usize::from(area.height));
+            let mut out =
+                String::with_capacity(usize::from(area.width + 1) * usize::from(area.height));
             for y in 0..area.height {
                 let mut row = String::with_capacity(usize::from(area.width));
                 for x in 0..area.width {
@@ -6619,7 +6629,14 @@ mod tests {
                 return None;
             }
             let d = |i: usize| b[i].is_ascii_digit();
-            if d(0) && d(1) && b[2] == b':' && d(3) && d(4) && b[5] == b':' && d(6) && d(7)
+            if d(0)
+                && d(1)
+                && b[2] == b':'
+                && d(3)
+                && d(4)
+                && b[5] == b':'
+                && d(6)
+                && d(7)
                 && &b[8..12] == b" UTC"
             {
                 Some(12)

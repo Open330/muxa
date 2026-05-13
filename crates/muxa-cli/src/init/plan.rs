@@ -183,12 +183,9 @@ fn plan_tmux_env(
     // `EditFile` outputs targeting the same path.
     let mut latest = read_to_string_opt(&path)?.unwrap_or_default();
     for action in actions.iter() {
-        if let Action::EditFile {
-            path: p, after, ..
-        } = action
-        {
+        if let Action::EditFile { path: p, after, .. } = action {
             if p == &path {
-                latest = after.clone();
+                latest.clone_from(after);
             }
         }
     }
@@ -458,9 +455,10 @@ mod tests {
             "first action must be the popup EditFile"
         );
 
-        let env_after = plan.actions.iter().any(|a| {
-            matches!(a, Action::EditFile { after, .. } if after.contains("MUXA_SOCKET"))
-        });
+        let env_after = plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::EditFile { after, .. } if after.contains("MUXA_SOCKET")));
         assert!(
             env_after,
             "tmux-env block must be auto-included with any tmux component"
@@ -476,7 +474,13 @@ mod tests {
     fn tmux_install_pins_provided_socket_path() {
         let d = Detection::default();
         let socket = PathBuf::from("/run/user/501/muxa.sock");
-        let plan = build(Direction::Install, &[Component::TmuxStatusLine], &d, &socket).unwrap();
+        let plan = build(
+            Direction::Install,
+            &[Component::TmuxStatusLine],
+            &d,
+            &socket,
+        )
+        .unwrap();
         let pinned = plan.actions.iter().any(|a| {
             matches!(
                 a,

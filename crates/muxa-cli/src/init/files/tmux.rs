@@ -8,7 +8,7 @@ use crate::init::components::Component;
 use crate::init::marker::{self, Outcome};
 use std::path::Path;
 
-/// Marker-block id reserved for the (component-less) MUXA_SOCKET pin.
+/// Marker-block id reserved for the (component-less) `MUXA_SOCKET` pin.
 /// Not exposed in the user-facing component catalog — it's auto-managed
 /// alongside any other tmux block so users can't get the popup or
 /// statusline without socket propagation.
@@ -65,7 +65,7 @@ pub fn remove(original: &str, component: Component) -> (String, Outcome) {
     }
 }
 
-/// Upsert the auto-managed `tmux-env` block (pins MUXA_SOCKET).
+/// Upsert the auto-managed `tmux-env` block (pins `MUXA_SOCKET`).
 pub fn upsert_env(original: &str, socket: &Path) -> (String, Outcome) {
     marker::upsert(original, ENV_BLOCK_ID, &env_body(socket))
 }
