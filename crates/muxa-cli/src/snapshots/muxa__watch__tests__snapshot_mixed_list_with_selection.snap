@@ -6,12 +6,12 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                               ACTIVITY  │
-│  alpha:0.0              working        alpha prompt                                              <rel>│
-│> alpha:1.0              waiting_input  beta prompt                                               <rel>│
-│                                        ↳ beta response                                                     │
-│  alpha:2.0              waiting_choice gamma prompt                                              <rel>│
-│  (no pane)              idle           -                                                         <rel>│
+│  PANE                   STATE                LAST PROMPT                                         ACTIVITY  │
+│  alpha:0.0              working              alpha prompt                                        <rel>│
+│> alpha:1.0              waiting_input 0s     beta prompt                                         <rel>│
+│                                              ↳ beta response                                               │
+│  alpha:2.0              waiting_choice 0s    gamma prompt                                        <rel>│
+│  (no pane)              idle                 -                                                   <rel>│
 │                                                                                                            │
 │                                                                                                            │
 │                                                                                                            │

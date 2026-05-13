@@ -6,9 +6,9 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                     ACTIVITY  │
-│> alpha:2.0              waiting_choice pick a plan                                     <rel>│
-│                                        ↳ pick a plan                                             │
+│  PANE                   STATE                LAST PROMPT                               ACTIVITY  │
+│> alpha:2.0              waiting_choice 0s    pick a plan                               <rel>│
+│                                              ↳ pick a plan                                       │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

@@ -136,7 +136,11 @@ impl WatchColumn {
             // PANE — "session:window.pane" can run long; 22 covers most.
             Self::Pane => Constraint::Length(22),
             Self::Kind => Constraint::Length(12),
-            Self::State => Constraint::Length(14),
+            // STATE — widest base label is `waiting_choice` (14 cells);
+            // the stuck-duration suffix (` Ns` / ` Nm` / ` Nh`) adds up
+            // to 5 more cells, so 20 keeps the suffix visible without
+            // crowding neighbouring columns.
+            Self::State => Constraint::Length(20),
             Self::Model => Constraint::Length(16),
             Self::Ctx => Constraint::Length(5),
             Self::Cost => Constraint::Length(7),

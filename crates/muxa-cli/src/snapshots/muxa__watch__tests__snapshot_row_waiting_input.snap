@@ -6,9 +6,9 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                     ACTIVITY  │
-│> alpha:1.0              waiting_input  approve permission?                             <rel>│
-│                                        ↳ approve permission?                                     │
+│  PANE                   STATE                LAST PROMPT                               ACTIVITY  │
+│> alpha:1.0              waiting_input 0s     approve permission?                       <rel>│
+│                                              ↳ approve permission?                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

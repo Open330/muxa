@@ -99,7 +99,7 @@
 # Missing keys fall back to a per-column default.
 # [watch.widths]
 # pane     = 22
-# state    = 14
+# state    = 20
 # prompt   = "min:30"
 # activity = 10
 

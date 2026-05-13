@@ -6,7 +6,7 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                                         ACTIVITY  │
+│  PANE                   STATE                LAST PROMPT                                                   ACTIVITY  │
 │> alpha:0.0┌ preview · %1 · prompt ───────────────────────────────────────────────────────────────────────┐ <rel>│
 │           │pane: alpha:0.0    kind: claude_code    state: working                                        │           │
 │           │                                                                                              │           │

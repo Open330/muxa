@@ -6,9 +6,9 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                                         ACTIVITY  │
-│> main:2.0               working        hello                                                               <rel>│
-│                                        ↳ hello                                                                       │
+│  PANE                   STATE                LAST PROMPT                                                   ACTIVITY  │
+│> main:2.0               working              hello                                                         <rel>│
+│                                              ↳ hello                                                                 │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

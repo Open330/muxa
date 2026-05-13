@@ -6,9 +6,9 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                     ACTIVITY  │
-│> alpha:0.0              working        refactor the ipc module                         <rel>│
-│                                        ↳ refactor the ipc module                                 │
+│  PANE                   STATE                LAST PROMPT                               ACTIVITY  │
+│> alpha:0.0              working              refactor the ipc module                   <rel>│
+│                                              ↳ refactor the ipc module                           │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

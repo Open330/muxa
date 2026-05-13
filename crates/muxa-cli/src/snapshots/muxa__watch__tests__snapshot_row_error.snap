@@ -6,9 +6,9 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   STATE          LAST PROMPT                                     ACTIVITY  │
-│> alpha:3.0              error          boom                                            <rel>│
-│                                        ↳ boom                                                    │
+│  PANE                   STATE                LAST PROMPT                               ACTIVITY  │
+│> alpha:3.0              error                boom                                      <rel>│
+│                                              ↳ boom                                              │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
