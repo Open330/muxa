@@ -433,6 +433,7 @@ mod tests {
             rate_limit_source: None,
             started_at: t0,
             last_activity_at: t0,
+            state_entered_at: t0,
         };
         store
             .hydrate(vec![

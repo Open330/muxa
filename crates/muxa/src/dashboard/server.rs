@@ -874,6 +874,7 @@ mod tests {
             rate_limit_source: None,
             started_at: OffsetDateTime::now_utc(),
             last_activity_at: OffsetDateTime::now_utc(),
+            state_entered_at: OffsetDateTime::now_utc(),
         };
         tx.send(Transition {
             from: AgentState::Starting,
@@ -975,6 +976,7 @@ mod tests {
             rate_limit_source: None,
             started_at: OffsetDateTime::now_utc(),
             last_activity_at: OffsetDateTime::now_utc(),
+            state_entered_at: OffsetDateTime::now_utc(),
         };
         for _ in 0..5 {
             tx.send(Transition {

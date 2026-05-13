@@ -185,7 +185,19 @@ impl WatchColumn {
                         .add_modifier(Modifier::DIM),
                     AgentState::Starting => Style::default().fg(Color::Cyan),
                 };
-                Text::from(Span::styled(a.state.to_string(), style))
+                // Append a stuck-duration suffix only for the "blocked on
+                // the user" states — long-running Working rows are
+                // expected and would just be noise. Format mirrors
+                // top(1)'s compact `15s` / `12m` / `1h` so the column
+                // stays inside its 14-cell default width.
+                let label = match a.state {
+                    AgentState::WaitingInput | AgentState::WaitingChoice => {
+                        let suffix = stuck_suffix(a.state_entered_at, now);
+                        format!("{} {suffix}", a.state)
+                    }
+                    _ => a.state.to_string(),
+                };
+                Text::from(Span::styled(label, style))
             }
             Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
             Self::Ctx => a
@@ -2794,6 +2806,23 @@ fn limits_text(a: &Agent, now: OffsetDateTime) -> Text<'static> {
     }
 }
 
+/// Compact "stuck for" duration suffix for the State column. Buckets at
+/// 1h / 1m: ≥1h prints `Nh`, ≥1m prints `Nm`, otherwise `Ns`. Negative
+/// deltas (clock skew or a `state_entered_at` from the future) collapse
+/// to `0s` rather than printing a negative — the column has no space
+/// for a sign and the suffix is a UX hint, not a precise measurement.
+fn stuck_suffix(state_entered_at: OffsetDateTime, now: OffsetDateTime) -> String {
+    let delta = now - state_entered_at;
+    let secs = delta.whole_seconds().max(0);
+    if secs >= 3600 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
     let delta = now - at;
     let secs = delta.whole_seconds();
@@ -2975,6 +3004,7 @@ mod tests {
             rate_limit_source: None,
             started_at: now,
             last_activity_at: now,
+            state_entered_at: now,
         }
     }
 

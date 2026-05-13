@@ -126,6 +126,21 @@ pub struct Agent {
     pub started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub last_activity_at: OffsetDateTime,
+    /// Wall-clock at which the agent most recently entered its current
+    /// `state`. Drives the watch UI's stuck-duration suffix so operators
+    /// can spot forgotten `WaitingInput` / `WaitingChoice` rows. Old
+    /// snapshots written before this field existed deserialize with the
+    /// rehydrate timestamp — the duration restarts at restart, which is
+    /// less misleading than a 1970-anchored multi-decade reading.
+    #[serde(
+        default = "default_state_entered_at",
+        with = "time::serde::rfc3339"
+    )]
+    pub state_entered_at: OffsetDateTime,
+}
+
+fn default_state_entered_at() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
 }
 
 impl Agent {
@@ -157,6 +172,7 @@ impl Agent {
             rate_limit_source: None,
             started_at: at,
             last_activity_at: at,
+            state_entered_at: at,
         }
     }
 }
@@ -346,6 +362,7 @@ fn mutate_for_event(
 ) -> (Option<PromptRecord>, Option<HistoryEntry>) {
     let mut prompt_record: Option<PromptRecord> = None;
     let mut history_entry: Option<HistoryEntry> = None;
+    let prev_state = agent.state;
 
     match ev {
         AgentEvent::Started { .. } => {
@@ -461,6 +478,10 @@ fn mutate_for_event(
     // event lands.
     if agent.state == AgentState::Starting {
         agent.state = AgentState::Idle;
+    }
+
+    if prev_state != agent.state {
+        agent.state_entered_at = at;
     }
 
     (prompt_record, history_entry)
@@ -2466,6 +2487,7 @@ mod tests {
                     rate_limit_source: None,
                     started_at: mid,
                     last_activity_at: mid,
+                    state_entered_at: mid,
                 },
             );
             agents.insert(
@@ -2491,6 +2513,7 @@ mod tests {
                     rate_limit_source: None,
                     started_at: new,
                     last_activity_at: new,
+                    state_entered_at: new,
                 },
             );
         }
@@ -2545,6 +2568,7 @@ mod tests {
                         rate_limit_source: None,
                         started_at: at,
                         last_activity_at: at,
+                        state_entered_at: at,
                     },
                 );
             }
@@ -2602,6 +2626,7 @@ mod tests {
             rate_limit_source: None,
             started_at: t0,
             last_activity_at: t0,
+            state_entered_at: t0,
         };
         let inserted = store
             .seed_if_absent(vec![
@@ -2621,6 +2646,105 @@ mod tests {
         // The fresh seed must carry the candidate's last_prompt.
         let fresh = snap.iter().find(|a| a.session_id == "fresh").unwrap();
         assert_eq!(fresh.last_prompt.as_deref(), Some("history-derived"));
+    }
+
+    #[tokio::test]
+    async fn state_entered_at_updates_on_transition() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = datetime!(2026-05-05 12:05:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("t"),
+                at: t0,
+            })
+            .await;
+        assert_eq!(store.by_session("t").await.unwrap().state_entered_at, t0);
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("t"),
+                prompt: "go".into(),
+                at: t1,
+            })
+            .await;
+        let a = store.by_session("t").await.unwrap();
+        assert_eq!(a.state, AgentState::Working);
+        assert_eq!(
+            a.state_entered_at, t1,
+            "PromptSubmitted (Idle → Working) must reset state_entered_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_update_state_entered_at() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = datetime!(2026-05-05 12:10:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("h"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("h"),
+                model: Some("claude-opus-4-7".into()),
+                context_used_pct: Some(12.5),
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: t1,
+            })
+            .await;
+        let a = store.by_session("h").await.unwrap();
+        // Heartbeat carries metadata only, doesn't move state — the
+        // stuck-duration clock must keep ticking from t0.
+        assert_eq!(a.state, AgentState::Idle);
+        assert_eq!(a.state_entered_at, t0);
+    }
+
+    #[tokio::test]
+    async fn same_state_event_preserves_state_entered_at() {
+        // Notification(NeedsInput) → already WaitingInput → another
+        // Notification(NeedsInput): the second one shouldn't reset the
+        // clock, otherwise a chatty adapter would mask the real stuck
+        // duration.
+        let store = Store::shared();
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = datetime!(2026-05-05 12:01:00 UTC);
+        let t2 = datetime!(2026-05-05 12:07:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("s"),
+                level: NotificationLevel::NeedsInput,
+                message: "first".into(),
+                at: t1,
+            })
+            .await;
+        assert_eq!(store.by_session("s").await.unwrap().state_entered_at, t1);
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("s"),
+                level: NotificationLevel::NeedsInput,
+                message: "second".into(),
+                at: t2,
+            })
+            .await;
+        let a = store.by_session("s").await.unwrap();
+        assert_eq!(a.state, AgentState::WaitingInput);
+        assert_eq!(
+            a.state_entered_at, t1,
+            "re-entering the same state must not reset state_entered_at"
+        );
     }
 
     #[tokio::test]

@@ -560,6 +560,7 @@ async fn enrich_from_history(
             rate_limit_source: None,
             started_at: entry.at,
             last_activity_at: entry.at,
+            state_entered_at: entry.at,
         });
     }
 
