@@ -6523,4 +6523,356 @@ mod tests {
         );
         assert!(dump.contains("kill the pane"), "missing kill: {dump:?}");
     }
+
+    // ---- visual snapshots --------------------------------------------------
+    //
+    // Pin the full rendered buffer as a plain-text snapshot so render
+    // regressions get caught beyond "did not panic". Helpers strip styling
+    // (colours don't affect logical layout, and styling deltas would churn
+    // snapshots) and normalize the relative-time column ("12s ago" →
+    // "<rel>") because the production `render` path calls
+    // `OffsetDateTime::now_utc()` directly and we'd rather not thread an
+    // injectable clock through it just for tests.
+
+    mod snapshot_helpers {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        /// Flatten the `TestBackend` buffer into a single visual string.
+        /// One line per buffer row, trailing whitespace trimmed per line,
+        /// relative-time tokens normalized so snapshots stay stable.
+        pub(super) fn buffer_string(terminal: &Terminal<TestBackend>) -> String {
+            let buf = terminal.backend().buffer();
+            let area = buf.area();
+            let mut out = String::with_capacity(usize::from(area.width + 1) * usize::from(area.height));
+            for y in 0..area.height {
+                let mut row = String::with_capacity(usize::from(area.width));
+                for x in 0..area.width {
+                    row.push_str(buf.cell((x, y)).map_or("", ratatui::buffer::Cell::symbol));
+                }
+                let row = row.trim_end();
+                out.push_str(&normalize_relative_time(row));
+                out.push('\n');
+            }
+            out
+        }
+
+        /// Replace `\d+(s|m|h|d) ago` with `<rel>` and `HH:MM:SS UTC` with
+        /// `<clock>` so neither the activity column nor the header clock
+        /// drifts across runs. (`render_header` reads `app.last_refresh`,
+        /// which is set to `now_utc()` inside `App::with_config`/`set_data`
+        /// — not injectable without a production-code change.)
+        fn normalize_relative_time(s: &str) -> String {
+            let bytes = s.as_bytes();
+            let mut out = String::with_capacity(s.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                if let Some(consumed) = match_clock(&bytes[i..]) {
+                    out.push_str("<clock>");
+                    i += consumed;
+                    continue;
+                }
+                let digit_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > digit_start
+                    && i < bytes.len()
+                    && matches!(bytes[i], b's' | b'm' | b'h' | b'd')
+                    && bytes.get(i + 1..i + 5) == Some(b" ago")
+                {
+                    // Eat the digits + unit + ` ago` AND any spaces that
+                    // follow (column padding). The relative-time text is
+                    // variable-length (6-8 chars) so without this the
+                    // column-trailing whitespace would drift across runs
+                    // as the value crosses the 60s / 60m / 48h boundaries.
+                    i += 5;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    out.push_str("<rel>");
+                } else {
+                    // Not a relative-time token — copy the digit run and the
+                    // following char (if any) verbatim.
+                    out.push_str(&s[digit_start..i]);
+                    if i < bytes.len() {
+                        let ch_start = i;
+                        // Advance one UTF-8 char.
+                        i += 1;
+                        while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                            i += 1;
+                        }
+                        out.push_str(&s[ch_start..i]);
+                    }
+                }
+            }
+            out
+        }
+
+        /// Return `Some(12)` if `b` starts with `HH:MM:SS UTC`, else `None`.
+        fn match_clock(b: &[u8]) -> Option<usize> {
+            if b.len() < 12 {
+                return None;
+            }
+            let d = |i: usize| b[i].is_ascii_digit();
+            if d(0) && d(1) && b[2] == b':' && d(3) && d(4) && b[5] == b':' && d(6) && d(7)
+                && &b[8..12] == b" UTC"
+            {
+                Some(12)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn snapshot_app() -> App {
+        // Pin sort to PaneId so row order doesn't drift on activity jitter
+        // and disable hide_paneless so the paneless row stays visible in
+        // the mixed-list snapshot.
+        let cfg = WatchConfig {
+            sort: vec![WatchSortKey::PaneId],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        };
+        App::with_config(cfg)
+    }
+
+    #[test]
+    fn snapshot_empty_state() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_row_working() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        app.set_data(
+            vec![fake_agent(
+                "s-work",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                Some("refactor the ipc module"),
+                Some("Opus"),
+                Some(34.0),
+                Some(0.12),
+            )],
+            vec![fake_pane("%1", "alpha", 0, 0, "claude")],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_row_waiting_input() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        app.set_data(
+            vec![fake_agent(
+                "s-wi",
+                Some("%2"),
+                AgentKind::Codex,
+                AgentState::WaitingInput,
+                Some("approve permission?"),
+                None,
+                None,
+                None,
+            )],
+            vec![fake_pane("%2", "alpha", 1, 0, "codex")],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_row_waiting_choice() {
+        // Regression guard: WaitingChoice is the newest AgentState variant
+        // and the one we most want to pin visually so future styling/label
+        // changes show up in review.
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        app.set_data(
+            vec![fake_agent(
+                "s-wc",
+                Some("%3"),
+                AgentKind::ClaudeCode,
+                AgentState::WaitingChoice,
+                Some("pick a plan"),
+                None,
+                None,
+                None,
+            )],
+            vec![fake_pane("%3", "alpha", 2, 0, "claude")],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_row_error() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        app.set_data(
+            vec![fake_agent(
+                "s-err",
+                Some("%4"),
+                AgentKind::GeminiCli,
+                AgentState::Error,
+                Some("boom"),
+                None,
+                None,
+                None,
+            )],
+            vec![fake_pane("%4", "alpha", 3, 0, "gemini")],
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_mixed_list_with_selection() {
+        // One agent per state, plus a paneless agent — selection on the
+        // second row so the detail-line expansion is exercised too.
+        let backend = TestBackend::new(110, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        let mut a1 = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("alpha prompt"),
+            Some("Opus"),
+            Some(7.0),
+            Some(0.05),
+        );
+        a1.last_response = Some("alpha response".into());
+        let mut a2 = fake_agent(
+            "s2",
+            Some("%2"),
+            AgentKind::Codex,
+            AgentState::WaitingInput,
+            Some("beta prompt"),
+            None,
+            None,
+            None,
+        );
+        a2.last_response = Some("beta response".into());
+        let mut a3 = fake_agent(
+            "s3",
+            Some("%3"),
+            AgentKind::ClaudeCode,
+            AgentState::WaitingChoice,
+            Some("gamma prompt"),
+            None,
+            None,
+            None,
+        );
+        a3.last_response = Some("gamma response".into());
+        let a4 = fake_agent(
+            "s4",
+            None,
+            AgentKind::Unknown,
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+        );
+        app.set_data(
+            vec![a1, a2, a3, a4],
+            vec![
+                fake_pane("%1", "alpha", 0, 0, "claude"),
+                fake_pane("%2", "alpha", 1, 0, "codex"),
+                fake_pane("%3", "alpha", 2, 0, "claude"),
+            ],
+        );
+        app.table_state.select(Some(1));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_help_overlay() {
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%1"),
+                AgentKind::ClaudeCode,
+                AgentState::Idle,
+                Some("hi"),
+                None,
+                None,
+                None,
+            )],
+            vec![fake_pane("%1", "alpha", 0, 0, "claude")],
+        );
+        app.help_open = true;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_confirm_popup() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        app.set_data(
+            vec![fake_agent(
+                "s1",
+                Some("%42"),
+                AgentKind::ClaudeCode,
+                AgentState::Working,
+                Some("hello"),
+                None,
+                None,
+                None,
+            )],
+            vec![fake_pane("%42", "main", 2, 0, "claude")],
+        );
+        app.confirm = Some(ConfirmPopup {
+            message: "Kill pane main:2.0?".into(),
+            on_confirm: QuickAction::KillPane("%42".into()),
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn snapshot_preview_popup() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = snapshot_app();
+        let mut a = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("the prompt body"),
+            Some("Opus"),
+            Some(12.0),
+            Some(0.03),
+        );
+        a.last_response = Some("the response body".into());
+        app.set_data(vec![a], vec![fake_pane("%1", "alpha", 0, 0, "claude")]);
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+            mode: PreviewMode::Popup,
+            content: PreviewContent::PromptResponse,
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
 }

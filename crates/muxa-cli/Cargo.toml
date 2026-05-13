@@ -61,6 +61,9 @@ tempfile = "3"
 # refresh-task tests use to drive the periodic tick deterministically
 # without sleeping the test runner.
 tokio = { workspace = true, features = ["test-util"] }
+# Snapshot tests for the `muxa watch` TUI — pinned to the visual buffer
+# string so render regressions get caught beyond "did not panic".
+insta = { version = "1", features = ["yaml"] }
 
 [lints]
 workspace = true
