@@ -79,6 +79,15 @@ enum RequestBody {
         limit: Option<usize>,
     },
     Health,
+    /// Capability handshake. Optional first message; opts the connection
+    /// into negotiated-protocol mode. The server replies with its
+    /// `[min, max]` supported range and a list of capability tags, then
+    /// downgrades wire-visible enum variants for the rest of the
+    /// connection so a client pinned to an older protocol stays usable.
+    Hello {
+        #[serde(default)]
+        client: Option<String>,
+    },
     /// Long-lived streaming subscribe. Server replies with a one-shot
     /// `ok` ack, then writes one JSON-encoded `Transition` per
     /// state change (newline-delimited) until the client closes the
@@ -96,6 +105,16 @@ struct Request {
     body: RequestBody,
 }
 
+/// Oldest protocol the server can still serve via the negotiated regime
+/// (i.e. with v1-compat enum downgrade). Bumped when we drop the
+/// downgrade path for an older variant.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// Stable feature tags advertised by `hello`. Each token names a
+/// semver-additive capability the server supports; clients use the list
+/// to feature-gate behaviour without re-reading `protocol`.
+const CAPABILITIES: &[&str] = &["waiting_choice", "needs_choice", "rate_limited"];
+
 #[derive(Debug, Serialize)]
 pub struct Response {
     pub ok: bool,
@@ -108,6 +127,12 @@ pub struct Response {
     pub prompts: Option<Vec<crate::history::HistoryEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_protocol: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_protocol: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<&'static str>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,17 +150,16 @@ impl Response {
             agents: None,
             prompts: None,
             health: None,
+            min_protocol: None,
+            max_protocol: None,
+            capabilities: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            protocol: PROTOCOL_VERSION,
-            error: Some(msg.into()),
-            agents: None,
-            prompts: None,
-            health: None,
-        }
+        let mut r = Self::ok();
+        r.ok = false;
+        r.error = Some(msg.into());
+        r
     }
     fn with_agents(agents: Vec<Agent>) -> Self {
         let mut r = Self::ok();
@@ -153,6 +177,13 @@ impl Response {
             version: env!("CARGO_PKG_VERSION"),
             protocol: PROTOCOL_VERSION,
         });
+        r
+    }
+    fn hello() -> Self {
+        let mut r = Self::ok();
+        r.min_protocol = Some(MIN_PROTOCOL_VERSION);
+        r.max_protocol = Some(PROTOCOL_VERSION);
+        r.capabilities = Some(CAPABILITIES.to_vec());
         r
     }
 }
@@ -249,6 +280,43 @@ impl Server {
     }
 }
 
+/// Rewrite v2-only enum string values to their v1 equivalents so an old
+/// client doesn't choke on unknown variants. Walks the JSON tree and
+/// mutates standalone string values; substrings inside larger strings
+/// (e.g. a prompt that happens to contain the word `waiting_choice`)
+/// are deliberately left alone. Called on the write path only when the
+/// negotiated protocol is below the variant's introducing version.
+fn downgrade_to_v1(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            if s == "waiting_choice" {
+                *s = "waiting_input".to_string();
+            } else if s == "needs_choice" {
+                *s = "needs_input".to_string();
+            }
+        }
+        serde_json::Value::Array(xs) => xs.iter_mut().for_each(downgrade_to_v1),
+        serde_json::Value::Object(m) => m.values_mut().for_each(downgrade_to_v1),
+        _ => {}
+    }
+}
+
+/// Serialize a payload as a single JSON line, applying the v1 downgrade
+/// when the connection negotiated a protocol older than v2. Keeps the
+/// fast path (no negotiation, or v2+) on a direct `to_vec` so we don't
+/// pay for a `Value` round-trip on every response.
+fn encode_line<T: Serialize>(value: &T, protocol: u32) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = if protocol < 2 {
+        let mut v = serde_json::to_value(value)?;
+        downgrade_to_v1(&mut v);
+        serde_json::to_vec(&v)?
+    } else {
+        serde_json::to_vec(value)?
+    };
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 /// Pump every state transition from `store` to `writer` as a JSON
 /// line. Runs until the broadcast channel closes (daemon shutting
 /// down) or the client closes its half of the socket — the first
@@ -262,13 +330,13 @@ impl Server {
 async fn stream_transitions(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     store: SharedStore,
+    protocol: u32,
 ) -> Result<(), RuntimeError> {
     let mut rx = store.subscribe();
     loop {
         match rx.recv().await {
             Ok(t) => {
-                let mut bytes = serde_json::to_vec(&t)?;
-                bytes.push(b'\n');
+                let bytes = encode_line(&t, protocol)?;
                 if writer.write_all(&bytes).await.is_err() {
                     return Ok(());
                 }
@@ -288,10 +356,18 @@ async fn stream_transitions(
 }
 
 #[tracing::instrument(level = "debug", skip(stream, store))]
+#[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
 async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+
+    // Per-connection negotiated protocol. `None` until the client sends
+    // `hello` — keeps the legacy strict-match check in force for clients
+    // that never opt into negotiation. Once set, the daemon honors the
+    // pinned version on every subsequent message on this connection,
+    // including the streaming pump.
+    let mut negotiated: Option<u32> = None;
 
     loop {
         line.clear();
@@ -318,7 +394,17 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
         #[allow(unused_assignments)]
         let mut kind: &'static str = "dispatch_unknown";
         let resp = match serde_json::from_str::<Request>(trimmed) {
-            Ok(req) if req.protocol != 0 && req.protocol != PROTOCOL_VERSION => {
+            // Strict-match only applies in the legacy regime, and only
+            // for non-`hello` kinds. Once the client has sent `hello`,
+            // the negotiated version governs and per-message `protocol`
+            // fields are advisory. `hello` itself carries the requested
+            // version and is checked inside its own arm.
+            Ok(req)
+                if negotiated.is_none()
+                    && !matches!(req.body, RequestBody::Hello { .. })
+                    && req.protocol != 0
+                    && req.protocol != PROTOCOL_VERSION =>
+            {
                 kind = "protocol_mismatch";
                 Response::err(format!(
                     "protocol mismatch: server={PROTOCOL_VERSION} client={}",
@@ -326,6 +412,29 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                 ))
             }
             Ok(req) => match req.body {
+                RequestBody::Hello { client } => {
+                    kind = "hello";
+                    let requested = if req.protocol == 0 {
+                        PROTOCOL_VERSION
+                    } else {
+                        req.protocol
+                    };
+                    if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&requested) {
+                        negotiated = Some(requested);
+                        tracing::debug!(
+                            client = client.as_deref().unwrap_or("(unknown)"),
+                            protocol = requested,
+                            "hello"
+                        );
+                        let mut r = Response::hello();
+                        r.protocol = requested;
+                        r
+                    } else {
+                        Response::err(format!(
+                            "unsupported protocol: server supports [{MIN_PROTOCOL_VERSION},{PROTOCOL_VERSION}] client={requested}",
+                        ))
+                    }
+                }
                 RequestBody::Ingest { event } => {
                     kind = "ingest";
                     tracing::debug!(?event, "ingest");
@@ -362,14 +471,14 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                 }
                 RequestBody::Subscribe => {
                     kind = "subscribe";
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     // Stream takeover. Send ack, then write transitions
                     // until the client disconnects or muxad shuts down.
                     // We deliberately do NOT return to the request loop
                     // — this connection is now owned by the streaming
                     // pump.
-                    let ack_bytes = serde_json::to_vec(&Response::ok())?;
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
                     writer.write_all(&ack_bytes).await?;
-                    writer.write_all(b"\n").await?;
                     writer.flush().await?;
                     tracing::debug!(
                         elapsed_us =
@@ -377,7 +486,7 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                         kind,
                         "ipc.handle (stream takeover)",
                     );
-                    return stream_transitions(writer, store).await;
+                    return stream_transitions(writer, store, stream_proto).await;
                 }
             },
             Err(e) => {
@@ -386,8 +495,7 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
             }
         };
 
-        let mut bytes = serde_json::to_vec(&resp)?;
-        bytes.push(b'\n');
+        let bytes = encode_line(&resp, negotiated.unwrap_or(PROTOCOL_VERSION))?;
         writer.write_all(&bytes).await?;
         writer.flush().await?;
 
@@ -521,6 +629,10 @@ impl Client {
                 _ => RuntimeError::Io(e),
             })?;
         let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        Self::send_hello(&mut reader, &mut writer).await?;
+
         let mut req = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "subscribe",
@@ -531,7 +643,6 @@ impl Client {
 
         // Server replies with a one-shot ack before the streaming
         // pump takes over.
-        let mut reader = BufReader::new(reader);
         let mut ack = String::new();
         reader.read_line(&mut ack).await?;
         let ack: serde_json::Value = serde_json::from_str(ack.trim())?;
@@ -552,26 +663,56 @@ impl Client {
         })
     }
 
+    /// Send the capability handshake as the first message on a freshly
+    /// opened connection. Best-effort: a daemon that doesn't understand
+    /// `hello` (older build) returns `ok:false` with a parse error or a
+    /// protocol-mismatch error; we ignore the failure so the legacy
+    /// strict-match path on the daemon stays usable.
+    async fn send_hello<R, W>(reader: &mut BufReader<R>, writer: &mut W) -> Result<(), RuntimeError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "hello",
+            "client": concat!("muxa/", env!("CARGO_PKG_VERSION")),
+        }))?;
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        let mut ack = String::new();
+        reader.read_line(&mut ack).await?;
+        // Parse but don't fail on a non-ok response — legacy daemons
+        // will reject the unknown `kind`, which is fine; the caller's
+        // request still goes through.
+        let _ = serde_json::from_str::<serde_json::Value>(ack.trim());
+        Ok(())
+    }
+
     pub async fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, RuntimeError> {
         // Connect-time ECONNREFUSED/ENOENT mean the daemon socket isn't there
         // or nothing is listening — surface a friendly message that names the
         // socket path. Other IO errors (timeouts, permission denied, …) keep
         // their existing display via the `Io(#[from] _)` impl.
-        let mut stream =
-            UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-                        RuntimeError::NotConnected(self.socket_path.clone())
-                    }
-                    _ => RuntimeError::Io(e),
-                })?;
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                    RuntimeError::NotConnected(self.socket_path.clone())
+                }
+                _ => RuntimeError::Io(e),
+            })?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        Self::send_hello(&mut reader, &mut writer).await?;
+
         let mut bytes = serde_json::to_vec(req)?;
         bytes.push(b'\n');
-        stream.write_all(&bytes).await?;
-        stream.flush().await?;
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
 
-        let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         Ok(serde_json::from_str(line.trim())?)
@@ -826,35 +967,254 @@ mod tests {
         assert_eq!(snap[0].session_id, "drain-test");
     }
 
+    /// Server must wait for the socket to appear before tests dial in.
+    async fn wait_for_socket(sock: &Path) {
+        for _ in 0..50 {
+            if sock.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Raw single-line request/response on a fresh connection. Bypasses
+    /// `Client::call`'s built-in `hello` handshake so tests can exercise
+    /// the legacy strict-match path and the negotiated downgrade path
+    /// in isolation.
+    async fn raw_call(sock: &Path, req: &serde_json::Value) -> serde_json::Value {
+        let mut stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+        let mut bytes = serde_json::to_vec(req).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    /// Legacy strict-match path: a client that never sends `hello` and
+    /// pins a mismatched `protocol` on a snapshot request gets the
+    /// "protocol mismatch" error. Negotiation is opt-in; pre-`hello`
+    /// connections keep the old behaviour.
     #[tokio::test]
-    async fn rejects_wrong_protocol() {
+    async fn rejects_wrong_protocol_without_hello() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-test.sock");
         let store = Store::shared();
         let server = Server::new(sock.clone(), store);
         let (tx, rx) = broadcast::channel(1);
         let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
 
-        for _ in 0..50 {
-            if sock.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let client = Client::new(sock.clone());
-        let resp = client
-            .call(&serde_json::json!({
-                "protocol": 999,
-                "kind": "snapshot"
-            }))
-            .await
-            .unwrap();
+        let resp = raw_call(
+            &sock,
+            &serde_json::json!({ "protocol": 999, "kind": "snapshot" }),
+        )
+        .await;
         assert_eq!(resp["ok"], false);
         assert!(resp["error"]
             .as_str()
             .unwrap()
             .contains("protocol mismatch"));
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// `hello` returns the supported protocol range and the capability
+    /// tag list, and echoes the requested `protocol` back in the
+    /// response envelope.
+    #[tokio::test]
+    async fn hello_returns_capabilities_and_negotiated_protocol() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-hello.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let resp = raw_call(
+            &sock,
+            &serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "hello",
+                "client": "muxa-test/0.0.0",
+            }),
+        )
+        .await;
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["protocol"], i64::from(PROTOCOL_VERSION));
+        assert_eq!(resp["min_protocol"], i64::from(MIN_PROTOCOL_VERSION));
+        assert_eq!(resp["max_protocol"], i64::from(PROTOCOL_VERSION));
+        let caps: Vec<&str> = resp["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(caps.contains(&"waiting_choice"));
+        assert!(caps.contains(&"needs_choice"));
+        assert!(caps.contains(&"rate_limited"));
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// After a v1-pinned `hello`, snapshot responses must downgrade
+    /// `waiting_choice` to `waiting_input` so the old client's serde
+    /// deserializer doesn't fail on the unknown variant.
+    #[tokio::test]
+    async fn v1_hello_downgrades_waiting_choice_in_snapshot() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-v1.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let id = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "v1-test".into(),
+            pane: Some("%1".into()),
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        // Drive into WaitingChoice via NeedsChoice notification.
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id.clone(),
+                level: crate::event::NotificationLevel::NeedsChoice,
+                message: "pick one".into(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        // Open one connection: hello v1, then snapshot.
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut hello = serde_json::to_vec(&serde_json::json!({
+            "protocol": 1, "kind": "hello", "client": "v1-test",
+        }))
+        .unwrap();
+        hello.push(b'\n');
+        stream.write_all(&hello).await.unwrap();
+        let mut snap = serde_json::to_vec(&serde_json::json!({
+            "kind": "snapshot",
+        }))
+        .unwrap();
+        snap.push(b'\n');
+        stream.write_all(&snap).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let hello_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(hello_resp["protocol"], 1);
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let snap_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let agents = snap_resp["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["state"], "waiting_input");
+        // The literal v2 string must not appear anywhere in the payload.
+        let body = line.clone();
+        assert!(
+            !body.contains("waiting_choice"),
+            "v1 snapshot still contains waiting_choice: {body}"
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A v2-pinned `hello` keeps `waiting_choice` intact.
+    #[tokio::test]
+    async fn v2_hello_keeps_waiting_choice_in_snapshot() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-v2.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let id = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "v2-test".into(),
+            pane: Some("%2".into()),
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id.clone(),
+                level: crate::event::NotificationLevel::NeedsChoice,
+                message: "pick".into(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut hello = serde_json::to_vec(&serde_json::json!({
+            "protocol": 2, "kind": "hello", "client": "v2-test",
+        }))
+        .unwrap();
+        hello.push(b'\n');
+        stream.write_all(&hello).await.unwrap();
+        let mut snap = serde_json::to_vec(&serde_json::json!({ "kind": "snapshot" })).unwrap();
+        snap.push(b'\n');
+        stream.write_all(&snap).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap(); // hello resp
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let snap_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let agents = snap_resp["agents"].as_array().unwrap();
+        assert_eq!(agents[0]["state"], "waiting_choice");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// `hello` with a protocol outside `[MIN, MAX]` is rejected without
+    /// pinning the connection — the legacy strict-match remains in force
+    /// for the rest of the connection.
+    #[tokio::test]
+    async fn hello_rejects_out_of_range_protocol() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-bad-hello.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let resp = raw_call(
+            &sock,
+            &serde_json::json!({ "protocol": 999, "kind": "hello" }),
+        )
+        .await;
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported protocol"));
 
         tx.send(()).unwrap();
         handle.await.unwrap();

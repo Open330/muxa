@@ -99,6 +99,74 @@ Response:
   "health": { "version": "0.0.1", "protocol": 1 } }
 ```
 
+#### `hello`
+
+Capability handshake. Optional, but clients SHOULD send it as the first
+message on a freshly opened connection. Sending `hello` opts the
+connection into *negotiated-protocol* mode: per-message `protocol`
+fields become advisory, and the server transparently downgrades enum
+variants the client's version doesn't understand. Connections that
+never send `hello` keep the legacy strict-match behaviour (any
+non-matching `protocol` is rejected).
+
+```json
+{ "protocol": 2, "kind": "hello", "client": "muxa/0.5.0" }
+```
+
+- `protocol` (required): the version the client wants to speak. Must
+  fall in the server's `[min_protocol, max_protocol]` range; out-of-range
+  hellos are rejected without pinning the connection.
+- `client` (optional, informational): free-form `name/version` tag, used
+  by the daemon for log lines.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "protocol": 2,
+  "min_protocol": 1,
+  "max_protocol": 2,
+  "capabilities": ["waiting_choice", "needs_choice", "rate_limited"]
+}
+```
+
+- `protocol`: the version the server agreed to speak — equals the
+  client's requested `protocol`.
+- `min_protocol` / `max_protocol`: inclusive range of protocol versions
+  the server can serve via the negotiated regime (with on-the-fly
+  downgrade where needed).
+- `capabilities`: stable string tags advertising semver-additive
+  features the server supports. Clients SHOULD feature-gate on these
+  rather than comparing `protocol` integers, so adding a new tag is
+  always non-breaking.
+
+Capability tags currently advertised:
+
+| tag              | meaning                                                                 |
+|------------------|-------------------------------------------------------------------------|
+| `waiting_choice` | server emits `AgentState::waiting_choice` (otherwise: `waiting_input`). |
+| `needs_choice`   | server emits `NotificationLevel::needs_choice` (otherwise: `needs_input`). |
+| `rate_limited`   | server emits the `rate_limited` event type and the `rate_limit_*` fields on `Agent`. |
+
+#### v1-compat downgrade
+
+When a client pins to `protocol: 1` via `hello`, the server rewrites
+wire-visible enum variants on the outgoing payload so the v1 client's
+deserializer doesn't choke on unknown values:
+
+| v2 value                        | v1 substitute    |
+|---------------------------------|------------------|
+| `AgentState::waiting_choice`    | `waiting_input`  |
+| `NotificationLevel::needs_choice` | `needs_input`  |
+
+The downgrade applies to every response on the connection — including
+streaming `Transition`s after a `subscribe` — until the client closes
+the socket. It is JSON-tree-aware: only standalone enum string values
+are rewritten, never substrings inside other strings (e.g. a
+`last_prompt` that happens to contain the word `waiting_choice` is left
+unchanged).
+
 ---
 
 ## `AgentEvent` schema
