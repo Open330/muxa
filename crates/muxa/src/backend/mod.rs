@@ -478,6 +478,7 @@ mod tests {
             tty: String::new(),
             current_command: "claude".into(),
             title: String::new(),
+            pane_pid: 0,
         }
     }
 

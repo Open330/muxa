@@ -3021,6 +3021,7 @@ mod tests {
             tty: "/dev/pts/0".into(),
             current_command: cmd.into(),
             title: cmd.into(),
+            pane_pid: 0,
         }
     }
 
@@ -3446,6 +3447,7 @@ mod tests {
             tty: String::new(),
             current_command: String::new(),
             title: String::new(),
+            pane_pid: 0,
         }];
         assert_eq!(pane_display(Some("%42"), &panes), "main:1.0");
         // Misses fall through to the raw id without panicking.

@@ -327,6 +327,7 @@ mod tests {
             tty: "/dev/pts/0".into(),
             current_command: "zsh".into(),
             title: String::new(),
+            pane_pid: 0,
         }
     }
 

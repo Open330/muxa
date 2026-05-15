@@ -165,6 +165,7 @@ mod tests {
             tty: String::new(),
             current_command: String::new(),
             title: String::new(),
+            pane_pid: 0,
         }
     }
 

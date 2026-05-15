@@ -30,16 +30,23 @@ pub struct PaneInfo {
     pub tty: String,
     pub current_command: String,
     pub title: String,
+    /// PID of the pane's initial process (typically the shell tmux spawned).
+    /// `0` means "unknown" — backends that can't supply it (zellij CLI today,
+    /// truncated lines from older tmux) leave it zeroed out, and downstream
+    /// discovery treats `0` as "no process tree to walk."
+    pub pane_pid: u32,
 }
 
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
-/// caller only sees well-formed rows.
+/// caller only sees well-formed rows. The `pane_pid` column was added in
+/// 0.5.x; rows from older `PANE_FMT` outputs (or other backends that
+/// don't emit it) get `pane_pid = 0`.
 pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
     let mut panes = Vec::new();
     for line in stdout.lines() {
@@ -47,6 +54,7 @@ pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
         if cols.len() < 7 {
             continue;
         }
+        let pane_pid = cols.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
         panes.push(PaneInfo {
             pane_id: cols[0].into(),
             session: cols[1].into(),
@@ -55,6 +63,7 @@ pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
             tty: cols[4].into(),
             current_command: cols[5].into(),
             title: cols[6].into(),
+            pane_pid,
         });
     }
     panes
