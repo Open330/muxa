@@ -642,20 +642,24 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
 /// Reconcile pane occupants for an incoming `Started` event.
 ///
 /// Returns `false` when the event should be dropped (re-running `muxa sync`
-/// against a pane that's already represented). Otherwise the map has been
-/// updated to make room for the new agent:
+/// against a pane that's already represented by a live session).
+/// Otherwise the map has been updated to make room for the new agent:
 ///
-/// * Synthetic placeholders are only allowed when no other record — real or
-///   synthetic, alive or stopped — already owns the pane. Once a real
-///   session has touched a pane, its identity is sticky: even after it
-///   becomes `Stopped` we still prefer to surface the real history rather
-///   than have a sync pass overwrite it with a generic placeholder.
+/// * Synthetic placeholders are rejected only when a *live* session
+///   (real or synthetic, non-`Stopped`) already owns the pane. A
+///   `Stopped` predecessor does **not** block the synthetic — that's
+///   the exact "user restarted claude in the same pane" case `muxa
+///   sync` is meant to recover from. The stale `Stopped` record is
+///   evicted so the pane carries a single entry. When a real hook
+///   later fires for the new session, the real Started event wins via
+///   the branch below.
 /// * Real `Started` events drop any synthetic placeholders for the same
 ///   pane outright, since the real session is now authoritative.
 /// * Other active sessions sharing the pane are flipped to `Stopped` (the
 ///   user launched a fresh agent in the same pane and the previous session
-///   never emitted `SessionEnd`). Stopped predecessors are left alone here;
-///   the periodic reconciler collapses them later.
+///   never emitted `SessionEnd`). Stopped predecessors that aren't
+///   evicted above are left alone here; the periodic reconciler
+///   collapses them later.
 fn reconcile_pane_for_started(
     agents: &mut HashMap<String, Agent>,
     incoming_session: &str,
@@ -663,16 +667,23 @@ fn reconcile_pane_for_started(
     at: OffsetDateTime,
 ) -> bool {
     if is_synthetic(incoming_session) {
-        // Reject the placeholder if any *other* session — real or synthetic,
-        // any state — already owns this pane. Re-syncing the same synthetic
-        // session id is still allowed because the entry-or-insert path that
-        // follows is a no-op upsert in that case.
-        let already_owned = agents
-            .values()
-            .any(|a| a.session_id != incoming_session && a.pane.as_deref() == Some(pane));
-        if already_owned {
+        let live_owner_exists = agents.values().any(|a| {
+            a.session_id != incoming_session
+                && a.pane.as_deref() == Some(pane)
+                && a.state != AgentState::Stopped
+        });
+        if live_owner_exists {
             return false;
         }
+        // Evict the stale Stopped predecessor(s) — keeping them would
+        // leave two rows for the same pane (one Stopped real, one
+        // synthetic-Idle) and surface the older "stopped" timestamp in
+        // `muxa status` even though the pane is alive again.
+        agents.retain(|_, a| {
+            !(a.pane.as_deref() == Some(pane)
+                && a.session_id != incoming_session
+                && a.state == AgentState::Stopped)
+        });
     } else {
         // Real Started — drop synthetic placeholders for this pane outright.
         agents.retain(|_, a| !(a.pane.as_deref() == Some(pane) && is_synthetic(&a.session_id)));
@@ -2328,8 +2339,14 @@ mod tests {
     /// already `Stopped`. Without this rule, a `muxa sync` pass after the
     /// real agent ended would re-introduce a synthetic placeholder for the
     /// same pane, producing a duplicate row in `muxa watch`.
+    /// `muxa sync` ran after the user restarted claude in the same pane:
+    /// the old real session is `Stopped` but the pane is alive again.
+    /// The synthetic placeholder must evict the stale `Stopped` entry
+    /// and take over — otherwise `muxa status` would report the pane
+    /// as `stopped` indefinitely (until a real hook fires, which may
+    /// take minutes for an idle claude).
     #[tokio::test]
-    async fn synthetic_rejected_when_real_stopped_exists_for_same_pane() {
+    async fn synthetic_replaces_stopped_real_on_same_pane() {
         let store = Store::shared();
         let t0 = datetime!(2026-04-24 12:00:00 UTC);
 
@@ -2373,8 +2390,17 @@ mod tests {
             .await;
 
         let snap = store.snapshot().await;
-        assert_eq!(snap.len(), 1, "synthetic must not coexist with real");
-        assert_eq!(snap[0].session_id, "real");
+        assert_eq!(
+            snap.len(),
+            1,
+            "synthetic should evict the stale stopped predecessor"
+        );
+        assert_eq!(snap[0].session_id, "synthetic-%5");
+        assert_ne!(snap[0].state, AgentState::Stopped);
+        assert!(
+            store.by_session("real").await.is_none(),
+            "stale Stopped real session must be evicted"
+        );
     }
 
     #[tokio::test]
