@@ -252,11 +252,20 @@ muxad
 Or run it as a systemd user service — see [`examples/muxad.service`](examples/muxad.service):
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp examples/muxad.service ~/.config/systemd/user/
+mkdir -p ~/.local/share/systemd/user
+cp examples/muxad.service ~/.local/share/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now muxad.service
 ```
+
+> Vendor-shipped units live under `$XDG_DATA_HOME` (`~/.local/share/systemd/user/`).
+> To override fields without forking the file, drop a same-named unit into
+> `~/.config/systemd/user/` — systemd searches that path first.
+>
+> **Upgrading from an earlier muxa?** If your unit is still at
+> `~/.config/systemd/user/muxad.service`, it keeps working as-is. To match
+> the current layout, move it once:
+> `mv ~/.config/systemd/user/muxad.service ~/.local/share/systemd/user/ && systemctl --user daemon-reload`.
 
 ### 2. Wire your agent
 

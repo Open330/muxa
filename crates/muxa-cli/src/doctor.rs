@@ -21,8 +21,7 @@ use std::time::Duration;
 use muxa::ipc::Client;
 use tokio::time::timeout;
 
-use crate::init::files::{claude, codex, gemini};
-use crate::init::util::default_muxad_socket;
+use crate::init::files::{claude, codex, gemini, launchd, systemd as systemd_files};
 
 /// Marker block ids the `muxa init` tmux installer writes — must match
 /// the constants in `init::components::Component::id`. Duplicated as
@@ -46,13 +45,17 @@ const MUXAD_ERR_LOG: &str = "/tmp/muxad.err";
 /// regardless of how many checks fail — `muxa doctor` is informational,
 /// not a gate. The exit code stays 0 so users can run it from scripts
 /// without conditionals.
-pub async fn run() -> Result<()> {
+///
+/// `socket` is the resolved daemon socket path — typically what `main.rs`
+/// computes from `--socket` / `MUXA_SOCKET` / `cfg.socket` / the default.
+/// Threading it in (rather than re-deriving from defaults here) keeps
+/// `muxa doctor` honest about which socket muxa would actually talk to.
+pub async fn run(socket: PathBuf) -> Result<()> {
     let _ = cliclack::intro("muxa doctor");
 
     let mut issues = 0u32;
 
     // 1. muxad responsive over IPC.
-    let socket = default_muxad_socket();
     match check_muxad(&socket).await {
         CheckResult::Ok(msg) => log_ok(&msg),
         CheckResult::Warn(msg) => {
@@ -186,12 +189,17 @@ async fn check_muxad(socket: &Path) -> CheckResult {
     let client = Client::new(socket.to_path_buf());
     match timeout(Duration::from_millis(1500), client.snapshot()).await {
         Ok(Ok(_)) => CheckResult::Ok(format!("muxad responding at {}", socket.display())),
-        Ok(Err(e)) => CheckResult::Fail(format!(
-            "muxad reachable but errored ({e}) — try `muxa init` to repair"
+        // The inner error already carries the failure mode — including
+        // socket path, connection refused vs. RPC mismatch, etc. The
+        // previous wording ("reachable but errored") was misleading when
+        // the inner error was actually "daemon not reachable", which is
+        // the most common cause. Surface the underlying message and add
+        // a single concrete next step.
+        Ok(Err(e)) => CheckResult::Fail(format!("{e} — run `muxa init` to repair")),
+        Err(_) => CheckResult::Fail(format!(
+            "muxad not responding within 1.5 s at {} — start `muxad` or run `muxa init`",
+            socket.display()
         )),
-        Err(_) => CheckResult::Fail(
-            "muxad not responding — start it with `muxa init` or `muxad &`".into(),
-        ),
     }
 }
 
@@ -223,6 +231,16 @@ fn check_launchctl() -> CheckResult {
 }
 
 fn check_systemctl() -> CheckResult {
+    // Gate on actual bus reachability, not just binary presence: in
+    // Docker without `--privileged` (and other non-systemd-init hosts)
+    // systemctl exists but the user bus is gone, so any `is-active`
+    // probe is meaningless. `muxa init` already falls back to the
+    // shellrc autostart there, and doctor should match that posture.
+    if !systemd_files::systemd_available() {
+        return CheckResult::Warn(
+            "systemd: user manager not usable on this host — relying on shellrc autostart".into(),
+        );
+    }
     let out = Command::new("systemctl")
         .args(["--user", "is-active", SYSTEMD_UNIT])
         .output();
@@ -252,28 +270,64 @@ fn check_systemctl() -> CheckResult {
 
 /// Confirm the unit/plist file the install wizard would write actually
 /// exists on disk. Catches the common "I deleted my dotfiles" footgun.
+///
+/// On Linux, the install location moved from `~/.config/systemd/user/`
+/// to `~/.local/share/systemd/user/`. We surface the legacy path in
+/// messages so upgraders aren't told their existing unit is "missing"
+/// when systemd is happily using it.
 fn check_unit_file() -> CheckResult {
-    let Some(path) = unit_file_path() else {
-        return CheckResult::Warn("Service unit — no per-OS check for this platform".to_string());
-    };
-    if path.exists() {
-        CheckResult::Ok(format!("Unit file present: {}", path.display()))
-    } else {
-        CheckResult::Fail(format!(
-            "Unit file missing: {} — run `muxa init`",
-            path.display()
-        ))
+    match std::env::consts::OS {
+        "macos" => match launchd::default_unit_path() {
+            Some(path) if path.exists() => {
+                CheckResult::Ok(format!("Unit file present: {}", path.display()))
+            }
+            Some(path) => CheckResult::Fail(format!(
+                "Unit file missing: {} — run `muxa init`",
+                path.display()
+            )),
+            None => {
+                CheckResult::Warn("Service unit — could not resolve home directory".to_string())
+            }
+        },
+        "linux" => {
+            // Mirror `check_systemctl`: if the user manager isn't
+            // usable, an absent unit file isn't an issue — it's
+            // expected, because no manager will ever consume it.
+            if !systemd_files::systemd_available() {
+                return CheckResult::Warn(
+                    "Service unit — systemd user manager not usable, no unit needed here".into(),
+                );
+            }
+            check_systemd_unit_file()
+        }
+        _ => CheckResult::Warn("Service unit — no per-OS check for this platform".to_string()),
     }
 }
 
-fn unit_file_path() -> Option<PathBuf> {
-    match std::env::consts::OS {
-        "macos" => dirs::home_dir().map(|h| {
-            h.join("Library/LaunchAgents")
-                .join("dev.open330.muxad.plist")
-        }),
-        "linux" => dirs::config_dir().map(|d| d.join("systemd/user/muxad.service")),
-        _ => None,
+fn check_systemd_unit_file() -> CheckResult {
+    let primary = systemd_files::default_unit_path();
+    let legacy = systemd_files::legacy_unit_path();
+    let primary_exists = primary.as_deref().is_some_and(Path::exists);
+    let legacy_exists = legacy.as_deref().is_some_and(Path::exists);
+
+    match (primary, legacy, primary_exists, legacy_exists) {
+        (Some(p), Some(l), true, true) => CheckResult::Warn(format!(
+            "Unit file present at {} but legacy copy still at {} — remove the legacy file to avoid \
+             override surprises",
+            p.display(),
+            l.display()
+        )),
+        (Some(p), _, true, _) => CheckResult::Ok(format!("Unit file present: {}", p.display())),
+        (Some(p), Some(l), false, true) => CheckResult::Warn(format!(
+            "Unit file at legacy location {} — move it to {} to match the current install layout",
+            l.display(),
+            p.display()
+        )),
+        (Some(p), _, false, false) => CheckResult::Fail(format!(
+            "Unit file missing: {} — run `muxa init`",
+            p.display()
+        )),
+        _ => CheckResult::Warn("Service unit — could not resolve home directory".to_string()),
     }
 }
 

@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
         Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
-        Cmd::Doctor => doctor::run().await,
+        Cmd::Doctor => doctor::run(socket).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
     }

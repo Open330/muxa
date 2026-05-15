@@ -1,4 +1,10 @@
-//! `~/.config/systemd/user/muxad.service` installer.
+//! `~/.local/share/systemd/user/muxad.service` installer.
+//!
+//! We write under `$XDG_DATA_HOME` rather than `$XDG_CONFIG_HOME`
+//! because the unit file is vendor-shipped data, not user-edited
+//! configuration. Users who want to override fields can drop a
+//! same-named unit into `~/.config/systemd/user/` — systemd searches
+//! that path first and the override wins.
 //!
 //! Two pieces:
 //!   1. Render the unit file (matches `examples/muxad.service`).
@@ -18,6 +24,13 @@ pub const UNIT_FILENAME: &str = "muxad.service";
 const UNIT_BODY: &str = include_str!("../../../../../examples/muxad.service");
 
 pub fn default_unit_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("systemd").join("user").join(UNIT_FILENAME))
+}
+
+/// Pre-1.x install location. Doctor still recognises units here so
+/// existing users aren't surprised by a sudden "Unit file missing"
+/// after upgrade — see `doctor::check_unit_file`.
+pub fn legacy_unit_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("systemd").join("user").join(UNIT_FILENAME))
 }
 
@@ -34,12 +47,20 @@ pub fn upsert(existing: Option<&str>) -> (String, Outcome) {
 
 /// Is `systemctl --user` even usable on this host? On macOS, in
 /// containers, or in CI without a session bus the whole component is
-/// a non-starter. We check by running `systemctl --user is-system-running
-/// --quiet || systemctl --user --version` — the `--version` path always
-/// succeeds when systemctl exists at all.
+/// a non-starter and we should fall back to the shellrc autostart.
+///
+/// We probe with `systemctl --user show-environment`: it requires
+/// actual IPC with the user manager (it asks the manager for its
+/// exported environment) and exits 0 only when the bus is reachable.
+/// Lighter alternatives we rejected:
+///   - `--version` only checks that the binary exists; succeeds even
+///     when the manager is unreachable.
+///   - `is-system-running` prints `offline` to stdout when the
+///     manager isn't initialised (e.g. Docker without `--privileged`),
+///     so it looks like a successful state word.
 pub fn systemd_available() -> bool {
     Command::new("systemctl")
-        .args(["--user", "--version"])
+        .args(["--user", "show-environment"])
         .output()
         .is_ok_and(|o| o.status.success())
 }

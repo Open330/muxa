@@ -22,14 +22,11 @@ pub fn uid_string() -> String {
         .map_or_else(|| "501".into(), |s| s.trim().to_string())
 }
 
-/// Where `muxad` listens by default — same logic as `muxa::paths::default_socket`,
-/// duplicated here so the init wizard can probe without reaching across crates
-/// for a `dirs::runtime_dir` lookup that's already in muxa's public API.
+/// Where `muxad` listens by default. Delegates to
+/// `muxa::paths::default_socket` so the wizard's probe path can never
+/// drift from the daemon's actual binding logic.
 pub fn default_muxad_socket() -> PathBuf {
-    if let Some(dir) = dirs::runtime_dir() {
-        return dir.join("muxa.sock");
-    }
-    PathBuf::from(format!("/tmp/muxa-{}.sock", uid_string()))
+    muxa::paths::default_socket()
 }
 
 /// Is `muxad` actually serving requests on `socket`? Lightweight: we

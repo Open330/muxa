@@ -176,11 +176,20 @@ muxad
 참고:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp examples/muxad.service ~/.config/systemd/user/
+mkdir -p ~/.local/share/systemd/user
+cp examples/muxad.service ~/.local/share/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now muxad.service
 ```
+
+> 벤더가 배포하는 unit은 `$XDG_DATA_HOME`(`~/.local/share/systemd/user/`)에 둡니다.
+> 필드를 직접 override하고 싶다면 같은 이름의 unit을 `~/.config/systemd/user/`에
+> 두세요 — systemd가 이쪽을 먼저 찾습니다.
+>
+> **이전 버전 muxa에서 업그레이드 중이라면?** unit이 아직
+> `~/.config/systemd/user/muxad.service`에 있어도 그대로 동작합니다. 현재
+> 레이아웃에 맞추려면 한 번 옮겨주세요:
+> `mv ~/.config/systemd/user/muxad.service ~/.local/share/systemd/user/ && systemctl --user daemon-reload`.
 
 ### 2. 에이전트 연결
 
