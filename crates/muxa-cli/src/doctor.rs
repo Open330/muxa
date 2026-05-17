@@ -19,6 +19,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use muxa::ipc::Client;
+use muxa::state::SYNTHETIC_SESSION_PREFIX;
+use muxa::Agent;
 use tokio::time::timeout;
 
 use crate::init::files::{claude, codex, gemini, launchd, systemd as systemd_files};
@@ -56,85 +58,38 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     let mut issues = 0u32;
 
     // 1. muxad responsive over IPC.
-    match check_muxad(&socket).await {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            issues += 1;
-        }
+    tally(check_muxad(&socket).await, &mut issues);
+
+    // 1½. Agents seen via discovery but never confirmed by a hook.
+    //      Skipped silently when muxad is unreachable — `check_muxad`
+    //      already owns and reported that condition.
+    if let Some(snapshot) = fetch_snapshot(&socket).await {
+        tally(check_synthetic_agents(&snapshot), &mut issues);
     }
 
     // 2. Service manager status (per-OS).
-    match check_service_manager() {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            issues += 1;
-        }
-    }
+    tally(check_service_manager(), &mut issues);
 
     // 3. Service manager unit file on disk.
-    match check_unit_file() {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            issues += 1;
-        }
-    }
+    tally(check_unit_file(), &mut issues);
 
-    // 4. Per-agent hook configuration.
+    // 4. Per-agent hook configuration. Label-prefixed, so it folds
+    //    its own message before handing off to `tally`.
     for (label, result) in check_agent_hooks() {
-        match result {
-            CheckResult::Ok(msg) => log_ok(&format!("{label} — {msg}")),
-            CheckResult::Warn(msg) => {
-                log_warn(&format!("{label} — {msg}"));
-                issues += 1;
-            }
-            CheckResult::Fail(msg) => {
-                log_fail(&format!("{label} — {msg}"));
-                issues += 1;
-            }
-        }
+        let labelled = match result {
+            CheckResult::Ok(m) => CheckResult::Ok(format!("{label} — {m}")),
+            CheckResult::Warn(m) => CheckResult::Warn(format!("{label} — {m}")),
+            CheckResult::Fail(m) => CheckResult::Fail(format!("{label} — {m}")),
+        };
+        tally(labelled, &mut issues);
     }
 
     // 5. tmux marker blocks.
-    match check_tmux_blocks() {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            issues += 1;
-        }
-    }
+    tally(check_tmux_blocks(), &mut issues);
 
     // 5½. MUXA_SOCKET env — the variable that lets every pane agree
     // on the daemon socket path after a restart.
-    match check_muxa_socket_env() {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            issues += 1;
-        }
-    }
+    tally(check_muxa_socket_env(), &mut issues);
 
     // 6. Recent muxad errors. These are surfaced as warnings (not
     //    failures) — a stale ERROR line from yesterday shouldn't make
@@ -182,6 +137,23 @@ fn log_fail(msg: &str) {
     let _ = cliclack::log::error(format!("✗ {msg}"));
 }
 
+/// Fold a uniform check into the running issue count + log line.
+/// One call site per check keeps `run()` readable and removes the
+/// Ok/Warn/Fail boilerplate that used to repeat for every check.
+fn tally(result: CheckResult, issues: &mut u32) {
+    match result {
+        CheckResult::Ok(msg) => log_ok(&msg),
+        CheckResult::Warn(msg) => {
+            log_warn(&msg);
+            *issues += 1;
+        }
+        CheckResult::Fail(msg) => {
+            log_fail(&msg);
+            *issues += 1;
+        }
+    }
+}
+
 /// IPC ping with a 1.5 s budget — same window `init::verify` uses.
 /// Cold-started muxad answers a snapshot in <50 ms; anything past 1.5 s
 /// is a real problem worth surfacing.
@@ -201,6 +173,63 @@ async fn check_muxad(socket: &Path) -> CheckResult {
             socket.display()
         )),
     }
+}
+
+/// One-shot snapshot fetch shared by the post-IPC checks. Returns
+/// `None` when muxad is unreachable so callers can skip rather than
+/// double-reporting the daemon-down condition `check_muxad` owns.
+async fn fetch_snapshot(socket: &Path) -> Option<Vec<Agent>> {
+    let client = Client::new(socket.to_path_buf());
+    match timeout(Duration::from_millis(1500), client.snapshot()).await {
+        Ok(Ok(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Flag agents that exist only as discovery placeholders. A
+/// `synthetic-*` session id means muxa saw the agent's process in a
+/// pane (via `muxa sync` / startup discovery) but has never received
+/// a hook event for it — so it can't track state transitions and the
+/// row is stuck at the discovered `idle`.
+///
+/// Both common causes are fixed by restarting the agent:
+///   * it was launched before `muxa init` wrote its hook config, so
+///     the running process never loaded the hooks;
+///   * (Codex) the hooks are wired in `~/.codex/config.toml` but await
+///     approval behind codex's `/hooks` review gate, so they never
+///     execute until the user approves them.
+fn check_synthetic_agents(snapshot: &[Agent]) -> CheckResult {
+    let panes = synthetic_panes(
+        snapshot
+            .iter()
+            .map(|a| (a.session_id.as_str(), a.pane.as_deref())),
+    );
+    if panes.is_empty() {
+        return CheckResult::Ok("Agent hooks — all tracked agents reporting".into());
+    }
+    CheckResult::Warn(format!(
+        "{} agent(s) discovered but sending no hook events ({}) — restart them \
+         to enable live tracking. Likely started before `muxa init`, or (Codex) \
+         their hooks await approval via `/hooks` inside codex.",
+        panes.len(),
+        panes.join(", ")
+    ))
+}
+
+/// Pure core of [`check_synthetic_agents`], split out so the
+/// classification is unit-testable without constructing the heavy
+/// `Agent` struct. Returns the sorted, de-duplicated panes whose only
+/// record is a synthetic discovery placeholder.
+fn synthetic_panes<'a>(
+    agents: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> Vec<&'a str> {
+    let mut panes: Vec<&str> = agents
+        .filter(|(sid, _)| sid.starts_with(SYNTHETIC_SESSION_PREFIX))
+        .map(|(_, pane)| pane.unwrap_or("?"))
+        .collect();
+    panes.sort_unstable();
+    panes.dedup();
+    panes
 }
 
 /// Branch on the host OS: launchd on macOS, systemd on Linux. Other
@@ -610,6 +639,45 @@ fn uid_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_panes_picks_only_synthetic_sorted_deduped() {
+        let rows = [
+            ("real-abc", Some("%1")),
+            ("synthetic-%4", Some("%4")),
+            ("synthetic-%2", Some("%2")),
+            ("real-def", Some("%3")),
+            // Duplicate synthetic for the same pane (re-sync) collapses.
+            ("synthetic-%2", Some("%2")),
+        ];
+        assert_eq!(
+            synthetic_panes(rows.iter().map(|&(s, p)| (s, p))),
+            vec!["%2", "%4"]
+        );
+    }
+
+    #[test]
+    fn synthetic_panes_empty_when_all_real() {
+        let rows = [("real-a", Some("%1")), ("real-b", Some("%2"))];
+        assert!(synthetic_panes(rows.iter().map(|&(s, p)| (s, p))).is_empty());
+    }
+
+    #[test]
+    fn synthetic_panes_handles_missing_pane() {
+        let rows = [("synthetic-x", None)];
+        assert_eq!(
+            synthetic_panes(rows.iter().map(|&(s, p)| (s, p))),
+            vec!["?"]
+        );
+    }
+
+    #[test]
+    fn check_synthetic_agents_ok_when_none() {
+        assert!(matches!(
+            check_synthetic_agents(&[]),
+            CheckResult::Ok(_)
+        ));
+    }
 
     #[test]
     fn claude_hook_configured_detects_muxa_entry() {
