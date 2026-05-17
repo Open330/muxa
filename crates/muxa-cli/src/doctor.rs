@@ -220,9 +220,7 @@ fn check_synthetic_agents(snapshot: &[Agent]) -> CheckResult {
 /// classification is unit-testable without constructing the heavy
 /// `Agent` struct. Returns the sorted, de-duplicated panes whose only
 /// record is a synthetic discovery placeholder.
-fn synthetic_panes<'a>(
-    agents: impl Iterator<Item = (&'a str, Option<&'a str>)>,
-) -> Vec<&'a str> {
+fn synthetic_panes<'a>(agents: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> Vec<&'a str> {
     let mut panes: Vec<&str> = agents
         .filter(|(sid, _)| sid.starts_with(SYNTHETIC_SESSION_PREFIX))
         .map(|(_, pane)| pane.unwrap_or("?"))
@@ -673,10 +671,7 @@ mod tests {
 
     #[test]
     fn check_synthetic_agents_ok_when_none() {
-        assert!(matches!(
-            check_synthetic_agents(&[]),
-            CheckResult::Ok(_)
-        ));
+        assert!(matches!(check_synthetic_agents(&[]), CheckResult::Ok(_)));
     }
 
     #[test]

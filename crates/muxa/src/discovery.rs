@@ -360,9 +360,9 @@ mod tests {
         assert!(is_wrapper_command("python3"));
         assert!(is_wrapper_command("deno"));
         assert!(is_wrapper_command("BUN")); // case-insensitive
-        // Shells aren't wrappers — pane_current_command being a shell
-        // usually means no agent is foregrounded, not that one is
-        // hiding two levels down.
+                                            // Shells aren't wrappers — pane_current_command being a shell
+                                            // usually means no agent is foregrounded, not that one is
+                                            // hiding two levels down.
         assert!(!is_wrapper_command("zsh"));
         assert!(!is_wrapper_command("bash"));
         // Real agents stay out so the cheap top-level match wins first.
@@ -469,7 +469,10 @@ mod tests {
         // path is covered by `classify_descendants_finds_grandchild` above.
         let panes = vec![pane("%9", "node")];
         let out = discover_from_panes(&panes);
-        assert!(out.is_empty(), "node with no walkable tree must not be classified");
+        assert!(
+            out.is_empty(),
+            "node with no walkable tree must not be classified"
+        );
     }
 
     #[test]
