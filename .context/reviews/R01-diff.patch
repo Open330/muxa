@@ -1,0 +1,42 @@
+diff --git a/crates/muxa/src/tmux/mod.rs b/crates/muxa/src/tmux/mod.rs
+index 6f25a13..ae15c05 100644
+--- a/crates/muxa/src/tmux/mod.rs
++++ b/crates/muxa/src/tmux/mod.rs
+@@ -77,8 +77,36 @@ pub fn inside_tmux() -> bool {
+     std::env::var_os("TMUX").is_some()
+ }
+ 
++/// Best-effort resolution of the user's active pane.
++///
++/// `$TMUX_PANE` covers the common case (a shell running inside that pane).
++/// But tmux does NOT propagate it to processes spawned by `run-shell`, key
++/// bindings, or `display-popup` — including the
++/// `bind-key s display-popup -E "muxa watch"` recipe shipped in
++/// `examples/muxa.tmux.conf`. In those contexts we ask tmux directly, which
++/// returns the pane that is currently active in the focused client (i.e. the
++/// pane the user is looking at behind the popup).
+ pub fn current_pane() -> Option<String> {
+-    std::env::var("TMUX_PANE").ok()
++    if let Some(p) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) {
++        return Some(p);
++    }
++    if !inside_tmux() {
++        return None;
++    }
++    let out = Command::new("tmux")
++        .args(["display-message", "-p", "#{pane_id}"])
++        .output()
++        .ok()?;
++    if !out.status.success() {
++        return None;
++    }
++    let s = String::from_utf8(out.stdout).ok()?;
++    let s = s.trim();
++    if s.is_empty() {
++        None
++    } else {
++        Some(s.to_string())
++    }
+ }
+ 
+ /// Resolve a raw tmux `pane_id` (e.g. `%42`) to its full `PaneInfo`.
