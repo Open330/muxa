@@ -1,9 +1,10 @@
-//! Cumulative tmux session attached-time tracking.
+//! Cumulative tmux session foreground-time tracking.
 //!
 //! The signal this module tracks is intentionally tmux-native:
-//! `#{session_attached} > 0`. That maps to "a human has a client attached
-//! to this session" better than agent hook activity does, and survives
-//! panes/windows coming and going inside the same session.
+//! interactive `tmux list-clients` rows grouped by their `client_session`.
+//! That maps to "a human has this session in a foreground tmux client",
+//! ignores control-mode automation clients, and survives panes/windows
+//! coming and going inside the same session.
 
 use crate::tmux::{self, SessionInfo, TmuxError};
 use serde::{Deserialize, Serialize};
@@ -276,12 +277,34 @@ impl SessionActivityTracker {
 }
 
 fn list_sessions_for_activity() -> Result<Vec<SessionInfo>, String> {
-    match tmux::list_sessions() {
-        Ok(sessions) => Ok(sessions),
+    let mut sessions = match tmux::list_sessions() {
+        Ok(sessions) => sessions,
         Err(TmuxError::NonZero(msg)) if msg.trim_start().starts_with("no server running") => {
-            Ok(Vec::new())
+            return Ok(Vec::new());
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let clients = match tmux::list_clients() {
+        Ok(clients) => clients,
+        Err(TmuxError::NonZero(msg)) if msg.trim_start().starts_with("no server running") => {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    apply_client_counts(&mut sessions, &clients);
+    Ok(sessions)
+}
+
+fn apply_client_counts(sessions: &mut [SessionInfo], clients: &[tmux::ClientInfo]) {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for client in clients {
+        if client.control_mode {
+            continue;
+        }
+        *counts.entry(client.session.as_str()).or_default() += 1;
+    }
+    for session in sessions {
+        session.attached_clients = counts.get(session.name.as_str()).copied().unwrap_or(0);
     }
 }
 
@@ -328,5 +351,25 @@ mod tests {
         assert_eq!(record.attached_since, None);
         assert_eq!(record.total_attached_secs, 20);
         assert_eq!(record.attached_clients, 0);
+    }
+
+    #[test]
+    fn client_counts_drive_user_attached_sessions() {
+        let mut sessions = vec![session("$1", "main", 99), session("$2", "work", 99)];
+        let clients = vec![
+            tmux::ClientInfo {
+                session: "main".into(),
+                control_mode: false,
+            },
+            tmux::ClientInfo {
+                session: "main".into(),
+                control_mode: true,
+            },
+        ];
+
+        apply_client_counts(&mut sessions, &clients);
+
+        assert_eq!(sessions[0].attached_clients, 1);
+        assert_eq!(sessions[1].attached_clients, 0);
     }
 }

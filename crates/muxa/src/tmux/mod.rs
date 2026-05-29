@@ -48,12 +48,22 @@ pub struct SessionInfo {
     pub attached_clients: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClientInfo {
+    /// Name of the session currently displayed by this tmux client.
+    pub session: String,
+    /// tmux control-mode clients are automation, not an interactive user
+    /// looking at a foreground session, so duration tracking ignores them.
+    pub control_mode: bool,
+}
+
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
     "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
+pub(crate) const CLIENT_FMT: &str = "#{client_session}\t#{client_control_mode}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -99,6 +109,21 @@ pub(crate) fn parse_session_lines(stdout: &str) -> Vec<SessionInfo> {
     sessions
 }
 
+pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
+    let mut clients = Vec::new();
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 || cols[0].is_empty() {
+            continue;
+        }
+        clients.push(ClientInfo {
+            session: cols[0].into(),
+            control_mode: matches!(cols[1].trim(), "1" | "true"),
+        });
+    }
+    clients
+}
+
 pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
     let out = Command::new("tmux")
         .args(["list-panes", "-a", "-F", PANE_FMT])
@@ -123,6 +148,19 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
     }
     let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
     Ok(parse_session_lines(&stdout))
+}
+
+pub fn list_clients() -> Result<Vec<ClientInfo>, TmuxError> {
+    let out = Command::new("tmux")
+        .args(["list-clients", "-F", CLIENT_FMT])
+        .output()?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
+    Ok(parse_client_lines(&stdout))
 }
 
 pub fn inside_tmux() -> bool {
@@ -296,6 +334,17 @@ mod tests {
         assert_eq!(sessions[0].name, "main");
         assert_eq!(sessions[0].attached_clients, 1);
         assert_eq!(sessions[1].attached_clients, 0);
+    }
+
+    #[test]
+    fn parses_client_lines() {
+        let stdout = "main\t0\nwork\t1\n\t0\n";
+        let clients = parse_client_lines(stdout);
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].session, "main");
+        assert!(!clients[0].control_mode);
+        assert_eq!(clients[1].session, "work");
+        assert!(clients[1].control_mode);
     }
 
     #[test]

@@ -403,8 +403,8 @@ Prefer one row per tmux session? Run `muxa watch --view session` (or set
 `[watch] view = "session"`). All panes in the same tmux session collapse
 into one row, represented by the most recently active agent in that
 session. In session view, `Enter` jumps to that representative pane and
-the `DUR` column shows the cumulative time the session has had a tmux
-client attached.
+the `DUR` column shows the cumulative time the session has been foregrounded
+by an interactive tmux client.
 
 When the detail line isn't enough — long prompt, multi-paragraph
 assistant response — press **`p`** on the selected row to pop open a
@@ -703,9 +703,10 @@ than wedging the daemon.
 
 ### Session activity
 
-`muxad` also tracks cumulative tmux attached time per session. A tmux
-session counts as active while `#{session_attached} > 0`, i.e. while at
-least one tmux client is attached. This is shown by `muxa watch --view
+`muxad` also tracks cumulative tmux foreground time per session. A tmux
+session counts as active while an interactive tmux client has that
+session foregrounded (`tmux list-clients`, grouped by `client_session`;
+control-mode clients are ignored). This is shown by `muxa watch --view
 session` in the `DUR` column.
 
 ```toml
@@ -715,8 +716,8 @@ enabled       = true
 interval_secs = 5
 ```
 
-The file is chmod 0600 and is updated on attach/detach edges. Set
-`enabled = false` if you do not want muxad polling `tmux list-sessions`.
+The file is chmod 0600 and is updated on foreground attach/detach edges.
+Set `enabled = false` if you do not want muxad polling tmux clients.
 
 ### Reconciler
 
@@ -803,7 +804,7 @@ agent CLIs (Claude, Codex, Gemini)
       ├── in-memory agent registry       └── status / watch TUI / status-line / recap
       ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (event-driven, debounced, 0600)
       ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
-      ├── tmux attached sampler ──▶ session-activity.json  (attached time, 0600)
+      ├── tmux client sampler ──▶ session-activity.json  (foreground time, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
       ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)

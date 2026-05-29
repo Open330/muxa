@@ -310,7 +310,8 @@ fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-r
 `[watch] view = "session"`을 설정하세요. 같은 tmux 세션의 모든 페인이
 하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가 대표
 행이 됩니다. 세션 뷰에서 `Enter`는 대표 페인으로 이동하며, `DUR`
-컬럼은 그 tmux 세션에 클라이언트가 attach 되어 있던 누적 시간을 보여줍니다.
+컬럼은 그 tmux 세션이 interactive tmux client에서 foreground였던 누적
+시간을 보여줍니다.
 
 detail 라인 한 줄로 부족할 때 — 긴 prompt, 여러 단락의 응답 — 선택된
 행에서 **`p`** 키를 누르면 가운데 정렬된 preview 팝업이 뜹니다. 전체
@@ -573,10 +574,10 @@ wedge 시키지 않습니다.
 
 ### 세션 활동 시간
 
-`muxad`는 tmux 세션별 누적 attach 시간을 추적합니다. tmux가
-`#{session_attached} > 0`이라고 보고하는 동안, 즉 하나 이상의 tmux
-클라이언트가 해당 세션에 attach 되어 있는 동안을 active 시간으로
-계산합니다. 이 값은 `muxa watch --view session`의 `DUR` 컬럼에
+`muxad`는 tmux 세션별 누적 foreground 시간을 추적합니다. interactive
+tmux client가 해당 세션을 foreground로 보고 있는 동안을 active 시간으로
+계산합니다(`tmux list-clients`의 `client_session` 기준이며 control-mode
+client는 제외). 이 값은 `muxa watch --view session`의 `DUR` 컬럼에
 표시됩니다.
 
 ```toml
@@ -586,9 +587,9 @@ enabled       = true
 interval_secs = 5
 ```
 
-파일은 chmod 0600이며 attach/detach edge가 감지될 때 갱신됩니다.
-`tmux list-sessions` polling을 원하지 않으면 `enabled = false`로 끌 수
-있습니다.
+파일은 chmod 0600이며 foreground attach/detach edge가 감지될 때
+갱신됩니다. tmux client polling을 원하지 않으면 `enabled = false`로 끌
+수 있습니다.
 
 ### 리컨실러
 
@@ -667,7 +668,7 @@ agent CLIs (Claude, Codex, Gemini)
       ├── in-memory agent registry       └── status / watch TUI / status-line / recap
       ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (이벤트 기반, debounce, 0600)
       ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
-      ├── tmux attached sampler ──▶ session-activity.json  (attached time, 0600)
+      ├── tmux client sampler ──▶ session-activity.json  (foreground time, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
       ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)

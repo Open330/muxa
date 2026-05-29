@@ -48,9 +48,9 @@
 # path        = "/home/$USER/.local/share/muxa/state.json"
 # debounce_ms = 200                  # coalesce window between dirty signal and write
 
-# tmux session attached-time tracker. A session counts as active while
-# `tmux` reports one or more attached clients. `muxa watch --view session`
-# shows the cumulative total in its DUR column.
+# tmux session foreground-time tracker. A session counts as active while an
+# interactive tmux client has that session foregrounded. `muxa watch --view
+# session` shows the cumulative total in its DUR column.
 [session_activity]
 # enabled       = true
 # path          = "/home/$USER/.local/share/muxa/session-activity.json"

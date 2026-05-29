@@ -391,12 +391,13 @@ impl Default for StateConfig {
     }
 }
 
-/// `[session_activity]` config — tracks cumulative tmux attached time.
+/// `[session_activity]` config — tracks cumulative tmux foreground time.
 ///
-/// A session counts as active while `tmux` reports one or more clients
-/// attached to it (`#{session_attached} > 0`). The daemon polls tmux and
-/// persists totals so `muxa watch --view session` can show "how long was
-/// I actually attached to this session?" rather than just agent hook time.
+/// A session counts as active while an interactive tmux client has that
+/// session foregrounded (`tmux list-clients` grouped by `client_session`).
+/// The daemon polls tmux and persists totals so `muxa watch --view session`
+/// can show "how long was I actually attached to this session?" rather
+/// than just agent hook time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionActivityConfig {
