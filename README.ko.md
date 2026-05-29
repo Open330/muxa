@@ -258,7 +258,7 @@ muxa watch          # 실시간 TUI
 |                                            |                                                                          |
 | ------------------------------------------ | ------------------------------------------------------------------------ |
 | `muxa status`                              | 추적 중인 모든 에이전트를 사람이 읽기 쉬운 테이블로 출력.                |
-| `muxa watch [--include-paneless]`          | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그를 주면 1회 호출에 한해 `[watch] hide_paneless`를 무시합니다. |
+| `muxa watch [--include-paneless] [--view pane\|session]` | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그는 1회 호출에 한해 `[watch]` 설정을 덮어씁니다. |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
 | `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
@@ -305,6 +305,12 @@ fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-r
 행은 기본적으로 tmux 세션별로 그룹핑되고, 그룹 내에서는 가장 최근에 활동한
 에이전트가 위로 올라옵니다. 정렬 기준은 `[watch] sort` 로 변경 가능
 (`session`, `activity`, `pane`, `pane_id` — [설정 > 정렬](#watch-sort) 참고).
+
+세션당 한 줄로 보고 싶으면 `muxa watch --view session`을 쓰거나
+`[watch] view = "session"`을 설정하세요. 같은 tmux 세션의 모든 페인이
+하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가 대표
+행이 됩니다. 세션 뷰에서 `Enter`는 대표 페인으로 이동하며, `DUR`
+컬럼은 그 tmux 세션에 클라이언트가 attach 되어 있던 누적 시간을 보여줍니다.
 
 detail 라인 한 줄로 부족할 때 — 긴 prompt, 여러 단락의 응답 — 선택된
 행에서 **`p`** 키를 누르면 가운데 정렬된 preview 팝업이 뜹니다. 전체
@@ -435,6 +441,7 @@ backend = "libnotify"
 
 ```toml
 [watch]
+view = "pane" # 또는 "session"
 # 표시 순서. 빠진 키는 숨겨집니다.
 columns = ["pane", "state", "prompt", "activity"]
 
@@ -444,13 +451,15 @@ columns = ["pane", "state", "prompt", "activity"]
 # "pct:N" 문자열   -> Constraint::Percentage(N)
 pane     = 22
 state    = 14
-prompt   = "min:30"
+prompt   = "min:20"
 activity = 10
+# view = "session"일 때 자동 추가됩니다(이미 설정한 경우 제외).
+session_time = 8
 ```
 
 사용 가능한 컬럼 키: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
-`prompt`, `activity`. 모르는 키는 경고만 남기고 무시되며, muxa 실행을
-막지는 않습니다.
+`limits`, `prompt`, `activity`, `session_time`. 모르는 키는 경고만
+남기고 무시되며, muxa 실행을 막지는 않습니다.
 
 <a name="watch-sort"></a>
 ### 정렬
@@ -562,6 +571,25 @@ snapshotter 는 종료 시 가장 마지막에 죽습니다 — `muxad` 가 IPC 
 초기 상태로 fallback 하므로, 디스크의 잘못된 state.json 이 daemon 을
 wedge 시키지 않습니다.
 
+### 세션 활동 시간
+
+`muxad`는 tmux 세션별 누적 attach 시간을 추적합니다. tmux가
+`#{session_attached} > 0`이라고 보고하는 동안, 즉 하나 이상의 tmux
+클라이언트가 해당 세션에 attach 되어 있는 동안을 active 시간으로
+계산합니다. 이 값은 `muxa watch --view session`의 `DUR` 컬럼에
+표시됩니다.
+
+```toml
+[session_activity]
+enabled       = true
+# path        = "$XDG_DATA_HOME/muxa/session-activity.json"   # 기본값
+interval_secs = 5
+```
+
+파일은 chmod 0600이며 attach/detach edge가 감지될 때 갱신됩니다.
+`tmux list-sessions` polling을 원하지 않으면 `enabled = false`로 끌 수
+있습니다.
+
 ### 리컨실러
 
 주기적인 control loop 가 in-memory 레지스트리를 tmux ground truth 와
@@ -639,6 +667,7 @@ agent CLIs (Claude, Codex, Gemini)
       ├── in-memory agent registry       └── status / watch TUI / status-line / recap
       ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (이벤트 기반, debounce, 0600)
       ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
+      ├── tmux attached sampler ──▶ session-activity.json  (attached time, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
       ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)

@@ -16,7 +16,16 @@ const DASHBOARD_TOKEN_ENV: &str = "MUXA_DASHBOARD_TOKEN";
 
 /// All known `[watch] columns` keys. Used at load time to warn on typos.
 const WATCH_COLUMN_KEYS: &[&str] = &[
-    "pane", "kind", "state", "model", "ctx", "cost", "limits", "prompt", "activity",
+    "pane",
+    "kind",
+    "state",
+    "model",
+    "ctx",
+    "cost",
+    "limits",
+    "prompt",
+    "activity",
+    "session_time",
 ];
 
 /// All known placeholder names accepted in `[watch.detail] template`. A
@@ -95,6 +104,7 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     pub history: HistoryConfig,
     pub state: StateConfig,
+    pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
 }
 
@@ -381,6 +391,39 @@ impl Default for StateConfig {
     }
 }
 
+/// `[session_activity]` config — tracks cumulative tmux attached time.
+///
+/// A session counts as active while `tmux` reports one or more clients
+/// attached to it (`#{session_attached} > 0`). The daemon polls tmux and
+/// persists totals so `muxa watch --view session` can show "how long was
+/// I actually attached to this session?" rather than just agent hook time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionActivityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override the default `$XDG_DATA_HOME/muxa/session-activity.json` path.
+    pub path: Option<PathBuf>,
+    /// Poll cadence. Defaults to 5s, which keeps display error small while
+    /// making the tmux shell-out cost negligible.
+    #[serde(default = "default_session_activity_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for SessionActivityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            interval_secs: default_session_activity_interval_secs(),
+        }
+    }
+}
+
+fn default_session_activity_interval_secs() -> u64 {
+    5
+}
+
 fn default_state_debounce_ms() -> u64 {
     200
 }
@@ -614,6 +657,12 @@ pub struct WatchConfig {
     /// a TOML integer (fixed length) or a string of the form `min:N` /
     /// `pct:N`. Missing keys fall back to the column's built-in default.
     pub widths: HashMap<String, WidthSpec>,
+    /// Row granularity for `muxa watch`.
+    ///
+    /// `pane` is the historical view: one row per tracked agent / bare pane.
+    /// `session` collapses all panes in the same tmux session into one row,
+    /// using the most recently active agent as that session's representative.
+    pub view: WatchView,
     /// Expanded detail line shown under the currently-selected row.
     pub detail: DetailConfig,
     /// Ordered list of sort keys applied to the agent rows in `muxa watch`.
@@ -670,6 +719,15 @@ pub enum PreviewContent {
     LivePane,
 }
 
+/// Granularity of the `muxa watch` table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchView {
+    #[default]
+    Pane,
+    Session,
+}
+
 impl Default for PreviewConfig {
     fn default() -> Self {
         Self {
@@ -712,12 +770,14 @@ impl Default for WatchConfig {
         ];
         let mut widths = HashMap::new();
         widths.insert("pane".to_string(), WidthSpec::Length(22));
-        widths.insert("state".to_string(), WidthSpec::Length(20));
-        widths.insert("prompt".to_string(), WidthSpec::Min(30));
+        widths.insert("state".to_string(), WidthSpec::Length(14));
+        widths.insert("prompt".to_string(), WidthSpec::Min(20));
         widths.insert("activity".to_string(), WidthSpec::Length(10));
+        widths.insert("session_time".to_string(), WidthSpec::Length(8));
         Self {
             columns,
             widths,
+            view: WatchView::Pane,
             detail: DetailConfig::default(),
             // Group by session, then bring the most recently active agent
             // in each group to the top — covers both "what's moving" and
@@ -878,9 +938,9 @@ mod tests {
         ));
         assert!(matches!(
             cfg.widths.get("state"),
-            Some(WidthSpec::Length(20))
+            Some(WidthSpec::Length(14))
         ));
-        assert!(matches!(cfg.widths.get("prompt"), Some(WidthSpec::Min(30))));
+        assert!(matches!(cfg.widths.get("prompt"), Some(WidthSpec::Min(20))));
         assert!(matches!(
             cfg.widths.get("activity"),
             Some(WidthSpec::Length(10))
@@ -943,6 +1003,12 @@ sort = ["activity"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.watch.sort, vec![WatchSortKey::Activity]);
+    }
+
+    #[test]
+    fn parses_watch_session_view() {
+        let cfg: Config = toml::from_str("[watch]\nview = \"session\"\n").unwrap();
+        assert_eq!(cfg.watch.view, WatchView::Session);
     }
 
     #[test]

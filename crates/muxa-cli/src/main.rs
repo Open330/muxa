@@ -7,7 +7,7 @@ mod upgrade;
 mod watch;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ContentArrangement, Table};
 use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
@@ -79,6 +79,9 @@ enum Cmd {
         /// detached SDK session.
         #[arg(long)]
         include_paneless: bool,
+        /// Row granularity: pane (default) or tmux session.
+        #[arg(long, value_enum)]
+        view: Option<WatchViewArg>,
     },
     /// Backfill the registry by scanning tmux panes for agent processes.
     Sync,
@@ -140,6 +143,21 @@ enum HookCmd {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WatchViewArg {
+    Pane,
+    Session,
+}
+
+impl From<WatchViewArg> for muxa::config::WatchView {
+    fn from(value: WatchViewArg) -> Self {
+        match value {
+            WatchViewArg::Pane => Self::Pane,
+            WatchViewArg::Session => Self::Session,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -168,7 +186,10 @@ async fn main() -> Result<()> {
             cmd_panes();
             Ok(())
         }
-        Cmd::Watch { include_paneless } => cmd_watch(&client, cfg, include_paneless).await,
+        Cmd::Watch {
+            include_paneless,
+            view,
+        } => cmd_watch(&client, cfg, include_paneless, view).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
@@ -228,18 +249,36 @@ async fn cmd_sync(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_watch(client: &Client, cfg: Config, include_paneless: bool) -> Result<()> {
+async fn cmd_watch(
+    client: &Client,
+    cfg: Config,
+    include_paneless: bool,
+    view: Option<WatchViewArg>,
+) -> Result<()> {
     // watch::run restores the terminal before returning, so by the time we
     // get here it's safe to exec tmux commands that mutate the client's
     // attached session / pane.
     //
     // CLI flag wins over config — one-shot override for the current
     // invocation without touching the user's ~/.config/muxa/config.toml.
-    let watch_cfg = WatchConfig {
+    let mut watch_cfg = WatchConfig {
         hide_paneless: cfg.watch.hide_paneless && !include_paneless,
         ..cfg.watch
     };
-    if let Some(pane_id) = watch::run(client, watch_cfg).await? {
+    if let Some(view) = view {
+        watch_cfg.view = view.into();
+    }
+    let session_activity_path = cfg
+        .session_activity
+        .enabled
+        .then(|| {
+            cfg.session_activity
+                .path
+                .clone()
+                .or_else(paths::default_session_activity_file)
+        })
+        .flatten();
+    if let Some(pane_id) = watch::run(client, watch_cfg, session_activity_path).await? {
         jump_to_pane(&pane_id);
     }
     Ok(())

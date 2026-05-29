@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
 
     spawn_gc_task(&store, &shutdown_tx);
     spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
+    spawn_session_activity_task(&cfg, &shutdown_tx);
     spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
 
     // The snapshotter listens on its own dedicated channel rather than
@@ -429,6 +430,34 @@ fn spawn_reconciler_task(
         stuck_working_timeout_secs = cfg.reconciler.stuck_working_timeout_secs,
         stuck_waiting_timeout_secs = cfg.reconciler.stuck_waiting_timeout_secs,
         "reconciler enabled",
+    );
+}
+
+/// Track cumulative tmux session attached time for `muxa watch --view session`.
+fn spawn_session_activity_task(cfg: &Config, shutdown_tx: &broadcast::Sender<()>) {
+    if !cfg.session_activity.enabled {
+        tracing::info!("session activity tracking disabled by config");
+        return;
+    }
+    let Some(path) = cfg
+        .session_activity
+        .path
+        .clone()
+        .or_else(paths::default_session_activity_file)
+    else {
+        tracing::warn!("session activity tracking enabled but no path resolvable");
+        return;
+    };
+    let tracker = muxa::SessionActivityTracker::new(
+        path.clone(),
+        std::time::Duration::from_secs(cfg.session_activity.interval_secs),
+    );
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(tracker.run(shutdown_rx));
+    tracing::info!(
+        path = %path.display(),
+        interval_secs = cfg.session_activity.interval_secs,
+        "session activity tracking enabled",
     );
 }
 

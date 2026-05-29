@@ -7,6 +7,7 @@ pub const CONFIG_DIRNAME: &str = "muxa";
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const HISTORY_FILENAME: &str = "prompts.ndjson";
 pub const STATE_FILENAME: &str = "state.json";
+pub const SESSION_ACTIVITY_FILENAME: &str = "session-activity.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -36,6 +37,13 @@ pub fn default_history_file() -> Option<PathBuf> {
 /// the prompt history so a single backup or rotation policy covers both.
 pub fn default_state_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
+}
+
+/// Default tmux session activity file: `$XDG_DATA_HOME/muxa/session-activity.json`.
+/// Co-located with the daemon's other user-state files so backups and
+/// cleanup policies stay simple.
+pub fn default_session_activity_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(SESSION_ACTIVITY_FILENAME))
 }
 
 fn posix_uid() -> u32 {

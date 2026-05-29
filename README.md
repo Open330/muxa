@@ -335,7 +335,7 @@ muxa watch          # live TUI
 |                                            |                                                                        |
 | ------------------------------------------ | ---------------------------------------------------------------------- |
 | `muxa status`                              | Human-readable table of all tracked agents.                            |
-| `muxa watch [--include-paneless]`          | Full-screen live TUI — see [Live TUI](#live-tui). The flag overrides `[watch] hide_paneless` for one invocation. |
+| `muxa watch [--include-paneless] [--view pane\|session]` | Full-screen live TUI — see [Live TUI](#live-tui). Flags override `[watch]` for one invocation. |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
 | `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
@@ -398,6 +398,13 @@ Rows are grouped by tmux session, with the most recently active agent
 floated to the top of each group. Reorder via `[watch] sort` (see
 [Configuration](#watch-sort)) — useful sort keys: `session`, `activity`,
 `pane`, `pane_id`.
+
+Prefer one row per tmux session? Run `muxa watch --view session` (or set
+`[watch] view = "session"`). All panes in the same tmux session collapse
+into one row, represented by the most recently active agent in that
+session. In session view, `Enter` jumps to that representative pane and
+the `DUR` column shows the cumulative time the session has had a tmux
+client attached.
 
 When the detail line isn't enough — long prompt, multi-paragraph
 assistant response — press **`p`** on the selected row to pop open a
@@ -559,6 +566,7 @@ the last prompt — `model` / `ctx` / `cost` are opt-in:
 
 ```toml
 [watch]
+view = "pane" # or "session"
 # Display order. Omitted keys are hidden.
 columns = ["pane", "state", "prompt", "activity"]
 
@@ -568,13 +576,15 @@ columns = ["pane", "state", "prompt", "activity"]
 # "pct:N" string  -> Constraint::Percentage(N)
 pane     = 22
 state    = 14
-prompt   = "min:30"
+prompt   = "min:20"
 activity = 10
+# Used automatically by `view = "session"` unless already configured.
+session_time = 8
 ```
 
 Valid column keys: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
-`prompt`, `activity`. Unknown keys log a warning and are skipped — they
-don't prevent muxa from starting.
+`limits`, `prompt`, `activity`, `session_time`. Unknown keys log a
+warning and are skipped — they don't prevent muxa from starting.
 
 <a name="watch-sort"></a>
 ### Sort order
@@ -691,6 +701,23 @@ warn and fall through to an empty initial state, so a bad state.json
 on disk degrades cleanly to the synthetic-placeholder baseline rather
 than wedging the daemon.
 
+### Session activity
+
+`muxad` also tracks cumulative tmux attached time per session. A tmux
+session counts as active while `#{session_attached} > 0`, i.e. while at
+least one tmux client is attached. This is shown by `muxa watch --view
+session` in the `DUR` column.
+
+```toml
+[session_activity]
+enabled       = true
+# path        = "$XDG_DATA_HOME/muxa/session-activity.json"   # default
+interval_secs = 5
+```
+
+The file is chmod 0600 and is updated on attach/detach edges. Set
+`enabled = false` if you do not want muxad polling `tmux list-sessions`.
+
 ### Reconciler
 
 A periodic control loop that converges the in-memory registry against
@@ -776,6 +803,7 @@ agent CLIs (Claude, Codex, Gemini)
       ├── in-memory agent registry       └── status / watch TUI / status-line / recap
       ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (event-driven, debounced, 0600)
       ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
+      ├── tmux attached sampler ──▶ session-activity.json  (attached time, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
       ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)

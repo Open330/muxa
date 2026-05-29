@@ -20,6 +20,7 @@
 
 use std::future::Future;
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -31,11 +32,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa::config::{WatchConfig, WatchSortKey, WidthSpec};
+use muxa::config::{WatchConfig, WatchSortKey, WatchView, WidthSpec};
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
+use muxa::session_activity::SessionActivity;
 use muxa::state::Agent;
-use muxa::tmux::PaneInfo;
+use muxa::tmux::{PaneInfo, SessionInfo};
 use muxa::{AgentKind, AgentState};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -97,6 +99,7 @@ pub(crate) enum WatchColumn {
     Limits,
     Prompt,
     Activity,
+    SessionTime,
 }
 
 impl WatchColumn {
@@ -113,6 +116,7 @@ impl WatchColumn {
             "limits" => Self::Limits,
             "prompt" => Self::Prompt,
             "activity" => Self::Activity,
+            "session_time" => Self::SessionTime,
             _ => return None,
         })
     }
@@ -128,6 +132,7 @@ impl WatchColumn {
             Self::Limits => "LIMITS",
             Self::Prompt => "LAST PROMPT",
             Self::Activity => "ACTIVITY",
+            Self::SessionTime => "DUR",
         }
     }
 
@@ -136,11 +141,8 @@ impl WatchColumn {
             // PANE — "session:window.pane" can run long; 22 covers most.
             Self::Pane => Constraint::Length(22),
             Self::Kind => Constraint::Length(12),
-            // STATE — widest base label is `waiting_choice` (14 cells);
-            // the stuck-duration suffix (` Ns` / ` Nm` / ` Nh`) adds up
-            // to 5 more cells, so 20 keeps the suffix visible without
-            // crowding neighbouring columns.
-            Self::State => Constraint::Length(20),
+            // STATE — widest base label is `waiting_choice` (14 cells).
+            Self::State => Constraint::Length(14),
             Self::Model => Constraint::Length(16),
             Self::Ctx => Constraint::Length(5),
             Self::Cost => Constraint::Length(7),
@@ -151,6 +153,7 @@ impl WatchColumn {
             Self::Limits => Constraint::Length(18),
             Self::Prompt => Constraint::Min(20),
             Self::Activity => Constraint::Length(10),
+            Self::SessionTime => Constraint::Length(8),
         }
     }
 
@@ -189,19 +192,7 @@ impl WatchColumn {
                         .add_modifier(Modifier::DIM),
                     AgentState::Starting => Style::default().fg(Color::Cyan),
                 };
-                // Append a stuck-duration suffix only for the "blocked on
-                // the user" states — long-running Working rows are
-                // expected and would just be noise. Format mirrors
-                // top(1)'s compact `15s` / `12m` / `1h` so the column
-                // stays inside its 14-cell default width.
-                let label = match a.state {
-                    AgentState::WaitingInput | AgentState::WaitingChoice => {
-                        let suffix = stuck_suffix(a.state_entered_at, now);
-                        format!("{} {suffix}", a.state)
-                    }
-                    _ => a.state.to_string(),
-                };
-                Text::from(Span::styled(label, style))
+                Text::from(Span::styled(a.state.to_string(), style))
             }
             Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
             Self::Ctx => a
@@ -225,6 +216,12 @@ impl WatchColumn {
                 .collect::<String>()
                 .into(),
             Self::Activity => relative_time(a.last_activity_at, now).into(),
+            Self::SessionTime => Text::from(Span::styled(
+                "-",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )),
         }
     }
 
@@ -250,9 +247,52 @@ impl WatchColumn {
                 Text::from(Span::styled(summary, dim))
             }
             Self::Kind | Self::State => Text::from(Span::styled("—", dim)),
-            Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
-                Text::from(Span::styled("-", dim))
-            }
+            Self::Model
+            | Self::Ctx
+            | Self::Cost
+            | Self::Limits
+            | Self::Activity
+            | Self::SessionTime => Text::from(Span::styled("-", dim)),
+        }
+    }
+
+    fn session_text<'a>(
+        self,
+        s: &'a SessionRow,
+        now: OffsetDateTime,
+        panes: &'a [PaneInfo],
+    ) -> Text<'a> {
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let Some(agent) = s.latest_agent.as_ref() else {
+            return match self {
+                Self::Pane => Text::from(session_label(s)),
+                Self::Prompt => Text::from(Span::styled(
+                    s.bare_summary.clone().unwrap_or_else(|| {
+                        format!("{} pane{}", s.pane_count, plural(s.pane_count))
+                    }),
+                    dim,
+                )),
+                Self::SessionTime => session_time_text(s, now),
+                Self::Kind | Self::State => Text::from(Span::styled("—", dim)),
+                Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
+                    Text::from(Span::styled("-", dim))
+                }
+            };
+        };
+
+        match self {
+            Self::Pane => Text::from(session_label(s)),
+            Self::Kind
+            | Self::State
+            | Self::Model
+            | Self::Ctx
+            | Self::Cost
+            | Self::Limits
+            | Self::Prompt
+            | Self::Activity => self.agent_text(agent, now, panes),
+            Self::SessionTime => session_time_text(s, now),
         }
     }
 }
@@ -307,6 +347,7 @@ impl WatchColumn {
             Self::Limits => "limits",
             Self::Prompt => "prompt",
             Self::Activity => "activity",
+            Self::SessionTime => "session_time",
         }
     }
 }
@@ -317,6 +358,19 @@ impl WatchColumn {
 pub(crate) enum WatchRow {
     Agent(Agent),
     BarePane(PaneInfo),
+    Session(Box<SessionRow>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionRow {
+    pub session: String,
+    pub pane_ids: Vec<String>,
+    pub representative_pane: Option<String>,
+    pub latest_agent: Option<Agent>,
+    pub pane_count: usize,
+    pub agent_count: usize,
+    pub bare_summary: Option<String>,
+    pub activity: Option<SessionActivity>,
 }
 
 impl WatchRow {
@@ -324,6 +378,15 @@ impl WatchRow {
         match self {
             Self::Agent(a) => a.pane.as_deref(),
             Self::BarePane(p) => Some(&p.pane_id),
+            Self::Session(s) => s.representative_pane.as_deref(),
+        }
+    }
+
+    fn contains_pane(&self, pane_id: &str) -> bool {
+        match self {
+            Self::Agent(a) => a.pane.as_deref() == Some(pane_id),
+            Self::BarePane(p) => p.pane_id == pane_id,
+            Self::Session(s) => s.pane_ids.iter().any(|id| id == pane_id),
         }
     }
 }
@@ -688,6 +751,11 @@ pub(crate) struct App {
     /// per-row resolves used to cost ~5 ms each, so a 35-agent table
     /// blocked the input loop for ~175 ms per paint.
     pub panes: Vec<PaneInfo>,
+    /// Snapshot of tmux sessions from the last refresh. Only populated for
+    /// tmux hosts; zellij and host-down cases leave it empty.
+    pub sessions: Vec<SessionInfo>,
+    /// Persisted cumulative attached-time counters keyed by tmux session id.
+    pub session_activity: Vec<SessionActivity>,
     /// True between a user-triggered refresh request (`r`) and the
     /// matching outcome landing on the channel. Surfaces a brief
     /// "↻ refreshing…" hint in the header so mashing `r` during a
@@ -802,7 +870,31 @@ impl App {
     }
 
     pub(crate) fn with_config(cfg: WatchConfig) -> Self {
-        let columns = resolve_columns(&cfg);
+        let mut columns = resolve_columns(&cfg);
+        if cfg.view == WatchView::Session && !columns.contains(&WatchColumn::SessionTime) {
+            if columns.as_slice()
+                == [
+                    WatchColumn::Pane,
+                    WatchColumn::State,
+                    WatchColumn::Prompt,
+                    WatchColumn::Activity,
+                ]
+            {
+                columns = vec![
+                    WatchColumn::Pane,
+                    WatchColumn::State,
+                    WatchColumn::SessionTime,
+                    WatchColumn::Activity,
+                    WatchColumn::Prompt,
+                ];
+            } else {
+                let insert_at = columns
+                    .iter()
+                    .position(|c| matches!(c, WatchColumn::Prompt | WatchColumn::Activity))
+                    .unwrap_or(columns.len());
+                columns.insert(insert_at, WatchColumn::SessionTime);
+            }
+        }
         Self {
             rows: Vec::new(),
             table_state: TableState::default(),
@@ -811,6 +903,8 @@ impl App {
             watch_cfg: cfg,
             columns,
             panes: Vec::new(),
+            sessions: Vec::new(),
+            session_activity: Vec::new(),
             refresh_pending: false,
             initial_pane: None,
             preview: None,
@@ -832,7 +926,18 @@ impl App {
     /// Replace the row set. `agents` (tracked) are listed first in stable
     /// order; `panes` minus any pane already represented by an agent are
     /// appended as `BarePane` rows.
-    pub(crate) fn set_data(&mut self, mut agents: Vec<Agent>, panes: Vec<PaneInfo>) {
+    #[cfg(test)]
+    pub(crate) fn set_data(&mut self, agents: Vec<Agent>, panes: Vec<PaneInfo>) {
+        self.set_data_with_sessions(agents, panes, Vec::new(), Vec::new());
+    }
+
+    pub(crate) fn set_data_with_sessions(
+        &mut self,
+        mut agents: Vec<Agent>,
+        panes: Vec<PaneInfo>,
+        sessions: Vec<SessionInfo>,
+        session_activity: Vec<SessionActivity>,
+    ) {
         // Filter out paneless agents up front when the user has opted in
         // (the default). They can't be attached to from the picker — Enter
         // is a no-op — so listing them just clutters the actionable view.
@@ -843,6 +948,22 @@ impl App {
             let before = agents.len();
             agents.retain(|a| a.pane.is_some());
             self.paneless_hidden = before - agents.len();
+        }
+
+        if self.watch_cfg.view == WatchView::Session {
+            self.rows = build_session_rows(
+                agents,
+                &panes,
+                &sessions,
+                &session_activity,
+                &self.watch_cfg.sort,
+            );
+            self.panes = panes;
+            self.sessions = sessions;
+            self.session_activity = session_activity;
+            self.last_refresh = OffsetDateTime::now_utc();
+            self.clamp_selection();
+            return;
         }
 
         // Sort agent rows according to the user's `[watch] sort` config.
@@ -881,6 +1002,8 @@ impl App {
         // `pane_display` can resolve `session:window.pane` labels for
         // agent rows by lookup instead of a tmux shell-out per render.
         self.panes = panes;
+        self.sessions = sessions;
+        self.session_activity = session_activity;
         self.last_refresh = OffsetDateTime::now_utc();
         self.clamp_selection();
     }
@@ -901,7 +1024,7 @@ impl App {
                 let hint = self.initial_pane.take();
                 let initial = hint
                     .as_deref()
-                    .and_then(|id| self.rows.iter().position(|r| r.pane_id() == Some(id)))
+                    .and_then(|id| self.rows.iter().position(|r| r.contains_pane(id)))
                     .unwrap_or(0);
                 self.table_state.select(Some(initial));
             }
@@ -957,6 +1080,7 @@ impl App {
         match self.selected_row()? {
             WatchRow::Agent(a) => a.last_prompt.as_deref(),
             WatchRow::BarePane(_) => None,
+            WatchRow::Session(s) => s.latest_agent.as_ref()?.last_prompt.as_deref(),
         }
     }
 
@@ -1037,6 +1161,176 @@ fn sort_agents(
     a.pane.as_deref().cmp(&b.pane.as_deref())
 }
 
+fn build_session_rows(
+    agents: Vec<Agent>,
+    panes: &[PaneInfo],
+    sessions: &[SessionInfo],
+    session_activity: &[SessionActivity],
+    sort_keys: &[WatchSortKey],
+) -> Vec<WatchRow> {
+    #[derive(Default)]
+    struct Builder {
+        session: String,
+        panes: Vec<PaneInfo>,
+        agents: Vec<Agent>,
+        activity: Option<SessionActivity>,
+    }
+
+    let pane_by_id: HashMap<&str, &PaneInfo> =
+        panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+    let session_id_by_name: HashMap<&str, &str> = sessions
+        .iter()
+        .map(|s| (s.name.as_str(), s.session_id.as_str()))
+        .collect();
+    let activity_by_id: HashMap<&str, &SessionActivity> = session_activity
+        .iter()
+        .map(|a| (a.session_id.as_str(), a))
+        .collect();
+
+    let mut builders: HashMap<String, Builder> = HashMap::new();
+    for p in panes {
+        let entry = builders
+            .entry(p.session.clone())
+            .or_insert_with(|| Builder {
+                session: p.session.clone(),
+                ..Builder::default()
+            });
+        entry.panes.push(p.clone());
+    }
+
+    for agent in agents {
+        let session = agent
+            .pane
+            .as_deref()
+            .and_then(|id| pane_by_id.get(id).map(|p| p.session.clone()))
+            .unwrap_or_else(|| {
+                agent
+                    .pane
+                    .as_deref()
+                    .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"))
+            });
+        let entry = builders.entry(session.clone()).or_insert_with(|| Builder {
+            session,
+            ..Builder::default()
+        });
+        entry.agents.push(agent);
+    }
+
+    for builder in builders.values_mut() {
+        if let Some(session_id) = session_id_by_name.get(builder.session.as_str()) {
+            if let Some(activity) = activity_by_id.get(session_id).copied() {
+                builder.activity = Some(activity.clone());
+            }
+        }
+    }
+
+    let mut rows: Vec<SessionRow> = builders
+        .into_values()
+        .map(|mut b| {
+            b.panes.sort_by(sort_panes);
+            b.agents.sort_by(|a, b| {
+                b.last_activity_at
+                    .cmp(&a.last_activity_at)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            });
+            let latest_agent = b.agents.first().cloned();
+            let representative_pane = latest_agent
+                .as_ref()
+                .and_then(|a| a.pane.clone())
+                .or_else(|| b.panes.first().map(|p| p.pane_id.clone()));
+            let bare_summary = if latest_agent.is_none() {
+                b.panes.first().map(|p| {
+                    let first = if p.title.is_empty() || p.title == p.current_command {
+                        p.current_command.clone()
+                    } else {
+                        format!("{}  {}", p.current_command, p.title)
+                    };
+                    if b.panes.len() > 1 {
+                        format!("{first} · {} panes", b.panes.len())
+                    } else {
+                        first
+                    }
+                })
+            } else {
+                None
+            };
+            SessionRow {
+                session: b.session,
+                pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
+                representative_pane,
+                latest_agent,
+                pane_count: b.panes.len(),
+                agent_count: b.agents.len(),
+                bare_summary,
+                activity: b.activity,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| sort_sessions(a, b, sort_keys, &pane_by_id));
+    rows.into_iter()
+        .map(|row| WatchRow::Session(Box::new(row)))
+        .collect()
+}
+
+fn sort_panes(a: &PaneInfo, b: &PaneInfo) -> std::cmp::Ordering {
+    a.session
+        .cmp(&b.session)
+        .then_with(|| {
+            a.window_index
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+                .cmp(&b.window_index.parse::<u32>().unwrap_or(u32::MAX))
+        })
+        .then_with(|| {
+            a.pane_index
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+                .cmp(&b.pane_index.parse::<u32>().unwrap_or(u32::MAX))
+        })
+        .then_with(|| a.pane_id.cmp(&b.pane_id))
+}
+
+fn sort_sessions(
+    a: &SessionRow,
+    b: &SessionRow,
+    keys: &[WatchSortKey],
+    pane_by_id: &HashMap<&str, &PaneInfo>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let pane_info = |row: &SessionRow| {
+        row.representative_pane
+            .as_deref()
+            .and_then(|id| pane_by_id.get(id).copied())
+    };
+    for key in keys {
+        let cmp = match key {
+            WatchSortKey::Session => a.session.cmp(&b.session),
+            WatchSortKey::Activity => b
+                .latest_agent
+                .as_ref()
+                .map(|agent| agent.last_activity_at)
+                .cmp(&a.latest_agent.as_ref().map(|agent| agent.last_activity_at)),
+            WatchSortKey::Pane => {
+                let key_for = |info: Option<&PaneInfo>| {
+                    info.map(|p| {
+                        (
+                            p.window_index.parse::<u32>().unwrap_or(u32::MAX),
+                            p.pane_index.parse::<u32>().unwrap_or(u32::MAX),
+                        )
+                    })
+                };
+                key_for(pane_info(a)).cmp(&key_for(pane_info(b)))
+            }
+            WatchSortKey::PaneId => a.representative_pane.cmp(&b.representative_pane),
+        };
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.session.cmp(&b.session)
+}
+
 /// Render a `pane_id` as `session:window.pane` when we can resolve it
 /// against the cached pane list, falling back to the raw id (e.g.
 /// `%1618`) when the agent's pane no longer exists.
@@ -1059,6 +1353,60 @@ fn pane_display(pane_id: Option<&str>, panes: &[PaneInfo]) -> String {
     match panes.iter().find(|p| p.pane_id == id) {
         Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
         None => id.to_string(),
+    }
+}
+
+fn session_label(s: &SessionRow) -> String {
+    if s.agent_count > 1 {
+        format!("{} · {} agents", s.session, s.agent_count)
+    } else {
+        s.session.clone()
+    }
+}
+
+fn session_time_text(s: &SessionRow, now: OffsetDateTime) -> Text<'static> {
+    let Some(activity) = s.activity.as_ref() else {
+        return Text::from(Span::styled(
+            "-",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    };
+    let text = format_duration(activity.effective_total_secs(now));
+    let style = if activity.is_attached() {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Text::from(Span::styled(text, style))
+}
+
+fn format_duration(total_secs: u64) -> String {
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
+    let minutes = total_secs / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let mins = minutes % 60;
+    if hours < 24 {
+        return format!("{hours}h{mins:02}m");
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    format!("{days}d{rem_hours:02}h")
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -1130,6 +1478,8 @@ pub(crate) enum RefreshOutcome {
 pub(crate) struct FullRefresh {
     pub agents: Vec<Agent>,
     pub panes: Vec<PaneInfo>,
+    pub sessions: Vec<SessionInfo>,
+    pub session_activity: Vec<SessionActivity>,
     pub error: Option<DaemonError>,
 }
 
@@ -1177,6 +1527,11 @@ pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
 /// "first event for this session" case, where the next fallback
 /// tick will reconcile sort order and pane labels.
 fn apply_single_agent(app: &mut App, agent: Agent) {
+    if app.watch_cfg.view == WatchView::Session {
+        apply_single_agent_to_session(app, agent);
+        return;
+    }
+
     let key = (agent.kind, agent.session_id.clone());
     let mut updated = false;
     for row in &mut app.rows {
@@ -1246,10 +1601,63 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
     // jumped" jitter we're trying to fix.
 }
 
+fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
+    let session = agent
+        .pane
+        .as_deref()
+        .and_then(|id| {
+            app.panes
+                .iter()
+                .find(|p| p.pane_id == id)
+                .map(|p| p.session.clone())
+        })
+        .unwrap_or_else(|| {
+            agent
+                .pane
+                .as_deref()
+                .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"))
+        });
+    for row in &mut app.rows {
+        let WatchRow::Session(s) = row else {
+            continue;
+        };
+        if s.session != session {
+            continue;
+        }
+        let replace = s
+            .latest_agent
+            .as_ref()
+            .is_none_or(|prior| agent.last_activity_at >= prior.last_activity_at);
+        if replace {
+            s.representative_pane = agent.pane.clone().or_else(|| s.representative_pane.clone());
+            if let Some(pane) = agent.pane.as_ref() {
+                if !s.pane_ids.iter().any(|id| id == pane) {
+                    s.pane_ids.push(pane.clone());
+                }
+            }
+            s.latest_agent = Some(agent);
+        }
+        return;
+    }
+
+    app.rows.push(WatchRow::Session(Box::new(SessionRow {
+        session,
+        pane_ids: agent.pane.clone().into_iter().collect(),
+        representative_pane: agent.pane.clone(),
+        latest_agent: Some(agent),
+        pane_count: 0,
+        agent_count: 1,
+        bare_summary: None,
+        activity: None,
+    })));
+}
+
 fn apply_full(app: &mut App, full: FullRefresh) {
     let FullRefresh {
         agents: mut new_agents,
         panes,
+        sessions,
+        session_activity,
         error,
     } = full;
 
@@ -1266,6 +1674,10 @@ fn apply_full(app: &mut App, full: FullRefresh) {
         .filter_map(|row| match row {
             WatchRow::Agent(a) => Some(((a.kind, a.session_id.clone()), a)),
             WatchRow::BarePane(_) => None,
+            WatchRow::Session(s) => s
+                .latest_agent
+                .as_ref()
+                .map(|a| ((a.kind, a.session_id.clone()), a)),
         })
         .collect();
 
@@ -1326,14 +1738,18 @@ fn apply_full(app: &mut App, full: FullRefresh) {
         }
     }
 
-    app.set_data(new_agents, panes);
+    app.set_data_with_sessions(new_agents, panes, sessions, session_activity);
 }
 
 /// Compute one refresh outcome: pane inventory from the active backend
 /// (off-runtime via `spawn_blocking` so any shell-out doesn't block the
 /// runtime) plus a daemon snapshot. Kept independent of `App` so the
 /// work can run on a worker thread without holding any UI state.
-async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> RefreshOutcome {
+async fn compute_refresh(
+    client: &Client,
+    backend: &muxa::SharedBackend,
+    session_activity_path: Option<PathBuf>,
+) -> RefreshOutcome {
     // Pane inventory is independent of the daemon — fetch it even when
     // muxad is down so `muxa watch` stays useful as a session picker.
     // The backend's `list_panes` may shell out (tmux) or hit a cache
@@ -1343,15 +1759,32 @@ async fn compute_refresh(client: &Client, backend: &muxa::SharedBackend) -> Refr
         .await
         .unwrap_or_default();
 
+    let sessions = if backend.kind() == muxa::HostKind::Tmux {
+        tokio::task::spawn_blocking(|| muxa::tmux::list_sessions().unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let session_activity = match session_activity_path {
+        Some(path) => muxa::session_activity::load(&path).await,
+        None => Vec::new(),
+    };
+
     let full = match client.snapshot().await {
         Ok(agents) => FullRefresh {
             agents,
             panes,
+            sessions,
+            session_activity,
             error: None,
         },
         Err(e) => FullRefresh {
             agents: Vec::new(),
             panes,
+            sessions,
+            session_activity,
             error: Some(DaemonError {
                 self_describing: matches!(e, RuntimeError::NotConnected(_)),
                 message: e.to_string(),
@@ -1484,7 +1917,11 @@ async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Optio
 /// terminal is already restored by the time we hand off control.
 #[allow(clippy::too_many_lines)] // mostly setup + action dispatch — extracting a helper
                                  // for three preview-related arms hurts readability more than it helps
-pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<String>> {
+pub async fn run(
+    client: &Client,
+    watch_cfg: WatchConfig,
+    session_activity_path: Option<PathBuf>,
+) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
@@ -1520,6 +1957,7 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
     // already an `Arc<dyn …>` so cloning it is just a refcount bump.
     let bg_client = client.clone();
     let bg_backend = backend.clone();
+    let bg_session_activity_path = session_activity_path.clone();
     let sub_client = client.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
@@ -1541,7 +1979,8 @@ pub async fn run(client: &Client, watch_cfg: WatchConfig) -> Result<Option<Strin
         move || {
             let client = bg_client.clone();
             let backend = bg_backend.clone();
-            async move { compute_refresh(&client, &backend).await }
+            let session_activity_path = bg_session_activity_path.clone();
+            async move { compute_refresh(&client, &backend, session_activity_path).await }
         },
         wake_rx,
         outcome_tx,
@@ -1935,6 +2374,13 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
             ),
             on_confirm: QuickAction::KillPane(p.pane_id.clone()),
         }),
+        Some(WatchRow::Session(s)) => match s.representative_pane.as_deref() {
+            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
+                message: format!("Kill pane {}?", app.pane_label(pane_id)),
+                on_confirm: QuickAction::KillPane(pane_id.to_string()),
+            }),
+            None => Action::NotApplicable("kill: no tmux pane on this row"),
+        },
         None => Action::NotApplicable("kill: no row selected"),
     }
 }
@@ -1955,6 +2401,14 @@ pub(crate) fn quick_abort_action(app: &App) -> Action {
         // agent action" in any meaningful sense. Skip rather than
         // surprise.
         Some(WatchRow::BarePane(_)) => Action::NotApplicable("abort: not a tracked agent"),
+        Some(WatchRow::Session(s)) => match s.latest_agent.as_ref().and_then(|a| a.pane.as_deref())
+        {
+            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
+                message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
+                on_confirm: QuickAction::AbortTurn(pane_id.to_string()),
+            }),
+            None => Action::NotApplicable("abort: not a tracked agent"),
+        },
         None => Action::NotApplicable("abort: no row selected"),
     }
 }
@@ -2232,13 +2686,16 @@ fn build_pane_capture_body<'a>(app: &'a App, pane_id: &str) -> ratatui::text::Te
 fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
     let mut out: Vec<Line<'a>> = Vec::new();
 
-    let row = app
-        .rows
-        .iter()
-        .find(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id)));
+    let agent = app.rows.iter().find_map(|r| match r {
+        WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a),
+        WatchRow::Session(s) if s.representative_pane.as_deref() == Some(pane_id) => {
+            s.latest_agent.as_ref()
+        }
+        WatchRow::Agent(_) | WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+    });
 
     let pane_label = pane_display(Some(pane_id), &app.panes);
-    if let Some(WatchRow::Agent(agent)) = row {
+    if let Some(agent) = agent {
         // Header line — pane label + kind + state, all on one row.
         out.push(Line::from(vec![
             Span::styled("pane: ", Style::default().add_modifier(Modifier::DIM)),
@@ -2317,7 +2774,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let agents = app
         .rows
         .iter()
-        .filter(|r| matches!(r, WatchRow::Agent(_)))
+        .filter(|r| match r {
+            WatchRow::Agent(_) => true,
+            WatchRow::Session(s) => s.latest_agent.is_some(),
+            WatchRow::BarePane(_) => false,
+        })
         .count();
     let bare = app.rows.len() - agents;
     let now = app.last_refresh;
@@ -2338,12 +2799,20 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{agents} agent{}", if agents == 1 { "" } else { "s" }),
+            if app.watch_cfg.view == WatchView::Session {
+                format!("{} session{}", app.rows.len(), plural(app.rows.len()))
+            } else {
+                format!("{agents} agent{}", plural(agents))
+            },
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
-            format!("+ {bare} pane{}", if bare == 1 { "" } else { "s" }),
+            if app.watch_cfg.view == WatchView::Session {
+                format!("{agents} with agent{}", plural(agents))
+            } else {
+                format!("+ {bare} pane{}", plural(bare))
+            },
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("   "),
@@ -2390,7 +2859,12 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header_cells = app.columns.iter().map(|c| {
-        Cell::from(c.header()).style(
+        let header = if app.watch_cfg.view == WatchView::Session && matches!(c, WatchColumn::Pane) {
+            "SESSION"
+        } else {
+            c.header()
+        };
+        Cell::from(header).style(
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
@@ -2413,6 +2887,11 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                     .map(|c| c.agent_text(a, now, &app.panes))
                     .collect(),
                 WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
+                WatchRow::Session(s) => app
+                    .columns
+                    .iter()
+                    .map(|c| c.session_text(s, now, &app.panes))
+                    .collect(),
             };
 
             let mut expanded = false;
@@ -2448,7 +2927,11 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Agents "),
+                .title(if app.watch_cfg.view == WatchView::Session {
+                    " Sessions "
+                } else {
+                    " Agents "
+                }),
         )
         .row_highlight_style(
             Style::default()
@@ -2631,6 +3114,31 @@ fn resolve_var(
             | "rate_limit_scope" => "—".into(),
             _ => return None,
         }),
+        WatchRow::Session(s) => {
+            if let Some(a) = s.latest_agent.as_ref() {
+                return resolve_var(name, &WatchRow::Agent(a.clone()), panes, now);
+            }
+            Some(match name {
+                "pane" => s.session.clone(),
+                "kind" => "session".into(),
+                "last_prompt" => s.bare_summary.clone().unwrap_or_else(|| "—".into()),
+                "activity" => s.activity.as_ref().map_or_else(
+                    || "—".into(),
+                    |a| format_duration(a.effective_total_secs(now)),
+                ),
+                "state"
+                | "model"
+                | "ctx"
+                | "cost"
+                | "last_response"
+                | "last_notification"
+                | "cwd"
+                | "rate_limit"
+                | "rate_limit_resets_at"
+                | "rate_limit_scope" => "—".into(),
+                _ => return None,
+            })
+        }
     }
 }
 
@@ -2810,23 +3318,6 @@ fn limits_text(a: &Agent, now: OffsetDateTime) -> Text<'static> {
     }
 }
 
-/// Compact "stuck for" duration suffix for the State column. Buckets at
-/// 1h / 1m: ≥1h prints `Nh`, ≥1m prints `Nm`, otherwise `Ns`. Negative
-/// deltas (clock skew or a `state_entered_at` from the future) collapse
-/// to `0s` rather than printing a negative — the column has no space
-/// for a sign and the suffix is a UX hint, not a precise measurement.
-fn stuck_suffix(state_entered_at: OffsetDateTime, now: OffsetDateTime) -> String {
-    let delta = now - state_entered_at;
-    let secs = delta.whole_seconds().max(0);
-    if secs >= 3600 {
-        format!("{}h", secs / 3600)
-    } else if secs >= 60 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
 fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
     let delta = now - at;
     let secs = delta.whole_seconds();
@@ -2963,6 +3454,7 @@ fn selected_has_no_pane(app: &App) -> bool {
         Some(WatchRow::Agent(a)) => a.pane.is_none(),
         // BarePane rows always have a pane id; tmux gives them a
         // pane_id by definition.
+        Some(WatchRow::Session(s)) => s.representative_pane.is_none(),
         Some(WatchRow::BarePane(_)) | None => false,
     }
 }
@@ -3022,6 +3514,30 @@ mod tests {
             current_command: cmd.into(),
             title: cmd.into(),
             pane_pid: 0,
+        }
+    }
+
+    fn fake_session(id: &str, name: &str, attached_clients: u32) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            name: name.into(),
+            attached_clients,
+        }
+    }
+
+    fn fake_session_activity(
+        id: &str,
+        name: &str,
+        total_attached_secs: u64,
+        attached_since: Option<OffsetDateTime>,
+    ) -> SessionActivity {
+        SessionActivity {
+            session_id: id.into(),
+            name: name.into(),
+            attached_clients: u32::from(attached_since.is_some()),
+            total_attached_secs,
+            attached_since,
+            last_seen_at: OffsetDateTime::now_utc(),
         }
     }
 
@@ -3134,7 +3650,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
             })
             .collect();
 
@@ -3181,7 +3697,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%1", "%2", "%10"]);
@@ -3236,12 +3752,118 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
             })
             .collect();
         // alpha: %11 (newer t2) before %10 (older t0); then beta: %21
         // (newer t3) before %20 (older t1).
         assert_eq!(order, vec!["%11", "%10", "%21", "%20"]);
+    }
+
+    #[test]
+    fn session_view_collapses_panes_to_latest_active_agent() {
+        let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![
+                fake_agent_at("old", "%1", t0),
+                fake_agent_at("new", "%2", t1),
+            ],
+            vec![
+                fake_pane("%1", "main", 0, 0, "claude"),
+                fake_pane("%2", "main", 0, 1, "codex"),
+                fake_pane("%3", "side", 0, 0, "vim"),
+            ],
+            vec![fake_session("$1", "main", 1), fake_session("$2", "side", 0)],
+            vec![],
+        );
+
+        assert_eq!(app.rows.len(), 2);
+        let WatchRow::Session(main) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        assert_eq!(main.session, "main");
+        assert_eq!(main.representative_pane.as_deref(), Some("%2"));
+        assert_eq!(
+            main.latest_agent.as_ref().map(|a| a.session_id.as_str()),
+            Some("new")
+        );
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+    }
+
+    #[test]
+    fn session_view_adds_attached_time_column_and_renders_total() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![fake_pane("%1", "main", 0, 0, "zsh")],
+            vec![fake_session("$1", "main", 1)],
+            vec![fake_session_activity(
+                "$1",
+                "main",
+                3_600,
+                Some(now - time::Duration::minutes(5)),
+            )],
+        );
+
+        assert!(app.columns.contains(&WatchColumn::SessionTime));
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        let text = WatchColumn::SessionTime.session_text(row, now, &app.panes);
+        let cell = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
+        assert_eq!(cell, "1h05m");
+    }
+
+    #[test]
+    fn session_view_keeps_duration_column_visible_at_80_cols() {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        assert_eq!(
+            app.columns,
+            vec![
+                WatchColumn::Pane,
+                WatchColumn::State,
+                WatchColumn::SessionTime,
+                WatchColumn::Activity,
+                WatchColumn::Prompt,
+            ]
+        );
+        app.set_data_with_sessions(
+            vec![],
+            vec![fake_pane("%1", "main", 0, 0, "zsh")],
+            vec![fake_session("$1", "main", 0)],
+            vec![fake_session_activity("$1", "main", 3_900, None)],
+        );
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let screen = (0..buf.area().height)
+            .map(|y| row_text(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("DUR"), "{screen}");
+        assert!(screen.contains("1h05m"), "{screen}");
     }
 
     #[test]
@@ -3275,7 +3897,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%20", "%30", "%10"]);
@@ -3309,7 +3931,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
             })
             .collect();
         // Lexicographic — "%1" < "%200" < "%30" because '2' < '3'.
@@ -3343,7 +3965,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%10", "%999"]);
@@ -3765,6 +4387,7 @@ mod tests {
             WatchColumn::Limits,
             WatchColumn::Prompt,
             WatchColumn::Activity,
+            WatchColumn::SessionTime,
         ] {
             let _ = col.agent_text(&a, now, &[]);
         }
@@ -4029,6 +4652,8 @@ mod tests {
                 None,
             )],
             panes: vec![],
+            sessions: vec![],
+            session_activity: vec![],
             error: None,
         })
     }
@@ -4687,6 +5312,8 @@ mod tests {
                 None,
             )],
             panes: vec![fake_pane("%99", "side", 0, 0, "vim")],
+            sessions: vec![],
+            session_activity: vec![],
             error: Some(DaemonError {
                 self_describing: false,
                 message: "boom".into(),
@@ -4725,6 +5352,8 @@ mod tests {
                     None,
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -4752,6 +5381,8 @@ mod tests {
                     None,
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -4782,6 +5413,8 @@ mod tests {
                     None,
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -4812,6 +5445,8 @@ mod tests {
                     None,
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -4859,6 +5494,8 @@ mod tests {
                     fake_pane("%1", "main", 0, 0, "claude"),
                     fake_pane("%2", "side", 1, 0, "claude"),
                 ],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -4943,6 +5580,8 @@ mod tests {
                     Some(0.12),
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -4995,6 +5634,8 @@ mod tests {
                     Some(0.05),
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -5014,6 +5655,8 @@ mod tests {
                     None,
                 )],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );
@@ -5062,6 +5705,8 @@ mod tests {
             RefreshOutcome::Full(FullRefresh {
                 agents: vec![limited],
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
+                sessions: vec![],
+                session_activity: vec![],
                 error: None,
             }),
         );

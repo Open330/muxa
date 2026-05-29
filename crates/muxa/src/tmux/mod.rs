@@ -37,10 +37,23 @@ pub struct PaneInfo {
     pub pane_pid: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// tmux's stable session id (e.g. `$3`). Prefer this over the mutable
+    /// session name for persisted counters.
+    pub session_id: String,
+    pub name: String,
+    /// Number of attached clients. A session is "active" for muxa's
+    /// cumulative timer when this is greater than zero.
+    pub attached_clients: u32,
+}
+
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
     "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
+
+pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -69,6 +82,23 @@ pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
     panes
 }
 
+pub(crate) fn parse_session_lines(stdout: &str) -> Vec<SessionInfo> {
+    let mut sessions = Vec::new();
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let attached_clients = cols[2].trim().parse::<u32>().unwrap_or(0);
+        sessions.push(SessionInfo {
+            session_id: cols[0].into(),
+            name: cols[1].into(),
+            attached_clients,
+        });
+    }
+    sessions
+}
+
 pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
     let out = Command::new("tmux")
         .args(["list-panes", "-a", "-F", PANE_FMT])
@@ -80,6 +110,19 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
     }
     let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
     Ok(parse_pane_lines(&stdout))
+}
+
+pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
+    let out = Command::new("tmux")
+        .args(["list-sessions", "-F", SESSION_FMT])
+        .output()?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
+    Ok(parse_session_lines(&stdout))
 }
 
 pub fn inside_tmux() -> bool {
@@ -242,6 +285,17 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].pane_id, "%10");
         assert_eq!(panes[0].current_command, "claude");
+    }
+
+    #[test]
+    fn parses_session_lines() {
+        let stdout = "$1\tmain\t1\n$2\twork\t0\n";
+        let sessions = parse_session_lines(stdout);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "$1");
+        assert_eq!(sessions[0].name, "main");
+        assert_eq!(sessions[0].attached_clients, 1);
+        assert_eq!(sessions[1].attached_clients, 0);
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub mod metrics;
 pub mod notify;
 pub mod paths;
 pub mod reconcile;
+pub mod session_activity;
 pub mod sinks;
 pub mod snapshot;
 pub mod state;
@@ -93,5 +94,9 @@ pub use history::{CompactReport, HistoryOptions};
 pub use metrics::{Metrics, MetricsSnapshot};
 #[doc(hidden)]
 pub use reconcile::{LivenessSource, Reconciler};
+#[doc(hidden)]
+pub use session_activity::{
+    SessionActivity, SessionActivityTracker, SESSION_ACTIVITY_SCHEMA_VERSION,
+};
 #[doc(hidden)]
 pub use snapshot::{Snapshotter, SnapshotterOptions};

@@ -451,6 +451,15 @@ fn mutate_for_event(
                 agent.rate_limited_until = None;
                 agent.rate_limit_source = None;
                 agent.state = AgentState::Idle;
+            } else if matches!(
+                agent.state,
+                AgentState::WaitingInput | AgentState::WaitingChoice
+            ) {
+                // Codex can emit `Stop` while a permission request is still
+                // sitting in the terminal. A response-less stop is not proof
+                // that the user-facing wait cleared; keep the row waiting
+                // until a tool event, response, or explicit later state
+                // transition says otherwise.
             } else if agent.state != AgentState::Error {
                 agent.state = AgentState::Idle;
             }
@@ -1211,6 +1220,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_less_turn_stopped_preserves_waiting_input() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("codex"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("codex"),
+                level: NotificationLevel::NeedsInput,
+                message: "codex permission: Bash".into(),
+                at: now,
+            })
+            .await;
+
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("codex"),
+                response: None,
+                at: now,
+            })
+            .await;
+
+        assert_eq!(
+            store.by_session("codex").await.unwrap().state,
+            AgentState::WaitingInput,
+            "Codex Stop without response must not hide an outstanding permission prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_started_preserves_error_state() {
         // Errors aren't transient activity — a tool firing while a row
         // is red shouldn't silently mask the failure.
@@ -1414,6 +1457,25 @@ mod tests {
             AgentState::WaitingInput
         );
 
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("s"),
+                response: None,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("s").await.unwrap().state,
+            AgentState::WaitingInput
+        );
+
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: id("s"),
+                tool: "Bash".into(),
+                at: now,
+            })
+            .await;
         store
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
