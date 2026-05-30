@@ -12,16 +12,18 @@ to re-record it.
 | `docs/demo.tape`       | [VHS](https://github.com/charmbracelet/vhs) script — the recording itself.            |
 | `docs/demo-setup.sh`   | Bootstraps an isolated `tmux -L muxa-demo` server with a few seeded panes + windows.  |
 | `docs/demo-seed.sh`    | Older pane-seed script (kept for reference; the live setup script does this inline).  |
-| `docs/demo.gif`        | The output. ~230 KB, 1200 × 720, ~17 s.                                               |
+| `docs/demo.gif`        | The output. ~410 KB, 1200 × 720, ~20 s.                                               |
 
 The tape's prelude (`Hide` block) does the boring setup so the visible
 recording stays focused on the muxa UI:
 
 1. Spawns a fresh `muxad` against `MUXA_SOCKET=/tmp/muxa-demo.sock`.
-2. Runs `docs/demo-setup.sh`, which stands up the labelled tmux server
+2. Writes a demo-local `MUXA_CONFIG` so local watch defaults do not leak
+   into the recording.
+3. Runs `docs/demo-setup.sh`, which stands up the labelled tmux server
    with three seeded agent panes (Claude / Codex / Gemini) plus a few
    bare panes for variety, and binds `prefix + s` to the watch popup.
-3. `exec`s into `tmux -L muxa-demo attach -t main:0` so the recording
+4. `exec`s into `tmux -L muxa-demo attach -t main:0` so the recording
    opens already inside the demo session.
 
 ## Happy path — when Chrome can sandbox

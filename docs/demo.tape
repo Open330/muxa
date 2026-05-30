@@ -42,6 +42,18 @@ Type "export PATH=$HOME/.cargo/bin:/tmp/muxa-demo-shim:$PATH"
 Enter
 Type "export MUXA_SOCKET=/tmp/muxa-demo.sock"
 Enter
+Type "export MUXA_CONFIG=/tmp/muxa-demo-config.toml"
+Enter
+Type "cat > $MUXA_CONFIG <<'EOF'"
+Enter
+Type "[watch]"
+Enter
+Type "view = 'pane'"
+Enter
+Type "sort = ['pane_id']"
+Enter
+Type "EOF"
+Enter
 Type "rm -f $MUXA_SOCKET"
 Enter
 Type "muxad >/dev/null 2>&1 &"
@@ -135,5 +147,7 @@ Enter
 Type "wait 2>/dev/null"
 Enter
 Type "rm -rf /tmp/muxa-demo-shim /tmp/muxa-demo-bashrc /tmp/muxa-demo-transcripts $MUXA_SOCKET"
+Enter
+Type "rm -f $MUXA_CONFIG"
 Enter
 Show
