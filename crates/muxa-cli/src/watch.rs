@@ -125,13 +125,13 @@ impl WatchColumn {
         match self {
             Self::Pane => "PANE",
             Self::Kind => "KIND",
-            Self::State => "STATE",
+            Self::State => "ST",
             Self::Model => "MODEL",
             Self::Ctx => "CTX%",
             Self::Cost => "COST$",
             Self::Limits => "LIMITS",
             Self::Prompt => "LAST PROMPT",
-            Self::Activity => "ACTIVITY",
+            Self::Activity => "ACT",
             Self::SessionTime => "DUR",
         }
     }
@@ -141,10 +141,11 @@ impl WatchColumn {
             // PANE — "session:window.pane" can run long; 22 covers most.
             Self::Pane => Constraint::Length(22),
             Self::Kind => Constraint::Length(12),
-            // STATE — widest base label is `waiting_choice` (14 cells).
-            Self::State => Constraint::Length(14),
+            // STATE — compact colored state marker; full state remains
+            // available in detail placeholders and structured snapshots.
+            Self::State => Constraint::Length(3),
             Self::Model => Constraint::Length(16),
-            Self::Ctx => Constraint::Length(5),
+            Self::Ctx | Self::Activity => Constraint::Length(5),
             Self::Cost => Constraint::Length(7),
             // LIMITS — widest realistic payload is `⛔ 7d in 23h 59m`
             // (~17 cells with a wide-cell emoji). Wider columns crowd the
@@ -152,8 +153,7 @@ impl WatchColumn {
             // emoji-greedy fonts.
             Self::Limits => Constraint::Length(18),
             Self::Prompt => Constraint::Min(20),
-            Self::Activity => Constraint::Length(10),
-            Self::SessionTime => Constraint::Length(8),
+            Self::SessionTime => Constraint::Length(6),
         }
     }
 
@@ -182,17 +182,8 @@ impl WatchColumn {
             }
             Self::Kind => a.kind.to_string().into(),
             Self::State => {
-                let style = match a.state {
-                    AgentState::Working => Style::default().fg(Color::Green),
-                    AgentState::WaitingInput => Style::default().fg(Color::Yellow),
-                    AgentState::WaitingChoice => Style::default().fg(Color::LightYellow),
-                    AgentState::Error => Style::default().fg(Color::Red),
-                    AgentState::Idle | AgentState::Stopped => Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    AgentState::Starting => Style::default().fg(Color::Cyan),
-                };
-                Text::from(Span::styled(a.state.to_string(), style))
+                let (symbol, style) = state_marker(a.state);
+                Text::from(Span::styled(symbol, style))
             }
             Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
             Self::Ctx => a
@@ -671,6 +662,9 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  p              open preview overlay",
         "  f              (in preview) toggle popup ↔ fullscreen",
         "  c              (in preview) toggle prompt ↔ live pane",
+        "",
+        "State markers",
+        "  ● working  ? input  ◆ choice  ! error  · idle  … starting  × stopped",
         "",
         "Quick actions (act on selected row)",
         "  c              copy last prompt to clipboard",
@@ -1361,6 +1355,46 @@ fn session_label(s: &SessionRow) -> String {
         format!("{} · {} agents", s.session, s.agent_count)
     } else {
         s.session.clone()
+    }
+}
+
+fn state_marker(state: AgentState) -> (&'static str, Style) {
+    match state {
+        AgentState::Working => (
+            "●",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        AgentState::WaitingInput => (
+            "?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        AgentState::WaitingChoice => (
+            "◆",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        AgentState::Error => (
+            "!",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        AgentState::Idle => (
+            "·",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        AgentState::Starting => ("…", Style::default().fg(Color::Cyan)),
+        AgentState::Stopped => (
+            "×",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
     }
 }
 
@@ -3326,18 +3360,18 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
         return format!("{:02}:{:02}", at.hour(), at.minute());
     }
     if secs < 60 {
-        return format!("{secs}s ago");
+        return format!("{secs}s");
     }
     let mins = delta.whole_minutes();
     if mins < 60 {
-        return format!("{mins}m ago");
+        return format!("{mins}m");
     }
     let hours = delta.whole_hours();
     if hours < 48 {
-        return format!("{hours}h ago");
+        return format!("{hours}h");
     }
     let days = delta.whole_days();
-    format!("{days}d ago")
+    format!("{days}d")
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -4276,10 +4310,10 @@ mod tests {
     #[test]
     fn relative_time_buckets() {
         let now = OffsetDateTime::now_utc();
-        assert!(relative_time(now, now).ends_with("s ago"));
-        assert!(relative_time(now - time::Duration::minutes(5), now).ends_with("m ago"));
-        assert!(relative_time(now - time::Duration::hours(3), now).ends_with("h ago"));
-        assert!(relative_time(now - time::Duration::days(3), now).ends_with("d ago"));
+        assert_eq!(relative_time(now, now), "0s");
+        assert_eq!(relative_time(now - time::Duration::minutes(5), now), "5m");
+        assert_eq!(relative_time(now - time::Duration::hours(3), now), "3h");
+        assert_eq!(relative_time(now - time::Duration::days(3), now), "3d");
     }
 
     #[test]
@@ -6971,6 +7005,9 @@ mod tests {
                         \x20\x20f              (in preview) toggle popup ↔ fullscreen\n\
                         \x20\x20c              (in preview) toggle prompt ↔ live pane\n\
                         \n\
+                        State markers\n\
+                        \x20\x20● working  ? input  ◆ choice  ! error  · idle  … starting  × stopped\n\
+                        \n\
                         Quick actions (act on selected row)\n\
                         \x20\x20c              copy last prompt to clipboard\n\
                         \x20\x20K              kill the pane (Shift — confirm popup)\n\
@@ -7189,7 +7226,7 @@ mod tests {
     // Pin the full rendered buffer as a plain-text snapshot so render
     // regressions get caught beyond "did not panic". Helpers strip styling
     // (colours don't affect logical layout, and styling deltas would churn
-    // snapshots) and normalize the relative-time column ("12s ago" →
+    // snapshots) and normalize the relative-time column ("12s" →
     // "<rel>") because the production `render` path calls
     // `OffsetDateTime::now_utc()` directly and we'd rather not thread an
     // injectable clock through it just for tests.
@@ -7218,7 +7255,7 @@ mod tests {
             out
         }
 
-        /// Replace `\d+(s|m|h|d) ago` with `<rel>` and `HH:MM:SS UTC` with
+        /// Replace compact `\d+(s|m|h|d)` tokens with `<rel>` and `HH:MM:SS UTC` with
         /// `<clock>` so neither the activity column nor the header clock
         /// drifts across runs. (`render_header` reads `app.last_refresh`,
         /// which is set to `now_utc()` inside `App::with_config`/`set_data`
@@ -7240,14 +7277,14 @@ mod tests {
                 if i > digit_start
                     && i < bytes.len()
                     && matches!(bytes[i], b's' | b'm' | b'h' | b'd')
-                    && bytes.get(i + 1..i + 5) == Some(b" ago")
+                    && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace)
                 {
-                    // Eat the digits + unit + ` ago` AND any spaces that
-                    // follow (column padding). The relative-time text is
-                    // variable-length (6-8 chars) so without this the
+                    // Eat the digits + unit AND any spaces that follow
+                    // (column padding). The relative-time text is
+                    // variable-length (2-4 chars) so without this the
                     // column-trailing whitespace would drift across runs
                     // as the value crosses the 60s / 60m / 48h boundaries.
-                    i += 5;
+                    i += 1;
                     while i < bytes.len() && bytes[i] == b' ' {
                         i += 1;
                     }

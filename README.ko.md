@@ -451,16 +451,19 @@ columns = ["pane", "state", "prompt", "activity"]
 # "min:N" 문자열   -> Constraint::Min(N)        (남는 공간을 흡수)
 # "pct:N" 문자열   -> Constraint::Percentage(N)
 pane     = 22
-state    = 14
+state    = 3
 prompt   = "min:20"
-activity = 10
+activity = 5
 # view = "session"일 때 자동 추가됩니다(이미 설정한 경우 제외).
-session_time = 8
+session_time = 6
 ```
 
 사용 가능한 컬럼 키: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `limits`, `prompt`, `activity`, `session_time`. 모르는 키는 경고만
 남기고 무시되며, muxa 실행을 막지는 않습니다.
+
+컴팩트 `state` 컬럼은 마커를 사용합니다: `●` working, `?` input 대기,
+`◆` choice 대기, `!` error, `·` idle, `…` starting, `×` stopped.
 
 <a name="watch-sort"></a>
 ### 정렬

@@ -575,16 +575,20 @@ columns = ["pane", "state", "prompt", "activity"]
 # "min:N" string  -> Constraint::Min(N)         (takes leftover space)
 # "pct:N" string  -> Constraint::Percentage(N)
 pane     = 22
-state    = 14
+state    = 3
 prompt   = "min:20"
-activity = 10
+activity = 5
 # Used automatically by `view = "session"` unless already configured.
-session_time = 8
+session_time = 6
 ```
 
 Valid column keys: `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `limits`, `prompt`, `activity`, `session_time`. Unknown keys log a
 warning and are skipped — they don't prevent muxa from starting.
+
+The compact `state` column uses markers: `●` working, `?` waiting for
+input, `◆` waiting for a choice, `!` error, `·` idle, `…` starting, `×`
+stopped.
 
 <a name="watch-sort"></a>
 ### Sort order

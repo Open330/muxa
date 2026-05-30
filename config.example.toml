@@ -110,10 +110,10 @@
 # Missing keys fall back to a per-column default.
 # [watch.widths]
 # pane     = 22
-# state    = 14
+# state    = 3
 # prompt   = "min:20"
-# activity = 10
-# session_time = 8
+# activity = 5
+# session_time = 6
 
 # Selected-row detail: a dim "↳ <text>" line rendered under whatever row
 # is currently highlighted. Useful for glancing at the agent's last

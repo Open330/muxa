@@ -771,10 +771,10 @@ impl Default for WatchConfig {
         ];
         let mut widths = HashMap::new();
         widths.insert("pane".to_string(), WidthSpec::Length(22));
-        widths.insert("state".to_string(), WidthSpec::Length(14));
+        widths.insert("state".to_string(), WidthSpec::Length(3));
         widths.insert("prompt".to_string(), WidthSpec::Min(20));
-        widths.insert("activity".to_string(), WidthSpec::Length(10));
-        widths.insert("session_time".to_string(), WidthSpec::Length(8));
+        widths.insert("activity".to_string(), WidthSpec::Length(5));
+        widths.insert("session_time".to_string(), WidthSpec::Length(6));
         Self {
             columns,
             widths,
@@ -939,12 +939,12 @@ mod tests {
         ));
         assert!(matches!(
             cfg.widths.get("state"),
-            Some(WidthSpec::Length(14))
+            Some(WidthSpec::Length(3))
         ));
         assert!(matches!(cfg.widths.get("prompt"), Some(WidthSpec::Min(20))));
         assert!(matches!(
             cfg.widths.get("activity"),
-            Some(WidthSpec::Length(10))
+            Some(WidthSpec::Length(5))
         ));
     }
 
