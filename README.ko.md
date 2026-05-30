@@ -261,11 +261,31 @@ muxa watch          # 실시간 TUI
 | `muxa watch [--include-paneless] [--view pane\|session]` | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그는 1회 호출에 한해 `[watch]` 설정을 덮어씁니다. |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
+| `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | 보관된 프롬프트 히스토리, live agent, 세션 `DUR`를 요약. |
+| `muxa report [--since 7d]`                 | day/project/agent/session breakdown 을 Markdown 리포트로 출력.          |
 | `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
 | `muxa panes`                               | 디버그용: tmux 페인 목록 덤프.                                            |
 | `muxa hook <agent> --event <e>`            | 훅 어댑터 진입점 — 에이전트 CLI가 직접 호출.                             |
 | `muxa hook claude-statusline --forward CMD` | Claude의 status-line JSON을 muxa로 받으면서 다운스트림 도구로 포워딩.   |
 | `muxad`                                    | 데몬 — 기본적으로 `$XDG_RUNTIME_DIR/muxa.sock`을 리슨.                   |
+
+### 통계와 리포트
+
+`muxa stats` 는 데몬이 보관 중인 프롬프트 히스토리와 live agent snapshot 을
+묶어서 로컬 분석 뷰로 보여줍니다:
+
+```bash
+muxa stats --since 7d --group-by project
+muxa stats --since 24h --group-by agent --format json
+muxa report --since 7d > muxa-weekly.md
+```
+
+`--since` 는 `24h`, `7d`, `4w`, RFC3339 timestamp, `all` 을 받습니다.
+`--format` 은 `table`, `json`, `markdown` 입니다. 프롬프트 합계는
+`[history].max_per_pane` / `max_age_days` 로 제한된 보관 히스토리 기준입니다.
+`DUR` 는 `session-activity.json` 의 누적 tmux foreground 시간이라 아직
+`--since` 로 잘리지 않습니다. 다음 단계의 activity ledger 가 들어가면
+duration 도 기간별로 계산할 수 있습니다.
 
 ### Sync
 
@@ -540,6 +560,9 @@ compact_interval_secs = 3600
 `enabled = false` 로 끌 때는 sink (예: oh-my-prompt) 로 따로 보내고
 있는 경우만 — 안 그러면 `muxa recap` 의 과거 조회 능력 자체가
 사라집니다.
+
+새 history entry 는 어댑터가 제공할 수 있을 때 `cwd` 도 함께 저장합니다.
+`muxa stats --group-by project` 는 이 basename 으로 프로젝트를 분류합니다.
 
 audit log 는 chmod 0600 — IPC 소켓과 동일한 자세 (prompt 내용은
 민감 정보) 입니다.

@@ -84,6 +84,23 @@ or empty).
 { "protocol": 1, "kind": "by_session", "session_id": "sess-abc" }
 ```
 
+#### `recent_prompts`
+
+Return retained prompt-history entries, newest first. `pane` is optional;
+when absent, prompts from every retained pane are returned. `limit = 0`
+or an absent `limit` means "all entries currently retained in memory",
+still bounded by `[history].max_per_pane` and `[history].max_age_days`.
+
+```json
+{ "protocol": 2, "kind": "recent_prompts", "pane": "%12", "limit": 10 }
+```
+
+Response:
+
+```json
+{ "ok": true, "protocol": 2, "prompts": [ <HistoryEntry>, ... ] }
+```
+
 #### `health`
 
 Liveness probe.
@@ -225,6 +242,27 @@ Same fields as stored in the registry:
   "last_activity_at": "2026-04-24T12:03:21Z"
 }
 ```
+
+## `HistoryEntry` schema (in `recent_prompts` responses)
+
+Prompt-history entries are a retained audit log, not the live agent row:
+many entries can point at the same pane/session.
+
+```json
+{
+  "v": 1,
+  "kind": "claude_code",
+  "session_id": "sess-abc",
+  "pane": "%12",
+  "cwd": "/home/user/proj",
+  "prompt": "fix this bug",
+  "at": "2026-04-24T12:00:00Z",
+  "model": "sonnet"
+}
+```
+
+`cwd` and `model` are optional. Older `prompts.ndjson` lines may not have
+`cwd`; readers should treat it as unknown.
 
 ---
 

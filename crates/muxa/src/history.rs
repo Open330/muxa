@@ -82,6 +82,8 @@ pub struct HistoryEntry {
     pub kind: AgentKind,
     pub session_id: String,
     pub pane: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub prompt: String,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
@@ -103,6 +105,28 @@ impl HistoryEntry {
             kind,
             session_id: session_id.into(),
             pane: pane.into(),
+            cwd: None,
+            prompt: prompt.into(),
+            at,
+            model,
+        }
+    }
+
+    pub fn with_cwd(
+        kind: AgentKind,
+        session_id: impl Into<String>,
+        pane: impl Into<String>,
+        cwd: Option<String>,
+        prompt: impl Into<String>,
+        at: OffsetDateTime,
+        model: Option<String>,
+    ) -> Self {
+        Self {
+            v: HISTORY_SCHEMA_VERSION,
+            kind,
+            session_id: session_id.into(),
+            pane: pane.into(),
+            cwd,
             prompt: prompt.into(),
             at,
             model,
@@ -556,6 +580,38 @@ mod tests {
             all.iter().map(|e| e.prompt.as_str()).collect::<Vec<_>>(),
             vec!["A2", "B1", "A1"]
         );
+    }
+
+    #[test]
+    fn history_entry_defaults_missing_cwd() {
+        let raw = r#"{
+            "v": 1,
+            "kind": "claude_code",
+            "session_id": "s",
+            "pane": "%1",
+            "prompt": "hello",
+            "at": "2026-04-24T12:00:00Z"
+        }"#;
+
+        let got: HistoryEntry = serde_json::from_str(raw).unwrap();
+        assert_eq!(got.cwd, None);
+    }
+
+    #[test]
+    fn history_entry_with_cwd_round_trips() {
+        let entry = HistoryEntry::with_cwd(
+            AgentKind::ClaudeCode,
+            "s",
+            "%1",
+            Some("/home/june/muxa".into()),
+            "hello",
+            datetime!(2026-04-24 12:00:00 UTC),
+            None,
+        );
+
+        let encoded = serde_json::to_string(&entry).unwrap();
+        let got: HistoryEntry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(got.cwd.as_deref(), Some("/home/june/muxa"));
     }
 
     #[tokio::test]

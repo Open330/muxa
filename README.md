@@ -338,11 +338,31 @@ muxa watch          # live TUI
 | `muxa watch [--include-paneless] [--view pane\|session]` | Full-screen live TUI — see [Live TUI](#live-tui). Flags override `[watch]` for one invocation. |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
+| `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | Summarize retained prompt history, live agents, and tracked session `DUR`. |
+| `muxa report [--since 7d]`                 | Emit a Markdown report with day/project/agent/session breakdowns.       |
 | `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
 | `muxa panes`                               | Debug: dump tmux pane inventory.                                       |
 | `muxa hook <agent> --event <e>`            | Hook adapter entry point. Invoked by the agent CLIs themselves.        |
 | `muxa hook claude-statusline --forward CMD` | Tee Claude's status-line JSON to muxa + a downstream tool.             |
 | `muxad`                                    | The daemon. Listens on `$XDG_RUNTIME_DIR/muxa.sock` by default.        |
+
+### Stats and reports
+
+`muxa stats` turns the daemon's retained prompt history plus the live
+agent snapshot into a quick local analytics view:
+
+```bash
+muxa stats --since 7d --group-by project
+muxa stats --since 24h --group-by agent --format json
+muxa report --since 7d > muxa-weekly.md
+```
+
+`--since` accepts `24h`, `7d`, `4w`, an RFC3339 timestamp, or `all`.
+`--format` is `table`, `json`, or `markdown`. The prompt totals are
+bounded by `[history].max_per_pane` / `max_age_days`, because muxa keeps
+a retained audit log rather than an unbounded warehouse. `DUR` comes
+from `session-activity.json` and is cumulative tmux foreground time; a
+future activity ledger will make duration windowed by `--since`.
 
 ### Sync
 
@@ -667,6 +687,9 @@ compact_interval_secs = 3600
 Set `enabled = false` only if you're routing history exclusively
 through a sink (e.g. oh-my-prompt) — otherwise you lose `muxa recap`'s
 ability to look back after a daemon restart or pane close.
+
+New history entries include `cwd` when the adapter can supply it; `muxa
+stats --group-by project` uses that basename for project attribution.
 
 The audit log is chmod 0600 — same posture as the IPC socket, since
 prompt content is sensitive.

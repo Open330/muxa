@@ -3,6 +3,7 @@
 mod doctor;
 mod init;
 mod logs;
+mod stats;
 mod upgrade;
 mod watch;
 
@@ -62,6 +63,10 @@ enum Cmd {
         #[arg(long, conflicts_with = "limit")]
         all: bool,
     },
+    /// Summarize retained prompt history, live agents, and session duration.
+    Stats(stats::Args),
+    /// Generate a Markdown activity report from the retained stats.
+    Report(stats::ReportArgs),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
     Hook {
         #[command(subcommand)]
@@ -181,6 +186,8 @@ async fn main() -> Result<()> {
         Cmd::Status => cmd_status(&client).await,
         Cmd::StatusLine { pane } => cmd_status_line(&client, pane).await,
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
+        Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
+        Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => {
             cmd_panes();

@@ -572,7 +572,7 @@ async fn enrich_from_history(
             kind: entry.kind,
             session_id: entry.session_id,
             pane: Some(pane.pane_id.clone()),
-            cwd: None,
+            cwd: entry.cwd,
             state: muxa::AgentState::Idle,
             last_prompt: Some(entry.prompt),
             last_response: None,

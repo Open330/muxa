@@ -383,10 +383,11 @@ fn mutate_for_event(
                 model: agent.model.clone(),
             });
             if let Some(pane) = agent.pane.clone() {
-                history_entry = Some(HistoryEntry::new(
+                history_entry = Some(HistoryEntry::with_cwd(
                     agent.kind,
                     agent.session_id.clone(),
                     pane,
+                    agent.cwd.clone(),
                     prompt.clone(),
                     at,
                     agent.model.clone(),
