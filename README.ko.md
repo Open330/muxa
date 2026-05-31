@@ -259,6 +259,7 @@ muxa watch          # 실시간 TUI
 | ------------------------------------------ | ------------------------------------------------------------------------ |
 | `muxa status`                              | 추적 중인 모든 에이전트를 사람이 읽기 쉬운 테이블로 출력.                |
 | `muxa watch [--include-paneless] [--view pane\|session]` | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그는 1회 호출에 한해 `[watch]` 설정을 덮어씁니다. |
+| `muxa attend [--cycle] [--list]` (별칭 `go`) | 나를 필요로 하는 에이전트로 점프 — input/choice/error로 가장 오래 막혀 있는 페인에 포커스. `--cycle`은 다음 대상으로 순환(tmux 키에 바인딩), `--list`는 점프 없이 대기 큐만 출력. |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
 | `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | 보관된 프롬프트 히스토리, live agent, 세션 `DUR`를 요약. |

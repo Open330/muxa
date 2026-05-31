@@ -59,6 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sweeper (uses the same `stuck_waiting_timeout`), and the `muxa
   watch` TUI (`LightYellow` next to `WaitingInput`'s `Yellow`). See
   PROTOCOL.md "v1 → v2" for the wire-format delta.
+- **`muxa attend`** (alias `go`) — jump straight to the agent that needs
+  you. The daemon already knows which agents are blocked on a human
+  (`WaitingInput` / `WaitingChoice` / `Error`); this turns that into one
+  action. A bare `muxa attend` focuses the pane that's been blocked
+  longest (oldest `state_entered_at`); `--cycle` rotates to the next
+  blocked pane *after* the current one in `session:window.pane` order,
+  wrapping — meant to be bound to a tmux key
+  (`bind-key a run-shell "muxa attend --cycle"`) so you can tab through
+  everything waiting on you. `--list` prints the ranked queue (glyph,
+  location, kind, how long blocked, last-prompt snippet) without jumping.
+  Reuses the same `jump_to_pane` machinery as the `muxa watch` Enter
+  action, so the tmux/zellij and inside/outside-multiplexer cases are
+  handled identically; agents with no pane are skipped (nothing to focus).
+  No protocol change — it's a pure CLI consumer of the existing
+  `snapshot` query.
 - **`muxa watch` quick actions** — the picker is no longer read-only.
   Four new keybindings act on the currently-selected row:
   - `c` — copy the agent's last prompt to the system clipboard

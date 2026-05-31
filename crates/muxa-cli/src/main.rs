@@ -1,5 +1,6 @@
 //! muxa CLI — user-facing entry point.
 
+mod attend;
 mod doctor;
 mod init;
 mod logs;
@@ -88,6 +89,12 @@ enum Cmd {
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
     },
+    /// Jump to the agent that needs you — focus the pane of whichever
+    /// agent has been blocked on input/choice/error longest. `--cycle`
+    /// rotates through them (bind it to a tmux key); `--list` prints the
+    /// queue without jumping.
+    #[command(visible_alias = "go")]
+    Attend(attend::Args),
     /// Backfill the registry by scanning tmux panes for agent processes.
     Sync,
     /// Interactive install wizard — wires tmux, agent hooks, systemd,
@@ -197,12 +204,25 @@ async fn main() -> Result<()> {
             include_paneless,
             view,
         } => cmd_watch(&client, cfg, include_paneless, view).await,
+        Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
     }
+}
+
+/// Jump to (or list) the agent that needs you. `attend::run` picks the
+/// pane — reusing the same selection that drives `--list` — and we perform
+/// the actual focus through `jump_to_pane`, the identical machinery the
+/// `muxa watch` Enter action uses, so a jump lands the same way from both.
+async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
+    let backend = muxa::default_backend();
+    if let Some(pane) = attend::run(client, backend.as_ref(), args).await? {
+        jump_to_pane(&pane);
+    }
+    Ok(())
 }
 
 /// Backfill the daemon's registry from host panes. Idempotent.
@@ -627,14 +647,14 @@ fn cmd_panes() {
 /// Decide whether to emit ANSI color. We check `NO_COLOR` (per the de-facto
 /// standard) and require stdout to be a TTY — piping `muxa status | grep`
 /// should stay clean.
-fn use_colors() -> bool {
+pub(crate) fn use_colors() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
     std::io::stdout().is_terminal()
 }
 
-fn state_icon(state: AgentState) -> &'static str {
+pub(crate) fn state_icon(state: AgentState) -> &'static str {
     match state {
         AgentState::Working => "⚙",
         AgentState::Idle => "·",
@@ -646,7 +666,7 @@ fn state_icon(state: AgentState) -> &'static str {
     }
 }
 
-fn state_style(state: AgentState) -> Style {
+pub(crate) fn state_style(state: AgentState) -> Style {
     match state {
         AgentState::Working => Style::new().green(),
         AgentState::WaitingInput => Style::new().yellow(),
@@ -667,7 +687,7 @@ fn state_style(state: AgentState) -> Style {
 /// -a` per call. With 30+ agents that meant 30+ subprocess invocations
 /// for one `muxa status` run. Callers now fetch the pane list once and
 /// pass it down.
-fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String {
+pub(crate) fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String {
     let Some(raw) = a.pane.as_deref() else {
         return "-".to_string();
     };
