@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first foreground interval lands. Foreground intervals close on detach or
   when a tmux session disappears, so duration remains reportable after the
   session is gone.
+- Prompt history and agent state intervals now persist the observed tmux
+  session name alongside the pane/session id, so new `muxa stats --group-by
+  session` rows keep the human-readable session name even after tmux deletes
+  the live session.
 - **`AgentState::waiting_choice` + `NotificationLevel::needs_choice`** —
   menu-style user blocks (Claude Code's `AskUserQuestion` and
   `ExitPlanMode`) now land in `waiting_choice` instead of being lumped

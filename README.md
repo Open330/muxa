@@ -366,7 +366,10 @@ closed agent state intervals, `TMUX` tracks foreground tmux session
 intervals, and `BLOCK` counts transitions into Waiting/Error states.
 Live attached tmux sessions are included up to "now"; older
 `session-activity.json` totals are used as a legacy fallback until
-`activity.ndjson` has foreground intervals.
+`activity.ndjson` has foreground intervals. New prompt and duration
+entries store the observed tmux session name, so `--group-by session`
+keeps readable names after tmux deletes the live session; older entries
+without a stored name fall back to the agent/session id.
 
 ### Sync
 
@@ -740,7 +743,9 @@ session foregrounded (`tmux list-clients`, grouped by `client_session`;
 control-mode clients are ignored). The rolling total is shown in the
 `DUR` column of `muxa watch`'s session view, and closed
 foreground intervals are appended to `activity.ndjson` so stats/report
-duration survives tmux session deletion.
+duration survives tmux session deletion. Agent state and prompt events
+also persist the current tmux session name when muxad can observe the
+pane, which preserves readable session-grouped stats for new records.
 
 ```toml
 [session_activity]

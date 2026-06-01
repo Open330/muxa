@@ -95,7 +95,7 @@ pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 #[doc(hidden)]
 pub use error::{CoreError, Result};
 #[doc(hidden)]
-pub use history::{CompactReport, HistoryOptions};
+pub use history::{CompactReport, HistoryOptions, PaneSessionCache};
 #[doc(hidden)]
 pub use metrics::{Metrics, MetricsSnapshot};
 #[doc(hidden)]

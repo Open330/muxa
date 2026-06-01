@@ -541,10 +541,10 @@ fn prompt_group_key(data: &StatsData, prompt: &HistoryEntry, group_by: GroupBy) 
             .or_else(|| data.project_by_pane.get(&prompt.pane).cloned())
             .unwrap_or_else(|| "unknown".to_string()),
         GroupBy::Agent => prompt.kind.to_string(),
-        GroupBy::Session => data
-            .pane_sessions
-            .get(&prompt.pane)
-            .cloned()
+        GroupBy::Session => prompt
+            .tmux_session
+            .clone()
+            .or_else(|| data.pane_sessions.get(&prompt.pane).cloned())
             .unwrap_or_else(|| prompt.session_id.clone()),
     }
 }
@@ -591,10 +591,15 @@ fn state_transition_group_key(
             .unwrap_or_else(|| "unknown".to_string()),
         GroupBy::Agent => entry.kind.to_string(),
         GroupBy::Session => entry
-            .pane
-            .as_ref()
-            .and_then(|pane| data.pane_sessions.get(pane))
-            .cloned()
+            .session_name
+            .clone()
+            .or_else(|| {
+                entry
+                    .pane
+                    .as_ref()
+                    .and_then(|pane| data.pane_sessions.get(pane))
+                    .cloned()
+            })
             .unwrap_or_else(|| entry.session_id.clone()),
     }
 }
@@ -609,7 +614,6 @@ fn session_foreground_group_key(
         GroupBy::Project | GroupBy::Agent => None,
     }
 }
-
 fn add_open_session_foreground_rows(
     data: &StatsData,
     group_by: GroupBy,
@@ -1225,6 +1229,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 session_id: "agent-a".into(),
                 pane: Some("%1".into()),
+                session_name: Some("muxa-session".into()),
                 cwd: Some("/home/june/muxa".into()),
                 from: AgentState::Working,
                 to: AgentState::WaitingInput,
@@ -1235,6 +1240,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 session_id: "agent-a".into(),
                 pane: Some("%1".into()),
+                session_name: Some("muxa-session".into()),
                 cwd: Some("/home/june/muxa".into()),
                 from: AgentState::WaitingInput,
                 to: AgentState::Working,
@@ -1265,6 +1271,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 session_id: "agent-a".into(),
                 pane: Some("%1".into()),
+                session_name: Some("muxa-session".into()),
                 cwd: Some("/home/june/muxa".into()),
                 from: AgentState::Working,
                 to: AgentState::WaitingInput,
@@ -1278,6 +1285,47 @@ mod tests {
         assert_eq!(rows[0].key, "muxa");
         assert_eq!(rows[0].working_secs, 600);
         assert_eq!(rows[0].attention_events, 1);
+    }
+
+    #[test]
+    fn rows_group_prompts_by_stored_tmux_session() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%dead",
+            Some("/home/june/muxa"),
+            "hello",
+            datetime!(2026-05-30 11:00:00 UTC),
+        );
+        p.tmux_session = Some("deleted-session-name".into());
+        let d = data(vec![p]);
+
+        let rows = build_rows(&d, GroupBy::Session, 0);
+
+        assert_eq!(rows[0].key, "deleted-session-name");
+    }
+
+    #[test]
+    fn rows_group_state_duration_by_stored_tmux_session() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![ActivityEntry::StateTransition(StateTransitionEntry::new(
+            StateTransitionInput {
+                at: datetime!(2026-05-30 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-a".into(),
+                pane: Some("%dead".into()),
+                session_name: Some("deleted-session-name".into()),
+                cwd: Some("/home/june/muxa".into()),
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-05-30 11:00:00 UTC)),
+            },
+        ))];
+
+        let rows = build_rows(&d, GroupBy::Session, 0);
+
+        assert_eq!(rows[0].key, "deleted-session-name");
+        assert_eq!(rows[0].working_secs, 600);
     }
 
     #[test]

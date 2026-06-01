@@ -51,6 +51,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -83,6 +84,8 @@ pub struct HistoryEntry {
     pub session_id: String,
     pub pane: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub prompt: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -105,6 +108,7 @@ impl HistoryEntry {
             kind,
             session_id: session_id.into(),
             pane: pane.into(),
+            tmux_session: None,
             cwd: None,
             prompt: prompt.into(),
             at,
@@ -126,6 +130,7 @@ impl HistoryEntry {
             kind,
             session_id: session_id.into(),
             pane: pane.into(),
+            tmux_session: None,
             cwd,
             prompt: prompt.into(),
             at,
@@ -150,6 +155,9 @@ pub struct HistoryOptions {
     /// Bounded mpsc capacity for the writer task. Sized for ~30s of peak
     /// traffic (tens/sec); above that, [`PromptHistory::append`] backpressures.
     pub writer_channel_capacity: usize,
+    /// Optional best-effort pane → tmux session-name cache. When present,
+    /// append enriches prompt rows so session grouping survives pane removal.
+    pub pane_sessions: Option<PaneSessionCache>,
 }
 
 impl Default for HistoryOptions {
@@ -159,7 +167,39 @@ impl Default for HistoryOptions {
             max_per_pane: 50,
             max_age: time::Duration::days(30),
             writer_channel_capacity: 1024,
+            pane_sessions: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PaneSessionCache {
+    inner: Arc<StdRwLock<HashMap<String, String>>>,
+}
+
+impl PaneSessionCache {
+    pub fn replace<I, K, V>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        guard.clear();
+        guard.extend(
+            entries
+                .into_iter()
+                .map(|(pane, session)| (pane.into(), session.into())),
+        );
+    }
+
+    pub fn get(&self, pane: &str) -> Option<String> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(pane).cloned())
     }
 }
 
@@ -182,6 +222,7 @@ pub struct PromptHistory {
     /// Writer-task sender. `None` iff this instance is in-memory only.
     /// `try_send` so the event-handler path never blocks on disk I/O.
     writer: Option<mpsc::Sender<WriterMsg>>,
+    pane_sessions: Option<PaneSessionCache>,
 }
 
 #[derive(Debug)]
@@ -198,6 +239,7 @@ impl PromptHistory {
     pub fn in_memory_only(opts: HistoryOptions) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(Inner::default()),
+            pane_sessions: opts.pane_sessions.clone(),
             opts: HistoryOptions { path: None, ..opts },
             writer: None,
         })
@@ -238,6 +280,7 @@ impl PromptHistory {
         Ok((
             Arc::new(Self {
                 inner: RwLock::new(inner),
+                pane_sessions: opts.pane_sessions.clone(),
                 opts,
                 writer: Some(tx),
             }),
@@ -256,7 +299,13 @@ impl PromptHistory {
     /// the disk record but **keeps the in-memory copy** — better to lose a
     /// rare disk write than to stall the broadcast pipeline behind it.
     /// The drop is logged for diagnosis.
-    pub async fn append(&self, entry: HistoryEntry) {
+    pub async fn append(&self, mut entry: HistoryEntry) {
+        if entry.tmux_session.is_none() {
+            entry.tmux_session = self
+                .pane_sessions
+                .as_ref()
+                .and_then(|cache| cache.get(&entry.pane));
+        }
         {
             let mut inner = self.inner.write().await;
             push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane);
@@ -595,6 +644,7 @@ mod tests {
 
         let got: HistoryEntry = serde_json::from_str(raw).unwrap();
         assert_eq!(got.cwd, None);
+        assert_eq!(got.tmux_session, None);
     }
 
     #[test]
@@ -612,6 +662,22 @@ mod tests {
         let encoded = serde_json::to_string(&entry).unwrap();
         let got: HistoryEntry = serde_json::from_str(&encoded).unwrap();
         assert_eq!(got.cwd.as_deref(), Some("/home/june/muxa"));
+    }
+
+    #[tokio::test]
+    async fn append_enriches_tmux_session_from_cache() {
+        let cache = PaneSessionCache::default();
+        cache.replace([("%1", "muxa")]);
+        let h = PromptHistory::in_memory_only(HistoryOptions {
+            pane_sessions: Some(cache),
+            ..Default::default()
+        });
+
+        h.append(entry("%1", "hello", datetime!(2026-04-24 12:00:00 UTC)))
+            .await;
+
+        let got = h.recent_for_pane("%1", 1).await;
+        assert_eq!(got[0].tmux_session.as_deref(), Some("muxa"));
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use muxa::activity::{
 };
 use muxa::config::NotifierBackend;
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
-use muxa::history::{HistoryOptions, PromptHistory};
+use muxa::history::{HistoryOptions, PaneSessionCache, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, Server};
 use muxa::notify::Notifier;
 use muxa::reconcile::Reconciler;
@@ -31,6 +31,7 @@ use tokio::sync::broadcast;
 const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 /// Cadence at which the GC task scans for evictable agents.
 const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
+const PANE_SESSION_CACHE_INTERVAL_SECONDS: u64 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "muxad", version, about = "muxa daemon")]
@@ -115,21 +116,12 @@ async fn main() -> Result<()> {
     // authoritative drain signal.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // Signal handler — translates SIGTERM/SIGINT into a broadcast.
-    let shutdown_for_signals = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => tracing::info!("SIGTERM received"),
-            _ = int.recv()  => tracing::info!("SIGINT received"),
-        }
-        let _ = shutdown_for_signals.send(());
-    });
+    install_shutdown_signal_handler(shutdown_tx.clone());
 
     // Prompt history must exist before the store: every PromptSubmitted
     // event fans out into history alongside the live agent record.
-    let history = build_history(&cfg, &shutdown_tx).await;
+    let pane_session_cache = PaneSessionCache::default();
+    let history = build_history(&cfg, &shutdown_tx, pane_session_cache.clone()).await;
     let store = Store::shared_with_history(history.clone());
 
     // One backend, shared across every consumer that previously spoke
@@ -140,6 +132,8 @@ async fn main() -> Result<()> {
     // handle without contention.
     let backend: muxa::SharedBackend = muxa::default_backend();
     tracing::info!(host = %backend.kind(), "pane backend selected");
+    refresh_pane_session_cache(&pane_session_cache, backend.clone()).await;
+    spawn_pane_session_cache_task(pane_session_cache.clone(), backend.clone(), &shutdown_tx);
 
     // Rehydrate the agent registry from the previous run's snapshot, if
     // any. Done before the IPC server starts accepting events so no
@@ -163,7 +157,13 @@ async fn main() -> Result<()> {
     enrich_from_history(&store, &history, &backend).await;
 
     let activity_log = build_activity_log(&cfg, &shutdown_tx).await;
-    spawn_activity_transition_task(&store, activity_log.clone(), &shutdown_tx).await;
+    spawn_activity_transition_task(
+        &store,
+        activity_log.clone(),
+        pane_session_cache.clone(),
+        &shutdown_tx,
+    )
+    .await;
     spawn_gc_task(&store, &shutdown_tx);
     spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
     spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
@@ -288,6 +288,18 @@ fn spawn_gc_task(store: &muxa::SharedStore, shutdown_tx: &broadcast::Sender<()>)
     });
 }
 
+fn install_shutdown_signal_handler(shutdown_tx: broadcast::Sender<()>) {
+    tokio::spawn(async move {
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM received"),
+            _ = int.recv()  => tracing::info!("SIGINT received"),
+        }
+        let _ = shutdown_tx.send(());
+    });
+}
+
 /// Initialize the prompt history layer.
 ///
 /// When `[history] enabled = true` we hydrate the in-memory cache from
@@ -299,6 +311,7 @@ fn spawn_gc_task(store: &muxa::SharedStore, shutdown_tx: &broadcast::Sender<()>)
 async fn build_history(
     cfg: &Config,
     shutdown_tx: &broadcast::Sender<()>,
+    pane_session_cache: PaneSessionCache,
 ) -> std::sync::Arc<PromptHistory> {
     let opts_template = HistoryOptions {
         path: cfg
@@ -308,6 +321,7 @@ async fn build_history(
             .or_else(paths::default_history_file),
         max_per_pane: cfg.history.max_per_pane,
         max_age: time::Duration::days(i64::from(cfg.history.max_age_days)),
+        pane_sessions: Some(pane_session_cache),
         ..HistoryOptions::default()
     };
 
@@ -399,9 +413,43 @@ async fn build_activity_log(
     }
 }
 
+async fn refresh_pane_session_cache(cache: &PaneSessionCache, backend: muxa::SharedBackend) {
+    let panes = tokio::task::spawn_blocking(move || backend.list_panes())
+        .await
+        .unwrap_or_default();
+    cache.replace(panes.into_iter().map(|pane| (pane.pane_id, pane.session)));
+}
+
+fn spawn_pane_session_cache_task(
+    cache: PaneSessionCache,
+    backend: muxa::SharedBackend,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+            PANE_SESSION_CACHE_INTERVAL_SECONDS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    refresh_pane_session_cache(&cache, backend.clone()).await;
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::debug!("pane session cache task shutting down");
+                    break;
+                }
+            }
+        }
+    });
+}
+
 async fn spawn_activity_transition_task(
     store: &muxa::SharedStore,
     activity_log: Option<std::sync::Arc<ActivityLog>>,
+    pane_session_cache: PaneSessionCache,
     shutdown_tx: &broadcast::Sender<()>,
 ) {
     let Some(activity_log) = activity_log else {
@@ -429,6 +477,10 @@ async fn spawn_activity_transition_task(
                                 kind: agent.kind,
                                 session_id: agent.session_id.clone(),
                                 pane: agent.pane.clone(),
+                                session_name: agent
+                                    .pane
+                                    .as_deref()
+                                    .and_then(|pane| pane_session_cache.get(pane)),
                                 cwd: agent.cwd.clone(),
                                 from: transition.from,
                                 to: transition.to,

@@ -54,6 +54,8 @@ pub struct StateTransitionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub from: AgentState,
     pub to: AgentState,
@@ -72,6 +74,7 @@ pub struct StateTransitionInput {
     pub kind: AgentKind,
     pub session_id: String,
     pub pane: Option<String>,
+    pub session_name: Option<String>,
     pub cwd: Option<String>,
     pub from: AgentState,
     pub to: AgentState,
@@ -85,6 +88,7 @@ impl StateTransitionEntry {
             kind,
             session_id,
             pane,
+            session_name,
             cwd,
             from,
             to,
@@ -97,6 +101,7 @@ impl StateTransitionEntry {
             kind,
             session_id,
             pane,
+            session_name,
             cwd,
             from,
             to,
@@ -376,6 +381,7 @@ mod tests {
             kind: AgentKind::Codex,
             session_id: "s".into(),
             pane: Some("%1".into()),
+            session_name: Some("main".into()),
             cwd: Some("/repo".into()),
             from: AgentState::Working,
             to: AgentState::Idle,
@@ -383,6 +389,7 @@ mod tests {
         });
 
         assert_eq!(entry.duration_secs, 60);
+        assert_eq!(entry.session_name.as_deref(), Some("main"));
     }
 
     #[test]

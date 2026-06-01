@@ -231,6 +231,7 @@ Same fields as stored in the registry:
   "kind": "claude_code",
   "session_id": "sess-abc",
   "pane": "%12",
+  "tmux_session": "main",
   "cwd": "/home/user/proj",
   "state": "working" | "idle" | "waiting_input" | "waiting_choice" | "error" | "stopped" | "starting",
   "last_prompt": "string | null",
@@ -254,6 +255,7 @@ many entries can point at the same pane/session.
   "kind": "claude_code",
   "session_id": "sess-abc",
   "pane": "%12",
+  "tmux_session": "main",
   "cwd": "/home/user/proj",
   "prompt": "fix this bug",
   "at": "2026-04-24T12:00:00Z",
@@ -261,8 +263,9 @@ many entries can point at the same pane/session.
 }
 ```
 
-`cwd` and `model` are optional. Older `prompts.ndjson` lines may not have
-`cwd`; readers should treat it as unknown.
+`tmux_session`, `cwd`, and `model` are optional. Older `prompts.ndjson`
+lines may not have `tmux_session` or `cwd`; readers should treat them as
+unknown.
 
 ## `ActivityEntry` schema (in `activity.ndjson`)
 
@@ -281,6 +284,7 @@ Closed agent state interval:
   "kind": "codex",
   "session_id": "sess-abc",
   "pane": "%12",
+  "session_name": "main",
   "cwd": "/home/user/proj",
   "from": "working",
   "to": "waiting_input",
@@ -303,9 +307,10 @@ Closed tmux foreground interval:
 }
 ```
 
-`pane`, `cwd`, and `state_entered_at` are optional on state transitions.
-Foreground intervals are closed when the tmux session detaches or
-disappears, so they remain reportable after the tmux session is gone.
+`pane`, `session_name`, `cwd`, and `state_entered_at` are optional on
+state transitions. Foreground intervals are closed when the tmux session
+detaches or disappears, so they remain reportable after the tmux session
+is gone.
 
 ---
 
