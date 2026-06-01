@@ -667,9 +667,7 @@ pub(crate) fn use_colors() -> bool {
 }
 
 pub(crate) fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(width, _)| usize::from(width))
-        .unwrap_or(DEFAULT_TERMINAL_WIDTH)
+    crossterm::terminal::size().map_or(DEFAULT_TERMINAL_WIDTH, |(width, _)| usize::from(width))
 }
 
 pub(crate) fn truncate_cell(value: &str, max_chars: usize) -> String {
