@@ -336,6 +336,7 @@ muxa watch          # live TUI
 | ------------------------------------------ | ---------------------------------------------------------------------- |
 | `muxa status`                              | Human-readable table of all tracked agents.                            |
 | `muxa watch [--include-paneless] [--view pane\|session]` | Full-screen live TUI — see [Live TUI](#live-tui). Flags override `[watch]` for one invocation. |
+| `muxa attend [--cycle] [--list]` (alias `go`) | Jump to the agent that needs you — focuses the pane blocked on input/choice/error longest. `--cycle` rotates to the next one (bind it to a tmux key); `--list` prints the queue without jumping. |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
 | `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | Summarize retained prompt history, live agents, and tracked session `DUR`. |
