@@ -85,7 +85,7 @@ enum Cmd {
         /// detached SDK session.
         #[arg(long)]
         include_paneless: bool,
-        /// Row granularity: pane (default) or tmux session.
+        /// Row granularity: tmux session (default) or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
     },

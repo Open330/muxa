@@ -327,12 +327,14 @@ fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-r
 에이전트가 위로 올라옵니다. 정렬 기준은 `[watch] sort` 로 변경 가능
 (`session`, `activity`, `pane`, `pane_id` — [설정 > 정렬](#watch-sort) 참고).
 
-세션당 한 줄로 보고 싶으면 `muxa watch --view session`을 쓰거나
-`[watch] view = "session"`을 설정하세요. 같은 tmux 세션의 모든 페인이
-하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가 대표
-행이 됩니다. 세션 뷰에서 `Enter`는 대표 페인으로 이동하며, `DUR`
-컬럼은 그 tmux 세션이 interactive tmux client에서 foreground였던 누적
-시간을 보여줍니다.
+`muxa watch`는 기본적으로 **세션 뷰**로 열립니다. 같은 tmux 세션의 모든
+페인이 하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가
+대표 행이 됩니다 — 여러 세션을 동시에 굴리는 운영자를 위한 한눈에 보기
+형태죠. `Enter`는 대표 페인으로 이동하며, `DUR` 컬럼은 그 tmux 세션이
+interactive tmux client에서 foreground였던 누적 시간을 보여줍니다.
+
+에이전트/페인별로 한 줄씩 보고 싶으면 `muxa watch --view pane`을 쓰거나
+`[watch] view = "pane"`을 설정하세요.
 
 detail 라인 한 줄로 부족할 때 — 긴 prompt, 여러 단락의 응답 — 선택된
 행에서 **`p`** 키를 누르면 가운데 정렬된 preview 팝업이 뜹니다. 전체
@@ -463,7 +465,7 @@ backend = "libnotify"
 
 ```toml
 [watch]
-view = "pane" # 또는 "session"
+view = "session" # 기본값; 에이전트별 한 줄은 "pane"
 # 표시 순서. 빠진 키는 숨겨집니다.
 columns = ["pane", "state", "prompt", "activity"]
 
@@ -604,7 +606,7 @@ wedge 시키지 않습니다.
 `muxad`는 tmux 세션별 누적 foreground 시간을 추적합니다. interactive
 tmux client가 해당 세션을 foreground로 보고 있는 동안을 active 시간으로
 계산합니다(`tmux list-clients`의 `client_session` 기준이며 control-mode
-client는 제외). 이 값은 `muxa watch --view session`의 `DUR` 컬럼에
+client는 제외). 이 값은 `muxa watch` 세션 뷰(기본값)의 `DUR` 컬럼에
 표시됩니다.
 
 ```toml
