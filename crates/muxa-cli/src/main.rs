@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
-use muxa::config::WatchConfig;
+use muxa::config::{WatchConfig, WatchSortKey};
 use muxa::ipc::Client;
 use muxa::state::Agent;
 use muxa::{discovery, paths, tmux, AgentState, Config};
@@ -95,6 +95,9 @@ enum Cmd {
         /// Row granularity: tmux session (default) or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
+        /// One-shot sort override: session, act/activity, dur/duration, st/state, pane, pane-id.
+        #[arg(long, value_enum)]
+        sort: Option<WatchSortArg>,
     },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
@@ -177,6 +180,33 @@ impl From<WatchViewArg> for muxa::config::WatchView {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WatchSortArg {
+    Session,
+    #[value(alias = "act")]
+    Activity,
+    #[value(alias = "dur", alias = "duration")]
+    SessionTime,
+    #[value(alias = "st")]
+    State,
+    Pane,
+    #[value(alias = "pane_id")]
+    PaneId,
+}
+
+impl WatchSortArg {
+    fn keys(self) -> Vec<WatchSortKey> {
+        match self {
+            Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
+            Self::Activity => vec![WatchSortKey::Activity],
+            Self::SessionTime => vec![WatchSortKey::SessionTime],
+            Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
+            Self::Pane => vec![WatchSortKey::Session, WatchSortKey::Pane],
+            Self::PaneId => vec![WatchSortKey::PaneId],
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -210,7 +240,8 @@ async fn main() -> Result<()> {
         Cmd::Watch {
             include_paneless,
             view,
-        } => cmd_watch(&client, cfg, include_paneless, view).await,
+            sort,
+        } => cmd_watch(&client, cfg, include_paneless, view, sort).await,
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
@@ -288,6 +319,7 @@ async fn cmd_watch(
     cfg: Config,
     include_paneless: bool,
     view: Option<WatchViewArg>,
+    sort: Option<WatchSortArg>,
 ) -> Result<()> {
     // watch::run restores the terminal before returning, so by the time we
     // get here it's safe to exec tmux commands that mutate the client's
@@ -301,6 +333,9 @@ async fn cmd_watch(
     };
     if let Some(view) = view {
         watch_cfg.view = view.into();
+    }
+    if let Some(sort) = sort {
+        watch_cfg.sort = sort.keys();
     }
     let session_activity_path = cfg
         .session_activity
@@ -996,6 +1031,29 @@ mod tests {
             current_command: "claude".into(),
             title: String::new(),
             pane_pid: 0,
+        }
+    }
+
+    #[test]
+    fn watch_sort_cli_aliases_parse_to_expected_keys() {
+        for (raw, expected) in [
+            (
+                "session",
+                vec![WatchSortKey::Session, WatchSortKey::Activity],
+            ),
+            ("act", vec![WatchSortKey::Activity]),
+            ("dur", vec![WatchSortKey::SessionTime]),
+            ("st", vec![WatchSortKey::State, WatchSortKey::Activity]),
+            ("pane_id", vec![WatchSortKey::PaneId]),
+        ] {
+            let args = Args::try_parse_from(["muxa", "watch", "--sort", raw]).unwrap();
+            let Cmd::Watch {
+                sort: Some(sort), ..
+            } = args.cmd
+            else {
+                panic!("expected watch sort arg");
+            };
+            assert_eq!(sort.keys(), expected);
         }
     }
 

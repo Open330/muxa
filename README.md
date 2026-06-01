@@ -424,8 +424,8 @@ both during a turn and after one. Configure via `[watch.detail]` (see
 
 Rows are grouped by tmux session, with the most recently active agent
 floated to the top of each group. Reorder via `[watch] sort` (see
-[Configuration](#watch-sort)) — useful sort keys: `session`, `activity`,
-`pane`, `pane_id`.
+[Configuration](#watch-sort)) or while `muxa watch` is open with
+`s`/`a`/`d`/`t` for `SESSION`/`ACT`/`DUR`/`ST`.
 
 By default `muxa watch` opens in **session view**: all panes in the same
 tmux session collapse into one row, represented by the most recently
@@ -634,19 +634,27 @@ closed) always sink to the bottom regardless of the sort keys.
 # in each group to the top.
 sort = ["session", "activity"]
 
-# sort = ["activity"]            # global newest-first, no grouping
+# sort = ["activity"]            # ACT: global newest-first, no grouping
+# sort = ["session_time"]        # DUR: longest foregrounded tmux session first
+# sort = ["state", "activity"]   # ST: attention states first, then newest
 # sort = ["session", "pane"]     # tmux-native order within session
 # sort = ["pane_id"]             # raw pane id lex asc (screenshot-friendly)
 ```
 
 Available keys:
 
-| Key       | Effect                                                          |
-| --------- | --------------------------------------------------------------- |
-| `session` | tmux session name ascending (groups same-session panes)         |
-| `activity`| `last_activity_at` descending — most recently updated first     |
-| `pane`    | window then pane index, parsed numerically (`10` after `2`)     |
-| `pane_id` | raw pane id (`%42`) lexicographic ascending                     |
+| Key            | Effect                                                          |
+| -------------- | --------------------------------------------------------------- |
+| `session`      | tmux session name ascending (groups same-session panes)         |
+| `activity`     | `last_activity_at` descending — most recently updated first     |
+| `state`        | attention states first: error, choice, input, working, idle     |
+| `session_time` | `DUR` descending — longest foregrounded tmux session first      |
+| `pane`         | window then pane index, parsed numerically (`10` after `2`)     |
+| `pane_id`      | raw pane id (`%42`) lexicographic ascending                     |
+
+`activity`, `state`, and `session_time` also accept the short aliases
+`act`, `st`, and `dur`. For one-off use, `muxa watch --sort act` (or
+`dur`, `st`, `session`) overrides the config for that run.
 
 Unknown keys surface as a parse error — typos don't fail silently.
 

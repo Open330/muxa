@@ -790,7 +790,18 @@ pub enum WatchSortKey {
     /// `last_activity_at` descending — most recently updated first. The
     /// useful default to surface "what's moving right now" without
     /// scrolling.
+    #[serde(alias = "act")]
     Activity,
+    /// Semantic agent state priority: error/input/choice rows first, then
+    /// working/starting/idle/stopped. This is deliberately operational,
+    /// not alphabetical.
+    #[serde(alias = "st")]
+    State,
+    /// Session foreground duration descending. In pane view this resolves
+    /// each pane's tmux session duration; panes without a known session
+    /// duration sort as zero.
+    #[serde(alias = "duration", alias = "dur")]
+    SessionTime,
     /// tmux window index, then pane index, both ascending and parsed
     /// numerically so `10` sorts after `2`. Combined with `Session`, this
     /// reproduces the tmux-native pane ordering.
@@ -1045,6 +1056,24 @@ sort = ["activity"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.watch.sort, vec![WatchSortKey::Activity]);
+    }
+
+    #[test]
+    fn parses_watch_sort_aliases_for_cli_column_names() {
+        let toml = r#"
+[watch]
+sort = ["act", "st", "dur", "duration"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.watch.sort,
+            vec![
+                WatchSortKey::Activity,
+                WatchSortKey::State,
+                WatchSortKey::SessionTime,
+                WatchSortKey::SessionTime,
+            ]
+        );
     }
 
     #[test]

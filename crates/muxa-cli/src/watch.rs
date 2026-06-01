@@ -364,6 +364,45 @@ pub(crate) struct SessionRow {
     pub activity: Option<SessionActivity>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchSortPreset {
+    Session,
+    Activity,
+    Duration,
+    State,
+}
+
+impl WatchSortPreset {
+    fn keys(self) -> Vec<WatchSortKey> {
+        match self {
+            Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
+            Self::Activity => vec![WatchSortKey::Activity],
+            Self::Duration => vec![WatchSortKey::SessionTime],
+            Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Session => "SESSION",
+            Self::Activity => "ACT",
+            Self::Duration => "DUR",
+            Self::State => "ST",
+        }
+    }
+}
+
+fn sort_label(keys: &[WatchSortKey]) -> &'static str {
+    match keys.first().copied() {
+        Some(WatchSortKey::Session) | None => "SESSION",
+        Some(WatchSortKey::Activity) => "ACT",
+        Some(WatchSortKey::SessionTime) => "DUR",
+        Some(WatchSortKey::State) => "ST",
+        Some(WatchSortKey::Pane) => "PANE",
+        Some(WatchSortKey::PaneId) => "PANE ID",
+    }
+}
+
 impl WatchRow {
     fn pane_id(&self) -> Option<&str> {
         match self {
@@ -662,6 +701,12 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  p              open preview overlay",
         "  f              (in preview) toggle popup ↔ fullscreen",
         "  c              (in preview) toggle prompt ↔ live pane",
+        "",
+        "Sorting",
+        "  s              sort by session name",
+        "  a              sort by activity (ACT)",
+        "  d              sort by duration (DUR)",
+        "  t              sort by state (ST)",
         "",
         "State markers",
         "  ● working  ? input  ◆ choice  ! error  · idle  … starting  × stopped",
@@ -977,10 +1022,14 @@ impl App {
         // Agent records carry only `pane_id`; session / window / pane
         // indices are resolved via the panes inventory collected this
         // refresh.
-        let pane_by_id: HashMap<&str, &PaneInfo> =
-            panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+        let sort_context = SortContext::new(
+            &panes,
+            &sessions,
+            &session_activity,
+            OffsetDateTime::now_utc(),
+        );
         let sort_keys = &self.watch_cfg.sort;
-        agents.sort_by(|a, b| sort_agents(a, b, sort_keys, &pane_by_id));
+        agents.sort_by(|a, b| sort_agents(a, b, sort_keys, &sort_context));
 
         let known: HashSet<String> = agents.iter().filter_map(|a| a.pane.clone()).collect();
 
@@ -1008,6 +1057,51 @@ impl App {
         self.sessions = sessions;
         self.session_activity = session_activity;
         self.last_refresh = OffsetDateTime::now_utc();
+        self.clamp_selection();
+    }
+
+    pub(crate) fn apply_sort_preset(&mut self, preset: WatchSortPreset) {
+        self.watch_cfg.sort = preset.keys();
+        self.resort_rows_preserving_selection();
+    }
+
+    fn resort_rows_preserving_selection(&mut self) {
+        let selected_pane = self.selected_pane();
+        let sort_context = SortContext::new(
+            &self.panes,
+            &self.sessions,
+            &self.session_activity,
+            OffsetDateTime::now_utc(),
+        );
+        let sort_keys = &self.watch_cfg.sort;
+
+        if self.watch_cfg.view == WatchView::Session {
+            self.rows.sort_by(|a, b| match (a, b) {
+                (WatchRow::Session(a), WatchRow::Session(b)) => {
+                    sort_sessions(a, b, sort_keys, &sort_context)
+                }
+                (WatchRow::Session(_), _) => std::cmp::Ordering::Less,
+                (_, WatchRow::Session(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            });
+        } else {
+            self.rows.sort_by(|a, b| match (a, b) {
+                (WatchRow::Agent(a), WatchRow::Agent(b)) => {
+                    sort_agents(a, b, sort_keys, &sort_context)
+                }
+                (WatchRow::Agent(_), _) => std::cmp::Ordering::Less,
+                (_, WatchRow::Agent(_)) => std::cmp::Ordering::Greater,
+                (WatchRow::BarePane(a), WatchRow::BarePane(b)) => sort_panes(a, b),
+                _ => std::cmp::Ordering::Equal,
+            });
+        }
+
+        if let Some(pane) = selected_pane {
+            if let Some(idx) = self.rows.iter().position(|r| r.contains_pane(&pane)) {
+                self.table_state.select(Some(idx));
+                return;
+            }
+        }
         self.clamp_selection();
     }
 
@@ -1107,6 +1201,70 @@ impl App {
     }
 }
 
+struct SortContext<'a> {
+    pane_by_id: HashMap<&'a str, &'a PaneInfo>,
+    session_id_by_name: HashMap<&'a str, &'a str>,
+    activity_by_id: HashMap<&'a str, &'a SessionActivity>,
+    now: OffsetDateTime,
+}
+
+impl<'a> SortContext<'a> {
+    fn new(
+        panes: &'a [PaneInfo],
+        sessions: &'a [SessionInfo],
+        session_activity: &'a [SessionActivity],
+        now: OffsetDateTime,
+    ) -> Self {
+        Self {
+            pane_by_id: panes.iter().map(|p| (p.pane_id.as_str(), p)).collect(),
+            session_id_by_name: sessions
+                .iter()
+                .map(|s| (s.name.as_str(), s.session_id.as_str()))
+                .collect(),
+            activity_by_id: session_activity
+                .iter()
+                .map(|a| (a.session_id.as_str(), a))
+                .collect(),
+            now,
+        }
+    }
+
+    fn pane(&self, pane_id: &str) -> Option<&'a PaneInfo> {
+        self.pane_by_id.get(pane_id).copied()
+    }
+
+    fn activity_for_session_name(&self, session: &str) -> Option<&'a SessionActivity> {
+        self.session_id_by_name
+            .get(session)
+            .and_then(|id| self.activity_by_id.get(*id).copied())
+    }
+
+    fn session_duration_secs(&self, session: &str) -> u64 {
+        self.activity_for_session_name(session)
+            .map_or(0, |a| a.effective_total_secs(self.now))
+    }
+
+    fn agent_session_duration_secs(&self, agent: &Agent) -> u64 {
+        agent
+            .pane
+            .as_deref()
+            .and_then(|id| self.pane(id))
+            .map_or(0, |p| self.session_duration_secs(&p.session))
+    }
+}
+
+fn state_sort_rank(state: AgentState) -> u8 {
+    match state {
+        AgentState::Error => 0,
+        AgentState::WaitingChoice => 1,
+        AgentState::WaitingInput => 2,
+        AgentState::Working => 3,
+        AgentState::Starting => 4,
+        AgentState::Idle => 5,
+        AgentState::Stopped => 6,
+    }
+}
+
 /// Compare two agents according to the user-configured sort keys.
 ///
 /// Comparison flow (each step exits as soon as one agent is "less than"
@@ -1120,12 +1278,12 @@ fn sort_agents(
     a: &Agent,
     b: &Agent,
     keys: &[WatchSortKey],
-    pane_by_id: &HashMap<&str, &PaneInfo>,
+    sort_context: &SortContext<'_>,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    let info_a = a.pane.as_deref().and_then(|id| pane_by_id.get(id).copied());
-    let info_b = b.pane.as_deref().and_then(|id| pane_by_id.get(id).copied());
+    let info_a = a.pane.as_deref().and_then(|id| sort_context.pane(id));
+    let info_b = b.pane.as_deref().and_then(|id| sort_context.pane(id));
 
     // Stale (pane gone) → Ordering::Greater so it sinks to the bottom.
     match (info_a.is_some(), info_b.is_some()) {
@@ -1143,6 +1301,10 @@ fn sort_agents(
                 // Reverse so newer (= larger timestamp) ends up first.
                 b.last_activity_at.cmp(&a.last_activity_at)
             }
+            WatchSortKey::State => state_sort_rank(a.state).cmp(&state_sort_rank(b.state)),
+            WatchSortKey::SessionTime => sort_context
+                .agent_session_duration_secs(b)
+                .cmp(&sort_context.agent_session_duration_secs(a)),
             WatchSortKey::Pane => {
                 let key_for = |info: Option<&PaneInfo>| {
                     info.map(|p| {
@@ -1179,16 +1341,8 @@ fn build_session_rows(
         activity: Option<SessionActivity>,
     }
 
-    let pane_by_id: HashMap<&str, &PaneInfo> =
-        panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
-    let session_id_by_name: HashMap<&str, &str> = sessions
-        .iter()
-        .map(|s| (s.name.as_str(), s.session_id.as_str()))
-        .collect();
-    let activity_by_id: HashMap<&str, &SessionActivity> = session_activity
-        .iter()
-        .map(|a| (a.session_id.as_str(), a))
-        .collect();
+    let sort_context =
+        SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
     let mut builders: HashMap<String, Builder> = HashMap::new();
     for p in panes {
@@ -1205,7 +1359,7 @@ fn build_session_rows(
         let session = agent
             .pane
             .as_deref()
-            .and_then(|id| pane_by_id.get(id).map(|p| p.session.clone()))
+            .and_then(|id| sort_context.pane(id).map(|p| p.session.clone()))
             .unwrap_or_else(|| {
                 agent
                     .pane
@@ -1220,10 +1374,8 @@ fn build_session_rows(
     }
 
     for builder in builders.values_mut() {
-        if let Some(session_id) = session_id_by_name.get(builder.session.as_str()) {
-            if let Some(activity) = activity_by_id.get(session_id).copied() {
-                builder.activity = Some(activity.clone());
-            }
+        if let Some(activity) = sort_context.activity_for_session_name(&builder.session) {
+            builder.activity = Some(activity.clone());
         }
     }
 
@@ -1270,7 +1422,7 @@ fn build_session_rows(
         })
         .collect();
 
-    rows.sort_by(|a, b| sort_sessions(a, b, sort_keys, &pane_by_id));
+    rows.sort_by(|a, b| sort_sessions(a, b, sort_keys, &sort_context));
     rows.into_iter()
         .map(|row| WatchRow::Session(Box::new(row)))
         .collect()
@@ -1298,13 +1450,13 @@ fn sort_sessions(
     a: &SessionRow,
     b: &SessionRow,
     keys: &[WatchSortKey],
-    pane_by_id: &HashMap<&str, &PaneInfo>,
+    sort_context: &SortContext<'_>,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let pane_info = |row: &SessionRow| {
         row.representative_pane
             .as_deref()
-            .and_then(|id| pane_by_id.get(id).copied())
+            .and_then(|id| sort_context.pane(id))
     };
     for key in keys {
         let cmp = match key {
@@ -1314,6 +1466,17 @@ fn sort_sessions(
                 .as_ref()
                 .map(|agent| agent.last_activity_at)
                 .cmp(&a.latest_agent.as_ref().map(|agent| agent.last_activity_at)),
+            WatchSortKey::State => {
+                let rank = |row: &SessionRow| {
+                    row.latest_agent
+                        .as_ref()
+                        .map_or(u8::MAX, |agent| state_sort_rank(agent.state))
+                };
+                rank(a).cmp(&rank(b))
+            }
+            WatchSortKey::SessionTime => sort_context
+                .session_duration_secs(&b.session)
+                .cmp(&sort_context.session_duration_secs(&a.session)),
             WatchSortKey::Pane => {
                 let key_for = |info: Option<&PaneInfo>| {
                     info.map(|p| {
@@ -2140,6 +2303,10 @@ pub async fn run(
                         }
                     }
                 }
+                Action::SetSort(preset) => {
+                    app.apply_sort_preset(preset);
+                    app.set_hint(format!("sorted by {}", preset.label()), HintLevel::Ok);
+                }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
                 }
@@ -2265,6 +2432,8 @@ pub(crate) enum Action {
     /// Swap the preview content between prompt/response and live pane
     /// capture. Composes with `TogglePreviewMode` (geometry).
     TogglePreviewContent,
+    /// Change the table's primary sort while staying inside the watch TUI.
+    SetSort(WatchSortPreset),
     /// Open a confirm popup for a destructive [`QuickAction`]. The
     /// popup itself is interpreted by the input loop; the action only
     /// dispatches when the user answers `y`.
@@ -2373,6 +2542,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Enter => Action::Attach,
         KeyCode::Char('p') => Action::OpenPreview,
         KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
+        KeyCode::Char('s') => Action::SetSort(WatchSortPreset::Session),
+        KeyCode::Char('a') => Action::SetSort(WatchSortPreset::Activity),
+        KeyCode::Char('d') => Action::SetSort(WatchSortPreset::Duration),
+        KeyCode::Char('t') => Action::SetSort(WatchSortPreset::State),
         // Capital-K / Capital-R require Shift in the spec — crossterm
         // surfaces Shift-letter as `Char('K')` regardless of whether
         // the user pressed Shift+k or had CapsLock on, so we accept
@@ -2504,7 +2677,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // help (handled by `handle_event`'s mode gates) so we render
     // whichever is active without worrying about z-order between them.
     if app.help_open {
-        // 60 × 90 % — the help body is ~23 lines tall, so 70 % on a
+        // 60 × 90 % — the help body is ~29 lines tall, so 70 % on a
         // 24-row terminal would clip the bottom sections. 90 %
         // leaves enough room for the full keybinding matrix while
         // still framing it as a popup rather than full-screen.
@@ -2856,6 +3029,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("+ {bare} pane{}", plural(bare))
             },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("sort {}", sort_label(&app.watch_cfg.sort)),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("   "),
@@ -3453,6 +3631,11 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" preview  "),
         Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" refresh  "),
+        Span::styled(
+            " s/a/d/t ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" sort  "),
         Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" help  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -3947,6 +4130,133 @@ mod tests {
             })
             .collect();
         assert_eq!(order, vec!["%20", "%30", "%10"]);
+    }
+
+    #[test]
+    fn state_sort_prioritizes_rows_that_need_attention() {
+        let now = OffsetDateTime::now_utc();
+        let cfg = WatchConfig {
+            view: WatchView::Pane,
+            sort: vec![WatchSortKey::State],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let mut idle = fake_agent_at("idle", "%10", now);
+        idle.state = AgentState::Idle;
+        let mut working = fake_agent_at("working", "%20", now);
+        working.state = AgentState::Working;
+        let mut choice = fake_agent_at("choice", "%30", now);
+        choice.state = AgentState::WaitingChoice;
+        let mut error = fake_agent_at("error", "%40", now);
+        error.state = AgentState::Error;
+
+        app.set_data(
+            vec![idle, working, choice, error],
+            vec![
+                fake_pane("%10", "a", 0, 0, "x"),
+                fake_pane("%20", "a", 0, 1, "x"),
+                fake_pane("%30", "a", 0, 2, "x"),
+                fake_pane("%40", "a", 0, 3, "x"),
+            ],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["%40", "%30", "%20", "%10"]);
+    }
+
+    #[test]
+    fn session_view_duration_sort_orders_longest_session_first() {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::SessionTime],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![
+                fake_pane("%1", "short", 0, 0, "zsh"),
+                fake_pane("%2", "long", 0, 0, "zsh"),
+            ],
+            vec![
+                fake_session("$1", "short", 0),
+                fake_session("$2", "long", 0),
+            ],
+            vec![
+                fake_session_activity("$1", "short", 60, None),
+                fake_session_activity("$2", "long", 3_600, None),
+            ],
+        );
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Session(s) => Some(s.session.as_str()),
+                WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["long", "short"]);
+    }
+
+    #[test]
+    fn runtime_sort_preset_reorders_rows_and_preserves_selected_pane() {
+        let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Pane,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent_at("alpha", "%10", t0),
+                fake_agent_at("beta", "%20", t1),
+            ],
+            vec![
+                fake_pane("%10", "alpha", 0, 0, "x"),
+                fake_pane("%20", "beta", 0, 0, "x"),
+            ],
+        );
+        app.table_state.select(Some(0));
+
+        app.apply_sort_preset(WatchSortPreset::Activity);
+
+        let order: Vec<&str> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Agent(a) => a.pane.as_deref(),
+                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["%20", "%10"]);
+        assert_eq!(app.selected_pane().as_deref(), Some("%10"));
+    }
+
+    #[test]
+    fn sort_keybindings_switch_sort_presets() {
+        let mut app = App::new();
+        for (key, preset) in [
+            ('s', WatchSortPreset::Session),
+            ('a', WatchSortPreset::Activity),
+            ('d', WatchSortPreset::Duration),
+            ('t', WatchSortPreset::State),
+        ] {
+            let action = handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                &mut app,
+            );
+            assert!(matches!(action, Action::SetSort(p) if p == preset));
+        }
     }
 
     #[test]
@@ -6200,6 +6510,9 @@ mod tests {
                     }
                 }
             }
+            Action::SetSort(preset) => {
+                app.apply_sort_preset(preset);
+            }
             // Quick-action paths aren't exercised through `press` —
             // tests that need them call `handle_event` directly so
             // they can inspect the `Action` variant. Anything we
@@ -7031,6 +7344,12 @@ mod tests {
                         \x20\x20p              open preview overlay\n\
                         \x20\x20f              (in preview) toggle popup ↔ fullscreen\n\
                         \x20\x20c              (in preview) toggle prompt ↔ live pane\n\
+                        \n\
+                        Sorting\n\
+                        \x20\x20s              sort by session name\n\
+                        \x20\x20a              sort by activity (ACT)\n\
+                        \x20\x20d              sort by duration (DUR)\n\
+                        \x20\x20t              sort by state (ST)\n\
                         \n\
                         State markers\n\
                         \x20\x20● working  ? input  ◆ choice  ! error  · idle  … starting  × stopped\n\
