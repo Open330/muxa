@@ -11,7 +11,7 @@ mod watch;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use comfy_table::{Cell, ContentArrangement, Table};
+use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
 use muxa::config::WatchConfig;
 use muxa::ipc::Client;
@@ -22,6 +22,13 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use time::OffsetDateTime;
+use unicode_width::UnicodeWidthChar;
+
+const DEFAULT_TERMINAL_WIDTH: usize = 120;
+const FULL_STATUS_TABLE_WIDTH: usize = 120;
+const COMPACT_STATUS_TABLE_WIDTH: usize = 76;
+const MIN_STATUS_PROMPT_WIDTH: usize = 8;
+const MAX_STATUS_PROMPT_WIDTH: usize = 60;
 
 #[derive(Debug, Parser)]
 #[command(name = "muxa", version, about = "muxa CLI")]
@@ -636,11 +643,16 @@ fn cmd_panes() {
         }
         return;
     }
+    let terminal_width = terminal_width();
+    let mut out = std::io::stdout().lock();
     for p in panes {
-        println!(
+        let line = format!(
             "{:<8} {}:{}.{}  tty={}  cmd={}  title={}",
             p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title
         );
+        if writeln!(out, "{}", truncate_cell(&line, terminal_width)).is_err() {
+            return;
+        }
     }
 }
 
@@ -652,6 +664,51 @@ pub(crate) fn use_colors() -> bool {
         return false;
     }
     std::io::stdout().is_terminal()
+}
+
+pub(crate) fn terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(width, _)| usize::from(width))
+        .unwrap_or(DEFAULT_TERMINAL_WIDTH)
+}
+
+pub(crate) fn truncate_cell(value: &str, max_chars: usize) -> String {
+    if value
+        .chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum::<usize>()
+        <= max_chars
+    {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        let mut used = 0;
+        let mut out = String::new();
+        for ch in value.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + width > max_chars {
+                break;
+            }
+            used += width;
+            out.push(ch);
+        }
+        return out;
+    }
+
+    let content_width = max_chars - 3;
+    let mut used = 0;
+    let mut out = String::new();
+    for ch in value.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > content_width {
+            break;
+        }
+        used += width;
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 pub(crate) fn state_icon(state: AgentState) -> &'static str {
@@ -723,56 +780,226 @@ fn print_table(
     now: OffsetDateTime,
     colored: bool,
 ) {
+    println!(
+        "{}",
+        render_status_table(agents, panes, now, colored, terminal_width())
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTableLayout {
+    Full,
+    Compact,
+    Minimal,
+}
+
+fn render_status_table(
+    agents: &[Agent],
+    panes: &[muxa::tmux::PaneInfo],
+    now: OffsetDateTime,
+    colored: bool,
+    terminal_width: usize,
+) -> String {
+    let layout = status_table_layout(terminal_width);
+    let prompt_width = status_prompt_width(terminal_width, layout);
     let mut table = Table::new();
     table
         .load_preset(UTF8_BORDERS_ONLY)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "PANE",
-            "KIND",
-            "STATE",
-            "MODEL",
-            "LAST ACTIVITY",
-            "LAST PROMPT",
-        ]);
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_constraints(status_table_constraints(layout, prompt_width))
+        .set_header(status_table_header(layout, prompt_width));
 
     for a in agents {
         let pane = pane_display(a, panes);
         let kind = a.kind.to_string();
-        let state_txt = a.state.to_string();
-        let state_cell = if colored {
-            Cell::new(state_txt.style(state_style(a.state)).to_string())
-        } else {
-            Cell::new(state_txt)
-        };
+        let state_txt = status_state_label(a.state, layout).to_string();
         let model = a.model.as_deref().unwrap_or("-").to_string();
         let last_activity = relative_time(now, a.last_activity_at);
         let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
-        let prompt: String = prompt_raw
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(60)
-            .collect();
+        let prompt = prompt_raw.lines().next().unwrap_or("");
 
-        table.add_row(vec![
-            Cell::new(pane),
-            Cell::new(kind),
-            state_cell,
-            Cell::new(model),
-            Cell::new(last_activity),
-            Cell::new(prompt),
-        ]);
+        let state_cell = status_state_cell(&state_txt, a.state, colored);
+        let row = match layout {
+            StatusTableLayout::Full => vec![
+                Cell::new(truncate_cell(&pane, 24)),
+                Cell::new(truncate_cell(&kind, 12)),
+                state_cell,
+                Cell::new(truncate_cell(&model, 16)),
+                right_cell(&last_activity, 7),
+                Cell::new(truncate_cell(prompt, prompt_width)),
+            ],
+            StatusTableLayout::Compact => vec![
+                Cell::new(truncate_cell(&pane, 18)),
+                Cell::new(truncate_cell(&kind, 11)),
+                state_cell,
+                right_cell(&last_activity, 7),
+                Cell::new(truncate_cell(prompt, prompt_width)),
+            ],
+            StatusTableLayout::Minimal => vec![
+                Cell::new(truncate_cell(&pane, 14)),
+                state_cell,
+                right_cell(&last_activity, 7),
+                Cell::new(truncate_cell(prompt, prompt_width)),
+            ],
+        };
+        table.add_row(row);
     }
 
-    println!("{table}");
+    format!("{table}")
+}
+
+fn status_table_layout(terminal_width: usize) -> StatusTableLayout {
+    if terminal_width >= FULL_STATUS_TABLE_WIDTH {
+        StatusTableLayout::Full
+    } else if terminal_width >= COMPACT_STATUS_TABLE_WIDTH {
+        StatusTableLayout::Compact
+    } else {
+        StatusTableLayout::Minimal
+    }
+}
+
+fn status_table_constraints(
+    layout: StatusTableLayout,
+    prompt_width: usize,
+) -> Vec<ColumnConstraint> {
+    let widths: &[usize] = match layout {
+        StatusTableLayout::Full => &[24, 12, 14, 16, 7],
+        StatusTableLayout::Compact => &[18, 11, 7, 7],
+        StatusTableLayout::Minimal => &[14, 6, 7],
+    };
+    widths
+        .iter()
+        .copied()
+        .chain(std::iter::once(prompt_width))
+        .map(|width| {
+            ColumnConstraint::Absolute(Width::Fixed(u16::try_from(width).unwrap_or(u16::MAX)))
+        })
+        .collect()
+}
+
+fn status_table_header(layout: StatusTableLayout, prompt_width: usize) -> Vec<Cell> {
+    match layout {
+        StatusTableLayout::Full => vec![
+            Cell::new("PANE"),
+            Cell::new("KIND"),
+            Cell::new("STATE"),
+            Cell::new("MODEL"),
+            right_cell("LAST", 7),
+            Cell::new(truncate_cell("LAST PROMPT", prompt_width)),
+        ],
+        StatusTableLayout::Compact => vec![
+            Cell::new("PANE"),
+            Cell::new("KIND"),
+            Cell::new("STATE"),
+            right_cell("LAST", 7),
+            Cell::new(truncate_cell("PROMPT", prompt_width)),
+        ],
+        StatusTableLayout::Minimal => vec![
+            Cell::new("PANE"),
+            Cell::new("STATE"),
+            right_cell("LAST", 7),
+            Cell::new(truncate_cell("PROMPT", prompt_width)),
+        ],
+    }
+}
+
+fn status_prompt_width(terminal_width: usize, layout: StatusTableLayout) -> usize {
+    let fixed_width: usize = match layout {
+        StatusTableLayout::Full => 24 + 12 + 14 + 16 + 7,
+        StatusTableLayout::Compact => 18 + 11 + 7 + 7,
+        StatusTableLayout::Minimal => 14 + 6 + 7,
+    };
+    let column_count: usize = match layout {
+        StatusTableLayout::Full => 6,
+        StatusTableLayout::Compact => 5,
+        StatusTableLayout::Minimal => 4,
+    };
+    let border_and_padding_width = column_count + 1 + column_count * 2;
+    terminal_width
+        .saturating_sub(fixed_width + border_and_padding_width)
+        .clamp(MIN_STATUS_PROMPT_WIDTH, MAX_STATUS_PROMPT_WIDTH)
+}
+
+fn status_state_label(state: AgentState, layout: StatusTableLayout) -> &'static str {
+    if layout == StatusTableLayout::Full {
+        return match state {
+            AgentState::Working => "working",
+            AgentState::Idle => "idle",
+            AgentState::WaitingInput => "waiting_input",
+            AgentState::WaitingChoice => "waiting_choice",
+            AgentState::Error => "error",
+            AgentState::Stopped => "stopped",
+            AgentState::Starting => "starting",
+        };
+    }
+    match state {
+        AgentState::Working => "work",
+        AgentState::Idle => "idle",
+        AgentState::WaitingInput => "input",
+        AgentState::WaitingChoice => "choice",
+        AgentState::Error => "error",
+        AgentState::Stopped => "stop",
+        AgentState::Starting => "start",
+    }
+}
+
+fn status_state_cell(label: &str, state: AgentState, colored: bool) -> Cell {
+    if colored {
+        Cell::new(label.style(state_style(state)).to_string())
+    } else {
+        Cell::new(label.to_string())
+    }
+}
+
+fn right_cell(value: &str, max_chars: usize) -> Cell {
+    Cell::new(truncate_cell(value, max_chars)).set_alignment(CellAlignment::Right)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxa::AgentKind;
     use time::macros::datetime;
+    use unicode_width::UnicodeWidthStr;
+
+    fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {
+        Agent {
+            kind: AgentKind::ClaudeCode,
+            session_id: session_id.into(),
+            pane: pane.map(str::to_string),
+            cwd: None,
+            state,
+            last_prompt: Some(prompt.into()),
+            last_response: None,
+            last_notification: None,
+            model: Some("claude-sonnet-very-long-model-name".into()),
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: datetime!(2026-04-24 12:00:00 UTC),
+            last_activity_at: datetime!(2026-04-24 11:55:00 UTC),
+            state_entered_at: datetime!(2026-04-24 11:55:00 UTC),
+        }
+    }
+
+    fn pane(id: &str, session: &str) -> muxa::tmux::PaneInfo {
+        muxa::tmux::PaneInfo {
+            pane_id: id.into(),
+            session: session.into(),
+            window_index: "12".into(),
+            pane_index: "3".into(),
+            tty: "/dev/pts/0".into(),
+            current_command: "claude".into(),
+            title: String::new(),
+            pane_pid: 0,
+        }
+    }
 
     #[test]
     fn relative_time_units() {
@@ -804,5 +1031,81 @@ mod tests {
             relative_time(now, datetime!(2026-04-24 12:00:30 UTC)),
             "0s ago"
         );
+    }
+
+    #[test]
+    fn truncate_cell_clips_to_ascii_ellipsis() {
+        assert_eq!(truncate_cell("short", 10), "short");
+        assert_eq!(truncate_cell("0123456789abc", 8), "01234...");
+        assert_eq!(truncate_cell("한글테스트입니다", 6), "한...");
+    }
+
+    #[test]
+    fn status_table_compacts_without_wrapping_at_88_cols() {
+        let agents = vec![
+            agent(
+                "a",
+                Some("%1"),
+                AgentState::WaitingChoice,
+                "please choose one of the available deployment options",
+            ),
+            agent(
+                "b",
+                Some("%2"),
+                AgentState::Working,
+                "this is a very long prompt that should be truncated in compact status output",
+            ),
+        ];
+        let panes = vec![
+            pane("%1", "callabo-knowledge-long-session-name"),
+            pane("%2", "muxa"),
+        ];
+
+        let rendered = render_status_table(
+            &agents,
+            &panes,
+            datetime!(2026-04-24 12:00:00 UTC),
+            false,
+            88,
+        );
+
+        assert!(rendered.contains("choice"));
+        assert!(!rendered.contains("MODEL"));
+        assert!(rendered.contains("callabo-knowled..."));
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 88,
+                "line exceeded compact status width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_table_minimal_layout_for_very_narrow_width() {
+        let agents = vec![agent(
+            "a",
+            Some("%1"),
+            AgentState::WaitingInput,
+            "approve permission",
+        )];
+        let panes = vec![pane("%1", "callabo-set")];
+
+        let rendered = render_status_table(
+            &agents,
+            &panes,
+            datetime!(2026-04-24 12:00:00 UTC),
+            false,
+            60,
+        );
+
+        assert!(rendered.contains("STATE"));
+        assert!(!rendered.contains("KIND"));
+        assert!(!rendered.contains("MODEL"));
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 60,
+                "line exceeded minimal status width: {line:?}"
+            );
+        }
     }
 }

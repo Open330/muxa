@@ -22,7 +22,7 @@ use muxa::state::Agent;
 use muxa::tmux::PaneInfo;
 use muxa::{AgentState, PaneBackend};
 
-use crate::{pane_display, state_icon, state_style, use_colors};
+use crate::{pane_display, state_icon, state_style, terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -174,6 +174,8 @@ pub async fn run(client: &Client, backend: &dyn PaneBackend, args: Args) -> Resu
 fn print_queue(cands: &[Candidate<'_>], panes: &[PaneInfo]) {
     let now = OffsetDateTime::now_utc();
     let color = use_colors();
+    let terminal_width = terminal_width();
+    let (loc_width, kind_width) = attend_queue_widths(terminal_width);
 
     let mut ranked: Vec<&Candidate<'_>> = cands.iter().collect();
     ranked.sort_by(|a, b| {
@@ -187,27 +189,43 @@ fn print_queue(cands: &[Candidate<'_>], panes: &[PaneInfo]) {
     println!("{n} agent{} need you:", if n == 1 { "" } else { "s" });
     for c in ranked {
         let icon = state_icon(c.agent.state);
-        let loc = pane_display(c.agent, panes);
-        let kind = c.agent.kind.to_string();
+        let loc = truncate_cell(&pane_display(c.agent, panes), loc_width);
+        let kind = truncate_cell(&c.agent.kind.to_string(), kind_width);
         let waited = humanize_since(c.agent.state_entered_at, now);
-        let head = format!("  {icon} {loc:<16} {kind:<12} waiting {waited:>4}");
-        let head = if color {
-            head.style(state_style(c.agent.state)).to_string()
+        let visible_head =
+            format!("  {icon} {loc:<loc_width$} {kind:<kind_width$} waiting {waited:>4}");
+        let styled_head = if color {
+            visible_head.style(state_style(c.agent.state)).to_string()
         } else {
-            head
+            visible_head.clone()
         };
         let snippet = c
             .agent
             .last_prompt
             .as_deref()
             .and_then(|p| p.lines().next())
-            .map(|line| truncate(line, 50))
+            .map(|line| {
+                let snippet_width = terminal_width
+                    .saturating_sub(visible_head.chars().count())
+                    .saturating_sub(2);
+                truncate_cell(line, snippet_width)
+            })
             .unwrap_or_default();
         if snippet.is_empty() {
-            println!("{head}");
+            println!("{styled_head}");
         } else {
-            println!("{head}  {snippet}");
+            println!("{styled_head}  {snippet}");
         }
+    }
+}
+
+fn attend_queue_widths(terminal_width: usize) -> (usize, usize) {
+    if terminal_width < 70 {
+        (10, 8)
+    } else if terminal_width < 100 {
+        (16, 12)
+    } else {
+        (24, 12)
     }
 }
 
@@ -226,6 +244,7 @@ fn humanize_since(then: OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
+#[cfg(test)]
 /// Truncate to at most `max` characters (counting by `char`, so multi-byte
 /// prompts don't panic on a byte boundary), appending `…` when clipped.
 fn truncate(s: &str, max: usize) -> String {

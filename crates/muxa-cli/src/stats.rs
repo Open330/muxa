@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use comfy_table::{Cell, ContentArrangement, Table};
+use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::{
@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+use crate::{terminal_width, truncate_cell};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -58,6 +60,11 @@ enum GroupBy {
     Agent,
     Session,
 }
+
+const FULL_STATS_TABLE_WIDTH: usize = 128;
+const COMPACT_STATS_TABLE_WIDTH: usize = 76;
+const MIN_GROUP_COLUMN_WIDTH: usize = 7;
+const MAX_GROUP_COLUMN_WIDTH: usize = 36;
 
 impl GroupBy {
     fn as_str(self) -> &'static str {
@@ -831,46 +838,254 @@ fn render_table(doc: &StatsDocument) {
     if doc.rows.is_empty() {
         println!("no retained prompts, live agents, or tracked session activity in this view");
     } else {
-        let mut table = Table::new();
-        table
-            .load_preset(UTF8_BORDERS_ONLY)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                doc.group_by.to_ascii_uppercase(),
-                "PROMPTS".to_string(),
-                "WORK".to_string(),
-                "WAIT".to_string(),
-                "ERR".to_string(),
-                "TMUX".to_string(),
-                "BLOCK".to_string(),
-                "TOK EST".to_string(),
-                "WORDS".to_string(),
-                "SESS".to_string(),
-                "AGENTS".to_string(),
-                "LAST".to_string(),
-            ]);
-
-        for row in &doc.rows {
-            table.add_row(vec![
-                Cell::new(&row.key),
-                Cell::new(row.prompts),
-                Cell::new(&row.working),
-                Cell::new(&row.waiting),
-                Cell::new(&row.error),
-                Cell::new(&row.foreground),
-                Cell::new(row.attention_events),
-                Cell::new(row.token_estimate),
-                Cell::new(row.words),
-                Cell::new(row.agent_sessions),
-                Cell::new(row.live_agents),
-                Cell::new(&row.last_prompt_age),
-            ]);
+        let terminal_width = terminal_width();
+        println!("{}", render_stats_table(doc, terminal_width));
+        if stats_table_layout(terminal_width) != StatsTableLayout::Full {
+            println!(
+                "note: Table compacted for terminal width; use --format json or --format markdown for every column."
+            );
         }
-        println!("{table}");
     }
 
     for note in &doc.notes {
         println!("note: {note}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatsTableLayout {
+    Full,
+    Compact,
+    Minimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatsColumn {
+    Prompts,
+    Working,
+    Waiting,
+    Error,
+    Foreground,
+    AttentionEvents,
+    TokenEstimate,
+    Words,
+    AgentSessions,
+    LiveAgents,
+    LastPromptAge,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatsTableColumn {
+    header: &'static str,
+    width: usize,
+    value: StatsColumn,
+}
+
+const FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
+    StatsTableColumn {
+        header: "PROMPTS",
+        width: 7,
+        value: StatsColumn::Prompts,
+    },
+    StatsTableColumn {
+        header: "WORK",
+        width: 6,
+        value: StatsColumn::Working,
+    },
+    StatsTableColumn {
+        header: "WAIT",
+        width: 6,
+        value: StatsColumn::Waiting,
+    },
+    StatsTableColumn {
+        header: "ERR",
+        width: 5,
+        value: StatsColumn::Error,
+    },
+    StatsTableColumn {
+        header: "TMUX",
+        width: 6,
+        value: StatsColumn::Foreground,
+    },
+    StatsTableColumn {
+        header: "BLOCK",
+        width: 5,
+        value: StatsColumn::AttentionEvents,
+    },
+    StatsTableColumn {
+        header: "TOK EST",
+        width: 7,
+        value: StatsColumn::TokenEstimate,
+    },
+    StatsTableColumn {
+        header: "WORDS",
+        width: 6,
+        value: StatsColumn::Words,
+    },
+    StatsTableColumn {
+        header: "SESS",
+        width: 4,
+        value: StatsColumn::AgentSessions,
+    },
+    StatsTableColumn {
+        header: "AGENTS",
+        width: 6,
+        value: StatsColumn::LiveAgents,
+    },
+    StatsTableColumn {
+        header: "LAST",
+        width: 7,
+        value: StatsColumn::LastPromptAge,
+    },
+];
+
+const COMPACT_STATS_COLUMNS: &[StatsTableColumn] = &[
+    StatsTableColumn {
+        header: "PRM",
+        width: 5,
+        value: StatsColumn::Prompts,
+    },
+    StatsTableColumn {
+        header: "WORK",
+        width: 6,
+        value: StatsColumn::Working,
+    },
+    StatsTableColumn {
+        header: "WAIT",
+        width: 6,
+        value: StatsColumn::Waiting,
+    },
+    StatsTableColumn {
+        header: "TMUX",
+        width: 6,
+        value: StatsColumn::Foreground,
+    },
+    StatsTableColumn {
+        header: "BLK",
+        width: 3,
+        value: StatsColumn::AttentionEvents,
+    },
+    StatsTableColumn {
+        header: "TOK",
+        width: 6,
+        value: StatsColumn::TokenEstimate,
+    },
+    StatsTableColumn {
+        header: "LAST",
+        width: 7,
+        value: StatsColumn::LastPromptAge,
+    },
+];
+
+const MINIMAL_STATS_COLUMNS: &[StatsTableColumn] = &[
+    StatsTableColumn {
+        header: "PRM",
+        width: 5,
+        value: StatsColumn::Prompts,
+    },
+    StatsTableColumn {
+        header: "WORK",
+        width: 6,
+        value: StatsColumn::Working,
+    },
+    StatsTableColumn {
+        header: "WAIT",
+        width: 6,
+        value: StatsColumn::Waiting,
+    },
+    StatsTableColumn {
+        header: "LAST",
+        width: 7,
+        value: StatsColumn::LastPromptAge,
+    },
+];
+
+fn render_stats_table(doc: &StatsDocument, terminal_width: usize) -> String {
+    let layout = stats_table_layout(terminal_width);
+    let columns = stats_table_columns(layout);
+    let group_width = stats_group_column_width(terminal_width, columns);
+    let mut table = Table::new();
+    let mut constraints = Vec::with_capacity(columns.len() + 1);
+    constraints.push(ColumnConstraint::Absolute(Width::Fixed(
+        u16::try_from(group_width).unwrap_or(u16::MAX),
+    )));
+    constraints.extend(columns.iter().map(|column| {
+        ColumnConstraint::Absolute(Width::Fixed(
+            u16::try_from(column.width).unwrap_or(u16::MAX),
+        ))
+    }));
+
+    let mut header = Vec::with_capacity(columns.len() + 1);
+    header.push(Cell::new(truncate_cell(
+        &doc.group_by.to_ascii_uppercase(),
+        group_width,
+    )));
+    header.extend(columns.iter().map(|column| {
+        Cell::new(truncate_cell(column.header, column.width)).set_alignment(CellAlignment::Right)
+    }));
+
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_constraints(constraints)
+        .set_header(header);
+
+    for row in &doc.rows {
+        let mut cells = Vec::with_capacity(columns.len() + 1);
+        cells.push(Cell::new(truncate_cell(&row.key, group_width)));
+        cells.extend(columns.iter().map(|column| {
+            Cell::new(truncate_cell(
+                &stats_column_value(row, column.value),
+                column.width,
+            ))
+            .set_alignment(CellAlignment::Right)
+        }));
+        table.add_row(cells);
+    }
+
+    format!("{table}")
+}
+
+fn stats_table_layout(terminal_width: usize) -> StatsTableLayout {
+    if terminal_width >= FULL_STATS_TABLE_WIDTH {
+        StatsTableLayout::Full
+    } else if terminal_width >= COMPACT_STATS_TABLE_WIDTH {
+        StatsTableLayout::Compact
+    } else {
+        StatsTableLayout::Minimal
+    }
+}
+
+fn stats_table_columns(layout: StatsTableLayout) -> &'static [StatsTableColumn] {
+    match layout {
+        StatsTableLayout::Full => FULL_STATS_COLUMNS,
+        StatsTableLayout::Compact => COMPACT_STATS_COLUMNS,
+        StatsTableLayout::Minimal => MINIMAL_STATS_COLUMNS,
+    }
+}
+
+fn stats_group_column_width(terminal_width: usize, columns: &[StatsTableColumn]) -> usize {
+    let total_columns = columns.len() + 1;
+    let fixed_content_width = columns.iter().map(|column| column.width).sum::<usize>();
+    let border_and_padding_width = total_columns + 1 + total_columns * 2;
+    terminal_width
+        .saturating_sub(fixed_content_width + border_and_padding_width)
+        .clamp(MIN_GROUP_COLUMN_WIDTH, MAX_GROUP_COLUMN_WIDTH)
+}
+
+fn stats_column_value(row: &GroupRow, column: StatsColumn) -> String {
+    match column {
+        StatsColumn::Prompts => row.prompts.to_string(),
+        StatsColumn::Working => row.working.clone(),
+        StatsColumn::Waiting => row.waiting.clone(),
+        StatsColumn::Error => row.error.clone(),
+        StatsColumn::Foreground => row.foreground.clone(),
+        StatsColumn::AttentionEvents => row.attention_events.to_string(),
+        StatsColumn::TokenEstimate => row.token_estimate.to_string(),
+        StatsColumn::Words => row.words.to_string(),
+        StatsColumn::AgentSessions => row.agent_sessions.to_string(),
+        StatsColumn::LiveAgents => row.live_agents.to_string(),
+        StatsColumn::LastPromptAge => row.last_prompt_age.clone(),
     }
 }
 
@@ -1070,6 +1285,7 @@ mod tests {
     use muxa::event::AgentKind;
     use muxa::StateTransitionInput;
     use time::macros::datetime;
+    use unicode_width::UnicodeWidthStr;
 
     fn prompt(
         kind: AgentKind,
@@ -1326,6 +1542,71 @@ mod tests {
 
         assert_eq!(rows[0].key, "deleted-session-name");
         assert_eq!(rows[0].working_secs, 600);
+    }
+
+    #[test]
+    fn stats_table_compacts_without_wrapping_at_88_cols() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/muxa"),
+            "hello",
+            datetime!(2026-05-30 11:00:00 UTC),
+        );
+        p.tmux_session = Some("callabo-auto-label".into());
+        let mut long = prompt(
+            AgentKind::Codex,
+            "agent-b",
+            "%2",
+            Some("/home/june/muxa"),
+            "hello",
+            datetime!(2026-05-30 11:01:00 UTC),
+        );
+        long.tmux_session = Some("9248e2a7-88f8-4229-ad96-eaf257accdfc".into());
+        let d = data(vec![p, long]);
+        let doc = build_document(&d, GroupBy::Session, 0);
+
+        let rendered = render_stats_table(&doc, 88);
+
+        assert!(rendered.contains("PRM"));
+        assert!(!rendered.contains("TOK EST"));
+        assert!(rendered.contains("callabo-auto-label"));
+        assert!(rendered.contains("9248e2a7-88f8-4229"));
+        assert!(rendered.contains("..."));
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 88,
+                "line exceeded compact table width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_table_full_layout_keeps_all_columns_when_wide() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/muxa"),
+            "hello",
+            datetime!(2026-05-30 11:00:00 UTC),
+        );
+        p.tmux_session = Some("callabo-auto-label".into());
+        let d = data(vec![p]);
+        let doc = build_document(&d, GroupBy::Session, 0);
+
+        let rendered = render_stats_table(&doc, 140);
+
+        assert!(rendered.contains("TOK EST"));
+        assert!(rendered.contains("WORDS"));
+        assert!(rendered.contains("AGENTS"));
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 140,
+                "line exceeded full table width: {line:?}"
+            );
+        }
     }
 
     #[test]
