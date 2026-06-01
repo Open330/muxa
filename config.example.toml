@@ -58,8 +58,8 @@
 # debounce_ms = 200                  # coalesce window between dirty signal and write
 
 # tmux session foreground-time tracker. A session counts as active while an
-# interactive tmux client has that session foregrounded. `muxa watch --view
-# session` shows the cumulative total in its DUR column.
+# interactive tmux client has that session foregrounded. `muxa watch`
+# (session view — the default) shows the cumulative total in its DUR column.
 [session_activity]
 # enabled       = true
 # path          = "/home/$USER/.local/share/muxa/session-activity.json"
@@ -76,8 +76,8 @@
 # activity, session_time.
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
-# view = "pane"       # one row per agent/pane (default)
-# view = "session"    # one row per tmux session; panes merge by latest activity
+# view = "session"    # one row per tmux session; panes merge by latest activity (default)
+# view = "pane"       # one row per agent/pane
 # columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because Enter on the picker

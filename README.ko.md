@@ -259,6 +259,7 @@ muxa watch          # 실시간 TUI
 | ------------------------------------------ | ------------------------------------------------------------------------ |
 | `muxa status`                              | 추적 중인 모든 에이전트를 사람이 읽기 쉬운 테이블로 출력.                |
 | `muxa watch [--include-paneless] [--view pane\|session]` | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그는 1회 호출에 한해 `[watch]` 설정을 덮어씁니다. |
+| `muxa attend [--cycle] [--list]` (별칭 `go`) | 나를 필요로 하는 에이전트로 점프 — input/choice/error로 가장 오래 막혀 있는 페인에 포커스. `--cycle`은 다음 대상으로 순환(tmux 키에 바인딩), `--list`는 점프 없이 대기 큐만 출력. |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
 | `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | 보관된 프롬프트 히스토리, live agent, agent 상태 duration, tmux foreground 시간을 요약. |
@@ -328,12 +329,14 @@ fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-r
 에이전트가 위로 올라옵니다. 정렬 기준은 `[watch] sort` 로 변경 가능
 (`session`, `activity`, `pane`, `pane_id` — [설정 > 정렬](#watch-sort) 참고).
 
-세션당 한 줄로 보고 싶으면 `muxa watch --view session`을 쓰거나
-`[watch] view = "session"`을 설정하세요. 같은 tmux 세션의 모든 페인이
-하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가 대표
-행이 됩니다. 세션 뷰에서 `Enter`는 대표 페인으로 이동하며, `DUR`
-컬럼은 그 tmux 세션이 interactive tmux client에서 foreground였던 누적
-시간을 보여줍니다.
+`muxa watch`는 기본적으로 **세션 뷰**로 열립니다. 같은 tmux 세션의 모든
+페인이 하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가
+대표 행이 됩니다 — 여러 세션을 동시에 굴리는 운영자를 위한 한눈에 보기
+형태죠. `Enter`는 대표 페인으로 이동하며, `DUR` 컬럼은 그 tmux 세션이
+interactive tmux client에서 foreground였던 누적 시간을 보여줍니다.
+
+에이전트/페인별로 한 줄씩 보고 싶으면 `muxa watch --view pane`을 쓰거나
+`[watch] view = "pane"`을 설정하세요.
 
 detail 라인 한 줄로 부족할 때 — 긴 prompt, 여러 단락의 응답 — 선택된
 행에서 **`p`** 키를 누르면 가운데 정렬된 preview 팝업이 뜹니다. 전체
@@ -464,7 +467,7 @@ backend = "libnotify"
 
 ```toml
 [watch]
-view = "pane" # 또는 "session"
+view = "session" # 기본값; 에이전트별 한 줄은 "pane"
 # 표시 순서. 빠진 키는 숨겨집니다.
 columns = ["pane", "state", "prompt", "activity"]
 
@@ -605,9 +608,12 @@ wedge 시키지 않습니다.
 `muxad`는 tmux 세션별 foreground 시간을 추적합니다. interactive tmux
 client가 해당 세션을 foreground로 보고 있는 동안을 active 시간으로
 계산합니다(`tmux list-clients`의 `client_session` 기준이며 control-mode
-client는 제외). rolling total 은 `muxa watch` 세션 뷰의 `DUR`
+client는 제외). rolling total 은 `muxa watch` 세션 뷰(기본값)의 `DUR`
 컬럼에 표시되고, 닫힌 foreground interval 은 `activity.ndjson`에 append되어
-tmux session이 사라진 뒤에도 stats/report duration 계산에 남습니다.
+tmux session이 사라진 뒤에도 stats/report duration 계산에 남습니다. `muxad`가
+pane을 관찰할 수 있는 경우 agent state/prompt 이벤트에도 현재 tmux session
+이름을 함께 저장하므로, 새 기록은 session별 stats에서 읽기 좋은 이름을
+유지합니다.
 
 ```toml
 [session_activity]

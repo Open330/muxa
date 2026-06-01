@@ -697,11 +697,13 @@ pub struct WatchConfig {
     /// a TOML integer (fixed length) or a string of the form `min:N` /
     /// `pct:N`. Missing keys fall back to the column's built-in default.
     pub widths: HashMap<String, WidthSpec>,
-    /// Row granularity for `muxa watch`.
+    /// Row granularity for `muxa watch`. Defaults to `session`.
     ///
-    /// `pane` is the historical view: one row per tracked agent / bare pane.
-    /// `session` collapses all panes in the same tmux session into one row,
-    /// using the most recently active agent as that session's representative.
+    /// `session` (default) collapses all panes in the same tmux session into
+    /// one row, using the most recently active agent as that session's
+    /// representative — the fleet-at-a-glance view for operators juggling
+    /// many sessions. `pane` is the finer-grained view: one row per tracked
+    /// agent / bare pane.
     pub view: WatchView,
     /// Expanded detail line shown under the currently-selected row.
     pub detail: DetailConfig,
@@ -763,8 +765,8 @@ pub enum PreviewContent {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchView {
-    #[default]
     Pane,
+    #[default]
     Session,
 }
 
@@ -817,7 +819,7 @@ impl Default for WatchConfig {
         Self {
             columns,
             widths,
-            view: WatchView::Pane,
+            view: WatchView::Session,
             detail: DetailConfig::default(),
             // Group by session, then bring the most recently active agent
             // in each group to the top — covers both "what's moving" and
@@ -1049,6 +1051,25 @@ sort = ["activity"]
     fn parses_watch_session_view() {
         let cfg: Config = toml::from_str("[watch]\nview = \"session\"\n").unwrap();
         assert_eq!(cfg.watch.view, WatchView::Session);
+    }
+
+    /// The default view is `session` — the fleet-at-a-glance row granularity.
+    /// Both the struct default and a config that omits `view` resolve to it,
+    /// so an empty `~/.config/muxa/config.toml` lands on session view.
+    #[test]
+    fn default_watch_view_is_session() {
+        assert_eq!(WatchConfig::default().view, WatchView::Session);
+        assert_eq!(WatchView::default(), WatchView::Session);
+        let cfg: Config = toml::from_str("[watch]\n").unwrap();
+        assert_eq!(cfg.watch.view, WatchView::Session);
+    }
+
+    /// `pane` is now the opt-in (non-default) granularity; setting it
+    /// explicitly still parses.
+    #[test]
+    fn parses_watch_pane_view() {
+        let cfg: Config = toml::from_str("[watch]\nview = \"pane\"\n").unwrap();
+        assert_eq!(cfg.watch.view, WatchView::Pane);
     }
 
     #[test]

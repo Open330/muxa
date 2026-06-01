@@ -336,6 +336,7 @@ muxa watch          # live TUI
 | ------------------------------------------ | ---------------------------------------------------------------------- |
 | `muxa status`                              | Human-readable table of all tracked agents.                            |
 | `muxa watch [--include-paneless] [--view pane\|session]` | Full-screen live TUI — see [Live TUI](#live-tui). Flags override `[watch]` for one invocation. |
+| `muxa attend [--cycle] [--list]` (alias `go`) | Jump to the agent that needs you — focuses the pane blocked on input/choice/error longest. `--cycle` rotates to the next one (bind it to a tmux key); `--list` prints the queue without jumping. |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
 | `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | Summarize retained prompt history, live agents, agent state duration, and tmux foreground time. |
@@ -426,12 +427,15 @@ floated to the top of each group. Reorder via `[watch] sort` (see
 [Configuration](#watch-sort)) — useful sort keys: `session`, `activity`,
 `pane`, `pane_id`.
 
-Prefer one row per tmux session? Run `muxa watch --view session` (or set
-`[watch] view = "session"`). All panes in the same tmux session collapse
-into one row, represented by the most recently active agent in that
-session. In session view, `Enter` jumps to that representative pane and
-the `DUR` column shows the cumulative time the session has been foregrounded
-by an interactive tmux client.
+By default `muxa watch` opens in **session view**: all panes in the same
+tmux session collapse into one row, represented by the most recently
+active agent in that session — the fleet-at-a-glance shape for operators
+juggling many sessions. `Enter` jumps to that representative pane, and the
+`DUR` column shows the cumulative time the session has been foregrounded by
+an interactive tmux client.
+
+Want one row per agent/pane instead? Run `muxa watch --view pane` (or set
+`[watch] view = "pane"`).
 
 When the detail line isn't enough — long prompt, multi-paragraph
 assistant response — press **`p`** on the selected row to pop open a
@@ -593,7 +597,7 @@ the last prompt — `model` / `ctx` / `cost` are opt-in:
 
 ```toml
 [watch]
-view = "pane" # or "session"
+view = "session" # default; or "pane" for one row per agent
 # Display order. Omitted keys are hidden.
 columns = ["pane", "state", "prompt", "activity"]
 
@@ -741,7 +745,7 @@ than wedging the daemon.
 session counts as active while an interactive tmux client has that
 session foregrounded (`tmux list-clients`, grouped by `client_session`;
 control-mode clients are ignored). The rolling total is shown in the
-`DUR` column of `muxa watch`'s session view, and closed
+`DUR` column of `muxa watch`'s session view (the default), and closed
 foreground intervals are appended to `activity.ndjson` so stats/report
 duration survives tmux session deletion. Agent state and prompt events
 also persist the current tmux session name when muxad can observe the
