@@ -38,6 +38,15 @@
 # max_age_days          = 30        # compaction drops anything older
 # compact_interval_secs = 3600      # rewrites the file every hour
 
+# Activity ledger: append-only duration events used by `muxa stats` and
+# `muxa report`. Records closed agent-state intervals plus closed tmux
+# foreground intervals, so duration survives pane/session removal.
+[activity]
+# enabled               = true
+# path                  = "/home/$USER/.local/share/muxa/activity.ndjson"
+# max_age_days          = 30
+# compact_interval_secs = 3600
+
 # Agent registry snapshot: mirrors the live in-memory registry to a single
 # JSON file so a daemon restart rehydrates real `session_id`s, last
 # prompt/response, and full state/metadata instead of falling back to

@@ -261,7 +261,7 @@ muxa watch          # 실시간 TUI
 | `muxa watch [--include-paneless] [--view pane\|session]` | 풀스크린 실시간 TUI — [실시간 TUI](#실시간-tui) 참고. 플래그는 1회 호출에 한해 `[watch]` 설정을 덮어씁니다. |
 | `muxa status-line [--pane %N]`             | tmux `status-right`용 한 줄 출력 — 기본은 `$TMUX_PANE` 스코프.           |
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
-| `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | 보관된 프롬프트 히스토리, live agent, 세션 `DUR`를 요약. |
+| `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | 보관된 프롬프트 히스토리, live agent, agent 상태 duration, tmux foreground 시간을 요약. |
 | `muxa report [--since 7d]`                 | day/project/agent/session breakdown 을 Markdown 리포트로 출력.          |
 | `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
 | `muxa panes`                               | 디버그용: tmux 페인 목록 덤프.                                            |
@@ -283,9 +283,11 @@ muxa report --since 7d > muxa-weekly.md
 `--since` 는 `24h`, `7d`, `4w`, RFC3339 timestamp, `all` 을 받습니다.
 `--format` 은 `table`, `json`, `markdown` 입니다. 프롬프트 합계는
 `[history].max_per_pane` / `max_age_days` 로 제한된 보관 히스토리 기준입니다.
-`DUR` 는 `session-activity.json` 의 누적 tmux foreground 시간이라 아직
-`--since` 로 잘리지 않습니다. 다음 단계의 activity ledger 가 들어가면
-duration 도 기간별로 계산할 수 있습니다.
+duration 컬럼은 `activity.ndjson` 에서 읽습니다. `WORK`, `WAIT`, `ERR`는
+닫힌 agent 상태 interval, `TMUX`는 tmux foreground interval, `BLOCK`은
+Waiting/Error 상태로 들어간 횟수입니다. 현재 attach 중인 tmux 세션은
+"지금"까지 포함하고, `activity.ndjson`에 foreground interval이 생기기 전에는
+기존 `session-activity.json` 누적값을 fallback 으로 사용합니다.
 
 ### Sync
 
@@ -600,11 +602,12 @@ wedge 시키지 않습니다.
 
 ### 세션 활동 시간
 
-`muxad`는 tmux 세션별 누적 foreground 시간을 추적합니다. interactive
-tmux client가 해당 세션을 foreground로 보고 있는 동안을 active 시간으로
+`muxad`는 tmux 세션별 foreground 시간을 추적합니다. interactive tmux
+client가 해당 세션을 foreground로 보고 있는 동안을 active 시간으로
 계산합니다(`tmux list-clients`의 `client_session` 기준이며 control-mode
-client는 제외). 이 값은 `muxa watch --view session`의 `DUR` 컬럼에
-표시됩니다.
+client는 제외). rolling total 은 `muxa watch` 세션 뷰의 `DUR`
+컬럼에 표시되고, 닫힌 foreground interval 은 `activity.ndjson`에 append되어
+tmux session이 사라진 뒤에도 stats/report duration 계산에 남습니다.
 
 ```toml
 [session_activity]
@@ -695,6 +698,7 @@ agent CLIs (Claude, Codex, Gemini)
       ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (이벤트 기반, debounce, 0600)
       ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
       ├── tmux client sampler ──▶ session-activity.json  (foreground time, 0600)
+      ├── state/tmux intervals ──▶ activity.ndjson  (duration ledger, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
       ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)

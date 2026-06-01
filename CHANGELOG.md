@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`activity.ndjson` duration ledger** — `muxad` now appends closed agent
+  state intervals and closed tmux foreground intervals to a bounded
+  `$XDG_DATA_HOME/muxa/activity.ndjson` file. `muxa stats` / `muxa report`
+  read it for windowed `WORK`, `WAIT`, `ERR`, `TMUX`, and `BLOCK` columns,
+  while falling back to legacy `session-activity.json` totals until the
+  first foreground interval lands. Foreground intervals close on detach or
+  when a tmux session disappears, so duration remains reportable after the
+  session is gone.
 - **`AgentState::waiting_choice` + `NotificationLevel::needs_choice`** —
   menu-style user blocks (Claude Code's `AskUserQuestion` and
   `ExitPlanMode`) now land in `waiting_choice` instead of being lumped

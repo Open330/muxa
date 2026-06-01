@@ -338,7 +338,7 @@ muxa watch          # live TUI
 | `muxa watch [--include-paneless] [--view pane\|session]` | Full-screen live TUI — see [Live TUI](#live-tui). Flags override `[watch]` for one invocation. |
 | `muxa status-line [--pane %N]`             | One-liner for tmux `status-right`; scoped to `$TMUX_PANE` by default.  |
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
-| `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | Summarize retained prompt history, live agents, and tracked session `DUR`. |
+| `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | Summarize retained prompt history, live agents, agent state duration, and tmux foreground time. |
 | `muxa report [--since 7d]`                 | Emit a Markdown report with day/project/agent/session breakdowns.       |
 | `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
 | `muxa panes`                               | Debug: dump tmux pane inventory.                                       |
@@ -360,9 +360,13 @@ muxa report --since 7d > muxa-weekly.md
 `--since` accepts `24h`, `7d`, `4w`, an RFC3339 timestamp, or `all`.
 `--format` is `table`, `json`, or `markdown`. The prompt totals are
 bounded by `[history].max_per_pane` / `max_age_days`, because muxa keeps
-a retained audit log rather than an unbounded warehouse. `DUR` comes
-from `session-activity.json` and is cumulative tmux foreground time; a
-future activity ledger will make duration windowed by `--since`.
+a retained audit log rather than an unbounded warehouse. Duration
+columns come from `activity.ndjson`: `WORK`, `WAIT`, and `ERR` track
+closed agent state intervals, `TMUX` tracks foreground tmux session
+intervals, and `BLOCK` counts transitions into Waiting/Error states.
+Live attached tmux sessions are included up to "now"; older
+`session-activity.json` totals are used as a legacy fallback until
+`activity.ndjson` has foreground intervals.
 
 ### Sync
 
@@ -733,8 +737,10 @@ than wedging the daemon.
 `muxad` also tracks cumulative tmux foreground time per session. A tmux
 session counts as active while an interactive tmux client has that
 session foregrounded (`tmux list-clients`, grouped by `client_session`;
-control-mode clients are ignored). This is shown by `muxa watch --view
-session` in the `DUR` column.
+control-mode clients are ignored). The rolling total is shown in the
+`DUR` column of `muxa watch`'s session view, and closed
+foreground intervals are appended to `activity.ndjson` so stats/report
+duration survives tmux session deletion.
 
 ```toml
 [session_activity]
@@ -832,6 +838,7 @@ agent CLIs (Claude, Codex, Gemini)
       ├── dirty-Notify ──▶ snapshotter ──▶ state.json   (event-driven, debounced, 0600)
       ├── PromptSubmitted ──▶ history   ──▶ prompts.ndjson  (audit log, 0600)
       ├── tmux client sampler ──▶ session-activity.json  (foreground time, 0600)
+      ├── state/tmux intervals ──▶ activity.ndjson  (duration ledger, 0600)
       ├── transition broadcast ──▶ notifier task (libnotify / native)
       ├── reconciler (tmux ground truth, idempotent control loop)
       ├── GC task (stopped-agent TTL)

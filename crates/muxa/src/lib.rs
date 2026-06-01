@@ -33,6 +33,7 @@
 //! an **unstable wire format** — the values may bump on any minor release
 //! when the underlying schema changes.
 
+pub mod activity;
 pub mod adapters;
 pub mod backend;
 pub mod config;
@@ -84,6 +85,11 @@ pub use snapshot::STATE_SCHEMA_VERSION;
 // signal "do not depend on this from outside the workspace".
 // ---------------------------------------------------------------------------
 
+#[doc(hidden)]
+pub use activity::{
+    ActivityEntry, ActivityLog, ActivityOptions, SessionForegroundEntry, StateTransitionEntry,
+    StateTransitionInput, ACTIVITY_SCHEMA_VERSION,
+};
 #[doc(hidden)]
 pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
 #[doc(hidden)]

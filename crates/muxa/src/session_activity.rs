@@ -6,11 +6,13 @@
 //! ignores control-mode automation clients, and survives panes/windows
 //! coming and going inside the same session.
 
+use crate::activity::{ActivityEntry, ActivityLog, SessionForegroundEntry};
 use crate::tmux::{self, SessionInfo, TmuxError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::fs::OpenOptions;
@@ -147,7 +149,22 @@ pub fn apply_sample<S: BuildHasher>(
     sessions: &[SessionInfo],
     now: OffsetDateTime,
 ) -> bool {
+    apply_sample_report(records, sessions, now).changed
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApplySampleReport {
+    pub changed: bool,
+    pub intervals: Vec<SessionForegroundEntry>,
+}
+
+pub fn apply_sample_report<S: BuildHasher>(
+    records: &mut HashMap<String, SessionActivity, S>,
+    sessions: &[SessionInfo],
+    now: OffsetDateTime,
+) -> ApplySampleReport {
     let mut changed = false;
+    let mut intervals = Vec::new();
     let live_ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
 
     for session in sessions {
@@ -179,6 +196,12 @@ pub fn apply_sample<S: BuildHasher>(
                 changed = true;
             }
             (Some(since), false) => {
+                intervals.push(SessionForegroundEntry::new(
+                    record.session_id.clone(),
+                    record.name.clone(),
+                    since,
+                    now,
+                ));
                 add_elapsed(record, since, now);
                 record.attached_since = None;
                 changed = true;
@@ -192,6 +215,12 @@ pub fn apply_sample<S: BuildHasher>(
             continue;
         }
         if let Some(since) = record.attached_since {
+            intervals.push(SessionForegroundEntry::new(
+                record.session_id.clone(),
+                record.name.clone(),
+                since,
+                now,
+            ));
             add_elapsed(record, since, now);
             record.attached_since = None;
             record.attached_clients = 0;
@@ -200,7 +229,7 @@ pub fn apply_sample<S: BuildHasher>(
         }
     }
 
-    changed
+    ApplySampleReport { changed, intervals }
 }
 
 fn add_elapsed(record: &mut SessionActivity, since: OffsetDateTime, now: OffsetDateTime) {
@@ -211,11 +240,22 @@ fn add_elapsed(record: &mut SessionActivity, since: OffsetDateTime, now: OffsetD
 pub struct SessionActivityTracker {
     path: PathBuf,
     interval: Duration,
+    activity_log: Option<Arc<ActivityLog>>,
 }
 
 impl SessionActivityTracker {
     pub fn new(path: PathBuf, interval: Duration) -> Self {
-        Self { path, interval }
+        Self {
+            path,
+            interval,
+            activity_log: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_activity_log(mut self, activity_log: Option<Arc<ActivityLog>>) -> Self {
+        self.activity_log = activity_log;
+        self
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -257,8 +297,13 @@ impl SessionActivityTracker {
             }
         };
 
-        let changed = apply_sample(records, &sessions, OffsetDateTime::now_utc());
-        if changed {
+        let report = apply_sample_report(records, &sessions, OffsetDateTime::now_utc());
+        for interval in report.intervals {
+            if let Some(activity_log) = &self.activity_log {
+                activity_log.append(ActivityEntry::SessionForeground(interval));
+            }
+        }
+        if report.changed {
             let mut sessions = records.values().cloned().collect::<Vec<_>>();
             sessions.sort_by(|a, b| {
                 a.name
@@ -340,13 +385,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_sample_report_emits_detach_interval() {
+        let mut records = HashMap::new();
+        let t0 = datetime!(2026-05-29 00:00:00 UTC);
+        let t1 = datetime!(2026-05-29 00:00:15 UTC);
+
+        apply_sample_report(&mut records, &[session("$1", "main", 1)], t0);
+        let report = apply_sample_report(&mut records, &[session("$1", "main", 0)], t1);
+
+        assert_eq!(report.intervals.len(), 1);
+        assert_eq!(report.intervals[0].session_id, "$1");
+        assert_eq!(report.intervals[0].session_name, "main");
+        assert_eq!(report.intervals[0].duration_secs, 15);
+    }
+
+    #[test]
     fn disappearing_attached_session_closes_interval() {
         let mut records = HashMap::new();
         let t0 = datetime!(2026-05-29 00:00:00 UTC);
         let t1 = datetime!(2026-05-29 00:00:20 UTC);
 
-        apply_sample(&mut records, &[session("$1", "main", 1)], t0);
-        assert!(apply_sample(&mut records, &[], t1));
+        apply_sample_report(&mut records, &[session("$1", "main", 1)], t0);
+        let report = apply_sample_report(&mut records, &[], t1);
+
+        assert_eq!(report.intervals.len(), 1);
+        assert_eq!(report.intervals[0].session_id, "$1");
+        assert_eq!(report.intervals[0].duration_secs, 20);
         let record = records.get("$1").unwrap();
         assert_eq!(record.attached_since, None);
         assert_eq!(record.total_attached_secs, 20);

@@ -264,6 +264,49 @@ many entries can point at the same pane/session.
 `cwd` and `model` are optional. Older `prompts.ndjson` lines may not have
 `cwd`; readers should treat it as unknown.
 
+## `ActivityEntry` schema (in `activity.ndjson`)
+
+Append-only duration ledger. Each line is a tagged JSON object with
+`v = 1`; readers should skip unknown versions or malformed lines. Timestamps
+are RFC 3339 UTC. `duration_secs` is stored redundantly so downstream tools
+can aggregate without re-parsing timestamp math.
+
+Closed agent state interval:
+
+```json
+{
+  "type": "state_transition",
+  "v": 1,
+  "at": "2026-04-24T12:03:21Z",
+  "kind": "codex",
+  "session_id": "sess-abc",
+  "pane": "%12",
+  "cwd": "/home/user/proj",
+  "from": "working",
+  "to": "waiting_input",
+  "state_entered_at": "2026-04-24T12:00:00Z",
+  "duration_secs": 201
+}
+```
+
+Closed tmux foreground interval:
+
+```json
+{
+  "type": "session_foreground",
+  "v": 1,
+  "session_id": "$1",
+  "session_name": "main",
+  "started_at": "2026-04-24T12:00:00Z",
+  "ended_at": "2026-04-24T12:30:00Z",
+  "duration_secs": 1800
+}
+```
+
+`pane`, `cwd`, and `state_entered_at` are optional on state transitions.
+Foreground intervals are closed when the tmux session detaches or
+disappears, so they remain reportable after the tmux session is gone.
+
 ---
 
 ## Semantics

@@ -6,6 +6,7 @@ pub const SOCKET_FILENAME: &str = "muxa.sock";
 pub const CONFIG_DIRNAME: &str = "muxa";
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const HISTORY_FILENAME: &str = "prompts.ndjson";
+pub const ACTIVITY_FILENAME: &str = "activity.ndjson";
 pub const STATE_FILENAME: &str = "state.json";
 pub const SESSION_ACTIVITY_FILENAME: &str = "session-activity.json";
 
@@ -30,6 +31,13 @@ pub fn default_config_file() -> Option<PathBuf> {
 /// operator may want to back up or grep through.
 pub fn default_history_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(HISTORY_FILENAME))
+}
+
+/// Default activity ledger file: `$XDG_DATA_HOME/muxa/activity.ndjson`.
+/// Stores closed duration intervals for agent states and tmux session
+/// foreground time.
+pub fn default_activity_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(ACTIVITY_FILENAME))
 }
 
 /// Default agent-registry snapshot file: `$XDG_DATA_HOME/muxa/state.json`,

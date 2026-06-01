@@ -4,7 +4,10 @@ use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ContentArrangement, Table};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
-use muxa::{Agent, Config, HistoryEntry, SessionActivity};
+use muxa::{
+    ActivityEntry, Agent, Config, HistoryEntry, SessionActivity, SessionForegroundEntry,
+    StateTransitionEntry,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -116,6 +119,7 @@ struct StatsData {
     now: OffsetDateTime,
     range: StatsRange,
     prompts: Vec<HistoryEntry>,
+    activity_entries: Vec<ActivityEntry>,
     agents: Vec<Agent>,
     activities: Vec<SessionActivity>,
     pane_sessions: HashMap<String, String>,
@@ -147,8 +151,15 @@ struct Totals {
     token_estimate: usize,
     agent_sessions: usize,
     live_agents: usize,
+    working_secs: u64,
+    working: String,
+    waiting_secs: u64,
+    waiting: String,
+    error_secs: u64,
+    error: String,
     foreground_secs: u64,
     foreground: String,
+    attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
 }
@@ -162,8 +173,15 @@ struct GroupRow {
     token_estimate: usize,
     agent_sessions: usize,
     live_agents: usize,
+    working_secs: u64,
+    working: String,
+    waiting_secs: u64,
+    waiting: String,
+    error_secs: u64,
+    error: String,
     foreground_secs: u64,
     foreground: String,
+    attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
 }
@@ -176,7 +194,11 @@ struct GroupAccumulator {
     token_estimate: usize,
     agent_sessions: BTreeSet<String>,
     live_agents: usize,
+    working_secs: u64,
+    waiting_secs: u64,
+    error_secs: u64,
     foreground_secs: u64,
+    attention_events: usize,
     last_prompt_at: Option<OffsetDateTime>,
 }
 
@@ -190,6 +212,7 @@ async fn load_data(client: &Client, cfg: &Config, since: &str) -> Result<StatsDa
         .context("querying daemon prompt history")?;
     prompts.retain(|entry| range.includes(entry.at));
 
+    let activity_entries = load_activity_entries(cfg).await;
     let agents = client
         .snapshot()
         .await
@@ -222,12 +245,28 @@ async fn load_data(client: &Client, cfg: &Config, since: &str) -> Result<StatsDa
         now,
         range,
         prompts,
+        activity_entries,
         agents,
         activities,
         pane_sessions,
         project_by_pane,
         project_by_agent_session,
     })
+}
+
+async fn load_activity_entries(cfg: &Config) -> Vec<ActivityEntry> {
+    if !cfg.activity.enabled {
+        return Vec::new();
+    }
+    let Some(path) = cfg
+        .activity
+        .path
+        .clone()
+        .or_else(muxa::paths::default_activity_file)
+    else {
+        return Vec::new();
+    };
+    muxa::activity::load(&path).await.unwrap_or_default()
 }
 
 async fn load_session_activities(cfg: &Config) -> Vec<SessionActivity> {
@@ -266,6 +305,12 @@ fn build_totals(data: &StatsData) -> Totals {
     let mut words = 0usize;
     let mut token_estimate = 0usize;
     let mut last_prompt_at = None;
+    let mut working_secs = 0u64;
+    let mut waiting_secs = 0u64;
+    let mut error_secs = 0u64;
+    let mut foreground_secs = 0u64;
+    let mut attention_events = 0usize;
+    let mut has_session_foreground_ledger = false;
 
     for prompt in &data.prompts {
         let metrics = prompt_metrics(prompt);
@@ -276,11 +321,41 @@ fn build_totals(data: &StatsData) -> Totals {
         update_max_time(&mut last_prompt_at, prompt.at);
     }
 
-    let foreground_secs = data
-        .activities
-        .iter()
-        .map(|activity| activity.effective_total_secs(data.now))
-        .sum();
+    for entry in &data.activity_entries {
+        match entry {
+            ActivityEntry::StateTransition(entry) => {
+                let secs = state_transition_overlap_secs(data, entry);
+                add_state_secs(
+                    entry.from,
+                    secs,
+                    &mut working_secs,
+                    &mut waiting_secs,
+                    &mut error_secs,
+                );
+                if data.range.includes(entry.at) && is_attention_state(entry.to) {
+                    attention_events += 1;
+                }
+            }
+            ActivityEntry::SessionForeground(entry) => {
+                has_session_foreground_ledger = true;
+                foreground_secs += session_foreground_overlap_secs(data, entry);
+            }
+        }
+    }
+    foreground_secs += open_session_foreground_secs(data);
+    if !has_session_foreground_ledger {
+        foreground_secs = foreground_secs.saturating_add(legacy_foreground_secs(data));
+    }
+    for agent in &data.agents {
+        let secs = open_agent_state_secs(data, agent);
+        add_state_secs(
+            agent.state,
+            secs,
+            &mut working_secs,
+            &mut waiting_secs,
+            &mut error_secs,
+        );
+    }
 
     Totals {
         prompts: data.prompts.len(),
@@ -293,8 +368,15 @@ fn build_totals(data: &StatsData) -> Totals {
             .iter()
             .filter(|agent| agent.state != AgentState::Stopped)
             .count(),
+        working_secs,
+        working: format_duration(working_secs),
+        waiting_secs,
+        waiting: format_duration(waiting_secs),
+        error_secs,
+        error: format_duration(error_secs),
         foreground_secs,
         foreground: format_duration(foreground_secs),
+        attention_events,
         last_prompt_at: last_prompt_at.map(format_rfc3339),
         last_prompt_age: last_prompt_at
             .map_or_else(|| "-".to_string(), |at| relative_time(data.now, at)),
@@ -303,6 +385,7 @@ fn build_totals(data: &StatsData) -> Totals {
 
 fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow> {
     let mut rows = BTreeMap::<String, GroupAccumulator>::new();
+    let session_foreground_ledger = has_session_foreground_ledger(data);
 
     for prompt in &data.prompts {
         let key = prompt_group_key(data, prompt, group_by);
@@ -316,6 +399,28 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
         update_max_time(&mut acc.last_prompt_at, prompt.at);
     }
 
+    add_activity_rows(data, group_by, &mut rows);
+
+    if group_by != GroupBy::Session || session_foreground_ledger {
+        add_open_session_foreground_rows(data, group_by, &mut rows);
+    }
+
+    for agent in &data.agents {
+        let secs = open_agent_state_secs(data, agent);
+        if secs == 0 {
+            continue;
+        }
+        let key = agent_group_key(data, agent, group_by);
+        let acc = rows.entry(key).or_default();
+        add_state_secs(
+            agent.state,
+            secs,
+            &mut acc.working_secs,
+            &mut acc.waiting_secs,
+            &mut acc.error_secs,
+        );
+    }
+
     for agent in &data.agents {
         if agent.state == AgentState::Stopped || !data.range.includes(agent.last_activity_at) {
             continue;
@@ -324,7 +429,7 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
         rows.entry(key).or_default().live_agents += 1;
     }
 
-    if group_by == GroupBy::Session {
+    if group_by == GroupBy::Session && !session_foreground_ledger {
         for activity in &data.activities {
             let key = activity.name.clone();
             rows.entry(key).or_default().foreground_secs += activity.effective_total_secs(data.now);
@@ -352,14 +457,73 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
             token_estimate: acc.token_estimate,
             agent_sessions: acc.agent_sessions.len(),
             live_agents: acc.live_agents,
+            working_secs: acc.working_secs,
+            working: format_duration(acc.working_secs),
+            waiting_secs: acc.waiting_secs,
+            waiting: format_duration(acc.waiting_secs),
+            error_secs: acc.error_secs,
+            error: format_duration(acc.error_secs),
             foreground_secs: acc.foreground_secs,
             foreground: format_duration(acc.foreground_secs),
+            attention_events: acc.attention_events,
             last_prompt_at: acc.last_prompt_at.map(format_rfc3339),
             last_prompt_age: acc
                 .last_prompt_at
                 .map_or_else(|| "-".to_string(), |at| relative_time(data.now, at)),
         })
         .collect()
+}
+
+fn add_activity_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+) {
+    for entry in &data.activity_entries {
+        match entry {
+            ActivityEntry::StateTransition(entry) => add_state_transition_row(
+                data,
+                group_by,
+                rows,
+                entry,
+                state_transition_overlap_secs(data, entry),
+            ),
+            ActivityEntry::SessionForeground(entry) => {
+                let secs = session_foreground_overlap_secs(data, entry);
+                if secs == 0 {
+                    continue;
+                }
+                if let Some(key) = session_foreground_group_key(entry, group_by) {
+                    rows.entry(key).or_default().foreground_secs += secs;
+                }
+            }
+        }
+    }
+}
+
+fn add_state_transition_row(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+    entry: &StateTransitionEntry,
+    secs: u64,
+) {
+    if secs == 0 && !data.range.includes(entry.at) {
+        return;
+    }
+    let acc = rows
+        .entry(state_transition_group_key(data, entry, group_by))
+        .or_default();
+    add_state_secs(
+        entry.from,
+        secs,
+        &mut acc.working_secs,
+        &mut acc.waiting_secs,
+        &mut acc.error_secs,
+    );
+    if data.range.includes(entry.at) && is_attention_state(entry.to) {
+        acc.attention_events += 1;
+    }
 }
 
 fn prompt_group_key(data: &StatsData, prompt: &HistoryEntry, group_by: GroupBy) -> String {
@@ -399,6 +563,152 @@ fn agent_group_key(data: &StatsData, agent: &Agent, group_by: GroupBy) -> String
             .cloned()
             .unwrap_or_else(|| agent.session_id.clone()),
     }
+}
+
+fn state_transition_group_key(
+    data: &StatsData,
+    entry: &StateTransitionEntry,
+    group_by: GroupBy,
+) -> String {
+    match group_by {
+        GroupBy::Day => format_day(entry.at),
+        GroupBy::Project => entry
+            .cwd
+            .as_deref()
+            .and_then(|cwd| project_from_cwd(Some(cwd)))
+            .or_else(|| {
+                data.project_by_agent_session
+                    .get(&entry.session_id)
+                    .cloned()
+            })
+            .or_else(|| {
+                entry
+                    .pane
+                    .as_ref()
+                    .and_then(|pane| data.project_by_pane.get(pane))
+                    .cloned()
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        GroupBy::Agent => entry.kind.to_string(),
+        GroupBy::Session => entry
+            .pane
+            .as_ref()
+            .and_then(|pane| data.pane_sessions.get(pane))
+            .cloned()
+            .unwrap_or_else(|| entry.session_id.clone()),
+    }
+}
+
+fn session_foreground_group_key(
+    entry: &SessionForegroundEntry,
+    group_by: GroupBy,
+) -> Option<String> {
+    match group_by {
+        GroupBy::Day => Some(format_day(entry.ended_at)),
+        GroupBy::Session => Some(entry.session_name.clone()),
+        GroupBy::Project | GroupBy::Agent => None,
+    }
+}
+
+fn add_open_session_foreground_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+) {
+    if !matches!(group_by, GroupBy::Day | GroupBy::Session) {
+        return;
+    }
+    for activity in &data.activities {
+        let Some(since) = activity.attached_since else {
+            continue;
+        };
+        let secs = overlap_secs(data, since, data.now);
+        if secs == 0 {
+            continue;
+        }
+        let key = match group_by {
+            GroupBy::Day => format_day(data.now),
+            GroupBy::Session => activity.name.clone(),
+            GroupBy::Project | GroupBy::Agent => unreachable!(),
+        };
+        rows.entry(key).or_default().foreground_secs += secs;
+    }
+}
+
+fn state_transition_overlap_secs(data: &StatsData, entry: &StateTransitionEntry) -> u64 {
+    let started_at = entry.state_entered_at.unwrap_or_else(|| {
+        entry.at - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
+    });
+    overlap_secs(data, started_at, entry.at)
+}
+
+fn session_foreground_overlap_secs(data: &StatsData, entry: &SessionForegroundEntry) -> u64 {
+    overlap_secs(data, entry.started_at, entry.ended_at)
+}
+
+fn open_session_foreground_secs(data: &StatsData) -> u64 {
+    data.activities
+        .iter()
+        .filter_map(|activity| activity.attached_since)
+        .map(|since| overlap_secs(data, since, data.now))
+        .sum()
+}
+
+fn open_agent_state_secs(data: &StatsData, agent: &Agent) -> u64 {
+    if agent.state == AgentState::Stopped {
+        return 0;
+    }
+    overlap_secs(data, agent.state_entered_at, data.now)
+}
+
+fn legacy_foreground_secs(data: &StatsData) -> u64 {
+    data.activities
+        .iter()
+        .filter(|activity| activity.attached_since.is_none())
+        .map(|activity| activity.effective_total_secs(data.now))
+        .sum()
+}
+
+fn has_session_foreground_ledger(data: &StatsData) -> bool {
+    data.activity_entries
+        .iter()
+        .any(|entry| matches!(entry, ActivityEntry::SessionForeground(_)))
+}
+
+fn overlap_secs(data: &StatsData, started_at: OffsetDateTime, ended_at: OffsetDateTime) -> u64 {
+    let start = data
+        .range
+        .since_at
+        .map_or(started_at, |since| started_at.max(since));
+    let end = ended_at.min(data.now);
+    if end <= start {
+        return 0;
+    }
+    u64::try_from((end - start).whole_seconds()).unwrap_or(u64::MAX)
+}
+
+fn add_state_secs(
+    state: AgentState,
+    secs: u64,
+    working_secs: &mut u64,
+    waiting_secs: &mut u64,
+    error_secs: &mut u64,
+) {
+    match state {
+        AgentState::Working => *working_secs = working_secs.saturating_add(secs),
+        AgentState::WaitingInput | AgentState::WaitingChoice => {
+            *waiting_secs = waiting_secs.saturating_add(secs);
+        }
+        AgentState::Error => *error_secs = error_secs.saturating_add(secs),
+        AgentState::Starting | AgentState::Idle | AgentState::Stopped => {}
+    }
+}
+
+fn is_attention_state(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -482,9 +792,13 @@ fn notes(data: &StatsData) -> Vec<String> {
     let mut notes = vec![
         "Prompt totals cover the daemon's retained history window, bounded by [history].max_per_pane and max_age_days.".to_string(),
     ];
-    if !data.activities.is_empty() {
+    if data.activity_entries.is_empty() {
         notes.push(
-            "DUR is cumulative tmux foreground time from session-activity.json; it is not yet windowed by --since.".to_string(),
+            "No activity ledger entries found yet; duration columns will fill as agents transition and tmux foreground intervals close.".to_string(),
+        );
+    } else if !has_session_foreground_ledger(data) && !data.activities.is_empty() {
+        notes.push(
+            "TMUX uses legacy cumulative session-activity.json totals until the first session foreground interval lands in activity.ndjson.".to_string(),
         );
     }
     notes
@@ -497,12 +811,16 @@ fn render_table(doc: &StatsDocument) {
         println!("Since: {since_at}");
     }
     println!(
-        "Prompts: {} | token est: {} | agent sessions: {} | live agents: {} | DUR: {}",
+        "Prompts: {} | token est: {} | agent sessions: {} | live agents: {} | work: {} | wait: {} | err: {} | tmux: {} | blocks: {}",
         doc.totals.prompts,
         doc.totals.token_estimate,
         doc.totals.agent_sessions,
         doc.totals.live_agents,
-        doc.totals.foreground
+        doc.totals.working,
+        doc.totals.waiting,
+        doc.totals.error,
+        doc.totals.foreground,
+        doc.totals.attention_events
     );
     println!();
 
@@ -516,11 +834,15 @@ fn render_table(doc: &StatsDocument) {
             .set_header(vec![
                 doc.group_by.to_ascii_uppercase(),
                 "PROMPTS".to_string(),
+                "WORK".to_string(),
+                "WAIT".to_string(),
+                "ERR".to_string(),
+                "TMUX".to_string(),
+                "BLOCK".to_string(),
                 "TOK EST".to_string(),
                 "WORDS".to_string(),
                 "SESS".to_string(),
                 "AGENTS".to_string(),
-                "DUR".to_string(),
                 "LAST".to_string(),
             ]);
 
@@ -528,11 +850,15 @@ fn render_table(doc: &StatsDocument) {
             table.add_row(vec![
                 Cell::new(&row.key),
                 Cell::new(row.prompts),
+                Cell::new(&row.working),
+                Cell::new(&row.waiting),
+                Cell::new(&row.error),
+                Cell::new(&row.foreground),
+                Cell::new(row.attention_events),
                 Cell::new(row.token_estimate),
                 Cell::new(row.words),
                 Cell::new(row.agent_sessions),
                 Cell::new(row.live_agents),
-                Cell::new(&row.foreground),
                 Cell::new(&row.last_prompt_age),
             ]);
         }
@@ -607,7 +933,15 @@ fn push_markdown_overview(out: &mut String, title: &str, doc: &StatsDocument) {
         &doc.totals.agent_sessions.to_string(),
     );
     push_metric(out, "Live agents", &doc.totals.live_agents.to_string());
-    push_metric(out, "DUR", &doc.totals.foreground);
+    push_metric(out, "Working", &doc.totals.working);
+    push_metric(out, "Waiting", &doc.totals.waiting);
+    push_metric(out, "Error time", &doc.totals.error);
+    push_metric(out, "TMUX foreground", &doc.totals.foreground);
+    push_metric(
+        out,
+        "Attention events",
+        &doc.totals.attention_events.to_string(),
+    );
     push_metric(out, "Last prompt", &doc.totals.last_prompt_age);
     out.push('\n');
 }
@@ -629,13 +963,25 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         return;
     }
 
-    out.push_str("| Group | Prompts | Tok est | Words | Sessions | Agents | DUR | Last |\n");
-    out.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
+    out.push_str("| Group | Prompts | Work | Wait | Error | TMUX | Block | Tok est | Words | Sessions | Agents | Last |\n");
+    out.push_str(
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+    );
     for row in rows {
         out.push_str("| ");
         out.push_str(&escape_markdown_cell(&row.key));
         out.push_str(" | ");
         out.push_str(&row.prompts.to_string());
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.working));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.waiting));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.error));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.foreground));
+        out.push_str(" | ");
+        out.push_str(&row.attention_events.to_string());
         out.push_str(" | ");
         out.push_str(&row.token_estimate.to_string());
         out.push_str(" | ");
@@ -644,8 +990,6 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         out.push_str(&row.agent_sessions.to_string());
         out.push_str(" | ");
         out.push_str(&row.live_agents.to_string());
-        out.push_str(" | ");
-        out.push_str(&escape_markdown_cell(&row.foreground));
         out.push_str(" | ");
         out.push_str(&escape_markdown_cell(&row.last_prompt_age));
         out.push_str(" |\n");
@@ -720,6 +1064,7 @@ fn format_duration(total_secs: u64) -> String {
 mod tests {
     use super::*;
     use muxa::event::AgentKind;
+    use muxa::StateTransitionInput;
     use time::macros::datetime;
 
     fn prompt(
@@ -741,6 +1086,32 @@ mod tests {
         )
     }
 
+    fn live_agent(state: AgentState, state_entered_at: OffsetDateTime, cwd: Option<&str>) -> Agent {
+        Agent {
+            kind: AgentKind::Codex,
+            session_id: "agent-live".into(),
+            pane: Some("%1".into()),
+            cwd: cwd.map(str::to_string),
+            state,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: state_entered_at,
+            last_activity_at: state_entered_at,
+            state_entered_at,
+        }
+    }
+
     fn data(prompts: Vec<HistoryEntry>) -> StatsData {
         StatsData {
             now: datetime!(2026-05-30 12:00:00 UTC),
@@ -749,6 +1120,7 @@ mod tests {
                 since_at: Some(datetime!(2026-05-23 12:00:00 UTC)),
             },
             prompts,
+            activity_entries: Vec::new(),
             agents: Vec::new(),
             activities: Vec::new(),
             pane_sessions: HashMap::new(),
@@ -842,6 +1214,87 @@ mod tests {
         let rows = build_rows(&d, GroupBy::Project, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "a");
+    }
+
+    #[test]
+    fn totals_include_activity_ledger_durations() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-05-30 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-a".into(),
+                pane: Some("%1".into()),
+                cwd: Some("/home/june/muxa".into()),
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-05-30 11:00:00 UTC)),
+            })),
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-05-30 11:20:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-a".into(),
+                pane: Some("%1".into()),
+                cwd: Some("/home/june/muxa".into()),
+                from: AgentState::WaitingInput,
+                to: AgentState::Working,
+                state_entered_at: Some(datetime!(2026-05-30 11:10:00 UTC)),
+            })),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-05-30 11:00:00 UTC),
+                datetime!(2026-05-30 11:30:00 UTC),
+            )),
+        ];
+
+        let totals = build_totals(&d);
+
+        assert_eq!(totals.working_secs, 600);
+        assert_eq!(totals.waiting_secs, 600);
+        assert_eq!(totals.foreground_secs, 1_800);
+        assert_eq!(totals.attention_events, 1);
+    }
+
+    #[test]
+    fn rows_group_activity_ledger_by_project() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![ActivityEntry::StateTransition(StateTransitionEntry::new(
+            StateTransitionInput {
+                at: datetime!(2026-05-30 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-a".into(),
+                pane: Some("%1".into()),
+                cwd: Some("/home/june/muxa".into()),
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-05-30 11:00:00 UTC)),
+            },
+        ))];
+
+        let rows = build_rows(&d, GroupBy::Project, 0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "muxa");
+        assert_eq!(rows[0].working_secs, 600);
+        assert_eq!(rows[0].attention_events, 1);
+    }
+
+    #[test]
+    fn open_live_agent_state_counts_until_now() {
+        let mut d = data(Vec::new());
+        d.agents.push(live_agent(
+            AgentState::Working,
+            datetime!(2026-05-30 11:00:00 UTC),
+            Some("/home/june/muxa"),
+        ));
+
+        let totals = build_totals(&d);
+        let rows = build_rows(&d, GroupBy::Project, 0);
+
+        assert_eq!(totals.working_secs, 3_600);
+        assert_eq!(rows[0].key, "muxa");
+        assert_eq!(rows[0].working_secs, 3_600);
     }
 
     #[test]

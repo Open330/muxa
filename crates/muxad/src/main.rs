@@ -7,6 +7,9 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use muxa::activity::{
+    ActivityEntry, ActivityLog, ActivityOptions, StateTransitionEntry, StateTransitionInput,
+};
 use muxa::config::NotifierBackend;
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PromptHistory};
@@ -17,6 +20,7 @@ use muxa::sinks::{webhook as webhook_sink, OhMyPromptSink, WebhookSink};
 use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
 use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -158,10 +162,13 @@ async fn main() -> Result<()> {
     // instead of `synthetic-%X` placeholders.
     enrich_from_history(&store, &history, &backend).await;
 
+    let activity_log = build_activity_log(&cfg, &shutdown_tx).await;
+    spawn_activity_transition_task(&store, activity_log.clone(), &shutdown_tx).await;
     spawn_gc_task(&store, &shutdown_tx);
     spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
-    spawn_session_activity_task(&cfg, &shutdown_tx);
+    spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
     spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
+    spawn_activity_compaction_task(&cfg, activity_log.clone(), &shutdown_tx);
 
     // The snapshotter listens on its own dedicated channel rather than
     // the main shutdown broadcast: it has to be the last thing to die
@@ -348,6 +355,116 @@ async fn build_history(
     }
 }
 
+/// Initialize the append-only activity ledger.
+///
+/// When enabled, state-transition and tmux foreground intervals are appended
+/// to `$XDG_DATA_HOME/muxa/activity.ndjson` so stats can compute duration
+/// even after panes or tmux sessions disappear.
+async fn build_activity_log(
+    cfg: &Config,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Option<std::sync::Arc<ActivityLog>> {
+    if !cfg.activity.enabled {
+        tracing::info!("activity ledger disabled by config");
+        return None;
+    }
+    let Some(path) = cfg
+        .activity
+        .path
+        .clone()
+        .or_else(paths::default_activity_file)
+    else {
+        tracing::warn!("activity ledger enabled but no path resolvable");
+        return None;
+    };
+
+    let opts = ActivityOptions::new(path.clone());
+    match ActivityLog::spawn(opts, shutdown_tx.subscribe()).await {
+        Ok((activity_log, _writer_handle)) => {
+            tracing::info!(
+                path = %path.display(),
+                max_age_days = cfg.activity.max_age_days,
+                "activity ledger enabled",
+            );
+            Some(activity_log)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "could not open activity ledger; duration stats will be incomplete",
+            );
+            None
+        }
+    }
+}
+
+async fn spawn_activity_transition_task(
+    store: &muxa::SharedStore,
+    activity_log: Option<std::sync::Arc<ActivityLog>>,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    let Some(activity_log) = activity_log else {
+        return;
+    };
+
+    let mut states = seed_activity_state_map(store.snapshot().await);
+    let mut rx = store.subscribe();
+    let store = store.clone();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(transition) => {
+                            let agent = transition.agent.as_ref();
+                            let at = agent.state_entered_at;
+                            let prior_entered_at = states
+                                .get(&agent.session_id)
+                                .map(|(_, entered_at)| *entered_at)
+                                .or(Some(agent.started_at));
+                            let entry = StateTransitionEntry::new(StateTransitionInput {
+                                at,
+                                kind: agent.kind,
+                                session_id: agent.session_id.clone(),
+                                pane: agent.pane.clone(),
+                                cwd: agent.cwd.clone(),
+                                from: transition.from,
+                                to: transition.to,
+                                state_entered_at: prior_entered_at,
+                            });
+                            activity_log.append(ActivityEntry::StateTransition(entry));
+                            states.insert(agent.session_id.clone(), (transition.to, at));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                dropped = n,
+                                "activity transition subscriber lagged; reseeding duration state",
+                            );
+                            states = seed_activity_state_map(store.snapshot().await);
+                        }
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::debug!("activity transition task shutting down");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn seed_activity_state_map(
+    agents: Vec<muxa::Agent>,
+) -> HashMap<String, (muxa::AgentState, time::OffsetDateTime)> {
+    agents
+        .into_iter()
+        .map(|agent| (agent.session_id, (agent.state, agent.state_entered_at)))
+        .collect()
+}
+
 /// Spawn the periodic prompt-history compaction task.
 ///
 /// Compaction drops aged-out entries from memory and rewrites the disk
@@ -385,6 +502,45 @@ fn spawn_history_compaction_task(
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::debug!("history compaction task shutting down");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_activity_compaction_task(
+    cfg: &Config,
+    activity_log: Option<std::sync::Arc<ActivityLog>>,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    if !cfg.activity.enabled {
+        return;
+    }
+    let Some(activity_log) = activity_log else {
+        return;
+    };
+    let interval_secs = cfg.activity.compact_interval_secs;
+    let max_age = time::Duration::days(i64::from(cfg.activity.max_age_days));
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let report = activity_log.compact(max_age).await;
+                    if report.aged_out > 0 || report.rewrite_skipped {
+                        tracing::debug!(
+                            aged_out = report.aged_out,
+                            rewrite_skipped = report.rewrite_skipped,
+                            "activity compaction pass",
+                        );
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::debug!("activity compaction task shutting down");
                     break;
                 }
             }
@@ -434,7 +590,11 @@ fn spawn_reconciler_task(
 }
 
 /// Track cumulative tmux session attached time for `muxa watch --view session`.
-fn spawn_session_activity_task(cfg: &Config, shutdown_tx: &broadcast::Sender<()>) {
+fn spawn_session_activity_task(
+    cfg: &Config,
+    shutdown_tx: &broadcast::Sender<()>,
+    activity_log: Option<std::sync::Arc<ActivityLog>>,
+) {
     if !cfg.session_activity.enabled {
         tracing::info!("session activity tracking disabled by config");
         return;
@@ -451,7 +611,8 @@ fn spawn_session_activity_task(cfg: &Config, shutdown_tx: &broadcast::Sender<()>
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),
         std::time::Duration::from_secs(cfg.session_activity.interval_secs),
-    );
+    )
+    .with_activity_log(activity_log);
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(tracker.run(shutdown_rx));
     tracing::info!(

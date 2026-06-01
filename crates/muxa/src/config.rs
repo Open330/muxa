@@ -103,6 +103,7 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
     pub reconciler: ReconcilerConfig,
     pub history: HistoryConfig,
+    pub activity: ActivityConfig,
     pub state: StateConfig,
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
@@ -351,6 +352,38 @@ impl Default for HistoryConfig {
     }
 }
 
+/// `[activity]` config — controls the append-only duration ledger.
+///
+/// The activity ledger records closed intervals for agent state transitions
+/// (`Working`, `WaitingInput`, `Error`, etc.) and tmux session foreground
+/// time. Unlike the live registry, these rows survive pane/session removal,
+/// which lets `muxa stats --since ...` compute windowed duration later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActivityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override the default `$XDG_DATA_HOME/muxa/activity.ndjson` path.
+    pub path: Option<PathBuf>,
+    /// Compaction drops intervals whose end timestamp is older than this.
+    #[serde(default = "default_activity_max_age_days")]
+    pub max_age_days: u32,
+    /// How often the compaction task rewrites the file.
+    #[serde(default = "default_activity_compact_interval_secs")]
+    pub compact_interval_secs: u64,
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            max_age_days: default_activity_max_age_days(),
+            compact_interval_secs: default_activity_compact_interval_secs(),
+        }
+    }
+}
+
 /// `[state]` config — controls the agent-registry snapshot file.
 ///
 /// The daemon mirrors its in-memory `agents` map to a single JSON file so a
@@ -436,6 +469,12 @@ fn default_history_max_age_days() -> u32 {
     30
 }
 fn default_history_compact_interval_secs() -> u64 {
+    3600
+}
+fn default_activity_max_age_days() -> u32 {
+    30
+}
+fn default_activity_compact_interval_secs() -> u64 {
     3600
 }
 
