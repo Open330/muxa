@@ -860,7 +860,16 @@ pub struct CapturedPane {
 impl App {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_config(WatchConfig::default())
+        // Pin pane view for the pane-level tests built around this helper
+        // (sorting, grouping, per-row actions, single-agent updates). The
+        // *production* default is `session` (see `WatchConfig::default`);
+        // session-view behavior is covered separately by config-crate tests
+        // and the explicit `view: Session` cases below. Pinning here keeps
+        // those pane-mechanics assertions stable regardless of the default.
+        Self::with_config(WatchConfig {
+            view: WatchView::Pane,
+            ..WatchConfig::default()
+        })
     }
 
     pub(crate) fn with_config(cfg: WatchConfig) -> Self {
@@ -3647,6 +3656,7 @@ mod tests {
         // independent of `last_activity_at` jitter from `fake_agent`. The
         // default `[Session, Activity]` is exercised by separate tests.
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::Session, WatchSortKey::Pane],
             ..WatchConfig::default()
         };
@@ -3701,6 +3711,7 @@ mod tests {
         // would invert that. Regression guard for the parse::<u32>() path.
         // Uses explicit `Pane` sort so activity-jitter doesn't matter.
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::Session, WatchSortKey::Pane],
             ..WatchConfig::default()
         };
@@ -3909,6 +3920,7 @@ mod tests {
         let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
 
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::Activity],
             ..WatchConfig::default()
         };
@@ -3943,6 +3955,7 @@ mod tests {
         // alphabetic order is preferred over recency.
         let now = OffsetDateTime::now_utc();
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
@@ -3982,6 +3995,7 @@ mod tests {
         let older_at = now - time::Duration::hours(1);
 
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::Activity],
             ..WatchConfig::default()
         };
@@ -4047,6 +4061,7 @@ mod tests {
         // selected_pane() contract — not on the default sort behaviour
         // covered by other tests.
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
@@ -4156,6 +4171,7 @@ mod tests {
         // Lock to PaneId sort: this test cares about which row matches
         // `set_initial_pane`, not the default sort interleaving.
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
@@ -4333,6 +4349,7 @@ mod tests {
     #[test]
     fn custom_columns_resolve_in_config_order() {
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             columns: vec!["prompt".into(), "pane".into(), "kind".into()],
             widths: HashMap::new(),
             ..Default::default()
@@ -4347,6 +4364,7 @@ mod tests {
     #[test]
     fn unknown_column_keys_are_skipped() {
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             columns: vec!["pane".into(), "bogus".into(), "prompt".into()],
             widths: HashMap::new(),
             ..Default::default()
@@ -4364,6 +4382,7 @@ mod tests {
         widths.insert("kind".into(), WidthSpec::Percentage(20));
         widths.insert("state".into(), WidthSpec::Invalid("nope".into()));
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             columns: vec![
                 "pane".into(),
                 "prompt".into(),
@@ -4645,6 +4664,7 @@ mod tests {
         // others — we verify the BarePane row is built without panic and
         // that the prompt column carries the summary.
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             columns: vec!["pane".into(), "prompt".into()],
             widths: HashMap::new(),
             ..Default::default()
@@ -4977,6 +4997,7 @@ mod tests {
     #[test]
     fn detail_disabled_skips_expansion() {
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             detail: muxa::config::DetailConfig {
                 enabled: false,
                 template: "{last_prompt}".into(),
@@ -5099,6 +5120,7 @@ mod tests {
         let backend = TestBackend::new(140, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             hide_paneless: false,
             ..WatchConfig::default()
         };
@@ -5170,6 +5192,7 @@ mod tests {
     fn selected_pane_returns_none_for_no_pane_agent() {
         // include the paneless row under test
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             hide_paneless: false,
             ..WatchConfig::default()
         };
@@ -5235,6 +5258,7 @@ mod tests {
     #[test]
     fn include_paneless_keeps_every_agent() {
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             hide_paneless: false,
             ..WatchConfig::default()
         };
@@ -5806,6 +5830,7 @@ mod tests {
         // which index don't drift with the default [Session, Activity]
         // sort once `fake_agent` timestamps differ across runs.
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             detail,
             sort: vec![WatchSortKey::PaneId],
             ..Default::default()
@@ -6495,6 +6520,7 @@ mod tests {
     /// future default flips.
     fn cfg_with_prompt_default() -> WatchConfig {
         WatchConfig {
+            view: WatchView::Pane,
             preview: muxa::config::PreviewConfig {
                 default_content: PreviewContent::PromptResponse,
             },
@@ -6773,6 +6799,7 @@ mod tests {
     /// shapes without re-doing the fixture each time.
     fn app_with_paneless_and_pane() -> App {
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             // Disable hide_paneless so the row stays in the table
             // — the picker default would filter it out and the test
             // would have to look elsewhere.
@@ -7333,8 +7360,11 @@ mod tests {
     fn snapshot_app() -> App {
         // Pin sort to PaneId so row order doesn't drift on activity jitter
         // and disable hide_paneless so the paneless row stays visible in
-        // the mixed-list snapshot.
+        // the mixed-list snapshot. Pin pane view too so these row-rendering
+        // snapshots stay focused on per-row visuals (state glyphs, columns,
+        // selection) independent of the production default (`session`).
         let cfg = WatchConfig {
+            view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],
             hide_paneless: false,
             ..WatchConfig::default()

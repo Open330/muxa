@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`muxa watch` now defaults to session view** (`[watch] view`'s default
+  flipped `pane` → `session`). One row per tmux session — collapsing the
+  panes in a session onto its most-recently-active agent — is the
+  fleet-at-a-glance shape for operators juggling many sessions, and surfaces
+  the `DUR` (session foreground-time) column by default. The finer-grained
+  one-row-per-agent view is still a flag/config away: `muxa watch --view
+  pane` or `[watch] view = "pane"`. No wire/protocol change — purely the
+  default value of a CLI-side setting; configs that pin `view` explicitly
+  are unaffected.
 - **`PROTOCOL_VERSION` bumped 1 → 2.** Adding new variants to wire-visible
   enums (`AgentState`, `NotificationLevel`) is breaking because serde
   rejects unknown variant values on deserialize — an old client receiving
