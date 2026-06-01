@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-01
+
 ### Changed
 
 - **`muxa watch` now defaults to session view** (`[watch] view`'s default
@@ -756,7 +758,15 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Open330/muxa/releases/tag/v0.6.0
+[0.5.0]: https://github.com/Open330/muxa/releases/tag/v0.5.0
+[0.4.5]: https://github.com/Open330/muxa/releases/tag/v0.4.5
+[0.4.4]: https://github.com/Open330/muxa/releases/tag/v0.4.4
+[0.4.3]: https://github.com/Open330/muxa/releases/tag/v0.4.3
+[0.4.2]: https://github.com/Open330/muxa/releases/tag/v0.4.2
+[0.4.1]: https://github.com/Open330/muxa/releases/tag/v0.4.1
+[0.4.0]: https://github.com/Open330/muxa/releases/tag/v0.4.0
 [0.3.2]: https://github.com/Open330/muxa/releases/tag/v0.3.2
 [0.3.1]: https://github.com/Open330/muxa/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Open330/muxa/releases/tag/v0.3.0

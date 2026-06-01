@@ -127,7 +127,7 @@ never send `hello` keep the legacy strict-match behaviour (any
 non-matching `protocol` is rejected).
 
 ```json
-{ "protocol": 2, "kind": "hello", "client": "muxa/0.5.0" }
+{ "protocol": 2, "kind": "hello", "client": "muxa/0.6.0" }
 ```
 
 - `protocol` (required): the version the client wants to speak. Must
