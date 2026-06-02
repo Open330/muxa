@@ -10,6 +10,8 @@
 #   3. Pick three of those panes and feed them into muxad as Claude /
 #      Codex / Gemini agents. The remaining panes will surface as
 #      BarePane rows in `muxa watch`.
+#   4. Seed a demo-local activity ledger so `muxa stats` and
+#      `muxa activity` have readable duration rows in the recording.
 #
 # Idempotent — safe to re-run between vhs renders.
 
@@ -18,6 +20,15 @@ set -euo pipefail
 : "${MUXA_SOCKET:=/tmp/muxa-demo.sock}"
 TMUX_LBL=muxa-demo
 SHIM_DIR=/tmp/muxa-demo-shim
+
+rfc3339_ago() {
+  local seconds="$1"
+  if date -u -d "1970-01-01 UTC" '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+    date -u -d "-${seconds} seconds" '+%Y-%m-%dT%H:%M:%SZ'
+  else
+    date -u -v-"${seconds}"S '+%Y-%m-%dT%H:%M:%SZ'
+  fi
+}
 
 # 1) PATH shim — every later `tmux` call (ours and muxa's children) routes
 #    through `tmux -L muxa-demo`.
@@ -99,7 +110,40 @@ TMUX_PANE="$PC" muxa hook gemini --event before_agent \
 TMUX_PANE="$PC" muxa hook gemini --event after_agent \
   <<<'{"session_id":"s-c"}'
 
-# 4) Wire muxa into the demo server so the recording shows the integration.
+# 4) Seed activity.ndjson. The live hooks above prove agent ingest works, but
+#    a short GIF cannot wait minutes for durations to accumulate. These closed
+#    intervals make the stats/activity scenes representative while staying
+#    fully isolated under XDG_DATA_HOME=/tmp/muxa-demo-data.
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+ACTIVITY_FILE="$DATA_HOME/muxa/activity.ndjson"
+mkdir -p "$(dirname "$ACTIVITY_FILE")"
+
+T_WORK_START=$(rfc3339_ago 1560)
+T_WORK_END=$(rfc3339_ago 1140)
+T_WAIT_START=$(rfc3339_ago 900)
+T_WAIT_END=$(rfc3339_ago 720)
+T_ERR_START=$(rfc3339_ago 660)
+T_ERR_END=$(rfc3339_ago 540)
+T_TMUX_START=$(rfc3339_ago 1800)
+T_TMUX_END=$(rfc3339_ago 300)
+T_PROMPT_START=$(rfc3339_ago 870)
+T_PROMPT_END=$(rfc3339_ago 760)
+T_ATTACH_START=$(rfc3339_ago 700)
+T_ATTACH_END=$(rfc3339_ago 620)
+T_WATCH_START=$(rfc3339_ago 520)
+T_WATCH_END=$(rfc3339_ago 400)
+
+cat > "$ACTIVITY_FILE" <<EOF
+{"type":"state_transition","v":1,"at":"$T_WORK_END","kind":"claude_code","session_id":"s-a","pane":"$PA","session_name":"main","cwd":"/home/you/proj","from":"working","to":"waiting_input","state_entered_at":"$T_WORK_START","duration_secs":420}
+{"type":"state_transition","v":1,"at":"$T_WAIT_END","kind":"claude_code","session_id":"s-a","pane":"$PA","session_name":"main","cwd":"/home/you/proj","from":"waiting_input","to":"working","state_entered_at":"$T_WAIT_START","duration_secs":180}
+{"type":"state_transition","v":1,"at":"$T_ERR_END","kind":"codex","session_id":"s-b","pane":"$PB","session_name":"main","cwd":"/home/you/legacy","from":"error","to":"working","state_entered_at":"$T_ERR_START","duration_secs":120}
+{"type":"session_foreground","v":1,"session_id":"demo-main","session_name":"main","started_at":"$T_TMUX_START","ended_at":"$T_TMUX_END","duration_secs":1500}
+{"type":"human_interaction","v":1,"kind":"muxa_prompt_input","pane":"$PA","session_id":"s-a","session_name":"main","started_at":"$T_PROMPT_START","ended_at":"$T_PROMPT_END","duration_secs":110}
+{"type":"human_interaction","v":1,"kind":"tmux_attach","pane":"$PB","session_id":"s-b","session_name":"main","started_at":"$T_ATTACH_START","ended_at":"$T_ATTACH_END","duration_secs":80}
+{"type":"human_interaction","v":1,"kind":"muxa_watch","pane":"$PA","session_id":"s-a","session_name":"main","started_at":"$T_WATCH_START","ended_at":"$T_WATCH_END","duration_secs":120}
+EOF
+
+# 5) Wire muxa into the demo server so the recording shows the integration.
 "$TM" -L "$TMUX_LBL" set-option -g status-interval 1
 # Status bar at the top — much more legible in a 1200×720 GIF than the
 # default bottom bar squeezed against the recording's edge.

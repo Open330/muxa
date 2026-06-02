@@ -12,17 +12,18 @@ to re-record it.
 | `docs/demo.tape`       | [VHS](https://github.com/charmbracelet/vhs) script — the recording itself.            |
 | `docs/demo-setup.sh`   | Bootstraps an isolated `tmux -L muxa-demo` server with a few seeded panes + windows.  |
 | `docs/demo-seed.sh`    | Older pane-seed script (kept for reference; the live setup script does this inline).  |
-| `docs/demo.gif`        | The output. ~410 KB, 1200 × 720, ~20 s.                                               |
+| `docs/demo.gif`        | The output. 1200 × 720; includes status, stats, activity, and watch.                  |
 
 The tape's prelude (`Hide` block) does the boring setup so the visible
 recording stays focused on the muxa UI:
 
 1. Spawns a fresh `muxad` against `MUXA_SOCKET=/tmp/muxa-demo.sock`.
-2. Writes a demo-local `MUXA_CONFIG` so local watch defaults do not leak
-   into the recording.
+2. Writes a demo-local `MUXA_CONFIG` and `XDG_DATA_HOME` so local watch
+   defaults and real activity ledgers do not leak into the recording.
 3. Runs `docs/demo-setup.sh`, which stands up the labelled tmux server
    with three seeded agent panes (Claude / Codex / Gemini) plus a few
-   bare panes for variety, and binds `prefix + s` to the watch popup.
+   bare panes for variety, writes sample activity intervals for
+   stats/activity, and binds `prefix + s` to the watch popup.
 4. `exec`s into `tmux -L muxa-demo attach -t main:0` so the recording
    opens already inside the demo session.
 
@@ -75,7 +76,7 @@ docker cp docs/demo.tape       "$CID":/work/docs/demo.tape
 docker cp docs/demo-setup.sh   "$CID":/work/docs/demo-setup.sh
 docker cp docs/demo-seed.sh    "$CID":/work/docs/demo-seed.sh
 
-# 4) Record. ~17 s of visible content + a few seconds of setup/teardown.
+# 4) Record. The visible flow shows status, stats, activity, and watch.
 docker exec -w /work "$CID" vhs docs/demo.tape
 
 # 5) Pull the resulting GIF out and tear the container down.
