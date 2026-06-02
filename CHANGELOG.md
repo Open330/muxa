@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa watch` prompt composer** — delay the submit key briefly after
+  injecting prompt text into a tmux pane, so Codex treats `Enter` as a
+  distinct submit key instead of folding it into a fast paste/input burst.
+
 ## [0.7.0] - 2026-06-02
 
 ### Added
