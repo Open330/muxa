@@ -89,7 +89,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 
     // 5½. MUXA_SOCKET env — the variable that lets every pane agree
     // on the daemon socket path after a restart.
-    tally(check_muxa_socket_env(), &mut issues);
+    tally(check_muxa_socket_env(&socket), &mut issues);
 
     // 6. Recent muxad errors. These are surfaced as warnings (not
     //    failures) — a stale ERROR line from yesterday shouldn't make
@@ -526,34 +526,61 @@ fn check_tmux_blocks() -> CheckResult {
     }
 }
 
-/// Confirm that `MUXA_SOCKET` is set in the tmux server environment.
-/// Without it, status-right and new panes may use a stale/default
-/// socket path after muxad restarts, causing heartbeats to miss the
-/// daemon and leaving rows stuck in `Starting`.
-fn check_muxa_socket_env() -> CheckResult {
+/// Confirm `MUXA_SOCKET` is pinned in the tmux server environment **and**
+/// that the pinned path still points at a live socket. A pin alone isn't
+/// enough: if it references a daemon socket that has since moved, or a
+/// temp socket that was cleaned up (e.g. a dashboard socket left behind by
+/// a short-lived nested session), every new pane inherits a dead path and
+/// `muxa watch` / status-right fail with "daemon not reachable". We probe
+/// the path the same way the IPC client does — a plain connect — so a
+/// stale pin downgrades to a warning instead of a misleading ✔.
+fn check_muxa_socket_env(daemon_socket: &Path) -> CheckResult {
     let out = Command::new("tmux")
         .args(["show-environment", "-g", "MUXA_SOCKET"])
         .output();
-    match out {
+    let value = match out {
         Ok(o) if o.status.success() => {
-            let line = String::from_utf8_lossy(&o.stdout);
-            if line.trim().starts_with("MUXA_SOCKET=") {
-                CheckResult::Ok(format!(
-                    "tmux: MUXA_SOCKET={}",
-                    line.trim().strip_prefix("MUXA_SOCKET=").unwrap_or("?")
-                ))
-            } else {
-                CheckResult::Warn(
-                    "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation"
-                        .into(),
-                )
+            match parse_muxa_socket_env(&String::from_utf8_lossy(&o.stdout)) {
+                Some(value) => value,
+                None => return muxa_socket_unset(),
             }
         }
-        Ok(_) => CheckResult::Warn(
-            "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation".into(),
-        ),
-        Err(e) => CheckResult::Warn(format!("tmux: could not query environment ({e})")),
+        Ok(_) => return muxa_socket_unset(),
+        Err(e) => return CheckResult::Warn(format!("tmux: could not query environment ({e})")),
+    };
+
+    if socket_is_reachable(Path::new(&value)) {
+        CheckResult::Ok(format!("tmux: MUXA_SOCKET={value} (reachable)"))
+    } else {
+        CheckResult::Warn(format!(
+            "tmux: MUXA_SOCKET={value} is unreachable — new panes will fail to reach muxad; \
+             re-pin it to {} with `muxa init`",
+            daemon_socket.display()
+        ))
     }
+}
+
+fn muxa_socket_unset() -> CheckResult {
+    CheckResult::Warn(
+        "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation".into(),
+    )
+}
+
+/// Extract the value from a `tmux show-environment -g MUXA_SOCKET` line.
+/// Returns `None` when the variable is unset or empty — tmux prints a
+/// `-MUXA_SOCKET` removal marker (or nothing useful), neither of which
+/// starts with `MUXA_SOCKET=` followed by a value.
+fn parse_muxa_socket_env(stdout: &str) -> Option<String> {
+    let value = stdout.trim().strip_prefix("MUXA_SOCKET=")?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Best-effort liveness probe for a unix socket path. A successful connect
+/// means something is listening; `ENOENT` / `ECONNREFUSED` mean the pin is
+/// stale. Mirrors the connect probe in `muxa::ipc` — a local unix connect
+/// resolves immediately, so no timeout is needed.
+fn socket_is_reachable(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 /// Pure detector for a `# >>> muxa managed (<id>) >>>` ... `# <<< muxa
@@ -672,6 +699,43 @@ mod tests {
     #[test]
     fn check_synthetic_agents_ok_when_none() {
         assert!(matches!(check_synthetic_agents(&[]), CheckResult::Ok(_)));
+    }
+
+    #[test]
+    fn parse_muxa_socket_env_extracts_value() {
+        assert_eq!(
+            parse_muxa_socket_env("MUXA_SOCKET=/tmp/muxa-1044.sock\n").as_deref(),
+            Some("/tmp/muxa-1044.sock")
+        );
+    }
+
+    #[test]
+    fn parse_muxa_socket_env_none_when_unset_or_empty() {
+        // tmux prints `-MUXA_SOCKET` when the global var is removed.
+        assert_eq!(parse_muxa_socket_env("-MUXA_SOCKET\n"), None);
+        assert_eq!(parse_muxa_socket_env("MUXA_SOCKET=\n"), None);
+        assert_eq!(parse_muxa_socket_env(""), None);
+    }
+
+    #[test]
+    fn socket_is_reachable_true_when_listener_bound() {
+        use std::os::unix::net::UnixListener;
+        let path =
+            std::env::temp_dir().join(format!("muxa-doctor-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind probe socket");
+        assert!(socket_is_reachable(&path));
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn socket_is_reachable_false_when_path_missing() {
+        // A pinned-but-dead path is exactly the stale-MUXA_SOCKET case.
+        let path =
+            std::env::temp_dir().join(format!("muxa-doctor-missing-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!socket_is_reachable(&path));
     }
 
     #[test]
