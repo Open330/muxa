@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-02
+
+### Added
+
+- **`muxa watch` prompt composer** — pressing Enter on a selected row now
+  opens a compact bottom input bar for sending a prompt directly to that
+  agent's tmux pane. A second Enter on an empty composer keeps the old
+  attach behavior, so operators can prompt first or attach intentionally.
+  The same Enter prompt path works from preview mode, including the live
+  pane preview.
+- **Terminal themes** — `classic`, `oh-my-muxa`, `focus`, `ops`, `mono`,
+  `high-contrast`, and `minimal` presets are now available. `muxa watch`
+  themes cover TUI chrome, footer hints, selection, and state markers.
+  `muxa status`, `muxa stats`, and `muxa activity` also accept
+  `--theme <THEME>` for styled table output.
+- **Shared `[ui] theme` config** — human-facing terminal output can now
+  share one visual default from `[ui] theme`. `muxa watch` inherits it
+  unless `[watch] theme` is set, preserving a watch-only override when
+  desired.
+
 ## [0.6.0] - 2026-06-01
 
 ### Changed

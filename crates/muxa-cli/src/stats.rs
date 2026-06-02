@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
+use comfy_table::{ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::{
@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use time::OffsetDateTime;
 
+use crate::theme::{self, CliTheme, TableTone, ThemeArg};
 use crate::time_range::TimeRange;
-use crate::{terminal_width, truncate_cell};
+use crate::{terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -33,6 +34,17 @@ pub struct Args {
     /// Maximum rows to print. Set 0 for all rows.
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    /// One-shot visual theme override for table output.
+    #[arg(long, value_enum)]
+    theme: Option<ThemeArg>,
+}
+
+impl Args {
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Option<ThemeArg> {
+        self.theme
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -90,7 +102,7 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let data = load_data(client, cfg, &args.since).await?;
     let doc = build_document(&data, args.group_by, args.limit);
     match args.format {
-        OutputFormat::Table => render_table(&doc),
+        OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
         OutputFormat::Markdown => print!("{}", render_markdown_stats(&doc)),
     }
@@ -1135,7 +1147,7 @@ fn notes(data: &StatsData) -> Vec<String> {
     notes
 }
 
-fn render_table(doc: &StatsDocument) {
+fn render_table(doc: &StatsDocument, theme: CliTheme) {
     println!("muxa stats");
     println!("Range: {}", doc.range.label);
     if let Some(since_at) = doc.range.since_at.as_deref() {
@@ -1164,7 +1176,7 @@ fn render_table(doc: &StatsDocument) {
         println!("no retained prompts, live agents, or tracked session activity in this view");
     } else {
         let terminal_width = terminal_width();
-        println!("{}", render_stats_table(doc, terminal_width));
+        println!("{}", render_stats_table(doc, terminal_width, theme));
         if stats_table_layout(terminal_width) != StatsTableLayout::Full {
             println!(
                 "note: Table compacted for terminal width; use --format json or --format markdown for every column."
@@ -1337,7 +1349,7 @@ const MINIMAL_STATS_COLUMNS: &[StatsTableColumn] = &[
     },
 ];
 
-fn render_stats_table(doc: &StatsDocument, terminal_width: usize) -> String {
+fn render_stats_table(doc: &StatsDocument, terminal_width: usize, theme: CliTheme) -> String {
     let layout = stats_table_layout(terminal_width);
     let columns = stats_table_columns(layout);
     let group_width = stats_group_column_width(terminal_width, columns);
@@ -1353,12 +1365,15 @@ fn render_stats_table(doc: &StatsDocument, terminal_width: usize) -> String {
     }));
 
     let mut header = Vec::with_capacity(columns.len() + 1);
-    header.push(Cell::new(truncate_cell(
-        &doc.group_by.to_ascii_uppercase(),
-        group_width,
-    )));
+    header.push(theme.cell(
+        truncate_cell(&doc.group_by.to_ascii_uppercase(), group_width),
+        TableTone::Header,
+    ));
     header.extend(columns.iter().map(|column| {
-        Cell::new(truncate_cell(column.header, column.width)).set_alignment(CellAlignment::Right)
+        theme.right_cell(
+            truncate_cell(column.header, column.width),
+            TableTone::Header,
+        )
     }));
 
     table
@@ -1369,18 +1384,34 @@ fn render_stats_table(doc: &StatsDocument, terminal_width: usize) -> String {
 
     for row in &doc.rows {
         let mut cells = Vec::with_capacity(columns.len() + 1);
-        cells.push(Cell::new(truncate_cell(&row.key, group_width)));
+        cells.push(theme.cell(truncate_cell(&row.key, group_width), TableTone::Accent));
         cells.extend(columns.iter().map(|column| {
-            Cell::new(truncate_cell(
-                &stats_column_value(row, column.value),
-                column.width,
-            ))
-            .set_alignment(CellAlignment::Right)
+            theme.right_cell(
+                truncate_cell(&stats_column_value(row, column.value), column.width),
+                stats_column_tone(column.value),
+            )
         }));
         table.add_row(cells);
     }
 
     format!("{table}")
+}
+
+fn stats_column_tone(column: StatsColumn) -> TableTone {
+    match column {
+        StatsColumn::Prompts
+        | StatsColumn::TokenEstimate
+        | StatsColumn::Words
+        | StatsColumn::AgentSessions => TableTone::Accent,
+        StatsColumn::Working | StatsColumn::LiveAgents => TableTone::Good,
+        StatsColumn::Waiting => TableTone::Warn,
+        StatsColumn::Error => TableTone::Error,
+        StatsColumn::Foreground => TableTone::Tmux,
+        StatsColumn::Human => TableTone::Human,
+        StatsColumn::Thinking => TableTone::Thinking,
+        StatsColumn::AttentionEvents => TableTone::Choice,
+        StatsColumn::LastPromptAge => TableTone::Dim,
+    }
 }
 
 fn stats_table_layout(terminal_width: usize) -> StatsTableLayout {
@@ -2021,7 +2052,7 @@ mod tests {
         let d = data(vec![p, long]);
         let doc = build_document(&d, GroupBy::Session, 0);
 
-        let rendered = render_stats_table(&doc, 88);
+        let rendered = render_stats_table(&doc, 88, CliTheme::plain());
 
         assert!(rendered.contains("PRM"));
         assert!(!rendered.contains("TOK EST"));
@@ -2050,7 +2081,7 @@ mod tests {
         let d = data(vec![p]);
         let doc = build_document(&d, GroupBy::Session, 0);
 
-        let rendered = render_stats_table(&doc, 140);
+        let rendered = render_stats_table(&doc, 140, CliTheme::plain());
 
         assert!(rendered.contains("TOK EST"));
         assert!(rendered.contains("WORDS"));

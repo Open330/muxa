@@ -97,6 +97,7 @@ pub struct Config {
     /// Unix socket path. Overrides the XDG default.
     pub socket: Option<PathBuf>,
 
+    pub ui: UiConfig,
     pub notifier: NotifierConfig,
     pub watch: WatchConfig,
     pub dashboard: DashboardTomlConfig,
@@ -107,6 +108,22 @@ pub struct Config {
     pub state: StateConfig,
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
+}
+
+/// `[ui]` config — shared visual defaults for human-facing terminal output.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// Visual preset used by table output and, unless overridden, `muxa watch`.
+    pub theme: WatchTheme,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: WatchTheme::Classic,
+        }
+    }
 }
 
 /// `[sinks]` config — opt-in fan-out to external systems.
@@ -691,6 +708,9 @@ fn unknown_detail_placeholders(template: &str) -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WatchConfig {
+    /// Optional visual preset override for the `muxa watch` terminal UI.
+    /// When omitted, watch inherits `[ui].theme`.
+    pub theme: Option<WatchTheme>,
     /// Columns to display, in order. Omitted keys are hidden.
     pub columns: Vec<String>,
     /// Per-column width override. Keys are column keys; values are either
@@ -770,6 +790,33 @@ pub enum WatchView {
     Session,
 }
 
+/// Visual preset for muxa's human-facing terminal UIs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WatchTheme {
+    /// Existing neutral palette and square borders.
+    #[default]
+    Classic,
+    /// A polished preset: warmer title, rounded chrome, and calmer
+    /// selection colors. Named as the first `oh-my-muxa` building block.
+    #[serde(alias = "oh_my_muxa")]
+    OhMyMuxa,
+    /// Low-noise palette that keeps attention on the selected row and
+    /// blocking states during long monitoring sessions.
+    Focus,
+    /// Operational palette that makes waiting/error/rate-limit rows stand
+    /// out more aggressively.
+    Ops,
+    /// Mostly monochrome palette for SSH, logs, screenshots, and terminals
+    /// with unreliable color support.
+    Mono,
+    /// Strong contrast palette for bright terminals and accessibility.
+    #[serde(alias = "high_contrast")]
+    HighContrast,
+    /// Low-decoration preset for dense terminals and screenshots.
+    Minimal,
+}
+
 impl Default for PreviewConfig {
     fn default() -> Self {
         Self {
@@ -828,6 +875,7 @@ impl Default for WatchConfig {
         widths.insert("activity".to_string(), WidthSpec::Length(5));
         widths.insert("session_time".to_string(), WidthSpec::Length(6));
         Self {
+            theme: None,
             columns,
             widths,
             view: WatchView::Session,
@@ -984,6 +1032,7 @@ mod tests {
     #[test]
     fn watch_default_is_prompt_forward() {
         let cfg = WatchConfig::default();
+        assert_eq!(cfg.theme, None);
         assert_eq!(cfg.columns, vec!["pane", "state", "prompt", "activity"]);
         assert!(matches!(
             cfg.widths.get("pane"),
@@ -1001,9 +1050,16 @@ mod tests {
     }
 
     #[test]
+    fn ui_theme_defaults_to_classic() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.theme, WatchTheme::Classic);
+    }
+
+    #[test]
     fn parses_watch_section() {
         let toml = r#"
 [watch]
+theme = "oh-my-muxa"
 columns = ["pane", "prompt"]
 
 [watch.widths]
@@ -1013,6 +1069,7 @@ ratio = "pct:25"
 broken = "what"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.watch.theme, Some(WatchTheme::OhMyMuxa));
         assert_eq!(cfg.watch.columns, vec!["pane", "prompt"]);
         assert!(matches!(
             cfg.watch.widths.get("pane"),
@@ -1030,6 +1087,13 @@ broken = "what"
             cfg.watch.widths.get("broken"),
             Some(WidthSpec::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn parses_ui_theme() {
+        let cfg: Config = toml::from_str("[ui]\ntheme = \"focus\"\n").unwrap();
+        assert_eq!(cfg.ui.theme, WatchTheme::Focus);
+        assert_eq!(cfg.watch.theme, None);
     }
 
     #[test]
@@ -1099,6 +1163,23 @@ sort = ["act", "st", "dur", "duration"]
     fn parses_watch_pane_view() {
         let cfg: Config = toml::from_str("[watch]\nview = \"pane\"\n").unwrap();
         assert_eq!(cfg.watch.view, WatchView::Pane);
+    }
+
+    #[test]
+    fn watch_theme_accepts_aliases() {
+        for (raw, expected) in [
+            ("oh-my-muxa", WatchTheme::OhMyMuxa),
+            ("oh_my_muxa", WatchTheme::OhMyMuxa),
+            ("focus", WatchTheme::Focus),
+            ("ops", WatchTheme::Ops),
+            ("mono", WatchTheme::Mono),
+            ("high-contrast", WatchTheme::HighContrast),
+            ("high_contrast", WatchTheme::HighContrast),
+            ("minimal", WatchTheme::Minimal),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[watch]\ntheme = \"{raw}\"\n")).unwrap();
+            assert_eq!(cfg.watch.theme, Some(expected));
+        }
     }
 
     #[test]

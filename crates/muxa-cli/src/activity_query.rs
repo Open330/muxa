@@ -1,13 +1,14 @@
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
+use comfy_table::{ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::{ActivityEntry, Config, HumanInteractionKind};
 use serde::Serialize;
 use time::OffsetDateTime;
 
+use crate::theme::{self, CliTheme, TableTone, ThemeArg};
 use crate::time_range::TimeRange;
-use crate::{terminal_width, truncate_cell};
+use crate::{terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -26,6 +27,17 @@ pub struct Args {
     /// Maximum rows to print. Set 0 for all rows.
     #[arg(long, default_value_t = 50)]
     limit: usize,
+
+    /// One-shot visual theme override for table output.
+    #[arg(long, value_enum)]
+    theme: Option<ThemeArg>,
+}
+
+impl Args {
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Option<ThemeArg> {
+        self.theme
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -99,7 +111,7 @@ pub async fn run(cfg: &Config, args: Args) -> Result<()> {
     };
 
     match args.format {
-        OutputFormat::Table => render_table(&doc),
+        OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
     }
     Ok(())
@@ -165,7 +177,7 @@ fn row_for_entry(entry: &ActivityEntry) -> ActivityRow {
     }
 }
 
-fn render_table(doc: &ActivityDocument) {
+fn render_table(doc: &ActivityDocument, theme: CliTheme) {
     println!("muxa activity");
     println!("Range: {}", doc.range);
     if let Some(since_at) = doc.since_at.as_deref() {
@@ -183,10 +195,10 @@ fn render_table(doc: &ActivityDocument) {
     }
 
     let terminal_width = terminal_width();
-    println!("{}", render_activity_table(doc, terminal_width));
+    println!("{}", render_activity_table(doc, terminal_width, theme));
 }
 
-fn render_activity_table(doc: &ActivityDocument, terminal_width: usize) -> String {
+fn render_activity_table(doc: &ActivityDocument, terminal_width: usize, theme: CliTheme) -> String {
     let scope_width = if terminal_width >= 100 { 24 } else { 16 };
     let detail_width = terminal_width
         .saturating_sub(scope_width + 55)
@@ -207,23 +219,32 @@ fn render_activity_table(doc: &ActivityDocument, terminal_width: usize) -> Strin
             )),
         ])
         .set_header(vec![
-            Cell::new("AT"),
-            Cell::new("TYPE"),
-            Cell::new("SCOPE"),
-            Cell::new("DUR").set_alignment(CellAlignment::Right),
-            Cell::new("DETAIL"),
+            theme.cell("AT", TableTone::Header),
+            theme.cell("TYPE", TableTone::Header),
+            theme.cell("SCOPE", TableTone::Header),
+            theme.right_cell("DUR", TableTone::Header),
+            theme.cell("DETAIL", TableTone::Header),
         ]);
 
     for row in &doc.rows {
         table.add_row(vec![
-            Cell::new(truncate_cell(&row.ended_at, 20)),
-            Cell::new(row.entry_type),
-            Cell::new(truncate_cell(&row.scope, scope_width)),
-            Cell::new(truncate_cell(&row.duration, 8)).set_alignment(CellAlignment::Right),
-            Cell::new(truncate_cell(&row.detail, detail_width)),
+            theme.cell(truncate_cell(&row.ended_at, 20), TableTone::Dim),
+            theme.cell(row.entry_type, activity_type_tone(row.entry_type)),
+            theme.cell(truncate_cell(&row.scope, scope_width), TableTone::Accent),
+            theme.right_cell(truncate_cell(&row.duration, 8), TableTone::Good),
+            theme.cell(truncate_cell(&row.detail, detail_width), TableTone::Dim),
         ]);
     }
     format!("{table}")
+}
+
+fn activity_type_tone(entry_type: &str) -> TableTone {
+    match entry_type {
+        "agent" => TableTone::Warn,
+        "tmux" => TableTone::Tmux,
+        "human" => TableTone::Human,
+        _ => TableTone::Dim,
+    }
 }
 
 fn parse_since(raw: &str, now: OffsetDateTime) -> Result<TimeRange> {

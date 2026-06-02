@@ -6,6 +6,7 @@ mod doctor;
 mod init;
 mod logs;
 mod stats;
+mod theme;
 mod time_range;
 mod upgrade;
 mod watch;
@@ -13,19 +14,20 @@ mod watch;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
+use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
-use muxa::config::{WatchConfig, WatchSortKey};
+use muxa::config::{WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
 use muxa::state::Agent;
 use muxa::{
     discovery, paths, tmux, ActivityEntry, AgentState, Config, HumanInteractionEntry,
     HumanInteractionInput, HumanInteractionKind,
 };
-use owo_colors::{OwoColorize, Style};
+use owo_colors::Style;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use theme::{CliTheme, TableTone, ThemeArg};
 use time::OffsetDateTime;
 use unicode_width::UnicodeWidthChar;
 
@@ -52,7 +54,11 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// List active agents as a human-readable table.
-    Status,
+    Status {
+        /// One-shot visual theme override.
+        #[arg(long, value_enum)]
+        theme: Option<ThemeArg>,
+    },
     /// Print a one-liner status suitable for tmux `status-right`.
     StatusLine {
         #[arg(long)]
@@ -105,6 +111,9 @@ enum Cmd {
         /// One-shot sort override: session, act/activity, dur/duration, st/state, pane, pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
+        /// One-shot visual theme override.
+        #[arg(long, value_enum)]
+        theme: Option<ThemeArg>,
     },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
@@ -234,7 +243,7 @@ async fn main() -> Result<()> {
     let client = Client::new(socket.clone());
 
     match args.cmd {
-        Cmd::Status => cmd_status(&client).await,
+        Cmd::Status { theme } => cmd_status(&client, &cfg, theme).await,
         Cmd::StatusLine { pane } => cmd_status_line(&client, pane).await,
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
@@ -249,7 +258,8 @@ async fn main() -> Result<()> {
             include_paneless,
             view,
             sort,
-        } => cmd_watch(&client, cfg, include_paneless, view, sort).await,
+            theme,
+        } => cmd_watch(&client, cfg, include_paneless, view, sort, theme).await,
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
@@ -328,6 +338,7 @@ async fn cmd_watch(
     include_paneless: bool,
     view: Option<WatchViewArg>,
     sort: Option<WatchSortArg>,
+    theme: Option<ThemeArg>,
 ) -> Result<()> {
     // watch::run restores the terminal before returning, so by the time we
     // get here it's safe to exec tmux commands that mutate the client's
@@ -345,6 +356,12 @@ async fn cmd_watch(
     if let Some(sort) = sort {
         watch_cfg.sort = sort.keys();
     }
+    watch_cfg.theme = Some(
+        theme
+            .map(WatchTheme::from)
+            .or(watch_cfg.theme)
+            .unwrap_or(cfg.ui.theme),
+    );
     let activity_path = cfg
         .activity
         .enabled
@@ -627,7 +644,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(client: &Client) -> Result<()> {
+async fn cmd_status(client: &Client, cfg: &Config, theme: Option<ThemeArg>) -> Result<()> {
     let agents = client.snapshot().await?;
     if agents.is_empty() {
         println!("no active agents");
@@ -640,7 +657,8 @@ async fn cmd_status(client: &Client) -> Result<()> {
     // raw pane ids in the location column.
     let backend = muxa::default_backend();
     let panes = backend.list_panes();
-    print_table(&agents, &panes, OffsetDateTime::now_utc(), use_colors());
+    let theme = theme::for_config(cfg, theme, use_colors());
+    print_table(&agents, &panes, OffsetDateTime::now_utc(), theme);
     Ok(())
 }
 
@@ -878,11 +896,11 @@ fn print_table(
     agents: &[Agent],
     panes: &[muxa::tmux::PaneInfo],
     now: OffsetDateTime,
-    colored: bool,
+    theme: CliTheme,
 ) {
     println!(
         "{}",
-        render_status_table(agents, panes, now, colored, terminal_width())
+        render_status_table(agents, panes, now, theme, terminal_width())
     );
 }
 
@@ -897,7 +915,7 @@ fn render_status_table(
     agents: &[Agent],
     panes: &[muxa::tmux::PaneInfo],
     now: OffsetDateTime,
-    colored: bool,
+    theme: CliTheme,
     terminal_width: usize,
 ) -> String {
     let layout = status_table_layout(terminal_width);
@@ -907,7 +925,7 @@ fn render_status_table(
         .load_preset(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Disabled)
         .set_constraints(status_table_constraints(layout, prompt_width))
-        .set_header(status_table_header(layout, prompt_width));
+        .set_header(status_table_header(layout, prompt_width, theme));
 
     for a in agents {
         let pane = pane_display(a, panes);
@@ -918,27 +936,27 @@ fn render_status_table(
         let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
         let prompt = prompt_raw.lines().next().unwrap_or("");
 
-        let state_cell = status_state_cell(&state_txt, a.state, colored);
+        let state_cell = status_state_cell(&state_txt, a.state, theme);
         let row = match layout {
             StatusTableLayout::Full => vec![
                 Cell::new(truncate_cell(&pane, 24)),
                 Cell::new(truncate_cell(&kind, 12)),
                 state_cell,
                 Cell::new(truncate_cell(&model, 16)),
-                right_cell(&last_activity, 7),
+                theme.right_cell(truncate_cell(&last_activity, 7), TableTone::Dim),
                 Cell::new(truncate_cell(prompt, prompt_width)),
             ],
             StatusTableLayout::Compact => vec![
                 Cell::new(truncate_cell(&pane, 18)),
                 Cell::new(truncate_cell(&kind, 11)),
                 state_cell,
-                right_cell(&last_activity, 7),
+                theme.right_cell(truncate_cell(&last_activity, 7), TableTone::Dim),
                 Cell::new(truncate_cell(prompt, prompt_width)),
             ],
             StatusTableLayout::Minimal => vec![
                 Cell::new(truncate_cell(&pane, 14)),
                 state_cell,
-                right_cell(&last_activity, 7),
+                theme.right_cell(truncate_cell(&last_activity, 7), TableTone::Dim),
                 Cell::new(truncate_cell(prompt, prompt_width)),
             ],
         };
@@ -977,28 +995,35 @@ fn status_table_constraints(
         .collect()
 }
 
-fn status_table_header(layout: StatusTableLayout, prompt_width: usize) -> Vec<Cell> {
+fn status_table_header(
+    layout: StatusTableLayout,
+    prompt_width: usize,
+    theme: CliTheme,
+) -> Vec<Cell> {
     match layout {
         StatusTableLayout::Full => vec![
-            Cell::new("PANE"),
-            Cell::new("KIND"),
-            Cell::new("STATE"),
-            Cell::new("MODEL"),
-            right_cell("LAST", 7),
-            Cell::new(truncate_cell("LAST PROMPT", prompt_width)),
+            theme.cell("PANE", TableTone::Header),
+            theme.cell("KIND", TableTone::Header),
+            theme.cell("STATE", TableTone::Header),
+            theme.cell("MODEL", TableTone::Header),
+            theme.right_cell("LAST", TableTone::Header),
+            theme.cell(
+                truncate_cell("LAST PROMPT", prompt_width),
+                TableTone::Header,
+            ),
         ],
         StatusTableLayout::Compact => vec![
-            Cell::new("PANE"),
-            Cell::new("KIND"),
-            Cell::new("STATE"),
-            right_cell("LAST", 7),
-            Cell::new(truncate_cell("PROMPT", prompt_width)),
+            theme.cell("PANE", TableTone::Header),
+            theme.cell("KIND", TableTone::Header),
+            theme.cell("STATE", TableTone::Header),
+            theme.right_cell("LAST", TableTone::Header),
+            theme.cell(truncate_cell("PROMPT", prompt_width), TableTone::Header),
         ],
         StatusTableLayout::Minimal => vec![
-            Cell::new("PANE"),
-            Cell::new("STATE"),
-            right_cell("LAST", 7),
-            Cell::new(truncate_cell("PROMPT", prompt_width)),
+            theme.cell("PANE", TableTone::Header),
+            theme.cell("STATE", TableTone::Header),
+            theme.right_cell("LAST", TableTone::Header),
+            theme.cell(truncate_cell("PROMPT", prompt_width), TableTone::Header),
         ],
     }
 }
@@ -1043,16 +1068,8 @@ fn status_state_label(state: AgentState, layout: StatusTableLayout) -> &'static 
     }
 }
 
-fn status_state_cell(label: &str, state: AgentState, colored: bool) -> Cell {
-    if colored {
-        Cell::new(label.style(state_style(state)).to_string())
-    } else {
-        Cell::new(label.to_string())
-    }
-}
-
-fn right_cell(value: &str, max_chars: usize) -> Cell {
-    Cell::new(truncate_cell(value, max_chars)).set_alignment(CellAlignment::Right)
+fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
+    theme.state_cell(label, state)
 }
 
 #[cfg(test)]
@@ -1125,6 +1142,44 @@ mod tests {
     }
 
     #[test]
+    fn watch_theme_cli_aliases_parse() {
+        for (raw, expected) in [
+            ("oh-my-muxa", WatchTheme::OhMyMuxa),
+            ("oh_my_muxa", WatchTheme::OhMyMuxa),
+            ("focus", WatchTheme::Focus),
+            ("ops", WatchTheme::Ops),
+            ("mono", WatchTheme::Mono),
+            ("high-contrast", WatchTheme::HighContrast),
+            ("high_contrast", WatchTheme::HighContrast),
+            ("minimal", WatchTheme::Minimal),
+        ] {
+            let args = Args::try_parse_from(["muxa", "watch", "--theme", raw]).unwrap();
+            let Cmd::Watch {
+                theme: Some(theme), ..
+            } = args.cmd
+            else {
+                panic!("expected watch theme arg");
+            };
+            assert_eq!(WatchTheme::from(theme), expected);
+        }
+    }
+
+    #[test]
+    fn table_theme_cli_aliases_parse() {
+        for command in ["status", "stats", "activity"] {
+            let args = Args::try_parse_from(["muxa", command, "--theme", "high-contrast"])
+                .unwrap_or_else(|err| panic!("{command} should accept --theme: {err}"));
+            let theme = match args.cmd {
+                Cmd::Status { theme: Some(theme) } => theme,
+                Cmd::Stats(args) => args.theme().expect("expected stats theme arg"),
+                Cmd::Activity(args) => args.theme().expect("expected activity theme arg"),
+                _ => panic!("expected {command} theme arg"),
+            };
+            assert_eq!(WatchTheme::from(theme), WatchTheme::HighContrast);
+        }
+    }
+
+    #[test]
     fn relative_time_units() {
         let now = datetime!(2026-04-24 12:00:00 UTC);
         assert_eq!(relative_time(now, now), "0s ago");
@@ -1188,7 +1243,7 @@ mod tests {
             &agents,
             &panes,
             datetime!(2026-04-24 12:00:00 UTC),
-            false,
+            CliTheme::plain(),
             88,
         );
 
@@ -1217,7 +1272,7 @@ mod tests {
             &agents,
             &panes,
             datetime!(2026-04-24 12:00:00 UTC),
-            false,
+            CliTheme::plain(),
             60,
         );
 

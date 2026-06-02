@@ -7,6 +7,9 @@
 # tmux socket to attach to for control mode. Default: auto-detect from $TMUX.
 # tmux_socket = "default"
 
+[ui]
+# theme = "classic"      # classic (default), oh-my-muxa, focus, ops, mono, high-contrast, minimal
+
 [notifier]
 # enabled = true
 # backend = "libnotify"   # libnotify | none   (more backends TBD)
@@ -76,6 +79,7 @@
 # activity, session_time.
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
+# theme = "classic"   # optional watch-only override for [ui].theme
 # view = "session"    # one row per tmux session; panes merge by latest activity (default)
 # view = "pane"       # one row per agent/pane
 # columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]

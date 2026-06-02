@@ -33,7 +33,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa::config::{WatchConfig, WatchSortKey, WatchView, WidthSpec};
+use muxa::config::{WatchConfig, WatchSortKey, WatchTheme, WatchView, WidthSpec};
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
 use muxa::session_activity::SessionActivity;
@@ -45,7 +45,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
+};
 use ratatui::{Frame, Terminal};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -86,6 +88,273 @@ const WAKE_CAPACITY: usize = 1;
 /// main task is mid-render without stalling the refresh task; the main loop
 /// always drains all pending outcomes before each render.
 const OUTCOME_CAPACITY: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct WatchThemeSpec {
+    title: &'static str,
+    accent: Color,
+    accent_fg: Color,
+    action: Color,
+    action_fg: Color,
+    key_bg: Color,
+    key_fg: Color,
+    border: Color,
+    dim: Color,
+    table_header: Color,
+    selected_bg: Color,
+    selected_fg: Option<Color>,
+    state_idle: Color,
+    state_working: Color,
+    state_waiting: Color,
+    state_choice: Color,
+    state_error: Color,
+    state_starting: Color,
+    border_type: BorderType,
+}
+
+impl WatchThemeSpec {
+    fn accent_badge(self) -> Style {
+        Style::default()
+            .fg(self.accent_fg)
+            .bg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn action_badge(self) -> Style {
+        Style::default().fg(self.action_fg).bg(self.action)
+    }
+
+    fn key_badge(self) -> Style {
+        Style::default().fg(self.key_fg).bg(self.key_bg)
+    }
+
+    fn border_style(self) -> Style {
+        Style::default().fg(self.border)
+    }
+
+    fn dim_style(self) -> Style {
+        Style::default().fg(self.dim)
+    }
+
+    fn table_header_style(self) -> Style {
+        Style::default()
+            .fg(self.table_header)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn selected_style(self) -> Style {
+        let style = Style::default()
+            .bg(self.selected_bg)
+            .add_modifier(Modifier::BOLD);
+        if let Some(fg) = self.selected_fg {
+            style.fg(fg)
+        } else {
+            style
+        }
+    }
+
+    fn state_style(self, state: AgentState) -> Style {
+        match state {
+            AgentState::Idle => Style::default()
+                .fg(self.state_idle)
+                .add_modifier(Modifier::BOLD),
+            AgentState::Working => Style::default()
+                .fg(self.state_working)
+                .add_modifier(Modifier::BOLD),
+            AgentState::WaitingInput => Style::default()
+                .fg(self.state_waiting)
+                .add_modifier(Modifier::BOLD),
+            AgentState::WaitingChoice => Style::default()
+                .fg(self.state_choice)
+                .add_modifier(Modifier::BOLD),
+            AgentState::Error => Style::default()
+                .fg(self.state_error)
+                .add_modifier(Modifier::BOLD),
+            AgentState::Starting => Style::default().fg(self.state_starting),
+            AgentState::Stopped => Style::default().fg(self.dim).add_modifier(Modifier::DIM),
+        }
+    }
+}
+
+fn watch_theme(theme: WatchTheme) -> WatchThemeSpec {
+    match theme {
+        WatchTheme::Classic => classic_watch_theme(),
+        WatchTheme::OhMyMuxa => oh_my_muxa_watch_theme(),
+        WatchTheme::Focus => focus_watch_theme(),
+        WatchTheme::Ops => ops_watch_theme(),
+        WatchTheme::Mono => mono_watch_theme(),
+        WatchTheme::HighContrast => high_contrast_watch_theme(),
+        WatchTheme::Minimal => minimal_watch_theme(),
+    }
+}
+
+fn classic_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " muxa watch ",
+        accent: Color::Cyan,
+        accent_fg: Color::Black,
+        action: Color::Green,
+        action_fg: Color::Black,
+        key_bg: Color::Gray,
+        key_fg: Color::Black,
+        border: Color::DarkGray,
+        dim: Color::DarkGray,
+        table_header: Color::Gray,
+        selected_bg: Color::DarkGray,
+        selected_fg: None,
+        state_idle: Color::Green,
+        state_working: Color::Yellow,
+        state_waiting: Color::Yellow,
+        state_choice: Color::LightYellow,
+        state_error: Color::Red,
+        state_starting: Color::Cyan,
+        border_type: BorderType::Plain,
+    }
+}
+
+fn oh_my_muxa_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " oh-my-muxa ",
+        accent: Color::Rgb(177, 139, 255),
+        accent_fg: Color::Black,
+        action: Color::Rgb(93, 230, 138),
+        action_fg: Color::Black,
+        key_bg: Color::Rgb(66, 74, 92),
+        key_fg: Color::White,
+        border: Color::Rgb(94, 234, 212),
+        dim: Color::Gray,
+        table_header: Color::Rgb(94, 234, 212),
+        selected_bg: Color::Rgb(52, 45, 67),
+        selected_fg: Some(Color::White),
+        state_idle: Color::Rgb(93, 230, 138),
+        state_working: Color::Rgb(255, 211, 105),
+        state_waiting: Color::Rgb(255, 176, 86),
+        state_choice: Color::Rgb(219, 181, 255),
+        state_error: Color::Rgb(255, 91, 107),
+        state_starting: Color::Rgb(94, 234, 212),
+        border_type: BorderType::Rounded,
+    }
+}
+
+fn focus_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " muxa focus ",
+        accent: Color::Rgb(125, 211, 252),
+        accent_fg: Color::Black,
+        action: Color::Rgb(134, 239, 172),
+        action_fg: Color::Black,
+        key_bg: Color::DarkGray,
+        key_fg: Color::White,
+        border: Color::DarkGray,
+        dim: Color::DarkGray,
+        table_header: Color::Rgb(125, 211, 252),
+        selected_bg: Color::Rgb(30, 58, 90),
+        selected_fg: Some(Color::White),
+        state_idle: Color::DarkGray,
+        state_working: Color::Rgb(125, 211, 252),
+        state_waiting: Color::Yellow,
+        state_choice: Color::LightYellow,
+        state_error: Color::Red,
+        state_starting: Color::Cyan,
+        border_type: BorderType::Plain,
+    }
+}
+
+fn ops_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " muxa ops ",
+        accent: Color::Yellow,
+        accent_fg: Color::Black,
+        action: Color::Green,
+        action_fg: Color::Black,
+        key_bg: Color::Rgb(64, 64, 64),
+        key_fg: Color::White,
+        border: Color::Yellow,
+        dim: Color::Gray,
+        table_header: Color::Yellow,
+        selected_bg: Color::Rgb(80, 54, 0),
+        selected_fg: Some(Color::White),
+        state_idle: Color::Green,
+        state_working: Color::Cyan,
+        state_waiting: Color::LightYellow,
+        state_choice: Color::Magenta,
+        state_error: Color::LightRed,
+        state_starting: Color::LightCyan,
+        border_type: BorderType::Plain,
+    }
+}
+
+fn mono_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " muxa mono ",
+        accent: Color::White,
+        accent_fg: Color::Black,
+        action: Color::White,
+        action_fg: Color::Black,
+        key_bg: Color::DarkGray,
+        key_fg: Color::White,
+        border: Color::Gray,
+        dim: Color::DarkGray,
+        table_header: Color::White,
+        selected_bg: Color::Gray,
+        selected_fg: Some(Color::Black),
+        state_idle: Color::Gray,
+        state_working: Color::White,
+        state_waiting: Color::White,
+        state_choice: Color::White,
+        state_error: Color::White,
+        state_starting: Color::Gray,
+        border_type: BorderType::Plain,
+    }
+}
+
+fn high_contrast_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " muxa high-contrast ",
+        accent: Color::White,
+        accent_fg: Color::Black,
+        action: Color::Black,
+        action_fg: Color::White,
+        key_bg: Color::White,
+        key_fg: Color::Black,
+        border: Color::White,
+        dim: Color::Gray,
+        table_header: Color::White,
+        selected_bg: Color::White,
+        selected_fg: Some(Color::Black),
+        state_idle: Color::LightGreen,
+        state_working: Color::LightCyan,
+        state_waiting: Color::Yellow,
+        state_choice: Color::LightMagenta,
+        state_error: Color::LightRed,
+        state_starting: Color::LightBlue,
+        border_type: BorderType::Rounded,
+    }
+}
+
+fn minimal_watch_theme() -> WatchThemeSpec {
+    WatchThemeSpec {
+        title: " muxa ",
+        accent: Color::White,
+        accent_fg: Color::Black,
+        action: Color::White,
+        action_fg: Color::Black,
+        key_bg: Color::DarkGray,
+        key_fg: Color::White,
+        border: Color::DarkGray,
+        dim: Color::DarkGray,
+        table_header: Color::White,
+        selected_bg: Color::Gray,
+        selected_fg: Some(Color::Black),
+        state_idle: Color::White,
+        state_working: Color::White,
+        state_waiting: Color::White,
+        state_choice: Color::White,
+        state_error: Color::White,
+        state_starting: Color::White,
+        border_type: BorderType::Plain,
+    }
+}
 
 /// A single column in the watch TUI. The set of valid columns is fixed by
 /// this enum — the `[watch]` config picks which ones to show and in what
@@ -162,7 +431,13 @@ impl WatchColumn {
     /// Build the `Text` content for one cell. Returning `Text` (rather
     /// than a finished `Cell`) lets the caller stack a second line on top
     /// of it when the row is selected and a detail template is enabled.
-    fn agent_text<'a>(self, a: &'a Agent, now: OffsetDateTime, panes: &'a [PaneInfo]) -> Text<'a> {
+    fn agent_text<'a>(
+        self,
+        a: &'a Agent,
+        now: OffsetDateTime,
+        panes: &'a [PaneInfo],
+        theme: WatchThemeSpec,
+    ) -> Text<'a> {
         match self {
             Self::Pane => {
                 let label = pane_display(a.pane.as_deref(), panes);
@@ -184,7 +459,7 @@ impl WatchColumn {
             }
             Self::Kind => a.kind.to_string().into(),
             Self::State => {
-                let (symbol, style) = state_marker(a.state);
+                let (symbol, style) = state_marker(a.state, theme);
                 Text::from(Span::styled(symbol, style))
             }
             Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
@@ -254,10 +529,9 @@ impl WatchColumn {
         s: &'a SessionRow,
         now: OffsetDateTime,
         panes: &'a [PaneInfo],
+        theme: WatchThemeSpec,
     ) -> Text<'a> {
-        let dim = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM);
+        let dim = theme.dim_style().add_modifier(Modifier::DIM);
         let Some(agent) = s.latest_agent.as_ref() else {
             return match self {
                 Self::Pane => Text::from(session_label(s)),
@@ -284,7 +558,7 @@ impl WatchColumn {
             | Self::Cost
             | Self::Limits
             | Self::Prompt
-            | Self::Activity => self.agent_text(agent, now, panes),
+            | Self::Activity => self.agent_text(agent, now, panes, theme),
             Self::SessionTime => session_time_text(s, now),
         }
     }
@@ -1626,44 +1900,17 @@ fn session_label(s: &SessionRow) -> String {
     }
 }
 
-fn state_marker(state: AgentState) -> (&'static str, Style) {
-    match state {
-        AgentState::Working => (
-            "●",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AgentState::WaitingInput => (
-            "?",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AgentState::WaitingChoice => (
-            "◆",
-            Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AgentState::Error => (
-            "!",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        AgentState::Idle => (
-            "·",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ),
-        AgentState::Starting => ("…", Style::default().fg(Color::Cyan)),
-        AgentState::Stopped => (
-            "×",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ),
-    }
+fn state_marker(state: AgentState, theme: WatchThemeSpec) -> (&'static str, Style) {
+    let symbol = match state {
+        AgentState::Working => "●",
+        AgentState::WaitingInput => "?",
+        AgentState::WaitingChoice => "◆",
+        AgentState::Error => "!",
+        AgentState::Idle => "·",
+        AgentState::Starting => "…",
+        AgentState::Stopped => "×",
+    };
+    (symbol, theme.state_style(state))
 }
 
 fn session_time_text(s: &SessionRow, now: OffsetDateTime) -> Text<'static> {
@@ -2979,7 +3226,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         // context and leaves the footer untouched.
         let popup_area = centered_rect(60, 90, chunks[1]);
         f.render_widget(Clear, popup_area);
-        render_help(f, popup_area);
+        render_help(f, popup_area, app);
     }
     if app.confirm.is_some() {
         // 50 × 30 % keeps the popup small enough that the table
@@ -3002,17 +3249,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
 /// Render the `?` help overlay — a centred popup with one line per
 /// keybinding. Body comes from `help_overlay_text()` so the snapshot
 /// test can pin the exact contents.
-fn render_help(f: &mut Frame, area: Rect) {
+fn render_help(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " help · ? to close ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(" help · ? to close ", theme.accent_badge()));
     let lines: Vec<Line> = help_overlay_text()
         .into_iter()
         .map(|s| {
@@ -3041,6 +3284,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 /// because the input handler only accepts `y` / `Y` / Enter as yes —
 /// any other key cancels.
 fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let popup = app
         .confirm
         .as_ref()
@@ -3048,6 +3292,7 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
+        .border_type(theme.border_type)
         .title(Span::styled(
             " confirm ",
             Style::default()
@@ -3094,17 +3339,16 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
 fn render_prompt(f: &mut Frame, area: Rect, app: &App) {
     use unicode_width::UnicodeWidthStr;
 
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let popup = app.prompt.as_ref().expect("render_prompt without prompt");
     let title = format!(" send · {} ", popup.label);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
         .title(Span::styled(
             title,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            theme.action_badge().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     let visible_input = truncate_prompt_input(&popup.input, inner.width.saturating_sub(2) as usize);
@@ -3209,6 +3453,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 /// Looks up the row by `pane_id` every frame so background refreshes that
 /// re-sort the table can't bump us onto a different agent's content.
 fn render_preview(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let preview = app
         .preview
         .as_ref()
@@ -3221,14 +3466,9 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
     let title = format!(" preview · {} · {} ", preview.pane_id, mode_tag);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(title, theme.accent_badge()));
 
     // Live-capture mode: render the cached `tmux capture-pane -ep`
     // output through `ansi-to-tui` so the source pane's colors / bold /
@@ -3376,6 +3616,7 @@ fn push_section<'a>(out: &mut Vec<Line<'a>>, title: &str, body: Option<&'a str>)
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let agents = app
         .rows
         .iter()
@@ -3395,13 +3636,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
 
     let title = Line::from(vec![
-        Span::styled(
-            " muxa watch ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(theme.title, theme.accent_badge()),
         Span::raw("  "),
         Span::styled(
             if app.watch_cfg.view == WatchView::Session {
@@ -3418,15 +3653,15 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("+ {bare} pane{}", plural(bare))
             },
-            Style::default().fg(Color::DarkGray),
+            theme.dim_style(),
         ),
         Span::raw("   "),
         Span::styled(
             format!("sort {}", sort_label(&app.watch_cfg.sort)),
-            Style::default().fg(Color::DarkGray),
+            theme.dim_style(),
         ),
         Span::raw("   "),
-        Span::styled(clock, Style::default().fg(Color::DarkGray)),
+        Span::styled(clock, theme.dim_style()),
     ]);
     let title = if app.refresh_pending {
         let mut spans = title.spans;
@@ -3462,23 +3697,21 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let header = Paragraph::new(vec![title, err_line]).block(
         Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(theme.border_style())
+            .border_type(theme.border_type),
     );
     f.render_widget(header, area);
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let header_cells = app.columns.iter().map(|c| {
         let header = if app.watch_cfg.view == WatchView::Session && matches!(c, WatchColumn::Pane) {
             "SESSION"
         } else {
             c.header()
         };
-        Cell::from(header).style(
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        )
+        Cell::from(header).style(theme.table_header_style())
     });
     let header = Row::new(header_cells).height(1);
 
@@ -3494,13 +3727,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 WatchRow::Agent(a) => app
                     .columns
                     .iter()
-                    .map(|c| c.agent_text(a, now, &app.panes))
+                    .map(|c| c.agent_text(a, now, &app.panes, theme))
                     .collect(),
                 WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
                 WatchRow::Session(s) => app
                     .columns
                     .iter()
-                    .map(|c| c.session_text(s, now, &app.panes))
+                    .map(|c| c.session_text(s, now, &app.panes, theme))
                     .collect(),
             };
 
@@ -3536,18 +3769,15 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(theme.border_style())
+                .border_type(theme.border_type)
                 .title(if app.watch_cfg.view == WatchView::Session {
                     " Sessions "
                 } else {
                     " Agents "
                 }),
         )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(theme.selected_style())
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -3951,6 +4181,7 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     // Transient action hint takes priority over keybinding strips —
     // the user just pressed a key and wants to see the result. Falls
     // off after `FOOTER_HINT_TTL` so the keybinding strip comes back
@@ -3972,34 +4203,31 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if app.prompt.is_some() {
-        render_prompt_footer(f, area);
+        render_prompt_footer(f, area, theme);
         return;
     }
 
     if let Some(preview) = app.preview.as_ref() {
-        render_preview_footer(f, area, preview);
+        render_preview_footer(f, area, preview, theme);
         return;
     }
 
     let mut spans = vec![
-        Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" ↑/↓ ", theme.key_badge()),
         Span::raw(" move  "),
-        Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::styled(" ⏎ ", theme.action_badge()),
         Span::raw(" prompt  "),
-        Span::styled(" ⏎⏎ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" ⏎⏎ ", theme.key_badge()),
         Span::raw(" attach  "),
-        Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" p ", theme.key_badge()),
         Span::raw(" preview  "),
-        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" r ", theme.key_badge()),
         Span::raw(" refresh  "),
-        Span::styled(
-            " s/a/d/t ",
-            Style::default().fg(Color::Black).bg(Color::Gray),
-        ),
+        Span::styled(" s/a/d/t ", theme.key_badge()),
         Span::raw(" sort  "),
-        Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" ? ", theme.key_badge()),
         Span::raw(" help  "),
-        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" q ", theme.key_badge()),
         Span::raw(" quit"),
     ];
     // When the highlighted row has no pane to attach to (e.g. a Claude
@@ -4025,33 +4253,27 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 "+{} paneless (use --include-paneless to show)",
                 app.paneless_hidden
             ),
-            Style::default()
-                .fg(Color::DarkGray)
+            theme
+                .dim_style()
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_prompt_footer(f: &mut Frame, area: Rect) {
+fn render_prompt_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
     let spans = vec![
-        Span::styled(
-            " Enter ",
-            Style::default().fg(Color::Black).bg(Color::Green),
-        ),
+        Span::styled(" Enter ", theme.action_badge()),
         Span::raw(" send  "),
-        Span::styled(
-            " empty Enter ",
-            Style::default().fg(Color::Black).bg(Color::Gray),
-        ),
+        Span::styled(" empty Enter ", theme.key_badge()),
         Span::raw(" attach  "),
-        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" Esc ", theme.key_badge()),
         Span::raw(" cancel"),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState) {
+fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState, theme: WatchThemeSpec) {
     // Preview mode rebinds the table-mode keybinds to their preview-pane
     // analogues. Toggle labels describe where the next keypress goes.
     let toggle_label = match preview.mode {
@@ -4063,25 +4285,19 @@ fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState) {
         PreviewContent::LivePane => " prompt  ",
     };
     let spans = vec![
-        Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" ↑/↓ ", theme.key_badge()),
         Span::raw(" scroll  "),
-        Span::styled(
-            " PgUp/PgDn ",
-            Style::default().fg(Color::Black).bg(Color::Gray),
-        ),
+        Span::styled(" PgUp/PgDn ", theme.key_badge()),
         Span::raw(" page  "),
-        Span::styled(" f ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" f ", theme.key_badge()),
         Span::raw(toggle_label),
-        Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" c ", theme.key_badge()),
         Span::raw(content_label),
-        Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::styled(" ⏎ ", theme.action_badge()),
         Span::raw(" prompt  "),
-        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" r ", theme.key_badge()),
         Span::raw(" refresh  "),
-        Span::styled(
-            " p/q/Esc ",
-            Style::default().fg(Color::Black).bg(Color::Gray),
-        ),
+        Span::styled(" p/q/Esc ", theme.key_badge()),
         Span::raw(" back"),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -4464,7 +4680,12 @@ mod tests {
         let WatchRow::Session(row) = &app.rows[0] else {
             panic!("expected session row");
         };
-        let text = WatchColumn::SessionTime.session_text(row, now, &app.panes);
+        let text = WatchColumn::SessionTime.session_text(
+            row,
+            now,
+            &app.panes,
+            watch_theme(WatchTheme::Classic),
+        );
         let cell = text
             .lines
             .iter()
@@ -5167,14 +5388,14 @@ mod tests {
             WatchColumn::Activity,
             WatchColumn::SessionTime,
         ] {
-            let _ = col.agent_text(&a, now, &[]);
+            let _ = col.agent_text(&a, now, &[], watch_theme(WatchTheme::Classic));
         }
     }
 
     /// Helper: pull the rendered LIMITS cell down to a single concatenated
     /// string so tests can assert on substrings without juggling spans.
     fn limits_cell_string(a: &Agent, now: OffsetDateTime) -> String {
-        let text = WatchColumn::Limits.agent_text(a, now, &[]);
+        let text = WatchColumn::Limits.agent_text(a, now, &[], watch_theme(WatchTheme::Classic));
         text.lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -5185,7 +5406,7 @@ mod tests {
     /// for the cell tests since LIMITS only ever emits a single span.
     fn limits_cell_fg(a: &Agent, now: OffsetDateTime) -> Option<Color> {
         WatchColumn::Limits
-            .agent_text(a, now, &[])
+            .agent_text(a, now, &[], watch_theme(WatchTheme::Classic))
             .lines
             .first()
             .and_then(|l| l.spans.first())
@@ -8333,6 +8554,53 @@ mod tests {
         let mut app = snapshot_app();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
+    fn oh_my_muxa_theme_renders_polished_chrome() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::with_config(WatchConfig {
+            theme: Some(WatchTheme::OhMyMuxa),
+            view: WatchView::Pane,
+            sort: vec![WatchSortKey::PaneId],
+            ..WatchConfig::default()
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump = snapshot_helpers::buffer_string(&terminal);
+
+        assert!(dump.contains("oh-my-muxa"));
+        assert!(
+            dump.contains("╭") && dump.contains("╯"),
+            "oh-my-muxa should switch watch chrome to rounded borders"
+        );
+    }
+
+    #[test]
+    fn watch_theme_presets_render_named_chrome() {
+        for (theme, title) in [
+            (WatchTheme::Focus, "muxa focus"),
+            (WatchTheme::Ops, "muxa ops"),
+            (WatchTheme::Mono, "muxa mono"),
+            (WatchTheme::HighContrast, "muxa high-contrast"),
+            (WatchTheme::Minimal, "muxa"),
+        ] {
+            let backend = TestBackend::new(100, 12);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut app = App::with_config(WatchConfig {
+                theme: Some(theme),
+                view: WatchView::Pane,
+                sort: vec![WatchSortKey::PaneId],
+                ..WatchConfig::default()
+            });
+            terminal.draw(|f| render(f, &mut app)).unwrap();
+            let dump = snapshot_helpers::buffer_string(&terminal);
+
+            assert!(
+                dump.contains(title),
+                "expected theme title {title:?} in render dump:\n{dump}"
+            );
+        }
     }
 
     #[test]
