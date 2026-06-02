@@ -1,0 +1,94 @@
+# Live TUI
+
+`muxa watch` is the main interactive surface. It shows tracked agents and
+plain tmux panes, lets you jump to panes, and can compose prompts directly
+from the picker.
+
+## Open
+
+```bash
+muxa watch
+muxa watch --view session
+muxa watch --view pane
+muxa watch --include-paneless
+```
+
+`view = "session"` groups panes by tmux session. `view = "pane"` shows one
+row per pane.
+
+## Common Keys
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Open prompt composer for the selected pane. Empty `Enter` attaches. |
+| `Esc` / `q` | Quit or close the active popup. |
+| `p` | Open live preview. |
+| `c` | Toggle preview content. |
+| `f` | Toggle popup/fullscreen preview. |
+| `?` | Help. |
+| `a` | Sort by activity. |
+| `d` | Sort by session duration. |
+| `s` | Sort by session grouping. |
+| `t` | Sort attention states first. |
+| `r` | Refresh. |
+
+## Prompt Composer
+
+Press `Enter` on a pane-bearing row to open the prompt composer. Type the
+prompt and press `Enter` to send it to that pane. Press `Esc` to cancel.
+If the composer is empty, `Enter` attaches to the pane instead.
+
+Prompt input time is recorded as a human interaction interval in
+`activity.ndjson` when activity logging is enabled.
+
+## tmux Popup Binding
+
+```tmux
+bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+```
+
+## Columns
+
+Columns are configured under `[watch]`:
+
+```toml
+[watch]
+view = "session"
+columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+
+[watch.widths]
+prompt = "min:20"
+activity = 5
+```
+
+Available column keys include `pane`, `pane_id`, `state`, `kind`, `model`,
+`ctx`, `cost`, `limits`, `prompt`, `activity`, and `session_time`.
+
+## Sort
+
+```toml
+[watch]
+sort = ["session", "activity"]
+# sort = ["activity"]
+# sort = ["session_time"]
+# sort = ["state", "activity"]
+# sort = ["session", "pane"]
+# sort = ["pane_id"]
+```
+
+Runtime sort keys mirror these presets. The default groups by tmux session
+and floats the most recently active agent in each group.
+
+## Detail Row
+
+```toml
+[watch.detail]
+enabled = true
+template = "{last_response || last_prompt || last_notification}"
+```
+
+Available variables include `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
+`activity`, `last_prompt`, `last_response`, `last_notification`, and `cwd`.
+
+Long detail content is truncated for the table. Use preview mode for pane
+captures or prompt/response text when you need more context.
