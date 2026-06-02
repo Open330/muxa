@@ -341,6 +341,7 @@ muxa watch          # live TUI
 | `muxa recap [--pane %N] [--limit N\|--all]`| Show recent prompts for the given pane. Pulls from the disk audit log so it survives daemon restarts. |
 | `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | Summarize retained prompt history, live agents, agent state duration, and tmux foreground time. |
 | `muxa report [--since 7d]`                 | Emit a Markdown report with day/project/agent/session breakdowns.       |
+| `muxa activity [--since today] [--type agent\|tmux\|human]` | Query raw duration ledger intervals. Useful when checking exactly which events fed stats/report. |
 | `muxa sync`                                | Backfill the registry by scanning tmux panes — see [Sync](#sync).      |
 | `muxa panes`                               | Debug: dump tmux pane inventory.                                       |
 | `muxa hook <agent> --event <e>`            | Hook adapter entry point. Invoked by the agent CLIs themselves.        |
@@ -354,23 +355,20 @@ agent snapshot into a quick local analytics view:
 
 ```bash
 muxa stats --since 7d --group-by project
+muxa stats --since today --group-by session
 muxa stats --since 24h --group-by agent --format json
 muxa report --since 7d > muxa-weekly.md
+muxa activity --since today --type human
 ```
 
-`--since` accepts `24h`, `7d`, `4w`, an RFC3339 timestamp, or `all`.
-`--format` is `table`, `json`, or `markdown`. The prompt totals are
-bounded by `[history].max_per_pane` / `max_age_days`, because muxa keeps
-a retained audit log rather than an unbounded warehouse. Duration
-columns come from `activity.ndjson`: `WORK`, `WAIT`, and `ERR` track
-closed agent state intervals, `TMUX` tracks foreground tmux session
-intervals, and `BLOCK` counts transitions into Waiting/Error states.
-Live attached tmux sessions are included up to "now"; older
-`session-activity.json` totals are used as a legacy fallback until
-`activity.ndjson` has foreground intervals. New prompt and duration
-entries store the observed tmux session name, so `--group-by session`
-keeps readable names after tmux deletes the live session; older entries
-without a stored name fall back to the agent/session id.
+`--since` accepts presets (`today`, `yesterday`, `week`), rolling
+durations (`24h`, `7d`, `4w`), an RFC3339 timestamp, or `all`.
+Duration columns come from `activity.ndjson`: `WORK`, `WAIT`, and
+`ERR` track agent state intervals, `TMUX` tracks foreground tmux
+session intervals, `HUMAN` tracks observed human presence/interaction,
+`THINK` is the overlap of attention states with human presence, and
+`BLOCK` counts transitions into Waiting/Error states. See
+[`docs/ACTIVITY.md`](docs/ACTIVITY.md) for the exact ledger semantics.
 
 ### Sync
 

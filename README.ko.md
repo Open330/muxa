@@ -264,6 +264,7 @@ muxa watch          # 실시간 TUI
 | `muxa recap [--pane %N] [--limit N\|--all]`| 해당 페인의 최근 프롬프트들을 보여줌. 디스크 audit log 에서 읽어와 데몬 재시작에도 살아남음. |
 | `muxa stats [--since 7d] [--group-by day\|project\|agent\|session]` | 보관된 프롬프트 히스토리, live agent, agent 상태 duration, tmux foreground 시간을 요약. |
 | `muxa report [--since 7d]`                 | day/project/agent/session breakdown 을 Markdown 리포트로 출력.          |
+| `muxa activity [--since today] [--type agent\|tmux\|human]` | raw duration ledger interval 을 조회. stats/report 에 어떤 이벤트가 들어갔는지 확인할 때 사용. |
 | `muxa sync`                                | tmux 페인을 스캔해 레지스트리를 백필 — [Sync](#sync) 참고.               |
 | `muxa panes`                               | 디버그용: tmux 페인 목록 덤프.                                            |
 | `muxa hook <agent> --event <e>`            | 훅 어댑터 진입점 — 에이전트 CLI가 직접 호출.                             |
@@ -277,18 +278,19 @@ muxa watch          # 실시간 TUI
 
 ```bash
 muxa stats --since 7d --group-by project
+muxa stats --since today --group-by session
 muxa stats --since 24h --group-by agent --format json
 muxa report --since 7d > muxa-weekly.md
+muxa activity --since today --type human
 ```
 
-`--since` 는 `24h`, `7d`, `4w`, RFC3339 timestamp, `all` 을 받습니다.
-`--format` 은 `table`, `json`, `markdown` 입니다. 프롬프트 합계는
-`[history].max_per_pane` / `max_age_days` 로 제한된 보관 히스토리 기준입니다.
-duration 컬럼은 `activity.ndjson` 에서 읽습니다. `WORK`, `WAIT`, `ERR`는
-닫힌 agent 상태 interval, `TMUX`는 tmux foreground interval, `BLOCK`은
-Waiting/Error 상태로 들어간 횟수입니다. 현재 attach 중인 tmux 세션은
-"지금"까지 포함하고, `activity.ndjson`에 foreground interval이 생기기 전에는
-기존 `session-activity.json` 누적값을 fallback 으로 사용합니다.
+`--since` 는 프리셋(`today`, `yesterday`, `week`), rolling duration
+(`24h`, `7d`, `4w`), RFC3339 timestamp, `all` 을 받습니다. duration
+컬럼은 `activity.ndjson` 에서 읽습니다. `WORK`, `WAIT`, `ERR`는 agent
+상태 interval, `TMUX`는 tmux foreground interval, `HUMAN`은 관측된
+사람의 presence/interaction, `THINK`는 attention 상태와 human presence 의
+겹침, `BLOCK`은 Waiting/Error 상태로 들어간 횟수입니다. 정확한 ledger
+판정 기준은 [`docs/ACTIVITY.ko.md`](docs/ACTIVITY.ko.md)에 정리했습니다.
 
 ### Sync
 
