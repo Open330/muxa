@@ -35,6 +35,15 @@ pub struct Args {
     #[arg(long, default_value_t = 10)]
     limit: usize,
 
+    /// Column to sort rows by: prompts, work, wait, err, tmux, human, think,
+    /// block, tok, words, sess, agents, last, or name.
+    #[arg(long, value_enum, default_value_t = SortKey::Prompts)]
+    sort: SortKey,
+
+    /// Reverse the sort order (numeric columns default to descending, name to ascending).
+    #[arg(long, default_value_t = false)]
+    reverse: bool,
+
     /// One-shot visual theme override for table output.
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
@@ -73,6 +82,24 @@ enum GroupBy {
     Session,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum SortKey {
+    Prompts,
+    Work,
+    Wait,
+    Err,
+    Tmux,
+    Human,
+    Think,
+    Block,
+    Tok,
+    Words,
+    Sess,
+    Agents,
+    Last,
+    Name,
+}
+
 const FULL_STATS_TABLE_WIDTH: usize = 128;
 const COMPACT_STATS_TABLE_WIDTH: usize = 76;
 const MIN_GROUP_COLUMN_WIDTH: usize = 7;
@@ -100,7 +127,7 @@ impl GroupBy {
 
 pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let data = load_data(client, cfg, &args.since).await?;
-    let doc = build_document(&data, args.group_by, args.limit);
+    let doc = build_document(&data, args.group_by, args.limit, args.sort, args.reverse);
     match args.format {
         OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
@@ -112,10 +139,10 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
 pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Result<()> {
     let data = load_data(client, cfg, &args.since).await?;
     let docs = [
-        build_document(&data, GroupBy::Day, args.limit),
-        build_document(&data, GroupBy::Project, args.limit),
-        build_document(&data, GroupBy::Agent, args.limit),
-        build_document(&data, GroupBy::Session, args.limit),
+        build_document(&data, GroupBy::Day, args.limit, SortKey::Prompts, false),
+        build_document(&data, GroupBy::Project, args.limit, SortKey::Prompts, false),
+        build_document(&data, GroupBy::Agent, args.limit, SortKey::Prompts, false),
+        build_document(&data, GroupBy::Session, args.limit, SortKey::Prompts, false),
     ];
     print!("{}", render_markdown_report(&docs));
     Ok(())
@@ -317,8 +344,14 @@ async fn load_session_activities(cfg: &Config) -> Vec<SessionActivity> {
     muxa::session_activity::load(&path).await
 }
 
-fn build_document(data: &StatsData, group_by: GroupBy, limit: usize) -> StatsDocument {
-    let rows = build_rows(data, group_by, limit);
+fn build_document(
+    data: &StatsData,
+    group_by: GroupBy,
+    limit: usize,
+    sort: SortKey,
+    reverse: bool,
+) -> StatsDocument {
+    let rows = build_rows(data, group_by, limit, sort, reverse);
     StatsDocument {
         generated_at: format_rfc3339(data.now),
         range: RangeDocument {
@@ -428,7 +461,13 @@ fn build_totals(data: &StatsData) -> Totals {
     }
 }
 
-fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow> {
+fn build_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    limit: usize,
+    sort: SortKey,
+    reverse: bool,
+) -> Vec<GroupRow> {
     let mut rows = BTreeMap::<String, GroupAccumulator>::new();
     let session_foreground_ledger = has_session_foreground_ledger(data);
 
@@ -487,13 +526,7 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
     }
 
     let mut rows = rows.into_iter().collect::<Vec<_>>();
-    rows.sort_by(|(a_key, a), (b_key, b)| {
-        b.prompts
-            .cmp(&a.prompts)
-            .then_with(|| b.foreground_secs.cmp(&a.foreground_secs))
-            .then_with(|| b.last_prompt_at.cmp(&a.last_prompt_at))
-            .then_with(|| a_key.cmp(b_key))
-    });
+    sort_group_rows(&mut rows, sort, reverse);
     if limit > 0 {
         rows.truncate(limit);
     }
@@ -526,6 +559,40 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
                 .map_or_else(|| "-".to_string(), |at| relative_time(data.now, at)),
         })
         .collect()
+}
+
+fn sort_group_rows(rows: &mut [(String, GroupAccumulator)], sort: SortKey, reverse: bool) {
+    rows.sort_by(|(a_key, a), (b_key, b)| {
+        // Numeric columns default to descending (largest first); `name` defaults
+        // to ascending. `--reverse` flips whichever default the column carries.
+        let ordering = match sort {
+            SortKey::Prompts => b
+                .prompts
+                .cmp(&a.prompts)
+                .then_with(|| b.foreground_secs.cmp(&a.foreground_secs))
+                .then_with(|| b.last_prompt_at.cmp(&a.last_prompt_at)),
+            SortKey::Work => b.working_secs.cmp(&a.working_secs),
+            SortKey::Wait => b.waiting_secs.cmp(&a.waiting_secs),
+            SortKey::Err => b.error_secs.cmp(&a.error_secs),
+            SortKey::Tmux => b.foreground_secs.cmp(&a.foreground_secs),
+            SortKey::Human => b.human_secs.cmp(&a.human_secs),
+            SortKey::Think => b.thinking_secs.cmp(&a.thinking_secs),
+            SortKey::Block => b.attention_events.cmp(&a.attention_events),
+            SortKey::Tok => b.token_estimate.cmp(&a.token_estimate),
+            SortKey::Words => b.words.cmp(&a.words),
+            SortKey::Sess => b.agent_sessions.len().cmp(&a.agent_sessions.len()),
+            SortKey::Agents => b.live_agents.cmp(&a.live_agents),
+            SortKey::Last => b.last_prompt_at.cmp(&a.last_prompt_at),
+            SortKey::Name => a_key.cmp(b_key),
+        };
+        let ordering = if reverse {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        // Stable, deterministic tie-break so equal rows keep a fixed order.
+        ordering.then_with(|| a_key.cmp(b_key))
+    });
 }
 
 fn add_activity_rows(
@@ -1156,20 +1223,6 @@ fn render_table(doc: &StatsDocument, theme: CliTheme) {
     if let Some(until_at) = doc.range.until_at.as_deref() {
         println!("Until: {until_at}");
     }
-    println!(
-        "Prompts: {} | token est: {} | agent sessions: {} | live agents: {} | work: {} | wait: {} | err: {} | tmux: {} | human: {} | think: {} | blocks: {}",
-        doc.totals.prompts,
-        doc.totals.token_estimate,
-        doc.totals.agent_sessions,
-        doc.totals.live_agents,
-        doc.totals.working,
-        doc.totals.waiting,
-        doc.totals.error,
-        doc.totals.foreground,
-        doc.totals.human,
-        doc.totals.thinking,
-        doc.totals.attention_events
-    );
     println!();
 
     if doc.rows.is_empty() {
@@ -1394,7 +1447,60 @@ fn render_stats_table(doc: &StatsDocument, terminal_width: usize, theme: CliThem
         table.add_row(cells);
     }
 
-    format!("{table}")
+    // Grand-total footer. Built from `doc.totals`, so it reflects every group
+    // even when `--limit` truncates the visible rows above.
+    let mut total_cells = Vec::with_capacity(columns.len() + 1);
+    total_cells.push(theme.cell(truncate_cell("TOTAL", group_width), TableTone::Header));
+    total_cells.extend(columns.iter().map(|column| {
+        theme.right_cell(
+            truncate_cell(&stats_total_value(&doc.totals, column.value), column.width),
+            stats_column_tone(column.value),
+        )
+    }));
+    table.add_row(total_cells);
+
+    insert_total_separator(&format!("{table}"))
+}
+
+/// Mirror the header rule above the TOTAL footer so the grand total reads as a
+/// footer rather than another group row. Depends on the `UTF8_BORDERS_ONLY`
+/// preset, whose only `╞`-led line is the header separator.
+fn insert_total_separator(rendered: &str) -> String {
+    let lines: Vec<&str> = rendered.lines().collect();
+    let Some(separator) = lines.iter().copied().find(|line| line.starts_with('╞')) else {
+        return rendered.to_string();
+    };
+    if lines.len() < 4 {
+        return rendered.to_string();
+    }
+    // The TOTAL row is added last, so it sits just above the bottom border.
+    let total_idx = lines.len() - 2;
+    let mut out = Vec::with_capacity(lines.len() + 1);
+    for (idx, line) in lines.into_iter().enumerate() {
+        if idx == total_idx {
+            out.push(separator);
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+fn stats_total_value(totals: &Totals, column: StatsColumn) -> String {
+    match column {
+        StatsColumn::Prompts => totals.prompts.to_string(),
+        StatsColumn::Working => totals.working.clone(),
+        StatsColumn::Waiting => totals.waiting.clone(),
+        StatsColumn::Error => totals.error.clone(),
+        StatsColumn::Foreground => totals.foreground.clone(),
+        StatsColumn::Human => totals.human.clone(),
+        StatsColumn::Thinking => totals.thinking.clone(),
+        StatsColumn::AttentionEvents => totals.attention_events.to_string(),
+        StatsColumn::TokenEstimate => totals.token_estimate.to_string(),
+        StatsColumn::Words => totals.words.to_string(),
+        StatsColumn::AgentSessions => totals.agent_sessions.to_string(),
+        StatsColumn::LiveAgents => totals.live_agents.to_string(),
+        StatsColumn::LastPromptAge => totals.last_prompt_age.clone(),
+    }
 }
 
 fn stats_column_tone(column: StatsColumn) -> TableTone {
@@ -1806,12 +1912,84 @@ mod tests {
             ),
         ]);
 
-        let rows = build_rows(&d, GroupBy::Project, 0);
+        let rows = build_rows(&d, GroupBy::Project, 0, SortKey::Prompts, false);
         assert_eq!(rows[0].key, "muxa");
         assert_eq!(rows[0].prompts, 2);
         assert_eq!(rows[0].agent_sessions, 2);
         assert_eq!(rows[1].key, "other");
         assert_eq!(rows[1].prompts, 1);
+    }
+
+    fn sort_fixture() -> StatsData {
+        data(vec![
+            prompt(
+                AgentKind::ClaudeCode,
+                "a",
+                "%1",
+                Some("/home/june/muxa"),
+                "hello world",
+                datetime!(2026-05-30 11:00:00 UTC),
+            ),
+            prompt(
+                AgentKind::Codex,
+                "b",
+                "%2",
+                Some("/home/june/muxa"),
+                "ship it",
+                datetime!(2026-05-30 11:01:00 UTC),
+            ),
+            prompt(
+                AgentKind::GeminiCli,
+                "c",
+                "%3",
+                Some("/home/june/other"),
+                "x",
+                datetime!(2026-05-30 11:02:00 UTC),
+            ),
+        ])
+    }
+
+    fn ordered_keys(rows: &[GroupRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.key.as_str()).collect()
+    }
+
+    #[test]
+    fn sort_key_and_reverse_control_row_order() {
+        let d = sort_fixture();
+
+        // Default: highest prompt count first.
+        let by_prompts = build_rows(&d, GroupBy::Project, 0, SortKey::Prompts, false);
+        assert_eq!(ordered_keys(&by_prompts), ["muxa", "other"]);
+
+        // --reverse flips the default direction.
+        let reversed = build_rows(&d, GroupBy::Project, 0, SortKey::Prompts, true);
+        assert_eq!(ordered_keys(&reversed), ["other", "muxa"]);
+
+        // name sorts ascending by group key; --reverse makes it descending.
+        let by_name = build_rows(&d, GroupBy::Project, 0, SortKey::Name, false);
+        assert_eq!(ordered_keys(&by_name), ["muxa", "other"]);
+        let by_name_rev = build_rows(&d, GroupBy::Project, 0, SortKey::Name, true);
+        assert_eq!(ordered_keys(&by_name_rev), ["other", "muxa"]);
+    }
+
+    #[test]
+    fn stats_table_appends_total_footer() {
+        let d = sort_fixture();
+        let doc = build_document(&d, GroupBy::Project, 0, SortKey::Prompts, false);
+        let rendered = render_stats_table(&doc, 140, CliTheme::plain());
+
+        let lines: Vec<&str> = rendered.lines().collect();
+        let total_idx = lines
+            .iter()
+            .position(|line| line.contains("TOTAL"))
+            .expect("TOTAL footer row present");
+        // The grand total is the last content row, ruled off like the header.
+        assert_eq!(total_idx, lines.len() - 2);
+        assert!(
+            lines[total_idx - 1].starts_with('╞'),
+            "expected a separator rule above TOTAL, got {:?}",
+            lines[total_idx - 1]
+        );
     }
 
     #[test]
@@ -1843,7 +2021,7 @@ mod tests {
             ),
         ]);
 
-        let rows = build_rows(&d, GroupBy::Project, 1);
+        let rows = build_rows(&d, GroupBy::Project, 1, SortKey::Prompts, false);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "a");
     }
@@ -1922,7 +2100,7 @@ mod tests {
         ];
 
         let totals = build_totals(&d);
-        let rows = build_rows(&d, GroupBy::Session, 0);
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
 
         assert_eq!(totals.waiting_secs, 1_200);
         assert_eq!(totals.human_secs, 1_500);
@@ -1980,7 +2158,7 @@ mod tests {
             },
         ))];
 
-        let rows = build_rows(&d, GroupBy::Project, 0);
+        let rows = build_rows(&d, GroupBy::Project, 0, SortKey::Prompts, false);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "muxa");
@@ -2001,7 +2179,7 @@ mod tests {
         p.tmux_session = Some("deleted-session-name".into());
         let d = data(vec![p]);
 
-        let rows = build_rows(&d, GroupBy::Session, 0);
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
 
         assert_eq!(rows[0].key, "deleted-session-name");
     }
@@ -2023,7 +2201,7 @@ mod tests {
             },
         ))];
 
-        let rows = build_rows(&d, GroupBy::Session, 0);
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
 
         assert_eq!(rows[0].key, "deleted-session-name");
         assert_eq!(rows[0].working_secs, 600);
@@ -2050,7 +2228,7 @@ mod tests {
         );
         long.tmux_session = Some("9248e2a7-88f8-4229-ad96-eaf257accdfc".into());
         let d = data(vec![p, long]);
-        let doc = build_document(&d, GroupBy::Session, 0);
+        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false);
 
         let rendered = render_stats_table(&doc, 88, CliTheme::plain());
 
@@ -2079,7 +2257,7 @@ mod tests {
         );
         p.tmux_session = Some("callabo-auto-label".into());
         let d = data(vec![p]);
-        let doc = build_document(&d, GroupBy::Session, 0);
+        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false);
 
         let rendered = render_stats_table(&doc, 140, CliTheme::plain());
 
@@ -2104,7 +2282,7 @@ mod tests {
         ));
 
         let totals = build_totals(&d);
-        let rows = build_rows(&d, GroupBy::Project, 0);
+        let rows = build_rows(&d, GroupBy::Project, 0, SortKey::Prompts, false);
 
         assert_eq!(totals.working_secs, 3_600);
         assert_eq!(rows[0].key, "muxa");

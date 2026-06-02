@@ -23,6 +23,25 @@ muxa activity --since today --type agent --format json
 - RFC3339 timestamp: everything since that instant.
 - `all`: all retained ledger entries.
 
+## Sorting
+
+`muxa stats` rows are ordered by prompt count by default. Use `--sort` to
+order by any column and `--reverse` to flip the direction. Numeric columns
+default to descending (largest first); `name` defaults to ascending.
+
+```bash
+muxa stats --since today --sort wait              # longest waiting first
+muxa stats --since today --sort work --reverse    # least working first
+muxa stats --since today --group-by session --sort name
+```
+
+`--sort` accepts: `prompts`, `work`, `wait`, `err`, `tmux`, `human`,
+`think`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
+
+The table closes with a `TOTAL` footer row. It holds the grand total across
+every group and reflects all data even when `--limit` truncates the rows
+above it.
+
 ## Ledger Types
 
 `muxa activity --type ...` filters the raw ledger:
