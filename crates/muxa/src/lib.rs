@@ -87,8 +87,9 @@ pub use snapshot::STATE_SCHEMA_VERSION;
 
 #[doc(hidden)]
 pub use activity::{
-    ActivityEntry, ActivityLog, ActivityOptions, SessionForegroundEntry, StateTransitionEntry,
-    StateTransitionInput, ACTIVITY_SCHEMA_VERSION,
+    ActivityEntry, ActivityLog, ActivityOptions, HumanInteractionEntry, HumanInteractionInput,
+    HumanInteractionKind, SessionForegroundEntry, StateTransitionEntry, StateTransitionInput,
+    ACTIVITY_SCHEMA_VERSION,
 };
 #[doc(hidden)]
 pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};

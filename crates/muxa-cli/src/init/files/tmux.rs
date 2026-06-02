@@ -16,7 +16,7 @@ pub const ENV_BLOCK_ID: &str = "tmux-env";
 
 /// The body that goes inside the `tmux-popup` marker block.
 pub const POPUP_BODY: &str = r#"# Replace tmux's stock prefix+s (choose-tree) with muxa watch in a popup.
-# Enter on a row attaches to that pane and closes the popup.
+# Enter opens a prompt composer; empty Enter again attaches.
 bind-key s display-popup -E -w 90% -h 85% "muxa watch""#;
 
 /// The body that goes inside the `tmux-statusline` marker block.

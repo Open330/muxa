@@ -235,7 +235,7 @@ set -g status-interval 2
 set -g status-right "#(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M"
 
 # 기본 세션 스위처를 에이전트 인지형 팝업으로 교체.
-# 행에서 Enter를 누르면 그 페인에 어태치되고, 종료 시 팝업이 닫힙니다.
+# Enter는 prompt 입력창을 열고, 빈 입력창에서 Enter를 한 번 더 누르면 어태치합니다.
 bind-key s display-popup -E -w 90% -h 85% "muxa watch"
 ```
 
@@ -332,8 +332,9 @@ fallback 합니다. 자세한 설정은 [설정 > 디테일 행](#watch-detail-r
 `muxa watch`는 기본적으로 **세션 뷰**로 열립니다. 같은 tmux 세션의 모든
 페인이 하나의 행으로 합쳐지고, 해당 세션에서 가장 최근 활동한 에이전트가
 대표 행이 됩니다 — 여러 세션을 동시에 굴리는 운영자를 위한 한눈에 보기
-형태죠. `Enter`는 대표 페인으로 이동하며, `DUR` 컬럼은 그 tmux 세션이
-interactive tmux client에서 foreground였던 누적 시간을 보여줍니다.
+형태죠. `Enter`는 대표 페인을 대상으로 prompt 전송/attach 입력창을 열며,
+`DUR` 컬럼은 그 tmux 세션이 interactive tmux client에서 foreground였던
+누적 시간을 보여줍니다.
 
 에이전트/페인별로 한 줄씩 보고 싶으면 `muxa watch --view pane`을 쓰거나
 `[watch] view = "pane"`을 설정하세요.
@@ -343,7 +344,8 @@ detail 라인 한 줄로 부족할 때 — 긴 prompt, 여러 단락의 응답 �
 prompt + 응답이 80% × 70% 박스에 렌더링되고 `↑`/`↓` / `PgUp`/`PgDn` /
 `Home` 으로 스크롤됩니다. 팝업 뒤로 주변 행이 그대로 보여 맥락을 잃지
 않고, 정말 긴 콘텐츠는 **`f`** 로 풀스크린으로 토글할 수 있습니다.
-`q` / `Esc` / `p` 로 picker 로 복귀.
+`Enter`는 preview 중인 페인 대상으로 같은 prompt 입력창을 열고,
+`q` / `Esc` / `p` 로 picker 로 복귀합니다.
 
 기본값으로 preview 는 **실제 tmux 페인 라이브 스냅샷**으로 바로 열립니다 —
 tmux 의 `prefix + s` choose-tree preview 와 같은 형태. 내부적으로
@@ -362,7 +364,7 @@ prompt/response 뷰).
 페인을 알 수 없는 에이전트(주로 `TMUX_PANE` 환경변수가 inherit되지 않은
 Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인을 복원하지
 못한 경우)는 **기본적으로 picker에서 숨겨집니다** — `Enter`로 attach 할
-대상이 없어서 액션이 안 되기 때문입니다. footer에 dim
+대상이 없어서 prompt 전송이나 attach 액션이 안 되기 때문입니다. footer에 dim
 `+N paneless (use --include-paneless to show)` 카운트가 떠서 행이 조용히
 사라지지 않게 알려줍니다. `muxa watch --include-paneless`(또는
 `[watch] hide_paneless = false`)로 다시 보이게 하면 PANE 컬럼에
@@ -372,8 +374,10 @@ Claude Code SDK 서브프로세스 중 프로세스 ancestry walk로도 페인�
 
 가장 좋은 사용법은 tmux 팝업을 통하는 것입니다(위 [tmux 연결](#3-tmux-연결)
 참고). 어떤 페인에서든 `prefix + s`를 누르면 → 실시간 대시보드가 팝업으로 뜨고
-→ 원하는 행에서 `Enter`를 누르면 → 팝업이 닫히면서 클라이언트가 그 페인으로
-전환됩니다. 다시 `prefix + s`를 누르면 원래 자리로 돌아옵니다.
+→ 원하는 행에서 `Enter`를 누르면 → prompt 입력창이 열립니다. 내용을 작성하고
+`Enter`를 누르면 picker를 떠나지 않고 해당 agent에 바로 전송됩니다. 이동하고
+싶을 때는 행에서 `Enter`, 빈 입력창에서 `Enter`를 한 번 더 누르면 팝업이
+닫히면서 클라이언트가 그 페인으로 전환됩니다.
 
 `muxa watch`를 일반 셸에서 직접 실행해도 됩니다 — 기존 tmux 세션에 어태치되며
 Enter 동작도 동일합니다. 다만 muxa가 `switch-client` 대신
@@ -384,8 +388,8 @@ Enter 동작도 동일합니다. 다만 muxa가 `switch-client` 대신
 | 키                    | 동작                                                                  |
 | --------------------- | --------------------------------------------------------------------- |
 | `↑` / `↓` / `k` / `j` | 선택 커서 이동.                                                        |
-| `Enter`               | 선택한 페인에 어태치 (`tmux select-pane` + `switch-client`).           |
-| `p`                   | 선택된 행의 prompt + response 를 가운데 정렬된 popup 으로 띄움 — detail 라인이 잘려서 안 보일 때 유용. `f` 로 popup ↔ 풀스크린 토글, `c` 로 prompt/response ↔ 실제 페인 라이브 캡처 토글 (`tmux capture-pane`, ANSI 컬러 보존). `q` / `Esc` / `p` 로 표로 복귀, `↑` / `↓` / `PgUp` / `PgDn` / `Home` 으로 스크롤. |
+| `Enter`               | 선택한 페인의 prompt 입력창을 엽니다. 빈 입력창에서 `Enter`를 한 번 더 누르면 어태치합니다 (`tmux select-pane` + `switch-client`). |
+| `p`                   | 선택된 행의 prompt + response 를 가운데 정렬된 popup 으로 띄움 — detail 라인이 잘려서 안 보일 때 유용. `Enter` 로 preview 중인 페인의 prompt 입력창을 열고, `f` 로 popup ↔ 풀스크린 토글, `c` 로 prompt/response ↔ 실제 페인 라이브 캡처 토글. `q` / `Esc` / `p` 로 표로 복귀, `↑` / `↓` / `PgUp` / `PgDn` / `Home` 으로 스크롤. |
 | `r`                   | 즉시 리프레시 강제.                                                    |
 | `q` / `Esc`           | 종료.                                                                  |
 | `Ctrl-C`              | 종료.                                                                  |

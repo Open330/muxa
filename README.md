@@ -311,7 +311,7 @@ set -g status-interval 2
 set -g status-right "#(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M"
 
 # Replace the stock session-switcher with an agent-aware popup.
-# Enter on a row attaches to that pane; popup closes on exit.
+# Enter opens a prompt composer; empty Enter again attaches.
 bind-key s display-popup -E -w 90% -h 85% "muxa watch"
 ```
 
@@ -412,7 +412,10 @@ drop-in replacement for tmux's `prefix + s`:
   `tmux list-panes -a`, so a freshly-spawned pane shows up on the next
   poll without any muxad knowledge.
 
-Both kinds are selectable. `Enter` on either attaches you to that pane.
+Both kinds are selectable. `Enter` opens an inline prompt composer for
+the selected pane: type a prompt and press `Enter` to send it straight
+to that agent via tmux. Press `Enter` again with the composer empty to
+attach to the pane instead.
 
 The selected row expands to two visual lines: a dim italic `↳ <detail>`
 hint underneath, useful for glancing at the agent's last response while
@@ -430,9 +433,9 @@ floated to the top of each group. Reorder via `[watch] sort` (see
 By default `muxa watch` opens in **session view**: all panes in the same
 tmux session collapse into one row, represented by the most recently
 active agent in that session — the fleet-at-a-glance shape for operators
-juggling many sessions. `Enter` jumps to that representative pane, and the
-`DUR` column shows the cumulative time the session has been foregrounded by
-an interactive tmux client.
+juggling many sessions. `Enter` targets that representative pane for
+prompt send / attach, and the `DUR` column shows the cumulative time the
+session has been foregrounded by an interactive tmux client.
 
 Want one row per agent/pane instead? Run `muxa watch --view pane` (or set
 `[watch] view = "pane"`).
@@ -444,7 +447,8 @@ a 80% × 70% box over the table, scrollable with the usual `↑`/`↓` /
 `PgUp`/`PgDn` / `Home` keys. The popup keeps the surrounding rows
 visible behind it so you don't lose context; **`f`** toggles full-
 screen for very long content where the popup wraps too aggressively.
-`q` / `Esc` / `p` returns to the picker.
+`Enter` opens the same prompt composer for the previewed pane; `q` /
+`Esc` / `p` returns to the picker.
 
 By default the preview opens straight into a **live tmux pane
 snapshot** — same shape as tmux's `prefix + s` choose-tree preview.
@@ -472,9 +476,10 @@ render `(no pane)` in the PANE column with a yellow
 
 The best way to use it is via a tmux popup (see the
 [tmux wiring](#3-wire-tmux) above). Press `prefix + s` from any pane →
-popup with the live dashboard → `Enter` on the target row → popup closes
-and your client switches to that pane. Press `prefix + s` again to bounce
-back.
+popup with the live dashboard → `Enter` on the target row → type a prompt
+and `Enter` to send it without leaving the picker. To jump instead, press
+`Enter` on the row and then `Enter` again while the prompt is empty; the
+popup closes and your client switches to that pane.
 
 Run `muxa watch` directly from a bare shell to attach into an existing
 tmux session — same Enter semantics, except muxa execs `tmux
@@ -485,8 +490,8 @@ attach-session` for you instead of `switch-client`.
 | Key                   | Action                                                                 |
 | --------------------- | ---------------------------------------------------------------------- |
 | `↑` / `↓` / `k` / `j` | Move the selection cursor.                                             |
-| `Enter`               | Attach to the selected pane (`tmux select-pane` + `switch-client`).    |
-| `p`                   | Pop open a centred preview popup of the selected row's prompt + response — useful when the detail line gets truncated. `f` toggles popup ↔ full-screen for very long content; `c` toggles content between prompt/response and a live `tmux capture-pane` snapshot of the actual pane contents (ANSI colors preserved). `q` / `Esc` / `p` returns to the table; `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll. |
+| `Enter`               | Open the prompt composer for the selected pane. Empty `Enter` inside the composer attaches (`tmux select-pane` + `switch-client`). |
+| `p`                   | Pop open a centred preview popup of the selected row's prompt + response — useful when the detail line gets truncated. `Enter` opens the prompt composer for that previewed pane; `f` toggles popup ↔ full-screen; `c` toggles prompt/response ↔ live pane; `q` / `Esc` / `p` returns; `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll. |
 | `r`                   | Force an immediate refresh.                                            |
 | `q` / `Esc`           | Quit.                                                                  |
 | `Ctrl-C`              | Quit.                                                                  |

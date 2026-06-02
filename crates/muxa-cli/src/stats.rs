@@ -1,24 +1,24 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::{
-    ActivityEntry, Agent, Config, HistoryEntry, SessionActivity, SessionForegroundEntry,
-    StateTransitionEntry,
+    ActivityEntry, Agent, Config, HistoryEntry, HumanInteractionKind, SessionActivity,
+    SessionForegroundEntry, StateTransitionEntry,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::time_range::TimeRange;
 use crate::{terminal_width, truncate_cell};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Time window to include: 24h, 7d, 4w, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
     since: String,
 
@@ -37,7 +37,7 @@ pub struct Args {
 
 #[derive(Debug, clap::Args)]
 pub struct ReportArgs {
-    /// Time window to include: 24h, 7d, 4w, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
     since: String,
 
@@ -110,21 +110,9 @@ pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Resu
 }
 
 #[derive(Debug, Clone)]
-struct StatsRange {
-    label: String,
-    since_at: Option<OffsetDateTime>,
-}
-
-impl StatsRange {
-    fn includes(&self, at: OffsetDateTime) -> bool {
-        self.since_at.is_none_or(|since| at >= since)
-    }
-}
-
-#[derive(Debug)]
 struct StatsData {
     now: OffsetDateTime,
-    range: StatsRange,
+    range: TimeRange,
     prompts: Vec<HistoryEntry>,
     activity_entries: Vec<ActivityEntry>,
     agents: Vec<Agent>,
@@ -148,6 +136,7 @@ struct StatsDocument {
 struct RangeDocument {
     label: String,
     since_at: Option<String>,
+    until_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +155,10 @@ struct Totals {
     error: String,
     foreground_secs: u64,
     foreground: String,
+    human_secs: u64,
+    human: String,
+    thinking_secs: u64,
+    thinking: String,
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
@@ -188,6 +181,10 @@ struct GroupRow {
     error: String,
     foreground_secs: u64,
     foreground: String,
+    human_secs: u64,
+    human: String,
+    thinking_secs: u64,
+    thinking: String,
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
@@ -205,8 +202,25 @@ struct GroupAccumulator {
     waiting_secs: u64,
     error_secs: u64,
     foreground_secs: u64,
+    human_secs: u64,
+    thinking_secs: u64,
     attention_events: usize,
     last_prompt_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone)]
+struct ScopedInterval {
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    pane: Option<String>,
+    session_name: Option<String>,
+    scope_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct AttentionInterval {
+    interval: ScopedInterval,
+    group_key: String,
 }
 
 async fn load_data(client: &Client, cfg: &Config, since: &str) -> Result<StatsData> {
@@ -298,6 +312,7 @@ fn build_document(data: &StatsData, group_by: GroupBy, limit: usize) -> StatsDoc
         range: RangeDocument {
             label: data.range.label.clone(),
             since_at: data.range.since_at.map(format_rfc3339),
+            until_at: data.range.until_at.map(format_rfc3339),
         },
         group_by: group_by.as_str().to_string(),
         totals: build_totals(data),
@@ -316,6 +331,7 @@ fn build_totals(data: &StatsData) -> Totals {
     let mut waiting_secs = 0u64;
     let mut error_secs = 0u64;
     let mut foreground_secs = 0u64;
+    let mut human_secs;
     let mut attention_events = 0usize;
     let mut has_session_foreground_ledger = false;
 
@@ -347,6 +363,7 @@ fn build_totals(data: &StatsData) -> Totals {
                 has_session_foreground_ledger = true;
                 foreground_secs += session_foreground_overlap_secs(data, entry);
             }
+            ActivityEntry::HumanInteraction(_) => {}
         }
     }
     foreground_secs += open_session_foreground_secs(data);
@@ -363,6 +380,11 @@ fn build_totals(data: &StatsData) -> Totals {
             &mut error_secs,
         );
     }
+    human_secs = sum_merged_scoped_intervals(&human_presence_intervals(data, false));
+    if !has_session_foreground_ledger {
+        human_secs = human_secs.saturating_add(legacy_foreground_secs(data));
+    }
+    let thinking_secs = thinking_secs_total(data);
 
     Totals {
         prompts: data.prompts.len(),
@@ -383,6 +405,10 @@ fn build_totals(data: &StatsData) -> Totals {
         error: format_duration(error_secs),
         foreground_secs,
         foreground: format_duration(foreground_secs),
+        human_secs,
+        human: format_duration(human_secs),
+        thinking_secs,
+        thinking: format_duration(thinking_secs),
         attention_events,
         last_prompt_at: last_prompt_at.map(format_rfc3339),
         last_prompt_age: last_prompt_at
@@ -407,6 +433,8 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
     }
 
     add_activity_rows(data, group_by, &mut rows);
+    add_human_rows(data, group_by, &mut rows);
+    add_thinking_rows(data, group_by, &mut rows);
 
     if group_by != GroupBy::Session || session_foreground_ledger {
         add_open_session_foreground_rows(data, group_by, &mut rows);
@@ -439,7 +467,10 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
     if group_by == GroupBy::Session && !session_foreground_ledger {
         for activity in &data.activities {
             let key = activity.name.clone();
-            rows.entry(key).or_default().foreground_secs += activity.effective_total_secs(data.now);
+            let secs = activity.effective_total_secs(data.now);
+            let acc = rows.entry(key).or_default();
+            acc.foreground_secs += secs;
+            acc.human_secs += secs;
         }
     }
 
@@ -472,6 +503,10 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
             error: format_duration(acc.error_secs),
             foreground_secs: acc.foreground_secs,
             foreground: format_duration(acc.foreground_secs),
+            human_secs: acc.human_secs,
+            human: format_duration(acc.human_secs),
+            thinking_secs: acc.thinking_secs,
+            thinking: format_duration(acc.thinking_secs),
             attention_events: acc.attention_events,
             last_prompt_at: acc.last_prompt_at.map(format_rfc3339),
             last_prompt_age: acc
@@ -504,6 +539,49 @@ fn add_activity_rows(
                     rows.entry(key).or_default().foreground_secs += secs;
                 }
             }
+            ActivityEntry::HumanInteraction(_) => {}
+        }
+    }
+}
+
+fn add_human_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+) {
+    let mut grouped: BTreeMap<String, Vec<ScopedInterval>> = BTreeMap::new();
+    for interval in human_presence_intervals(data, false) {
+        if let Some(key) = human_presence_group_key(data, &interval, group_by) {
+            grouped.entry(key).or_default().push(interval);
+        }
+    }
+    for (key, intervals) in grouped {
+        let secs = sum_merged_scoped_intervals(&intervals);
+        if secs > 0 {
+            rows.entry(key).or_default().human_secs += secs;
+        }
+    }
+}
+
+fn add_thinking_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+) {
+    let presences = human_presence_intervals(data, true);
+    let mut grouped: BTreeMap<String, Vec<ScopedInterval>> = BTreeMap::new();
+    for attention in attention_intervals(data, group_by) {
+        for segment in overlapping_presence_segments(&attention.interval, &presences) {
+            grouped
+                .entry(attention.group_key.clone())
+                .or_default()
+                .push(segment);
+        }
+    }
+    for (key, intervals) in grouped {
+        let secs = sum_merged_scoped_intervals(&intervals);
+        if secs > 0 {
+            rows.entry(key).or_default().thinking_secs += secs;
         }
     }
 }
@@ -686,12 +764,291 @@ fn has_session_foreground_ledger(data: &StatsData) -> bool {
         .any(|entry| matches!(entry, ActivityEntry::SessionForeground(_)))
 }
 
+fn human_presence_intervals(data: &StatsData, thinking_only: bool) -> Vec<ScopedInterval> {
+    let mut intervals = Vec::new();
+    for entry in &data.activity_entries {
+        match entry {
+            ActivityEntry::SessionForeground(entry) => {
+                if let Some(interval) = scoped_interval(
+                    data,
+                    entry.started_at,
+                    entry.ended_at,
+                    None,
+                    Some(entry.session_name.clone()),
+                    &entry.session_id,
+                ) {
+                    intervals.push(interval);
+                }
+            }
+            ActivityEntry::HumanInteraction(entry) => {
+                if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
+                    continue;
+                }
+                if let Some(interval) = scoped_interval(
+                    data,
+                    entry.started_at,
+                    entry.ended_at,
+                    entry.pane.clone(),
+                    entry.session_name.clone(),
+                    entry.session_id.as_deref().unwrap_or("human_interaction"),
+                ) {
+                    intervals.push(interval);
+                }
+            }
+            ActivityEntry::StateTransition(_) => {}
+        }
+    }
+    for activity in &data.activities {
+        let Some(since) = activity.attached_since else {
+            continue;
+        };
+        if let Some(interval) = scoped_interval(
+            data,
+            since,
+            data.now,
+            None,
+            Some(activity.name.clone()),
+            &activity.session_id,
+        ) {
+            intervals.push(interval);
+        }
+    }
+    intervals
+}
+
+fn human_interaction_counts_for_thinking(kind: HumanInteractionKind) -> bool {
+    matches!(
+        kind,
+        HumanInteractionKind::MuxaPromptInput | HumanInteractionKind::TmuxAttach
+    )
+}
+
+fn human_presence_group_key(
+    data: &StatsData,
+    interval: &ScopedInterval,
+    group_by: GroupBy,
+) -> Option<String> {
+    match group_by {
+        GroupBy::Day => Some(format_day(interval.ended_at)),
+        GroupBy::Session => interval
+            .session_name
+            .clone()
+            .or_else(|| interval.pane.clone())
+            .or_else(|| Some("unknown".to_string())),
+        GroupBy::Project => interval
+            .pane
+            .as_ref()
+            .and_then(|pane| data.project_by_pane.get(pane))
+            .cloned(),
+        GroupBy::Agent => None,
+    }
+}
+
+fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
+    let mut intervals = Vec::new();
+    for entry in &data.activity_entries {
+        let ActivityEntry::StateTransition(entry) = entry else {
+            continue;
+        };
+        if !is_attention_state(entry.from) {
+            continue;
+        }
+        let started_at = entry.state_entered_at.unwrap_or_else(|| {
+            entry.at
+                - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
+        });
+        let session_name = entry.session_name.clone().or_else(|| {
+            entry
+                .pane
+                .as_ref()
+                .and_then(|pane| data.pane_sessions.get(pane))
+                .cloned()
+        });
+        if let Some(interval) = scoped_interval(
+            data,
+            started_at,
+            entry.at,
+            entry.pane.clone(),
+            session_name,
+            &entry.session_id,
+        ) {
+            intervals.push(AttentionInterval {
+                interval,
+                group_key: state_transition_group_key(data, entry, group_by),
+            });
+        }
+    }
+    for agent in &data.agents {
+        if !is_attention_state(agent.state) {
+            continue;
+        }
+        let session_name = agent
+            .pane
+            .as_ref()
+            .and_then(|pane| data.pane_sessions.get(pane))
+            .cloned();
+        if let Some(interval) = scoped_interval(
+            data,
+            agent.state_entered_at,
+            data.now,
+            agent.pane.clone(),
+            session_name,
+            &agent.session_id,
+        ) {
+            intervals.push(AttentionInterval {
+                interval,
+                group_key: agent_group_key(data, agent, group_by),
+            });
+        }
+    }
+    intervals
+}
+
+fn thinking_secs_total(data: &StatsData) -> u64 {
+    let presences = human_presence_intervals(data, true);
+    let mut segments = Vec::new();
+    for attention in attention_intervals(data, GroupBy::Session) {
+        segments.extend(overlapping_presence_segments(
+            &attention.interval,
+            &presences,
+        ));
+    }
+    sum_merged_scoped_intervals(&segments)
+}
+
+fn overlapping_presence_segments(
+    attention: &ScopedInterval,
+    presences: &[ScopedInterval],
+) -> Vec<ScopedInterval> {
+    let mut segments = Vec::new();
+    for presence in presences {
+        if !intervals_relate(attention, presence) {
+            continue;
+        }
+        let start = attention.started_at.max(presence.started_at);
+        let end = attention.ended_at.min(presence.ended_at);
+        if end <= start {
+            continue;
+        }
+        segments.push(ScopedInterval {
+            started_at: start,
+            ended_at: end,
+            pane: attention.pane.clone(),
+            session_name: attention.session_name.clone(),
+            scope_key: attention.scope_key.clone(),
+        });
+    }
+    segments
+}
+
+fn intervals_relate(a: &ScopedInterval, b: &ScopedInterval) -> bool {
+    if let (Some(a_pane), Some(b_pane)) = (a.pane.as_deref(), b.pane.as_deref()) {
+        if a_pane == b_pane {
+            return true;
+        }
+    }
+    if let (Some(a_session), Some(b_session)) =
+        (a.session_name.as_deref(), b.session_name.as_deref())
+    {
+        return a_session == b_session;
+    }
+    false
+}
+
+fn scoped_interval(
+    data: &StatsData,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    pane: Option<String>,
+    session_name: Option<String>,
+    fallback_scope: &str,
+) -> Option<ScopedInterval> {
+    let (start, end) = clip_interval(data, started_at, ended_at)?;
+    let scope_key = scope_key(pane.as_deref(), session_name.as_deref(), fallback_scope);
+    Some(ScopedInterval {
+        started_at: start,
+        ended_at: end,
+        pane,
+        session_name,
+        scope_key,
+    })
+}
+
+fn clip_interval(
+    data: &StatsData,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let start = data
+        .range
+        .since_at
+        .map_or(started_at, |since| started_at.max(since));
+    let end = ended_at.min(data.range.effective_end(data.now));
+    (end > start).then_some((start, end))
+}
+
+fn scope_key(pane: Option<&str>, session_name: Option<&str>, fallback: &str) -> String {
+    if let Some(session_name) = session_name {
+        return format!("session:{session_name}");
+    }
+    if let Some(pane) = pane {
+        return format!("pane:{pane}");
+    }
+    format!("unknown:{fallback}")
+}
+
+fn sum_merged_scoped_intervals(intervals: &[ScopedInterval]) -> u64 {
+    let mut by_scope: BTreeMap<&str, Vec<(OffsetDateTime, OffsetDateTime)>> = BTreeMap::new();
+    for interval in intervals {
+        if interval.ended_at <= interval.started_at {
+            continue;
+        }
+        by_scope
+            .entry(interval.scope_key.as_str())
+            .or_default()
+            .push((interval.started_at, interval.ended_at));
+    }
+
+    let mut total = 0u64;
+    for mut ranges in by_scope.into_values() {
+        ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut merged_start: Option<OffsetDateTime> = None;
+        let mut merged_end: Option<OffsetDateTime> = None;
+        for (start, end) in ranges {
+            match (merged_start, merged_end) {
+                (None, None) => {
+                    merged_start = Some(start);
+                    merged_end = Some(end);
+                }
+                (Some(current_start), Some(current_end)) if start <= current_end => {
+                    merged_start = Some(current_start);
+                    merged_end = Some(current_end.max(end));
+                }
+                (Some(current_start), Some(current_end)) => {
+                    total = total.saturating_add(duration_between(current_start, current_end));
+                    merged_start = Some(start);
+                    merged_end = Some(end);
+                }
+                _ => unreachable!("merged interval state is always both set or both unset"),
+            }
+        }
+        if let (Some(start), Some(end)) = (merged_start, merged_end) {
+            total = total.saturating_add(duration_between(start, end));
+        }
+    }
+    total
+}
+
+fn duration_between(started_at: OffsetDateTime, ended_at: OffsetDateTime) -> u64 {
+    u64::try_from((ended_at - started_at).whole_seconds().max(0)).unwrap_or(u64::MAX)
+}
+
 fn overlap_secs(data: &StatsData, started_at: OffsetDateTime, ended_at: OffsetDateTime) -> u64 {
     let start = data
         .range
         .since_at
         .map_or(started_at, |since| started_at.max(since));
-    let end = ended_at.min(data.now);
+    let end = ended_at.min(data.range.effective_end(data.now));
     if end <= start {
         return 0;
     }
@@ -738,48 +1095,8 @@ fn prompt_metrics(prompt: &HistoryEntry) -> PromptMetrics {
     }
 }
 
-fn parse_since(raw: &str, now: OffsetDateTime) -> Result<StatsRange> {
-    let trimmed = raw.trim();
-    if trimmed.eq_ignore_ascii_case("all") {
-        return Ok(StatsRange {
-            label: "all retained history".to_string(),
-            since_at: None,
-        });
-    }
-    if let Ok(at) = OffsetDateTime::parse(trimmed, &Rfc3339) {
-        return Ok(StatsRange {
-            label: format!("since {trimmed}"),
-            since_at: Some(at),
-        });
-    }
-    if trimmed.is_empty() {
-        bail!("--since must be a duration like 7d, an RFC3339 timestamp, or all");
-    }
-
-    let unit = trimmed
-        .chars()
-        .last()
-        .context("--since must be a duration like 7d, an RFC3339 timestamp, or all")?;
-    let number = &trimmed[..trimmed.len() - unit.len_utf8()];
-    let amount: i64 = number
-        .parse()
-        .with_context(|| format!("invalid --since duration {trimmed:?}"))?;
-    if amount <= 0 {
-        bail!("--since duration must be greater than zero");
-    }
-    let duration = match unit {
-        's' => time::Duration::seconds(amount),
-        'm' => time::Duration::minutes(amount),
-        'h' => time::Duration::hours(amount),
-        'd' => time::Duration::days(amount),
-        'w' => time::Duration::weeks(amount),
-        _ => bail!("--since duration unit must be one of s, m, h, d, w"),
-    };
-
-    Ok(StatsRange {
-        label: format!("last {trimmed}"),
-        since_at: Some(now - duration),
-    })
+fn parse_since(raw: &str, now: OffsetDateTime) -> Result<TimeRange> {
+    crate::time_range::parse_since(raw, now, "all retained history")
 }
 
 fn project_from_cwd(cwd: Option<&str>) -> Option<String> {
@@ -805,13 +1122,16 @@ fn notes(data: &StatsData) -> Vec<String> {
     ];
     if data.activity_entries.is_empty() {
         notes.push(
-            "No activity ledger entries found yet; duration columns will fill as agents transition and tmux foreground intervals close.".to_string(),
+            "No activity ledger entries found yet; duration columns will fill as agents transition, tmux foreground intervals close, and muxa interactions are recorded.".to_string(),
         );
     } else if !has_session_foreground_ledger(data) && !data.activities.is_empty() {
         notes.push(
             "TMUX uses legacy cumulative session-activity.json totals until the first session foreground interval lands in activity.ndjson.".to_string(),
         );
     }
+    notes.push(
+        "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
+    );
     notes
 }
 
@@ -821,8 +1141,11 @@ fn render_table(doc: &StatsDocument) {
     if let Some(since_at) = doc.range.since_at.as_deref() {
         println!("Since: {since_at}");
     }
+    if let Some(until_at) = doc.range.until_at.as_deref() {
+        println!("Until: {until_at}");
+    }
     println!(
-        "Prompts: {} | token est: {} | agent sessions: {} | live agents: {} | work: {} | wait: {} | err: {} | tmux: {} | blocks: {}",
+        "Prompts: {} | token est: {} | agent sessions: {} | live agents: {} | work: {} | wait: {} | err: {} | tmux: {} | human: {} | think: {} | blocks: {}",
         doc.totals.prompts,
         doc.totals.token_estimate,
         doc.totals.agent_sessions,
@@ -831,6 +1154,8 @@ fn render_table(doc: &StatsDocument) {
         doc.totals.waiting,
         doc.totals.error,
         doc.totals.foreground,
+        doc.totals.human,
+        doc.totals.thinking,
         doc.totals.attention_events
     );
     println!();
@@ -866,6 +1191,8 @@ enum StatsColumn {
     Waiting,
     Error,
     Foreground,
+    Human,
+    Thinking,
     AttentionEvents,
     TokenEstimate,
     Words,
@@ -906,6 +1233,16 @@ const FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
         header: "TMUX",
         width: 6,
         value: StatsColumn::Foreground,
+    },
+    StatsTableColumn {
+        header: "HUMAN",
+        width: 6,
+        value: StatsColumn::Human,
+    },
+    StatsTableColumn {
+        header: "THINK",
+        width: 6,
+        value: StatsColumn::Thinking,
     },
     StatsTableColumn {
         header: "BLOCK",
@@ -961,14 +1298,9 @@ const COMPACT_STATS_COLUMNS: &[StatsTableColumn] = &[
         value: StatsColumn::Foreground,
     },
     StatsTableColumn {
-        header: "BLK",
-        width: 3,
-        value: StatsColumn::AttentionEvents,
-    },
-    StatsTableColumn {
-        header: "TOK",
+        header: "THINK",
         width: 6,
-        value: StatsColumn::TokenEstimate,
+        value: StatsColumn::Thinking,
     },
     StatsTableColumn {
         header: "LAST",
@@ -992,6 +1324,11 @@ const MINIMAL_STATS_COLUMNS: &[StatsTableColumn] = &[
         header: "WAIT",
         width: 6,
         value: StatsColumn::Waiting,
+    },
+    StatsTableColumn {
+        header: "THINK",
+        width: 6,
+        value: StatsColumn::Thinking,
     },
     StatsTableColumn {
         header: "LAST",
@@ -1080,6 +1417,8 @@ fn stats_column_value(row: &GroupRow, column: StatsColumn) -> String {
         StatsColumn::Waiting => row.waiting.clone(),
         StatsColumn::Error => row.error.clone(),
         StatsColumn::Foreground => row.foreground.clone(),
+        StatsColumn::Human => row.human.clone(),
+        StatsColumn::Thinking => row.thinking.clone(),
         StatsColumn::AttentionEvents => row.attention_events.to_string(),
         StatsColumn::TokenEstimate => row.token_estimate.to_string(),
         StatsColumn::Words => row.words.to_string(),
@@ -1139,6 +1478,9 @@ fn push_markdown_overview(out: &mut String, title: &str, doc: &StatsDocument) {
     if let Some(since_at) = doc.range.since_at.as_deref() {
         push_metric(out, "Since", since_at);
     }
+    if let Some(until_at) = doc.range.until_at.as_deref() {
+        push_metric(out, "Until", until_at);
+    }
     push_metric(out, "Prompts", &doc.totals.prompts.to_string());
     push_metric(
         out,
@@ -1156,6 +1498,8 @@ fn push_markdown_overview(out: &mut String, title: &str, doc: &StatsDocument) {
     push_metric(out, "Waiting", &doc.totals.waiting);
     push_metric(out, "Error time", &doc.totals.error);
     push_metric(out, "TMUX foreground", &doc.totals.foreground);
+    push_metric(out, "Human presence", &doc.totals.human);
+    push_metric(out, "Thinking", &doc.totals.thinking);
     push_metric(
         out,
         "Attention events",
@@ -1182,9 +1526,9 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         return;
     }
 
-    out.push_str("| Group | Prompts | Work | Wait | Error | TMUX | Block | Tok est | Words | Sessions | Agents | Last |\n");
+    out.push_str("| Group | Prompts | Work | Wait | Error | TMUX | Human | Think | Block | Tok est | Words | Sessions | Agents | Last |\n");
     out.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
     );
     for row in rows {
         out.push_str("| ");
@@ -1199,6 +1543,10 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         out.push_str(&escape_markdown_cell(&row.error));
         out.push_str(" | ");
         out.push_str(&escape_markdown_cell(&row.foreground));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.human));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.thinking));
         out.push_str(" | ");
         out.push_str(&row.attention_events.to_string());
         out.push_str(" | ");
@@ -1238,7 +1586,8 @@ fn format_day(at: OffsetDateTime) -> String {
 }
 
 fn format_rfc3339(at: OffsetDateTime) -> String {
-    at.format(&Rfc3339).unwrap_or_else(|_| at.to_string())
+    at.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| at.to_string())
 }
 
 fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
@@ -1283,7 +1632,9 @@ fn format_duration(total_secs: u64) -> String {
 mod tests {
     use super::*;
     use muxa::event::AgentKind;
-    use muxa::StateTransitionInput;
+    use muxa::{
+        HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind, StateTransitionInput,
+    };
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
 
@@ -1335,9 +1686,10 @@ mod tests {
     fn data(prompts: Vec<HistoryEntry>) -> StatsData {
         StatsData {
             now: datetime!(2026-05-30 12:00:00 UTC),
-            range: StatsRange {
+            range: TimeRange {
                 label: "last 7d".into(),
                 since_at: Some(datetime!(2026-05-23 12:00:00 UTC)),
+                until_at: None,
             },
             prompts,
             activity_entries: Vec::new(),
@@ -1363,6 +1715,35 @@ mod tests {
         let range = parse_since("all", now).unwrap();
         assert_eq!(range.label, "all retained history");
         assert_eq!(range.since_at, None);
+        assert_eq!(range.until_at, None);
+    }
+
+    #[test]
+    fn parse_since_accepts_week_alias() {
+        let now = datetime!(2026-05-30 12:00:00 UTC);
+        let range = parse_since("week", now).unwrap();
+        assert_eq!(range.label, "last 7d");
+        assert_eq!(range.since_at, Some(datetime!(2026-05-23 12:00:00 UTC)));
+        assert_eq!(range.until_at, None);
+    }
+
+    #[test]
+    fn ended_range_clips_open_agent_state() {
+        let mut d = data(Vec::new());
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 11:00:00 UTC)),
+        };
+        d.agents.push(live_agent(
+            AgentState::WaitingInput,
+            datetime!(2026-05-30 10:30:00 UTC),
+            Some("/home/june/muxa"),
+        ));
+
+        let totals = build_totals(&d);
+
+        assert_eq!(totals.waiting_secs, 1_800);
     }
 
     #[test]
@@ -1476,6 +1857,79 @@ mod tests {
         assert_eq!(totals.waiting_secs, 600);
         assert_eq!(totals.foreground_secs, 1_800);
         assert_eq!(totals.attention_events, 1);
+    }
+
+    #[test]
+    fn thinking_counts_attention_overlap_with_human_presence() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-05-30 11:30:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-a".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: Some("/home/june/muxa".into()),
+                from: AgentState::WaitingInput,
+                to: AgentState::Working,
+                state_entered_at: Some(datetime!(2026-05-30 11:10:00 UTC)),
+            })),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-05-30 11:00:00 UTC),
+                datetime!(2026-05-30 11:20:00 UTC),
+            )),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaPromptInput,
+                pane: Some("%1".into()),
+                session_id: Some("$1".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 11:18:00 UTC),
+                ended_at: datetime!(2026-05-30 11:25:00 UTC),
+            })),
+        ];
+
+        let totals = build_totals(&d);
+        let rows = build_rows(&d, GroupBy::Session, 0);
+
+        assert_eq!(totals.waiting_secs, 1_200);
+        assert_eq!(totals.human_secs, 1_500);
+        assert_eq!(totals.thinking_secs, 900);
+        assert_eq!(rows[0].key, "main");
+        assert_eq!(rows[0].thinking_secs, 900);
+    }
+
+    #[test]
+    fn watch_open_does_not_count_as_thinking() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-05-30 11:20:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-a".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: Some("/home/june/muxa".into()),
+                from: AgentState::Error,
+                to: AgentState::Working,
+                state_entered_at: Some(datetime!(2026-05-30 11:10:00 UTC)),
+            })),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaWatch,
+                pane: Some("%1".into()),
+                session_id: Some("$1".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 11:10:00 UTC),
+                ended_at: datetime!(2026-05-30 11:20:00 UTC),
+            })),
+        ];
+
+        let totals = build_totals(&d);
+
+        assert_eq!(totals.error_secs, 600);
+        assert_eq!(totals.human_secs, 600);
+        assert_eq!(totals.thinking_secs, 0);
     }
 
     #[test]

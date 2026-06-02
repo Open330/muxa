@@ -1,10 +1,12 @@
 //! muxa CLI — user-facing entry point.
 
+mod activity_query;
 mod attend;
 mod doctor;
 mod init;
 mod logs;
 mod stats;
+mod time_range;
 mod upgrade;
 mod watch;
 
@@ -16,10 +18,13 @@ use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapte
 use muxa::config::{WatchConfig, WatchSortKey};
 use muxa::ipc::Client;
 use muxa::state::Agent;
-use muxa::{discovery, paths, tmux, AgentState, Config};
+use muxa::{
+    discovery, paths, tmux, ActivityEntry, AgentState, Config, HumanInteractionEntry,
+    HumanInteractionInput, HumanInteractionKind,
+};
 use owo_colors::{OwoColorize, Style};
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use time::OffsetDateTime;
 use unicode_width::UnicodeWidthChar;
@@ -75,6 +80,8 @@ enum Cmd {
     Stats(stats::Args),
     /// Generate a Markdown activity report from the retained stats.
     Report(stats::ReportArgs),
+    /// Query raw activity ledger intervals.
+    Activity(activity_query::Args),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
     Hook {
         #[command(subcommand)]
@@ -232,6 +239,7 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
+        Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => {
             cmd_panes();
@@ -337,6 +345,16 @@ async fn cmd_watch(
     if let Some(sort) = sort {
         watch_cfg.sort = sort.keys();
     }
+    let activity_path = cfg
+        .activity
+        .enabled
+        .then(|| {
+            cfg.activity
+                .path
+                .clone()
+                .or_else(paths::default_activity_file)
+        })
+        .flatten();
     let session_activity_path = cfg
         .session_activity
         .enabled
@@ -347,10 +365,59 @@ async fn cmd_watch(
                 .or_else(paths::default_session_activity_file)
         })
         .flatten();
-    if let Some(pane_id) = watch::run(client, watch_cfg, session_activity_path).await? {
-        jump_to_pane(&pane_id);
+    if let Some(pane_id) = watch::run(
+        client,
+        watch_cfg,
+        session_activity_path,
+        activity_path.clone(),
+    )
+    .await?
+    {
+        jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
     }
     Ok(())
+}
+
+async fn jump_to_pane_logged(pane_id: &str, activity_path: Option<&Path>) {
+    let should_log_attach = muxa::default_backend().kind() == muxa::HostKind::Tmux
+        && !tmux::inside_tmux()
+        && activity_path.is_some();
+    let target = should_log_attach
+        .then(|| tmux_interaction_target(pane_id))
+        .flatten();
+    let started_at = OffsetDateTime::now_utc();
+    jump_to_pane(pane_id);
+    let ended_at = OffsetDateTime::now_utc();
+
+    let (Some(path), Some((session_id, session_name))) = (activity_path, target) else {
+        return;
+    };
+    if (ended_at - started_at).whole_seconds() <= 0 {
+        return;
+    }
+    let entry =
+        ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+            kind: HumanInteractionKind::TmuxAttach,
+            pane: Some(pane_id.to_string()),
+            session_id,
+            session_name,
+            started_at,
+            ended_at,
+        }));
+    if let Err(e) = muxa::activity::append_entry(path, &entry).await {
+        tracing::warn!(error = %e, path = %path.display(), "could not append tmux attach interval");
+    }
+}
+
+fn tmux_interaction_target(pane_id: &str) -> Option<(Option<String>, Option<String>)> {
+    let pane = tmux::resolve_pane(pane_id)?;
+    let session_id = tmux::list_sessions().ok().and_then(|sessions| {
+        sessions
+            .into_iter()
+            .find(|session| session.name == pane.session)
+            .map(|session| session.session_id)
+    });
+    Some((session_id, Some(pane.session)))
 }
 
 /// Attach the user to `pane_id`. Handles two cases:

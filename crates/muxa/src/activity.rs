@@ -25,6 +25,7 @@ pub const ACTIVITY_SCHEMA_VERSION: u32 = 1;
 pub enum ActivityEntry {
     StateTransition(StateTransitionEntry),
     SessionForeground(SessionForegroundEntry),
+    HumanInteraction(HumanInteractionEntry),
 }
 
 impl ActivityEntry {
@@ -32,6 +33,7 @@ impl ActivityEntry {
         match self {
             Self::StateTransition(e) => e.v,
             Self::SessionForeground(e) => e.v,
+            Self::HumanInteraction(e) => e.v,
         }
     }
 
@@ -39,6 +41,7 @@ impl ActivityEntry {
         match self {
             Self::StateTransition(e) => e.at,
             Self::SessionForeground(e) => e.ended_at,
+            Self::HumanInteraction(e) => e.ended_at,
         }
     }
 }
@@ -135,6 +138,65 @@ impl SessionForegroundEntry {
             v: ACTIVITY_SCHEMA_VERSION,
             session_id: session_id.into(),
             session_name: session_name.into(),
+            started_at,
+            ended_at,
+            duration_secs: duration_secs(started_at, ended_at),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanInteractionKind {
+    MuxaWatch,
+    MuxaPromptInput,
+    TmuxAttach,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInteractionEntry {
+    #[serde(default)]
+    pub v: u32,
+    pub kind: HumanInteractionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ended_at: OffsetDateTime,
+    pub duration_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanInteractionInput {
+    pub kind: HumanInteractionKind,
+    pub pane: Option<String>,
+    pub session_id: Option<String>,
+    pub session_name: Option<String>,
+    pub started_at: OffsetDateTime,
+    pub ended_at: OffsetDateTime,
+}
+
+impl HumanInteractionEntry {
+    pub fn new(input: HumanInteractionInput) -> Self {
+        let HumanInteractionInput {
+            kind,
+            pane,
+            session_id,
+            session_name,
+            started_at,
+            ended_at,
+        } = input;
+        Self {
+            v: ACTIVITY_SCHEMA_VERSION,
+            kind,
+            pane,
+            session_id,
+            session_name,
             started_at,
             ended_at,
             duration_secs: duration_secs(started_at, ended_at),
@@ -267,6 +329,17 @@ pub async fn load(path: &Path) -> std::io::Result<Vec<ActivityEntry>> {
         debug!(skipped, path = %path.display(), "skipped unreadable activity lines");
     }
     Ok(out)
+}
+
+pub async fn append_entry(path: &Path, entry: &ActivityEntry) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    let mut file = open_appender(path).await?;
+    write_one(&mut file, entry).await?;
+    file.flush().await
 }
 
 async fn run_writer(
@@ -404,6 +477,22 @@ mod tests {
         assert_eq!(entry.duration_secs, 5);
     }
 
+    #[test]
+    fn human_interaction_computes_duration() {
+        let entry = HumanInteractionEntry::new(HumanInteractionInput {
+            kind: HumanInteractionKind::MuxaPromptInput,
+            pane: Some("%1".into()),
+            session_id: Some("$1".into()),
+            session_name: Some("main".into()),
+            started_at: datetime!(2026-05-31 00:00:00 UTC),
+            ended_at: datetime!(2026-05-31 00:00:42 UTC),
+        });
+
+        assert_eq!(entry.duration_secs, 42);
+        assert_eq!(entry.kind, HumanInteractionKind::MuxaPromptInput);
+        assert_eq!(entry.session_name.as_deref(), Some("main"));
+    }
+
     #[tokio::test]
     async fn disk_roundtrip_skips_unknown_schema() {
         let tmp = tempfile::tempdir().unwrap();
@@ -412,6 +501,8 @@ mod tests {
             &path,
             concat!(
                 r#"{"type":"session_foreground","v":1,"session_id":"$1","session_name":"main","started_at":"2026-05-31T00:00:00Z","ended_at":"2026-05-31T00:00:05Z","duration_secs":5}"#,
+                "\n",
+                r#"{"type":"human_interaction","v":1,"kind":"muxa_prompt_input","pane":"%1","session_id":"$1","session_name":"main","started_at":"2026-05-31T00:00:00Z","ended_at":"2026-05-31T00:00:03Z","duration_secs":3}"#,
                 "\n",
                 r#"{"type":"session_foreground","v":999,"session_id":"$2","session_name":"old","started_at":"2026-05-31T00:00:00Z","ended_at":"2026-05-31T00:00:05Z","duration_secs":5}"#,
                 "\n",
@@ -422,6 +513,26 @@ mod tests {
         .unwrap();
 
         let entries = load(&path).await.unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn append_entry_writes_one_ndjson_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let entry =
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaWatch,
+                pane: Some("%1".into()),
+                session_id: Some("$1".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-31 00:00:00 UTC),
+                ended_at: datetime!(2026-05-31 00:00:05 UTC),
+            }));
+
+        append_entry(&path, &entry).await.unwrap();
+
+        let entries = load(&path).await.unwrap();
+        assert_eq!(entries, vec![entry]);
     }
 }

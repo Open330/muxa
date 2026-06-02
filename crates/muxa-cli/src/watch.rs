@@ -5,7 +5,8 @@
 //! events:
 //!
 //! - Navigation: `q`/`Esc`/`Ctrl-C` to quit, `r` to force-refresh, `↑/↓`
-//!   or `j/k` for selection, `Enter` to attach into the selected pane.
+//!   or `j/k` for selection, `Enter` to prompt the selected pane
+//!   (`Enter` again on an empty prompt attaches).
 //! - Inspection: `p` pops open a full-screen preview of the selected
 //!   row's prompt and response (`q`/`Esc`/`p` returns to the table).
 //! - Quick actions (act on the selected row): `c` copies the last
@@ -20,7 +21,7 @@
 
 use std::future::Future;
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,7 @@ use muxa::ipc::{Client, RuntimeError};
 use muxa::session_activity::SessionActivity;
 use muxa::state::Agent;
 use muxa::tmux::{PaneInfo, SessionInfo};
+use muxa::{ActivityEntry, HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind};
 use muxa::{AgentKind, AgentState};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -451,6 +453,10 @@ pub(crate) enum QuickAction {
     /// String is the prompt body; the dispatcher tries pbcopy / wl-copy
     /// / xclip in order and falls back to a temp file if none work.
     CopyPrompt(String),
+    /// Send a freshly-authored prompt straight into the selected pane.
+    /// The dispatcher writes the text literally, then sends Enter as a
+    /// separate key so the target agent submits it.
+    SendPrompt { pane_id: String, text: String },
     /// Toggle the `?` help overlay. Pure UI — no side-effects.
     ShowHelp,
 }
@@ -488,6 +494,9 @@ pub(crate) trait Effects {
     /// `tmpfile:<path>` if all helpers were missing and we wrote a
     /// fallback file. `Err()` when even the fallback failed.
     fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String>;
+    /// Send `text` to `pane_id` as literal terminal input, then press
+    /// Enter. Return Ok only if both tmux calls succeed.
+    fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String>;
 }
 
 /// Real-world `Effects` impl — shells out to tmux and the system
@@ -501,6 +510,11 @@ impl Effects for RealEffects {
 
     fn send_ctrl_c(&mut self, pane_id: &str) -> std::result::Result<(), String> {
         run_status("tmux", &["send-keys", "-t", pane_id, "C-c"])
+    }
+
+    fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String> {
+        run_status("tmux", &["send-keys", "-t", pane_id, "-l", "--", text])?;
+        run_status("tmux", &["send-keys", "-t", pane_id, "Enter"])
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String> {
@@ -663,6 +677,10 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             Ok(via) => ActionOutcome::Ok(format!("✔ copied prompt via {via}")),
             Err(e) => ActionOutcome::Err(format!("✗ copy failed: {e}")),
         },
+        QuickAction::SendPrompt { pane_id, text } => match fx.send_prompt(&pane_id, &text) {
+            Ok(()) => ActionOutcome::Ok(format!("✔ sent prompt to {pane_id}")),
+            Err(e) => ActionOutcome::Err(format!("✗ send failed: {e}")),
+        },
         QuickAction::ShowHelp => ActionOutcome::HelpToggled,
     }
 }
@@ -693,7 +711,8 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "Navigation",
         "  ↑ / k          move selection up",
         "  ↓ / j          move selection down",
-        "  Enter          attach to selected pane",
+        "  Enter          compose prompt for selected pane",
+        "  empty Enter    attach to selected pane",
         "  r              force refresh",
         "  q / Esc        quit",
         "",
@@ -701,6 +720,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  p              open preview overlay",
         "  f              (in preview) toggle popup ↔ fullscreen",
         "  c              (in preview) toggle prompt ↔ live pane",
+        "  Enter          (in preview) compose prompt",
         "",
         "Sorting",
         "  s              sort by session name",
@@ -715,8 +735,6 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  c              copy last prompt to clipboard",
         "  K              kill the pane (Shift — confirm popup)",
         "  R              abort current turn (Shift — confirm popup)",
-        "",
-        "Help",
         "  ?              toggle this overlay",
     ]
 }
@@ -740,6 +758,80 @@ pub(crate) struct ConfirmPopup {
     /// re-resolving the selected row (which might have moved between
     /// the popup opening and the user's reply).
     pub on_confirm: QuickAction,
+}
+
+/// Inline prompt composer opened from the table with Enter. It pins the
+/// target pane at open time so background refreshes or resorting cannot
+/// redirect a typed prompt to a different row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptPopup {
+    pub pane_id: String,
+    pub label: String,
+    pub input: String,
+    /// Cursor position in chars, not bytes, so editing non-ASCII prompt
+    /// text stays safe.
+    pub cursor: usize,
+}
+
+impl PromptPopup {
+    fn new(pane_id: String, label: String) -> Self {
+        Self {
+            pane_id,
+            label,
+            input: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn insert(&mut self, c: char) {
+        let idx = char_to_byte_idx(&self.input, self.cursor);
+        self.input.insert(idx, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, self.cursor - 1);
+        let end = char_to_byte_idx(&self.input, self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, self.cursor);
+        let end = char_to_byte_idx(&self.input, self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.input.chars().count());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+}
+
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_idx)
+        .map_or_else(|| s.len(), |(idx, _)| idx)
 }
 
 /// A transient hint pinned to the footer for ~2 s after a quick action
@@ -827,6 +919,9 @@ pub(crate) struct App {
     /// the input handler resolves the popup before any other key is
     /// interpreted.
     pub confirm: Option<ConfirmPopup>,
+    /// `Some` while the user is composing a prompt to send directly to
+    /// the selected pane. Steals table input until submitted or canceled.
+    pub prompt: Option<PromptPopup>,
     /// True while the `?` help overlay is visible. Renders as a centred
     /// popup listing every keybinding — the same pattern as `confirm`,
     /// just with a static body and no follow-up dispatch.
@@ -959,6 +1054,7 @@ impl App {
             paneless_hidden: 0,
             pane_capture: None,
             confirm: None,
+            prompt: None,
             help_open: false,
             footer_hint: None,
         }
@@ -2127,6 +2223,7 @@ pub async fn run(
     client: &Client,
     watch_cfg: WatchConfig,
     session_activity_path: Option<PathBuf>,
+    activity_path: Option<PathBuf>,
 ) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
@@ -2139,7 +2236,10 @@ pub async fn run(
     // When invoked from inside a host (tmux / zellij), land the cursor
     // on the user's current pane on first load instead of always
     // row 0.
-    app.set_initial_pane(backend.current_pane());
+    let initial_pane = backend.current_pane();
+    app.set_initial_pane(initial_pane.clone());
+    let watch_started_at = OffsetDateTime::now_utc();
+    let mut prompt_started_at: Option<(OffsetDateTime, String)> = None;
 
     // Paint the first frame **before** any IPC. The popup
     // (`prefix + s` → `display-popup -E muxa watch`) becomes visible
@@ -2240,12 +2340,22 @@ pub async fn run(
                     quit = true;
                     break;
                 }
-                Action::Attach => {
-                    if let Some(pane) = app.selected_pane() {
-                        jump_target = Some(pane);
-                        quit = true;
-                        break;
+                Action::AttachPane(pane) => {
+                    if let Some((started_at, prompt_pane)) = prompt_started_at.take() {
+                        append_human_interaction(
+                            activity_path.as_deref(),
+                            HumanInteractionKind::MuxaPromptInput,
+                            &app,
+                            Some(&prompt_pane),
+                            started_at,
+                            OffsetDateTime::now_utc(),
+                        )
+                        .await;
                     }
+                    app.prompt = None;
+                    jump_target = Some(pane);
+                    quit = true;
+                    break;
                 }
                 Action::Refresh => {
                     // Coalesce repeated `r` mashes: if the wake slot is
@@ -2309,6 +2419,48 @@ pub async fn run(
                 }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
+                }
+                Action::OpenPrompt(popup) => {
+                    prompt_started_at = Some((OffsetDateTime::now_utc(), popup.pane_id.clone()));
+                    app.prompt = Some(popup);
+                }
+                Action::SubmitPrompt => {
+                    if let Some(popup) = app.prompt.take() {
+                        if let Some((started_at, pane_id)) = prompt_started_at.take() {
+                            append_human_interaction(
+                                activity_path.as_deref(),
+                                HumanInteractionKind::MuxaPromptInput,
+                                &app,
+                                Some(&pane_id),
+                                started_at,
+                                OffsetDateTime::now_utc(),
+                            )
+                            .await;
+                        }
+                        let mut fx = RealEffects;
+                        let outcome = dispatch_quick_action(
+                            QuickAction::SendPrompt {
+                                pane_id: popup.pane_id,
+                                text: popup.input,
+                            },
+                            &mut fx,
+                        );
+                        apply_outcome_to_app(&mut app, outcome);
+                    }
+                }
+                Action::CancelPrompt => {
+                    if let Some((started_at, pane_id)) = prompt_started_at.take() {
+                        append_human_interaction(
+                            activity_path.as_deref(),
+                            HumanInteractionKind::MuxaPromptInput,
+                            &app,
+                            Some(&pane_id),
+                            started_at,
+                            OffsetDateTime::now_utc(),
+                        )
+                        .await;
+                    }
+                    app.prompt = None;
                 }
                 Action::ConfirmYes => {
                     if let Some(popup) = app.confirm.take() {
@@ -2384,6 +2536,29 @@ pub async fn run(
         }
     }
 
+    if let Some((started_at, pane_id)) = prompt_started_at.take() {
+        append_human_interaction(
+            activity_path.as_deref(),
+            HumanInteractionKind::MuxaPromptInput,
+            &app,
+            Some(&pane_id),
+            started_at,
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+    }
+
+    let watch_pane = app.selected_pane().or(initial_pane);
+    append_human_interaction(
+        activity_path.as_deref(),
+        HumanInteractionKind::MuxaWatch,
+        &app,
+        watch_pane.as_deref(),
+        watch_started_at,
+        OffsetDateTime::now_utc(),
+    )
+    .await;
+
     // Drop the wake sender so refresh_task's `wake.recv()` returns None
     // on its next iteration; then await the join so we don't leak a task.
     //
@@ -2404,6 +2579,51 @@ pub async fn run(
     Ok(jump_target)
 }
 
+async fn append_human_interaction(
+    path: Option<&Path>,
+    kind: HumanInteractionKind,
+    app: &App,
+    pane_id: Option<&str>,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    if ended_at <= started_at {
+        return;
+    }
+    let (session_id, session_name) = interaction_session(app, pane_id);
+    let entry =
+        ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+            kind,
+            pane: pane_id.map(str::to_string),
+            session_id,
+            session_name,
+            started_at,
+            ended_at,
+        }));
+    if let Err(e) = muxa::activity::append_entry(path, &entry).await {
+        tracing::warn!(error = %e, path = %path.display(), "could not append human interaction");
+    }
+}
+
+fn interaction_session(app: &App, pane_id: Option<&str>) -> (Option<String>, Option<String>) {
+    let session_name = pane_id.and_then(|id| {
+        app.panes
+            .iter()
+            .find(|pane| pane.pane_id == id)
+            .map(|pane| pane.session.clone())
+    });
+    let session_id = session_name.as_deref().and_then(|name| {
+        app.sessions
+            .iter()
+            .find(|session| session.name == name)
+            .map(|session| session.session_id.clone())
+    });
+    (session_id, session_name)
+}
+
 /// Pull every event already sitting in the OS-side terminal input
 /// buffer without ever blocking. `poll(Duration::ZERO)` returns
 /// immediately; we keep reading until nothing is left. Safe to call
@@ -2421,8 +2641,8 @@ pub(crate) enum Action {
     None,
     Quit,
     Refresh,
-    /// Attach to the currently-selected pane.
-    Attach,
+    /// Attach to a pane that was pinned by an overlay.
+    AttachPane(String),
     /// Pop open the preview overlay for the selected row.
     OpenPreview,
     /// Close the preview overlay and return to the table.
@@ -2434,6 +2654,12 @@ pub(crate) enum Action {
     TogglePreviewContent,
     /// Change the table's primary sort while staying inside the watch TUI.
     SetSort(WatchSortPreset),
+    /// Open the inline prompt composer for the selected pane.
+    OpenPrompt(PromptPopup),
+    /// Submit the active inline prompt.
+    SubmitPrompt,
+    /// Cancel the active inline prompt and return to the table.
+    CancelPrompt,
     /// Open a confirm popup for a destructive [`QuickAction`]. The
     /// popup itself is interpreted by the input loop; the action only
     /// dispatches when the user answers `y`.
@@ -2490,6 +2716,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         };
     }
 
+    if let Some(prompt) = app.prompt.as_mut() {
+        return handle_prompt_event(code, modifiers, prompt);
+    }
+
     // Help overlay: `?` toggles it; `q` / `Esc` close it. Anything
     // else passes through but is ignored — we don't want `c` while
     // the overlay is open to silently copy a prompt the user can't
@@ -2501,45 +2731,14 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         };
     }
 
-    // Preview mode: arrow keys scroll the overlay instead of moving the
-    // table cursor; quit/back collapses the overlay rather than the app.
-    // We mutate `app.preview` inline (mirroring how table-mode arrows
-    // mutate `table_state` directly) so the run loop only has to handle
-    // open/close transitions.
-    if let Some(preview) = app.preview.as_mut() {
-        return match code {
-            KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
-            KeyCode::Char('f') => Action::TogglePreviewMode,
-            KeyCode::Char('c') => Action::TogglePreviewContent,
-            KeyCode::Char('r') => Action::Refresh,
-            KeyCode::Down | KeyCode::Char('j') => {
-                preview.scroll = preview.scroll.saturating_add(1);
-                Action::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                preview.scroll = preview.scroll.saturating_sub(1);
-                Action::None
-            }
-            KeyCode::PageDown => {
-                preview.scroll = preview.scroll.saturating_add(10);
-                Action::None
-            }
-            KeyCode::PageUp => {
-                preview.scroll = preview.scroll.saturating_sub(10);
-                Action::None
-            }
-            KeyCode::Home => {
-                preview.scroll = 0;
-                Action::None
-            }
-            _ => Action::None,
-        };
+    if app.preview.is_some() {
+        return handle_preview_event(code, app);
     }
 
     match code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Char('r') => Action::Refresh,
-        KeyCode::Enter => Action::Attach,
+        KeyCode::Enter => quick_prompt_action(app),
         KeyCode::Char('p') => Action::OpenPreview,
         KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
         KeyCode::Char('s') => Action::SetSort(WatchSortPreset::Session),
@@ -2560,6 +2759,93 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_up();
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+/// Prompt composer steals table input until submitted or canceled. An
+/// empty Enter is the intentional "Enter twice to attach" path.
+fn handle_prompt_event(code: KeyCode, modifiers: KeyModifiers, prompt: &mut PromptPopup) -> Action {
+    match code {
+        KeyCode::Esc => Action::CancelPrompt,
+        KeyCode::Enter => {
+            if prompt.input.trim().is_empty() {
+                Action::AttachPane(prompt.pane_id.clone())
+            } else {
+                Action::SubmitPrompt
+            }
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            prompt.insert(c);
+            Action::None
+        }
+        KeyCode::Backspace => {
+            prompt.backspace();
+            Action::None
+        }
+        KeyCode::Delete => {
+            prompt.delete();
+            Action::None
+        }
+        KeyCode::Left => {
+            prompt.move_left();
+            Action::None
+        }
+        KeyCode::Right => {
+            prompt.move_right();
+            Action::None
+        }
+        KeyCode::Home => {
+            prompt.move_home();
+            Action::None
+        }
+        KeyCode::End => {
+            prompt.move_end();
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+/// Preview mode scrolls the overlay instead of the table and opens the
+/// prompt composer against the preview-pinned pane, not the table cursor.
+fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
+    if matches!(code, KeyCode::Enter) {
+        let pane_id = app
+            .preview
+            .as_ref()
+            .expect("preview present")
+            .pane_id
+            .clone();
+        return Action::OpenPrompt(PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id)));
+    }
+
+    let preview = app.preview.as_mut().expect("preview present");
+    match code {
+        KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
+        KeyCode::Char('f') => Action::TogglePreviewMode,
+        KeyCode::Char('c') => Action::TogglePreviewContent,
+        KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Down | KeyCode::Char('j') => {
+            preview.scroll = preview.scroll.saturating_add(1);
+            Action::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            preview.scroll = preview.scroll.saturating_sub(1);
+            Action::None
+        }
+        KeyCode::PageDown => {
+            preview.scroll = preview.scroll.saturating_add(10);
+            Action::None
+        }
+        KeyCode::PageUp => {
+            preview.scroll = preview.scroll.saturating_sub(10);
+            Action::None
+        }
+        KeyCode::Home => {
+            preview.scroll = 0;
             Action::None
         }
         _ => Action::None,
@@ -2629,6 +2915,17 @@ pub(crate) fn quick_abort_action(app: &App) -> Action {
     }
 }
 
+/// Resolve table-mode Enter. First Enter opens the inline composer; a
+/// second Enter inside that empty composer attaches to this pinned pane.
+pub(crate) fn quick_prompt_action(app: &App) -> Action {
+    match app.selected_pane() {
+        Some(pane_id) => {
+            Action::OpenPrompt(PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id)))
+        }
+        None => Action::NotApplicable("send: no tmux pane on this row"),
+    }
+}
+
 /// Resolve `c` (copy last prompt). Non-destructive, so no confirm —
 /// dispatches straight to `Quick`. Vetoes when there's no
 /// prompt to copy so the user gets a hint instead of a silent no-op.
@@ -2677,10 +2974,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // help (handled by `handle_event`'s mode gates) so we render
     // whichever is active without worrying about z-order between them.
     if app.help_open {
-        // 60 × 90 % — the help body is ~29 lines tall, so 70 % on a
-        // 24-row terminal would clip the bottom sections. 90 %
-        // leaves enough room for the full keybinding matrix while
-        // still framing it as a popup rather than full-screen.
+        // 60 × 90 % — the help body is the complete keybinding matrix.
+        // Keeping it inside the table chunk preserves the surrounding
+        // context and leaves the footer untouched.
         let popup_area = centered_rect(60, 90, chunks[1]);
         f.render_widget(Clear, popup_area);
         render_help(f, popup_area);
@@ -2694,6 +2990,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         let popup_area = centered_rect(50, 30, chunks[1]);
         f.render_widget(Clear, popup_area);
         render_confirm(f, popup_area, app);
+    }
+    if app.prompt.is_some() {
+        let popup_area = bottom_prompt_rect(chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_prompt(f, popup_area, app);
     }
     render_footer(f, chunks[2], app);
 }
@@ -2785,6 +3086,94 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
     ];
     let paragraph = Paragraph::new(body).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Render the inline prompt composer as a compact bottom bar. The cursor
+/// is placed on the input line rather than drawn as text, so wide and
+/// non-ASCII characters keep their normal terminal behavior.
+fn render_prompt(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let popup = app.prompt.as_ref().expect("render_prompt without prompt");
+    let title = format!(" send · {} ", popup.label);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let visible_input = truncate_prompt_input(&popup.input, inner.width.saturating_sub(2) as usize);
+    let body = vec![Line::from(vec![
+        Span::raw("> "),
+        Span::raw(visible_input.text.clone()),
+    ])];
+    let paragraph = Paragraph::new(body).block(block);
+    f.render_widget(paragraph, area);
+
+    let cursor_visible = popup.cursor.saturating_sub(visible_input.skipped_chars);
+    let before_cursor: String = visible_input.text.chars().take(cursor_visible).collect();
+    let before_cursor_width = u16::try_from(before_cursor.width()).unwrap_or(u16::MAX);
+    let cursor_x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(before_cursor_width);
+    let cursor_y = inner.y;
+    if cursor_x < inner.x.saturating_add(inner.width)
+        && cursor_y < inner.y.saturating_add(inner.height)
+    {
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+/// Prompt input should feel like a command bar, not a modal dialog: it
+/// hugs the bottom of the current content area and consumes only the
+/// border plus one editable line.
+fn bottom_prompt_rect(r: Rect) -> Rect {
+    let height = r.height.min(3);
+    Rect {
+        x: r.x,
+        y: r.y.saturating_add(r.height.saturating_sub(height)),
+        width: r.width,
+        height,
+    }
+}
+
+struct VisiblePromptInput {
+    text: String,
+    skipped_chars: usize,
+}
+
+fn truncate_prompt_input(input: &str, max_width: usize) -> VisiblePromptInput {
+    use unicode_width::UnicodeWidthStr;
+
+    if input.width() <= max_width {
+        return VisiblePromptInput {
+            text: input.to_string(),
+            skipped_chars: 0,
+        };
+    }
+    let mut chars: Vec<char> = input.chars().collect();
+    let mut skipped = 0;
+    while !chars.is_empty() {
+        let candidate: String = chars.iter().collect();
+        if candidate.width() < max_width {
+            return VisiblePromptInput {
+                text: format!("…{candidate}"),
+                skipped_chars: skipped,
+            };
+        }
+        chars.remove(0);
+        skipped += 1;
+    }
+    VisiblePromptInput {
+        text: "…".into(),
+        skipped_chars: skipped,
+    }
 }
 
 /// Compute a centred sub-rect of `r` sized as `percent_x` × `percent_y`
@@ -3582,43 +3971,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    // Preview mode rebinds the table-mode keybinds to their preview-pane
-    // analogues — clearer for the user than leaving the same hint strings
-    // up while the keys behave differently. The `f` hint label flips with
-    // the mode so the user knows what tapping it will do.
+    if app.prompt.is_some() {
+        render_prompt_footer(f, area);
+        return;
+    }
+
     if let Some(preview) = app.preview.as_ref() {
-        let toggle_label = match preview.mode {
-            PreviewMode::Popup => " fullscreen  ",
-            PreviewMode::Fullscreen => " popup  ",
-        };
-        // Content toggle reads as the *target* state (where `c` would
-        // take you) so the hint stays actionable rather than describing
-        // where you already are.
-        let content_label = match preview.content {
-            PreviewContent::PromptResponse => " live pane  ",
-            PreviewContent::LivePane => " prompt  ",
-        };
-        let spans = vec![
-            Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
-            Span::raw(" scroll  "),
-            Span::styled(
-                " PgUp/PgDn ",
-                Style::default().fg(Color::Black).bg(Color::Gray),
-            ),
-            Span::raw(" page  "),
-            Span::styled(" f ", Style::default().fg(Color::Black).bg(Color::Gray)),
-            Span::raw(toggle_label),
-            Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Gray)),
-            Span::raw(content_label),
-            Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
-            Span::raw(" refresh  "),
-            Span::styled(
-                " p/q/Esc ",
-                Style::default().fg(Color::Black).bg(Color::Gray),
-            ),
-            Span::raw(" back"),
-        ];
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        render_preview_footer(f, area, preview);
         return;
     }
 
@@ -3626,6 +3985,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" move  "),
         Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::raw(" prompt  "),
+        Span::styled(" ⏎⏎ ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" attach  "),
         Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" preview  "),
@@ -3669,6 +4030,60 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_prompt_footer(f: &mut Frame, area: Rect) {
+    let spans = vec![
+        Span::styled(
+            " Enter ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ),
+        Span::raw(" send  "),
+        Span::styled(
+            " empty Enter ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" attach  "),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" cancel"),
+    ];
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState) {
+    // Preview mode rebinds the table-mode keybinds to their preview-pane
+    // analogues. Toggle labels describe where the next keypress goes.
+    let toggle_label = match preview.mode {
+        PreviewMode::Popup => " fullscreen  ",
+        PreviewMode::Fullscreen => " popup  ",
+    };
+    let content_label = match preview.content {
+        PreviewContent::PromptResponse => " live pane  ",
+        PreviewContent::LivePane => " prompt  ",
+    };
+    let spans = vec![
+        Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" scroll  "),
+        Span::styled(
+            " PgUp/PgDn ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" page  "),
+        Span::styled(" f ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(toggle_label),
+        Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(content_label),
+        Span::styled(" ⏎ ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::raw(" prompt  "),
+        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" refresh  "),
+        Span::styled(
+            " p/q/Esc ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" back"),
+    ];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -5520,10 +5935,9 @@ mod tests {
             )],
             vec![],
         );
-        // Existing Action::Attach branch is `if let Some(pane) = ...`,
-        // so returning None here is what causes Enter to silently no-op.
-        // The footer hint added above is the user-facing fix; this
-        // assertion just nails down the underlying contract.
+        // Table-mode Enter resolves through `selected_pane`; returning
+        // None here is what lets the input handler surface a "no pane"
+        // hint instead of opening the prompt composer.
         assert_eq!(app.selected_pane(), None);
     }
 
@@ -6521,7 +6935,10 @@ mod tests {
             Action::None
             | Action::Quit
             | Action::Refresh
-            | Action::Attach
+            | Action::AttachPane(_)
+            | Action::OpenPrompt(_)
+            | Action::SubmitPrompt
+            | Action::CancelPrompt
             | Action::AskConfirm(_)
             | Action::ConfirmYes
             | Action::ConfirmCancel
@@ -6573,6 +6990,33 @@ mod tests {
                 matches!(action, Action::ClosePreview),
                 "key {key:?} must request ClosePreview while in preview mode"
             );
+        }
+    }
+
+    #[test]
+    fn preview_enter_opens_prompt_for_pinned_pane() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.panes = vec![fake_pane("%1", "alpha", 0, 0, "claude")];
+        // Select a different table row to prove Enter targets the
+        // preview-pinned pane, not whatever the table cursor says now.
+        app.table_state.select(Some(2));
+        app.preview = Some(PreviewState {
+            pane_id: "%1".into(),
+            scroll: 0,
+            mode: PreviewMode::Popup,
+            content: PreviewContent::PromptResponse,
+        });
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        match action {
+            Action::OpenPrompt(popup) => {
+                assert_eq!(popup.pane_id, "%1");
+                assert_eq!(popup.label, "alpha:0.0");
+            }
+            other => panic!("expected OpenPrompt, got {other:?}"),
         }
     }
 
@@ -6821,6 +7265,15 @@ mod tests {
             left.abs_diff(right) <= 1,
             "popup must be horizontally centred (left={left}, right={right})"
         );
+    }
+
+    #[test]
+    fn bottom_prompt_rect_hugs_parent_bottom() {
+        let parent = Rect::new(2, 3, 100, 10);
+        assert_eq!(bottom_prompt_rect(parent), Rect::new(2, 10, 100, 3));
+
+        let short = Rect::new(2, 3, 100, 2);
+        assert_eq!(bottom_prompt_rect(short), short);
     }
 
     /// `c` toggles the preview content axis: `PromptResponse` → `LivePane`
@@ -7084,9 +7537,11 @@ mod tests {
         kill_calls: Vec<String>,
         ctrl_c_calls: Vec<String>,
         copy_calls: Vec<String>,
+        send_prompt_calls: Vec<(String, String)>,
         kill_result: Option<std::result::Result<(), String>>,
         ctrl_c_result: Option<std::result::Result<(), String>>,
         copy_result: Option<std::result::Result<String, String>>,
+        send_prompt_result: Option<std::result::Result<(), String>>,
     }
 
     impl Effects for RecorderEffects {
@@ -7103,6 +7558,11 @@ mod tests {
             self.copy_result
                 .clone()
                 .unwrap_or_else(|| Ok("pbcopy".into()))
+        }
+        fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String> {
+            self.send_prompt_calls
+                .push((pane_id.to_string(), text.to_string()));
+            self.send_prompt_result.clone().unwrap_or(Ok(()))
         }
     }
 
@@ -7232,6 +7692,142 @@ mod tests {
     }
 
     #[test]
+    fn enter_opens_prompt_composer_for_selected_pane() {
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .expect("test fixture must include a pane-bearing row");
+        app.table_state.select(Some(pane_idx));
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        match action {
+            Action::OpenPrompt(popup) => {
+                assert_eq!(popup.pane_id, "%42");
+                assert_eq!(popup.label, "main:2.0");
+                assert!(popup.input.is_empty());
+            }
+            other => panic!("expected OpenPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_paneless_row_hints_instead_of_opening_prompt() {
+        let mut app = app_with_paneless_and_pane();
+        let paneless_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.is_none()))
+            .expect("test fixture must include a paneless row");
+        app.table_state.select(Some(paneless_idx));
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(
+            matches!(action, Action::NotApplicable(msg) if msg.contains("no tmux pane")),
+            "Enter on a paneless row must yield NotApplicable, got something else"
+        );
+    }
+
+    #[test]
+    fn prompt_composer_edits_and_submits_prompt() {
+        let mut app = app_with_paneless_and_pane();
+        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
+
+        for c in ['h', 'e', 'l', 'o'] {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        assert!(matches!(key_action(&mut app, 'l'), Action::None));
+        assert_eq!(app.prompt.as_ref().unwrap().input, "hello");
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::SubmitPrompt));
+        let popup = app.prompt.take().unwrap();
+        let mut fx = RecorderEffects::default();
+        let outcome = dispatch_quick_action(
+            QuickAction::SendPrompt {
+                pane_id: popup.pane_id,
+                text: popup.input,
+            },
+            &mut fx,
+        );
+        assert_eq!(fx.send_prompt_calls, vec![("%42".into(), "hello".into())]);
+        assert!(matches!(outcome, ActionOutcome::Ok(msg) if msg.contains("sent prompt")));
+    }
+
+    #[test]
+    fn empty_prompt_enter_attaches_pinned_pane() {
+        let mut app = app_with_paneless_and_pane();
+        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::AttachPane(pane) if pane == "%42"));
+    }
+
+    #[test]
+    fn prompt_escape_cancels_composer() {
+        let mut app = app_with_paneless_and_pane();
+        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::CancelPrompt));
+    }
+
+    #[test]
+    fn prompt_composer_renders_as_compact_bottom_bar() {
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_paneless_and_pane();
+        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
+        if let Some(prompt) = app.prompt.as_mut() {
+            prompt.input = "hello".into();
+            prompt.cursor = prompt.input.chars().count();
+        }
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((8, 9));
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            row_text(buf, 8).contains("send · main:2.0"),
+            "prompt title must sit at the bottom edge of the content area"
+        );
+        assert!(
+            row_text(buf, 9).contains("> hello"),
+            "prompt input should be a single compact editable line"
+        );
+        let dump: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !dump.contains("target:"),
+            "old multi-line prompt body must not come back"
+        );
+    }
+
+    #[test]
     fn confirm_popup_y_proceeds() {
         // Drives the popup state machine end-to-end: open the popup
         // via `K`, press `y`, observe that ConfirmYes lands and that
@@ -7336,7 +7932,8 @@ mod tests {
                         Navigation\n\
                         \x20\x20↑ / k          move selection up\n\
                         \x20\x20↓ / j          move selection down\n\
-                        \x20\x20Enter          attach to selected pane\n\
+                        \x20\x20Enter          compose prompt for selected pane\n\
+                        \x20\x20empty Enter    attach to selected pane\n\
                         \x20\x20r              force refresh\n\
                         \x20\x20q / Esc        quit\n\
                         \n\
@@ -7344,6 +7941,7 @@ mod tests {
                         \x20\x20p              open preview overlay\n\
                         \x20\x20f              (in preview) toggle popup ↔ fullscreen\n\
                         \x20\x20c              (in preview) toggle prompt ↔ live pane\n\
+                        \x20\x20Enter          (in preview) compose prompt\n\
                         \n\
                         Sorting\n\
                         \x20\x20s              sort by session name\n\
@@ -7358,8 +7956,6 @@ mod tests {
                         \x20\x20c              copy last prompt to clipboard\n\
                         \x20\x20K              kill the pane (Shift — confirm popup)\n\
                         \x20\x20R              abort current turn (Shift — confirm popup)\n\
-                        \n\
-                        Help\n\
                         \x20\x20?              toggle this overlay";
         assert_eq!(body, expected);
     }
@@ -7469,6 +8065,45 @@ mod tests {
                 assert!(msg.contains("no clipboard tool"));
             }
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_send_prompt_calls_effects_and_reports_pane_id() {
+        let mut fx = RecorderEffects::default();
+        let outcome = dispatch_quick_action(
+            QuickAction::SendPrompt {
+                pane_id: "%99".into(),
+                text: "continue".into(),
+            },
+            &mut fx,
+        );
+        assert_eq!(
+            fx.send_prompt_calls,
+            vec![("%99".into(), "continue".into())]
+        );
+        assert!(matches!(outcome, ActionOutcome::Ok(msg) if msg.contains("%99")));
+    }
+
+    #[test]
+    fn dispatch_send_prompt_reports_failure_with_message() {
+        let mut fx = RecorderEffects {
+            send_prompt_result: Some(Err("tmux exited with 1".into())),
+            ..Default::default()
+        };
+        let outcome = dispatch_quick_action(
+            QuickAction::SendPrompt {
+                pane_id: "%99".into(),
+                text: "continue".into(),
+            },
+            &mut fx,
+        );
+        match outcome {
+            ActionOutcome::Err(msg) => {
+                assert!(msg.contains("send failed"));
+                assert!(msg.contains("tmux exited with 1"));
+            }
+            other => panic!("expected Err, got {other:?}"),
         }
     }
 
