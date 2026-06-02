@@ -23,6 +23,24 @@ muxa activity --since today --type agent --format json
 - RFC3339 timestamp: 해당 시각 이후 전체.
 - `all`: 보관 중인 모든 ledger entry.
 
+## 정렬
+
+`muxa stats`의 행은 기본적으로 prompt 수 기준으로 정렬됩니다. `--sort`로 임의의
+컬럼을 기준으로 정렬하고 `--reverse`로 방향을 뒤집을 수 있습니다. 숫자 컬럼은
+기본 내림차순(큰 값 먼저), `name`은 기본 오름차순입니다.
+
+```bash
+muxa stats --since today --sort wait              # 대기 시간이 긴 순
+muxa stats --since today --sort work --reverse    # 작업 시간이 짧은 순
+muxa stats --since today --group-by session --sort name
+```
+
+`--sort` 는 다음 값을 받습니다: `prompts`, `work`, `wait`, `err`, `tmux`,
+`human`, `think`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
+
+표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
+`--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.
+
 ## Ledger 타입
 
 `muxa activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
