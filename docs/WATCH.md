@@ -76,9 +76,11 @@ sort = ["session", "latest"]
 # sort = ["pane_id"]
 ```
 
-Runtime sort keys mirror these presets. The default groups by tmux session
-and floats the most recently active agent in each group. `activity` and `act`
-remain accepted aliases for `latest`.
+Runtime sort keys mirror these presets and save the selected preset back to
+`[watch].sort`. The `--sort` flag remains a one-shot launch override until
+you press a runtime sort key. The default groups by tmux session and floats
+the most recently active agent in each group. `activity` and `act` remain
+accepted aliases for `latest`.
 
 ## Detail Row
 
