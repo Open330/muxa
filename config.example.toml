@@ -101,20 +101,21 @@
 # `pane_id` as a final stable tiebreaker. Stale agents (pane closed)
 # always sink to the bottom regardless of what's listed here.
 #
-# Default: ["session", "activity"] — groups by tmux session, floats
+# Default: ["session", "latest"] — groups by tmux session, floats
 # the most recently active agent inside each group to the top.
 #
 # Available keys:
 #   session   — tmux session name asc (groups same-session panes)
-#   activity  — last_activity_at desc (most recently updated first)
+#   latest    — last_activity_at desc (most recently updated first)
+#   activity  — alias for latest
 #   pane      — window then pane index, parsed numerically
 #   pane_id   — raw pane id lex asc (predictable; useful for screenshots)
 #
 # Examples:
-#   sort = ["activity"]              # global newest-first, no grouping
+#   sort = ["latest"]                # global newest-first, no grouping
 #   sort = ["session", "pane"]       # tmux-native order within session
-#   sort = ["session", "activity"]   # default — grouping + recency
-# sort = ["session", "activity"]
+#   sort = ["session", "latest"]     # default — grouping + recency
+# sort = ["session", "latest"]
 
 # Per-column widths. Three accepted forms:
 #   integer  -> fixed length      (Constraint::Length)

@@ -26,7 +26,7 @@ row per pane.
 | `c` | Toggle preview content. |
 | `f` | Toggle popup/fullscreen preview. |
 | `?` | Help. |
-| `a` | Sort by activity. |
+| `l` / `a` | Sort by latest activity. |
 | `d` | Sort by session duration. |
 | `s` | Sort by session grouping. |
 | `t` | Sort attention states first. |
@@ -68,16 +68,17 @@ Available column keys include `pane`, `pane_id`, `state`, `kind`, `model`,
 
 ```toml
 [watch]
-sort = ["session", "activity"]
-# sort = ["activity"]
+sort = ["session", "latest"]
+# sort = ["latest"]
 # sort = ["session_time"]
-# sort = ["state", "activity"]
+# sort = ["state", "latest"]
 # sort = ["session", "pane"]
 # sort = ["pane_id"]
 ```
 
 Runtime sort keys mirror these presets. The default groups by tmux session
-and floats the most recently active agent in each group.
+and floats the most recently active agent in each group. `activity` and `act`
+remain accepted aliases for `latest`.
 
 ## Detail Row
 

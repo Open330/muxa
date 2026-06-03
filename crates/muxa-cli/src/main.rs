@@ -108,7 +108,7 @@ enum Cmd {
         /// Row granularity: tmux session (default) or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
-        /// One-shot sort override: session, act/activity, dur/duration, st/state, pane, pane-id.
+        /// One-shot sort override: session, latest/activity/act, dur/duration, st/state, pane, pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
         /// One-shot visual theme override.
@@ -199,8 +199,8 @@ impl From<WatchViewArg> for muxa::config::WatchView {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WatchSortArg {
     Session,
-    #[value(alias = "act")]
-    Activity,
+    #[value(alias = "activity", alias = "act")]
+    Latest,
     #[value(alias = "dur", alias = "duration")]
     SessionTime,
     #[value(alias = "st")]
@@ -214,7 +214,7 @@ impl WatchSortArg {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
             Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
-            Self::Activity => vec![WatchSortKey::Activity],
+            Self::Latest => vec![WatchSortKey::Activity],
             Self::SessionTime => vec![WatchSortKey::SessionTime],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
             Self::Pane => vec![WatchSortKey::Session, WatchSortKey::Pane],

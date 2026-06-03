@@ -650,7 +650,7 @@ pub(crate) struct SessionRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchSortPreset {
     Session,
-    Activity,
+    Latest,
     Duration,
     State,
 }
@@ -659,7 +659,7 @@ impl WatchSortPreset {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
             Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
-            Self::Activity => vec![WatchSortKey::Activity],
+            Self::Latest => vec![WatchSortKey::Activity],
             Self::Duration => vec![WatchSortKey::SessionTime],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
         }
@@ -668,7 +668,7 @@ impl WatchSortPreset {
     fn label(self) -> &'static str {
         match self {
             Self::Session => "SESSION",
-            Self::Activity => "ACT",
+            Self::Latest => "LATEST",
             Self::Duration => "DUR",
             Self::State => "ST",
         }
@@ -678,7 +678,7 @@ impl WatchSortPreset {
 fn sort_label(keys: &[WatchSortKey]) -> &'static str {
     match keys.first().copied() {
         Some(WatchSortKey::Session) | None => "SESSION",
-        Some(WatchSortKey::Activity) => "ACT",
+        Some(WatchSortKey::Activity) => "LATEST",
         Some(WatchSortKey::SessionTime) => "DUR",
         Some(WatchSortKey::State) => "ST",
         Some(WatchSortKey::Pane) => "PANE",
@@ -1029,7 +1029,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "",
         "Sorting",
         "  s              sort by session name",
-        "  a              sort by activity (ACT)",
+        "  l / a          sort by latest activity",
         "  d              sort by duration (DUR)",
         "  t              sort by state (ST)",
         "",
@@ -3020,7 +3020,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('p') => Action::OpenPreview,
         KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
         KeyCode::Char('s') => Action::SetSort(WatchSortPreset::Session),
-        KeyCode::Char('a') => Action::SetSort(WatchSortPreset::Activity),
+        KeyCode::Char('l' | 'a') => Action::SetSort(WatchSortPreset::Latest),
         KeyCode::Char('d') => Action::SetSort(WatchSortPreset::Duration),
         KeyCode::Char('t') => Action::SetSort(WatchSortPreset::State),
         // Capital-K / Capital-R require Shift in the spec — crossterm
@@ -4254,7 +4254,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" preview  "),
         Span::styled(" r ", theme.key_badge()),
         Span::raw(" refresh  "),
-        Span::styled(" s/a/d/t ", theme.key_badge()),
+        Span::styled(" s/l/d/t ", theme.key_badge()),
         Span::raw(" sort  "),
         Span::styled(" ? ", theme.key_badge()),
         Span::raw(" help  "),
@@ -4895,7 +4895,7 @@ mod tests {
         );
         app.table_state.select(Some(0));
 
-        app.apply_sort_preset(WatchSortPreset::Activity);
+        app.apply_sort_preset(WatchSortPreset::Latest);
 
         let order: Vec<&str> = app
             .rows
@@ -4914,7 +4914,8 @@ mod tests {
         let mut app = App::new();
         for (key, preset) in [
             ('s', WatchSortPreset::Session),
-            ('a', WatchSortPreset::Activity),
+            ('l', WatchSortPreset::Latest),
+            ('a', WatchSortPreset::Latest),
             ('d', WatchSortPreset::Duration),
             ('t', WatchSortPreset::State),
         ] {
@@ -8197,7 +8198,7 @@ mod tests {
                         \n\
                         Sorting\n\
                         \x20\x20s              sort by session name\n\
-                        \x20\x20a              sort by activity (ACT)\n\
+                        \x20\x20l / a          sort by latest activity\n\
                         \x20\x20d              sort by duration (DUR)\n\
                         \x20\x20t              sort by state (ST)\n\
                         \n\
