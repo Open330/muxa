@@ -8,7 +8,7 @@
 ```bash
 muxa stats --since today
 muxa stats --since yesterday --group-by session
-muxa stats --since week --group-by project
+muxa stats --since week --group-by project --sort human
 muxa report --since week
 muxa activity --since today --type human
 muxa activity --since today --type agent --format json
@@ -54,6 +54,11 @@ muxa activity --since today --type agent --format json
 input, tmux attach 입니다. 단순히 `muxa watch`를 열어둔 시간은 `HUMAN`에는
 들어가지만 `THINK`에는 들어가지 않습니다. 대시보드를 열어둔 시간이 실제
 사고 시간이라고 단정하기 어렵기 때문입니다.
+
+`muxa stats --sort human`으로 row를 `HUMAN` 기준 정렬할 수 있습니다. 다른
+정렬 key는 `prompts`, `foreground`/`tmux`, `thinking`, `working`, `waiting`,
+`error`, `attention`/`blocks`, `last-prompt`, `key`, `agent-sessions`,
+`live-agents`, `token-estimate`, `words`입니다.
 
 ## Retention
 

@@ -95,6 +95,7 @@ Common stats queries:
 
 ```bash
 muxa stats --since today --group-by session
+muxa stats --since today --group-by session --sort human
 muxa stats --since yesterday --group-by project
 muxa report --since week
 muxa activity --since today --type human

@@ -8,7 +8,7 @@
 ```bash
 muxa stats --since today
 muxa stats --since yesterday --group-by session
-muxa stats --since week --group-by project
+muxa stats --since week --group-by project --sort human
 muxa report --since week
 muxa activity --since today --type human
 muxa activity --since today --type agent --format json
@@ -52,6 +52,11 @@ agent needs attention (`WaitingInput`, `WaitingChoice`, or `Error`) and
 there is human presence from tmux foreground, muxa prompt input, or tmux
 attach. A plain open `muxa watch` interval counts toward `HUMAN`, but not
 `THINK`, because simply watching the dashboard can be idle time.
+
+Use `muxa stats --sort human` to order rows by `HUMAN`. Other sort keys
+include `prompts`, `foreground`/`tmux`, `thinking`, `working`, `waiting`,
+`error`, `attention`/`blocks`, `last-prompt`, `key`, `agent-sessions`,
+`live-agents`, `token-estimate`, and `words`.
 
 ## Retention
 

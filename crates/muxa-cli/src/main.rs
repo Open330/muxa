@@ -1155,6 +1155,24 @@ mod tests {
     }
 
     #[test]
+    fn stats_sort_cli_accepts_human() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "stats",
+            "--group-by",
+            "session",
+            "--since",
+            "today",
+            "--limit",
+            "15",
+            "--sort",
+            "human",
+        ])
+        .unwrap();
+        assert!(matches!(args.cmd, Cmd::Stats(_)));
+    }
+
+    #[test]
     fn watch_theme_cli_aliases_parse() {
         for (raw, expected) in [
             ("oh-my-muxa", WatchTheme::OhMyMuxa),

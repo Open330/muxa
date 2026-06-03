@@ -9,6 +9,7 @@ use muxa::{
     SessionForegroundEntry, StateTransitionEntry,
 };
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use time::OffsetDateTime;
@@ -30,6 +31,10 @@ pub struct Args {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
+
+    /// Row sort key.
+    #[arg(long, value_enum, default_value_t = StatsSort::Prompts)]
+    sort: StatsSort,
 
     /// Maximum rows to print. Set 0 for all rows.
     #[arg(long, default_value_t = 10)]
@@ -73,6 +78,30 @@ enum GroupBy {
     Session,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum StatsSort {
+    Prompts,
+    #[value(alias = "tmux")]
+    Foreground,
+    Human,
+    Thinking,
+    Working,
+    Waiting,
+    Error,
+    #[value(alias = "block", alias = "blocks")]
+    Attention,
+    #[value(alias = "last_prompt", alias = "latest")]
+    LastPrompt,
+    Key,
+    #[value(alias = "agents")]
+    AgentSessions,
+    #[value(alias = "live")]
+    LiveAgents,
+    #[value(alias = "token", alias = "tokens")]
+    TokenEstimate,
+    Words,
+}
+
 const FULL_STATS_TABLE_WIDTH: usize = 128;
 const COMPACT_STATS_TABLE_WIDTH: usize = 76;
 const MIN_GROUP_COLUMN_WIDTH: usize = 7;
@@ -100,7 +129,7 @@ impl GroupBy {
 
 pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let data = load_data(client, cfg, &args.since).await?;
-    let doc = build_document(&data, args.group_by, args.limit);
+    let doc = build_document_with_sort(&data, args.group_by, args.limit, args.sort);
     match args.format {
         OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
@@ -318,7 +347,16 @@ async fn load_session_activities(cfg: &Config) -> Vec<SessionActivity> {
 }
 
 fn build_document(data: &StatsData, group_by: GroupBy, limit: usize) -> StatsDocument {
-    let rows = build_rows(data, group_by, limit);
+    build_document_with_sort(data, group_by, limit, StatsSort::Prompts)
+}
+
+fn build_document_with_sort(
+    data: &StatsData,
+    group_by: GroupBy,
+    limit: usize,
+    sort: StatsSort,
+) -> StatsDocument {
+    let rows = build_rows_with_sort(data, group_by, limit, sort);
     StatsDocument {
         generated_at: format_rfc3339(data.now),
         range: RangeDocument {
@@ -428,7 +466,17 @@ fn build_totals(data: &StatsData) -> Totals {
     }
 }
 
+#[cfg(test)]
 fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow> {
+    build_rows_with_sort(data, group_by, limit, StatsSort::Prompts)
+}
+
+fn build_rows_with_sort(
+    data: &StatsData,
+    group_by: GroupBy,
+    limit: usize,
+    sort: StatsSort,
+) -> Vec<GroupRow> {
     let mut rows = BTreeMap::<String, GroupAccumulator>::new();
     let session_foreground_ledger = has_session_foreground_ledger(data);
 
@@ -487,13 +535,7 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
     }
 
     let mut rows = rows.into_iter().collect::<Vec<_>>();
-    rows.sort_by(|(a_key, a), (b_key, b)| {
-        b.prompts
-            .cmp(&a.prompts)
-            .then_with(|| b.foreground_secs.cmp(&a.foreground_secs))
-            .then_with(|| b.last_prompt_at.cmp(&a.last_prompt_at))
-            .then_with(|| a_key.cmp(b_key))
-    });
+    sort_stats_rows(&mut rows, sort);
     if limit > 0 {
         rows.truncate(limit);
     }
@@ -526,6 +568,63 @@ fn build_rows(data: &StatsData, group_by: GroupBy, limit: usize) -> Vec<GroupRow
                 .map_or_else(|| "-".to_string(), |at| relative_time(data.now, at)),
         })
         .collect()
+}
+
+fn sort_stats_rows(rows: &mut [(String, GroupAccumulator)], sort: StatsSort) {
+    rows.sort_by(|(a_key, a), (b_key, b)| stats_row_cmp(sort, a_key, a, b_key, b));
+}
+
+fn stats_row_cmp(
+    sort: StatsSort,
+    a_key: &str,
+    a: &GroupAccumulator,
+    b_key: &str,
+    b: &GroupAccumulator,
+) -> Ordering {
+    if sort == StatsSort::Prompts {
+        return default_stats_row_cmp(a_key, a, b_key, b);
+    }
+
+    stats_sort_primary_cmp(sort, a_key, a, b_key, b)
+        .then_with(|| default_stats_row_cmp(a_key, a, b_key, b))
+}
+
+fn default_stats_row_cmp(
+    a_key: &str,
+    a: &GroupAccumulator,
+    b_key: &str,
+    b: &GroupAccumulator,
+) -> Ordering {
+    b.prompts
+        .cmp(&a.prompts)
+        .then_with(|| b.foreground_secs.cmp(&a.foreground_secs))
+        .then_with(|| b.last_prompt_at.cmp(&a.last_prompt_at))
+        .then_with(|| a_key.cmp(b_key))
+}
+
+fn stats_sort_primary_cmp(
+    sort: StatsSort,
+    a_key: &str,
+    a: &GroupAccumulator,
+    b_key: &str,
+    b: &GroupAccumulator,
+) -> Ordering {
+    match sort {
+        StatsSort::Prompts => default_stats_row_cmp(a_key, a, b_key, b),
+        StatsSort::Foreground => b.foreground_secs.cmp(&a.foreground_secs),
+        StatsSort::Human => b.human_secs.cmp(&a.human_secs),
+        StatsSort::Thinking => b.thinking_secs.cmp(&a.thinking_secs),
+        StatsSort::Working => b.working_secs.cmp(&a.working_secs),
+        StatsSort::Waiting => b.waiting_secs.cmp(&a.waiting_secs),
+        StatsSort::Error => b.error_secs.cmp(&a.error_secs),
+        StatsSort::Attention => b.attention_events.cmp(&a.attention_events),
+        StatsSort::LastPrompt => b.last_prompt_at.cmp(&a.last_prompt_at),
+        StatsSort::Key => a_key.cmp(b_key),
+        StatsSort::AgentSessions => b.agent_sessions.len().cmp(&a.agent_sessions.len()),
+        StatsSort::LiveAgents => b.live_agents.cmp(&a.live_agents),
+        StatsSort::TokenEstimate => b.token_estimate.cmp(&a.token_estimate),
+        StatsSort::Words => b.words.cmp(&a.words),
+    }
 }
 
 fn add_activity_rows(
@@ -1846,6 +1945,36 @@ mod tests {
         let rows = build_rows(&d, GroupBy::Project, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "a");
+    }
+
+    #[test]
+    fn build_rows_sorts_by_human_time() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaPromptInput,
+                pane: Some("%1".into()),
+                session_id: Some("$1".into()),
+                session_name: Some("alpha".into()),
+                started_at: datetime!(2026-05-30 11:00:00 UTC),
+                ended_at: datetime!(2026-05-30 11:05:00 UTC),
+            })),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaPromptInput,
+                pane: Some("%2".into()),
+                session_id: Some("$2".into()),
+                session_name: Some("beta".into()),
+                started_at: datetime!(2026-05-30 11:00:00 UTC),
+                ended_at: datetime!(2026-05-30 11:20:00 UTC),
+            })),
+        ];
+
+        let rows = build_rows_with_sort(&d, GroupBy::Session, 0, StatsSort::Human);
+
+        assert_eq!(rows[0].key, "beta");
+        assert_eq!(rows[0].human_secs, 1_200);
+        assert_eq!(rows[1].key, "alpha");
+        assert_eq!(rows[1].human_secs, 300);
     }
 
     #[test]

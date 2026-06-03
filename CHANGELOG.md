@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa stats` row sort** — `muxa stats --sort human` and related metric
+  sort keys now order grouped rows before applying `--limit`.
 - **`muxa watch` latest sort** — `latest` is now the user-facing name for
   newest-activity-first sorting. Use `l` in the TUI or `--sort latest`;
   existing `a`, `activity`, and `act` aliases remain supported. Runtime sort
