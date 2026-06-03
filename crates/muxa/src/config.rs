@@ -731,7 +731,7 @@ pub struct WatchConfig {
     /// Stale agents (pane closed) always bucket at the end, regardless of
     /// what's listed here.
     ///
-    /// Default: `["session", "activity"]` — groups by tmux session, then
+    /// Default: `["session", "latest"]` — groups by tmux session, then
     /// floats the most-recently-active agent inside each group to the top.
     pub sort: Vec<WatchSortKey>,
     /// Hide agents that aren't bound to a tmux pane.
@@ -837,7 +837,7 @@ pub enum WatchSortKey {
     /// `last_activity_at` descending — most recently updated first. The
     /// useful default to surface "what's moving right now" without
     /// scrolling.
-    #[serde(alias = "act")]
+    #[serde(rename = "latest", alias = "activity", alias = "act")]
     Activity,
     /// Semantic agent state priority: error/input/choice rows first, then
     /// working/starting/idle/stopped. This is deliberately operational,
@@ -1118,7 +1118,7 @@ broken = "what"
     fn parses_watch_sort_section() {
         let toml = r#"
 [watch]
-sort = ["activity"]
+sort = ["latest"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.watch.sort, vec![WatchSortKey::Activity]);
@@ -1128,18 +1128,33 @@ sort = ["activity"]
     fn parses_watch_sort_aliases_for_cli_column_names() {
         let toml = r#"
 [watch]
-sort = ["act", "st", "dur", "duration"]
+sort = ["activity", "act", "st", "dur", "duration"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(
             cfg.watch.sort,
             vec![
                 WatchSortKey::Activity,
+                WatchSortKey::Activity,
                 WatchSortKey::State,
                 WatchSortKey::SessionTime,
                 WatchSortKey::SessionTime,
             ]
         );
+    }
+
+    #[test]
+    fn serializes_activity_sort_as_latest() {
+        #[derive(Serialize)]
+        struct SortOnly {
+            sort: Vec<WatchSortKey>,
+        }
+
+        let rendered = toml::to_string(&SortOnly {
+            sort: vec![WatchSortKey::Session, WatchSortKey::Activity],
+        })
+        .unwrap();
+        assert_eq!(rendered.trim(), "sort = [\"session\", \"latest\"]");
     }
 
     #[test]

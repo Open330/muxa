@@ -56,7 +56,7 @@ stats while newer activity ledger intervals are accumulating.
 [watch]
 view = "session"
 columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
-sort = ["session", "activity"]
+sort = ["session", "latest"]
 hide_paneless = true
 
 [watch.widths]

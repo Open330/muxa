@@ -55,7 +55,7 @@ compatibility source이자 stats fallback으로 사용됩니다.
 [watch]
 view = "session"
 columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
-sort = ["session", "activity"]
+sort = ["session", "latest"]
 hide_paneless = true
 
 [watch.widths]

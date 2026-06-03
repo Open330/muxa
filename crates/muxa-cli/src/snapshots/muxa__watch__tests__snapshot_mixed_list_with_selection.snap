@@ -17,4 +17,4 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 │                                                                                                            │
 │                                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- ↑/↓  move   ⏎  prompt   ⏎⏎  attach   p  preview   r  refresh   s/a/d/t  sort   ?  help   q  quit
+ ↑/↓  move   ⏎  prompt   ⏎⏎  attach   p  preview   r  refresh   s/l/d/t  sort   ?  help   q  quit

@@ -25,7 +25,7 @@ muxa watch --include-paneless
 | `c` | preview content toggle. |
 | `f` | popup/fullscreen preview toggle. |
 | `?` | 도움말. |
-| `a` | activity 기준 정렬. |
+| `l` / `a` | 최신 activity 기준 정렬. |
 | `d` | session duration 기준 정렬. |
 | `s` | session grouping 정렬. |
 | `t` | attention state 우선 정렬. |
@@ -67,16 +67,16 @@ activity = 5
 
 ```toml
 [watch]
-sort = ["session", "activity"]
-# sort = ["activity"]
+sort = ["session", "latest"]
+# sort = ["latest"]
 # sort = ["session_time"]
-# sort = ["state", "activity"]
+# sort = ["state", "latest"]
 # sort = ["session", "pane"]
 # sort = ["pane_id"]
 ```
 
 기본값은 tmux session으로 묶고, 각 group 안에서 가장 최근 activity가 있는
-agent를 위로 올립니다.
+agent를 위로 올립니다. `activity`와 `act`는 `latest` alias로 계속 동작합니다.
 
 ## Detail Row
 
