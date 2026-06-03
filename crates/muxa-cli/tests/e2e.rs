@@ -147,7 +147,7 @@ fn claude_hook_round_trip() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("claude_code") && stdout.contains("%99") && stdout.contains("hello e2e"),
+        stdout.contains("%99") && stdout.contains("hello e2e"),
         "unexpected status output:\n{stdout}"
     );
 }

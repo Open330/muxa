@@ -535,7 +535,7 @@ fn check_tmux_blocks() -> CheckResult {
 /// the path the same way the IPC client does — a plain connect — so a
 /// stale pin downgrades to a warning instead of a misleading ✔.
 fn check_muxa_socket_env(daemon_socket: &Path) -> CheckResult {
-    let out = Command::new("tmux")
+    let out = muxa::tmux::tmux_command()
         .args(["show-environment", "-g", "MUXA_SOCKET"])
         .output();
     let value = match out {

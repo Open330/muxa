@@ -9,7 +9,62 @@
 
 pub mod scanner;
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// Absolute path to the `tmux` binary, resolved once per process.
+///
+/// `tmux_command()` relies on `$PATH`, which is fine for an
+/// interactive shell but fails inside `launchd`-spawned `muxad` whose
+/// inherited `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin` — neither
+/// Homebrew prefix is on that list. A failed shell-out collapsed to an
+/// empty pane inventory drove the reconciler to reap every paned agent
+/// each tick, wiping `last_prompt` on every row.
+///
+/// Resolution order:
+/// 1. `$PATH` lookup via `tmux -V`. Cheap (~5 ms once) and the steady-state
+///    path everywhere except launchd.
+/// 2. Known Homebrew install prefixes — Apple Silicon then Intel.
+/// 3. Bare `tmux` as a last-resort sentinel so the eventual error message
+///    matches the prior behavior.
+/// Build a `Command` for shelling out to tmux with the resolved binary
+/// path and a UTF-8 locale pre-applied.
+///
+/// launchd's gui-domain user-agents inherit no `LANG`/`LC_*` env, leaving
+/// child processes in the POSIX (C) locale. tmux in that locale silently
+/// transliterates non-ASCII bytes — including the literal TAB characters
+/// our format strings rely on as field separators — to `_`. The result
+/// is a `list-panes` payload that exits 0 with 1.9 KB of stdout but parses
+/// to zero rows, so the reconciler then reaps every paned agent.
+///
+/// Set `LC_ALL` (overrides every `LC_*`) to a UTF-8 locale on every tmux
+/// invocation so the daemon and the user's interactive shell see byte-
+/// identical output. `en_US.UTF-8` is universally available on macOS;
+/// `C.UTF-8` would work on recent macOS too but is less portable.
+pub fn tmux_command() -> Command {
+    let mut cmd = Command::new(tmux_binary());
+    cmd.env("LC_ALL", "en_US.UTF-8");
+    cmd
+}
+
+pub fn tmux_binary() -> &'static Path {
+    static RESOLVED: OnceLock<PathBuf> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        if Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return PathBuf::from("tmux");
+        }
+        ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .map_or_else(|| PathBuf::from("tmux"), PathBuf::from)
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TmuxError {
@@ -125,7 +180,55 @@ pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
 }
 
 pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
-    let out = Command::new("tmux")
+    // Under `launchd` (gui-domain user agent) tmux's default socket
+    // lookup resolves to a different temp dir than the user's
+    // interactive shell, so a bare `tmux list-panes -a` finds no server
+    // and returns nothing. Enumerate every known socket (the same
+    // dedup'd /tmp/tmux-<uid> + /private/tmp/tmux-<uid> set the scanner
+    // uses) and aggregate; fall back to the bare call only when no
+    // enumerable socket exists (e.g. CI sandboxes).
+    let sockets = scanner::enumerate_sockets();
+    if sockets.is_empty() {
+        return list_panes_bare();
+    }
+    let mut all: Vec<PaneInfo> = Vec::new();
+    let mut last_err: Option<TmuxError> = None;
+    for sock in &sockets {
+        let Some(sock_str) = sock.to_str() else {
+            continue;
+        };
+        match tmux_command()
+            .args(["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                all.extend(parse_pane_lines(&stdout));
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                // "no server running" is the steady-state for stale socket
+                // files left behind by crashed servers; treat as empty
+                // rather than a hard error.
+                if !stderr.starts_with("no server running on") {
+                    last_err = Some(TmuxError::NonZero(stderr));
+                }
+            }
+            Err(e) => {
+                last_err = Some(TmuxError::Spawn(e));
+            }
+        }
+    }
+    if all.is_empty() {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(all)
+}
+
+fn list_panes_bare() -> Result<Vec<PaneInfo>, TmuxError> {
+    let out = tmux_command()
         .args(["list-panes", "-a", "-F", PANE_FMT])
         .output()?;
     if !out.status.success() {
@@ -138,7 +241,7 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(["list-sessions", "-F", SESSION_FMT])
         .output()?;
     if !out.status.success() {
@@ -151,7 +254,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
 }
 
 pub fn list_clients() -> Result<Vec<ClientInfo>, TmuxError> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(["list-clients", "-F", CLIENT_FMT])
         .output()?;
     if !out.status.success() {
@@ -181,7 +284,7 @@ pub fn inside_tmux() -> bool {
 /// status is non-zero, the stderr is short — so callers should treat
 /// `NonZero` as "ephemeral, retry next tick" rather than fatal.
 pub fn capture_pane(pane_id: &str) -> Result<String, TmuxError> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(["capture-pane", "-ep", "-t", pane_id])
         .output()?;
     if !out.status.success() {
@@ -208,7 +311,7 @@ pub fn current_pane() -> Option<String> {
         return Some(p);
     }
     let target = parse_tmux_session_target(&std::env::var("TMUX").ok()?)?;
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(["display-message", "-p", "-t", &target, "#{pane_id}"])
         .output()
         .ok()?;
@@ -261,7 +364,7 @@ pub fn resolve_pane(pane_id: &str) -> Option<PaneInfo> {
 /// treat the empty map as "no fallback available" and proceed with
 /// `pane: None`.
 pub fn pane_pid_map() -> std::collections::HashMap<u32, String> {
-    let out = match Command::new("tmux")
+    let out = match tmux_command()
         .args(["list-panes", "-a", "-F", "#{pane_pid}\t#{pane_id}"])
         .output()
     {

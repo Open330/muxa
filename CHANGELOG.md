@@ -12,6 +12,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`muxa watch` prompt composer** — delay the submit key briefly after
   injecting prompt text into a tmux pane, so Codex treats `Enter` as a
   distinct submit key instead of folding it into a fast paste/input burst.
+- **tmux shell-outs from `muxad` now find the binary, the right socket, and
+  preserve their format separators.** Three independent failures piled on
+  top of each other under macOS launchd:
+  1. **Binary not on `PATH`.** launchd's gui-domain inherited
+     `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, missing both `/opt/homebrew/bin`
+     and `/usr/local/bin`. `Command::new("tmux")` then failed with "No
+     such file or directory" before tmux ever ran.
+  2. **Bare `tmux list-panes -a` hit the wrong default socket.** Once tmux
+     could spawn, its default-socket lookup pointed at a temp dir the
+     user's server wasn't bound to, so the daemon got exit 0 with zero
+     rows.
+  3. **POSIX locale corrupted format output.** With `LC_ALL` unset, tmux
+     transliterated the literal TAB byte we used as a field separator —
+     and every non-ASCII byte in `#{pane_title}` — to `_`, so the bytes
+     that did come back parsed to zero rows.
+
+  Each step lined up so the reconciler ran with `live_panes = []`, reaped
+  every paned agent on every 30 s tick, and lost the `last_prompt` /
+  `started_at` set by the next inbound hook event.
+
+  Resolved by adding two helpers in `muxa::tmux`:
+  - `tmux_binary()` resolves the binary once per process via `$PATH`
+    probe + Homebrew fallbacks.
+  - `tmux_command()` returns a `Command` pre-configured with the resolved
+    binary and `LC_ALL=en_US.UTF-8`.
+
+  `tmux::list_panes()` now enumerates the known socket dirs and aggregates
+  rows across every server it can reach, instead of relying on tmux's
+  default-socket lookup. Every tmux shell-out site across `muxad`,
+  `muxa-cli`, and the library now routes through `tmux_command()`.
+
+### Changed
+
+- **Default `muxa status` / `muxa watch` columns tightened to NAME / ST /
+  ACT / LAST PROMPT.** `KIND` and `MODEL` are no longer in the default
+  view — operators get one row that leads with identity, then state, age,
+  and content. Both columns remain available via `[watch] columns` for
+  users who want them back.
 
 ## [0.7.0] - 2026-06-02
 

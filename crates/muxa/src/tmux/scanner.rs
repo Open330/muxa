@@ -188,7 +188,8 @@ async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<PaneInfo>, String> {
     let sock_str = sock
         .to_str()
         .ok_or_else(|| "non-utf8 socket path".to_string())?;
-    let fut = Command::new("tmux")
+    let fut = Command::new(crate::tmux::tmux_binary())
+        .env("LC_ALL", "en_US.UTF-8")
         .args(["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT])
         .output();
     let out = timeout(TMUX_LIST_TIMEOUT, fut)

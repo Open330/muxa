@@ -10,7 +10,6 @@
 //! refactor lands as a strict superset of v0.2.0 behavior.
 
 use std::collections::HashMap;
-use std::process::Command;
 
 use crate::backend::{HostKind, PaneBackend};
 use crate::tmux::{self, PaneInfo};
@@ -69,7 +68,7 @@ impl PaneBackend for TmuxBackend {
         // already). Best-effort: a non-zero exit (pane closed mid-call)
         // collapses to `false` so the caller can show a "couldn't
         // jump" hint instead of bubbling a TmuxError up.
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args(["select-pane", "-t", pane_id])
             .status()
             .is_ok_and(|s| s.success())

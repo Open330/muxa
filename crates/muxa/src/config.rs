@@ -860,13 +860,15 @@ pub enum WatchSortKey {
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        // Prompt-forward defaults: lead with the last prompt. Users who
-        // care about model/ctx/cost can opt back in via config.
+        // Defaults: NAME / ST / ACT / LAST PROMPT — lead with identity,
+        // then state, then activity, with the variable-width prompt last
+        // so it can absorb the remaining width. Users who care about
+        // model/ctx/cost can opt back in via config.
         let columns = vec![
             "pane".to_string(),
             "state".to_string(),
-            "prompt".to_string(),
             "activity".to_string(),
+            "prompt".to_string(),
         ];
         let mut widths = HashMap::new();
         widths.insert("pane".to_string(), WidthSpec::Length(22));
@@ -1033,7 +1035,7 @@ mod tests {
     fn watch_default_is_prompt_forward() {
         let cfg = WatchConfig::default();
         assert_eq!(cfg.theme, None);
-        assert_eq!(cfg.columns, vec!["pane", "state", "prompt", "activity"]);
+        assert_eq!(cfg.columns, vec!["pane", "state", "activity", "prompt"]);
         assert!(matches!(
             cfg.widths.get("pane"),
             Some(WidthSpec::Length(22))

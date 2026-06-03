@@ -1,18 +1,17 @@
 ---
 source: crates/muxa-cli/src/watch.rs
-assertion_line: 8288
 expression: "snapshot_helpers::buffer_string(&terminal)"
 ---
  muxa watch   4 agents  + 0 panes   sort PANE ID   <clock>
 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   ST  LAST PROMPT                                                               ACT  │
-│  alpha:0.0              ●   alpha prompt                                                              <rel>│
-│> alpha:1.0              ?   beta prompt                                                               <rel>│
-│                             ↳ beta response                                                                │
-│  alpha:2.0              ◆   gamma prompt                                                              <rel>│
-│  (no pane)              ·   -                                                                         <rel>│
+│  NAME                   ST  ACT   LAST PROMPT                                                              │
+│  alpha:0.0              ●   <rel>alpha prompt                                                             │
+│> alpha:1.0              ?   <rel>beta prompt                                                              │
+│                                   ↳ beta response                                                          │
+│  alpha:2.0              ◆   <rel>gamma prompt                                                             │
+│  (no pane)              ·   <rel>-                                                                        │
 │                                                                                                            │
 │                                                                                                            │
 │                                                                                                            │

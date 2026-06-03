@@ -916,7 +916,7 @@ fn spawn_webhook_sink(
 /// environment. Called once at daemon startup so panes that were
 /// spawned before this muxad instance can still reach it via hooks.
 fn heal_tmux_socket_env(socket: &std::path::Path) {
-    let server_up = std::process::Command::new("tmux")
+    let server_up = muxa::tmux::tmux_command()
         .arg("info")
         .output()
         .is_ok_and(|o| o.status.success());
@@ -928,7 +928,7 @@ fn heal_tmux_socket_env(socket: &std::path::Path) {
         tracing::debug!("socket path is not UTF-8 — skipping socket env heal");
         return;
     };
-    match std::process::Command::new("tmux")
+    match muxa::tmux::tmux_command()
         .args(["set-environment", "-g", "MUXA_SOCKET", s])
         .status()
     {

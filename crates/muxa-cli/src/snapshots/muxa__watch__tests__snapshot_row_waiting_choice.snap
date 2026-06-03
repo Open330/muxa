@@ -1,15 +1,14 @@
 ---
 source: crates/muxa-cli/src/watch.rs
-assertion_line: 8203
 expression: "snapshot_helpers::buffer_string(&terminal)"
 ---
  muxa watch   1 agent  + 0 panes   sort PANE ID   <clock>
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
-│  PANE                   ST  LAST PROMPT                                                     ACT  │
-│> alpha:2.0              ◆   pick a plan                                                     <rel>│
-│                             ↳ pick a plan                                                        │
+│  NAME                   ST  ACT   LAST PROMPT                                                    │
+│> alpha:2.0              ◆   <rel>pick a plan                                                    │
+│                                   ↳ pick a plan                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

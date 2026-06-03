@@ -401,7 +401,7 @@ impl WatchColumn {
 
     fn header(self) -> &'static str {
         match self {
-            Self::Pane => "PANE",
+            Self::Pane => "NAME",
             Self::Kind => "KIND",
             Self::State => "ST",
             Self::Model => "MODEL",
@@ -5317,8 +5317,8 @@ mod tests {
             vec![
                 WatchColumn::Pane,
                 WatchColumn::State,
-                WatchColumn::Prompt,
                 WatchColumn::Activity,
+                WatchColumn::Prompt,
             ]
         );
     }

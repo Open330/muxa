@@ -151,13 +151,13 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     // heals the runtime env if the tmux server was restarted since the
     // last init. The conf-file persistence added by `tmux-env` handles
     // fresh server boots; this live injection handles existing servers.
-    let server_up = std::process::Command::new("tmux")
+    let server_up = muxa::tmux::tmux_command()
         .arg("info")
         .output()
         .is_ok_and(|o| o.status.success());
     if server_up {
         if let Some(s) = socket.to_str() {
-            let _ = std::process::Command::new("tmux")
+            let _ = muxa::tmux::tmux_command()
                 .args(["set-environment", "-g", "MUXA_SOCKET", s])
                 .status();
         }

@@ -478,7 +478,7 @@ fn jump_to_pane_tmux(pane_id: &str) {
         // Bare shell — hand our terminal to a fresh tmux attach-session.
         // `.status()` waits for tmux to exit; on detach the user is back at
         // this shell prompt, which is the least-surprising behaviour.
-        match Command::new("tmux")
+        match muxa::tmux::tmux_command()
             .args(["attach-session", "-t", &info.session])
             .status()
         {
@@ -506,7 +506,7 @@ fn jump_to_pane_zellij(backend: &dyn muxa::PaneBackend, pane_id: &str) {
 }
 
 fn run_tmux(args: &[&str]) {
-    match Command::new("tmux").args(args).status() {
+    match muxa::tmux::tmux_command().args(args).status() {
         Ok(s) if s.success() => {}
         Ok(s) => eprintln!(
             "muxa: `tmux {}` exited with {}",
@@ -929,9 +929,7 @@ fn render_status_table(
 
     for a in agents {
         let pane = pane_display(a, panes);
-        let kind = a.kind.to_string();
         let state_txt = status_state_label(a.state, layout).to_string();
-        let model = a.model.as_deref().unwrap_or("-").to_string();
         let last_activity = relative_time(now, a.last_activity_at);
         let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
         let prompt = prompt_raw.lines().next().unwrap_or("");
@@ -940,15 +938,12 @@ fn render_status_table(
         let row = match layout {
             StatusTableLayout::Full => vec![
                 Cell::new(truncate_cell(&pane, 24)),
-                Cell::new(truncate_cell(&kind, 12)),
                 state_cell,
-                Cell::new(truncate_cell(&model, 16)),
                 theme.right_cell(truncate_cell(&last_activity, 7), TableTone::Dim),
                 Cell::new(truncate_cell(prompt, prompt_width)),
             ],
             StatusTableLayout::Compact => vec![
                 Cell::new(truncate_cell(&pane, 18)),
-                Cell::new(truncate_cell(&kind, 11)),
                 state_cell,
                 theme.right_cell(truncate_cell(&last_activity, 7), TableTone::Dim),
                 Cell::new(truncate_cell(prompt, prompt_width)),
@@ -980,9 +975,12 @@ fn status_table_constraints(
     layout: StatusTableLayout,
     prompt_width: usize,
 ) -> Vec<ColumnConstraint> {
+    // Column order matches `status_table_header`: NAME, ST, ACT, LAST PROMPT.
+    // Per-layout widths are the NAME / ST / ACT cells; the prompt cell
+    // soaks up whatever's left and is provided by the caller.
     let widths: &[usize] = match layout {
-        StatusTableLayout::Full => &[24, 12, 14, 16, 7],
-        StatusTableLayout::Compact => &[18, 11, 7, 7],
+        StatusTableLayout::Full => &[24, 14, 7],
+        StatusTableLayout::Compact => &[18, 7, 7],
         StatusTableLayout::Minimal => &[14, 6, 7],
     };
     widths
@@ -1000,45 +998,35 @@ fn status_table_header(
     prompt_width: usize,
     theme: CliTheme,
 ) -> Vec<Cell> {
-    match layout {
-        StatusTableLayout::Full => vec![
-            theme.cell("PANE", TableTone::Header),
-            theme.cell("KIND", TableTone::Header),
-            theme.cell("STATE", TableTone::Header),
-            theme.cell("MODEL", TableTone::Header),
-            theme.right_cell("LAST", TableTone::Header),
-            theme.cell(
-                truncate_cell("LAST PROMPT", prompt_width),
-                TableTone::Header,
-            ),
-        ],
-        StatusTableLayout::Compact => vec![
-            theme.cell("PANE", TableTone::Header),
-            theme.cell("KIND", TableTone::Header),
-            theme.cell("STATE", TableTone::Header),
-            theme.right_cell("LAST", TableTone::Header),
-            theme.cell(truncate_cell("PROMPT", prompt_width), TableTone::Header),
-        ],
-        StatusTableLayout::Minimal => vec![
-            theme.cell("PANE", TableTone::Header),
-            theme.cell("STATE", TableTone::Header),
-            theme.right_cell("LAST", TableTone::Header),
-            theme.cell(truncate_cell("PROMPT", prompt_width), TableTone::Header),
-        ],
-    }
+    // Default columns: NAME / ST / ACT / LAST PROMPT across every layout.
+    // KIND and MODEL used to share the row but were demoted to opt-in
+    // because the prompt is the highest-value column on every screen
+    // size — leading with identity + state + age + content keeps the
+    // narrow-terminal path readable without losing parity with wide
+    // terminals.
+    let prompt_label = if matches!(layout, StatusTableLayout::Full) {
+        "LAST PROMPT"
+    } else {
+        "PROMPT"
+    };
+    vec![
+        theme.cell("NAME", TableTone::Header),
+        theme.cell("ST", TableTone::Header),
+        theme.right_cell("ACT", TableTone::Header),
+        theme.cell(truncate_cell(prompt_label, prompt_width), TableTone::Header),
+    ]
 }
 
 fn status_prompt_width(terminal_width: usize, layout: StatusTableLayout) -> usize {
+    // Sum of the non-prompt column widths declared in
+    // `status_table_constraints` — keep these in sync.
     let fixed_width: usize = match layout {
-        StatusTableLayout::Full => 24 + 12 + 14 + 16 + 7,
-        StatusTableLayout::Compact => 18 + 11 + 7 + 7,
+        StatusTableLayout::Full => 24 + 14 + 7,
+        StatusTableLayout::Compact => 18 + 7 + 7,
         StatusTableLayout::Minimal => 14 + 6 + 7,
     };
-    let column_count: usize = match layout {
-        StatusTableLayout::Full => 6,
-        StatusTableLayout::Compact => 5,
-        StatusTableLayout::Minimal => 4,
-    };
+    // Every layout is now 4 columns (NAME / ST / ACT / LAST PROMPT).
+    let column_count: usize = 4;
     let border_and_padding_width = column_count + 1 + column_count * 2;
     terminal_width
         .saturating_sub(fixed_width + border_and_padding_width)
@@ -1276,7 +1264,9 @@ mod tests {
             60,
         );
 
-        assert!(rendered.contains("STATE"));
+        assert!(rendered.contains("ST"));
+        assert!(rendered.contains("ACT"));
+        assert!(rendered.contains("NAME"));
         assert!(!rendered.contains("KIND"));
         assert!(!rendered.contains("MODEL"));
         for line in rendered.lines() {
