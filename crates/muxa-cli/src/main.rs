@@ -259,7 +259,18 @@ async fn main() -> Result<()> {
             view,
             sort,
             theme,
-        } => cmd_watch(&client, cfg, include_paneless, view, sort, theme).await,
+        } => {
+            cmd_watch(
+                &client,
+                cfg,
+                config_path.clone(),
+                include_paneless,
+                view,
+                sort,
+                theme,
+            )
+            .await
+        }
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
@@ -335,6 +346,7 @@ async fn cmd_sync(client: &Client) -> Result<()> {
 async fn cmd_watch(
     client: &Client,
     cfg: Config,
+    config_path: Option<PathBuf>,
     include_paneless: bool,
     view: Option<WatchViewArg>,
     sort: Option<WatchSortArg>,
@@ -387,6 +399,7 @@ async fn cmd_watch(
         watch_cfg,
         session_activity_path,
         activity_path.clone(),
+        config_path,
     )
     .await?
     {

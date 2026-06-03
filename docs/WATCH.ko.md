@@ -75,8 +75,11 @@ sort = ["session", "latest"]
 # sort = ["pane_id"]
 ```
 
-기본값은 tmux session으로 묶고, 각 group 안에서 가장 최근 activity가 있는
-agent를 위로 올립니다. `activity`와 `act`는 `latest` alias로 계속 동작합니다.
+런타임 정렬 키는 위 preset과 대응하며, 선택한 preset을 `[watch].sort`에 다시
+저장합니다. `--sort` flag는 런타임 정렬 키를 누르기 전까지 현재 실행에만 적용되는
+override입니다. 기본값은 tmux session으로 묶고, 각 group 안에서 가장 최근
+activity가 있는 agent를 위로 올립니다. `activity`와 `act`는 `latest` alias로
+계속 동작합니다.
 
 ## Detail Row
 
