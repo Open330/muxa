@@ -76,7 +76,7 @@ pub enum TmuxError {
     BadOutput(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
     pub session: String,

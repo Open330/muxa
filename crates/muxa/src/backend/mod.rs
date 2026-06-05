@@ -208,6 +208,15 @@ pub trait PaneBackend: Send + Sync + 'static {
     fn caps(&self) -> BackendCaps {
         BackendCaps::default()
     }
+
+    /// Ingest a wholesale pane snapshot pushed by an out-of-process
+    /// source — today the zellij WASM plugin, which forwards zellij
+    /// `PaneUpdate` events to the daemon over the `BackendPaneSnapshot`
+    /// IPC command (see [`docs/ZELLIJ.md`](../../../../docs/ZELLIJ.md)
+    /// Step 2). Default no-op: backends that enumerate panes themselves
+    /// (tmux) ignore external pushes; the zellij backend overrides this
+    /// to replace its cached snapshot.
+    fn ingest_pane_snapshot(&self, _panes: Vec<PaneInfo>) {}
 }
 
 /// `Arc<dyn PaneBackend>` is itself a backend — every method
@@ -247,6 +256,9 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn caps(&self) -> BackendCaps {
         (**self).caps()
+    }
+    fn ingest_pane_snapshot(&self, panes: Vec<PaneInfo>) {
+        (**self).ingest_pane_snapshot(panes);
     }
 }
 

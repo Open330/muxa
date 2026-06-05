@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
     spawn_oh_my_prompt_sink(&cfg, &store, &shutdown_tx)?;
     spawn_webhook_sink(&cfg, &store, &shutdown_tx)?;
 
-    let server = Server::new(socket.clone(), store);
+    let server = Server::new(socket.clone(), store).with_backend(backend.clone());
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
     // Harden socket permissions once the listener exists. We poll briefly

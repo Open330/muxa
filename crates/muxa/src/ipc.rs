@@ -19,8 +19,10 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
+use crate::backend::{default_backend, SharedBackend};
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::state::{Agent, SharedStore};
+use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -94,6 +96,16 @@ enum RequestBody {
     /// socket. Used by `muxa watch` to switch from 500 ms polling to
     /// push-based updates.
     Subscribe,
+
+    /// Wholesale pane-metadata snapshot pushed by an out-of-process
+    /// backend source — today the zellij WASM plugin forwarding
+    /// `PaneUpdate` events. The daemon hands the panes to its
+    /// `SharedBackend::ingest_pane_snapshot`, which the zellij backend
+    /// caches so `list_panes` / `resolve_pane` answer from real data. A
+    /// no-op on tmux (that backend enumerates panes itself).
+    BackendPaneSnapshot {
+        panes: Vec<PaneInfo>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,11 +204,27 @@ impl Response {
 pub struct Server {
     socket_path: PathBuf,
     store: SharedStore,
+    backend: SharedBackend,
 }
 
 impl Server {
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
-        Self { socket_path, store }
+        Self {
+            socket_path,
+            store,
+            backend: default_backend(),
+        }
+    }
+
+    /// Set the pane backend the server forwards `BackendPaneSnapshot`
+    /// pushes to. The daemon passes the same `SharedBackend` the
+    /// reconciler and discovery hold, so a plugin push updates the
+    /// snapshot every consumer reads. Defaults to [`default_backend`]
+    /// for callers (mostly tests) that never push.
+    #[must_use]
+    pub fn with_backend(mut self, backend: SharedBackend) -> Self {
+        self.backend = backend;
+        self
     }
 
     /// Run until `shutdown` fires or an I/O error occurs.
@@ -219,8 +247,9 @@ impl Server {
                 accept = listener.accept() => {
                     let (stream, _) = accept?;
                     let store = self.store.clone();
+                    let backend = self.backend.clone();
                     handlers.spawn(async move {
-                        if let Err(e) = handle(stream, store).await {
+                        if let Err(e) = handle(stream, store, backend).await {
                             tracing::warn!(error = %e, "connection handler failed");
                         }
                     });
@@ -355,9 +384,13 @@ async fn stream_transitions(
     }
 }
 
-#[tracing::instrument(level = "debug", skip(stream, store))]
+#[tracing::instrument(level = "debug", skip(stream, store, backend))]
 #[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
-async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeError> {
+async fn handle(
+    stream: UnixStream,
+    store: SharedStore,
+    backend: SharedBackend,
+) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -469,6 +502,13 @@ async fn handle(stream: UnixStream, store: SharedStore) -> Result<(), RuntimeErr
                     kind = "health";
                     Response::health()
                 }
+                RequestBody::BackendPaneSnapshot { panes } => {
+                    kind = "backend_pane_snapshot";
+                    let count = panes.len();
+                    backend.ingest_pane_snapshot(panes);
+                    tracing::debug!(panes = count, "backend_pane_snapshot");
+                    Response::ok()
+                }
                 RequestBody::Subscribe => {
                     kind = "subscribe";
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
@@ -556,6 +596,19 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "ingest",
             "event": event
+        });
+        let _ = self.call(&req).await?;
+        Ok(())
+    }
+
+    /// Push a wholesale pane snapshot to the daemon. The zellij
+    /// WASM-plugin bridge calls this to forward `PaneUpdate` events; the
+    /// daemon hands the panes to its `SharedBackend::ingest_pane_snapshot`.
+    pub async fn push_pane_snapshot(&self, panes: &[PaneInfo]) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "backend_pane_snapshot",
+            "panes": panes,
         });
         let _ = self.call(&req).await?;
         Ok(())
@@ -1215,6 +1268,57 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unsupported protocol"));
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A `backend_pane_snapshot` push reaches the server's
+    /// `SharedBackend`, so the zellij backend's cache — and thus
+    /// `list_panes` / `resolve_pane` — reflects it. The request/response
+    /// is synchronous, so once the client call returns the ingest has
+    /// already run daemon-side; no sleep/poll needed.
+    #[tokio::test]
+    async fn backend_pane_snapshot_push_updates_shared_backend() {
+        use crate::backend::zellij::ZellijBackend;
+        use crate::backend::PaneBackend;
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-backend-snap.sock");
+        let store = Store::shared();
+        let backend = Arc::new(ZellijBackend::new());
+        let server = Server::new(sock.clone(), store).with_backend(backend.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        // No plugin push yet → empty.
+        assert!(backend.list_panes().is_empty());
+
+        let pane = PaneInfo {
+            pane_id: "zellij:3".into(),
+            session: "z".into(),
+            window_index: "0".into(),
+            pane_index: "3".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            pane_pid: 0,
+        };
+        Client::new(sock.clone())
+            .push_pane_snapshot(&[pane])
+            .await
+            .unwrap();
+
+        // The same Arc the test holds now sees the pushed pane.
+        let panes = backend.list_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "zellij:3");
+        assert_eq!(
+            backend.resolve_pane("zellij:3").unwrap().current_command,
+            "claude"
+        );
 
         tx.send(()).unwrap();
         handle.await.unwrap();
