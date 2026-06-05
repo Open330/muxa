@@ -22,7 +22,7 @@ use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
     // warm-restart scenarios without requiring the user to re-run
     // `muxa init` after every daemon or tmux server restart.
     if listener_ready {
-        heal_tmux_socket_env(&socket);
+        maybe_heal_tmux_socket_env(&socket, cfg.socket.as_deref());
         spawn_startup_discovery(&cfg, socket.clone(), backend.clone());
     }
 
@@ -948,6 +948,43 @@ fn heal_tmux_socket_env(socket: &std::path::Path) {
     }
 }
 
+/// Heal the tmux global `MUXA_SOCKET` — but only for the canonical
+/// daemon (see [`should_heal_tmux_socket_env`]). A non-canonical instance
+/// (an explicit `--socket`/`MUXA_SOCKET` override matching neither the
+/// default nor the configured socket — a dashboard demo, an e2e test, a
+/// throwaway `muxad --socket /tmp/…`) logs and returns without touching
+/// the global env, so its short-lived socket can't strand later panes
+/// once it exits.
+fn maybe_heal_tmux_socket_env(socket: &Path, cfg_socket: Option<&Path>) {
+    if should_heal_tmux_socket_env(socket, &paths::default_socket(), cfg_socket) {
+        heal_tmux_socket_env(socket);
+    } else {
+        tracing::debug!(
+            socket = %socket.display(),
+            "non-canonical socket override — skipping tmux env heal to avoid clobbering the primary daemon's global pin"
+        );
+    }
+}
+
+/// Whether this muxad instance may write its socket into the tmux
+/// server's global `MUXA_SOCKET` (see [`heal_tmux_socket_env`]).
+///
+/// Only the *canonical* daemon heals: one on the XDG/default socket, or
+/// on the socket named in config. An instance started with an explicit
+/// `--socket` / `MUXA_SOCKET` override matching neither — a dashboard
+/// demo, an e2e test, a throwaway `muxad --socket /tmp/…` — must NOT
+/// touch the global env. That env (and `muxa init`'s tmux.conf pin)
+/// belong to the primary daemon; when the ephemeral instance exits its
+/// socket is unlinked, and every pane spawned while the global pointed at
+/// it can no longer reach any daemon until the global is re-pinned.
+fn should_heal_tmux_socket_env(
+    socket: &Path,
+    default_socket: &Path,
+    cfg_socket: Option<&Path>,
+) -> bool {
+    socket == default_socket || cfg_socket == Some(socket)
+}
+
 /// Decide whether to fire the one-shot discovery pass and, if so, spawn it
 /// onto the current tokio runtime.
 ///
@@ -987,6 +1024,38 @@ fn spawn_startup_discovery(cfg: &Config, socket: PathBuf, backend: muxa::SharedB
 mod tests {
     use super::*;
     use muxa::config::DiscoveryConfig;
+
+    #[test]
+    fn heals_canonical_default_or_configured_socket() {
+        let default = Path::new("/run/user/1000/muxa.sock");
+        let configured = Path::new("/custom/primary.sock");
+        // Default socket → the primary daemon, may heal.
+        assert!(should_heal_tmux_socket_env(default, default, None));
+        // Socket named in config → also the primary, may heal even when
+        // it differs from the XDG/default path.
+        assert!(should_heal_tmux_socket_env(
+            configured,
+            default,
+            Some(configured)
+        ));
+    }
+
+    #[test]
+    fn skips_ephemeral_override_socket() {
+        // A dashboard demo / e2e daemon on a throwaway socket matching
+        // neither the default nor the configured one must NOT clobber the
+        // tmux global env the primary daemon owns — that poisoning is
+        // exactly what strands later panes on a dead `muxa-dash.sock`.
+        let default = Path::new("/run/user/1000/muxa.sock");
+        let configured = Path::new("/custom/primary.sock");
+        let ephemeral = Path::new("/tmp/.tmpXYZ/muxa-dash.sock");
+        assert!(!should_heal_tmux_socket_env(ephemeral, default, None));
+        assert!(!should_heal_tmux_socket_env(
+            ephemeral,
+            default,
+            Some(configured)
+        ));
+    }
 
     #[tokio::test]
     async fn startup_discovery_runs_when_enabled() {
