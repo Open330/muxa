@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-06
+
+### Added
+
+- **`muxa timeline --sort`** — timeline output can now sort groups and lanes
+  by `latest`, `name`, `duration`, `working`, `waiting`, `error`, `human`, or
+  `foreground`, with short aliases like `dur`, `work`, `wait`, `err`, and
+  `tmux`. The TUI also adds `s` to cycle sort modes without restarting.
+
+### Fixed
+
+- **cargo-deny CI after the zellij plugin bridge** — documented and ignored
+  the upstream `zellij-tile 0.44.3 -> clap 3` unmaintained advisories that do
+  not currently have a safe upgrade path, and allowed the permissive `0BSD`
+  license used by zellij plugin transitive dependencies.
+
 ## [0.8.0] - 2026-06-05
 
 ### Added
@@ -878,7 +894,10 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/Open330/muxa/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/Open330/muxa/releases/tag/v0.8.0
+[0.7.0]: https://github.com/Open330/muxa/releases/tag/v0.7.0
 [0.6.0]: https://github.com/Open330/muxa/releases/tag/v0.6.0
 [0.5.0]: https://github.com/Open330/muxa/releases/tag/v0.5.0
 [0.4.5]: https://github.com/Open330/muxa/releases/tag/v0.4.5
