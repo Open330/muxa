@@ -61,6 +61,9 @@ agent transition row는 진입한 상태(`to`)가 아니라 떠난 상태(`from`
 그립니다. 예를 들어 `working -> waiting_input` row는 `state_entered_at`부터
 transition timestamp까지의 `working` 구간입니다.
 
+TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
+[docs/TIMELINE.ko.md](TIMELINE.ko.md)에 따로 정리했습니다.
+
 ## Ledger 타입
 
 `muxa activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:

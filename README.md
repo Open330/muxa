@@ -125,6 +125,7 @@ muxa activity --since today --type human
 | Install and wiring | [docs/INSTALL.md](docs/INSTALL.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |
 | Stats, reports, activity ledger | [docs/ACTIVITY.md](docs/ACTIVITY.md) |
+| Timeline TUI and dashboard graph | [docs/TIMELINE.md](docs/TIMELINE.md) |
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Web dashboard | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |

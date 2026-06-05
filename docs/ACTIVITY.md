@@ -62,6 +62,9 @@ Agent transition rows render the state they left. For example, a ledger row
 `working -> waiting_input` contributes a `working` span from
 `state_entered_at` to the transition timestamp.
 
+For TUI keybindings, grouping modes, dashboard behavior, and JSON export
+details, see [docs/TIMELINE.md](TIMELINE.md).
+
 ## Ledger Types
 
 `muxa activity --type ...` filters the raw ledger:

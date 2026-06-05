@@ -123,6 +123,7 @@ ledger 판정 기준은 [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md)에 있습니�
 | 설치와 wiring | [docs/INSTALL.ko.md](docs/INSTALL.ko.md) |
 | Live TUI와 prompt composer | [docs/WATCH.ko.md](docs/WATCH.ko.md) |
 | Stats, report, activity ledger | [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md) |
+| Timeline TUI와 dashboard graph | [docs/TIMELINE.ko.md](docs/TIMELINE.ko.md) |
 | 설정 레퍼런스 | [docs/CONFIGURATION.ko.md](docs/CONFIGURATION.ko.md) |
 | Web dashboard | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
