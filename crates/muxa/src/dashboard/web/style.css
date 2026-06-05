@@ -155,6 +155,22 @@ button, select {
   min-height: 44px;
 }
 
+.session-panel .panel-header.compact {
+  flex-wrap: nowrap;
+  gap: 8px;
+}
+
+.session-panel .panel-header.compact .panel-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.session-panel .panel-header.compact .panel-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .panel.collapsed .panel-header {
   border-bottom: none;
 }
@@ -429,9 +445,11 @@ button, select {
 }
 
 .compact-select {
-  max-width: 96px;
+  width: 82px;
+  max-width: 82px;
   font-family: var(--mono);
   font-size: 11px;
+  padding-right: 18px;
 }
 
 .timeline-wrap {
