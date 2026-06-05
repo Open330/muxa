@@ -175,8 +175,7 @@ pub async fn serve(
 /// Auth middleware. When a token is configured on the resolved config,
 /// every request must carry a matching `Authorization: Bearer <tok>`.
 /// When no token is configured, requests pass through unchallenged
-/// (only allowed for loopback binds — enforced upstream by the
-/// resolver).
+/// (loopback default, or explicit `dashboard.auth = "none"`).
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,

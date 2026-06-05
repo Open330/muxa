@@ -21,6 +21,8 @@
 // are small (typically <100 rows total) so virtualization is overkill.
 
 const TOKEN_KEY = "muxa.token";
+const COLLAPSED_PANELS_KEY = "muxa.dashboard.collapsedPanels";
+const COLLAPSED_TIMELINE_GROUPS_KEY = "muxa.dashboard.collapsedTimelineGroups";
 const PANES_REFETCH_INTERVAL_MS = 5000;
 const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
@@ -140,9 +142,12 @@ const dom = {
   timelineBody: document.getElementById("timeline-body"),
   timelineRangeChips: document.getElementById("timeline-range-chips"),
   timelineSession: document.getElementById("timeline-session"),
+  timelineMeta: document.getElementById("timeline-meta"),
   agentStateChips: document.getElementById("agent-state-chips"),
   agentKindChips: document.getElementById("agent-kind-chips"),
+  agentsMeta: document.getElementById("agents-meta"),
   paneSocketChips: document.getElementById("pane-socket-chips"),
+  panesMeta: document.getElementById("panes-meta"),
   toast: document.getElementById("toast"),
 };
 
@@ -161,6 +166,24 @@ function showToast(msg) {
   }, 1800);
 }
 
+function loadSet(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    const vals = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(vals) ? vals : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function saveSet(key, values) {
+  try {
+    localStorage.setItem(key, JSON.stringify([...values]));
+  } catch (_) {
+    // Keep the UI interactive even when storage is blocked.
+  }
+}
+
 // ── State ─────────────────────────────────────────────────────────
 
 const store = {
@@ -169,6 +192,10 @@ const store = {
   paneErrors: [], // ScanError[]
   timeline: null, // TimelineDocument
   timelineSessions: new Set(),
+  ui: {
+    collapsedPanels: loadSet(COLLAPSED_PANELS_KEY),
+    collapsedTimelineGroups: loadSet(COLLAPSED_TIMELINE_GROUPS_KEY),
+  },
   filters: {
     agentStates: new Set(AGENT_STATES),
     agentKinds: new Set(AGENT_KINDS),
@@ -234,6 +261,8 @@ function renderCounts() {
   let s = `${a} agent${a === 1 ? "" : "s"} · ${p} pane${p === 1 ? "" : "s"}`;
   if (e > 0) s += ` · ${e} scan error${e === 1 ? "" : "s"}`;
   dom.counts.textContent = s;
+  dom.agentsMeta.textContent = `${a} tracked`;
+  dom.panesMeta.textContent = e > 0 ? `${p} panes · ${e} errors` : `${p} panes`;
 }
 
 function renderTimeline() {
@@ -241,6 +270,7 @@ function renderTimeline() {
   if (!doc) {
     dom.timelineBody.innerHTML = `<div class="timeline-empty">loading…</div>`;
     dom.timelineAxis.innerHTML = "";
+    dom.timelineMeta.textContent = "loading";
     return;
   }
   renderTimelineSessionOptions(doc);
@@ -249,32 +279,38 @@ function renderTimeline() {
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
     dom.timelineBody.innerHTML = `<div class="timeline-empty">timeline window is invalid</div>`;
     dom.timelineAxis.innerHTML = "";
+    dom.timelineMeta.textContent = "invalid window";
     return;
   }
   renderTimelineAxis(start, end);
 
   const lanes = doc.lanes || [];
+  const groups = groupTimelineLanesBySession(lanes);
+  dom.timelineMeta.textContent = `${groups.length} session${groups.length === 1 ? "" : "s"} · ${lanes.length} lane${lanes.length === 1 ? "" : "s"}`;
   if (lanes.length === 0) {
     const note = (doc.notes || [])[0] || "no timeline intervals in this view";
     dom.timelineBody.innerHTML = `<div class="timeline-empty">${esc(note)}</div>`;
     return;
   }
 
-  dom.timelineBody.innerHTML = groupTimelineLanesBySession(lanes)
+  dom.timelineBody.innerHTML = groups
     .map((group) => {
-      const groupHeader = `<div class="timeline-group-header">
+      const collapsed = store.ui.collapsedTimelineGroups.has(group.key);
+      const groupHeader = `<button class="timeline-group-header" type="button" data-timeline-group="${esc(group.key)}" aria-expanded="${collapsed ? "false" : "true"}">
+        <span class="timeline-group-toggle" aria-hidden="true">${collapsed ? "›" : "⌄"}</span>
         <div class="timeline-group-label">
           <span>${esc(group.label)}</span>
           <small>${esc(group.lanes.length)} lane${group.lanes.length === 1 ? "" : "s"} · ${esc(laneTotalsLabel(group.totals))}</small>
         </div>
         <div class="timeline-group-rule"></div>
-      </div>`;
+      </button>`;
       const laneRows = group.lanes
         .map((lane) => renderTimelineLane(lane, start, end, true))
         .join("");
-      return `<div class="timeline-group">${groupHeader}${laneRows}</div>`;
+      return `<div class="timeline-group${collapsed ? " collapsed" : ""}">${groupHeader}<div class="timeline-group-lanes">${laneRows}</div></div>`;
     })
     .join("");
+  bindTimelineGroupToggles();
 }
 
 function renderTimelineLane(lane, start, end, grouped) {
@@ -328,6 +364,22 @@ function compareTimelineLanesInGroup(a, b) {
   const rank = timelineLaneRank(a.kind) - timelineLaneRank(b.kind);
   if (rank !== 0) return rank;
   return (shortTimelineLaneLabel(a) || "").localeCompare(shortTimelineLaneLabel(b) || "");
+}
+
+function bindTimelineGroupToggles() {
+  dom.timelineBody.querySelectorAll("[data-timeline-group]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.getAttribute("data-timeline-group");
+      if (!key) return;
+      if (store.ui.collapsedTimelineGroups.has(key)) {
+        store.ui.collapsedTimelineGroups.delete(key);
+      } else {
+        store.ui.collapsedTimelineGroups.add(key);
+      }
+      saveSet(COLLAPSED_TIMELINE_GROUPS_KEY, store.ui.collapsedTimelineGroups);
+      renderTimeline();
+    });
+  });
 }
 
 function timelineLaneRank(kind) {
@@ -666,6 +718,35 @@ function renderStaticChips() {
   });
 }
 
+function initCollapseControls() {
+  document.querySelectorAll("[data-collapse-target]").forEach((btn) => {
+    const panelId = btn.getAttribute("data-collapse-target");
+    const panel = document.getElementById(panelId);
+    if (!panel) return;
+
+    const collapsed = store.ui.collapsedPanels.has(panelId);
+    setPanelCollapsed(panel, btn, collapsed);
+
+    btn.addEventListener("click", () => {
+      const next = !panel.classList.contains("collapsed");
+      setPanelCollapsed(panel, btn, next);
+      if (next) {
+        store.ui.collapsedPanels.add(panelId);
+      } else {
+        store.ui.collapsedPanels.delete(panelId);
+      }
+      saveSet(COLLAPSED_PANELS_KEY, store.ui.collapsedPanels);
+    });
+  });
+}
+
+function setPanelCollapsed(panel, btn, collapsed) {
+  panel.classList.toggle("collapsed", collapsed);
+  btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  const icon = btn.querySelector("span");
+  if (icon) icon.textContent = collapsed ? "›" : "⌄";
+}
+
 // ── Helpers ───────────────────────────────────────────────────────
 
 function esc(v) {
@@ -783,6 +864,7 @@ function scheduleTimelineRefresh() {
 
 async function main() {
   bootstrapToken();
+  initCollapseControls();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
 

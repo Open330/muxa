@@ -22,9 +22,15 @@
   </header>
 
   <main>
-    <section class="panel" id="timeline-panel">
+    <section class="panel" id="timeline-panel" data-panel="timeline">
       <div class="panel-header">
-        <h2>Timeline</h2>
+        <div class="panel-title">
+          <button class="collapse-btn" type="button" data-collapse-target="timeline-panel" aria-expanded="true" aria-controls="timeline-content" title="Collapse Timeline">
+            <span aria-hidden="true">⌄</span>
+          </button>
+          <h2>Timeline</h2>
+          <span class="panel-meta" id="timeline-meta"></span>
+        </div>
         <div class="filters">
           <span class="filter-label">range:</span>
           <span class="chips" id="timeline-range-chips"></span>
@@ -34,7 +40,7 @@
           </select>
         </div>
       </div>
-      <div class="timeline-wrap">
+      <div class="panel-content timeline-wrap" id="timeline-content">
         <div class="timeline-axis" id="timeline-axis"></div>
         <div class="timeline-body" id="timeline-body">
           <div class="timeline-empty">loading…</div>
@@ -50,9 +56,15 @@
       </div>
     </section>
 
-    <section class="panel" id="agents-panel">
+    <section class="panel" id="agents-panel" data-panel="agents">
       <div class="panel-header">
-        <h2>Agents</h2>
+        <div class="panel-title">
+          <button class="collapse-btn" type="button" data-collapse-target="agents-panel" aria-expanded="true" aria-controls="agents-content" title="Collapse Agents">
+            <span aria-hidden="true">⌄</span>
+          </button>
+          <h2>Agents</h2>
+          <span class="panel-meta" id="agents-meta"></span>
+        </div>
         <div class="filters">
           <span class="filter-label">state:</span>
           <span class="chips" id="agent-state-chips"></span>
@@ -60,7 +72,7 @@
           <span class="chips" id="agent-kind-chips"></span>
         </div>
       </div>
-      <div class="table-wrap">
+      <div class="panel-content table-wrap" id="agents-content">
         <table class="data">
           <thead>
             <tr>
@@ -82,15 +94,21 @@
       </div>
     </section>
 
-    <section class="panel" id="panes-panel">
+    <section class="panel" id="panes-panel" data-panel="panes">
       <div class="panel-header">
-        <h2>tmux panes <span class="muted">(global)</span></h2>
+        <div class="panel-title">
+          <button class="collapse-btn" type="button" data-collapse-target="panes-panel" aria-expanded="true" aria-controls="panes-content" title="Collapse tmux panes">
+            <span aria-hidden="true">⌄</span>
+          </button>
+          <h2>tmux panes <span class="muted">(global)</span></h2>
+          <span class="panel-meta" id="panes-meta"></span>
+        </div>
         <div class="filters">
           <span class="filter-label">socket:</span>
           <span class="chips" id="pane-socket-chips"></span>
         </div>
       </div>
-      <div class="table-wrap">
+      <div class="panel-content table-wrap" id="panes-content">
         <table class="data">
           <thead>
             <tr>

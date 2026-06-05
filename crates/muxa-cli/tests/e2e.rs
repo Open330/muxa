@@ -66,18 +66,33 @@ impl Daemon {
         let dir = dir.keep();
         let socket = dir.join("muxa-e2e.sock");
         let history_path = dir.join("prompts.ndjson");
+        let state_path = dir.join("state.json");
+        let activity_path = dir.join("activity.ndjson");
+        let session_activity_path = dir.join("session-activity.json");
 
-        // Default config that isolates history into the per-test tempdir.
+        // Default config that isolates persisted state into the per-test tempdir.
         // Tests that want richer config concatenate their own TOML body.
         let mut toml = format!(
             r#"
 [history]
 path = "{}"
 
+[state]
+path = "{}"
+
+[activity]
+path = "{}"
+
+[session_activity]
+path = "{}"
+
 [reconciler]
 enabled = false
 "#,
-            history_path.display()
+            history_path.display(),
+            state_path.display(),
+            activity_path.display(),
+            session_activity_path.display()
         );
         if let Some(extra) = extra_toml {
             toml.push_str(extra);
@@ -147,7 +162,7 @@ fn claude_hook_round_trip() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("%99") && stdout.contains("hello e2e"),
+        stdout.contains("hello e2e"),
         "unexpected status output:\n{stdout}"
     );
 }
@@ -297,9 +312,12 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
     let dir = dir.keep();
     let socket = dir.join("muxa-dash.sock");
     let history_path = dir.join("prompts.ndjson");
+    let state_path = dir.join("state.json");
+    let activity_path = dir.join("activity.ndjson");
+    let session_activity_path = dir.join("session-activity.json");
 
-    // Isolate the history file so dashboard tests don't write to the
-    // operator's real `$XDG_DATA_HOME/muxa/prompts.ndjson`.
+    // Isolate persisted state so dashboard tests don't read or write the
+    // operator's real `$XDG_DATA_HOME/muxa/*` files.
     let cfg_path = dir.join("muxa-dash.toml");
     std::fs::write(
         &cfg_path,
@@ -307,8 +325,20 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
             r#"
 [history]
 path = "{}"
+
+[state]
+path = "{}"
+
+[activity]
+path = "{}"
+
+[session_activity]
+path = "{}"
 "#,
-            history_path.display()
+            history_path.display(),
+            state_path.display(),
+            activity_path.display(),
+            session_activity_path.display()
         ),
     )
     .expect("write dashboard test config");

@@ -7,7 +7,7 @@ over Server-Sent Events.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
 Production-ready means default-secure: there is no path that exposes data
-beyond your local machine without you flipping two flags.
+beyond your local machine without explicit public-bind acknowledgement.
 
 ## Surfaces
 
@@ -21,8 +21,8 @@ beyond your local machine without you flipping two flags.
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
 
-`/api/*` endpoints require a Bearer token if one is configured. The static
-routes do not — see "Why the HTML is public" below.
+`/api/*` endpoints require a Bearer token when token auth is enabled. The
+static routes do not — see "Why the HTML is public" below.
 
 ## Quick start
 
@@ -60,7 +60,7 @@ across tab close and browser restart, so you only need to paste it once per
 browser profile. To revoke, clear the `muxa.token` key (DevTools → Application
 → Local Storage) or restart `muxad` with a different token.
 
-### Public bind (LAN / VPN)
+### Public bind with a token (LAN / VPN)
 
 You must opt in to *both* a non-loopback bind *and* a token. Either alone
 fails at startup:
@@ -76,6 +76,32 @@ muxad --dashboard \
 If you skip `--allow-public` or `--dashboard-token`, `muxad` refuses to start
 with a clear message — same applies to TOML configs.
 
+### Public bind without API auth
+
+For a trusted private network, you can intentionally expose the read-only API
+without a bearer token:
+
+```toml
+[dashboard]
+enabled = true
+bind = "0.0.0.0:7878"
+allow_public = true
+auth = "none"
+```
+
+Or via flags/env:
+
+```sh
+muxad --dashboard \
+      --dashboard-bind 0.0.0.0:7878 \
+      --allow-public \
+      --dashboard-auth none
+```
+
+This exposes `/api/agents`, `/api/panes`, `/api/timeline`, `/api/events`, and
+`/api/metrics` to anyone who can reach the port. Use it only on a network you
+already trust.
+
 > ⚠️ **TLS is out of scope.** Use a reverse proxy (nginx, Caddy, Traefik) to
 > terminate TLS in front of the dashboard. Set `proxy_buffering off;` for the
 > SSE endpoint or live updates will batch.
@@ -90,6 +116,7 @@ already enforces env-beats-flag for the fields it covers).
 | -------------------- | ------- | ------------------ | --------------------------------------------------------------- |
 | `enabled`            | bool    | `false`            | `--dashboard` / `--no-dashboard` / `MUXA_DASHBOARD_ENABLED`     |
 | `bind`               | string  | `"127.0.0.1:7878"` | `--dashboard-bind` / `MUXA_DASHBOARD_BIND`                      |
+| `auth`               | string  | `"token"`          | `--dashboard-auth` / `MUXA_DASHBOARD_AUTH` (`token` or `none`)  |
 | `token`              | string  | `""` (no auth)     | `--dashboard-token` / `MUXA_DASHBOARD_TOKEN`                    |
 | `allow_public`       | bool    | `false`            | `--allow-public` / `MUXA_DASHBOARD_ALLOW_PUBLIC`                |
 | `pane_cache_ttl_ms`  | u64     | `2000`             | (TOML only)                                                     |

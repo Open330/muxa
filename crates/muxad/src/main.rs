@@ -10,7 +10,7 @@ use clap::Parser;
 use muxa::activity::{
     ActivityEntry, ActivityLog, ActivityOptions, StateTransitionEntry, StateTransitionInput,
 };
-use muxa::config::NotifierBackend;
+use muxa::config::{DashboardAuthMode, NotifierBackend};
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PaneSessionCache, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, Server};
@@ -61,9 +61,13 @@ struct Args {
     #[arg(long, value_name = "TOKEN", env = "MUXA_DASHBOARD_TOKEN")]
     dashboard_token: Option<String>,
 
+    /// Dashboard API auth mode: `token` or `none`.
+    #[arg(long, value_name = "MODE", env = "MUXA_DASHBOARD_AUTH")]
+    dashboard_auth: Option<String>,
+
     /// Confirm that you want to bind the dashboard to a non-loopback
-    /// address. Required (with a token) when `dashboard.bind` is not
-    /// `127.0.0.1` / `::1`.
+    /// address. Required when `dashboard.bind` is not `127.0.0.1` /
+    /// `::1`.
     #[arg(long)]
     allow_public: bool,
 }
@@ -877,12 +881,25 @@ fn resolve_dashboard_config(cfg: &Config, args: &Args) -> Result<DashboardConfig
     let overrides = DashboardOverrides {
         enabled,
         bind: args.dashboard_bind.clone(),
+        auth: args
+            .dashboard_auth
+            .as_deref()
+            .map(parse_dashboard_auth)
+            .transpose()?,
         token: args.dashboard_token.clone(),
         allow_public,
     };
 
     DashboardConfig::resolve(&cfg.dashboard, &overrides)
         .map_err(|e| anyhow::anyhow!(e).context("resolving dashboard config"))
+}
+
+fn parse_dashboard_auth(s: &str) -> Result<DashboardAuthMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "token" | "bearer" => Ok(DashboardAuthMode::Token),
+        "none" | "off" | "public" => Ok(DashboardAuthMode::None),
+        _ => anyhow::bail!("invalid dashboard auth mode {s:?}; expected `token` or `none`"),
+    }
 }
 
 /// Resolve the oh-my-prompt sink config and, if enabled, spawn its

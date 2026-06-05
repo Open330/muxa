@@ -9,9 +9,9 @@
 //!
 //! Default-secure: opt-in via `[dashboard] enabled = true`, bound to
 //! `127.0.0.1` only. Non-loopback binds require both `allow_public =
-//! true` (an explicit acknowledgement) *and* a non-empty bearer token
-//! — the resolver rejects any combination that exposes an unauthenticated
-//! socket beyond the local machine. Token comparison is constant-time.
+//! true` (an explicit acknowledgement) and either a non-empty bearer
+//! token or the explicit `auth = "none"` public-API opt-in. Token
+//! comparison is constant-time when token auth is enabled.
 //!
 //! ## Layout
 //!

@@ -87,11 +87,13 @@ stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 time
 [dashboard]
 enabled = false
 bind = "127.0.0.1:7878"
+auth = "token"
 token = ""
 allow_public = false
 ```
 
 dashboard는 명시적으로 public binding을 허용하기 전까지 loopback-only입니다.
+token 없는 public API는 추가로 `auth = "none"`을 명시해야 합니다.
 자세한 내용은 [DASHBOARD.md](DASHBOARD.md).
 
 ## External Sinks

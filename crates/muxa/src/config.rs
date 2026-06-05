@@ -73,8 +73,10 @@ pub enum ConfigError {
     #[error(
         "dashboard.bind: {addr} is non-loopback; a bearer token is required \
          — set `dashboard.token` in config OR `MUXA_DASHBOARD_TOKEN` in the \
-         running daemon's environment (note: under systemd the unit's \
-         `Environment=` is what counts, not your interactive shell)"
+         running daemon's environment. To intentionally expose read-only \
+         API data without auth, set `dashboard.auth = \"none\"` too \
+         (note: under systemd the unit's `Environment=` is what counts, \
+         not your interactive shell)"
     )]
     DashboardRequiresToken { addr: SocketAddr },
 
@@ -203,8 +205,13 @@ pub struct DashboardTomlConfig {
     pub enabled: Option<bool>,
     /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
     pub bind: Option<String>,
+    /// API authentication mode. Default keeps the existing behavior:
+    /// bearer-token auth is used when a token is configured, and public
+    /// non-loopback binds require one. Set to `"none"` to explicitly
+    /// expose the dashboard API without auth.
+    pub auth: Option<DashboardAuthMode>,
     /// Bearer token. Empty string is treated as "unset". Required when
-    /// `bind` is non-loopback.
+    /// `bind` is non-loopback unless `auth = "none"` is explicitly set.
     pub token: Option<String>,
     /// Required to be `true` for non-loopback `bind` values. Acts as an
     /// explicit acknowledgement that the operator means to expose the
@@ -212,6 +219,13 @@ pub struct DashboardTomlConfig {
     pub allow_public: Option<bool>,
     /// Pane scanner cache TTL in milliseconds. Default 2000.
     pub pane_cache_ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardAuthMode {
+    Token,
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,12 +633,16 @@ fn validate_dashboard(cfg: &DashboardTomlConfig) -> std::result::Result<(), Conf
         return Ok(());
     }
 
-    // Non-loopback path mirrors `DashboardConfig::resolve`: both
-    // allow_public AND a non-empty token are required. We honor the env
-    // var here because `muxad` reads it via clap; without it we'd emit
-    // false positives for users whose only token source is the env.
+    // Non-loopback path mirrors `DashboardConfig::resolve`: allow_public
+    // plus either a non-empty token or explicit `auth = "none"` is
+    // required. We honor the env var here because `muxad` reads it via
+    // clap; without it we'd emit false positives for users whose only
+    // token source is the env.
     if !cfg.allow_public.unwrap_or(false) {
         return Err(ConfigError::DashboardRequiresAllowPublic { addr: bind });
+    }
+    if matches!(cfg.auth, Some(DashboardAuthMode::None)) {
+        return Ok(());
     }
 
     // Whitespace-only tokens (`"   "`) are pathological — they pass a
@@ -1400,6 +1418,22 @@ default_content = "nope"
                 bind: Some("0.0.0.0:7878".into()),
                 allow_public: Some(true),
                 token: Some("s3cret".into()),
+                ..DashboardTomlConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_for_daemon().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_non_loopback_bind_with_explicit_auth_none() {
+        std::env::set_var(DASHBOARD_TOKEN_ENV, "");
+
+        let cfg = Config {
+            dashboard: DashboardTomlConfig {
+                bind: Some("0.0.0.0:7878".into()),
+                allow_public: Some(true),
+                auth: Some(DashboardAuthMode::None),
                 ..DashboardTomlConfig::default()
             },
             ..Config::default()

@@ -7,14 +7,15 @@
 //! validates the security invariants:
 //!
 //! 1. A non-loopback `bind` is rejected unless `allow_public = true`.
-//! 2. A non-loopback `bind` is rejected unless a non-empty token is set
-//!    — `allow_public` alone is insufficient; we want both an explicit
-//!    acknowledgement *and* a credential before exposing the socket.
+//! 2. A non-loopback `bind` is rejected unless either a non-empty token
+//!    is set or `auth = "none"` is explicitly configured. `allow_public`
+//!    alone is insufficient; exposing unauthenticated API data requires
+//!    a second explicit opt-in.
 //!
 //! These invariants are enforced once, at startup. The HTTP layer trusts
 //! the resolved value.
 
-use crate::config::DashboardTomlConfig;
+use crate::config::{DashboardAuthMode, DashboardTomlConfig};
 use std::net::{AddrParseError, SocketAddr};
 use std::time::Duration;
 
@@ -30,7 +31,8 @@ pub const DEFAULT_PANE_CACHE_TTL: Duration = Duration::from_secs(2);
 pub struct DashboardConfig {
     pub enabled: bool,
     pub bind: SocketAddr,
-    /// `None` = no auth required (only allowed for loopback binds).
+    pub auth: DashboardAuthMode,
+    /// `None` = no auth required.
     pub token: Option<String>,
     pub allow_public: bool,
     pub pane_cache_ttl: Duration,
@@ -47,6 +49,7 @@ pub struct DashboardConfig {
 pub struct DashboardOverrides {
     pub enabled: Option<bool>,
     pub bind: Option<String>,
+    pub auth: Option<DashboardAuthMode>,
     pub token: Option<String>,
     pub allow_public: Option<bool>,
 }
@@ -68,7 +71,8 @@ pub enum DashboardConfigError {
 
     #[error(
         "dashboard.bind={addr} is non-loopback; a bearer token is required \
-         (set dashboard.token, --dashboard-token, or MUXA_DASHBOARD_TOKEN)"
+         (set dashboard.token, --dashboard-token, or MUXA_DASHBOARD_TOKEN; \
+          or set dashboard.auth=\"none\" to intentionally expose the read-only API)"
     )]
     NonLoopbackRequiresToken { addr: SocketAddr },
 }
@@ -96,11 +100,18 @@ impl DashboardConfig {
                     source,
                 })?;
 
+        let auth = ov.auth.or(toml.auth).unwrap_or(DashboardAuthMode::Token);
+
         let token = ov
             .token
             .clone()
             .or_else(|| toml.token.clone())
-            .filter(|s| !s.is_empty()); // empty string treated as unset
+            .filter(|s| !s.trim().is_empty()); // empty/whitespace treated as unset
+        let token = if matches!(auth, DashboardAuthMode::None) {
+            None
+        } else {
+            token
+        };
 
         let allow_public = ov.allow_public.or(toml.allow_public).unwrap_or(false);
 
@@ -112,7 +123,7 @@ impl DashboardConfig {
             if !allow_public {
                 return Err(DashboardConfigError::NonLoopbackRequiresAllowPublic { addr: bind });
             }
-            if token.is_none() {
+            if !matches!(auth, DashboardAuthMode::None) && token.is_none() {
                 return Err(DashboardConfigError::NonLoopbackRequiresToken { addr: bind });
             }
         }
@@ -120,6 +131,7 @@ impl DashboardConfig {
         Ok(Self {
             enabled,
             bind,
+            auth,
             token,
             allow_public,
             pane_cache_ttl,
@@ -133,6 +145,7 @@ impl DashboardConfig {
         Self {
             enabled: false,
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
+            auth: DashboardAuthMode::Token,
             token: None,
             allow_public: false,
             pane_cache_ttl: DEFAULT_PANE_CACHE_TTL,
@@ -208,6 +221,20 @@ mod tests {
     }
 
     #[test]
+    fn non_loopback_with_allow_public_and_auth_none_resolves_without_token() {
+        let toml = DashboardTomlConfig {
+            bind: Some("0.0.0.0:7878".into()),
+            allow_public: Some(true),
+            auth: Some(DashboardAuthMode::None),
+            ..DashboardTomlConfig::default()
+        };
+        let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        assert!(cfg.allow_public);
+        assert_eq!(cfg.auth, DashboardAuthMode::None);
+        assert!(cfg.token.is_none());
+    }
+
+    #[test]
     fn non_loopback_with_allow_public_and_token_resolves_clean() {
         let toml = DashboardTomlConfig {
             bind: Some("0.0.0.0:7878".into()),
@@ -217,6 +244,7 @@ mod tests {
         };
         let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
         assert_eq!(cfg.token.as_deref(), Some("s3cret"));
+        assert_eq!(cfg.auth, DashboardAuthMode::Token);
         assert!(cfg.allow_public);
     }
 
@@ -242,6 +270,7 @@ mod tests {
         let ov = DashboardOverrides {
             enabled: Some(true),
             bind: Some("127.0.0.1:2222".into()),
+            auth: None,
             token: Some("from-override".into()),
             allow_public: None,
         };

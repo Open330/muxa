@@ -3,11 +3,13 @@
 :root {
   --bg: #0d1117;
   --bg-elev: #161b22;
+  --bg-soft: #111722;
   --bg-row-hover: #1f2733;
   --fg: #c9d1d9;
   --fg-muted: #6e7681;
   --fg-dim: #4b5563;
   --border: #30363d;
+  --border-soft: rgba(139, 148, 158, 0.18);
   --accent: #58a6ff;
   --green: #3fb950;
   --yellow: #d29922;
@@ -21,11 +23,13 @@
   :root {
     --bg: #ffffff;
     --bg-elev: #f6f8fa;
+    --bg-soft: #ffffff;
     --bg-row-hover: #eaeef2;
     --fg: #1f2328;
     --fg-muted: #57606a;
     --fg-dim: #818b98;
     --border: #d0d7de;
+    --border-soft: rgba(84, 91, 100, 0.18);
     --accent: #0969da;
     --green: #1a7f37;
     --yellow: #9a6700;
@@ -52,7 +56,8 @@ html, body {
   justify-content: space-between;
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
-  background: var(--bg-elev);
+  background: color-mix(in srgb, var(--bg-elev) 88%, transparent);
+  backdrop-filter: blur(14px);
   position: sticky;
   top: 0;
   z-index: 10;
@@ -88,8 +93,8 @@ html, body {
 main {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 16px 20px 32px;
+  gap: 14px;
+  padding: 18px 20px 34px;
   max-width: 1600px;
   margin: 0 auto;
 }
@@ -99,6 +104,11 @@ main {
   border-radius: 6px;
   background: var(--bg-elev);
   overflow: hidden;
+  box-shadow: 0 10px 26px rgba(0,0,0,0.18);
+}
+
+.panel.collapsed {
+  background: var(--bg-soft);
 }
 
 .panel-header {
@@ -106,9 +116,40 @@ main {
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 12px;
-  padding: 10px 14px;
+  gap: 10px 14px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
+}
+
+.panel.collapsed .panel-header {
+  border-bottom: none;
+}
+
+.panel-title {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.collapse-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  font: 16px/1 var(--mono);
+  cursor: pointer;
+}
+
+.collapse-btn:hover,
+.collapse-btn:focus-visible {
+  color: var(--fg);
+  border-color: var(--accent);
+  outline: none;
 }
 
 .panel-header h2 {
@@ -118,6 +159,21 @@ main {
   font-family: var(--mono);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.panel-meta {
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.panel-content {
+  display: block;
+}
+
+.panel.collapsed .panel-content {
+  display: none;
 }
 
 .muted { color: var(--fg-muted); font-weight: 400; }
@@ -144,7 +200,7 @@ main {
   display: inline-flex;
   align-items: center;
   padding: 2px 8px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-soft);
   border-radius: 999px;
   background: transparent;
   color: var(--fg-muted);
@@ -168,7 +224,7 @@ main {
 
 .select {
   height: 24px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-soft);
   border-radius: 4px;
   background: var(--bg);
   color: var(--fg);
@@ -229,11 +285,53 @@ main {
   gap: 5px;
 }
 
+.timeline-group.collapsed {
+  gap: 0;
+}
+
 .timeline-group-header {
   display: grid;
-  grid-template-columns: 180px minmax(520px, 1fr);
-  gap: 12px;
+  grid-template-columns: 18px 154px minmax(520px, 1fr);
+  gap: 8px;
   align-items: center;
+  width: 100%;
+  min-width: 760px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.timeline-group-header:hover .timeline-group-label span,
+.timeline-group-header:focus-visible .timeline-group-label span {
+  color: var(--accent);
+}
+
+.timeline-group-header:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.timeline-group-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 16px;
+}
+
+.timeline-group-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.timeline-group.collapsed .timeline-group-lanes {
+  display: none;
 }
 
 .timeline-group-label {

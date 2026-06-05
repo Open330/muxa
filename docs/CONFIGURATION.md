@@ -89,12 +89,14 @@ values of `0` disable that timeout.
 [dashboard]
 enabled = false
 bind = "127.0.0.1:7878"
+auth = "token"
 token = ""
 allow_public = false
 ```
 
 The dashboard is loopback-only unless public binding is explicitly
-allowed. See [DASHBOARD.md](DASHBOARD.md).
+allowed. Public API without a token requires the additional explicit
+`auth = "none"` opt-in. See [DASHBOARD.md](DASHBOARD.md).
 
 ## External Sinks
 

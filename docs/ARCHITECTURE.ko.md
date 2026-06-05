@@ -45,7 +45,8 @@ file도 함께 사용합니다.
 
 - IPC socket은 가능한 경우 owner-only permission으로 harden합니다.
 - Dashboard는 기본 loopback-only입니다.
-- Public dashboard binding은 명시적 `allow_public`이 필요합니다.
+- Public dashboard binding은 명시적 `allow_public`이 필요하며, token 없는
+  public API는 추가로 `dashboard.auth = "none"` opt-in이 필요합니다.
 - External sink는 opt-in입니다.
 - Rust `unsafe`는 금지되어 있습니다.
 
