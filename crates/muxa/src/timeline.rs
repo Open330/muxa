@@ -6,7 +6,7 @@
 use crate::activity::{ActivityEntry, HumanInteractionKind};
 use crate::event::{AgentKind, AgentState};
 use crate::session_activity::SessionActivity;
-use crate::state::Agent;
+use crate::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use time::format_description::well_known::Rfc3339;
@@ -301,6 +301,9 @@ pub fn build_document(input: TimelineBuildInput<'_>) -> TimelineDocument {
 
     for agent in input.agents {
         if agent.state == AgentState::Stopped {
+            continue;
+        }
+        if !live_agent_has_range_activity(agent, &input.range) {
             continue;
         }
         let session_name = agent
@@ -722,6 +725,13 @@ fn matches_agent_filter(filters: &TimelineFilters, kind: Option<AgentKind>) -> b
     filters.agent_kind.is_none_or(|wanted| kind == Some(wanted))
 }
 
+fn live_agent_has_range_activity(agent: &Agent, range: &TimelineRange) -> bool {
+    if agent.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) {
+        return false;
+    }
+    range.includes_end(agent.last_activity_at)
+}
+
 fn agent_lane_id(kind: AgentKind, session_id: &str) -> String {
     format!("agent:{kind}:{session_id}")
 }
@@ -919,5 +929,136 @@ mod tests {
             .iter()
             .all(|lane| lane.kind == TimelineLaneKind::Human));
         assert_eq!(doc.totals.human_secs, 240);
+    }
+
+    #[test]
+    fn live_snapshot_agent_without_range_activity_is_not_synthesized() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let agents = [agent(
+            "s1",
+            AgentState::Idle,
+            datetime!(2026-06-05 09:00:00 UTC),
+            datetime!(2026-06-05 09:30:00 UTC),
+        )];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &[],
+            agents: &agents,
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert!(doc.lanes.is_empty());
+        assert!(doc
+            .notes
+            .iter()
+            .any(|note| note == "no timeline intervals in this view"));
+    }
+
+    #[test]
+    fn live_snapshot_agent_with_range_activity_keeps_open_interval() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let agents = [agent(
+            "s1",
+            AgentState::Working,
+            datetime!(2026-06-05 09:00:00 UTC),
+            datetime!(2026-06-05 11:00:00 UTC),
+        )];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &[],
+            agents: &agents,
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.lanes.len(), 1);
+        assert_eq!(doc.lanes[0].intervals.len(), 1);
+        assert_eq!(doc.lanes[0].intervals[0].state, Some(AgentState::Working));
+        assert_eq!(
+            doc.lanes[0].intervals[0].started_at,
+            datetime!(2026-06-05 10:00:00 UTC)
+        );
+        assert!(doc.lanes[0].intervals[0].open);
+        assert_eq!(doc.lanes[0].totals.working_secs, 7200);
+    }
+
+    #[test]
+    fn synthetic_snapshot_agent_is_not_timeline_activity() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let agents = [agent(
+            "synthetic-%1",
+            AgentState::Idle,
+            datetime!(2026-06-05 11:00:00 UTC),
+            datetime!(2026-06-05 11:00:00 UTC),
+        )];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &[],
+            agents: &agents,
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert!(doc.lanes.is_empty());
+    }
+
+    fn agent(
+        session_id: &str,
+        state: AgentState,
+        state_entered_at: OffsetDateTime,
+        last_activity_at: OffsetDateTime,
+    ) -> Agent {
+        Agent {
+            kind: AgentKind::Codex,
+            session_id: session_id.into(),
+            surface: None,
+            pane: Some("%1".into()),
+            cwd: None,
+            state,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: state_entered_at,
+            last_activity_at,
+            state_entered_at,
+        }
     }
 }
