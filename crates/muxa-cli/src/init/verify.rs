@@ -44,7 +44,10 @@ pub async fn run(plan: &Plan, socket: PathBuf) -> Result<VerifyReport> {
 fn agent_component(c: Component) -> bool {
     matches!(
         c,
-        Component::ClaudeHooks | Component::CodexHooks | Component::GeminiHooks
+        Component::ClaudeHooks
+            | Component::CodexHooks
+            | Component::GeminiHooks
+            | Component::OpencodeHooks
     )
 }
 

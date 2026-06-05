@@ -102,6 +102,7 @@ pub fn build(
             Component::ClaudeHooks => plan_claude(direction, *c, &mut actions, &mut warnings)?,
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
             Component::GeminiHooks => plan_gemini(direction, *c, &mut actions)?,
+            Component::OpencodeHooks => plan_opencode(direction, *c, &mut actions)?,
             Component::MuxadSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
             Component::MuxadLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
             Component::MuxadShellrc => plan_shellrc(direction, *c, &mut actions)?,
@@ -163,6 +164,26 @@ pub fn build(
         actions,
         warnings,
     })
+}
+
+fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::opencode::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => files::opencode::upsert(&original),
+        Direction::Uninstall => files::opencode::remove(&original),
+    };
+    actions.push(Action::EditFile {
+        component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
 }
 
 /// Append an `EditFile` for the auto-managed `tmux-env` block. Uses the

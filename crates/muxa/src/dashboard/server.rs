@@ -40,6 +40,7 @@ use tower_http::trace::TraceLayer;
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::metrics::Metrics;
+use crate::session::{SessionBackend, SharedSessionBackend};
 use crate::state::{Agent, SharedStore, Transition};
 use crate::timeline::{self, TimelineBuildInput, TimelineFilters};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
@@ -81,6 +82,7 @@ pub struct AppState {
     pub store: SharedStore,
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
+    pub sessions: SharedSessionBackend,
     /// Lock-free runtime counters surfaced via `/api/metrics`. Cloned
     /// from the [`Store`](crate::state::Store)'s metrics so SSE
     /// connect/disconnect bumps live alongside event-apply bumps.
@@ -103,12 +105,14 @@ impl AppState {
         store: SharedStore,
         config: Arc<DashboardConfig>,
         pane_cache: Arc<PaneCache>,
+        sessions: SharedSessionBackend,
     ) -> Self {
         let metrics = store.metrics();
         Self {
             store,
             config,
             pane_cache,
+            sessions,
             metrics,
             activity_path: None,
             session_activity_path: None,
@@ -138,6 +142,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/terminal-sessions", get(terminal_sessions_handler))
+        .route(
+            "/api/terminal-sessions/{id}/capture",
+            get(terminal_capture_handler),
+        )
         .route("/api/timeline", get(timeline_handler))
         .route("/api/events", get(events_handler))
         .route("/api/metrics", get(metrics_handler))
@@ -155,11 +164,12 @@ pub async fn serve(
     config: Arc<DashboardConfig>,
     store: SharedStore,
     pane_cache: Arc<PaneCache>,
+    sessions: SharedSessionBackend,
     activity_path: Option<PathBuf>,
     session_activity_path: Option<PathBuf>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
-    let state = AppState::new(store, config.clone(), pane_cache)
+    let state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_activity_paths(activity_path, session_activity_path);
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
@@ -236,6 +246,31 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
         errors: result.errors,
         fetched_at: result.fetched_at,
     })
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalSessionsResponse {
+    sessions: Vec<crate::session::SessionRef>,
+}
+
+async fn terminal_sessions_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(TerminalSessionsResponse {
+        sessions: state.sessions.list_sessions(),
+    })
+}
+
+async fn terminal_capture_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.sessions.capture(&id) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,6 +626,7 @@ mod tests {
             Store::shared(),
             Arc::new(DashboardConfig::loopback_default()),
             Arc::new(PaneCache::new(Duration::from_secs(60))),
+            crate::session::PtySessionBackend::shared(),
         )
     }
 
@@ -601,6 +637,7 @@ mod tests {
             Store::shared(),
             Arc::new(cfg),
             Arc::new(PaneCache::new(Duration::from_secs(60))),
+            crate::session::PtySessionBackend::shared(),
         )
     }
 
@@ -642,6 +679,7 @@ mod tests {
                     id: AgentId {
                         kind,
                         session_id: sid.into(),
+                        surface: None,
                         pane: Some(pane.into()),
                         cwd: None,
                     },
@@ -811,6 +849,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "s1".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },
@@ -853,6 +892,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "snap-1".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },
@@ -921,6 +961,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "s1".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },
@@ -948,6 +989,7 @@ mod tests {
                     id: AgentId {
                         kind: AgentKind::ClaudeCode,
                         session_id: "s1".into(),
+                        surface: None,
                         pane: Some("%1".into()),
                         cwd: None,
                     },
@@ -990,6 +1032,7 @@ mod tests {
         let agent = Agent {
             kind: AgentKind::ClaudeCode,
             session_id: "s1".into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: None,
             state: AgentState::Idle,
@@ -1092,6 +1135,7 @@ mod tests {
         let agent = Agent {
             kind: AgentKind::ClaudeCode,
             session_id: "lag".into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: None,
             state: AgentState::Idle,
@@ -1179,6 +1223,7 @@ mod tests {
                     id: AgentId {
                         kind,
                         session_id: sid.into(),
+                        surface: None,
                         pane: Some(pane.into()),
                         cwd: None,
                     },

@@ -210,6 +210,7 @@ pub fn synthesize_started(d: &Discovered, at: OffsetDateTime) -> AgentEvent {
         id: AgentId {
             kind: d.kind,
             session_id: format!("{}{}", SYNTHETIC_SESSION_PREFIX, d.pane.pane_id),
+            surface: None,
             pane: Some(d.pane.pane_id.clone()),
             cwd: None,
         },

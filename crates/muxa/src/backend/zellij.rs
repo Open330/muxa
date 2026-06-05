@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::backend::{BackendCaps, HostKind, PaneBackend};
 use crate::tmux::PaneInfo;
@@ -59,7 +60,36 @@ use crate::tmux::PaneInfo;
 /// Cheap to construct (no I/O); cheap to clone (`Arc` + `RwLock`).
 #[derive(Debug, Default, Clone)]
 pub struct ZellijBackend {
-    snapshot: Arc<RwLock<Vec<PaneInfo>>>,
+    snapshot: Arc<RwLock<ZellijSnapshot>>,
+}
+
+#[derive(Debug, Clone)]
+struct ZellijSnapshot {
+    panes: Vec<PaneInfo>,
+    updated_at: Option<Instant>,
+    ttl: Duration,
+}
+
+impl Default for ZellijSnapshot {
+    fn default() -> Self {
+        Self {
+            panes: Vec::new(),
+            updated_at: None,
+            ttl: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ZellijSnapshot {
+    fn fresh_panes(&self) -> Vec<PaneInfo> {
+        let Some(updated_at) = self.updated_at else {
+            return Vec::new();
+        };
+        if updated_at.elapsed() > self.ttl {
+            return Vec::new();
+        }
+        self.panes.clone()
+    }
 }
 
 impl ZellijBackend {
@@ -75,7 +105,8 @@ impl ZellijBackend {
     /// snapshot).
     pub(crate) fn replace_snapshot(&self, panes: Vec<PaneInfo>) {
         if let Ok(mut w) = self.snapshot.write() {
-            *w = panes;
+            w.panes = panes;
+            w.updated_at = Some(Instant::now());
         }
     }
 }
@@ -89,14 +120,17 @@ impl PaneBackend for ZellijBackend {
         // RwLock poisoning collapses to "empty list" rather than
         // panicking on a hot path; the daemon already treats
         // host-down as ephemeral.
-        self.snapshot.read().map(|s| s.clone()).unwrap_or_default()
+        self.snapshot
+            .read()
+            .map(|s| s.fresh_panes())
+            .unwrap_or_default()
     }
 
     fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
         self.snapshot
             .read()
             .ok()
-            .and_then(|s| s.iter().find(|p| p.pane_id == pane_id).cloned())
+            .and_then(|s| s.fresh_panes().into_iter().find(|p| p.pane_id == pane_id))
     }
 
     fn capture_pane(&self, _pane_id: &str) -> Option<String> {
@@ -108,9 +142,16 @@ impl PaneBackend for ZellijBackend {
     }
 
     fn pane_pid_map(&self) -> HashMap<u32, String> {
-        // Plugin-only — see `caps().pane_pid_map`. Hook ancestry will
-        // skip the walk entirely on this host.
-        HashMap::new()
+        self.snapshot
+            .read()
+            .map(|s| {
+                s.fresh_panes()
+                    .into_iter()
+                    .filter(|p| p.pane_pid != 0)
+                    .map(|p| (p.pane_pid, p.pane_id))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn current_pane(&self) -> Option<String> {
@@ -142,12 +183,13 @@ impl PaneBackend for ZellijBackend {
     }
 
     fn caps(&self) -> BackendCaps {
+        let has_fresh_snapshot = self
+            .snapshot
+            .read()
+            .is_ok_and(|s| !s.fresh_panes().is_empty());
         BackendCaps {
-            // `list_panes`'s `current_command` field stays empty until
-            // the plugin pushes real metadata.
-            current_command: false,
-            // No CLI surface for pid → pane id; plugin-only.
-            pane_pid_map: false,
+            current_command: has_fresh_snapshot,
+            pane_pid_map: has_fresh_snapshot,
             // Disruptive on CLI; plugin-only when non-disruptive.
             capture_pane: false,
             // Always works.

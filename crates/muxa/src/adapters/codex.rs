@@ -65,6 +65,7 @@ impl HookAdapter for CodexAdapter {
         let id = AgentId {
             kind: AgentKind::Codex,
             session_id: input.session_id,
+            surface: None,
             pane,
             cwd: input.cwd,
         };

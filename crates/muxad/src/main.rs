@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
     // reconciler, discovery, enrichment, and snapshotter each hold a
     // handle without contention.
     let backend: muxa::SharedBackend = muxa::default_backend();
+    let sessions = muxa::PtySessionBackend::shared();
     tracing::info!(host = %backend.kind(), "pane backend selected");
     refresh_pane_session_cache(&pane_session_cache, backend.clone()).await;
     spawn_pane_session_cache_task(pane_session_cache.clone(), backend.clone(), &shutdown_tx);
@@ -225,11 +226,13 @@ async fn main() -> Result<()> {
                     .or_else(paths::default_session_activity_file)
             })
             .flatten();
+        let sessions_for_dash = sessions.clone();
         tokio::spawn(async move {
             if let Err(e) = muxa::dashboard::serve(
                 dash_cfg_for_task,
                 store_for_dash,
                 pane_cache,
+                sessions_for_dash,
                 dashboard_activity_path,
                 dashboard_session_activity_path,
                 shutdown_rx,
@@ -245,7 +248,9 @@ async fn main() -> Result<()> {
     spawn_oh_my_prompt_sink(&cfg, &store, &shutdown_tx)?;
     spawn_webhook_sink(&cfg, &store, &shutdown_tx)?;
 
-    let server = Server::new(socket.clone(), store).with_backend(backend.clone());
+    let server = Server::new(socket.clone(), store)
+        .with_backend(backend.clone())
+        .with_sessions(sessions);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
     // Harden socket permissions once the listener exists. We poll briefly
@@ -815,6 +820,7 @@ async fn enrich_from_history(
         candidates.push(muxa::Agent {
             kind: entry.kind,
             session_id: entry.session_id,
+            surface: None,
             pane: Some(pane.pane_id.clone()),
             cwd: entry.cwd,
             state: muxa::AgentState::Idle,

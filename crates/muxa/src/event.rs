@@ -43,6 +43,28 @@ pub enum AgentState {
     Stopped,
 }
 
+/// Normalized execution surface an agent is associated with.
+///
+/// `pane` remains the legacy host-pane field used by tmux/zellij liveness.
+/// `surface` is the additive identity for newer runtimes, including
+/// muxa-owned PTY sessions. Keeping these separate prevents a `pty:*`
+/// identifier from being mistaken for a tmux/zellij pane and reaped by the
+/// host-pane reconciler.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SurfaceKind {
+    Tmux,
+    Zellij,
+    Pty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SurfaceRef {
+    pub kind: SurfaceKind,
+    pub id: String,
+}
+
 /// Identity of an agent instance.
 ///
 /// `session_id` is the source of truth when present. `pane` correlates back
@@ -51,6 +73,8 @@ pub enum AgentState {
 pub struct AgentId {
     pub kind: AgentKind,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
     pub cwd: Option<String>,
 }
@@ -219,6 +243,20 @@ impl AgentEvent {
         }
     }
 
+    pub fn id_mut(&mut self) -> &mut AgentId {
+        match self {
+            Self::Started { id, .. }
+            | Self::PromptSubmitted { id, .. }
+            | Self::ToolStarted { id, .. }
+            | Self::ToolCompleted { id, .. }
+            | Self::NotificationFired { id, .. }
+            | Self::TurnStopped { id, .. }
+            | Self::SessionEnded { id, .. }
+            | Self::Heartbeat { id, .. }
+            | Self::RateLimited { id, .. } => id,
+        }
+    }
+
     pub fn at(&self) -> OffsetDateTime {
         match self {
             Self::Started { at, .. }
@@ -245,6 +283,7 @@ mod tests {
             id: AgentId {
                 kind: AgentKind::ClaudeCode,
                 session_id: "sess-1".into(),
+                surface: None,
                 pane: Some("%10".into()),
                 cwd: None,
             },
@@ -286,6 +325,7 @@ mod tests {
             id: AgentId {
                 kind: AgentKind::ClaudeCode,
                 session_id: "s".into(),
+                surface: None,
                 pane: None,
                 cwd: None,
             },

@@ -26,6 +26,7 @@ const COLLAPSED_TIMELINE_GROUPS_KEY = "muxa.dashboard.collapsedTimelineGroups";
 const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
 const PANES_REFETCH_INTERVAL_MS = 5000;
+const TERMINALS_REFETCH_INTERVAL_MS = 2000;
 const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
@@ -150,6 +151,7 @@ const dom = {
   metricTmux: document.getElementById("metric-tmux"),
   agentsBody: document.getElementById("agents-tbody"),
   panesBody: document.getElementById("panes-tbody"),
+  terminalsBody: document.getElementById("terminals-tbody"),
   timelineAxis: document.getElementById("timeline-axis"),
   timelineBody: document.getElementById("timeline-body"),
   timelineRangeChips: document.getElementById("timeline-range-chips"),
@@ -160,10 +162,12 @@ const dom = {
   agentsMeta: document.getElementById("agents-meta"),
   paneSocketChips: document.getElementById("pane-socket-chips"),
   panesMeta: document.getElementById("panes-meta"),
+  terminalsMeta: document.getElementById("terminals-meta"),
   dataMeta: document.getElementById("data-meta"),
   dataTabs: document.getElementById("data-tabs"),
   agentsTab: document.getElementById("agents-tab"),
   panesTab: document.getElementById("panes-tab"),
+  terminalsTab: document.getElementById("terminals-tab"),
   inspectorBody: document.getElementById("inspector-body"),
   inspectorMeta: document.getElementById("inspector-meta"),
   toast: document.getElementById("toast"),
@@ -223,6 +227,7 @@ function saveValue(key, value) {
 const store = {
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
+  terminalSessions: [], // SessionRef[]
   paneErrors: [], // ScanError[]
   timeline: null, // TimelineDocument
   timelineSessions: new Set(),
@@ -1008,9 +1013,56 @@ function renderPanes() {
   });
 }
 
+function renderTerminals() {
+  const rows = store.terminalSessions;
+  dom.terminalsMeta.textContent = `${rows.length} sessions`;
+  renderDataMeta();
+  if (rows.length === 0) {
+    dom.terminalsBody.innerHTML = `<tr class="empty"><td colspan="7">no muxa-owned terminal sessions</td></tr>`;
+    return;
+  }
+  dom.terminalsBody.innerHTML = rows
+    .map((s) => `<tr>
+      <td>${esc(s.id)}</td>
+      <td>${esc(s.backend)}</td>
+      <td>${esc(s.display_name || "—")}</td>
+      <td title="${esc(s.cwd || "")}">${esc(shortPath(s.cwd || "—"))}</td>
+      <td class="num">${esc(String(s.attached_clients || 0))}</td>
+      <td>${s.exited ? `exited ${esc(String(s.exit_status ?? ""))}` : "running"}</td>
+      <td><button class="attach-btn" data-session="${esc(s.id)}">capture</button></td>
+    </tr>`)
+    .join("");
+  dom.terminalsBody.querySelectorAll("[data-session]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-session");
+      await showTerminalCapture(id);
+    });
+  });
+}
+
+async function showTerminalCapture(id) {
+  const snap = await jsonFetch(`/api/terminal-sessions/${encodeURIComponent(id)}/capture`);
+  const text = (snap.lines || []).join("\n");
+  dom.inspectorMeta.textContent = "terminal";
+  dom.inspectorBody.innerHTML = `
+    <div class="inspector-title">
+      <span>${esc(snap.session?.display_name || snap.session?.id || id)}</span>
+      <small>${esc(snap.session?.cwd || "")}</small>
+    </div>
+    <pre class="terminal-capture"></pre>`;
+  dom.inspectorBody.querySelector(".terminal-capture").textContent = text;
+}
+
 function renderDataMeta() {
   const scope = selectedSession() || "all sessions";
   dom.dataMeta.textContent = `${store.ui.activeTab} · ${scope}`;
+}
+
+function shortPath(path) {
+  if (!path || path === "—") return path || "—";
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length <= 2) return path;
+  return `…/${parts.slice(-2).join("/")}`;
 }
 
 function renderSocketChips(sockets) {
@@ -1091,13 +1143,14 @@ function renderStaticChips() {
 
 function initDataTabs() {
   const apply = (tab) => {
-    store.ui.activeTab = tab === "panes" ? "panes" : "agents";
+    store.ui.activeTab = tab === "panes" || tab === "terminals" ? tab : "agents";
     saveValue(DATA_TAB_KEY, store.ui.activeTab);
     dom.dataTabs.querySelectorAll("[data-tab]").forEach((btn) => {
       btn.classList.toggle("active", btn.getAttribute("data-tab") === store.ui.activeTab);
     });
     dom.agentsTab.classList.toggle("active", store.ui.activeTab === "agents");
     dom.panesTab.classList.toggle("active", store.ui.activeTab === "panes");
+    dom.terminalsTab.classList.toggle("active", store.ui.activeTab === "terminals");
     renderDataMeta();
   };
   dom.dataTabs.querySelectorAll("[data-tab]").forEach((btn) => {
@@ -1303,6 +1356,12 @@ async function fetchPanes() {
   renderCounts();
 }
 
+async function fetchTerminalSessions() {
+  const data = await jsonFetch("/api/terminal-sessions");
+  store.terminalSessions = data.sessions || [];
+  renderTerminals();
+}
+
 async function fetchTimeline() {
   const params = new URLSearchParams({ since: store.filters.timelineRange });
   store.timeline = await jsonFetch(`/api/timeline?${params.toString()}`);
@@ -1362,7 +1421,12 @@ async function main() {
     return; // setConnectionStatus already showed the error
   }
 
-  await Promise.all([fetchAgentsSnapshot(), fetchPanes(), fetchTimeline()]);
+  await Promise.all([
+    fetchAgentsSnapshot(),
+    fetchPanes(),
+    fetchTerminalSessions(),
+    fetchTimeline(),
+  ]);
 
   // Periodically refetch panes — they are pull-only on the server.
   setInterval(() => {
@@ -1370,6 +1434,10 @@ async function main() {
       /* swallowed; SSE indicator will reflect downtime */
     });
   }, PANES_REFETCH_INTERVAL_MS);
+
+  setInterval(() => {
+    fetchTerminalSessions().catch(() => {});
+  }, TERMINALS_REFETCH_INTERVAL_MS);
 
   setInterval(() => {
     fetchTimeline().catch(() => {});

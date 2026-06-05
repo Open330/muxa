@@ -4438,6 +4438,7 @@ mod tests {
         Agent {
             kind,
             session_id: session.into(),
+            surface: None,
             pane: pane.map(Into::into),
             cwd: None,
             state,

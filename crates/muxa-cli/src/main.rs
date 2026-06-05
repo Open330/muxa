@@ -16,7 +16,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
-use muxa::adapters::{claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter};
+use muxa::adapters::{
+    claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
+};
 use muxa::config::{WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
 use muxa::state::Agent;
@@ -28,6 +30,7 @@ use owo_colors::Style;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 use theme::{CliTheme, TableTone, ThemeArg};
 use time::OffsetDateTime;
 use unicode_width::UnicodeWidthChar;
@@ -118,6 +121,31 @@ enum Cmd {
         #[arg(long, value_enum)]
         theme: Option<ThemeArg>,
     },
+    /// Run a command in a muxa-owned PTY session.
+    Run {
+        /// Human-readable session name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Working directory for the child process. Defaults to the current directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Spawn the session and return without attaching.
+        #[arg(long)]
+        detach: bool,
+        /// Command and arguments to run. Use `--` before commands with flags.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Attach this terminal to a muxa-owned PTY session.
+    Attach { session: String },
+    /// Mark a muxa-owned PTY session as detached.
+    Detach { session: String },
+    /// Internal bridge used by the zellij WASM plugin.
+    #[command(hide = true)]
+    ZellijPluginSnapshot {
+        #[arg(long)]
+        json: String,
+    },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
     /// rotates through them (bind it to a tmux key); `--list` prints the
@@ -171,13 +199,7 @@ enum HookCmd {
         #[arg(long)]
         event: String,
     },
-    /// opencode hook handler — not yet implemented.
-    ///
-    /// Kept visible in `--help` so users who try it get a friendly,
-    /// targeted error rather than a generic "unrecognized subcommand".
-    /// Dispatched in `handle_hook` to return a non-zero exit with a
-    /// message pointing at the tracking issue. See
-    /// `crates/muxa/src/adapters/opencode.rs` for the deferred design.
+    /// opencode hook handler.
     Opencode {
         #[arg(long)]
         event: String,
@@ -275,6 +297,15 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Cmd::Run {
+            name,
+            cwd,
+            detach,
+            command,
+        } => cmd_run(&client, &socket, name, cwd, detach, command).await,
+        Cmd::Attach { session } => cmd_attach(&client, &session).await,
+        Cmd::Detach { session } => cmd_detach(&client, &session).await,
+        Cmd::ZellijPluginSnapshot { json } => cmd_zellij_plugin_snapshot(&client, &json).await,
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
@@ -282,6 +313,190 @@ async fn main() -> Result<()> {
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
     }
+}
+
+async fn cmd_run(
+    client: &Client,
+    socket_path: &Path,
+    name: Option<String>,
+    cwd: Option<PathBuf>,
+    detach: bool,
+    command: Vec<String>,
+) -> Result<()> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let Some((program, args)) = command.split_first() else {
+        anyhow::bail!("missing command");
+    };
+    let session = client
+        .spawn_session(muxa::SpawnSession {
+            command: program.clone(),
+            args: args.to_vec(),
+            env: caller_env(socket_path),
+            cwd: Some(cwd.unwrap_or(std::env::current_dir()?)),
+            name,
+            cols: Some(cols),
+            rows: Some(rows),
+        })
+        .await
+        .context("spawning muxa session")?;
+    println!(
+        "muxa: started {} ({})",
+        session
+            .display_name
+            .as_deref()
+            .unwrap_or(session.id.as_str()),
+        session.id
+    );
+    if !detach {
+        attach_session(client, &session.id).await?;
+    }
+    Ok(())
+}
+
+fn caller_env(socket_path: &Path) -> Vec<(String, String)> {
+    let mut env = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect::<Vec<_>>();
+    match env.iter_mut().find(|(key, _)| key == "MUXA_SOCKET") {
+        Some((_, value)) if value.is_empty() => {
+            *value = socket_path.display().to_string();
+        }
+        Some(_) => {}
+        None => env.push(("MUXA_SOCKET".into(), socket_path.display().to_string())),
+    }
+    env
+}
+
+async fn cmd_attach(client: &Client, session: &str) -> Result<()> {
+    let sessions = client.list_sessions().await?;
+    let id = sessions
+        .iter()
+        .find(|s| s.id == session || s.display_name.as_deref() == Some(session))
+        .map_or_else(|| session.to_string(), |s| s.id.clone());
+    attach_session(client, &id).await
+}
+
+async fn cmd_detach(client: &Client, session: &str) -> Result<()> {
+    client.set_session_attached(session, false).await?;
+    println!("muxa: detached {session}");
+    Ok(())
+}
+
+async fn cmd_zellij_plugin_snapshot(client: &Client, json: &str) -> Result<()> {
+    let panes: Vec<muxa::tmux::PaneInfo> =
+        serde_json::from_str(json).context("parsing zellij pane snapshot")?;
+    client
+        .push_pane_snapshot(&panes)
+        .await
+        .context("pushing zellij pane snapshot")?;
+    Ok(())
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+async fn attach_session(client: &Client, session_id: &str) -> Result<()> {
+    let _guard = RawModeGuard::enter()?;
+    client.set_session_attached(session_id, true).await?;
+    let result = attach_session_loop(client, session_id).await;
+    let detach_result = client.set_session_attached(session_id, false).await;
+    match (result, detach_result) {
+        (Err(e), _) => Err(e),
+        (Ok(()), Err(e)) => Err(e).context("detaching muxa session"),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+
+    let mut stdout = std::io::stdout().lock();
+    let mut offset = 0_u64;
+    let mut detach_armed = false;
+
+    loop {
+        let output = client.read_session(session_id, offset).await?;
+        if !output.data.is_empty() {
+            stdout.write_all(output.data.as_bytes())?;
+            stdout.flush()?;
+            offset = output.next_offset;
+        }
+        if output.exited {
+            break;
+        }
+
+        while crossterm::event::poll(Duration::ZERO)? {
+            match crossterm::event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if detach_armed {
+                        detach_armed = false;
+                        if matches!(key.code, KeyCode::Char('d' | 'D')) {
+                            return Ok(());
+                        }
+                        client.write_session(session_id, "\u{1d}").await?;
+                    }
+                    if is_detach_prefix(key) {
+                        detach_armed = true;
+                    } else if let Some(input) = key_to_pty_input(key) {
+                        client.write_session(session_id, &input).await?;
+                    }
+                }
+                Event::Resize(cols, rows) => {
+                    let _ = client.resize_session(session_id, cols, rows).await;
+                }
+                _ => {}
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    Ok(())
+}
+
+fn is_detach_prefix(key: crossterm::event::KeyEvent) -> bool {
+    key.modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+        && matches!(key.code, crossterm::event::KeyCode::Char(']'))
+}
+
+fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    Some(match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let lower = c.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                char::from((lower as u8) - b'a' + 1).to_string()
+            } else {
+                return None;
+            }
+        }
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "\r".into(),
+        KeyCode::Backspace => "\u{7f}".into(),
+        KeyCode::Tab => "\t".into(),
+        KeyCode::Esc => "\u{1b}".into(),
+        KeyCode::Left => "\u{1b}[D".into(),
+        KeyCode::Right => "\u{1b}[C".into(),
+        KeyCode::Up => "\u{1b}[A".into(),
+        KeyCode::Down => "\u{1b}[B".into(),
+        KeyCode::Home => "\u{1b}[H".into(),
+        KeyCode::End => "\u{1b}[F".into(),
+        KeyCode::Delete => "\u{1b}[3~".into(),
+        _ => return None,
+    })
 }
 
 /// Jump to (or list) the agent that needs you. `attend::run` picks the
@@ -645,17 +860,9 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
         }
-        HookCmd::Opencode { event: _ } => {
-            // The `opencode` adapter is deferred — see
-            // `crates/muxa/src/adapters/opencode.rs` and the README's
-            // "Agent support" table. Print a friendly, actionable
-            // error and exit non-zero so users hitting this aren't
-            // left wondering why nothing happened.
-            eprintln!(
-                "error: 'opencode' adapter is not yet implemented. \
-                 See https://github.com/Open330/muxa/issues for status."
-            );
-            std::process::exit(2);
+        HookCmd::Opencode { event } => {
+            let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;
+            best_effort_ingest(client, &ev).await;
         }
     }
     Ok(())
@@ -1088,6 +1295,7 @@ mod tests {
         Agent {
             kind: AgentKind::ClaudeCode,
             session_id: session_id.into(),
+            surface: None,
             pane: pane.map(str::to_string),
             cwd: None,
             state,

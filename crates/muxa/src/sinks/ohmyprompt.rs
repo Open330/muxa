@@ -581,6 +581,7 @@ mod tests {
             id: AgentId {
                 kind,
                 session_id: "sess-1".into(),
+                surface: None,
                 pane: Some("%1".into()),
                 cwd: cwd.map(str::to_string),
             },

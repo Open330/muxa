@@ -778,6 +778,21 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 }
 .attach-btn:hover { border-color: var(--accent); }
 
+.terminal-capture {
+  margin: 12px 0 0;
+  max-height: 52vh;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
 .inspector-body {
   padding: 12px;
 }

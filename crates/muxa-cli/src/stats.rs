@@ -1798,6 +1798,7 @@ mod tests {
         Agent {
             kind: AgentKind::Codex,
             session_id: "agent-live".into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: cwd.map(str::to_string),
             state,

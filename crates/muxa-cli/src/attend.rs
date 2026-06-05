@@ -286,6 +286,7 @@ mod tests {
         Agent {
             kind: AgentKind::ClaudeCode,
             session_id: session.into(),
+            surface: None,
             pane: pane.map(Into::into),
             cwd: None,
             state,

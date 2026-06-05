@@ -532,6 +532,7 @@ mod tests {
                     id: AgentId {
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
+                        surface: None,
                         pane: Some(format!("%{sid}")),
                         cwd: None,
                     },

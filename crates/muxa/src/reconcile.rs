@@ -293,6 +293,7 @@ mod tests {
             id: AgentId {
                 kind: AgentKind::ClaudeCode,
                 session_id: sid.into(),
+                surface: None,
                 pane: Some(pane_id.into()),
                 cwd: None,
             },
@@ -416,6 +417,7 @@ mod tests {
         let mk = |sid: &str, state: AgentState| Agent {
             kind: AgentKind::ClaudeCode,
             session_id: sid.into(),
+            surface: None,
             pane: Some("%3".into()),
             cwd: None,
             state,

@@ -21,13 +21,17 @@
 
 use crate::backend::{default_backend, SharedBackend};
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
+use crate::session::{
+    PtySessionBackend, SessionBackend, SessionOutput, SessionRef, SharedSessionBackend,
+    SpawnSession, TerminalSnapshot,
+};
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -38,6 +42,7 @@ use tokio::task::JoinSet;
 /// generous slack. If a handler hangs past this we abort it rather than
 /// blocking the daemon's exit indefinitely.
 const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_IPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -55,6 +60,9 @@ pub enum RuntimeError {
         .0.display()
     )]
     NotConnected(PathBuf),
+
+    #[error("ipc message exceeds {0} bytes")]
+    MessageTooLarge(usize),
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +77,9 @@ enum RequestBody {
     },
     BySession {
         session_id: String,
+    },
+    BySurface {
+        surface_id: String,
     },
     /// Disk-backed prompt audit log. `pane = None` returns prompts across
     /// every tracked pane, sorted newest-first; otherwise filtered to one
@@ -105,6 +116,45 @@ enum RequestBody {
     /// no-op on tmux (that backend enumerates panes itself).
     BackendPaneSnapshot {
         panes: Vec<PaneInfo>,
+    },
+    SpawnSession {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+    },
+    ListSessions,
+    CaptureSession {
+        session_id: String,
+    },
+    ReadSession {
+        session_id: String,
+        offset: u64,
+    },
+    WriteSession {
+        session_id: String,
+        data: String,
+    },
+    ResizeSession {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    SetSessionAttached {
+        session_id: String,
+        attached: bool,
+    },
+    TerminateSession {
+        session_id: String,
     },
 }
 
@@ -145,6 +195,14 @@ pub struct Response {
     pub max_protocol: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<SessionRef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<SessionOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,6 +223,10 @@ impl Response {
             min_protocol: None,
             max_protocol: None,
             capabilities: None,
+            sessions: None,
+            session: None,
+            terminal: None,
+            output: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -191,6 +253,26 @@ impl Response {
         });
         r
     }
+    fn with_sessions(sessions: Vec<SessionRef>) -> Self {
+        let mut r = Self::ok();
+        r.sessions = Some(sessions);
+        r
+    }
+    fn with_session(session: SessionRef) -> Self {
+        let mut r = Self::ok();
+        r.session = Some(session);
+        r
+    }
+    fn with_terminal(terminal: TerminalSnapshot) -> Self {
+        let mut r = Self::ok();
+        r.terminal = Some(terminal);
+        r
+    }
+    fn with_output(output: SessionOutput) -> Self {
+        let mut r = Self::ok();
+        r.output = Some(output);
+        r
+    }
     fn hello() -> Self {
         let mut r = Self::ok();
         r.min_protocol = Some(MIN_PROTOCOL_VERSION);
@@ -205,6 +287,7 @@ pub struct Server {
     socket_path: PathBuf,
     store: SharedStore,
     backend: SharedBackend,
+    sessions: SharedSessionBackend,
 }
 
 impl Server {
@@ -213,6 +296,7 @@ impl Server {
             socket_path,
             store,
             backend: default_backend(),
+            sessions: PtySessionBackend::shared(),
         }
     }
 
@@ -227,6 +311,12 @@ impl Server {
         self
     }
 
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: SharedSessionBackend) -> Self {
+        self.sessions = sessions;
+        self
+    }
+
     /// Run until `shutdown` fires or an I/O error occurs.
     ///
     /// In-flight connection handlers are tracked on a `JoinSet` so a
@@ -238,6 +328,7 @@ impl Server {
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<(), RuntimeError> {
         self.bind_with_perms()?;
         let listener = UnixListener::bind(&self.socket_path)?;
+        harden_permissions(&self.socket_path)?;
         tracing::info!(socket = %self.socket_path.display(), "listening");
 
         let mut handlers: JoinSet<()> = JoinSet::new();
@@ -248,8 +339,9 @@ impl Server {
                     let (stream, _) = accept?;
                     let store = self.store.clone();
                     let backend = self.backend.clone();
+                    let sessions = self.sessions.clone();
                     handlers.spawn(async move {
-                        if let Err(e) = handle(stream, store, backend).await {
+                        if let Err(e) = handle(stream, store, backend, sessions).await {
                             tracing::warn!(error = %e, "connection handler failed");
                         }
                     });
@@ -290,7 +382,7 @@ impl Server {
     }
 
     /// Pre-bind sequence: if a stale socket exists, remove it; then the
-    /// caller binds. We also chmod 0600 after bind (see `run`).
+    /// caller binds and immediately chmods 0600 in `run`.
     fn bind_with_perms(&self) -> Result<(), RuntimeError> {
         if self.socket_path.exists() {
             // Probe: is anything listening?
@@ -303,8 +395,6 @@ impl Server {
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Tighten perms *after* bind in `run` — but we also chmod here in
-        // case UnixListener::bind leaves world-readable perms briefly.
         Ok(())
     }
 }
@@ -346,6 +436,37 @@ fn encode_line<T: Serialize>(value: &T, protocol: u32) -> Result<Vec<u8>, serde_
     Ok(bytes)
 }
 
+async fn read_limited_line<R>(reader: &mut R, line: &mut String) -> Result<usize, RuntimeError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(available.len(), |pos| pos + 1);
+        if bytes.len().saturating_add(take) > MAX_IPC_LINE_BYTES {
+            return Err(RuntimeError::MessageTooLarge(MAX_IPC_LINE_BYTES));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if bytes.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    *line = String::from_utf8(bytes)
+        .map_err(|e| RuntimeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    Ok(line.len())
+}
+
 /// Pump every state transition from `store` to `writer` as a JSON
 /// line. Runs until the broadcast channel closes (daemon shutting
 /// down) or the client closes its half of the socket — the first
@@ -384,12 +505,13 @@ async fn stream_transitions(
     }
 }
 
-#[tracing::instrument(level = "debug", skip(stream, store, backend))]
+#[tracing::instrument(level = "debug", skip(stream, store, backend, sessions))]
 #[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
 async fn handle(
     stream: UnixStream,
     store: SharedStore,
     backend: SharedBackend,
+    sessions: SharedSessionBackend,
 ) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -404,7 +526,7 @@ async fn handle(
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = read_limited_line(&mut reader, &mut line).await?;
         if n == 0 {
             return Ok(());
         }
@@ -491,6 +613,10 @@ async fn handle(
                         .collect::<Vec<_>>();
                     Response::with_agents(v)
                 }
+                RequestBody::BySurface { surface_id } => {
+                    kind = "by_surface";
+                    Response::with_agents(store.by_surface(&surface_id).await)
+                }
                 RequestBody::RecentPrompts { pane, limit } => {
                     kind = "recent_prompts";
                     let prompts = store
@@ -508,6 +634,82 @@ async fn handle(
                     backend.ingest_pane_snapshot(panes);
                     tracing::debug!(panes = count, "backend_pane_snapshot");
                     Response::ok()
+                }
+                RequestBody::SpawnSession {
+                    command,
+                    args,
+                    env,
+                    cwd,
+                    name,
+                    cols,
+                    rows,
+                } => {
+                    kind = "spawn_session";
+                    match sessions.spawn_session(SpawnSession {
+                        command,
+                        args,
+                        env,
+                        cwd,
+                        name,
+                        cols,
+                        rows,
+                    }) {
+                        Ok(session) => Response::with_session(session),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::ListSessions => {
+                    kind = "list_sessions";
+                    Response::with_sessions(sessions.list_sessions())
+                }
+                RequestBody::CaptureSession { session_id } => {
+                    kind = "capture_session";
+                    match sessions.capture(&session_id) {
+                        Ok(snapshot) => Response::with_terminal(snapshot),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::ReadSession { session_id, offset } => {
+                    kind = "read_session";
+                    match sessions.read_output(&session_id, offset) {
+                        Ok(output) => Response::with_output(output),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::WriteSession { session_id, data } => {
+                    kind = "write_session";
+                    match sessions.send_input(&session_id, data.as_bytes()) {
+                        Ok(()) => Response::ok(),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::ResizeSession {
+                    session_id,
+                    cols,
+                    rows,
+                } => {
+                    kind = "resize_session";
+                    match sessions.resize(&session_id, cols, rows) {
+                        Ok(()) => Response::ok(),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::SetSessionAttached {
+                    session_id,
+                    attached,
+                } => {
+                    kind = "set_session_attached";
+                    match sessions.set_attached(&session_id, attached) {
+                        Ok(()) => Response::ok(),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::TerminateSession { session_id } => {
+                    kind = "terminate_session";
+                    match sessions.terminate(&session_id) {
+                        Ok(()) => Response::ok(),
+                        Err(e) => Response::err(e.to_string()),
+                    }
                 }
                 RequestBody::Subscribe => {
                     kind = "subscribe";
@@ -577,7 +779,7 @@ impl TransitionStream {
     /// Wait for and return the next streamed `Transition`.
     pub async fn recv(&mut self) -> Result<Option<crate::state::Transition>, RuntimeError> {
         self.line.clear();
-        let n = self.reader.read_line(&mut self.line).await?;
+        let n = read_limited_line(&mut self.reader, &mut self.line).await?;
         if n == 0 {
             return Ok(None);
         }
@@ -629,6 +831,20 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "by_pane",
             "pane": pane
+        });
+        let resp = self.call(&req).await?;
+        Ok(resp["agents"]
+            .as_array()
+            .cloned()
+            .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
+            .unwrap_or_default())
+    }
+
+    pub async fn by_surface(&self, surface_id: &str) -> Result<Vec<Agent>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "by_surface",
+            "surface_id": surface_id
         });
         let resp = self.call(&req).await?;
         Ok(resp["agents"]
@@ -691,13 +907,16 @@ impl Client {
             "kind": "subscribe",
         }))?;
         req.push(b'\n');
+        if req.len() > MAX_IPC_LINE_BYTES {
+            return Err(RuntimeError::MessageTooLarge(MAX_IPC_LINE_BYTES));
+        }
         writer.write_all(&req).await?;
         writer.flush().await?;
 
         // Server replies with a one-shot ack before the streaming
         // pump takes over.
         let mut ack = String::new();
-        reader.read_line(&mut ack).await?;
+        read_limited_line(&mut reader, &mut ack).await?;
         let ack: serde_json::Value = serde_json::from_str(ack.trim())?;
         if !ack["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(format!(
@@ -716,6 +935,116 @@ impl Client {
         })
     }
 
+    pub async fn spawn_session(
+        &self,
+        spawn: crate::session::SpawnSession,
+    ) -> Result<SessionRef, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "spawn_session",
+            "command": spawn.command,
+            "args": spawn.args,
+            "env": spawn.env,
+            "cwd": spawn.cwd,
+            "name": spawn.name,
+            "cols": spawn.cols,
+            "rows": spawn.rows,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["session"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<SessionRef>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "list_sessions" });
+        let resp = self.call_checked(&req).await?;
+        Ok(resp["sessions"]
+            .as_array()
+            .cloned()
+            .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
+            .unwrap_or_default())
+    }
+
+    pub async fn capture_session(
+        &self,
+        session_id: &str,
+    ) -> Result<TerminalSnapshot, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "capture_session",
+            "session_id": session_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["terminal"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn read_session(
+        &self,
+        session_id: &str,
+        offset: u64,
+    ) -> Result<SessionOutput, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "read_session",
+            "session_id": session_id,
+            "offset": offset,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["output"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn write_session(&self, session_id: &str, data: &str) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "write_session",
+            "session_id": session_id,
+            "data": data,
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
+    pub async fn resize_session(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "resize_session",
+            "session_id": session_id,
+            "cols": cols,
+            "rows": rows,
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
+    pub async fn set_session_attached(
+        &self,
+        session_id: &str,
+        attached: bool,
+    ) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "set_session_attached",
+            "session_id": session_id,
+            "attached": attached,
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
+    pub async fn terminate_session(&self, session_id: &str) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "terminate_session",
+            "session_id": session_id,
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
     /// Send the capability handshake as the first message on a freshly
     /// opened connection. Best-effort: a daemon that doesn't understand
     /// `hello` (older build) returns `ok:false` with a parse error or a
@@ -732,10 +1061,13 @@ impl Client {
             "client": concat!("muxa/", env!("CARGO_PKG_VERSION")),
         }))?;
         bytes.push(b'\n');
+        if bytes.len() > MAX_IPC_LINE_BYTES {
+            return Err(RuntimeError::MessageTooLarge(MAX_IPC_LINE_BYTES));
+        }
         writer.write_all(&bytes).await?;
         writer.flush().await?;
         let mut ack = String::new();
-        reader.read_line(&mut ack).await?;
+        read_limited_line(reader, &mut ack).await?;
         // Parse but don't fail on a non-ok response — legacy daemons
         // will reject the unknown `kind`, which is fine; the caller's
         // request still goes through.
@@ -763,12 +1095,32 @@ impl Client {
 
         let mut bytes = serde_json::to_vec(req)?;
         bytes.push(b'\n');
+        if bytes.len() > MAX_IPC_LINE_BYTES {
+            return Err(RuntimeError::MessageTooLarge(MAX_IPC_LINE_BYTES));
+        }
         writer.write_all(&bytes).await?;
         writer.flush().await?;
 
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        read_limited_line(&mut reader, &mut line).await?;
         Ok(serde_json::from_str(line.trim())?)
+    }
+
+    async fn call_checked(
+        &self,
+        req: &serde_json::Value,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let resp = self.call(req).await?;
+        if resp["ok"].as_bool().unwrap_or(false) {
+            Ok(resp)
+        } else {
+            Err(RuntimeError::Json(serde::de::Error::custom(
+                resp["error"]
+                    .as_str()
+                    .unwrap_or("request failed")
+                    .to_string(),
+            )))
+        }
     }
 }
 
@@ -808,6 +1160,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "sess-a".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },
@@ -847,6 +1200,7 @@ mod tests {
         let id = AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: "sub-test".into(),
+            surface: None,
             pane: Some("%9".into()),
             cwd: None,
         };
@@ -1131,6 +1485,7 @@ mod tests {
         let id = AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: "v1-test".into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: None,
         };
@@ -1202,6 +1557,7 @@ mod tests {
         let id = AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: "v2-test".into(),
+            surface: None,
             pane: Some("%2".into()),
             cwd: None,
         };

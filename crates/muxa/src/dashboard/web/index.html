@@ -112,6 +112,7 @@
           <div class="tabs" id="data-tabs">
             <button class="tab active" type="button" data-tab="agents">Agents</button>
             <button class="tab" type="button" data-tab="panes">Panes</button>
+            <button class="tab" type="button" data-tab="terminals">Terminals</button>
           </div>
         </div>
 
@@ -169,6 +170,30 @@
                 </tr>
               </thead>
               <tbody id="panes-tbody">
+                <tr class="empty"><td colspan="7">loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="terminals-tab">
+          <div class="panel-toolbar">
+            <span class="panel-meta" id="terminals-meta"></span>
+          </div>
+          <div class="table-wrap" id="terminals-content">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>SESSION</th>
+                  <th>BACKEND</th>
+                  <th>NAME</th>
+                  <th>CWD</th>
+                  <th>CLIENTS</th>
+                  <th>STATE</th>
+                  <th>CAPTURE</th>
+                </tr>
+              </thead>
+              <tbody id="terminals-tbody">
                 <tr class="empty"><td colspan="7">loading…</td></tr>
               </tbody>
             </table>

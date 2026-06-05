@@ -22,3 +22,4 @@ pub use hook::{run_hook, AdapterError, HookAdapter};
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
+pub use opencode::OpencodeAdapter;

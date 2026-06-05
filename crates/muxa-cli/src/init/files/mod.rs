@@ -10,6 +10,7 @@ pub mod codex;
 pub mod dashboard;
 pub mod gemini;
 pub mod launchd;
+pub mod opencode;
 pub mod shellrc;
 pub mod systemd;
 pub mod tmux;

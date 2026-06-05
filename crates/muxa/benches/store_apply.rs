@@ -50,6 +50,7 @@ fn make_realistic_agent() -> Agent {
     Agent {
         kind: AgentKind::ClaudeCode,
         session_id: "sess-bench-0001".into(),
+        surface: None,
         pane: Some("%42".into()),
         cwd: Some("/home/user/projects/some-large-codebase".into()),
         state: muxa::AgentState::Idle,
@@ -132,6 +133,7 @@ async fn bench_one(n_subscribers: usize, iters: u64) -> (Duration, Duration, u64
     let id = AgentId {
         kind: AgentKind::ClaudeCode,
         session_id: "sess-bench-0001".into(),
+        surface: None,
         pane: Some("%42".into()),
         cwd: Some("/home/user/projects/some-large-codebase".into()),
     };

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]
+members = ["crates/muxa", "crates/muxa-cli", "crates/muxad", "crates/muxa-zellij-plugin"]
 
 [workspace.package]
 version = "0.7.1"
@@ -36,6 +36,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 rust-embed = "8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 url = "2"
+portable-pty = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

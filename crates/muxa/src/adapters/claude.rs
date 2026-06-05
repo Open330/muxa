@@ -96,6 +96,7 @@ impl HookAdapter for ClaudeAdapter {
         let id = AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: input.session_id,
+            surface: None,
             pane,
             cwd: input.cwd,
         };
@@ -337,6 +338,7 @@ pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> Age
         id: AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: input.session_id,
+            surface: None,
             pane,
             cwd: input.cwd,
         },

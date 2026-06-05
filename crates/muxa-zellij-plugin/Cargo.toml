@@ -1,0 +1,22 @@
+[package]
+name = "muxa-zellij-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zellij WASM metadata bridge for muxa"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+zellij-tile = "0.44.3"
+
+[lints]
+workspace = true

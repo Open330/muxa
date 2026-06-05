@@ -147,6 +147,7 @@ mod tests {
         Agent {
             kind: AgentKind::ClaudeCode,
             session_id: "s".into(),
+            surface: None,
             pane: Some("%7".into()),
             cwd: None,
             state,

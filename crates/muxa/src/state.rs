@@ -15,6 +15,7 @@
 
 use crate::event::{
     AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope, RateLimitSource,
+    SurfaceRef,
 };
 use crate::history::{HistoryEntry, HistoryOptions, PromptHistory};
 use crate::metrics::Metrics;
@@ -62,6 +63,8 @@ const PROMPT_CHANNEL_CAPACITY: usize = 256;
 pub struct Agent {
     pub kind: AgentKind,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
     pub cwd: Option<String>,
     pub state: AgentState,
@@ -144,6 +147,7 @@ impl Agent {
     fn new(
         kind: AgentKind,
         session_id: String,
+        surface: Option<SurfaceRef>,
         pane: Option<String>,
         cwd: Option<String>,
         at: OffsetDateTime,
@@ -151,6 +155,7 @@ impl Agent {
         Self {
             kind,
             session_id,
+            surface,
             pane,
             cwd,
             state: AgentState::Starting,
@@ -382,7 +387,11 @@ fn mutate_for_event(
                 at,
                 model: agent.model.clone(),
             });
-            if let Some(pane) = agent.pane.clone() {
+            let history_key = agent
+                .pane
+                .clone()
+                .or_else(|| agent.surface.as_ref().map(|s| s.id.clone()));
+            if let Some(pane) = history_key {
                 history_entry = Some(HistoryEntry::with_cwd(
                     agent.kind,
                     agent.session_id.clone(),
@@ -778,6 +787,7 @@ impl Store {
             Agent::new(
                 id.kind,
                 id.session_id.clone(),
+                id.surface.clone(),
                 id.pane.clone(),
                 id.cwd.clone(),
                 at,
@@ -787,6 +797,9 @@ impl Store {
         // Keep identity fields fresh — adapters may re-send with more info.
         if agent.pane.is_none() {
             agent.pane.clone_from(&id.pane);
+        }
+        if agent.surface.is_none() {
+            agent.surface.clone_from(&id.surface);
         }
         if agent.cwd.is_none() {
             agent.cwd.clone_from(&id.cwd);
@@ -855,6 +868,16 @@ impl Store {
             .await
             .values()
             .filter(|a| a.pane.as_deref() == Some(pane))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn by_surface(&self, surface_id: &str) -> Vec<Agent> {
+        self.agents
+            .read()
+            .await
+            .values()
+            .filter(|a| a.surface.as_ref().is_some_and(|s| s.id == surface_id))
             .cloned()
             .collect()
     }
@@ -1089,6 +1112,7 @@ mod tests {
         AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: session.into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: None,
         }
@@ -2248,6 +2272,7 @@ mod tests {
         let synthetic = AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: "synthetic-%1".into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: None,
         };
@@ -2285,6 +2310,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%7".into(),
+                    surface: None,
                     pane: Some("%7".into()),
                     cwd: None,
                 },
@@ -2300,6 +2326,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-sess".into(),
+                    surface: None,
                     pane: Some("%7".into()),
                     cwd: Some("/work".into()),
                 },
@@ -2326,6 +2353,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-sess".into(),
+                    surface: None,
                     pane: Some("%9".into()),
                     cwd: None,
                 },
@@ -2339,6 +2367,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%9".into(),
+                    surface: None,
                     pane: Some("%9".into()),
                     cwd: None,
                 },
@@ -2419,6 +2448,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real".into(),
+                    surface: None,
                     pane: Some("%5".into()),
                     cwd: None,
                 },
@@ -2430,6 +2460,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real".into(),
+                    surface: None,
                     pane: Some("%5".into()),
                     cwd: None,
                 },
@@ -2446,6 +2477,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%5".into(),
+                    surface: None,
                     pane: Some("%5".into()),
                     cwd: None,
                 },
@@ -2477,6 +2509,7 @@ mod tests {
                     id: AgentId {
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
+                        surface: None,
                         pane: Some(format!("%{sid}")),
                         cwd: None,
                     },
@@ -2506,6 +2539,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "no-pane".into(),
+                    surface: None,
                     pane: None,
                     cwd: None,
                 },
@@ -2537,6 +2571,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%1".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },
@@ -2556,6 +2591,7 @@ mod tests {
                 Agent {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-old".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Stopped,
@@ -2582,6 +2618,7 @@ mod tests {
                 Agent {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-new".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Working,
@@ -2637,6 +2674,7 @@ mod tests {
                     Agent {
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
+                        surface: None,
                         pane: Some("%1".into()),
                         cwd: None,
                         state: AgentState::Working,
@@ -2683,6 +2721,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "live".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },
@@ -2695,6 +2734,7 @@ mod tests {
         let mk = |sid: &str, pane: &str, prompt: &str| Agent {
             kind: AgentKind::ClaudeCode,
             session_id: sid.into(),
+            surface: None,
             pane: Some(pane.into()),
             cwd: None,
             state: AgentState::Idle,
@@ -2843,6 +2883,7 @@ mod tests {
                 id: AgentId {
                     kind: AgentKind::ClaudeCode,
                     session_id: "lone".into(),
+                    surface: None,
                     pane: Some("%1".into()),
                     cwd: None,
                 },

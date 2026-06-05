@@ -27,6 +27,7 @@ rust-embed = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 notify-rust = "4"
+portable-pty = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

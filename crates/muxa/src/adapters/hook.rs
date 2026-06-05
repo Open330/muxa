@@ -1,6 +1,6 @@
 //! Shared machinery for stdin-JSON hook adapters.
 
-use crate::event::{AgentEvent, AgentKind};
+use crate::event::{AgentEvent, AgentKind, SurfaceKind, SurfaceRef};
 use serde::de::DeserializeOwned;
 use std::io::Read;
 
@@ -58,9 +58,31 @@ where
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
-    let pane = host_pane_env()
-        .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()));
-    Ok(A::normalize(event, input, pane))
+    let surface = muxa_session_env();
+    let pane = if surface.is_some() {
+        None
+    } else {
+        host_pane_env()
+            .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()))
+    };
+    let mut ev = A::normalize(event, input, pane);
+    if let Some(surface) = surface {
+        ev.id_mut().surface = Some(surface);
+    }
+    Ok(ev)
+}
+
+fn muxa_session_env() -> Option<SurfaceRef> {
+    let id = std::env::var("MUXA_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let backend = std::env::var("MUXA_SESSION_BACKEND").unwrap_or_else(|_| "pty".into());
+    let kind = match backend.trim() {
+        "tmux" => SurfaceKind::Tmux,
+        "zellij" => SurfaceKind::Zellij,
+        _ => SurfaceKind::Pty,
+    };
+    Some(SurfaceRef { kind, id })
 }
 
 /// Read whichever host-set "this pane" env var is present, in

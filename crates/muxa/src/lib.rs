@@ -47,6 +47,7 @@ pub mod metrics;
 pub mod notify;
 pub mod paths;
 pub mod reconcile;
+pub mod session;
 pub mod session_activity;
 pub mod sinks;
 pub mod snapshot;
@@ -64,7 +65,9 @@ pub use backend::{
 };
 pub use config::Config;
 pub use error::CoreError as Error;
-pub use event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel};
+pub use event::{
+    AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, SurfaceKind, SurfaceRef,
+};
 pub use history::{HistoryEntry, PromptHistory};
 pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
 
@@ -102,6 +105,11 @@ pub use history::{CompactReport, HistoryOptions, PaneSessionCache};
 pub use metrics::{Metrics, MetricsSnapshot};
 #[doc(hidden)]
 pub use reconcile::{LivenessSource, Reconciler};
+#[doc(hidden)]
+pub use session::{
+    PtySessionBackend, SessionBackend, SessionBackendCaps, SessionBackendKind, SessionError,
+    SessionOutput, SessionRef, SharedSessionBackend, SpawnSession, TerminalSnapshot,
+};
 #[doc(hidden)]
 pub use session_activity::{
     SessionActivity, SessionActivityTracker, SESSION_ACTIVITY_SCHEMA_VERSION,

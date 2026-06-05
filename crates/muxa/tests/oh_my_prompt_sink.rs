@@ -35,6 +35,7 @@ fn make_prompt(prompt: &str, session: &str) -> PromptRecord {
         id: AgentId {
             kind: AgentKind::ClaudeCode,
             session_id: session.into(),
+            surface: None,
             pane: Some("%1".into()),
             cwd: Some("/work/proj".into()),
         },

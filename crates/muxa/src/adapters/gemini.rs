@@ -69,6 +69,7 @@ impl HookAdapter for GeminiAdapter {
         let id = AgentId {
             kind: AgentKind::GeminiCli,
             session_id: input.session_id,
+            surface: None,
             pane,
             cwd: input.cwd,
         };

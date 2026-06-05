@@ -485,6 +485,7 @@ mod tests {
         Agent {
             kind,
             session_id: "sess-1".into(),
+            surface: None,
             pane: pane.map(str::to_string),
             cwd: None,
             state: AgentState::WaitingInput,
