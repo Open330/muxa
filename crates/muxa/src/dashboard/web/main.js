@@ -344,11 +344,12 @@ function renderOverview() {
   const working = agents.filter((a) => a.state === "working").length;
   const waiting = agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length;
   const errors = agents.filter((a) => a.state === "error").length;
+  const lanes = store.timeline?.lanes || [];
   const totals = store.timeline?.totals || {};
   dom.metricWorking.textContent = String(working);
   dom.metricWaiting.textContent = String(waiting);
   dom.metricErrors.textContent = String(errors);
-  dom.metricHuman.textContent = formatDuration(totals.human_secs || 0);
+  dom.metricHuman.textContent = formatDuration(humanPresenceSecs(lanes));
   dom.metricTmux.textContent = formatDuration(totals.foreground_secs || 0);
 }
 
@@ -405,6 +406,7 @@ function buildSessionSummaries() {
         errors: 0,
         latest: "",
         totals: emptyTimelineTotals(),
+        human_presence_secs: 0,
       });
     }
     return map.get(key);
@@ -426,6 +428,13 @@ function buildSessionSummaries() {
   }
   for (const pane of store.panes) {
     ensure(pane.session).panes += 1;
+  }
+  for (const summary of map.values()) {
+    summary.human_presence_secs = humanPresenceSecs(
+      (store.timeline?.lanes || []).filter((lane) =>
+        (lane.session_name || lane.session_id || "no session") === summary.label
+      )
+    );
   }
 
   return [...map.values()].sort((a, b) => {
@@ -542,6 +551,7 @@ function groupTimelineLanesBySession(lanes) {
         label,
         lanes: [],
         totals: emptyTimelineTotals(),
+        human_presence_secs: 0,
       });
     }
     const group = groups.get(key);
@@ -552,13 +562,15 @@ function groupTimelineLanesBySession(lanes) {
     .sort((a, b) => a.key.localeCompare(b.key))
     .map((group) => {
       group.lanes.sort(compareTimelineLanesInGroup);
+      group.human_presence_secs = humanPresenceSecs(group.lanes);
+      group.totals.human_presence_secs = group.human_presence_secs;
       return group;
     });
 }
 
 function shortTimelineLaneLabel(lane) {
   if (lane.kind === "agent") return `  ${lane.agent_kind || "agent"}`;
-  if (lane.kind === "human") return "  human";
+  if (lane.kind === "human") return "  interaction";
   if (lane.kind === "tmux") return "  tmux";
   return `  ${lane.label || "lane"}`;
 }
@@ -621,6 +633,7 @@ function emptyTimelineTotals() {
     stopped_secs: 0,
     human_secs: 0,
     foreground_secs: 0,
+    human_presence_secs: 0,
   };
 }
 
@@ -628,6 +641,68 @@ function addTimelineTotals(total, next) {
   for (const key of Object.keys(total)) {
     total[key] += next[key] || 0;
   }
+}
+
+function humanPresenceSecs(lanes) {
+  const intervals = [];
+  for (const lane of lanes || []) {
+    for (const interval of lane.intervals || []) {
+      if (!isHumanPresenceInterval(interval)) continue;
+      const startedAt = Date.parse(interval.started_at);
+      const endedAt = Date.parse(interval.ended_at);
+      if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt <= startedAt) {
+        continue;
+      }
+      intervals.push({
+        scope: intervalScopeKey(interval, lane),
+        startedAt,
+        endedAt,
+      });
+    }
+  }
+  return sumMergedScopedMs(intervals);
+}
+
+function isHumanPresenceInterval(interval) {
+  return interval.source === "session_foreground" || interval.source === "human_interaction";
+}
+
+function intervalScopeKey(interval, lane) {
+  if (interval.session_name) return `session:${interval.session_name}`;
+  if (lane.session_name) return `session:${lane.session_name}`;
+  if (interval.pane) return `pane:${interval.pane}`;
+  if (interval.session_id) return `session:${interval.session_id}`;
+  if (lane.session_id) return `session:${lane.session_id}`;
+  return `lane:${lane.id || lane.label || "unknown"}`;
+}
+
+function sumMergedScopedMs(intervals) {
+  const byScope = new Map();
+  for (const interval of intervals) {
+    if (!byScope.has(interval.scope)) byScope.set(interval.scope, []);
+    byScope.get(interval.scope).push([interval.startedAt, interval.endedAt]);
+  }
+
+  let totalMs = 0;
+  for (const ranges of byScope.values()) {
+    ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    let currentStart = null;
+    let currentEnd = null;
+    for (const [start, end] of ranges) {
+      if (currentStart === null) {
+        currentStart = start;
+        currentEnd = end;
+      } else if (start <= currentEnd) {
+        currentEnd = Math.max(currentEnd, end);
+      } else {
+        totalMs += currentEnd - currentStart;
+        currentStart = start;
+        currentEnd = end;
+      }
+    }
+    if (currentStart !== null) totalMs += currentEnd - currentStart;
+  }
+  return Math.floor(totalMs / 1000);
 }
 
 function renderTimelineAxis(start, end) {
@@ -685,7 +760,7 @@ function timelineSegmentClass(interval) {
 }
 
 function timelineSegmentLabel(interval) {
-  if (interval.source === "human_interaction") return "human";
+  if (interval.source === "human_interaction") return "interaction";
   if (interval.source === "session_foreground") return "tmux foreground";
   return interval.state || "agent";
 }
@@ -695,7 +770,7 @@ function laneTotalsLabel(totals) {
     ["work", totals.working_secs],
     ["wait", totals.waiting_secs],
     ["err", totals.error_secs],
-    ["human", totals.human_secs],
+    ["interact", totals.human_secs],
     ["tmux", totals.foreground_secs],
   ].filter(([, secs]) => secs > 0);
   if (parts.length === 0) return "—";
@@ -1038,7 +1113,9 @@ function renderInspector() {
     agents: agents.length,
     panes: panes.length,
     totals: store.timeline?.totals || emptyTimelineTotals(),
+    human_presence_secs: humanPresenceSecs(store.timeline?.lanes || []),
   };
+  const humanSecs = activeSummary.human_presence_secs ?? humanPresenceSecs(store.timeline?.lanes || []);
 
   dom.inspectorBody.innerHTML = `
     <div class="inspector-title">
@@ -1049,7 +1126,7 @@ function renderInspector() {
       ${inspectorMetric("work", activeSummary.working)}
       ${inspectorMetric("wait", activeSummary.waiting)}
       ${inspectorMetric("err", activeSummary.errors)}
-      ${inspectorMetric("human", formatDuration(activeSummary.totals.human_secs || 0))}
+      ${inspectorMetric("human", formatDuration(humanSecs))}
       ${inspectorMetric("tmux", formatDuration(activeSummary.totals.foreground_secs || 0))}
       ${inspectorMetric("panes", panes.length)}
     </div>

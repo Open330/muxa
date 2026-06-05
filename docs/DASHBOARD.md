@@ -145,6 +145,11 @@ and `agent=<kind>` (`codex`, `claude_code`, `gemini_cli`, `opencode`,
 The browser groups timeline lanes by session by default, with agent, human,
 and tmux foreground lanes shown under the same session header.
 
+The overview's `human` metric follows the same meaning as `muxa stats
+HUMAN`: the union of tmux foreground time and muxa-recorded human
+interaction intervals. Timeline lanes still show raw human-interaction
+spans separately as `interaction`.
+
 Closed intervals come from `activity.ndjson`. Currently-open agent states
 come from the live `Store` snapshot, and currently-open tmux foreground spans
 come from `session-activity.json` when that tracker is enabled.
