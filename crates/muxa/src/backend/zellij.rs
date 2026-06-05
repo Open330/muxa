@@ -67,16 +67,12 @@ impl ZellijBackend {
         Self::default()
     }
 
-    /// Replace the cached pane snapshot wholesale. Called by the
-    /// daemon's IPC handler when the WASM plugin pushes a new
-    /// `BackendPaneSnapshot` payload. Atomic relative to readers
-    /// (the `RwLock` write guard blocks new readers; in-flight
-    /// readers see the previous snapshot).
-    ///
-    /// Until the plugin lands this method has no callers — kept on
-    /// the type so the wiring is in place when the IPC command
-    /// arrives.
-    #[allow(dead_code)]
+    /// Replace the cached pane snapshot wholesale. Reached via
+    /// [`PaneBackend::ingest_pane_snapshot`] when the daemon's
+    /// `BackendPaneSnapshot` IPC command delivers a fresh push from the
+    /// WASM plugin. Atomic relative to readers (the `RwLock` write
+    /// guard blocks new readers; in-flight readers see the previous
+    /// snapshot).
     pub(crate) fn replace_snapshot(&self, panes: Vec<PaneInfo>) {
         if let Ok(mut w) = self.snapshot.write() {
             *w = panes;
@@ -135,6 +131,14 @@ impl PaneBackend for ZellijBackend {
             .args(["action", "focus-pane-with-id", pane_id])
             .status()
             .is_ok_and(|s| s.success())
+    }
+
+    fn ingest_pane_snapshot(&self, panes: Vec<PaneInfo>) {
+        // The plugin's `PaneUpdate` push arrives via the daemon's
+        // `BackendPaneSnapshot` IPC command. Replace the cache
+        // wholesale — the plugin is the source of truth and always
+        // sends the full pane set.
+        self.replace_snapshot(panes);
     }
 
     fn caps(&self) -> BackendCaps {
@@ -215,6 +219,20 @@ mod tests {
         assert_eq!(panes.len(), 2);
         assert_eq!(b.resolve_pane("z-1").unwrap().pane_id, "z-1");
         assert!(b.resolve_pane("missing").is_none());
+    }
+
+    /// `ingest_pane_snapshot` through a `dyn PaneBackend` routes to
+    /// `replace_snapshot` for zellij — the exact path the daemon's
+    /// `BackendPaneSnapshot` handler takes (it holds an
+    /// `Arc<dyn PaneBackend>`, never the concrete type). Exercised via a
+    /// trait object so a regression that drops the override — falling
+    /// back to the no-op trait default — fails here.
+    #[test]
+    fn ingest_pane_snapshot_via_trait_updates_cache() {
+        let b: Box<dyn PaneBackend> = Box::new(ZellijBackend::new());
+        b.ingest_pane_snapshot(vec![fake_pane("z-7")]);
+        assert_eq!(b.list_panes().len(), 1);
+        assert_eq!(b.resolve_pane("z-7").unwrap().pane_id, "z-7");
     }
 
     /// Trait-object dispatch compiles — locks in the

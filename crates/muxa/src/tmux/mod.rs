@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 /// 2. Known Homebrew install prefixes — Apple Silicon then Intel.
 /// 3. Bare `tmux` as a last-resort sentinel so the eventual error message
 ///    matches the prior behavior.
+///
 /// Build a `Command` for shelling out to tmux with the resolved binary
 /// path and a UTF-8 locale pre-applied.
 ///
@@ -54,8 +55,7 @@ pub fn tmux_binary() -> &'static Path {
         if Command::new("tmux")
             .arg("-V")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
         {
             return PathBuf::from("tmux");
         }
@@ -76,7 +76,7 @@ pub enum TmuxError {
     BadOutput(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
     pub session: String,
