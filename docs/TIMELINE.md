@@ -11,6 +11,7 @@ muxa timeline --since today
 muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind
+muxa timeline --since today --sort waiting
 muxa timeline --since today --format json
 ```
 
@@ -30,6 +31,7 @@ The default overview is grouped by tmux session. Each session group can show:
 | `--session` | tmux session name, tmux session id, or pane id. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
 | `--group-by` | `session` default, `kind`, or `flat`. TUI only. |
+| `--sort` | `latest` default, `name`, `duration`, `working`, `waiting`, `error`, `human`, or `foreground`. Also accepts aliases like `dur`, `work`, `wait`, `err`, and `tmux`. |
 | `--format` | `tui` default or `json`. |
 | `--theme` | Same one-shot theme override style as other muxa TUIs. |
 
@@ -43,6 +45,7 @@ The default overview is grouped by tmux session. Each session group can show:
 | `0` | Jump back to the latest view. |
 | `f` | Fit the full selected `--since` range. |
 | `g` | Cycle grouping: `session` -> `kind` -> `flat`. |
+| `s` | Cycle sorting: `latest` -> `duration` -> `working` -> `waiting` -> `error` -> `human` -> `foreground` -> `name`. |
 | `tab` / `shift-tab` | Cycle intervals on the selected lane. |
 | `enter` / `o` | Toggle overview and focus views. |
 | `r` | Reload activity and live agent state. |

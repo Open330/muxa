@@ -11,6 +11,7 @@ muxa timeline --since today
 muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind
+muxa timeline --since today --sort waiting
 muxa timeline --since today --format json
 ```
 
@@ -31,6 +32,7 @@ muxa timeline --since today --format json
 | `--session` | tmux session 이름, tmux session id, pane id. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
 | `--group-by` | 기본값 `session`, 또는 `kind`, `flat`. TUI 전용. |
+| `--sort` | 기본값 `latest`, 또는 `name`, `duration`, `working`, `waiting`, `error`, `human`, `foreground`. `dur`, `work`, `wait`, `err`, `tmux` alias도 지원. |
 | `--format` | 기본값 `tui`, 또는 `json`. |
 | `--theme` | 다른 muxa TUI와 같은 일회성 theme override. |
 
@@ -44,6 +46,7 @@ muxa timeline --since today --format json
 | `0` | 최신 view로 이동. |
 | `f` | 선택한 `--since` 전체 범위에 맞춤. |
 | `g` | grouping 순환: `session` -> `kind` -> `flat`. |
+| `s` | sorting 순환: `latest` -> `duration` -> `working` -> `waiting` -> `error` -> `human` -> `foreground` -> `name`. |
 | `tab` / `shift-tab` | 선택한 lane의 interval 순환. |
 | `enter` / `o` | overview와 focus view 전환. |
 | `r` | activity와 live agent 상태 reload. |

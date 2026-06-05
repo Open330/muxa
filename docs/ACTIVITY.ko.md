@@ -53,7 +53,7 @@ foreground lane을 보여줍니다. focus view는 선택한 lane을 timestamped 
 muxa timeline --since today
 muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
-muxa timeline --since today --group-by kind
+muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --since today --format json
 ```
 

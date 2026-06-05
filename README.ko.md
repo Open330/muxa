@@ -86,7 +86,7 @@ muxa watch
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa stats --since today` | day/project/agent/session 단위 summary. |
 | `muxa report --since week` | Markdown stats report. |
-| `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링. |
+| `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting`으로 정렬. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
 | `muxa init` | install/uninstall wizard. |
@@ -99,7 +99,7 @@ muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
 muxa report --since week
 muxa timeline --since today --session main
-muxa timeline --since today --group-by kind
+muxa timeline --since today --group-by kind --sort waiting
 muxa activity --since today --type human
 ```
 

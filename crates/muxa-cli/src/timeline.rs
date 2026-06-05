@@ -20,6 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -54,6 +55,10 @@ pub struct Args {
     /// Group lanes in the TUI overview.
     #[arg(long, value_enum, default_value_t = TimelineGroupBy::Session)]
     group_by: TimelineGroupBy,
+
+    /// Sort groups and lanes.
+    #[arg(long, value_enum, default_value_t = TimelineSort::Latest)]
+    sort: TimelineSort,
 
     /// One-shot visual theme override for TUI output.
     #[arg(long, value_enum)]
@@ -95,6 +100,51 @@ impl TimelineGroupBy {
             Self::Session => Self::Kind,
             Self::Kind => Self::Flat,
             Self::Flat => Self::Session,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum TimelineSort {
+    Latest,
+    Name,
+    #[value(alias = "dur", alias = "total")]
+    Duration,
+    #[value(alias = "work")]
+    Working,
+    #[value(alias = "wait")]
+    Waiting,
+    #[value(alias = "err")]
+    Error,
+    Human,
+    #[value(alias = "tmux")]
+    Foreground,
+}
+
+impl TimelineSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Name => "name",
+            Self::Duration => "duration",
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Error => "error",
+            Self::Human => "human",
+            Self::Foreground => "foreground",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Latest => Self::Duration,
+            Self::Duration => Self::Working,
+            Self::Working => Self::Waiting,
+            Self::Waiting => Self::Error,
+            Self::Error => Self::Human,
+            Self::Human => Self::Foreground,
+            Self::Foreground => Self::Name,
+            Self::Name => Self::Latest,
         }
     }
 }
@@ -169,7 +219,7 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
         .map(|pane| (pane.pane_id, pane.session))
         .collect::<HashMap<_, _>>();
 
-    Ok(core_timeline::build_document(TimelineBuildInput {
+    let mut doc = core_timeline::build_document(TimelineBuildInput {
         now,
         range,
         activity_entries: &activity_entries,
@@ -181,7 +231,9 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
             agent_kind: args.agent.map(AgentKind::from),
         },
         notes,
-    }))
+    });
+    sort_document(&mut doc, args.sort);
+    Ok(doc)
 }
 
 async fn load_session_activities(cfg: &Config) -> Vec<muxa::SessionActivity> {
@@ -208,7 +260,7 @@ async fn run_tui(
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
     let theme = args.theme.map_or(cfg.ui.theme, WatchTheme::from);
-    let mut app = TimelineApp::new(initial_doc, theme, use_colors(), args.group_by);
+    let mut app = TimelineApp::new(initial_doc, theme, use_colors(), args.group_by, args.sort);
     let mut last_refresh = Instant::now();
 
     loop {
@@ -268,15 +320,18 @@ struct TimelineApp {
     last_error: Option<String>,
     status: Option<String>,
     group_by: TimelineGroupBy,
+    sort: TimelineSort,
 }
 
 impl TimelineApp {
     fn new(
-        doc: TimelineDocument,
+        mut doc: TimelineDocument,
         theme: WatchTheme,
         colors: bool,
         group_by: TimelineGroupBy,
+        sort: TimelineSort,
     ) -> Self {
+        sort_document(&mut doc, sort);
         let (window_started_at, window_ended_at) = latest_window(&doc);
         let selected_interval = doc
             .lanes
@@ -295,19 +350,22 @@ impl TimelineApp {
             last_error: None,
             status: None,
             group_by,
+            sort,
         }
     }
 
     fn replace_doc(&mut self, doc: TimelineDocument) {
+        let selected_lane_id = self.selected_lane_ref().map(|lane| lane.id.clone());
+        let selected_lane = self.selected_lane;
+        let mut doc = doc;
+        sort_document(&mut doc, self.sort);
         let follow_live = (self.doc.window_ended_at - self.window_ended_at)
             .whole_seconds()
             .abs()
             <= 3;
         let current_span = window_span_secs(self.window_started_at, self.window_ended_at);
         self.doc = doc;
-        self.selected_lane = self
-            .selected_lane
-            .min(self.doc.lanes.len().saturating_sub(1));
+        self.restore_selected_lane(selected_lane_id.as_deref(), selected_lane);
         self.selected_interval = self.selected_interval.min(
             self.selected_lane_ref()
                 .map_or(0, |lane| lane.intervals.len().saturating_sub(1)),
@@ -320,6 +378,13 @@ impl TimelineApp {
         }
         self.clamp_window();
         self.last_error = None;
+    }
+
+    fn restore_selected_lane(&mut self, selected_lane_id: Option<&str>, fallback_lane: usize) {
+        let fallback = fallback_lane.min(self.doc.lanes.len().saturating_sub(1));
+        self.selected_lane = selected_lane_id
+            .and_then(|id| self.doc.lanes.iter().position(|lane| lane.id == id))
+            .unwrap_or(fallback);
     }
 
     fn selected_lane_ref(&self) -> Option<&TimelineLane> {
@@ -409,6 +474,15 @@ impl TimelineApp {
     fn cycle_group_by(&mut self) {
         self.group_by = self.group_by.next();
         self.status = Some(format!("group by {}", self.group_by.label()));
+    }
+
+    fn cycle_sort(&mut self) {
+        let selected_lane_id = self.selected_lane_ref().map(|lane| lane.id.clone());
+        let selected_lane = self.selected_lane;
+        self.sort = self.sort.next();
+        sort_document(&mut self.doc, self.sort);
+        self.restore_selected_lane(selected_lane_id.as_deref(), selected_lane);
+        self.status = Some(format!("sort {}", self.sort.label()));
     }
 
     fn clamp_window(&mut self) {
@@ -620,6 +694,7 @@ fn handle_key(app: &mut TimelineApp, code: KeyCode, modifiers: KeyModifiers) -> 
         KeyCode::Char('0') => app.reset_window(),
         KeyCode::Char('f') => app.fit_window(),
         KeyCode::Char('g') => app.cycle_group_by(),
+        KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Tab => app.select_interval_delta(1),
         KeyCode::BackTab => app.select_interval_delta(-1),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
@@ -657,11 +732,12 @@ fn render(f: &mut Frame, app: &mut TimelineApp) {
 
 fn render_header(f: &mut Frame, area: Rect, app: &TimelineApp) {
     let title = format!(
-        "{} · {} · {} lanes · group {}",
+        "{} · {} · {} lanes · group {} · sort {}",
         app.theme.title.trim(),
         app.doc.range.label,
         app.doc.lanes.len(),
-        app.group_by.label()
+        app.group_by.label(),
+        app.sort.label()
     );
     let body = vec![
         Line::from(vec![
@@ -855,7 +931,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TimelineApp) {
         TimelineView::Focus => "focus",
     };
     let mut body = format!(
-        " {mode}  j/k select  h/l pan  +/- zoom  0 latest  f fit  g group  tab interval  enter/o toggle  r refresh  ? help  q quit"
+        " {mode}  j/k select  h/l pan  +/- zoom  0 latest  f fit  g group  s sort  tab interval  enter/o toggle  r refresh  ? help  q quit"
     );
     if let Some(status) = app.status.as_deref() {
         body.push_str("  ·  ");
@@ -881,6 +957,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &TimelineApp) {
         "  0                 jump back to the latest view",
         "  f                 fit the full selected time range",
         "  g                 cycle grouping: session, kind, flat",
+        "  s                 cycle sorting: latest, duration, working, waiting, error, human, foreground, name",
         "  enter / o         toggle overview and focus views",
         "  r                 reload activity and live agent state",
         "  q / Esc           quit",
@@ -957,15 +1034,24 @@ fn overview_rows(app: &TimelineApp) -> Vec<OverviewRow> {
             label,
             lane_indices: Vec::new(),
             totals: TimelineTotals::default(),
+            latest_at: None,
         });
         group.lane_indices.push(lane_index);
         add_timeline_totals(&mut group.totals, &lane.totals);
+        group.latest_at = group.latest_at.max(lane_latest_at(lane));
     }
 
     let mut rows = Vec::new();
-    for mut group in groups.into_values() {
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|a, b| compare_groups(a, b, app.sort, app.group_by));
+    for mut group in groups {
         group.lane_indices.sort_by(|a, b| {
-            compare_lanes_in_group(&app.doc.lanes[*a], &app.doc.lanes[*b], app.group_by)
+            compare_lanes_in_group(
+                &app.doc.lanes[*a],
+                &app.doc.lanes[*b],
+                app.group_by,
+                app.sort,
+            )
         });
         rows.push(OverviewRow::Group {
             label: group.label,
@@ -987,6 +1073,7 @@ struct OverviewGroup {
     label: String,
     lane_indices: Vec<usize>,
     totals: TimelineTotals,
+    latest_at: Option<OffsetDateTime>,
 }
 
 fn selected_overview_row(rows: &[OverviewRow], selected_lane: usize) -> Option<usize> {
@@ -1027,12 +1114,123 @@ fn compare_lanes_in_group(
     a: &TimelineLane,
     b: &TimelineLane,
     group_by: TimelineGroupBy,
-) -> std::cmp::Ordering {
-    let rank = cli_lane_rank(a.kind).cmp(&cli_lane_rank(b.kind));
-    if rank != std::cmp::Ordering::Equal {
-        return rank;
+    sort: TimelineSort,
+) -> Ordering {
+    compare_lanes(a, b, sort, group_by)
+}
+
+fn sort_document(doc: &mut TimelineDocument, sort: TimelineSort) {
+    doc.lanes
+        .sort_by(|a, b| compare_lanes(a, b, sort, TimelineGroupBy::Flat));
+}
+
+fn compare_lanes(
+    a: &TimelineLane,
+    b: &TimelineLane,
+    sort: TimelineSort,
+    group_by: TimelineGroupBy,
+) -> Ordering {
+    compare_lane_sort(a, b, sort)
+        .then_with(|| cli_lane_rank(a.kind).cmp(&cli_lane_rank(b.kind)))
+        .then_with(|| overview_lane_label(a, group_by).cmp(&overview_lane_label(b, group_by)))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn compare_groups(
+    a: &OverviewGroup,
+    b: &OverviewGroup,
+    sort: TimelineSort,
+    group_by: TimelineGroupBy,
+) -> Ordering {
+    compare_group_sort(a, b, sort)
+        .then_with(|| compare_group_fallback(a, b, group_by))
+        .then_with(|| a.label.cmp(&b.label))
+}
+
+fn compare_lane_sort(a: &TimelineLane, b: &TimelineLane, sort: TimelineSort) -> Ordering {
+    match sort {
+        TimelineSort::Latest => compare_desc(lane_latest_at(a), lane_latest_at(b)),
+        TimelineSort::Name => normalized_cmp(&a.label, &b.label),
+        TimelineSort::Duration => compare_desc(
+            total_duration_secs(&a.totals),
+            total_duration_secs(&b.totals),
+        ),
+        TimelineSort::Working => compare_desc(a.totals.working_secs, b.totals.working_secs),
+        TimelineSort::Waiting => compare_desc(a.totals.waiting_secs, b.totals.waiting_secs),
+        TimelineSort::Error => compare_desc(a.totals.error_secs, b.totals.error_secs),
+        TimelineSort::Human => compare_desc(a.totals.human_secs, b.totals.human_secs),
+        TimelineSort::Foreground => {
+            compare_desc(a.totals.foreground_secs, b.totals.foreground_secs)
+        }
     }
-    overview_lane_label(a, group_by).cmp(&overview_lane_label(b, group_by))
+}
+
+fn compare_group_sort(a: &OverviewGroup, b: &OverviewGroup, sort: TimelineSort) -> Ordering {
+    match sort {
+        TimelineSort::Latest => compare_desc(a.latest_at, b.latest_at),
+        TimelineSort::Name => normalized_cmp(&a.label, &b.label),
+        TimelineSort::Duration => compare_desc(
+            total_duration_secs(&a.totals),
+            total_duration_secs(&b.totals),
+        ),
+        TimelineSort::Working => compare_desc(a.totals.working_secs, b.totals.working_secs),
+        TimelineSort::Waiting => compare_desc(a.totals.waiting_secs, b.totals.waiting_secs),
+        TimelineSort::Error => compare_desc(a.totals.error_secs, b.totals.error_secs),
+        TimelineSort::Human => compare_desc(a.totals.human_secs, b.totals.human_secs),
+        TimelineSort::Foreground => {
+            compare_desc(a.totals.foreground_secs, b.totals.foreground_secs)
+        }
+    }
+}
+
+fn compare_group_fallback(
+    a: &OverviewGroup,
+    b: &OverviewGroup,
+    group_by: TimelineGroupBy,
+) -> Ordering {
+    if group_by == TimelineGroupBy::Kind {
+        group_kind_rank(&a.label).cmp(&group_kind_rank(&b.label))
+    } else {
+        normalized_cmp(&a.label, &b.label)
+    }
+}
+
+fn compare_desc<T: Ord>(a: T, b: T) -> Ordering {
+    b.cmp(&a)
+}
+
+fn normalized_cmp(a: &str, b: &str) -> Ordering {
+    a.to_ascii_lowercase()
+        .cmp(&b.to_ascii_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
+fn lane_latest_at(lane: &TimelineLane) -> Option<OffsetDateTime> {
+    lane.intervals
+        .iter()
+        .map(|interval| interval.ended_at)
+        .max()
+}
+
+fn total_duration_secs(totals: &TimelineTotals) -> u64 {
+    totals
+        .working_secs
+        .saturating_add(totals.waiting_secs)
+        .saturating_add(totals.error_secs)
+        .saturating_add(totals.idle_secs)
+        .saturating_add(totals.starting_secs)
+        .saturating_add(totals.stopped_secs)
+        .saturating_add(totals.human_secs)
+        .saturating_add(totals.foreground_secs)
+}
+
+fn group_kind_rank(label: &str) -> u8 {
+    match label {
+        "agent" => cli_lane_rank(TimelineLaneKind::Agent),
+        "human" => cli_lane_rank(TimelineLaneKind::Human),
+        "tmux" => cli_lane_rank(TimelineLaneKind::Tmux),
+        _ => u8::MAX,
+    }
 }
 
 fn add_timeline_totals(total: &mut TimelineTotals, next: &TimelineTotals) {
@@ -1520,6 +1718,23 @@ mod tests {
         }
     }
 
+    fn agent_interval(started_at: OffsetDateTime, ended_at: OffsetDateTime) -> TimelineInterval {
+        TimelineInterval {
+            source: TimelineIntervalSource::AgentState,
+            state: Some(AgentState::Working),
+            human_kind: None,
+            started_at,
+            ended_at,
+            duration_secs: u64::try_from((ended_at - started_at).whole_seconds()).unwrap_or(0),
+            open: false,
+            pane: None,
+            session_id: None,
+            session_name: None,
+            cwd: None,
+            detail: "test".to_string(),
+        }
+    }
+
     #[test]
     fn add_delta_clamps() {
         assert_eq!(add_delta(0, -1, 3), 0);
@@ -1544,6 +1759,7 @@ mod tests {
             WatchTheme::Classic,
             false,
             TimelineGroupBy::Session,
+            TimelineSort::Latest,
         );
 
         assert_eq!(app.window_started_at, end - time::Duration::hours(6));
@@ -1559,6 +1775,7 @@ mod tests {
             WatchTheme::Classic,
             false,
             TimelineGroupBy::Session,
+            TimelineSort::Latest,
         );
         let before = (app.window_started_at, app.window_ended_at);
 
@@ -1578,6 +1795,7 @@ mod tests {
             WatchTheme::Classic,
             false,
             TimelineGroupBy::Session,
+            TimelineSort::Latest,
         );
         let before = (app.window_started_at, app.window_ended_at);
 
@@ -1596,6 +1814,7 @@ mod tests {
             WatchTheme::Classic,
             false,
             TimelineGroupBy::Session,
+            TimelineSort::Latest,
         );
 
         app.fit_window();
@@ -1643,7 +1862,13 @@ mod tests {
                 },
             ),
         ];
-        let app = TimelineApp::new(doc, WatchTheme::Classic, false, TimelineGroupBy::Session);
+        let app = TimelineApp::new(
+            doc,
+            WatchTheme::Classic,
+            false,
+            TimelineGroupBy::Session,
+            TimelineSort::Latest,
+        );
         let rows = overview_rows(&app);
 
         assert!(matches!(
@@ -1651,13 +1876,109 @@ mod tests {
             OverviewRow::Group { label, lane_count, .. }
                 if label == "main" && *lane_count == 2
         ));
-        assert!(matches!(&rows[1], OverviewRow::Lane { lane_index } if *lane_index == 2));
-        assert!(matches!(&rows[2], OverviewRow::Lane { lane_index } if *lane_index == 0));
+        assert!(
+            matches!(&rows[1], OverviewRow::Lane { lane_index } if app.doc.lanes[*lane_index].label == "human/main")
+        );
+        assert!(
+            matches!(&rows[2], OverviewRow::Lane { lane_index } if app.doc.lanes[*lane_index].label == "tmux/main")
+        );
         assert!(matches!(
             &rows[3],
             OverviewRow::Group { label, lane_count, .. }
                 if label == "side" && *lane_count == 1
         ));
-        assert!(matches!(&rows[4], OverviewRow::Lane { lane_index } if *lane_index == 1));
+        assert!(
+            matches!(&rows[4], OverviewRow::Lane { lane_index } if app.doc.lanes[*lane_index].label == "codex/side")
+        );
+    }
+
+    #[test]
+    fn sort_document_orders_lanes_by_latest_interval() {
+        let start = datetime!(2026-06-05 00:00:00 UTC);
+        let end = datetime!(2026-06-05 12:00:00 UTC);
+        let mut doc = empty_doc(start, end);
+        let mut older = lane(
+            "codex/older",
+            TimelineLaneKind::Agent,
+            Some("older"),
+            TimelineTotals::default(),
+        );
+        older.intervals.push(agent_interval(
+            datetime!(2026-06-05 09:00:00 UTC),
+            datetime!(2026-06-05 09:30:00 UTC),
+        ));
+        let mut newer = lane(
+            "codex/newer",
+            TimelineLaneKind::Agent,
+            Some("newer"),
+            TimelineTotals::default(),
+        );
+        newer.intervals.push(agent_interval(
+            datetime!(2026-06-05 11:00:00 UTC),
+            datetime!(2026-06-05 11:30:00 UTC),
+        ));
+        doc.lanes = vec![
+            lane(
+                "codex/empty",
+                TimelineLaneKind::Agent,
+                Some("empty"),
+                TimelineTotals::default(),
+            ),
+            older,
+            newer,
+        ];
+
+        sort_document(&mut doc, TimelineSort::Latest);
+
+        let labels = doc
+            .lanes
+            .iter()
+            .map(|lane| lane.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["codex/newer", "codex/older", "codex/empty"]);
+    }
+
+    #[test]
+    fn overview_groups_follow_metric_sort() {
+        let start = datetime!(2026-06-05 00:00:00 UTC);
+        let end = datetime!(2026-06-05 12:00:00 UTC);
+        let mut doc = empty_doc(start, end);
+        doc.lanes = vec![
+            lane(
+                "codex/main",
+                TimelineLaneKind::Agent,
+                Some("main"),
+                TimelineTotals {
+                    waiting_secs: 60,
+                    ..TimelineTotals::default()
+                },
+            ),
+            lane(
+                "codex/side",
+                TimelineLaneKind::Agent,
+                Some("side"),
+                TimelineTotals {
+                    waiting_secs: 180,
+                    ..TimelineTotals::default()
+                },
+            ),
+        ];
+        let app = TimelineApp::new(
+            doc,
+            WatchTheme::Classic,
+            false,
+            TimelineGroupBy::Session,
+            TimelineSort::Waiting,
+        );
+        let rows = overview_rows(&app);
+
+        assert!(matches!(
+            &rows[0],
+            OverviewRow::Group { label, .. } if label == "side"
+        ));
+        assert!(matches!(
+            &rows[2],
+            OverviewRow::Group { label, .. } if label == "main"
+        ));
     }
 }

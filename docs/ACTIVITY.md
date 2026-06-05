@@ -54,7 +54,7 @@ timestamped intervals.
 muxa timeline --since today
 muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
-muxa timeline --since today --group-by kind
+muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --since today --format json
 ```
 

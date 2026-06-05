@@ -87,7 +87,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa stats --since today` | Summary table; group by day/project/agent/session. |
 | `muxa report --since week` | Markdown stats report. |
-| `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` or `--agent codex`. |
+| `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa init` | Interactive install/uninstall wizard. |
@@ -100,7 +100,7 @@ muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
 muxa report --since week
 muxa timeline --since today --session main
-muxa timeline --since today --group-by kind
+muxa timeline --since today --group-by kind --sort waiting
 muxa activity --since today --type human
 ```
 
