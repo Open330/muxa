@@ -108,7 +108,7 @@ enum Cmd {
         /// Row granularity: tmux session (default) or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
-        /// One-shot sort override: session, act/activity, dur/duration, st/state, pane, pane-id.
+        /// One-shot sort override: session, latest/activity/act, dur/duration, st/state, pane, pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
         /// One-shot visual theme override.
@@ -199,8 +199,8 @@ impl From<WatchViewArg> for muxa::config::WatchView {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WatchSortArg {
     Session,
-    #[value(alias = "act")]
-    Activity,
+    #[value(alias = "activity", alias = "act")]
+    Latest,
     #[value(alias = "dur", alias = "duration")]
     SessionTime,
     #[value(alias = "st")]
@@ -214,7 +214,7 @@ impl WatchSortArg {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
             Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
-            Self::Activity => vec![WatchSortKey::Activity],
+            Self::Latest => vec![WatchSortKey::Activity],
             Self::SessionTime => vec![WatchSortKey::SessionTime],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
             Self::Pane => vec![WatchSortKey::Session, WatchSortKey::Pane],
@@ -259,7 +259,18 @@ async fn main() -> Result<()> {
             view,
             sort,
             theme,
-        } => cmd_watch(&client, cfg, include_paneless, view, sort, theme).await,
+        } => {
+            cmd_watch(
+                &client,
+                cfg,
+                config_path.clone(),
+                include_paneless,
+                view,
+                sort,
+                theme,
+            )
+            .await
+        }
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
@@ -335,6 +346,7 @@ async fn cmd_sync(client: &Client) -> Result<()> {
 async fn cmd_watch(
     client: &Client,
     cfg: Config,
+    config_path: Option<PathBuf>,
     include_paneless: bool,
     view: Option<WatchViewArg>,
     sort: Option<WatchSortArg>,
@@ -387,6 +399,7 @@ async fn cmd_watch(
         watch_cfg,
         session_activity_path,
         activity_path.clone(),
+        config_path,
     )
     .await?
     {

@@ -650,7 +650,7 @@ pub(crate) struct SessionRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchSortPreset {
     Session,
-    Activity,
+    Latest,
     Duration,
     State,
 }
@@ -659,7 +659,7 @@ impl WatchSortPreset {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
             Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
-            Self::Activity => vec![WatchSortKey::Activity],
+            Self::Latest => vec![WatchSortKey::Activity],
             Self::Duration => vec![WatchSortKey::SessionTime],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
         }
@@ -668,7 +668,7 @@ impl WatchSortPreset {
     fn label(self) -> &'static str {
         match self {
             Self::Session => "SESSION",
-            Self::Activity => "ACT",
+            Self::Latest => "LATEST",
             Self::Duration => "DUR",
             Self::State => "ST",
         }
@@ -678,12 +678,61 @@ impl WatchSortPreset {
 fn sort_label(keys: &[WatchSortKey]) -> &'static str {
     match keys.first().copied() {
         Some(WatchSortKey::Session) | None => "SESSION",
-        Some(WatchSortKey::Activity) => "ACT",
+        Some(WatchSortKey::Activity) => "LATEST",
         Some(WatchSortKey::SessionTime) => "DUR",
         Some(WatchSortKey::State) => "ST",
         Some(WatchSortKey::Pane) => "PANE",
         Some(WatchSortKey::PaneId) => "PANE ID",
     }
+}
+
+fn sort_key_toml_name(key: WatchSortKey) -> &'static str {
+    match key {
+        WatchSortKey::Session => "session",
+        WatchSortKey::Activity => "latest",
+        WatchSortKey::SessionTime => "session_time",
+        WatchSortKey::State => "state",
+        WatchSortKey::Pane => "pane",
+        WatchSortKey::PaneId => "pane_id",
+    }
+}
+
+fn persist_watch_sort(path: &Path, keys: &[WatchSortKey]) -> std::result::Result<(), String> {
+    let original = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+
+    let mut doc = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    };
+
+    match doc.get("watch") {
+        Some(toml_edit::Item::Table(_)) | None => {}
+        Some(_) => return Err("[watch] is not a table".to_string()),
+    }
+    if doc.get("watch").is_none() {
+        doc["watch"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    let watch = doc["watch"]
+        .as_table_mut()
+        .ok_or_else(|| "[watch] is not a table".to_string())?;
+    let mut sort = toml_edit::Array::new();
+    for key in keys {
+        sort.push(sort_key_toml_name(*key));
+    }
+    watch["sort"] = toml_edit::Item::Value(toml_edit::Value::Array(sort));
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 impl WatchRow {
@@ -1029,7 +1078,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "",
         "Sorting",
         "  s              sort by session name",
-        "  a              sort by activity (ACT)",
+        "  l / a          sort by latest activity",
         "  d              sort by duration (DUR)",
         "  t              sort by state (ST)",
         "",
@@ -2502,6 +2551,7 @@ pub async fn run(
     watch_cfg: WatchConfig,
     session_activity_path: Option<PathBuf>,
     activity_path: Option<PathBuf>,
+    sort_persist_path: Option<PathBuf>,
 ) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
@@ -2693,7 +2743,25 @@ pub async fn run(
                 }
                 Action::SetSort(preset) => {
                     app.apply_sort_preset(preset);
-                    app.set_hint(format!("sorted by {}", preset.label()), HintLevel::Ok);
+                    match sort_persist_path.as_deref() {
+                        Some(path) => match persist_watch_sort(path, &app.watch_cfg.sort) {
+                            Ok(()) => {
+                                app.set_hint(
+                                    format!("sorted by {} (saved)", preset.label()),
+                                    HintLevel::Ok,
+                                );
+                            }
+                            Err(e) => {
+                                app.set_hint(
+                                    format!("sorted by {} (save failed: {e})", preset.label()),
+                                    HintLevel::Warn,
+                                );
+                            }
+                        },
+                        None => {
+                            app.set_hint(format!("sorted by {}", preset.label()), HintLevel::Ok);
+                        }
+                    }
                 }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
@@ -3020,7 +3088,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('p') => Action::OpenPreview,
         KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
         KeyCode::Char('s') => Action::SetSort(WatchSortPreset::Session),
-        KeyCode::Char('a') => Action::SetSort(WatchSortPreset::Activity),
+        KeyCode::Char('l' | 'a') => Action::SetSort(WatchSortPreset::Latest),
         KeyCode::Char('d') => Action::SetSort(WatchSortPreset::Duration),
         KeyCode::Char('t') => Action::SetSort(WatchSortPreset::State),
         // Capital-K / Capital-R require Shift in the spec — crossterm
@@ -4254,7 +4322,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" preview  "),
         Span::styled(" r ", theme.key_badge()),
         Span::raw(" refresh  "),
-        Span::styled(" s/a/d/t ", theme.key_badge()),
+        Span::styled(" s/l/d/t ", theme.key_badge()),
         Span::raw(" sort  "),
         Span::styled(" ? ", theme.key_badge()),
         Span::raw(" help  "),
@@ -4895,7 +4963,7 @@ mod tests {
         );
         app.table_state.select(Some(0));
 
-        app.apply_sort_preset(WatchSortPreset::Activity);
+        app.apply_sort_preset(WatchSortPreset::Latest);
 
         let order: Vec<&str> = app
             .rows
@@ -4914,7 +4982,8 @@ mod tests {
         let mut app = App::new();
         for (key, preset) in [
             ('s', WatchSortPreset::Session),
-            ('a', WatchSortPreset::Activity),
+            ('l', WatchSortPreset::Latest),
+            ('a', WatchSortPreset::Latest),
             ('d', WatchSortPreset::Duration),
             ('t', WatchSortPreset::State),
         ] {
@@ -4924,6 +4993,51 @@ mod tests {
             );
             assert!(matches!(action, Action::SetSort(p) if p == preset));
         }
+    }
+
+    #[test]
+    fn persist_watch_sort_creates_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+
+        persist_watch_sort(&path, &[WatchSortKey::Activity]).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("[watch]"), "{saved}");
+        assert!(saved.contains("sort = [\"latest\"]"), "{saved}");
+        let cfg = muxa::config::Config::load_or_default(Some(&path)).unwrap();
+        assert_eq!(cfg.watch.sort, vec![WatchSortKey::Activity]);
+    }
+
+    #[test]
+    fn persist_watch_sort_updates_sort_without_rewriting_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# user config
+[ui]
+theme = "focus"
+
+[watch]
+columns = ["pane", "state"]
+sort = ["state"]
+"#,
+        )
+        .unwrap();
+
+        persist_watch_sort(&path, &[WatchSortKey::State, WatchSortKey::Activity]).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# user config"), "{saved}");
+        assert!(saved.contains("theme = \"focus\""), "{saved}");
+        assert!(saved.contains("columns = [\"pane\", \"state\"]"), "{saved}");
+        assert!(saved.contains("sort = [\"state\", \"latest\"]"), "{saved}");
+        let cfg = muxa::config::Config::load_or_default(Some(&path)).unwrap();
+        assert_eq!(
+            cfg.watch.sort,
+            vec![WatchSortKey::State, WatchSortKey::Activity]
+        );
     }
 
     #[test]
@@ -8197,7 +8311,7 @@ mod tests {
                         \n\
                         Sorting\n\
                         \x20\x20s              sort by session name\n\
-                        \x20\x20a              sort by activity (ACT)\n\
+                        \x20\x20l / a          sort by latest activity\n\
                         \x20\x20d              sort by duration (DUR)\n\
                         \x20\x20t              sort by state (ST)\n\
                         \n\
