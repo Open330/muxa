@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-05
+
 ### Added
 
+- **muxa-owned terminal sessions** — `muxa run <command...>` can now launch
+  agent commands without tmux. The daemon owns the child process inside a
+  PTY, keeps a bounded output buffer, and exposes session lifecycle,
+  capture, input, resize, attach-count, and terminate operations over IPC.
+  `muxa attach <session>` reconnects a local terminal to that session, while
+  `muxa detach <session>` marks it detached for dashboard/session state.
+- **Session surface identity** — agents now carry an optional `surface`
+  separate from the legacy `pane` field. This lets muxa-owned `pty:*`
+  sessions persist and collect prompt history without being mistaken for
+  tmux/zellij panes by the reconciler.
+- **Dashboard terminal capture** — the dashboard has a read-only terminal
+  sessions tab backed by authenticated `/api/terminal-sessions` routes.
+  Captured output is bounded and rendered with `textContent` on the
+  frontend.
+- **opencode hook support** — `muxa hook opencode` now normalizes common
+  opencode session, message, permission, and tool events. `muxa init`
+  installs a queued plugin wrapper instead of doing synchronous shell-outs
+  from high-frequency event handlers.
+- **Zellij plugin bridge** — a new `muxa-zellij-plugin` WASM crate forwards
+  terminal pane metadata through `muxa zellij-plugin-snapshot`, with a
+  freshness TTL in the zellij backend so stale snapshots do not masquerade
+  as live pane inventory.
 - **`muxa timeline`** — new interactive TUI and JSON timeline built from the
   activity ledger plus live agent/tmux spans. The default overview groups
   lanes by session, supports `--session`, `--agent`, and `--group-by`, and
@@ -22,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PTY/session hardening from review** — session ids now include an atomic
+  counter to prevent same-millisecond collisions, `muxa run` forwards the
+  caller's environment and `MUXA_SOCKET`, attach cleanup decrements
+  `attached_clients` on error paths, the IPC socket is chmodded immediately
+  after bind, oversized IPC JSON lines are rejected, and exited PTY sessions
+  are pruned after a TTL.
 - **`muxad` only self-heals the tmux global `MUXA_SOCKET` for the
   canonical daemon.** At startup `muxad` writes its socket into the tmux
   server's global env so panes spawned before it can still reach it — but
