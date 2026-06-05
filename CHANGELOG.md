@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`muxad` only self-heals the tmux global `MUXA_SOCKET` for the
+  canonical daemon.** At startup `muxad` writes its socket into the tmux
+  server's global env so panes spawned before it can still reach it — but
+  it now does so only when running on the default (XDG / `/tmp`) socket or
+  the one named in config. An ephemeral instance started with an explicit
+  `--socket` / `MUXA_SOCKET` override (a dashboard demo, an e2e test) no
+  longer clobbers the global env that the primary daemon and `muxa init`'s
+  `tmux.conf` pin own; previously such an instance, on exit, stranded every
+  pane spawned in the meantime on a now-dead socket
+  (`daemon not reachable at …`). Note: a *non-default primary* daemon
+  should set its socket via config (or the `MUXA_SOCKET` pin) rather than a
+  bare `--socket` flag if it needs pre-existing panes auto-healed.
+
 - **`muxa watch` prompt composer** — delay the submit key briefly after
   injecting prompt text into a tmux pane, so Codex treats `Enter` as a
   distinct submit key instead of folding it into a fast paste/input burst.
