@@ -166,6 +166,13 @@ button, select {
   min-width: 0;
 }
 
+.session-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .panel-header h2 {
   margin: 0;
   font-family: var(--mono);
@@ -419,6 +426,12 @@ button, select {
   color: var(--fg);
   font: inherit;
   padding: 2px 24px 2px 8px;
+}
+
+.compact-select {
+  max-width: 96px;
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
 .timeline-wrap {

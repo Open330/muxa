@@ -29,7 +29,16 @@
           <h2>Sessions</h2>
           <span class="panel-meta" id="sessions-meta"></span>
         </div>
-        <button class="icon-btn" type="button" id="show-all-sessions" title="Show all sessions">∅</button>
+        <div class="session-actions">
+          <select id="session-sort" class="select compact-select" title="Sort sessions">
+            <option value="priority">priority</option>
+            <option value="latest">latest</option>
+            <option value="name">A-Z</option>
+            <option value="human">human</option>
+            <option value="tmux">tmux</option>
+          </select>
+          <button class="icon-btn" type="button" id="show-all-sessions" title="Show all sessions">∅</button>
+        </div>
       </div>
       <div class="session-list" id="session-list">
         <div class="empty-block">loading…</div>

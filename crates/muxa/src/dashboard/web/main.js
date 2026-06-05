@@ -24,12 +24,14 @@ const TOKEN_KEY = "muxa.token";
 const COLLAPSED_PANELS_KEY = "muxa.dashboard.collapsedPanels";
 const COLLAPSED_TIMELINE_GROUPS_KEY = "muxa.dashboard.collapsedTimelineGroups";
 const DATA_TAB_KEY = "muxa.dashboard.dataTab";
+const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
 const PANES_REFETCH_INTERVAL_MS = 5000;
 const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
 const TIMELINE_RANGES = ["24h", "today", "7d"];
+const SESSION_SORTS = new Set(["priority", "latest", "name", "human", "tmux"]);
 
 // ── Token bootstrap ────────────────────────────────────────────────
 
@@ -139,6 +141,7 @@ const dom = {
   version: document.getElementById("version"),
   sessionList: document.getElementById("session-list"),
   sessionsMeta: document.getElementById("sessions-meta"),
+  sessionSort: document.getElementById("session-sort"),
   showAllSessions: document.getElementById("show-all-sessions"),
   metricWorking: document.getElementById("metric-working"),
   metricWaiting: document.getElementById("metric-waiting"),
@@ -227,6 +230,7 @@ const store = {
     collapsedPanels: loadSet(COLLAPSED_PANELS_KEY),
     collapsedTimelineGroups: loadSet(COLLAPSED_TIMELINE_GROUPS_KEY),
     activeTab: loadValue(DATA_TAB_KEY, "agents"),
+    sessionSort: normalizeSessionSort(loadValue(SESSION_SORT_KEY, "priority")),
     selectedSegment: null,
   },
   filters: {
@@ -264,6 +268,10 @@ function sessionForAgent(agent) {
 
 function selectedSession() {
   return store.filters.timelineSession || "";
+}
+
+function normalizeSessionSort(sort) {
+  return SESSION_SORTS.has(sort) ? sort : "priority";
 }
 
 function agentMatchesSelectedSession(agent) {
@@ -356,6 +364,7 @@ function renderOverview() {
 function renderSessionSidebar() {
   const summaries = buildSessionSummaries();
   dom.sessionsMeta.textContent = `${summaries.length} total`;
+  if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
   if (summaries.length === 0) {
     dom.sessionList.innerHTML = `<div class="empty-block">no sessions</div>`;
     return;
@@ -382,7 +391,7 @@ function renderSessionSidebar() {
         <span class="session-name">${esc(s.label)}</span>
         <span class="session-detail">${esc(sessionSummaryLine(s))}</span>
       </span>
-      <span class="session-score">${esc(sessionScoreLabel(s))}</span>
+      <span class="session-score">${esc(sessionScoreLabel(s, store.ui.sessionSort))}</span>
     </button>`;
   }).join("");
   dom.sessionList.innerHTML = allRow + rows;
@@ -417,6 +426,11 @@ function buildSessionSummaries() {
     const s = ensure(label);
     s.lanes += 1;
     addTimelineTotals(s.totals, lane.totals || {});
+    for (const interval of lane.intervals || []) {
+      if (interval.open) continue;
+      const latest = interval.ended_at || interval.started_at || "";
+      if (latest > s.latest) s.latest = latest;
+    }
   }
   for (const agent of store.agents.values()) {
     const s = ensure(sessionForAgent(agent));
@@ -437,13 +451,7 @@ function buildSessionSummaries() {
     );
   }
 
-  return [...map.values()].sort((a, b) => {
-    const scoreA = a.errors * 1000 + a.waiting * 100 + a.working * 10;
-    const scoreB = b.errors * 1000 + b.waiting * 100 + b.working * 10;
-    if (scoreA !== scoreB) return scoreB - scoreA;
-    if (a.latest !== b.latest) return b.latest.localeCompare(a.latest);
-    return a.label.localeCompare(b.label);
-  });
+  return [...map.values()].sort(compareSessionSummaries);
 }
 
 function sessionSummaryLine(s) {
@@ -456,7 +464,48 @@ function sessionSummaryLine(s) {
   return parts.slice(0, 3).join(" · ") || `${s.lanes} lanes`;
 }
 
-function sessionScoreLabel(s) {
+function compareSessionSummaries(a, b) {
+  switch (store.ui.sessionSort) {
+    case "latest":
+      return compareLatest(a, b) || comparePriority(a, b) || compareName(a, b);
+    case "name":
+      return compareName(a, b);
+    case "human":
+      return compareNumeric(b.human_presence_secs, a.human_presence_secs) ||
+        compareLatest(a, b) ||
+        compareName(a, b);
+    case "tmux":
+      return compareNumeric(b.totals.foreground_secs, a.totals.foreground_secs) ||
+        compareLatest(a, b) ||
+        compareName(a, b);
+    case "priority":
+    default:
+      return comparePriority(a, b) || compareLatest(a, b) || compareName(a, b);
+  }
+}
+
+function comparePriority(a, b) {
+  const scoreA = a.errors * 1000 + a.waiting * 100 + a.working * 10;
+  const scoreB = b.errors * 1000 + b.waiting * 100 + b.working * 10;
+  return compareNumeric(scoreB, scoreA);
+}
+
+function compareLatest(a, b) {
+  return (b.latest || "").localeCompare(a.latest || "");
+}
+
+function compareName(a, b) {
+  return a.label.localeCompare(b.label);
+}
+
+function compareNumeric(a, b) {
+  return a === b ? 0 : a > b ? 1 : -1;
+}
+
+function sessionScoreLabel(s, sort) {
+  if (sort === "latest") return relTime(s.latest);
+  if (sort === "human") return formatDuration(s.human_presence_secs || 0);
+  if (sort === "tmux") return formatDuration(s.totals.foreground_secs || 0);
   if (s.errors > 0) return String(s.errors);
   if (s.waiting > 0) return String(s.waiting);
   if (s.working > 0) return String(s.working);
@@ -1059,6 +1108,11 @@ function initDataTabs() {
 
 function initSessionControls() {
   dom.showAllSessions.addEventListener("click", () => setSelectedSession(""));
+  dom.sessionSort?.addEventListener("change", () => {
+    store.ui.sessionSort = normalizeSessionSort(dom.sessionSort.value);
+    saveValue(SESSION_SORT_KEY, store.ui.sessionSort);
+    renderSessionSidebar();
+  });
 }
 
 function initCollapseControls() {
