@@ -15,118 +15,170 @@
       <span class="version" id="version" title="protocol version"></span>
     </div>
     <div class="status">
+      <span class="mode-badge">read-only public</span>
       <span class="conn" id="conn">●</span>
       <span class="conn-label" id="conn-label">connecting…</span>
       <span class="counts" id="counts"></span>
     </div>
   </header>
 
-  <main>
-    <section class="panel" id="timeline-panel" data-panel="timeline">
-      <div class="panel-header">
+  <main class="dashboard-shell">
+    <aside class="panel session-panel">
+      <div class="panel-header compact">
         <div class="panel-title">
-          <button class="collapse-btn" type="button" data-collapse-target="timeline-panel" aria-expanded="true" aria-controls="timeline-content" title="Collapse Timeline">
-            <span aria-hidden="true">⌄</span>
-          </button>
-          <h2>Timeline</h2>
-          <span class="panel-meta" id="timeline-meta"></span>
+          <h2>Sessions</h2>
+          <span class="panel-meta" id="sessions-meta"></span>
         </div>
-        <div class="filters">
-          <span class="filter-label">range:</span>
-          <span class="chips" id="timeline-range-chips"></span>
-          <span class="filter-label">session:</span>
-          <select id="timeline-session" class="select">
-            <option value="">all sessions</option>
-          </select>
-        </div>
+        <button class="icon-btn" type="button" id="show-all-sessions" title="Show all sessions">∅</button>
       </div>
-      <div class="panel-content timeline-wrap" id="timeline-content">
-        <div class="timeline-axis" id="timeline-axis"></div>
-        <div class="timeline-body" id="timeline-body">
-          <div class="timeline-empty">loading…</div>
-        </div>
-        <div class="timeline-legend">
-          <span class="legend-item state-working">working</span>
-          <span class="legend-item state-waiting">waiting</span>
-          <span class="legend-item state-error">error</span>
-          <span class="legend-item state-idle">idle</span>
-          <span class="legend-item source-human">human</span>
-          <span class="legend-item source-tmux">tmux</span>
-        </div>
+      <div class="session-list" id="session-list">
+        <div class="empty-block">loading…</div>
       </div>
+    </aside>
+
+    <section class="workbench">
+      <section class="overview-strip" id="overview-strip">
+        <div class="metric-card">
+          <span>working</span>
+          <strong id="metric-working">—</strong>
+        </div>
+        <div class="metric-card attention">
+          <span>waiting</span>
+          <strong id="metric-waiting">—</strong>
+        </div>
+        <div class="metric-card danger">
+          <span>errors</span>
+          <strong id="metric-errors">—</strong>
+        </div>
+        <div class="metric-card">
+          <span>human</span>
+          <strong id="metric-human">—</strong>
+        </div>
+        <div class="metric-card">
+          <span>tmux</span>
+          <strong id="metric-tmux">—</strong>
+        </div>
+      </section>
+
+      <section class="panel timeline-panel" id="timeline-panel" data-panel="timeline">
+        <div class="panel-header">
+          <div class="panel-title">
+            <button class="collapse-btn" type="button" data-collapse-target="timeline-panel" aria-expanded="true" aria-controls="timeline-content" title="Collapse Timeline">
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <h2>Timeline</h2>
+            <span class="panel-meta" id="timeline-meta"></span>
+          </div>
+          <div class="filters">
+            <span class="filter-label">range:</span>
+            <span class="chips" id="timeline-range-chips"></span>
+            <span class="filter-label">session:</span>
+            <select id="timeline-session" class="select">
+              <option value="">all sessions</option>
+            </select>
+          </div>
+        </div>
+        <div class="panel-content timeline-wrap" id="timeline-content">
+          <div class="timeline-axis" id="timeline-axis"></div>
+          <div class="timeline-body" id="timeline-body">
+            <div class="timeline-empty">loading…</div>
+          </div>
+          <div class="timeline-legend">
+            <span class="legend-item state-working">working</span>
+            <span class="legend-item state-waiting">waiting</span>
+            <span class="legend-item state-error">error</span>
+            <span class="legend-item state-idle">idle</span>
+            <span class="legend-item source-human">human</span>
+            <span class="legend-item source-tmux">tmux</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel data-panel" id="data-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Data</h2>
+            <span class="panel-meta" id="data-meta"></span>
+          </div>
+          <div class="tabs" id="data-tabs">
+            <button class="tab active" type="button" data-tab="agents">Agents</button>
+            <button class="tab" type="button" data-tab="panes">Panes</button>
+          </div>
+        </div>
+
+        <div class="tab-pane active" id="agents-tab">
+          <div class="panel-toolbar">
+            <div class="filters">
+              <span class="filter-label">state:</span>
+              <span class="chips" id="agent-state-chips"></span>
+              <span class="filter-label">kind:</span>
+              <span class="chips" id="agent-kind-chips"></span>
+            </div>
+            <span class="panel-meta" id="agents-meta"></span>
+          </div>
+          <div class="table-wrap" id="agents-content">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>PANE</th>
+                  <th>KIND</th>
+                  <th>STATE</th>
+                  <th>MODEL</th>
+                  <th class="num">CTX</th>
+                  <th class="num">COST</th>
+                  <th>LIMITS</th>
+                  <th>LAST PROMPT</th>
+                  <th>ACTIVITY</th>
+                </tr>
+              </thead>
+              <tbody id="agents-tbody">
+                <tr class="empty"><td colspan="9">loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="panes-tab">
+          <div class="panel-toolbar">
+            <div class="filters">
+              <span class="filter-label">socket:</span>
+              <span class="chips" id="pane-socket-chips"></span>
+            </div>
+            <span class="panel-meta" id="panes-meta"></span>
+          </div>
+          <div class="table-wrap" id="panes-content">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>SOCKET</th>
+                  <th>SESSION</th>
+                  <th>WINDOW</th>
+                  <th>PANE</th>
+                  <th>COMMAND</th>
+                  <th>TITLE</th>
+                  <th>ATTACH</th>
+                </tr>
+              </thead>
+              <tbody id="panes-tbody">
+                <tr class="empty"><td colspan="7">loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </section>
 
-    <section class="panel" id="agents-panel" data-panel="agents">
-      <div class="panel-header">
+    <aside class="panel inspector-panel">
+      <div class="panel-header compact">
         <div class="panel-title">
-          <button class="collapse-btn" type="button" data-collapse-target="agents-panel" aria-expanded="true" aria-controls="agents-content" title="Collapse Agents">
-            <span aria-hidden="true">⌄</span>
-          </button>
-          <h2>Agents</h2>
-          <span class="panel-meta" id="agents-meta"></span>
-        </div>
-        <div class="filters">
-          <span class="filter-label">state:</span>
-          <span class="chips" id="agent-state-chips"></span>
-          <span class="filter-label">kind:</span>
-          <span class="chips" id="agent-kind-chips"></span>
+          <h2>Inspector</h2>
+          <span class="panel-meta" id="inspector-meta"></span>
         </div>
       </div>
-      <div class="panel-content table-wrap" id="agents-content">
-        <table class="data">
-          <thead>
-            <tr>
-              <th>PANE</th>
-              <th>KIND</th>
-              <th>STATE</th>
-              <th>MODEL</th>
-              <th class="num">CTX</th>
-              <th class="num">COST</th>
-              <th>LIMITS</th>
-              <th>LAST PROMPT</th>
-              <th>ACTIVITY</th>
-            </tr>
-          </thead>
-          <tbody id="agents-tbody">
-            <tr class="empty"><td colspan="9">loading…</td></tr>
-          </tbody>
-        </table>
+      <div class="inspector-body" id="inspector-body">
+        <div class="empty-block">loading…</div>
       </div>
-    </section>
-
-    <section class="panel" id="panes-panel" data-panel="panes">
-      <div class="panel-header">
-        <div class="panel-title">
-          <button class="collapse-btn" type="button" data-collapse-target="panes-panel" aria-expanded="true" aria-controls="panes-content" title="Collapse tmux panes">
-            <span aria-hidden="true">⌄</span>
-          </button>
-          <h2>tmux panes <span class="muted">(global)</span></h2>
-          <span class="panel-meta" id="panes-meta"></span>
-        </div>
-        <div class="filters">
-          <span class="filter-label">socket:</span>
-          <span class="chips" id="pane-socket-chips"></span>
-        </div>
-      </div>
-      <div class="panel-content table-wrap" id="panes-content">
-        <table class="data">
-          <thead>
-            <tr>
-              <th>SOCKET</th>
-              <th>SESSION</th>
-              <th>WINDOW</th>
-              <th>PANE</th>
-              <th>COMMAND</th>
-              <th>TITLE</th>
-              <th>ATTACH</th>
-            </tr>
-          </thead>
-          <tbody id="panes-tbody">
-            <tr class="empty"><td colspan="7">loading…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+    </aside>
   </main>
 
   <div id="toast" class="toast" hidden></div>

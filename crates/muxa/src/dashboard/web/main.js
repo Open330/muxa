@@ -23,6 +23,7 @@
 const TOKEN_KEY = "muxa.token";
 const COLLAPSED_PANELS_KEY = "muxa.dashboard.collapsedPanels";
 const COLLAPSED_TIMELINE_GROUPS_KEY = "muxa.dashboard.collapsedTimelineGroups";
+const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const PANES_REFETCH_INTERVAL_MS = 5000;
 const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
@@ -136,6 +137,14 @@ const dom = {
   connLabel: document.getElementById("conn-label"),
   counts: document.getElementById("counts"),
   version: document.getElementById("version"),
+  sessionList: document.getElementById("session-list"),
+  sessionsMeta: document.getElementById("sessions-meta"),
+  showAllSessions: document.getElementById("show-all-sessions"),
+  metricWorking: document.getElementById("metric-working"),
+  metricWaiting: document.getElementById("metric-waiting"),
+  metricErrors: document.getElementById("metric-errors"),
+  metricHuman: document.getElementById("metric-human"),
+  metricTmux: document.getElementById("metric-tmux"),
   agentsBody: document.getElementById("agents-tbody"),
   panesBody: document.getElementById("panes-tbody"),
   timelineAxis: document.getElementById("timeline-axis"),
@@ -148,6 +157,12 @@ const dom = {
   agentsMeta: document.getElementById("agents-meta"),
   paneSocketChips: document.getElementById("pane-socket-chips"),
   panesMeta: document.getElementById("panes-meta"),
+  dataMeta: document.getElementById("data-meta"),
+  dataTabs: document.getElementById("data-tabs"),
+  agentsTab: document.getElementById("agents-tab"),
+  panesTab: document.getElementById("panes-tab"),
+  inspectorBody: document.getElementById("inspector-body"),
+  inspectorMeta: document.getElementById("inspector-meta"),
   toast: document.getElementById("toast"),
 };
 
@@ -184,6 +199,22 @@ function saveSet(key, values) {
   }
 }
 
+function loadValue(key, fallback) {
+  try {
+    return localStorage.getItem(key) || fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function saveValue(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (_) {
+    // Ignore storage failures; the visible state is already updated.
+  }
+}
+
 // ── State ─────────────────────────────────────────────────────────
 
 const store = {
@@ -195,6 +226,8 @@ const store = {
   ui: {
     collapsedPanels: loadSet(COLLAPSED_PANELS_KEY),
     collapsedTimelineGroups: loadSet(COLLAPSED_TIMELINE_GROUPS_KEY),
+    activeTab: loadValue(DATA_TAB_KEY, "agents"),
+    selectedSegment: null,
   },
   filters: {
     agentStates: new Set(AGENT_STATES),
@@ -217,6 +250,46 @@ function resolvePaneLabel(paneId) {
   const match = store.panes.find((p) => p.pane_id === paneId);
   if (!match) return paneId;
   return `${match.session}:${match.window_index}.${paneId}`;
+}
+
+function sessionForAgent(agent) {
+  if (!agent) return "";
+  const paneMatch = agent.pane ? store.panes.find((p) => p.pane_id === agent.pane) : null;
+  if (paneMatch?.session) return paneMatch.session;
+  const laneMatch = (store.timeline?.lanes || []).find(
+    (lane) => lane.kind === "agent" && lane.session_id === agent.session_id
+  );
+  return laneMatch?.session_name || agent.session_id || "";
+}
+
+function selectedSession() {
+  return store.filters.timelineSession || "";
+}
+
+function agentMatchesSelectedSession(agent) {
+  const session = selectedSession();
+  if (!session) return true;
+  return sessionForAgent(agent) === session || agent.session_id === session;
+}
+
+function paneMatchesSelectedSession(pane) {
+  const session = selectedSession();
+  return !session || pane.session === session;
+}
+
+function laneMatchesSelectedSession(lane) {
+  const session = selectedSession();
+  return !session || lane.session_name === session || lane.session_id === session;
+}
+
+function setSelectedSession(session) {
+  store.filters.timelineSession = session || "";
+  store.ui.selectedSegment = null;
+  if (dom.timelineSession) dom.timelineSession.value = store.filters.timelineSession;
+  renderTimeline();
+  renderAgents();
+  renderPanes();
+  renderInspector();
 }
 
 // Copy text to clipboard. Uses the async Clipboard API when available
@@ -261,8 +334,124 @@ function renderCounts() {
   let s = `${a} agent${a === 1 ? "" : "s"} · ${p} pane${p === 1 ? "" : "s"}`;
   if (e > 0) s += ` · ${e} scan error${e === 1 ? "" : "s"}`;
   dom.counts.textContent = s;
-  dom.agentsMeta.textContent = `${a} tracked`;
-  dom.panesMeta.textContent = e > 0 ? `${p} panes · ${e} errors` : `${p} panes`;
+  renderOverview();
+  renderSessionSidebar();
+  renderInspector();
+}
+
+function renderOverview() {
+  const agents = [...store.agents.values()];
+  const working = agents.filter((a) => a.state === "working").length;
+  const waiting = agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length;
+  const errors = agents.filter((a) => a.state === "error").length;
+  const totals = store.timeline?.totals || {};
+  dom.metricWorking.textContent = String(working);
+  dom.metricWaiting.textContent = String(waiting);
+  dom.metricErrors.textContent = String(errors);
+  dom.metricHuman.textContent = formatDuration(totals.human_secs || 0);
+  dom.metricTmux.textContent = formatDuration(totals.foreground_secs || 0);
+}
+
+function renderSessionSidebar() {
+  const summaries = buildSessionSummaries();
+  dom.sessionsMeta.textContent = `${summaries.length} total`;
+  if (summaries.length === 0) {
+    dom.sessionList.innerHTML = `<div class="empty-block">no sessions</div>`;
+    return;
+  }
+  const active = selectedSession();
+  const allAgents = store.agents.size;
+  const allWaiting = [...store.agents.values()].filter((a) =>
+    a.state === "waiting_input" || a.state === "waiting_choice" || a.state === "error"
+  ).length;
+  const allActive = active === "";
+  const allRow = `<button class="session-row${allActive ? " active" : ""}" type="button" data-session="">
+    <span class="session-dot ${allWaiting > 0 ? "waiting" : "working"}"></span>
+    <span class="session-main">
+      <span class="session-name">all sessions</span>
+      <span class="session-detail">${allAgents} agents · ${store.panes.length} panes</span>
+    </span>
+    <span class="session-score">${allWaiting}</span>
+  </button>`;
+  const rows = summaries.map((s) => {
+    const stateClass = s.errors > 0 ? "error" : s.waiting > 0 ? "waiting" : s.working > 0 ? "working" : "idle";
+    return `<button class="session-row${s.label === active ? " active" : ""}" type="button" data-session="${esc(s.label)}">
+      <span class="session-dot ${stateClass}"></span>
+      <span class="session-main">
+        <span class="session-name">${esc(s.label)}</span>
+        <span class="session-detail">${esc(sessionSummaryLine(s))}</span>
+      </span>
+      <span class="session-score">${esc(sessionScoreLabel(s))}</span>
+    </button>`;
+  }).join("");
+  dom.sessionList.innerHTML = allRow + rows;
+  dom.sessionList.querySelectorAll("[data-session]").forEach((row) => {
+    row.addEventListener("click", () => setSelectedSession(row.getAttribute("data-session") || ""));
+  });
+}
+
+function buildSessionSummaries() {
+  const map = new Map();
+  const ensure = (label) => {
+    const key = label || "no session";
+    if (!map.has(key)) {
+      map.set(key, {
+        label: key,
+        agents: 0,
+        panes: 0,
+        lanes: 0,
+        working: 0,
+        waiting: 0,
+        errors: 0,
+        latest: "",
+        totals: emptyTimelineTotals(),
+      });
+    }
+    return map.get(key);
+  };
+
+  for (const lane of store.timeline?.lanes || []) {
+    const label = lane.session_name || lane.session_id || "no session";
+    const s = ensure(label);
+    s.lanes += 1;
+    addTimelineTotals(s.totals, lane.totals || {});
+  }
+  for (const agent of store.agents.values()) {
+    const s = ensure(sessionForAgent(agent));
+    s.agents += 1;
+    if (agent.state === "working") s.working += 1;
+    if (agent.state === "waiting_input" || agent.state === "waiting_choice") s.waiting += 1;
+    if (agent.state === "error") s.errors += 1;
+    if ((agent.last_activity_at || "") > s.latest) s.latest = agent.last_activity_at || "";
+  }
+  for (const pane of store.panes) {
+    ensure(pane.session).panes += 1;
+  }
+
+  return [...map.values()].sort((a, b) => {
+    const scoreA = a.errors * 1000 + a.waiting * 100 + a.working * 10;
+    const scoreB = b.errors * 1000 + b.waiting * 100 + b.working * 10;
+    if (scoreA !== scoreB) return scoreB - scoreA;
+    if (a.latest !== b.latest) return b.latest.localeCompare(a.latest);
+    return a.label.localeCompare(b.label);
+  });
+}
+
+function sessionSummaryLine(s) {
+  const parts = [];
+  if (s.working) parts.push(`${s.working} work`);
+  if (s.waiting) parts.push(`${s.waiting} wait`);
+  if (s.errors) parts.push(`${s.errors} err`);
+  if (s.agents) parts.push(`${s.agents} agents`);
+  if (s.panes) parts.push(`${s.panes} panes`);
+  return parts.slice(0, 3).join(" · ") || `${s.lanes} lanes`;
+}
+
+function sessionScoreLabel(s) {
+  if (s.errors > 0) return String(s.errors);
+  if (s.waiting > 0) return String(s.waiting);
+  if (s.working > 0) return String(s.working);
+  return "·";
 }
 
 function renderTimeline() {
@@ -271,6 +460,9 @@ function renderTimeline() {
     dom.timelineBody.innerHTML = `<div class="timeline-empty">loading…</div>`;
     dom.timelineAxis.innerHTML = "";
     dom.timelineMeta.textContent = "loading";
+    renderOverview();
+    renderSessionSidebar();
+    renderInspector();
     return;
   }
   renderTimelineSessionOptions(doc);
@@ -280,16 +472,23 @@ function renderTimeline() {
     dom.timelineBody.innerHTML = `<div class="timeline-empty">timeline window is invalid</div>`;
     dom.timelineAxis.innerHTML = "";
     dom.timelineMeta.textContent = "invalid window";
+    renderOverview();
+    renderSessionSidebar();
+    renderInspector();
     return;
   }
   renderTimelineAxis(start, end);
 
-  const lanes = doc.lanes || [];
+  const lanes = (doc.lanes || []).filter(laneMatchesSelectedSession);
   const groups = groupTimelineLanesBySession(lanes);
-  dom.timelineMeta.textContent = `${groups.length} session${groups.length === 1 ? "" : "s"} · ${lanes.length} lane${lanes.length === 1 ? "" : "s"}`;
+  const scope = selectedSession() ? `${selectedSession()} · ` : "";
+  dom.timelineMeta.textContent = `${scope}${groups.length} session${groups.length === 1 ? "" : "s"} · ${lanes.length} lane${lanes.length === 1 ? "" : "s"}`;
   if (lanes.length === 0) {
     const note = (doc.notes || [])[0] || "no timeline intervals in this view";
     dom.timelineBody.innerHTML = `<div class="timeline-empty">${esc(note)}</div>`;
+    renderOverview();
+    renderSessionSidebar();
+    renderInspector();
     return;
   }
 
@@ -311,6 +510,10 @@ function renderTimeline() {
     })
     .join("");
   bindTimelineGroupToggles();
+  bindTimelineSegmentClicks();
+  renderOverview();
+  renderSessionSidebar();
+  renderInspector();
 }
 
 function renderTimelineLane(lane, start, end, grouped) {
@@ -382,6 +585,25 @@ function bindTimelineGroupToggles() {
   });
 }
 
+function bindTimelineSegmentClicks() {
+  dom.timelineBody.querySelectorAll("[data-segment]").forEach((el) => {
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      store.ui.selectedSegment = {
+        detail: el.getAttribute("data-detail") || "interval",
+        source: el.getAttribute("data-source") || "",
+        state: el.getAttribute("data-state") || "",
+        started_at: el.getAttribute("data-started") || "",
+        ended_at: el.getAttribute("data-ended") || "",
+        duration_secs: Number(el.getAttribute("data-duration") || 0),
+        session: el.getAttribute("data-session") || "",
+        pane: el.getAttribute("data-pane") || "",
+      };
+      renderInspector();
+    });
+  });
+}
+
 function timelineLaneRank(kind) {
   if (kind === "agent") return 0;
   if (kind === "human") return 1;
@@ -435,7 +657,16 @@ function renderTimelineSegment(interval, start, end) {
   ].filter(Boolean).join(" · ");
   return `<span class="timeline-segment ${esc(cls)}${interval.open ? " open" : ""}"
     style="left:${left}%;width:${width}%"
-    title="${esc(title)}"></span>`;
+    title="${esc(title)}"
+    data-segment="1"
+    data-detail="${esc(interval.detail || timelineSegmentLabel(interval))}"
+    data-source="${esc(interval.source || "")}"
+    data-state="${esc(interval.state || "")}"
+    data-started="${esc(interval.started_at || "")}"
+    data-ended="${esc(interval.ended_at || "")}"
+    data-duration="${esc(interval.duration_secs || 0)}"
+    data-session="${esc(interval.session_name || interval.session_id || "")}"
+    data-pane="${esc(interval.pane || "")}"></span>`;
 }
 
 function timelineSegmentClass(interval) {
@@ -490,10 +721,15 @@ function renderTimelineSessionOptions(doc) {
 function renderAgents() {
   const rows = [...store.agents.values()].filter(
     (a) =>
+      agentMatchesSelectedSession(a) &&
       store.filters.agentStates.has(a.state) &&
       store.filters.agentKinds.has(a.kind)
   );
   rows.sort((x, y) => (y.last_activity_at || "").localeCompare(x.last_activity_at || ""));
+  dom.agentsMeta.textContent = selectedSession()
+    ? `${rows.length} in ${selectedSession()}`
+    : `${rows.length} shown · ${store.agents.size} tracked`;
+  renderDataMeta();
 
   if (rows.length === 0) {
     dom.agentsBody.innerHTML = `<tr class="empty"><td colspan="9">no matching agents</td></tr>`;
@@ -607,7 +843,11 @@ function renderPanes() {
   }
   renderSocketChips([...socketsInData].sort());
 
-  const rows = store.panes.filter((p) => store.filters.paneSockets.has(p.socket));
+  const rows = store.panes.filter((p) => store.filters.paneSockets.has(p.socket) && paneMatchesSelectedSession(p));
+  dom.panesMeta.textContent = store.paneErrors.length > 0
+    ? `${rows.length} shown · ${store.paneErrors.length} errors`
+    : `${rows.length} shown`;
+  renderDataMeta();
   if (rows.length === 0 && store.paneErrors.length === 0) {
     dom.panesBody.innerHTML = `<tr class="empty"><td colspan="7">no panes (no tmux servers, or all filtered out)</td></tr>`;
     return;
@@ -644,6 +884,11 @@ function renderPanes() {
   });
 }
 
+function renderDataMeta() {
+  const scope = selectedSession() || "all sessions";
+  dom.dataMeta.textContent = `${store.ui.activeTab} · ${scope}`;
+}
+
 function renderSocketChips(sockets) {
   const html = sockets
     .map((s) => {
@@ -662,6 +907,7 @@ function renderSocketChips(sockets) {
         store.filters.paneSockets.add(s);
       }
       renderPanes();
+      renderInspector();
     });
   });
 }
@@ -679,8 +925,7 @@ function renderStaticChips() {
     });
   });
   dom.timelineSession.addEventListener("change", () => {
-    store.filters.timelineSession = dom.timelineSession.value;
-    fetchTimeline().catch(() => {});
+    setSelectedSession(dom.timelineSession.value);
   });
 
   dom.agentStateChips.innerHTML = AGENT_STATES.map(
@@ -697,6 +942,7 @@ function renderStaticChips() {
         chip.classList.add("active");
       }
       renderAgents();
+      renderInspector();
     });
   });
 
@@ -714,8 +960,30 @@ function renderStaticChips() {
         chip.classList.add("active");
       }
       renderAgents();
+      renderInspector();
     });
   });
+}
+
+function initDataTabs() {
+  const apply = (tab) => {
+    store.ui.activeTab = tab === "panes" ? "panes" : "agents";
+    saveValue(DATA_TAB_KEY, store.ui.activeTab);
+    dom.dataTabs.querySelectorAll("[data-tab]").forEach((btn) => {
+      btn.classList.toggle("active", btn.getAttribute("data-tab") === store.ui.activeTab);
+    });
+    dom.agentsTab.classList.toggle("active", store.ui.activeTab === "agents");
+    dom.panesTab.classList.toggle("active", store.ui.activeTab === "panes");
+    renderDataMeta();
+  };
+  dom.dataTabs.querySelectorAll("[data-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => apply(btn.getAttribute("data-tab")));
+  });
+  apply(store.ui.activeTab);
+}
+
+function initSessionControls() {
+  dom.showAllSessions.addEventListener("click", () => setSelectedSession(""));
 }
 
 function initCollapseControls() {
@@ -745,6 +1013,96 @@ function setPanelCollapsed(panel, btn, collapsed) {
   btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
   const icon = btn.querySelector("span");
   if (icon) icon.textContent = collapsed ? "›" : "⌄";
+}
+
+function renderInspector() {
+  if (store.ui.selectedSegment) {
+    renderSegmentInspector(store.ui.selectedSegment);
+    return;
+  }
+
+  const session = selectedSession();
+  const summaries = buildSessionSummaries();
+  const summary = session ? summaries.find((s) => s.label === session) : null;
+  const agents = [...store.agents.values()]
+    .filter(agentMatchesSelectedSession)
+    .sort((a, b) => (b.last_activity_at || "").localeCompare(a.last_activity_at || ""));
+  const panes = store.panes.filter(paneMatchesSelectedSession);
+
+  dom.inspectorMeta.textContent = session || "overview";
+  const title = session || "all sessions";
+  const activeSummary = summary || {
+    working: agents.filter((a) => a.state === "working").length,
+    waiting: agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length,
+    errors: agents.filter((a) => a.state === "error").length,
+    agents: agents.length,
+    panes: panes.length,
+    totals: store.timeline?.totals || emptyTimelineTotals(),
+  };
+
+  dom.inspectorBody.innerHTML = `
+    <div class="inspector-title">
+      <span>${esc(title)}</span>
+      <small>${esc(sessionSummaryLine(activeSummary))}</small>
+    </div>
+    <div class="inspector-grid">
+      ${inspectorMetric("work", activeSummary.working)}
+      ${inspectorMetric("wait", activeSummary.waiting)}
+      ${inspectorMetric("err", activeSummary.errors)}
+      ${inspectorMetric("human", formatDuration(activeSummary.totals.human_secs || 0))}
+      ${inspectorMetric("tmux", formatDuration(activeSummary.totals.foreground_secs || 0))}
+      ${inspectorMetric("panes", panes.length)}
+    </div>
+    <div class="inspector-section">
+      <h3>Agents</h3>
+      ${renderInspectorAgents(agents.slice(0, 8))}
+    </div>
+    <div class="inspector-section">
+      <h3>Panes</h3>
+      ${renderInspectorPanes(panes.slice(0, 8))}
+    </div>`;
+}
+
+function renderSegmentInspector(segment) {
+  dom.inspectorMeta.textContent = "interval";
+  dom.inspectorBody.innerHTML = `
+    <div class="inspector-title">
+      <span>${esc(segment.detail)}</span>
+      <small>${esc(segment.source || segment.state || "timeline")}</small>
+    </div>
+    <div class="inspector-grid">
+      ${inspectorMetric("duration", formatDuration(segment.duration_secs || 0))}
+      ${inspectorMetric("state", segment.state || "—")}
+      ${inspectorMetric("session", segment.session || "—")}
+      ${inspectorMetric("pane", segment.pane || "—")}
+    </div>
+    <dl class="kv-list">
+      <dt>start</dt><dd>${esc(segment.started_at ? dateTimeLabel(new Date(segment.started_at)) : "—")}</dd>
+      <dt>end</dt><dd>${esc(segment.ended_at ? dateTimeLabel(new Date(segment.ended_at)) : "—")}</dd>
+      <dt>source</dt><dd>${esc(segment.source || "—")}</dd>
+    </dl>`;
+}
+
+function inspectorMetric(label, value) {
+  return `<div class="mini-metric"><span>${esc(label)}</span><strong>${esc(value ?? "—")}</strong></div>`;
+}
+
+function renderInspectorAgents(agents) {
+  if (agents.length === 0) return `<div class="empty-block compact">none</div>`;
+  return agents.map((a) => `<div class="mini-row">
+    <span class="state-dot ${esc(a.state)}"></span>
+    <span>${esc(a.kind)}</span>
+    <small>${esc(relTime(a.last_activity_at))}</small>
+  </div>`).join("");
+}
+
+function renderInspectorPanes(panes) {
+  if (panes.length === 0) return `<div class="empty-block compact">none</div>`;
+  return panes.map((p) => `<div class="mini-row">
+    <span>${esc(p.window_index)}.${esc(p.pane_id)}</span>
+    <span>${esc(p.current_command || "—")}</span>
+    <small>${esc(p.title || "")}</small>
+  </div>`).join("");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -816,9 +1174,6 @@ async function fetchPanes() {
 
 async function fetchTimeline() {
   const params = new URLSearchParams({ since: store.filters.timelineRange });
-  if (store.filters.timelineSession) {
-    params.set("session", store.filters.timelineSession);
-  }
   store.timeline = await jsonFetch(`/api/timeline?${params.toString()}`);
   renderTimeline();
 }
@@ -865,6 +1220,8 @@ function scheduleTimelineRefresh() {
 async function main() {
   bootstrapToken();
   initCollapseControls();
+  initDataTabs();
+  initSessionControls();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
 
