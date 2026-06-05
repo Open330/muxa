@@ -22,6 +22,34 @@
   </header>
 
   <main>
+    <section class="panel" id="timeline-panel">
+      <div class="panel-header">
+        <h2>Timeline</h2>
+        <div class="filters">
+          <span class="filter-label">range:</span>
+          <span class="chips" id="timeline-range-chips"></span>
+          <span class="filter-label">session:</span>
+          <select id="timeline-session" class="select">
+            <option value="">all sessions</option>
+          </select>
+        </div>
+      </div>
+      <div class="timeline-wrap">
+        <div class="timeline-axis" id="timeline-axis"></div>
+        <div class="timeline-body" id="timeline-body">
+          <div class="timeline-empty">loading…</div>
+        </div>
+        <div class="timeline-legend">
+          <span class="legend-item state-working">working</span>
+          <span class="legend-item state-waiting">waiting</span>
+          <span class="legend-item state-error">error</span>
+          <span class="legend-item state-idle">idle</span>
+          <span class="legend-item source-human">human</span>
+          <span class="legend-item source-tmux">tmux</span>
+        </div>
+      </div>
+    </section>
+
     <section class="panel" id="agents-panel">
       <div class="panel-header">
         <h2>Agents</h2>

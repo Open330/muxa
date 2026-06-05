@@ -1128,12 +1128,13 @@ sort = ["latest"]
     fn parses_watch_sort_aliases_for_cli_column_names() {
         let toml = r#"
 [watch]
-sort = ["activity", "act", "st", "dur", "duration"]
+sort = ["activity", "act", "latest", "st", "dur", "duration"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(
             cfg.watch.sort,
             vec![
+                WatchSortKey::Activity,
                 WatchSortKey::Activity,
                 WatchSortKey::Activity,
                 WatchSortKey::State,

@@ -22,9 +22,11 @@
 
 const TOKEN_KEY = "muxa.token";
 const PANES_REFETCH_INTERVAL_MS = 5000;
+const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
-const AGENT_STATES = ["working", "waiting_input", "idle", "starting", "error", "stopped"];
+const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
+const TIMELINE_RANGES = ["24h", "today", "7d"];
 
 // ── Token bootstrap ────────────────────────────────────────────────
 
@@ -134,6 +136,10 @@ const dom = {
   version: document.getElementById("version"),
   agentsBody: document.getElementById("agents-tbody"),
   panesBody: document.getElementById("panes-tbody"),
+  timelineAxis: document.getElementById("timeline-axis"),
+  timelineBody: document.getElementById("timeline-body"),
+  timelineRangeChips: document.getElementById("timeline-range-chips"),
+  timelineSession: document.getElementById("timeline-session"),
   agentStateChips: document.getElementById("agent-state-chips"),
   agentKindChips: document.getElementById("agent-kind-chips"),
   paneSocketChips: document.getElementById("pane-socket-chips"),
@@ -161,10 +167,14 @@ const store = {
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
   paneErrors: [], // ScanError[]
+  timeline: null, // TimelineDocument
+  timelineSessions: new Set(),
   filters: {
     agentStates: new Set(AGENT_STATES),
     agentKinds: new Set(AGENT_KINDS),
     paneSockets: new Set(), // populated dynamically
+    timelineRange: "24h",
+    timelineSession: "",
   },
 };
 
@@ -224,6 +234,205 @@ function renderCounts() {
   let s = `${a} agent${a === 1 ? "" : "s"} · ${p} pane${p === 1 ? "" : "s"}`;
   if (e > 0) s += ` · ${e} scan error${e === 1 ? "" : "s"}`;
   dom.counts.textContent = s;
+}
+
+function renderTimeline() {
+  const doc = store.timeline;
+  if (!doc) {
+    dom.timelineBody.innerHTML = `<div class="timeline-empty">loading…</div>`;
+    dom.timelineAxis.innerHTML = "";
+    return;
+  }
+  renderTimelineSessionOptions(doc);
+  const start = Date.parse(doc.window_started_at);
+  const end = Date.parse(doc.window_ended_at);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    dom.timelineBody.innerHTML = `<div class="timeline-empty">timeline window is invalid</div>`;
+    dom.timelineAxis.innerHTML = "";
+    return;
+  }
+  renderTimelineAxis(start, end);
+
+  const lanes = doc.lanes || [];
+  if (lanes.length === 0) {
+    const note = (doc.notes || [])[0] || "no timeline intervals in this view";
+    dom.timelineBody.innerHTML = `<div class="timeline-empty">${esc(note)}</div>`;
+    return;
+  }
+
+  dom.timelineBody.innerHTML = groupTimelineLanesBySession(lanes)
+    .map((group) => {
+      const groupHeader = `<div class="timeline-group-header">
+        <div class="timeline-group-label">
+          <span>${esc(group.label)}</span>
+          <small>${esc(group.lanes.length)} lane${group.lanes.length === 1 ? "" : "s"} · ${esc(laneTotalsLabel(group.totals))}</small>
+        </div>
+        <div class="timeline-group-rule"></div>
+      </div>`;
+      const laneRows = group.lanes
+        .map((lane) => renderTimelineLane(lane, start, end, true))
+        .join("");
+      return `<div class="timeline-group">${groupHeader}${laneRows}</div>`;
+    })
+    .join("");
+}
+
+function renderTimelineLane(lane, start, end, grouped) {
+  const segments = (lane.intervals || [])
+    .map((interval) => renderTimelineSegment(interval, start, end))
+    .join("");
+  const totals = laneTotalsLabel(lane.totals || {});
+  const label = grouped ? shortTimelineLaneLabel(lane) : lane.label;
+  return `<div class="timeline-lane${grouped ? " grouped" : ""}">
+    <div class="timeline-label" title="${esc(lane.label)}">
+      <span>${esc(label)}</span>
+      <small>${esc(totals)}</small>
+    </div>
+    <div class="timeline-track">${segments}</div>
+  </div>`;
+}
+
+function groupTimelineLanesBySession(lanes) {
+  const groups = new Map();
+  for (const lane of lanes) {
+    const label = lane.session_name || lane.session_id || "no session";
+    const key = label === "no session" ? "zzzz:no-session" : `session:${label.toLowerCase()}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        label,
+        lanes: [],
+        totals: emptyTimelineTotals(),
+      });
+    }
+    const group = groups.get(key);
+    group.lanes.push(lane);
+    addTimelineTotals(group.totals, lane.totals || {});
+  }
+  return [...groups.values()]
+    .sort((a, b) => a.key.localeCompare(b.key))
+    .map((group) => {
+      group.lanes.sort(compareTimelineLanesInGroup);
+      return group;
+    });
+}
+
+function shortTimelineLaneLabel(lane) {
+  if (lane.kind === "agent") return `  ${lane.agent_kind || "agent"}`;
+  if (lane.kind === "human") return "  human";
+  if (lane.kind === "tmux") return "  tmux";
+  return `  ${lane.label || "lane"}`;
+}
+
+function compareTimelineLanesInGroup(a, b) {
+  const rank = timelineLaneRank(a.kind) - timelineLaneRank(b.kind);
+  if (rank !== 0) return rank;
+  return (shortTimelineLaneLabel(a) || "").localeCompare(shortTimelineLaneLabel(b) || "");
+}
+
+function timelineLaneRank(kind) {
+  if (kind === "agent") return 0;
+  if (kind === "human") return 1;
+  if (kind === "tmux") return 2;
+  return 3;
+}
+
+function emptyTimelineTotals() {
+  return {
+    working_secs: 0,
+    waiting_secs: 0,
+    error_secs: 0,
+    idle_secs: 0,
+    starting_secs: 0,
+    stopped_secs: 0,
+    human_secs: 0,
+    foreground_secs: 0,
+  };
+}
+
+function addTimelineTotals(total, next) {
+  for (const key of Object.keys(total)) {
+    total[key] += next[key] || 0;
+  }
+}
+
+function renderTimelineAxis(start, end) {
+  const ticks = 5;
+  const html = Array.from({ length: ticks + 1 }, (_, i) => {
+    const pct = (i / ticks) * 100;
+    const at = new Date(start + (end - start) * (i / ticks));
+    return `<span style="left:${pct}%">${esc(timeLabel(at))}</span>`;
+  }).join("");
+  dom.timelineAxis.innerHTML = `<div class="timeline-axis-spacer"></div><div class="timeline-axis-track">${html}</div>`;
+}
+
+function renderTimelineSegment(interval, start, end) {
+  const s = Math.max(start, Date.parse(interval.started_at));
+  const e = Math.min(end, Date.parse(interval.ended_at));
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return "";
+  const left = ((s - start) / (end - start)) * 100;
+  const width = Math.max(0.5, ((e - s) / (end - start)) * 100);
+  const cls = timelineSegmentClass(interval);
+  const title = [
+    interval.detail || timelineSegmentLabel(interval),
+    `${dateTimeLabel(new Date(s))} → ${dateTimeLabel(new Date(e))}`,
+    formatDuration(interval.duration_secs || 0),
+    interval.open ? "open" : "",
+    interval.session_name ? `session ${interval.session_name}` : "",
+    interval.pane ? `pane ${interval.pane}` : "",
+  ].filter(Boolean).join(" · ");
+  return `<span class="timeline-segment ${esc(cls)}${interval.open ? " open" : ""}"
+    style="left:${left}%;width:${width}%"
+    title="${esc(title)}"></span>`;
+}
+
+function timelineSegmentClass(interval) {
+  if (interval.source === "human_interaction") return "source-human";
+  if (interval.source === "session_foreground") return "source-tmux";
+  switch (interval.state) {
+    case "working": return "state-working";
+    case "waiting_input":
+    case "waiting_choice": return "state-waiting";
+    case "error": return "state-error";
+    case "starting": return "state-starting";
+    case "idle":
+    case "stopped": return "state-idle";
+    default: return "state-idle";
+  }
+}
+
+function timelineSegmentLabel(interval) {
+  if (interval.source === "human_interaction") return "human";
+  if (interval.source === "session_foreground") return "tmux foreground";
+  return interval.state || "agent";
+}
+
+function laneTotalsLabel(totals) {
+  const parts = [
+    ["work", totals.working_secs],
+    ["wait", totals.waiting_secs],
+    ["err", totals.error_secs],
+    ["human", totals.human_secs],
+    ["tmux", totals.foreground_secs],
+  ].filter(([, secs]) => secs > 0);
+  if (parts.length === 0) return "—";
+  return parts.slice(0, 2).map(([label, secs]) => `${label} ${formatDuration(secs)}`).join(" · ");
+}
+
+function renderTimelineSessionOptions(doc) {
+  for (const p of store.panes || []) {
+    if (p.session) store.timelineSessions.add(p.session);
+  }
+  for (const lane of doc.lanes || []) {
+    if (lane.session_name) store.timelineSessions.add(lane.session_name);
+    if (lane.session_id) store.timelineSessions.add(lane.session_id);
+  }
+  const current = store.filters.timelineSession;
+  const options = [`<option value="">all sessions</option>`]
+    .concat([...store.timelineSessions.values()].sort().map((s) =>
+      `<option value="${esc(s)}"${s === current ? " selected" : ""}>${esc(s)}</option>`
+    ));
+  dom.timelineSession.innerHTML = options.join("");
 }
 
 function renderAgents() {
@@ -406,6 +615,22 @@ function renderSocketChips(sockets) {
 }
 
 function renderStaticChips() {
+  dom.timelineRangeChips.innerHTML = TIMELINE_RANGES.map(
+    (range) => `<button class="chip${range === store.filters.timelineRange ? " active" : ""}" data-range="${range}">${range}</button>`
+  ).join("");
+  dom.timelineRangeChips.querySelectorAll(".chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      store.filters.timelineRange = chip.getAttribute("data-range");
+      dom.timelineRangeChips.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
+      chip.classList.add("active");
+      fetchTimeline().catch(() => {});
+    });
+  });
+  dom.timelineSession.addEventListener("change", () => {
+    store.filters.timelineSession = dom.timelineSession.value;
+    fetchTimeline().catch(() => {});
+  });
+
   dom.agentStateChips.innerHTML = AGENT_STATES.map(
     (s) => `<button class="chip state-${s} active" data-state="${s}">${s}</button>`
   ).join("");
@@ -460,6 +685,32 @@ function relTime(iso) {
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
+function timeLabel(date) {
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function dateTimeLabel(date) {
+  return date.toLocaleString([], {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatDuration(totalSecs) {
+  const secs = Math.max(0, Math.floor(totalSecs || 0));
+  if (secs === 0) return "—";
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  if (hours < 24) return `${hours}h${String(remMins).padStart(2, "0")}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d${String(hours % 24).padStart(2, "0")}h`;
+}
+
 // ── Data loading ──────────────────────────────────────────────────
 
 async function fetchAgentsSnapshot() {
@@ -482,6 +733,15 @@ async function fetchPanes() {
   renderCounts();
 }
 
+async function fetchTimeline() {
+  const params = new URLSearchParams({ since: store.filters.timelineRange });
+  if (store.filters.timelineSession) {
+    params.set("session", store.filters.timelineSession);
+  }
+  store.timeline = await jsonFetch(`/api/timeline?${params.toString()}`);
+  renderTimeline();
+}
+
 async function fetchHealth() {
   const data = await jsonFetch("/api/health");
   dom.version.textContent = `v${data.version} · proto ${data.protocol}`;
@@ -494,6 +754,7 @@ function applySnapshot(payload) {
   for (const a of payload.agents || []) store.agents.set(a.session_id, a);
   renderAgents();
   renderCounts();
+  scheduleTimelineRefresh();
 }
 
 function applyTransition(t) {
@@ -506,6 +767,16 @@ function applyTransition(t) {
   }
   renderAgents();
   renderCounts();
+  scheduleTimelineRefresh();
+}
+
+let timelineRefreshTimer = null;
+function scheduleTimelineRefresh() {
+  if (timelineRefreshTimer) return;
+  timelineRefreshTimer = setTimeout(() => {
+    timelineRefreshTimer = null;
+    fetchTimeline().catch(() => {});
+  }, 500);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────
@@ -521,7 +792,7 @@ async function main() {
     return; // setConnectionStatus already showed the error
   }
 
-  await Promise.all([fetchAgentsSnapshot(), fetchPanes()]);
+  await Promise.all([fetchAgentsSnapshot(), fetchPanes(), fetchTimeline()]);
 
   // Periodically refetch panes — they are pull-only on the server.
   setInterval(() => {
@@ -529,6 +800,10 @@ async function main() {
       /* swallowed; SSE indicator will reflect downtime */
     });
   }, PANES_REFETCH_INTERVAL_MS);
+
+  setInterval(() => {
+    fetchTimeline().catch(() => {});
+  }, TIMELINE_REFETCH_INTERVAL_MS);
 
   // Subscribe to live events.
   streamEvents(

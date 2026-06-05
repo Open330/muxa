@@ -42,8 +42,9 @@ backend; zellij has a CLI baseline and a planned richer plugin path.
 | `muxa watch` | Full-screen TUI for agents and panes, with attach and prompt composition. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
+| `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
-| Dashboard | Optional loopback HTTP UI with SSE live updates. |
+| Dashboard | Optional loopback HTTP UI with SSE live updates and a timeline graph. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
 ## Quick Start
@@ -86,6 +87,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa stats --since today` | Summary table; group by day/project/agent/session. |
 | `muxa report --since week` | Markdown stats report. |
+| `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` or `--agent codex`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa init` | Interactive install/uninstall wizard. |
@@ -97,6 +99,8 @@ Common stats queries:
 muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
 muxa report --since week
+muxa timeline --since today --session main
+muxa timeline --since today --group-by kind
 muxa activity --since today --type human
 ```
 

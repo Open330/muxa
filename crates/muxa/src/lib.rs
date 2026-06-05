@@ -51,6 +51,7 @@ pub mod session_activity;
 pub mod sinks;
 pub mod snapshot;
 pub mod state;
+pub mod timeline;
 pub mod tmux;
 
 // ---------------------------------------------------------------------------
@@ -107,3 +108,8 @@ pub use session_activity::{
 };
 #[doc(hidden)]
 pub use snapshot::{Snapshotter, SnapshotterOptions};
+#[doc(hidden)]
+pub use timeline::{
+    TimelineBuildInput, TimelineDocument, TimelineFilters, TimelineInterval,
+    TimelineIntervalSource, TimelineLane, TimelineLaneKind, TimelineRange, TimelineTotals,
+};

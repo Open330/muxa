@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa timeline`** — new interactive TUI and JSON timeline built from the
+  activity ledger plus live agent/tmux spans. The default overview groups
+  lanes by session, supports `--session`, `--agent`, and `--group-by`, and
+  includes pan/zoom/focus navigation for work/wait/error/human/foreground
+  intervals. The dashboard now includes the same session-grouped timeline
+  panel.
 - **`muxa watch` latest sort** — `latest` is now the user-facing name for
   newest-activity-first sorting. Use `l` in the TUI or `--sort latest`;
   existing `a`, `activity`, and `act` aliases remain supported. Runtime sort

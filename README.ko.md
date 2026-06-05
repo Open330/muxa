@@ -41,8 +41,9 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | `muxa watch` | agent/pane 실시간 TUI. attach와 prompt composer 포함. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
+| `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
-| Dashboard | optional loopback HTTP UI + SSE live update. |
+| Dashboard | optional loopback HTTP UI + SSE live update + timeline graph. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
 ## 빠른 시작
@@ -85,6 +86,7 @@ muxa watch
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa stats --since today` | day/project/agent/session 단위 summary. |
 | `muxa report --since week` | Markdown stats report. |
+| `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
 | `muxa init` | install/uninstall wizard. |
@@ -96,6 +98,8 @@ muxa watch
 muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
 muxa report --since week
+muxa timeline --since today --session main
+muxa timeline --since today --group-by kind
 muxa activity --since today --type human
 ```
 

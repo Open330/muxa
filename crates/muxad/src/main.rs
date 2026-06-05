@@ -69,6 +69,7 @@ struct Args {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // daemon bootstrap wires long-lived tasks in startup order
 async fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -200,10 +201,36 @@ async fn main() -> Result<()> {
         let store_for_dash = store.clone();
         let shutdown_rx = shutdown_tx.subscribe();
         let dash_cfg_for_task = dash_cfg.clone();
+        let dashboard_activity_path = cfg
+            .activity
+            .enabled
+            .then(|| {
+                cfg.activity
+                    .path
+                    .clone()
+                    .or_else(paths::default_activity_file)
+            })
+            .flatten();
+        let dashboard_session_activity_path = cfg
+            .session_activity
+            .enabled
+            .then(|| {
+                cfg.session_activity
+                    .path
+                    .clone()
+                    .or_else(paths::default_session_activity_file)
+            })
+            .flatten();
         tokio::spawn(async move {
-            if let Err(e) =
-                muxa::dashboard::serve(dash_cfg_for_task, store_for_dash, pane_cache, shutdown_rx)
-                    .await
+            if let Err(e) = muxa::dashboard::serve(
+                dash_cfg_for_task,
+                store_for_dash,
+                pane_cache,
+                dashboard_activity_path,
+                dashboard_session_activity_path,
+                shutdown_rx,
+            )
+            .await
             {
                 tracing::error!(error = %e, "dashboard server exited");
             }

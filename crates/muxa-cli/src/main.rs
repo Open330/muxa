@@ -8,6 +8,7 @@ mod logs;
 mod stats;
 mod theme;
 mod time_range;
+mod timeline;
 mod upgrade;
 mod watch;
 
@@ -86,6 +87,8 @@ enum Cmd {
     Stats(stats::Args),
     /// Generate a Markdown activity report from the retained stats.
     Report(stats::ReportArgs),
+    /// Explore agent work/wait/error intervals as an interactive timeline.
+    Timeline(timeline::Args),
     /// Query raw activity ledger intervals.
     Activity(activity_query::Args),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
@@ -248,6 +251,7 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
+        Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
         Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => {
@@ -1167,12 +1171,13 @@ mod tests {
 
     #[test]
     fn table_theme_cli_aliases_parse() {
-        for command in ["status", "stats", "activity"] {
+        for command in ["status", "stats", "timeline", "activity"] {
             let args = Args::try_parse_from(["muxa", command, "--theme", "high-contrast"])
                 .unwrap_or_else(|err| panic!("{command} should accept --theme: {err}"));
             let theme = match args.cmd {
                 Cmd::Status { theme: Some(theme) } => theme,
                 Cmd::Stats(args) => args.theme().expect("expected stats theme arg"),
+                Cmd::Timeline(args) => args.theme().expect("expected timeline theme arg"),
                 Cmd::Activity(args) => args.theme().expect("expected activity theme arg"),
                 _ => panic!("expected {command} theme arg"),
             };

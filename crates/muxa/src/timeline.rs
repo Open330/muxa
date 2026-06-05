@@ -1,0 +1,923 @@
+//! Timeline projection over the activity ledger.
+//!
+//! The activity ledger is append-only and transition-shaped. This module
+//! turns those rows into clipped intervals that UIs can render as lanes.
+
+use crate::activity::{ActivityEntry, HumanInteractionKind};
+use crate::event::{AgentKind, AgentState};
+use crate::session_activity::SessionActivity;
+use crate::state::Agent;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use time::format_description::well_known::Rfc3339;
+use time::{Date, OffsetDateTime, UtcOffset};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimelineRange {
+    pub label: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub since_at: Option<OffsetDateTime>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub until_at: Option<OffsetDateTime>,
+}
+
+impl TimelineRange {
+    #[must_use]
+    pub fn includes_end(&self, at: OffsetDateTime) -> bool {
+        self.since_at.is_none_or(|since| at >= since)
+            && self.until_at.is_none_or(|until| at < until)
+    }
+
+    #[must_use]
+    pub fn effective_end(&self, now: OffsetDateTime) -> OffsetDateTime {
+        self.until_at.map_or(now, |until| until.min(now))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineDocument {
+    #[serde(with = "time::serde::rfc3339")]
+    pub generated_at: OffsetDateTime,
+    pub range: TimelineRange,
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_ended_at: OffsetDateTime,
+    pub lanes: Vec<TimelineLane>,
+    pub totals: TimelineTotals,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineLane {
+    pub id: String,
+    pub label: String,
+    pub kind: TimelineLaneKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub totals: TimelineTotals,
+    pub intervals: Vec<TimelineInterval>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineLaneKind {
+    Agent,
+    Human,
+    Tmux,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineInterval {
+    pub source: TimelineIntervalSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<AgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_kind: Option<HumanInteractionKind>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ended_at: OffsetDateTime,
+    pub duration_secs: u64,
+    pub open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineIntervalSource {
+    AgentState,
+    HumanInteraction,
+    SessionForeground,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TimelineTotals {
+    pub working_secs: u64,
+    pub waiting_secs: u64,
+    pub error_secs: u64,
+    pub idle_secs: u64,
+    pub starting_secs: u64,
+    pub stopped_secs: u64,
+    pub human_secs: u64,
+    pub foreground_secs: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TimelineFilters {
+    pub session: Option<String>,
+    pub agent_kind: Option<AgentKind>,
+}
+
+pub struct TimelineBuildInput<'a> {
+    pub now: OffsetDateTime,
+    pub range: TimelineRange,
+    pub activity_entries: &'a [ActivityEntry],
+    pub agents: &'a [Agent],
+    pub session_activities: &'a [SessionActivity],
+    pub pane_sessions: &'a HashMap<String, String>,
+    pub filters: TimelineFilters,
+    pub notes: Vec<String>,
+}
+
+#[must_use]
+#[allow(clippy::too_many_lines)] // central projection pass keeps ledger clipping and live spans together
+pub fn build_document(input: TimelineBuildInput<'_>) -> TimelineDocument {
+    let mut lanes: BTreeMap<String, LaneAccumulator> = BTreeMap::new();
+
+    for entry in input.activity_entries {
+        match entry {
+            ActivityEntry::StateTransition(entry) => {
+                let session_name = entry.session_name.clone().or_else(|| {
+                    entry
+                        .pane
+                        .as_ref()
+                        .and_then(|pane| input.pane_sessions.get(pane))
+                        .cloned()
+                });
+                if !matches_session_filter(
+                    &input.filters,
+                    Some(&entry.session_id),
+                    session_name.as_deref(),
+                    entry.pane.as_deref(),
+                ) || !matches_agent_filter(&input.filters, Some(entry.kind))
+                {
+                    continue;
+                }
+                let started_at = entry.state_entered_at.unwrap_or_else(|| {
+                    entry.at
+                        - time::Duration::seconds(
+                            i64::try_from(entry.duration_secs).unwrap_or(i64::MAX),
+                        )
+                });
+                let Some((started_at, ended_at)) =
+                    clip_interval(&input.range, input.now, started_at, entry.at)
+                else {
+                    continue;
+                };
+                let lane_id = agent_lane_id(entry.kind, &entry.session_id);
+                let label =
+                    agent_lane_label(entry.kind, session_name.as_deref(), &entry.session_id);
+                let interval = TimelineInterval {
+                    source: TimelineIntervalSource::AgentState,
+                    state: Some(entry.from),
+                    human_kind: None,
+                    duration_secs: duration_secs(started_at, ended_at),
+                    started_at,
+                    ended_at,
+                    open: false,
+                    pane: entry.pane.clone(),
+                    session_id: Some(entry.session_id.clone()),
+                    session_name: session_name.clone(),
+                    cwd: entry.cwd.clone(),
+                    detail: format!("{} {} -> {}", entry.kind, entry.from, entry.to),
+                };
+                lanes
+                    .entry(lane_id.clone())
+                    .or_insert_with(|| {
+                        LaneAccumulator::agent(
+                            lane_id,
+                            label,
+                            entry.kind,
+                            entry.session_id.clone(),
+                            session_name,
+                        )
+                    })
+                    .push(interval);
+            }
+            ActivityEntry::SessionForeground(entry) => {
+                if !matches_session_filter(
+                    &input.filters,
+                    Some(&entry.session_id),
+                    Some(&entry.session_name),
+                    None,
+                ) {
+                    continue;
+                }
+                let Some((started_at, ended_at)) =
+                    clip_interval(&input.range, input.now, entry.started_at, entry.ended_at)
+                else {
+                    continue;
+                };
+                let lane_id = tmux_lane_id(&entry.session_id, &entry.session_name);
+                let interval = TimelineInterval {
+                    source: TimelineIntervalSource::SessionForeground,
+                    state: None,
+                    human_kind: None,
+                    duration_secs: duration_secs(started_at, ended_at),
+                    started_at,
+                    ended_at,
+                    open: false,
+                    pane: None,
+                    session_id: Some(entry.session_id.clone()),
+                    session_name: Some(entry.session_name.clone()),
+                    cwd: None,
+                    detail: "tmux foreground".to_string(),
+                };
+                lanes
+                    .entry(lane_id.clone())
+                    .or_insert_with(|| {
+                        LaneAccumulator::tmux(
+                            lane_id,
+                            format!("tmux/{}", entry.session_name),
+                            entry.session_id.clone(),
+                            entry.session_name.clone(),
+                        )
+                    })
+                    .push(interval);
+            }
+            ActivityEntry::HumanInteraction(entry) => {
+                if !matches_session_filter(
+                    &input.filters,
+                    entry.session_id.as_deref(),
+                    entry.session_name.as_deref(),
+                    entry.pane.as_deref(),
+                ) {
+                    continue;
+                }
+                let Some((started_at, ended_at)) =
+                    clip_interval(&input.range, input.now, entry.started_at, entry.ended_at)
+                else {
+                    continue;
+                };
+                let lane_id = human_lane_id(
+                    entry.session_id.as_deref(),
+                    entry.session_name.as_deref(),
+                    entry.pane.as_deref(),
+                );
+                let label = human_lane_label(
+                    entry.session_id.as_deref(),
+                    entry.session_name.as_deref(),
+                    entry.pane.as_deref(),
+                );
+                let interval = TimelineInterval {
+                    source: TimelineIntervalSource::HumanInteraction,
+                    state: None,
+                    human_kind: Some(entry.kind),
+                    duration_secs: duration_secs(started_at, ended_at),
+                    started_at,
+                    ended_at,
+                    open: false,
+                    pane: entry.pane.clone(),
+                    session_id: entry.session_id.clone(),
+                    session_name: entry.session_name.clone(),
+                    cwd: None,
+                    detail: format!("human {}", human_kind_label(entry.kind)),
+                };
+                lanes
+                    .entry(lane_id.clone())
+                    .or_insert_with(|| {
+                        LaneAccumulator::human(
+                            lane_id,
+                            label,
+                            entry.session_id.clone(),
+                            entry.session_name.clone(),
+                        )
+                    })
+                    .push(interval);
+            }
+        }
+    }
+
+    for agent in input.agents {
+        if agent.state == AgentState::Stopped {
+            continue;
+        }
+        let session_name = agent
+            .pane
+            .as_ref()
+            .and_then(|pane| input.pane_sessions.get(pane))
+            .cloned();
+        if !matches_session_filter(
+            &input.filters,
+            Some(&agent.session_id),
+            session_name.as_deref(),
+            agent.pane.as_deref(),
+        ) || !matches_agent_filter(&input.filters, Some(agent.kind))
+        {
+            continue;
+        }
+        let Some((started_at, ended_at)) =
+            clip_interval(&input.range, input.now, agent.state_entered_at, input.now)
+        else {
+            continue;
+        };
+        let lane_id = agent_lane_id(agent.kind, &agent.session_id);
+        let label = agent_lane_label(agent.kind, session_name.as_deref(), &agent.session_id);
+        let interval = TimelineInterval {
+            source: TimelineIntervalSource::AgentState,
+            state: Some(agent.state),
+            human_kind: None,
+            duration_secs: duration_secs(started_at, ended_at),
+            started_at,
+            ended_at,
+            open: true,
+            pane: agent.pane.clone(),
+            session_id: Some(agent.session_id.clone()),
+            session_name: session_name.clone(),
+            cwd: agent.cwd.clone(),
+            detail: format!("{} {} (open)", agent.kind, agent.state),
+        };
+        lanes
+            .entry(lane_id.clone())
+            .or_insert_with(|| {
+                LaneAccumulator::agent(
+                    lane_id,
+                    label,
+                    agent.kind,
+                    agent.session_id.clone(),
+                    session_name,
+                )
+            })
+            .push(interval);
+    }
+
+    for activity in input.session_activities {
+        let Some(attached_since) = activity.attached_since else {
+            continue;
+        };
+        if !matches_session_filter(
+            &input.filters,
+            Some(&activity.session_id),
+            Some(&activity.name),
+            None,
+        ) {
+            continue;
+        }
+        let Some((started_at, ended_at)) =
+            clip_interval(&input.range, input.now, attached_since, input.now)
+        else {
+            continue;
+        };
+        let lane_id = tmux_lane_id(&activity.session_id, &activity.name);
+        let interval = TimelineInterval {
+            source: TimelineIntervalSource::SessionForeground,
+            state: None,
+            human_kind: None,
+            duration_secs: duration_secs(started_at, ended_at),
+            started_at,
+            ended_at,
+            open: true,
+            pane: None,
+            session_id: Some(activity.session_id.clone()),
+            session_name: Some(activity.name.clone()),
+            cwd: None,
+            detail: "tmux foreground (open)".to_string(),
+        };
+        lanes
+            .entry(lane_id.clone())
+            .or_insert_with(|| {
+                LaneAccumulator::tmux(
+                    lane_id,
+                    format!("tmux/{}", activity.name),
+                    activity.session_id.clone(),
+                    activity.name.clone(),
+                )
+            })
+            .push(interval);
+    }
+
+    let mut lanes = lanes
+        .into_values()
+        .map(LaneAccumulator::finish)
+        .collect::<Vec<_>>();
+    lanes.sort_by(|a, b| {
+        lane_rank(a.kind)
+            .cmp(&lane_rank(b.kind))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+
+    let mut window_started_at = input.range.since_at.unwrap_or_else(|| {
+        lanes
+            .iter()
+            .flat_map(|lane| lane.intervals.iter().map(|interval| interval.started_at))
+            .min()
+            .unwrap_or(input.now - time::Duration::hours(1))
+    });
+    let window_ended_at = input.range.effective_end(input.now);
+    if window_ended_at <= window_started_at {
+        window_started_at = window_ended_at - time::Duration::seconds(1);
+    }
+    if input.range.since_at.is_none() {
+        window_started_at = lanes
+            .iter()
+            .flat_map(|lane| lane.intervals.iter().map(|interval| interval.started_at))
+            .min()
+            .unwrap_or(window_started_at);
+    }
+
+    let totals = lanes
+        .iter()
+        .fold(TimelineTotals::default(), |mut acc, lane| {
+            acc.add_totals(&lane.totals);
+            acc
+        });
+    let mut notes = input.notes;
+    if lanes.is_empty() {
+        notes.push("no timeline intervals in this view".to_string());
+    }
+
+    TimelineDocument {
+        generated_at: input.now,
+        range: input.range,
+        window_started_at,
+        window_ended_at,
+        lanes,
+        totals,
+        notes,
+    }
+}
+
+pub fn parse_since(
+    raw: &str,
+    now: OffsetDateTime,
+    all_label: &str,
+) -> Result<TimelineRange, String> {
+    let trimmed = raw.trim();
+    let normalized = trimmed.to_ascii_lowercase().replace(['-', ' '], "_");
+    if normalized == "all" {
+        return Ok(TimelineRange {
+            label: all_label.to_string(),
+            since_at: None,
+            until_at: None,
+        });
+    }
+
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    match normalized.as_str() {
+        "today" | "tod" => {
+            let start = local_day_start(now.to_offset(offset).date(), offset);
+            return Ok(TimelineRange {
+                label: "today".to_string(),
+                since_at: Some(start),
+                until_at: None,
+            });
+        }
+        "yesterday" | "yday" => {
+            let today = now.to_offset(offset).date();
+            let yesterday = today
+                .previous_day()
+                .ok_or_else(|| "could not compute yesterday date".to_string())?;
+            return Ok(TimelineRange {
+                label: "yesterday".to_string(),
+                since_at: Some(local_day_start(yesterday, offset)),
+                until_at: Some(local_day_start(today, offset)),
+            });
+        }
+        "week" | "last7d" | "last_7d" | "7days" => {
+            return Ok(TimelineRange {
+                label: "last 7d".to_string(),
+                since_at: Some(now - time::Duration::days(7)),
+                until_at: None,
+            });
+        }
+        _ => {}
+    }
+
+    if let Ok(at) = OffsetDateTime::parse(trimmed, &Rfc3339) {
+        return Ok(TimelineRange {
+            label: format!("since {trimmed}"),
+            since_at: Some(at),
+            until_at: None,
+        });
+    }
+    if trimmed.is_empty() {
+        return Err("--since must be today, yesterday, week, a duration like 7d, an RFC3339 timestamp, or all".to_string());
+    }
+
+    let unit = trimmed.chars().last().ok_or_else(|| {
+        "--since must be today, yesterday, week, a duration like 7d, an RFC3339 timestamp, or all"
+            .to_string()
+    })?;
+    let number = &trimmed[..trimmed.len() - unit.len_utf8()];
+    let amount: i64 = number
+        .parse()
+        .map_err(|_| format!("invalid --since duration {trimmed:?}"))?;
+    if amount <= 0 {
+        return Err("--since duration must be greater than zero".to_string());
+    }
+    let duration = match unit {
+        's' => time::Duration::seconds(amount),
+        'm' => time::Duration::minutes(amount),
+        'h' => time::Duration::hours(amount),
+        'd' => time::Duration::days(amount),
+        'w' => time::Duration::weeks(amount),
+        _ => return Err("--since duration unit must be one of s, m, h, d, w".to_string()),
+    };
+
+    Ok(TimelineRange {
+        label: format!("last {trimmed}"),
+        since_at: Some(now - duration),
+        until_at: None,
+    })
+}
+
+#[derive(Debug)]
+struct LaneAccumulator {
+    id: String,
+    label: String,
+    kind: TimelineLaneKind,
+    agent_kind: Option<AgentKind>,
+    session_id: Option<String>,
+    session_name: Option<String>,
+    intervals: Vec<TimelineInterval>,
+}
+
+impl LaneAccumulator {
+    fn agent(
+        id: String,
+        label: String,
+        agent_kind: AgentKind,
+        session_id: String,
+        session_name: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            kind: TimelineLaneKind::Agent,
+            agent_kind: Some(agent_kind),
+            session_id: Some(session_id),
+            session_name,
+            intervals: Vec::new(),
+        }
+    }
+
+    fn human(
+        id: String,
+        label: String,
+        session_id: Option<String>,
+        session_name: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            kind: TimelineLaneKind::Human,
+            agent_kind: None,
+            session_id,
+            session_name,
+            intervals: Vec::new(),
+        }
+    }
+
+    fn tmux(id: String, label: String, session_id: String, session_name: String) -> Self {
+        Self {
+            id,
+            label,
+            kind: TimelineLaneKind::Tmux,
+            agent_kind: None,
+            session_id: Some(session_id),
+            session_name: Some(session_name),
+            intervals: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, interval: TimelineInterval) {
+        self.intervals.push(interval);
+    }
+
+    fn finish(mut self) -> TimelineLane {
+        self.intervals
+            .sort_by_key(|interval| (interval.started_at, interval.ended_at));
+        let mut merged: Vec<TimelineInterval> = Vec::with_capacity(self.intervals.len());
+        for interval in self.intervals {
+            if let Some(prev) = merged.last_mut() {
+                if mergeable(prev, &interval) {
+                    prev.ended_at = prev.ended_at.max(interval.ended_at);
+                    prev.duration_secs = duration_secs(prev.started_at, prev.ended_at);
+                    prev.open |= interval.open;
+                    continue;
+                }
+            }
+            merged.push(interval);
+        }
+        let totals = totals_for_intervals(&merged);
+        TimelineLane {
+            id: self.id,
+            label: self.label,
+            kind: self.kind,
+            agent_kind: self.agent_kind,
+            session_id: self.session_id,
+            session_name: self.session_name,
+            totals,
+            intervals: merged,
+        }
+    }
+}
+
+impl TimelineTotals {
+    fn add_interval(&mut self, interval: &TimelineInterval) {
+        match interval.source {
+            TimelineIntervalSource::AgentState => match interval.state {
+                Some(AgentState::Working) => {
+                    self.working_secs = self.working_secs.saturating_add(interval.duration_secs);
+                }
+                Some(AgentState::WaitingInput | AgentState::WaitingChoice) => {
+                    self.waiting_secs = self.waiting_secs.saturating_add(interval.duration_secs);
+                }
+                Some(AgentState::Error) => {
+                    self.error_secs = self.error_secs.saturating_add(interval.duration_secs);
+                }
+                Some(AgentState::Idle) => {
+                    self.idle_secs = self.idle_secs.saturating_add(interval.duration_secs);
+                }
+                Some(AgentState::Starting) => {
+                    self.starting_secs = self.starting_secs.saturating_add(interval.duration_secs);
+                }
+                Some(AgentState::Stopped) => {
+                    self.stopped_secs = self.stopped_secs.saturating_add(interval.duration_secs);
+                }
+                None => {}
+            },
+            TimelineIntervalSource::HumanInteraction => {
+                self.human_secs = self.human_secs.saturating_add(interval.duration_secs);
+            }
+            TimelineIntervalSource::SessionForeground => {
+                self.foreground_secs = self.foreground_secs.saturating_add(interval.duration_secs);
+            }
+        }
+    }
+
+    fn add_totals(&mut self, other: &Self) {
+        self.working_secs = self.working_secs.saturating_add(other.working_secs);
+        self.waiting_secs = self.waiting_secs.saturating_add(other.waiting_secs);
+        self.error_secs = self.error_secs.saturating_add(other.error_secs);
+        self.idle_secs = self.idle_secs.saturating_add(other.idle_secs);
+        self.starting_secs = self.starting_secs.saturating_add(other.starting_secs);
+        self.stopped_secs = self.stopped_secs.saturating_add(other.stopped_secs);
+        self.human_secs = self.human_secs.saturating_add(other.human_secs);
+        self.foreground_secs = self.foreground_secs.saturating_add(other.foreground_secs);
+    }
+}
+
+fn totals_for_intervals(intervals: &[TimelineInterval]) -> TimelineTotals {
+    let mut totals = TimelineTotals::default();
+    for interval in intervals {
+        totals.add_interval(interval);
+    }
+    totals
+}
+
+fn mergeable(prev: &TimelineInterval, next: &TimelineInterval) -> bool {
+    prev.source == next.source
+        && prev.state == next.state
+        && prev.human_kind == next.human_kind
+        && prev.open == next.open
+        && prev.pane == next.pane
+        && prev.session_id == next.session_id
+        && prev.session_name == next.session_name
+        && prev.cwd == next.cwd
+        && prev.ended_at >= next.started_at
+}
+
+fn clip_interval(
+    range: &TimelineRange,
+    now: OffsetDateTime,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let start = range
+        .since_at
+        .map_or(started_at, |since| started_at.max(since));
+    let end = ended_at.min(range.effective_end(now));
+    (end > start).then_some((start, end))
+}
+
+fn duration_secs(started_at: OffsetDateTime, ended_at: OffsetDateTime) -> u64 {
+    u64::try_from((ended_at - started_at).whole_seconds().max(0)).unwrap_or(u64::MAX)
+}
+
+fn matches_session_filter(
+    filters: &TimelineFilters,
+    session_id: Option<&str>,
+    session_name: Option<&str>,
+    pane: Option<&str>,
+) -> bool {
+    let Some(filter) = filters.session.as_deref().filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    session_id == Some(filter) || session_name == Some(filter) || pane == Some(filter)
+}
+
+fn matches_agent_filter(filters: &TimelineFilters, kind: Option<AgentKind>) -> bool {
+    filters.agent_kind.is_none_or(|wanted| kind == Some(wanted))
+}
+
+fn agent_lane_id(kind: AgentKind, session_id: &str) -> String {
+    format!("agent:{kind}:{session_id}")
+}
+
+fn agent_lane_label(kind: AgentKind, session_name: Option<&str>, session_id: &str) -> String {
+    let suffix = session_name.unwrap_or(session_id);
+    format!("{kind}/{suffix}")
+}
+
+fn tmux_lane_id(session_id: &str, session_name: &str) -> String {
+    if session_id.is_empty() {
+        format!("tmux:{session_name}")
+    } else {
+        format!("tmux:{session_id}")
+    }
+}
+
+fn human_lane_id(
+    session_id: Option<&str>,
+    session_name: Option<&str>,
+    pane: Option<&str>,
+) -> String {
+    if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
+        format!("human:{session_id}")
+    } else if let Some(session_name) = session_name.filter(|value| !value.is_empty()) {
+        format!("human:{session_name}")
+    } else if let Some(pane) = pane.filter(|value| !value.is_empty()) {
+        format!("human:{pane}")
+    } else {
+        "human".to_string()
+    }
+}
+
+fn human_lane_label(
+    session_id: Option<&str>,
+    session_name: Option<&str>,
+    pane: Option<&str>,
+) -> String {
+    if let Some(session_name) = session_name.filter(|value| !value.is_empty()) {
+        format!("human/{session_name}")
+    } else if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
+        format!("human/{session_id}")
+    } else if let Some(pane) = pane.filter(|value| !value.is_empty()) {
+        format!("human/{pane}")
+    } else {
+        "human".to_string()
+    }
+}
+
+fn lane_rank(kind: TimelineLaneKind) -> u8 {
+    match kind {
+        TimelineLaneKind::Agent => 0,
+        TimelineLaneKind::Human => 1,
+        TimelineLaneKind::Tmux => 2,
+    }
+}
+
+fn human_kind_label(kind: HumanInteractionKind) -> &'static str {
+    match kind {
+        HumanInteractionKind::MuxaWatch => "muxa_watch",
+        HumanInteractionKind::MuxaPromptInput => "muxa_prompt_input",
+        HumanInteractionKind::TmuxAttach => "tmux_attach",
+    }
+}
+
+fn local_day_start(date: Date, offset: UtcOffset) -> OffsetDateTime {
+    date.midnight().assume_offset(offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::{
+        HumanInteractionEntry, HumanInteractionInput, StateTransitionEntry, StateTransitionInput,
+    };
+    use crate::event::{AgentKind, AgentState};
+    use time::macros::datetime;
+
+    #[test]
+    fn state_transition_interval_uses_from_state() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let entry =
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "s1".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-06-05 11:00:00 UTC)),
+            }));
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:30:00 UTC)),
+            until_at: None,
+        };
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &[entry],
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.lanes.len(), 1);
+        assert_eq!(doc.lanes[0].intervals[0].state, Some(AgentState::Working));
+        assert_eq!(doc.lanes[0].totals.working_secs, 600);
+    }
+
+    #[test]
+    fn range_clips_interval_start() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let entry =
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "s1".into(),
+                pane: None,
+                session_name: None,
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-06-05 11:00:00 UTC)),
+            }));
+        let range = TimelineRange {
+            label: "recent".into(),
+            since_at: Some(datetime!(2026-06-05 11:05:00 UTC)),
+            until_at: None,
+        };
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &[entry],
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.lanes[0].intervals[0].duration_secs, 300);
+        assert_eq!(doc.totals.working_secs, 300);
+    }
+
+    #[test]
+    fn human_interactions_are_laned_by_session() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let entries = [
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaPromptInput,
+                pane: Some("%1".into()),
+                session_id: Some("s1".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-06-05 11:00:00 UTC),
+                ended_at: datetime!(2026-06-05 11:02:00 UTC),
+            })),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaPromptInput,
+                pane: Some("%2".into()),
+                session_id: Some("s2".into()),
+                session_name: Some("side".into()),
+                started_at: datetime!(2026-06-05 11:05:00 UTC),
+                ended_at: datetime!(2026-06-05 11:07:00 UTC),
+            })),
+        ];
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        let labels = doc
+            .lanes
+            .iter()
+            .map(|lane| lane.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["human/main", "human/side"]);
+        assert!(doc
+            .lanes
+            .iter()
+            .all(|lane| lane.kind == TimelineLaneKind::Human));
+        assert_eq!(doc.totals.human_secs, 240);
+    }
+}

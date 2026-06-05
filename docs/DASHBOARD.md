@@ -1,8 +1,9 @@
 # muxa dashboard
 
 A small read-only HTTP UI bolted onto the daemon. Same agents you see on the
-tmux status line, plus **every tmux pane on the box** (across all running
-servers), updated live over Server-Sent Events.
+tmux status line, a timeline graph of work/wait/error intervals, plus
+**every tmux pane on the box** (across all running servers), updated live
+over Server-Sent Events.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
 Production-ready means default-secure: there is no path that exposes data
@@ -17,6 +18,7 @@ beyond your local machine without you flipping two flags.
 | `GET /api/health`   | `{ ok, version, protocol }`                                                    |
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
 | `GET /api/panes`    | Global tmux pane list (every readable socket), with per-socket scan errors.   |
+| `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
 
 `/api/*` endpoints require a Bearer token if one is configured. The static
@@ -106,6 +108,19 @@ ones. Every per-socket invocation has a 1 s timeout.
 
 Results are cached for `pane_cache_ttl_ms` (default 2 s, lazy pull) so a
 hammering refresh loop doesn't fork tmux 60 times a minute.
+
+## Timeline
+
+The timeline panel calls `/api/timeline?since=24h` by default and can switch
+to `today` or `7d` in the browser. The endpoint also accepts `session=<name>`
+and `agent=<kind>` (`codex`, `claude_code`, `gemini_cli`, `opencode`,
+`unknown`).
+The browser groups timeline lanes by session by default, with agent, human,
+and tmux foreground lanes shown under the same session header.
+
+Closed intervals come from `activity.ndjson`. Currently-open agent states
+come from the live `Store` snapshot, and currently-open tmux foreground spans
+come from `session-activity.json` when that tracker is enabled.
 
 ## Live updates
 

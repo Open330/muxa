@@ -13,7 +13,7 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{
@@ -24,10 +24,11 @@ use axum::{
     Router,
 };
 use futures::stream::{self, Stream, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -37,9 +38,10 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
 use crate::dashboard::{assets, auth, DashboardConfig};
-use crate::event::{AgentState, PROTOCOL_VERSION};
+use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::metrics::Metrics;
 use crate::state::{Agent, SharedStore, Transition};
+use crate::timeline::{self, TimelineBuildInput, TimelineFilters};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
@@ -83,6 +85,12 @@ pub struct AppState {
     /// from the [`Store`](crate::state::Store)'s metrics so SSE
     /// connect/disconnect bumps live alongside event-apply bumps.
     pub metrics: Metrics,
+    /// Activity ledger path used by `/api/timeline`. `None` means the
+    /// endpoint still returns a well-formed empty timeline with a note.
+    pub activity_path: Option<PathBuf>,
+    /// Session activity file used only for currently-open tmux foreground
+    /// intervals. Closed foreground intervals come from `activity_path`.
+    pub session_activity_path: Option<PathBuf>,
     /// 1-second cache for the `agents_by_state` histogram. See the
     /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
     /// and the eventual plan to replace this with per-state atomics.
@@ -102,8 +110,21 @@ impl AppState {
             config,
             pane_cache,
             metrics,
+            activity_path: None,
+            session_activity_path: None,
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
         }
+    }
+
+    #[must_use]
+    pub fn with_activity_paths(
+        mut self,
+        activity_path: Option<PathBuf>,
+        session_activity_path: Option<PathBuf>,
+    ) -> Self {
+        self.activity_path = activity_path;
+        self.session_activity_path = session_activity_path;
+        self
     }
 }
 
@@ -117,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/timeline", get(timeline_handler))
         .route("/api/events", get(events_handler))
         .route("/api/metrics", get(metrics_handler))
         .layer(auth_layer)
@@ -133,9 +155,12 @@ pub async fn serve(
     config: Arc<DashboardConfig>,
     store: SharedStore,
     pane_cache: Arc<PaneCache>,
+    activity_path: Option<PathBuf>,
+    session_activity_path: Option<PathBuf>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
-    let state = AppState::new(store, config.clone(), pane_cache);
+    let state = AppState::new(store, config.clone(), pane_cache)
+        .with_activity_paths(activity_path, session_activity_path);
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
@@ -212,6 +237,95 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
         errors: result.errors,
         fetched_at: result.fetched_at,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct TimelineQuery {
+    /// Same grammar as the CLI: today, yesterday, week, 24h, 7d, RFC3339, all.
+    since: Option<String>,
+    /// tmux session name, tmux session id, or pane id.
+    session: Option<String>,
+    /// Agent kind in `snake_case`.
+    agent: Option<String>,
+}
+
+async fn timeline_handler(
+    State(state): State<AppState>,
+    Query(query): Query<TimelineQuery>,
+) -> Response {
+    let now = OffsetDateTime::now_utc();
+    let since = query.since.as_deref().unwrap_or("24h");
+    let range = match timeline::parse_since(since, now, "all retained activity") {
+        Ok(range) => range,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let agent_kind = match query.agent.as_deref().map(parse_agent_kind).transpose() {
+        Ok(kind) => kind,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut notes = Vec::new();
+    let activity_entries = if let Some(path) = state.activity_path.as_ref() {
+        match crate::activity::load(path).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                notes.push(format!("could not load activity ledger: {e}"));
+                Vec::new()
+            }
+        }
+    } else {
+        notes.push("activity ledger is not available to the dashboard".to_string());
+        Vec::new()
+    };
+    let session_activities = match state.session_activity_path.as_ref() {
+        Some(path) => crate::session_activity::load(path).await,
+        None => Vec::new(),
+    };
+    let agents = state.store.snapshot().await;
+    let pane_scan = state.pane_cache.get_or_refresh(scanner::scan).await;
+    let pane_sessions = pane_scan
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.session.clone()))
+        .collect::<HashMap<_, _>>();
+
+    Json(timeline::build_document(TimelineBuildInput {
+        now,
+        range,
+        activity_entries: &activity_entries,
+        agents: &agents,
+        session_activities: &session_activities,
+        pane_sessions: &pane_sessions,
+        filters: TimelineFilters {
+            session: query.session,
+            agent_kind,
+        },
+        notes,
+    }))
+    .into_response()
+}
+
+fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
+    match raw {
+        "claude_code" => Ok(AgentKind::ClaudeCode),
+        "codex" => Ok(AgentKind::Codex),
+        "gemini_cli" => Ok(AgentKind::GeminiCli),
+        "opencode" => Ok(AgentKind::Opencode),
+        "unknown" => Ok(AgentKind::Unknown),
+        _ => Err(format!("unknown agent kind {raw:?}")),
+    }
 }
 
 /// Wire shape for `/api/metrics`. Mirrors [`crate::metrics::MetricsSnapshot`]
@@ -576,6 +690,27 @@ mod tests {
         assert!(v["panes"].is_array());
         assert!(v["errors"].is_array());
         assert!(v["fetched_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn timeline_endpoint_returns_well_formed_json_shape() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=24h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v["generated_at"].is_string());
+        assert!(v["window_started_at"].is_string());
+        assert!(v["window_ended_at"].is_string());
+        assert!(v["lanes"].is_array());
+        assert!(v["notes"].is_array());
     }
 
     #[tokio::test]

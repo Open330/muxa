@@ -10,6 +10,7 @@ muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
 muxa report --since week
+muxa timeline --since today --session main
 muxa activity --since today --type human
 muxa activity --since today --type agent --format json
 ```
@@ -40,6 +41,25 @@ muxa stats --since today --group-by session --sort name
 
 표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
 `--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.
+
+## Timeline
+
+`muxa timeline`은 같은 duration 데이터를 interactive TUI로 표시합니다.
+overview는 기본적으로 session별로 묶고, 각 session 아래에 agent/human/tmux
+foreground lane을 보여줍니다. focus view는 선택한 lane을 timestamped interval
+목록처럼 따라갑니다.
+
+```bash
+muxa timeline --since today
+muxa timeline --since today --session main
+muxa timeline --since 24h --agent codex
+muxa timeline --since today --group-by kind
+muxa timeline --since today --format json
+```
+
+agent transition row는 진입한 상태(`to`)가 아니라 떠난 상태(`from`)를
+그립니다. 예를 들어 `working -> waiting_input` row는 `state_entered_at`부터
+transition timestamp까지의 `working` 구간입니다.
 
 ## Ledger 타입
 

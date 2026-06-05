@@ -10,6 +10,7 @@ muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
 muxa report --since week
+muxa timeline --since today --session main
 muxa activity --since today --type human
 muxa activity --since today --type agent --format json
 ```
@@ -41,6 +42,25 @@ muxa stats --since today --group-by session --sort name
 The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows
 above it.
+
+## Timeline
+
+`muxa timeline` renders the same duration source as an interactive TUI.
+The overview groups lanes by session by default, with agent, human, and tmux
+foreground lanes inside each session; focus view follows the selected lane as
+timestamped intervals.
+
+```bash
+muxa timeline --since today
+muxa timeline --since today --session main
+muxa timeline --since 24h --agent codex
+muxa timeline --since today --group-by kind
+muxa timeline --since today --format json
+```
+
+Agent transition rows render the state they left. For example, a ledger row
+`working -> waiting_input` contributes a `working` span from
+`state_entered_at` to the transition timestamp.
 
 ## Ledger Types
 
