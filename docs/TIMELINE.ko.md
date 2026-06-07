@@ -12,6 +12,8 @@ muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind
 muxa timeline --since today --sort waiting
+muxa timeline --view heatmap --since 12w
+muxa timeline --day 2026-06-06
 muxa timeline --since today --format json
 ```
 
@@ -28,13 +30,23 @@ muxa timeline --since today --format json
 
 | Option | 값 |
 | --- | --- |
-| `--since` | `today`, `yesterday`, `week`, `24h`/`7d`/`4w` 같은 rolling duration, RFC3339 timestamp, `all`. |
+| `--since` | `today`, `yesterday`, `week`, `24h`/`7d`/`4w` 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`. |
+| `--day` | 특정 local calendar day shortcut. 예: `--day 2026-06-06`. |
 | `--session` | tmux session 이름, tmux session id, pane id. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
+| `--view` | 기본값 `timeline`, 또는 terminal contribution-map summary인 `heatmap`. |
 | `--group-by` | 기본값 `session`, 또는 `kind`, `flat`. TUI 전용. |
 | `--sort` | 기본값 `latest`, 또는 `name`, `duration`, `working`, `waiting`, `error`, `human`, `foreground`. `dur`, `work`, `wait`, `err`, `tmux` alias도 지원. |
 | `--format` | 기본값 `tui`, 또는 `json`. |
 | `--theme` | 다른 muxa TUI와 같은 일회성 theme override. |
+
+## Heatmap View
+
+`muxa timeline --view heatmap --since 12w`는 terminal에 compact daily
+activity map을 출력합니다. 각 cell은 local calendar day이고, intensity는 agent
+work, waiting, error, human interaction, tmux foreground 시간을 기준으로 합니다.
+grid 아래에는 가장 바쁜 날짜가 표시되고, 하루 view에서는 해당 날짜의 top session도
+같이 표시됩니다.
 
 ## TUI 키
 
@@ -71,6 +83,8 @@ timestamp까지의 `working` span입니다. 이렇게 해야 `muxa stats`의 dur
 ## Dashboard
 
 Dashboard timeline도 같은 `/api/timeline` 문서를 사용하며 기본적으로 session별로
-lane을 묶습니다. 브라우저에서 계속 켜둘 화면이 필요하면 dashboard를 쓰고, keyboard
-navigation, focus view, terminal-native JSON export가 필요하면 `muxa timeline`을
-쓰는 것이 좋습니다.
+lane을 묶습니다. lane graph 위에는 daily contribution-map style heatmap이
+표시되고, 날짜를 클릭하면 해당 calendar day로 drilldown됩니다. 브라우저에서 계속
+켜둘 화면이 필요하면 dashboard를 쓰고, keyboard navigation, focus view, terminal
+heatmap, terminal-native JSON export가 필요하면 `muxa timeline`을 쓰는 것이
+좋습니다.

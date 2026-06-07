@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
-use time::{OffsetDateTime, UtcOffset};
+use time::{Date, OffsetDateTime, UtcOffset, Weekday};
 
 use crate::theme::ThemeArg;
 use crate::use_colors;
@@ -40,6 +40,10 @@ pub struct Args {
     #[arg(long, default_value = "today")]
     since: String,
 
+    /// Focus one local calendar day, e.g. 2026-06-06.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    day: Option<String>,
+
     /// Focus a tmux session by name, session id, or pane id.
     #[arg(long)]
     session: Option<String>,
@@ -51,6 +55,10 @@ pub struct Args {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Tui)]
     format: OutputFormat,
+
+    /// Timeline presentation.
+    #[arg(long, value_enum, default_value_t = TimelineCliView::Timeline)]
+    view: TimelineCliView,
 
     /// Group lanes in the TUI overview.
     #[arg(long, value_enum, default_value_t = TimelineGroupBy::Session)]
@@ -76,6 +84,13 @@ impl Args {
 enum OutputFormat {
     Tui,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum TimelineCliView {
+    Timeline,
+    #[value(alias = "calendar", alias = "contrib", alias = "contribution")]
+    Heatmap,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -179,13 +194,20 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&doc)?);
             Ok(())
         }
-        OutputFormat::Tui => run_tui(client, cfg, args, doc).await,
+        OutputFormat::Tui => match args.view {
+            TimelineCliView::Timeline => run_tui(client, cfg, args, doc).await,
+            TimelineCliView::Heatmap => {
+                print_heatmap(&doc);
+                Ok(())
+            }
+        },
     }
 }
 
 async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<TimelineDocument> {
     let now = OffsetDateTime::now_utc();
-    let range = core_timeline::parse_since(&args.since, now, "all retained activity")
+    let since = args.day.as_deref().unwrap_or(&args.since);
+    let range = core_timeline::parse_since(since, now, "all retained activity")
         .map_err(anyhow::Error::msg)?;
     let mut notes = Vec::new();
 
@@ -1641,6 +1663,358 @@ fn format_duration(total_secs: u64) -> String {
     format!("{days}d{rem_hours:02}h")
 }
 
+#[derive(Debug, Clone)]
+struct TimelineDayBucket {
+    date: Date,
+    totals: TimelineTotals,
+    session_secs: BTreeMap<String, u64>,
+}
+
+impl TimelineDayBucket {
+    fn new(date: Date) -> Self {
+        Self {
+            date,
+            totals: TimelineTotals::default(),
+            session_secs: BTreeMap::new(),
+        }
+    }
+
+    fn active_secs(&self) -> u64 {
+        self.totals
+            .working_secs
+            .saturating_add(self.totals.waiting_secs)
+            .saturating_add(self.totals.error_secs)
+            .saturating_add(self.totals.human_secs)
+            .saturating_add(self.totals.foreground_secs)
+    }
+}
+
+fn print_heatmap(doc: &TimelineDocument) {
+    let buckets = timeline_day_buckets(doc);
+    let start = buckets.first().map_or_else(
+        || local_time(doc.window_started_at).date(),
+        |bucket| bucket.date,
+    );
+    let end = buckets.last().map_or_else(
+        || local_time(doc.window_ended_at).date(),
+        |bucket| bucket.date,
+    );
+    println!(
+        "muxa timeline heatmap · {} · {} → {}",
+        doc.range.label, start, end
+    );
+    println!(
+        "{} lanes · {}",
+        doc.lanes.len(),
+        timeline_totals_label(&doc.totals)
+    );
+    if buckets.is_empty() {
+        println!("no timeline intervals in this view");
+        return;
+    }
+    println!();
+    print_heatmap_grid(&buckets);
+    println!();
+    println!("legend  · none  ░ low  ▒ medium  ▓ high  █ peak");
+    println!();
+    print_top_days(&buckets);
+    if buckets.len() <= 2 {
+        println!();
+        print_day_sessions(&buckets[0]);
+    }
+}
+
+fn print_heatmap_grid(buckets: &[TimelineDayBucket]) {
+    let max_secs = buckets
+        .iter()
+        .map(TimelineDayBucket::active_secs)
+        .max()
+        .unwrap_or(0);
+    let leading = weekday_index(buckets[0].date.weekday());
+    let mut cells = Vec::with_capacity(leading + buckets.len() + 6);
+    cells.extend(std::iter::repeat_n(None, leading));
+    cells.extend(buckets.iter().map(Some));
+    while cells.len() % 7 != 0 {
+        cells.push(None);
+    }
+    let weeks = cells.chunks(7).collect::<Vec<_>>();
+    println!("{}", heatmap_month_header(&weeks));
+    for weekday in [
+        Weekday::Sunday,
+        Weekday::Monday,
+        Weekday::Tuesday,
+        Weekday::Wednesday,
+        Weekday::Thursday,
+        Weekday::Friday,
+        Weekday::Saturday,
+    ] {
+        let row = weekday_index(weekday);
+        let mut line = format!("{:>3} ", weekday_short_label(weekday));
+        for week in &weeks {
+            let cell = week[row].map_or(' ', |bucket| heatmap_char(bucket.active_secs(), max_secs));
+            line.push(cell);
+            line.push(' ');
+        }
+        println!("{line}");
+    }
+}
+
+fn heatmap_month_header(weeks: &[&[Option<&TimelineDayBucket>]]) -> String {
+    let mut line = "    ".to_string();
+    let mut last_month = None;
+    for week in weeks {
+        let month = week
+            .iter()
+            .flatten()
+            .map(|bucket| bucket.date.month())
+            .next();
+        if month.is_some() && month != last_month {
+            let label = month
+                .map(|month| format!("{month:?}"))
+                .unwrap_or_default()
+                .chars()
+                .take(3)
+                .collect::<String>();
+            line.push_str(&label);
+            last_month = month;
+        } else {
+            line.push_str("  ");
+        }
+    }
+    line
+}
+
+fn print_top_days(buckets: &[TimelineDayBucket]) {
+    let mut days = buckets
+        .iter()
+        .filter(|bucket| bucket.active_secs() > 0)
+        .collect::<Vec<_>>();
+    days.sort_by(|a, b| {
+        b.active_secs()
+            .cmp(&a.active_secs())
+            .then_with(|| b.date.cmp(&a.date))
+    });
+    if days.is_empty() {
+        println!("top days: no recorded activity");
+        return;
+    }
+    println!("top days");
+    for bucket in days.into_iter().take(8) {
+        println!("  {}  {}", bucket.date, day_totals_label(&bucket.totals));
+    }
+}
+
+fn print_day_sessions(bucket: &TimelineDayBucket) {
+    let mut sessions = bucket.session_secs.iter().collect::<Vec<_>>();
+    sessions.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    if sessions.is_empty() {
+        println!("sessions: no active sessions on {}", bucket.date);
+        return;
+    }
+    println!("sessions on {}", bucket.date);
+    for (session, secs) in sessions.into_iter().take(10) {
+        println!("  {session:<28} {}", format_duration(*secs));
+    }
+}
+
+fn timeline_day_buckets(doc: &TimelineDocument) -> Vec<TimelineDayBucket> {
+    if doc.window_ended_at <= doc.window_started_at {
+        return Vec::new();
+    }
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let start_date = doc.window_started_at.to_offset(offset).date();
+    let end_anchor = (doc.window_ended_at - time::Duration::seconds(1)).max(doc.window_started_at);
+    let end_date = end_anchor.to_offset(offset).date();
+    let mut buckets = Vec::new();
+    let mut date = start_date;
+    loop {
+        buckets.push(TimelineDayBucket::new(date));
+        if date >= end_date {
+            break;
+        }
+        let Some(next) = date.next_day() else {
+            break;
+        };
+        date = next;
+    }
+    let positions = buckets
+        .iter()
+        .enumerate()
+        .map(|(idx, bucket)| (bucket.date, idx))
+        .collect::<BTreeMap<_, _>>();
+    for lane in &doc.lanes {
+        for interval in &lane.intervals {
+            add_interval_to_day_buckets(
+                &mut buckets,
+                &positions,
+                lane,
+                interval,
+                offset,
+                doc.window_started_at,
+                doc.window_ended_at,
+            );
+        }
+    }
+    buckets
+}
+
+fn add_interval_to_day_buckets(
+    buckets: &mut [TimelineDayBucket],
+    positions: &BTreeMap<Date, usize>,
+    lane: &TimelineLane,
+    interval: &TimelineInterval,
+    offset: UtcOffset,
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
+) {
+    let mut cursor = interval.started_at.max(window_start);
+    let ended_at = interval.ended_at.min(window_end);
+    if ended_at <= cursor {
+        return;
+    }
+    while cursor < ended_at {
+        let date = cursor.to_offset(offset).date();
+        let next_day_start = date
+            .next_day()
+            .map_or(ended_at, |next| local_day_start(next, offset));
+        let segment_end = ended_at.min(next_day_start);
+        let secs = u64::try_from((segment_end - cursor).whole_seconds().max(0)).unwrap_or(u64::MAX);
+        if secs > 0 {
+            if let Some(idx) = positions.get(&date).copied() {
+                add_interval_secs(&mut buckets[idx].totals, interval, secs);
+                let active = active_interval_secs(interval, secs);
+                if active > 0 {
+                    let session = interval_session_label(lane, interval);
+                    *buckets[idx].session_secs.entry(session).or_default() += active;
+                }
+            }
+        }
+        cursor = segment_end;
+    }
+}
+
+fn add_interval_secs(totals: &mut TimelineTotals, interval: &TimelineInterval, secs: u64) {
+    match interval.source {
+        TimelineIntervalSource::AgentState => match interval.state {
+            Some(AgentState::Working) => totals.working_secs += secs,
+            Some(AgentState::WaitingInput | AgentState::WaitingChoice) => {
+                totals.waiting_secs += secs;
+            }
+            Some(AgentState::Error) => totals.error_secs += secs,
+            Some(AgentState::Idle) => totals.idle_secs += secs,
+            Some(AgentState::Starting) => totals.starting_secs += secs,
+            Some(AgentState::Stopped) => totals.stopped_secs += secs,
+            None => {}
+        },
+        TimelineIntervalSource::HumanInteraction => totals.human_secs += secs,
+        TimelineIntervalSource::SessionForeground => totals.foreground_secs += secs,
+    }
+}
+
+fn active_interval_secs(interval: &TimelineInterval, secs: u64) -> u64 {
+    match interval.source {
+        TimelineIntervalSource::AgentState => match interval.state {
+            Some(
+                AgentState::Working
+                | AgentState::WaitingInput
+                | AgentState::WaitingChoice
+                | AgentState::Error,
+            ) => secs,
+            _ => 0,
+        },
+        TimelineIntervalSource::HumanInteraction | TimelineIntervalSource::SessionForeground => {
+            secs
+        }
+    }
+}
+
+fn interval_session_label(lane: &TimelineLane, interval: &TimelineInterval) -> String {
+    interval
+        .session_name
+        .as_ref()
+        .or(lane.session_name.as_ref())
+        .or(interval.session_id.as_ref())
+        .or(lane.session_id.as_ref())
+        .cloned()
+        .unwrap_or_else(|| lane.label.clone())
+}
+
+fn day_totals_label(totals: &TimelineTotals) -> String {
+    let active = totals
+        .working_secs
+        .saturating_add(totals.waiting_secs)
+        .saturating_add(totals.error_secs)
+        .saturating_add(totals.human_secs)
+        .saturating_add(totals.foreground_secs);
+    if active == 0 {
+        return "-".to_string();
+    }
+    let parts = [
+        ("active", active),
+        ("work", totals.working_secs),
+        ("wait", totals.waiting_secs),
+        ("err", totals.error_secs),
+        ("human", totals.human_secs),
+        ("tmux", totals.foreground_secs),
+    ]
+    .into_iter()
+    .filter(|(_, secs)| *secs > 0)
+    .map(|(label, secs)| format!("{label} {}", format_duration(secs)))
+    .collect::<Vec<_>>();
+    parts.join(" · ")
+}
+
+fn heatmap_char(secs: u64, max_secs: u64) -> char {
+    match heatmap_level(secs, max_secs) {
+        0 => '·',
+        1 => '░',
+        2 => '▒',
+        3 => '▓',
+        _ => '█',
+    }
+}
+
+fn heatmap_level(secs: u64, max_secs: u64) -> u8 {
+    if secs == 0 {
+        return 0;
+    }
+    if max_secs == 0 {
+        return 1;
+    }
+    match secs.saturating_mul(4).div_ceil(max_secs) {
+        0 => 1,
+        level => u8::try_from(level.min(4)).unwrap_or(4),
+    }
+}
+
+fn local_day_start(date: Date, offset: UtcOffset) -> OffsetDateTime {
+    date.midnight().assume_offset(offset)
+}
+
+fn weekday_index(weekday: Weekday) -> usize {
+    match weekday {
+        Weekday::Sunday => 0,
+        Weekday::Monday => 1,
+        Weekday::Tuesday => 2,
+        Weekday::Wednesday => 3,
+        Weekday::Thursday => 4,
+        Weekday::Friday => 5,
+        Weekday::Saturday => 6,
+    }
+}
+
+fn weekday_short_label(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Sunday => "Sun",
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+    }
+}
+
 struct TerminalGuard<B: Backend + io::Write> {
     terminal: Option<Terminal<B>>,
 }
@@ -1682,7 +2056,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
+    use time::macros::{date, datetime};
 
     fn empty_doc(start: OffsetDateTime, end: OffsetDateTime) -> TimelineDocument {
         TimelineDocument {
@@ -1733,6 +2107,41 @@ mod tests {
             cwd: None,
             detail: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn timeline_day_buckets_split_intervals_across_local_days() {
+        let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        let start = local_day_start(date!(2026 - 06 - 05), offset);
+        let end = start + time::Duration::days(2);
+        let mut doc = empty_doc(start, end);
+        let mut lane = lane(
+            "codex/main",
+            TimelineLaneKind::Agent,
+            Some("main"),
+            TimelineTotals::default(),
+        );
+        lane.intervals.push(agent_interval(
+            start + time::Duration::hours(23),
+            start + time::Duration::hours(25),
+        ));
+        doc.lanes = vec![lane];
+
+        let buckets = timeline_day_buckets(&doc);
+
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].active_secs(), 3600);
+        assert_eq!(buckets[1].active_secs(), 3600);
+        assert_eq!(buckets[0].session_secs.get("main"), Some(&3600));
+        assert_eq!(buckets[1].session_secs.get("main"), Some(&3600));
+    }
+
+    #[test]
+    fn heatmap_level_handles_zero_and_relative_intensity() {
+        assert_eq!(heatmap_level(0, 100), 0);
+        assert_eq!(heatmap_level(1, 100), 1);
+        assert_eq!(heatmap_level(50, 100), 2);
+        assert_eq!(heatmap_level(100, 100), 4);
     }
 
     #[test]

@@ -54,6 +54,8 @@ muxa timeline --since today
 muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind --sort waiting
+muxa timeline --view heatmap --since 12w
+muxa timeline --day 2026-06-06
 muxa timeline --since today --format json
 ```
 

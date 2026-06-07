@@ -31,7 +31,7 @@ const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
-const TIMELINE_RANGES = ["24h", "today", "7d"];
+const TIMELINE_RANGES = ["24h", "today", "7d", "30d", "12w"];
 const SESSION_SORTS = new Set(["priority", "latest", "name", "human", "tmux"]);
 
 // ── Token bootstrap ────────────────────────────────────────────────
@@ -152,6 +152,7 @@ const dom = {
   agentsBody: document.getElementById("agents-tbody"),
   panesBody: document.getElementById("panes-tbody"),
   terminalsBody: document.getElementById("terminals-tbody"),
+  timelineHeatmap: document.getElementById("timeline-heatmap"),
   timelineAxis: document.getElementById("timeline-axis"),
   timelineBody: document.getElementById("timeline-body"),
   timelineRangeChips: document.getElementById("timeline-range-chips"),
@@ -237,12 +238,13 @@ const store = {
     activeTab: loadValue(DATA_TAB_KEY, "agents"),
     sessionSort: normalizeSessionSort(loadValue(SESSION_SORT_KEY, "priority")),
     selectedSegment: null,
+    selectedTimelineDay: "",
   },
   filters: {
     agentStates: new Set(AGENT_STATES),
     agentKinds: new Set(AGENT_KINDS),
     paneSockets: new Set(), // populated dynamically
-    timelineRange: "24h",
+    timelineRange: "7d",
     timelineSession: "",
   },
 };
@@ -520,6 +522,7 @@ function sessionScoreLabel(s, sort) {
 function renderTimeline() {
   const doc = store.timeline;
   if (!doc) {
+    dom.timelineHeatmap.innerHTML = `<div class="timeline-empty compact">loading…</div>`;
     dom.timelineBody.innerHTML = `<div class="timeline-empty">loading…</div>`;
     dom.timelineAxis.innerHTML = "";
     dom.timelineMeta.textContent = "loading";
@@ -532,6 +535,7 @@ function renderTimeline() {
   const start = Date.parse(doc.window_started_at);
   const end = Date.parse(doc.window_ended_at);
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    dom.timelineHeatmap.innerHTML = "";
     dom.timelineBody.innerHTML = `<div class="timeline-empty">timeline window is invalid</div>`;
     dom.timelineAxis.innerHTML = "";
     dom.timelineMeta.textContent = "invalid window";
@@ -543,6 +547,8 @@ function renderTimeline() {
   renderTimelineAxis(start, end);
 
   const lanes = (doc.lanes || []).filter(laneMatchesSelectedSession);
+  const dayBuckets = buildTimelineDayBuckets(lanes, start, end);
+  renderTimelineHeatmap(dayBuckets);
   const groups = groupTimelineLanesBySession(lanes);
   const scope = selectedSession() ? `${selectedSession()} · ` : "";
   dom.timelineMeta.textContent = `${scope}${groups.length} session${groups.length === 1 ? "" : "s"} · ${lanes.length} lane${lanes.length === 1 ? "" : "s"}`;
@@ -620,6 +626,207 @@ function groupTimelineLanesBySession(lanes) {
       group.totals.human_presence_secs = group.human_presence_secs;
       return group;
     });
+}
+
+function renderTimelineHeatmap(buckets) {
+  if (!dom.timelineHeatmap) return;
+  if (!buckets.length) {
+    dom.timelineHeatmap.innerHTML = `<div class="timeline-empty compact">no daily activity in this view</div>`;
+    return;
+  }
+  const maxSecs = Math.max(...buckets.map((bucket) => activeTimelineSecs(bucket.totals)));
+  const leading = new Date(buckets[0].dateMs).getDay();
+  const cells = Array.from({ length: leading }, () => null).concat(buckets);
+  while (cells.length % 7 !== 0) cells.push(null);
+  const selected =
+    buckets.find((bucket) => bucket.key === store.ui.selectedTimelineDay) ||
+    [...buckets].reverse().find((bucket) => activeTimelineSecs(bucket.totals) > 0) ||
+    buckets[buckets.length - 1];
+  const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    .map((label) => `<span>${label}</span>`)
+    .join("");
+  const dayCells = cells
+    .map((bucket) => {
+      if (!bucket) return `<span class="timeline-day spacer"></span>`;
+      const active = activeTimelineSecs(bucket.totals);
+      const level = heatmapLevel(active, maxSecs);
+      const selectedClass = bucket.key === selected.key ? " selected" : "";
+      const title = `${bucket.key} · ${dayTotalsLabel(bucket.totals)}`;
+      return `<button class="timeline-day level-${level}${selectedClass}" type="button" data-day="${esc(bucket.key)}" title="${esc(title)}" aria-label="${esc(title)}"></button>`;
+    })
+    .join("");
+  dom.timelineHeatmap.innerHTML = `
+    <div class="timeline-heatmap-head">
+      <strong>Daily activity</strong>
+      <span>${buckets.length} day${buckets.length === 1 ? "" : "s"} · peak ${esc(formatDuration(maxSecs))}</span>
+    </div>
+    <div class="timeline-heatmap-map">
+      <div class="timeline-heatmap-weekdays">${weekdayLabels}</div>
+      <div class="timeline-heatmap-grid">${dayCells}</div>
+    </div>
+    <div class="timeline-day-detail">
+      <strong>${esc(selected.key)}</strong>
+      <span>${esc(dayTotalsLabel(selected.totals))}</span>
+      <small>${esc(topDaySessionsLabel(selected))}</small>
+    </div>`;
+  bindTimelineDayClicks();
+}
+
+function bindTimelineDayClicks() {
+  dom.timelineHeatmap.querySelectorAll("[data-day]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const day = btn.getAttribute("data-day");
+      if (!day) return;
+      setTimelineRange(day, day);
+    });
+  });
+}
+
+function buildTimelineDayBuckets(lanes, windowStart, windowEnd) {
+  if (!Number.isFinite(windowStart) || !Number.isFinite(windowEnd) || windowEnd <= windowStart) {
+    return [];
+  }
+  const startDay = localDayStartMs(windowStart);
+  const endDay = localDayStartMs(Math.max(windowStart, windowEnd - 1));
+  const buckets = [];
+  const byKey = new Map();
+  for (let day = startDay; day <= endDay; day = addLocalDays(day, 1)) {
+    const key = localDateKey(day);
+    const bucket = {
+      key,
+      dateMs: day,
+      totals: emptyTimelineTotals(),
+      sessions: new Map(),
+    };
+    buckets.push(bucket);
+    byKey.set(key, bucket);
+  }
+
+  for (const lane of lanes || []) {
+    for (const interval of lane.intervals || []) {
+      addIntervalToDayBuckets(byKey, lane, interval, windowStart, windowEnd);
+    }
+  }
+  return buckets;
+}
+
+function addIntervalToDayBuckets(byKey, lane, interval, windowStart, windowEnd) {
+  let cursor = Math.max(windowStart, Date.parse(interval.started_at));
+  const endedAt = Math.min(windowEnd, Date.parse(interval.ended_at));
+  if (!Number.isFinite(cursor) || !Number.isFinite(endedAt) || endedAt <= cursor) return;
+  while (cursor < endedAt) {
+    const key = localDateKey(cursor);
+    const nextDay = addLocalDays(localDayStartMs(cursor), 1);
+    const segmentEnd = Math.min(endedAt, nextDay);
+    const secs = Math.max(0, Math.floor((segmentEnd - cursor) / 1000));
+    const bucket = byKey.get(key);
+    if (bucket && secs > 0) {
+      addIntervalSecs(bucket.totals, interval, secs);
+      const active = activeIntervalSecs(interval, secs);
+      if (active > 0) {
+        const session = interval.session_name || lane.session_name || interval.session_id || lane.session_id || lane.label || "unknown";
+        bucket.sessions.set(session, (bucket.sessions.get(session) || 0) + active);
+      }
+    }
+    if (segmentEnd <= cursor) break;
+    cursor = segmentEnd;
+  }
+}
+
+function addIntervalSecs(totals, interval, secs) {
+  if (interval.source === "human_interaction") {
+    totals.human_secs += secs;
+    return;
+  }
+  if (interval.source === "session_foreground") {
+    totals.foreground_secs += secs;
+    return;
+  }
+  switch (interval.state) {
+    case "working":
+      totals.working_secs += secs;
+      break;
+    case "waiting_input":
+    case "waiting_choice":
+      totals.waiting_secs += secs;
+      break;
+    case "error":
+      totals.error_secs += secs;
+      break;
+    case "starting":
+      totals.starting_secs += secs;
+      break;
+    case "stopped":
+      totals.stopped_secs += secs;
+      break;
+    default:
+      totals.idle_secs += secs;
+      break;
+  }
+}
+
+function activeIntervalSecs(interval, secs) {
+  if (interval.source === "human_interaction" || interval.source === "session_foreground") return secs;
+  return ["working", "waiting_input", "waiting_choice", "error"].includes(interval.state) ? secs : 0;
+}
+
+function activeTimelineSecs(totals) {
+  return (totals.working_secs || 0) +
+    (totals.waiting_secs || 0) +
+    (totals.error_secs || 0) +
+    (totals.human_secs || 0) +
+    (totals.foreground_secs || 0);
+}
+
+function heatmapLevel(secs, maxSecs) {
+  if (!secs) return 0;
+  if (!maxSecs) return 1;
+  return Math.max(1, Math.min(4, Math.ceil((secs / maxSecs) * 4)));
+}
+
+function dayTotalsLabel(totals) {
+  const active = activeTimelineSecs(totals);
+  if (!active) return "—";
+  return [
+    ["active", active],
+    ["work", totals.working_secs],
+    ["wait", totals.waiting_secs],
+    ["err", totals.error_secs],
+    ["human", totals.human_secs],
+    ["tmux", totals.foreground_secs],
+  ]
+    .filter(([, secs]) => secs > 0)
+    .map(([label, secs]) => `${label} ${formatDuration(secs)}`)
+    .join(" · ");
+}
+
+function topDaySessionsLabel(bucket) {
+  const sessions = [...bucket.sessions.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 2)
+    .map(([session, secs]) => `${session} ${formatDuration(secs)}`);
+  return sessions.length ? sessions.join(" · ") : "no active sessions";
+}
+
+function localDayStartMs(ms) {
+  const date = new Date(ms);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function addLocalDays(ms, days) {
+  const date = new Date(ms);
+  date.setDate(date.getDate() + days);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function localDateKey(ms) {
+  const date = new Date(ms);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function shortTimelineLaneLabel(lane) {
@@ -1094,10 +1301,7 @@ function renderStaticChips() {
   ).join("");
   dom.timelineRangeChips.querySelectorAll(".chip").forEach((chip) => {
     chip.addEventListener("click", () => {
-      store.filters.timelineRange = chip.getAttribute("data-range");
-      dom.timelineRangeChips.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
-      chip.classList.add("active");
-      fetchTimeline().catch(() => {});
+      setTimelineRange(chip.getAttribute("data-range") || "7d");
     });
   });
   dom.timelineSession.addEventListener("change", () => {
@@ -1138,6 +1342,19 @@ function renderStaticChips() {
       renderAgents();
       renderInspector();
     });
+  });
+}
+
+function setTimelineRange(range, selectedDay = "") {
+  store.filters.timelineRange = range;
+  store.ui.selectedTimelineDay = selectedDay;
+  syncTimelineRangeChips();
+  fetchTimeline().catch(() => {});
+}
+
+function syncTimelineRangeChips() {
+  dom.timelineRangeChips.querySelectorAll(".chip").forEach((chip) => {
+    chip.classList.toggle("active", chip.getAttribute("data-range") === store.filters.timelineRange);
   });
 }
 

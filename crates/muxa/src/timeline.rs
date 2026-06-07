@@ -10,7 +10,7 @@ use crate::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use time::format_description::well_known::Rfc3339;
-use time::{Date, OffsetDateTime, UtcOffset};
+use time::{Date, Month, OffsetDateTime, UtcOffset};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineRange {
@@ -467,6 +467,17 @@ pub fn parse_since(
     }
 
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    if let Some(date) = parse_iso_date(trimmed)? {
+        let next = date
+            .next_day()
+            .ok_or_else(|| "could not compute next date".to_string())?;
+        return Ok(TimelineRange {
+            label: date.to_string(),
+            since_at: Some(local_day_start(date, offset)),
+            until_at: Some(local_day_start(next, offset)),
+        });
+    }
+
     match normalized.as_str() {
         "today" | "tod" => {
             let start = local_day_start(now.to_offset(offset).date(), offset);
@@ -801,6 +812,32 @@ fn local_day_start(date: Date, offset: UtcOffset) -> OffsetDateTime {
     date.midnight().assume_offset(offset)
 }
 
+fn parse_iso_date(raw: &str) -> Result<Option<Date>, String> {
+    if raw.len() != 10 {
+        return Ok(None);
+    }
+    let mut parts = raw.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Ok(None);
+    };
+    let year = year
+        .parse::<i32>()
+        .map_err(|_| format!("invalid date {raw:?}: year must be four digits"))?;
+    let month = month
+        .parse::<u8>()
+        .map_err(|_| format!("invalid date {raw:?}: month must be 01-12"))?;
+    let day = day
+        .parse::<u8>()
+        .map_err(|_| format!("invalid date {raw:?}: day must be 01-31"))?;
+    let month =
+        Month::try_from(month).map_err(|_| format!("invalid date {raw:?}: month must be 01-12"))?;
+    Date::from_calendar_date(year, month, day)
+        .map(Some)
+        .map_err(|_| format!("invalid date {raw:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +966,22 @@ mod tests {
             .iter()
             .all(|lane| lane.kind == TimelineLaneKind::Human));
         assert_eq!(doc.totals.human_secs, 240);
+    }
+
+    #[test]
+    fn parse_since_accepts_iso_date_as_single_day() {
+        let range = parse_since(
+            "2026-06-05",
+            datetime!(2026-06-05 12:00:00 UTC),
+            "all retained activity",
+        )
+        .unwrap();
+
+        assert_eq!(range.label, "2026-06-05");
+        assert_eq!(
+            range.until_at.unwrap() - range.since_at.unwrap(),
+            time::Duration::days(1)
+        );
     }
 
     #[test]

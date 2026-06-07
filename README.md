@@ -87,7 +87,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa stats --since today` | Summary table; group by day/project/agent/session. |
 | `muxa report --since week` | Markdown stats report. |
-| `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`. |
+| `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa init` | Interactive install/uninstall wizard. |
@@ -101,11 +101,14 @@ muxa stats --since yesterday --group-by project
 muxa report --since week
 muxa timeline --since today --session main
 muxa timeline --since today --group-by kind --sort waiting
+muxa timeline --view heatmap --since 12w
+muxa timeline --day 2026-06-06
 muxa activity --since today --type human
 ```
 
 `--since` accepts `today`, `yesterday`, `week`, rolling durations like
-`24h`/`7d`/`4w`, RFC3339 timestamps, and `all`. See
+`24h`/`7d`/`4w`, local dates like `2026-06-06`, RFC3339 timestamps, and
+`all`. See
 [docs/ACTIVITY.md](docs/ACTIVITY.md) for ledger semantics, including
 `HUMAN` and `THINK`.
 

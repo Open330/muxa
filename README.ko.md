@@ -86,7 +86,7 @@ muxa watch
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa stats --since today` | day/project/agent/session 단위 summary. |
 | `muxa report --since week` | Markdown stats report. |
-| `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting`으로 정렬. |
+| `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
 | `muxa init` | install/uninstall wizard. |
@@ -100,11 +100,13 @@ muxa stats --since yesterday --group-by project
 muxa report --since week
 muxa timeline --since today --session main
 muxa timeline --since today --group-by kind --sort waiting
+muxa timeline --view heatmap --since 12w
+muxa timeline --day 2026-06-06
 muxa activity --since today --type human
 ```
 
 `--since`는 `today`, `yesterday`, `week`, `24h`/`7d`/`4w` 같은 rolling
-duration, RFC3339 timestamp, `all`을 받습니다. `HUMAN`, `THINK`를 포함한
+duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`을 받습니다. `HUMAN`, `THINK`를 포함한
 ledger 판정 기준은 [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md)에 있습니다.
 
 ## 지원 에이전트

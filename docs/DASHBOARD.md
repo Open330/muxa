@@ -138,12 +138,14 @@ hammering refresh loop doesn't fork tmux 60 times a minute.
 
 ## Timeline
 
-The timeline panel calls `/api/timeline?since=24h` by default and can switch
-to `today` or `7d` in the browser. The endpoint also accepts `session=<name>`
-and `agent=<kind>` (`codex`, `claude_code`, `gemini_cli`, `opencode`,
-`unknown`).
-The browser groups timeline lanes by session by default, with agent, human,
-and tmux foreground lanes shown under the same session header.
+The timeline panel calls `/api/timeline?since=7d` by default and can switch
+to `24h`, `today`, `30d`, `12w`, or a clicked `YYYY-MM-DD` calendar day in the
+browser. The endpoint also accepts `session=<name>` and `agent=<kind>`
+(`codex`, `claude_code`, `gemini_cli`, `opencode`, `unknown`).
+The browser renders a daily contribution-map style heatmap above the lane
+graph; clicking a day drills the graph into that local calendar day. Timeline
+lanes are grouped by session by default, with agent, human, and tmux
+foreground lanes shown under the same session header.
 
 The overview's `human` metric follows the same meaning as `muxa stats
 HUMAN`: the union of tmux foreground time and muxa-recorded human

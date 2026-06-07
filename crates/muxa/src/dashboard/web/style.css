@@ -458,9 +458,117 @@ button, select {
   overflow: auto;
 }
 
-.timeline-axis {
+.timeline-heatmap {
   position: sticky;
   top: 0;
+  z-index: 3;
+  min-width: 860px;
+  padding: 10px 0 12px;
+  margin-bottom: 4px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.timeline-heatmap-head,
+.timeline-day-detail {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+}
+
+.timeline-heatmap-head {
+  margin-bottom: 8px;
+}
+
+.timeline-heatmap-head strong,
+.timeline-day-detail strong {
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.timeline-heatmap-head span,
+.timeline-day-detail span,
+.timeline-day-detail small {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.timeline-heatmap-map {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  align-items: start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.timeline-heatmap-weekdays,
+.timeline-heatmap-grid {
+  display: grid;
+  grid-template-rows: repeat(7, 12px);
+  gap: 3px;
+}
+
+.timeline-heatmap-weekdays {
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 12px;
+}
+
+.timeline-heatmap-grid {
+  grid-auto-flow: column;
+  grid-auto-columns: 12px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.timeline-day {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(155, 152, 141, 0.18);
+  border-radius: 3px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.timeline-day.spacer {
+  border-color: transparent;
+  background: transparent;
+  cursor: default;
+}
+
+.timeline-day.level-1 { background: rgba(63, 185, 80, 0.28); }
+.timeline-day.level-2 { background: rgba(63, 185, 80, 0.48); }
+.timeline-day.level-3 { background: rgba(63, 185, 80, 0.68); }
+.timeline-day.level-4 { background: var(--green); }
+
+.timeline-day:hover {
+  border-color: var(--fg);
+  filter: brightness(1.15);
+}
+
+.timeline-day.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.timeline-day-detail {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 34px;
+}
+
+.timeline-day-detail small {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-axis {
+  position: sticky;
+  top: 126px;
   z-index: 2;
   display: grid;
   grid-template-columns: 190px minmax(640px, 1fr);
@@ -693,6 +801,10 @@ button, select {
 }
 
 .empty-block.compact {
+  padding: 8px 0;
+}
+
+.timeline-empty.compact {
   padding: 8px 0;
 }
 

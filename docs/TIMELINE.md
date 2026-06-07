@@ -12,6 +12,8 @@ muxa timeline --since today --session main
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind
 muxa timeline --since today --sort waiting
+muxa timeline --view heatmap --since 12w
+muxa timeline --day 2026-06-06
 muxa timeline --since today --format json
 ```
 
@@ -27,13 +29,23 @@ The default overview is grouped by tmux session. Each session group can show:
 
 | Option | Values |
 | --- | --- |
-| `--since` | `today`, `yesterday`, `week`, rolling durations like `24h`/`7d`/`4w`, RFC3339 timestamps, or `all`. |
+| `--since` | `today`, `yesterday`, `week`, rolling durations like `24h`/`7d`/`4w`, local dates like `2026-06-06`, RFC3339 timestamps, or `all`. |
+| `--day` | Shortcut for one local calendar day, e.g. `--day 2026-06-06`. |
 | `--session` | tmux session name, tmux session id, or pane id. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
+| `--view` | `timeline` default, or `heatmap` for a terminal contribution-map summary. |
 | `--group-by` | `session` default, `kind`, or `flat`. TUI only. |
 | `--sort` | `latest` default, `name`, `duration`, `working`, `waiting`, `error`, `human`, or `foreground`. Also accepts aliases like `dur`, `work`, `wait`, `err`, and `tmux`. |
 | `--format` | `tui` default or `json`. |
 | `--theme` | Same one-shot theme override style as other muxa TUIs. |
+
+## Heatmap View
+
+`muxa timeline --view heatmap --since 12w` prints a compact daily activity
+map in the terminal. Each cell is a local calendar day; intensity is based on
+agent work, waiting, errors, human interaction, and tmux foreground time.
+Below the grid, muxa lists the busiest days and, for a single-day view, the
+top sessions for that day.
 
 ## TUI Keys
 
@@ -71,6 +83,8 @@ the transition timestamp. This keeps duration accounting consistent with
 ## Dashboard
 
 The dashboard timeline uses the same `/api/timeline` document and groups
-lanes by session by default. Use the dashboard when you want a persistent
-browser view; use `muxa timeline` when you want keyboard navigation, focus
-view, and terminal-native JSON export.
+lanes by session by default. It also renders a daily contribution-map style
+heatmap above the lane graph; click a day to drill into that calendar day.
+Use the dashboard when you want a persistent browser view; use
+`muxa timeline` when you want keyboard navigation, focus view, terminal
+heatmaps, and terminal-native JSON export.
