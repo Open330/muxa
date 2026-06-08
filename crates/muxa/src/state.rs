@@ -36,9 +36,24 @@ use tokio::sync::{broadcast, Notify, RwLock};
 /// Kept here (not in the runtime crate) so the no-I/O store layer can dedup
 /// without taking a cross-crate dependency on the discovery module.
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
+const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
+}
+
+fn normalize_hydrated_agent(mut agent: Agent) -> Agent {
+    if is_legacy_claude_idle_prompt_wait(&agent) {
+        agent.state = AgentState::Idle;
+        agent.state_entered_at = agent.last_activity_at;
+    }
+    agent
+}
+
+fn is_legacy_claude_idle_prompt_wait(agent: &Agent) -> bool {
+    agent.kind == AgentKind::ClaudeCode
+        && agent.state == AgentState::WaitingInput
+        && agent.last_notification.as_deref() == Some(CLAUDE_IDLE_PROMPT_NOTIFICATION)
 }
 
 /// Capacity of the in-process state-transition broadcast. Slow subscribers
@@ -304,6 +319,7 @@ impl Store {
     pub async fn hydrate(&self, initial: Vec<Agent>) {
         let mut agents = self.agents.write().await;
         for a in initial {
+            let a = normalize_hydrated_agent(a);
             agents.insert(a.session_id.clone(), a);
         }
     }
@@ -1116,6 +1132,77 @@ mod tests {
             pane: Some("%1".into()),
             cwd: None,
         }
+    }
+
+    fn stored_agent(
+        session: &str,
+        kind: AgentKind,
+        state: AgentState,
+        last_notification: Option<&str>,
+    ) -> Agent {
+        let at = datetime!(2026-05-05 12:00:00 UTC);
+        Agent {
+            kind,
+            session_id: session.into(),
+            surface: None,
+            pane: Some("%1".into()),
+            cwd: None,
+            state,
+            last_prompt: None,
+            last_response: None,
+            last_notification: last_notification.map(Into::into),
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: at,
+            last_activity_at: at,
+            state_entered_at: at,
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_downgrades_legacy_claude_idle_prompt_waiting_input() {
+        let store = Store::shared();
+        store
+            .hydrate(vec![stored_agent(
+                "legacy-idle",
+                AgentKind::ClaudeCode,
+                AgentState::WaitingInput,
+                Some(CLAUDE_IDLE_PROMPT_NOTIFICATION),
+            )])
+            .await;
+
+        let agent = store.by_session("legacy-idle").await.unwrap();
+        assert_eq!(agent.state, AgentState::Idle);
+        assert_eq!(
+            agent.last_notification.as_deref(),
+            Some(CLAUDE_IDLE_PROMPT_NOTIFICATION)
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_preserves_real_waiting_input_notifications() {
+        let store = Store::shared();
+        store
+            .hydrate(vec![stored_agent(
+                "permission",
+                AgentKind::ClaudeCode,
+                AgentState::WaitingInput,
+                Some("permission required"),
+            )])
+            .await;
+
+        assert_eq!(
+            store.by_session("permission").await.unwrap().state,
+            AgentState::WaitingInput
+        );
     }
 
     #[tokio::test]

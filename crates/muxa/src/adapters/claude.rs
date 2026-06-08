@@ -119,9 +119,7 @@ impl HookAdapter for ClaudeAdapter {
             Event::Notification => {
                 let kind = input.notification_type.unwrap_or_default();
                 let level = match kind.as_str() {
-                    "permission_prompt" | "idle_prompt" | "elicitation_dialog" => {
-                        NotificationLevel::NeedsInput
-                    }
+                    "permission_prompt" | "elicitation_dialog" => NotificationLevel::NeedsInput,
                     _ => NotificationLevel::Info,
                 };
                 AgentEvent::NotificationFired {
@@ -410,6 +408,51 @@ mod tests {
         match ev {
             AgentEvent::ToolStarted { tool, .. } => assert_eq!(tool, "Bash"),
             other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    fn notification_input(notification_type: &str) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: None,
+            notification_type: Some(notification_type.into()),
+            message: Some(format!("notification: {notification_type}")),
+            prompt: None,
+            transcript_path: None,
+            error: None,
+            error_details: None,
+            last_assistant_message: None,
+        }
+    }
+
+    #[test]
+    fn idle_prompt_notification_stays_informational() {
+        let ev =
+            ClaudeAdapter::normalize(Event::Notification, notification_input("idle_prompt"), None);
+        match ev {
+            AgentEvent::NotificationFired { level, message, .. } => {
+                assert_eq!(level, NotificationLevel::Info);
+                assert_eq!(message, "notification: idle_prompt");
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_blocking_notifications_still_need_input() {
+        for notification_type in ["permission_prompt", "elicitation_dialog"] {
+            let ev = ClaudeAdapter::normalize(
+                Event::Notification,
+                notification_input(notification_type),
+                None,
+            );
+            match ev {
+                AgentEvent::NotificationFired { level, .. } => {
+                    assert_eq!(level, NotificationLevel::NeedsInput);
+                }
+                other => panic!("expected NotificationFired, got {other:?}"),
+            }
         }
     }
 

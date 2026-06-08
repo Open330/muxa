@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-06-08
+
+### Fixed
+
+- **Claude idle prompts no longer look like blockers** — Claude Code's
+  `idle_prompt` notification now stays informational instead of flipping rows
+  to `WaitingInput`. User-blocking signals such as permission prompts,
+  elicitation dialogs, and choice-style tools still surface as attention states.
+- **Legacy idle-prompt snapshots are normalized on restart** — previously
+  persisted Claude rows whose only blocker was `Claude is waiting for your input`
+  hydrate back to `Idle`, keeping `muxa watch` consistent with Codex rows.
+
 ## [0.8.5] - 2026-06-08
 
 ### Changed
@@ -970,7 +982,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/Open330/muxa/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/Open330/muxa/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/Open330/muxa/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/Open330/muxa/compare/v0.8.2...v0.8.3
