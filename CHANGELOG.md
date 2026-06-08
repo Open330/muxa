@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-06-08
+
+### Added
+
+- **Scope exclusions for noisy monitoring sessions** — `muxa stats`,
+  `muxa report`, and `muxa timeline` now accept `--exclude-pane` and
+  `--exclude-session`. Values can be repeated or comma-separated, support
+  case-sensitive `*` / `?` wildcards, and are applied before totals are
+  computed so monitoring panes do not skew reports.
+- **Rolling month and previous calendar month ranges** — `--since month`
+  selects the rolling last 30 days, while `--since last-month` /
+  `"last month"` selects the previous local calendar month across stats,
+  report, timeline, activity, and the dashboard timeline API.
+
+### Fixed
+
+- **Range parser guidance** — unsupported `--since` values now print the
+  accepted keywords, duration syntax, date syntax, and timestamp syntax instead
+  of a terse invalid-duration error.
+
 ## [0.8.2] - 2026-06-08
 
 ### Added
@@ -915,7 +935,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/Open330/muxa/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/Open330/muxa/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/Open330/muxa/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Open330/muxa/releases/tag/v0.8.0
