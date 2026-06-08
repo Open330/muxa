@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Engaged ("active") time estimate** — `muxa stats` and `muxa report` now
   surface an `ACT` / "Active (engaged)" column next to `HUMAN`, with `active` /
-  `active_secs` in the JSON output and `--sort active`. It is the union of short
-  windows around each submitted prompt (60s before, 5m after), so a pane left
-  attached — or a left-open `muxa watch` — no longer balloons the figure the way
-  raw `human` presence does. It is a floor (reading between prompts is not
-  counted) and is not bounded by `human`.
+  `active_secs` in the JSON output and `--sort active`. It is the union of three
+  signals, each of which an idle attach never triggers: windows around each
+  submitted prompt (60s before, 5m after); **tmux input ticks** — the daemon now
+  samples each client's `client_activity` and records a `tmux_input` interaction
+  whenever it advances (a keypress or scroll), so *reading* while attached counts,
+  not just typing; and `thinking` time (present while an agent is blocked on you).
+  A pane left attached but untouched no longer balloons the figure the way raw
+  `human` presence does. `active` is not bounded by `human`.
 
 ## [0.8.3] - 2026-06-08
 

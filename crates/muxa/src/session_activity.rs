@@ -6,7 +6,10 @@
 //! ignores control-mode automation clients, and survives panes/windows
 //! coming and going inside the same session.
 
-use crate::activity::{ActivityEntry, ActivityLog, SessionForegroundEntry};
+use crate::activity::{
+    ActivityEntry, ActivityLog, HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind,
+    SessionForegroundEntry,
+};
 use crate::tmux::{self, SessionInfo, TmuxError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +42,15 @@ pub struct SessionActivity {
     pub attached_since: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub last_seen_at: OffsetDateTime,
+    /// Most recent tmux `client_activity` (last human keypress/scroll) observed
+    /// for this session, used to detect *new* input between polls. Persisted so
+    /// a daemon restart does not re-emit a stale input tick.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub last_input_at: Option<OffsetDateTime>,
 }
 
 impl SessionActivity {
@@ -178,6 +190,7 @@ pub fn apply_sample_report<S: BuildHasher>(
                 total_attached_secs: 0,
                 attached_since: None,
                 last_seen_at: now,
+                last_input_at: None,
             });
 
         if record.name != session.name {
@@ -286,24 +299,37 @@ impl SessionActivityTracker {
     }
 
     async fn poll_once(&self, records: &mut HashMap<String, SessionActivity>) {
-        let sample = tokio::task::spawn_blocking(list_sessions_for_activity)
+        let sample = tokio::task::spawn_blocking(sample_activity)
             .await
             .unwrap_or_else(|e| Err(format!("join error: {e}")));
-        let sessions = match sample {
-            Ok(sessions) => sessions,
+        let sample = match sample {
+            Ok(sample) => sample,
             Err(e) => {
                 debug!(error = %e, "session activity poll skipped");
                 return;
             }
         };
 
-        let report = apply_sample_report(records, &sessions, OffsetDateTime::now_utc());
+        let now = OffsetDateTime::now_utc();
+        let report = apply_sample_report(records, &sample.sessions, now);
         for interval in report.intervals {
             if let Some(activity_log) = &self.activity_log {
                 activity_log.append(ActivityEntry::SessionForeground(interval));
             }
         }
-        if report.changed {
+
+        // Reading detection: when a session's tmux `client_activity` advances,
+        // the human pressed a key or scrolled — record a short input tick so
+        // `active` time can credit reading, not just typing. Idle attaches never
+        // advance, so they emit nothing.
+        let (inputs, input_changed) = collect_input_interactions(records, &sample.last_input_by_id);
+        for entry in inputs {
+            if let Some(activity_log) = &self.activity_log {
+                activity_log.append(ActivityEntry::HumanInteraction(entry));
+            }
+        }
+
+        if report.changed || input_changed {
             let mut sessions = records.values().cloned().collect::<Vec<_>>();
             sessions.sort_by(|a, b| {
                 a.name
@@ -321,23 +347,100 @@ impl SessionActivityTracker {
     }
 }
 
-fn list_sessions_for_activity() -> Result<Vec<SessionInfo>, String> {
+/// One tmux poll: live sessions (with attached-client counts) plus, per session
+/// id, the most recent non-control `client_activity` epoch (last human input).
+struct ActivitySample {
+    sessions: Vec<SessionInfo>,
+    last_input_by_id: HashMap<String, i64>,
+}
+
+/// Width of the synthetic interval emitted for a detected input tick. The tick
+/// itself is a point in time; `active` pads it with its own window, so a hair of
+/// width here just keeps the interval non-empty.
+const INPUT_TICK_SECS: i64 = 1;
+
+fn sample_activity() -> Result<ActivitySample, String> {
+    let empty = || ActivitySample {
+        sessions: Vec::new(),
+        last_input_by_id: HashMap::new(),
+    };
     let mut sessions = match tmux::list_sessions() {
         Ok(sessions) => sessions,
         Err(TmuxError::NonZero(msg)) if msg.trim_start().starts_with("no server running") => {
-            return Ok(Vec::new());
+            return Ok(empty());
         }
         Err(e) => return Err(e.to_string()),
     };
     let clients = match tmux::list_clients() {
         Ok(clients) => clients,
         Err(TmuxError::NonZero(msg)) if msg.trim_start().starts_with("no server running") => {
-            return Ok(Vec::new());
+            return Ok(empty());
         }
         Err(e) => return Err(e.to_string()),
     };
     apply_client_counts(&mut sessions, &clients);
-    Ok(sessions)
+
+    // Most recent input epoch per session *name*, ignoring control-mode clients.
+    let mut by_name: HashMap<&str, i64> = HashMap::new();
+    for client in &clients {
+        if client.control_mode || client.last_activity <= 0 {
+            continue;
+        }
+        let slot = by_name.entry(client.session.as_str()).or_default();
+        *slot = (*slot).max(client.last_activity);
+    }
+    let mut last_input_by_id = HashMap::new();
+    for session in &sessions {
+        if let Some(&epoch) = by_name.get(session.name.as_str()) {
+            last_input_by_id.insert(session.session_id.clone(), epoch);
+        }
+    }
+
+    Ok(ActivitySample {
+        sessions,
+        last_input_by_id,
+    })
+}
+
+/// Compare each session's freshly sampled `client_activity` against the last one
+/// we recorded. A strictly newer value means human input arrived since the last
+/// poll, so emit a `TmuxInput` tick. The first observation only seeds the
+/// baseline (no tick) so we never fabricate input at startup. Returns the ticks
+/// to append and whether any record changed (so the caller knows to persist).
+fn collect_input_interactions<S: BuildHasher>(
+    records: &mut HashMap<String, SessionActivity, S>,
+    last_input_by_id: &HashMap<String, i64>,
+) -> (Vec<HumanInteractionEntry>, bool) {
+    let mut entries = Vec::new();
+    let mut changed = false;
+    for (session_id, &epoch) in last_input_by_id {
+        let Ok(at) = OffsetDateTime::from_unix_timestamp(epoch) else {
+            continue;
+        };
+        let Some(record) = records.get_mut(session_id) else {
+            continue;
+        };
+        match record.last_input_at {
+            Some(prev) if at > prev => {
+                entries.push(HumanInteractionEntry::new(HumanInteractionInput {
+                    kind: HumanInteractionKind::TmuxInput,
+                    pane: None,
+                    session_id: Some(record.session_id.clone()),
+                    session_name: Some(record.name.clone()),
+                    started_at: at - time::Duration::seconds(INPUT_TICK_SECS),
+                    ended_at: at,
+                }));
+                record.last_input_at = Some(at);
+                changed = true;
+            }
+            None => {
+                record.last_input_at = Some(at);
+                changed = true;
+            }
+            Some(_) => {}
+        }
+    }
+    (entries, changed)
 }
 
 fn apply_client_counts(sessions: &mut [SessionInfo], clients: &[tmux::ClientInfo]) {
@@ -424,10 +527,12 @@ mod tests {
             tmux::ClientInfo {
                 session: "main".into(),
                 control_mode: false,
+                last_activity: 0,
             },
             tmux::ClientInfo {
                 session: "main".into(),
                 control_mode: true,
+                last_activity: 0,
             },
         ];
 
@@ -435,5 +540,43 @@ mod tests {
 
         assert_eq!(sessions[0].attached_clients, 1);
         assert_eq!(sessions[1].attached_clients, 0);
+    }
+
+    #[test]
+    fn tmux_input_tick_emitted_only_when_activity_advances() {
+        let now = datetime!(2026-05-30 12:00:00 UTC);
+        let mut records = HashMap::new();
+        records.insert(
+            "$1".to_string(),
+            SessionActivity {
+                session_id: "$1".into(),
+                name: "main".into(),
+                attached_clients: 1,
+                total_attached_secs: 0,
+                attached_since: Some(now),
+                last_seen_at: now,
+                last_input_at: None,
+            },
+        );
+        let t1 = datetime!(2026-05-30 11:59:00 UTC).unix_timestamp();
+        let by_id: HashMap<String, i64> = [("$1".to_string(), t1)].into_iter().collect();
+
+        // First observation seeds the baseline without emitting a tick.
+        let (entries, changed) = collect_input_interactions(&mut records, &by_id);
+        assert!(entries.is_empty());
+        assert!(changed);
+
+        // Same epoch again: no new input, nothing emitted.
+        let (entries, _) = collect_input_interactions(&mut records, &by_id);
+        assert!(entries.is_empty());
+
+        // A newer epoch means the human typed/scrolled: emit one tick.
+        let t2 = datetime!(2026-05-30 11:59:30 UTC).unix_timestamp();
+        let by_id2: HashMap<String, i64> = [("$1".to_string(), t2)].into_iter().collect();
+        let (entries, changed) = collect_input_interactions(&mut records, &by_id2);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HumanInteractionKind::TmuxInput);
+        assert_eq!(entries[0].session_id.as_deref(), Some("$1"));
+        assert!(changed);
     }
 }

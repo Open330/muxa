@@ -796,19 +796,27 @@ fn add_thinking_rows(
     }
 }
 
-/// Estimate engaged ("active") human time: the union of short windows around
-/// each submitted prompt, padded by [`ACTIVE_LOOKBACK`] before and
-/// [`ACTIVE_TIMEOUT`] after. A prompt submission is the one unambiguous,
-/// discrete human action muxa records; raw presence signals are unreliable
-/// (a bare `TmuxAttach` or a left-open `muxa watch` accrue continuously while
-/// the human is away, and autonomous agent state transitions fire without one).
-/// Anchoring on prompts means a pane left attached with no prompts contributes
-/// nothing, which is what keeps a forgotten attach from ballooning the estimate
-/// to hours. It is a deliberate floor: time spent only reading agent output
-/// between prompts is not counted. (It is not bounded by `human`: driving agents
-/// without a tracked tmux attach can make `active` exceed it.)
+/// Estimate engaged ("active") human time as the union of three signals, each
+/// discounting idle attach (the failure mode of raw `human` presence):
+///
+/// 1. **Submitted prompts** — padded [`ACTIVE_LOOKBACK`] before / [`ACTIVE_TIMEOUT`]
+///    after each prompt. The unambiguous "I typed something" action.
+/// 2. **tmux input ticks** (`HumanInteractionKind::TmuxInput`) — the daemon
+///    records one whenever a client's `client_activity` advances (a keypress or
+///    scroll), so *reading* while attached counts, not just typing. An idle
+///    attach never advances, so it still contributes nothing.
+/// 3. **Thinking** — time spent present while an agent is blocked on you
+///    (`WaitingInput`/`WaitingChoice`/`Error`), i.e. reading its question and
+///    deciding even without a keystroke.
+///
+/// A pane left attached with no prompts, no input, and no waiting agent yields
+/// none of the three, which is what keeps a forgotten attach from ballooning the
+/// estimate to hours. It is not bounded by `human`: driving agents without a
+/// tracked tmux attach can make `active` larger.
 fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
     let mut intervals = Vec::new();
+
+    // (1) Submitted prompts.
     for prompt in &data.prompts {
         let session_name = prompt
             .tmux_session
@@ -828,6 +836,43 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
             });
         }
     }
+
+    // (2) tmux input ticks (keypress / scroll while attached).
+    for entry in &data.activity_entries {
+        let ActivityEntry::HumanInteraction(entry) = entry else {
+            continue;
+        };
+        if entry.kind != HumanInteractionKind::TmuxInput {
+            continue;
+        }
+        if let Some(interval) = scoped_interval(
+            data,
+            entry.started_at - ACTIVE_LOOKBACK,
+            entry.ended_at + ACTIVE_TIMEOUT,
+            entry.pane.clone(),
+            entry.session_name.clone(),
+            entry.session_id.as_deref().unwrap_or("human_interaction"),
+        ) {
+            if let Some(group_key) = human_presence_group_key(data, &interval, group_by) {
+                intervals.push(AttentionInterval {
+                    interval,
+                    group_key,
+                });
+            }
+        }
+    }
+
+    // (3) Thinking: present while an agent is blocked on you (reading/deciding).
+    let presences = human_presence_intervals(data, true);
+    for attention in attention_intervals(data, group_by) {
+        for segment in overlapping_presence_segments(&attention.interval, &presences) {
+            intervals.push(AttentionInterval {
+                interval: segment,
+                group_key: attention.group_key.clone(),
+            });
+        }
+    }
+
     intervals
 }
 
@@ -1406,7 +1451,7 @@ fn notes(data: &StatsData) -> Vec<String> {
         "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
     );
     notes.push(
-        "ACTIVE estimates engaged human time as the union of windows around each submitted prompt, padded 60s before and 300s after. Idle attach and left-open watch sessions accrue no prompts, so ACTIVE discounts them. It is a floor (time spent only reading agent output between prompts is not counted) and is not bounded by HUMAN.".to_string(),
+        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded 60s before / 300s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). An idle attach advances none of these, so ACTIVE discounts it; it is not bounded by HUMAN.".to_string(),
     );
     notes
 }
@@ -2140,6 +2185,44 @@ mod tests {
     }
 
     #[test]
+    fn active_counts_tmux_input_reading() {
+        // No prompts at all — only a long idle attach plus a single tmux input
+        // tick (the human scrolled/typed at 10:30 while reading). Active must
+        // credit the reading window, not the whole attach.
+        let mut d = data(Vec::new());
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.pane_sessions.insert("%1".into(), "main".into());
+        d.activity_entries = vec![
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxAttach,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 10:00:00 UTC),
+                ended_at: datetime!(2026-05-30 12:00:00 UTC),
+            })),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxInput,
+                pane: None,
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 10:29:59 UTC),
+                ended_at: datetime!(2026-05-30 10:30:00 UTC),
+            })),
+        ];
+
+        let totals = build_totals(&d);
+
+        // Window = [10:28:59, 10:35:00] around the 1s tick = 6m01s.
+        assert_eq!(totals.active_secs, 361);
+        assert!(totals.active_secs < totals.human_secs);
+    }
+
+    #[test]
     fn scope_exclusions_remove_matching_source_data() {
         let mut kept_prompt = prompt(
             AgentKind::Codex,
@@ -2202,6 +2285,7 @@ mod tests {
                 total_attached_secs: 60,
                 attached_since: None,
                 last_seen_at: datetime!(2026-05-30 11:00:00 UTC),
+                last_input_at: None,
             },
             SessionActivity {
                 session_id: "$monitor".into(),
@@ -2210,6 +2294,7 @@ mod tests {
                 total_attached_secs: 60,
                 attached_since: None,
                 last_seen_at: datetime!(2026-05-30 11:00:00 UTC),
+                last_input_at: None,
             },
         ];
 

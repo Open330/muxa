@@ -151,6 +151,11 @@ pub enum HumanInteractionKind {
     MuxaWatch,
     MuxaPromptInput,
     TmuxAttach,
+    /// A tmux client's `client_activity` advanced between polls — the human
+    /// pressed a key or scrolled. Unlike [`Self::TmuxAttach`] (which spans the
+    /// whole attach, idle included), this marks an instant of real input, so it
+    /// distinguishes active reading from a forgotten attach.
+    TmuxInput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

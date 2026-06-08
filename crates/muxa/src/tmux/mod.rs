@@ -110,6 +110,11 @@ pub struct ClientInfo {
     /// tmux control-mode clients are automation, not an interactive user
     /// looking at a foreground session, so duration tracking ignores them.
     pub control_mode: bool,
+    /// Unix epoch (seconds) of this client's last activity — a keypress,
+    /// scroll, or other input — from tmux `#{client_activity}`. It advances
+    /// only when the human interacts, which is what distinguishes active
+    /// reading from an idle attach. `0` when tmux did not report it.
+    pub last_activity: i64,
 }
 
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
@@ -118,7 +123,7 @@ pub(crate) const PANE_FMT: &str =
     "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
-pub(crate) const CLIENT_FMT: &str = "#{client_session}\t#{client_control_mode}";
+pub(crate) const CLIENT_FMT: &str = "#{client_session}\t#{client_control_mode}\t#{client_activity}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -174,6 +179,7 @@ pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
         clients.push(ClientInfo {
             session: cols[0].into(),
             control_mode: matches!(cols[1].trim(), "1" | "true"),
+            last_activity: cols.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
         });
     }
     clients
