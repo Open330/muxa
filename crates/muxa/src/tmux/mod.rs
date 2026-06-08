@@ -105,11 +105,26 @@ pub struct SessionInfo {
 
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
+    /// tmux `#{client_name}`, typically the controlling tty (e.g. `/dev/pts/3`).
+    /// Reused across attaches of the same terminal, so it alone can't tell a
+    /// reattach from a keypress — pair it with [`Self::created`].
+    pub name: String,
     /// Name of the session currently displayed by this tmux client.
     pub session: String,
     /// tmux control-mode clients are automation, not an interactive user
     /// looking at a foreground session, so duration tracking ignores them.
     pub control_mode: bool,
+    /// Unix epoch (seconds) of this client's last activity — a keypress,
+    /// scroll, or other input — from tmux `#{client_activity}`. It advances
+    /// only when the human interacts, which is what distinguishes active
+    /// reading from an idle attach. `0` when tmux did not report it.
+    pub last_activity: i64,
+    /// Unix epoch (seconds) this client attached, from tmux `#{client_created}`.
+    /// Changes on every (re)attach even when the tty is reused, so
+    /// `(name, created)` uniquely identifies one attach session — letting input
+    /// detection treat an idle reattach as a fresh client rather than input.
+    /// `0` when tmux did not report it.
+    pub created: i64,
 }
 
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
@@ -118,7 +133,8 @@ pub(crate) const PANE_FMT: &str =
     "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
-pub(crate) const CLIENT_FMT: &str = "#{client_session}\t#{client_control_mode}";
+pub(crate) const CLIENT_FMT: &str =
+    "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}\t#{client_created}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -168,12 +184,15 @@ pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
     let mut clients = Vec::new();
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 2 || cols[0].is_empty() {
+        if cols.len() < 3 || cols[1].is_empty() {
             continue;
         }
         clients.push(ClientInfo {
-            session: cols[0].into(),
-            control_mode: matches!(cols[1].trim(), "1" | "true"),
+            name: cols[0].into(),
+            session: cols[1].into(),
+            control_mode: matches!(cols[2].trim(), "1" | "true"),
+            last_activity: cols.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+            created: cols.get(4).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
         });
     }
     clients
@@ -441,13 +460,29 @@ mod tests {
 
     #[test]
     fn parses_client_lines() {
-        let stdout = "main\t0\nwork\t1\n\t0\n";
+        // name \t session \t control_mode \t client_activity \t client_created
+        let stdout = "/dev/pts/0\tmain\t0\t1780900000\t1780899000\n\
+                      /dev/pts/1\twork\t1\t1780900050\t1780899100\n\
+                      /dev/pts/2\t\t0\t0\t0\n";
         let clients = parse_client_lines(stdout);
+        // The third row has an empty session and is skipped.
         assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].name, "/dev/pts/0");
         assert_eq!(clients[0].session, "main");
         assert!(!clients[0].control_mode);
+        assert_eq!(clients[0].last_activity, 1_780_900_000);
+        assert_eq!(clients[0].created, 1_780_899_000);
         assert_eq!(clients[1].session, "work");
         assert!(clients[1].control_mode);
+    }
+
+    #[test]
+    fn parse_client_lines_tolerates_missing_trailing_columns() {
+        // Older tmux (no activity/created) still yields a valid row, epochs 0.
+        let clients = parse_client_lines("/dev/pts/0\tmain\t0\n");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].last_activity, 0);
+        assert_eq!(clients[0].created, 0);
     }
 
     #[test]
