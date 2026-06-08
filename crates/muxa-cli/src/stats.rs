@@ -117,7 +117,7 @@ enum SortKey {
     Name,
 }
 
-const FULL_STATS_TABLE_WIDTH: usize = 136;
+const FULL_STATS_TABLE_WIDTH: usize = 128;
 const COMPACT_STATS_TABLE_WIDTH: usize = 76;
 const MIN_GROUP_COLUMN_WIDTH: usize = 7;
 const MAX_GROUP_COLUMN_WIDTH: usize = 36;
@@ -1526,7 +1526,6 @@ enum StatsColumn {
     Active,
     AttentionEvents,
     TokenEstimate,
-    Words,
     AgentSessions,
     LiveAgents,
     LastPromptAge,
@@ -1591,11 +1590,6 @@ const FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
         value: StatsColumn::TokenEstimate,
     },
     StatsTableColumn {
-        header: "WORDS",
-        width: 6,
-        value: StatsColumn::Words,
-    },
-    StatsTableColumn {
         header: "SESS",
         width: 4,
         value: StatsColumn::AgentSessions,
@@ -1632,6 +1626,11 @@ const COMPACT_STATS_COLUMNS: &[StatsTableColumn] = &[
         header: "TMUX",
         width: 6,
         value: StatsColumn::Foreground,
+    },
+    StatsTableColumn {
+        header: "ACT",
+        width: 6,
+        value: StatsColumn::Active,
     },
     StatsTableColumn {
         header: "THINK",
@@ -1768,7 +1767,6 @@ fn stats_total_value(totals: &Totals, column: StatsColumn) -> String {
         StatsColumn::Active => totals.active.clone(),
         StatsColumn::AttentionEvents => totals.attention_events.to_string(),
         StatsColumn::TokenEstimate => totals.token_estimate.to_string(),
-        StatsColumn::Words => totals.words.to_string(),
         StatsColumn::AgentSessions => totals.agent_sessions.to_string(),
         StatsColumn::LiveAgents => totals.live_agents.to_string(),
         StatsColumn::LastPromptAge => totals.last_prompt_age.clone(),
@@ -1777,10 +1775,9 @@ fn stats_total_value(totals: &Totals, column: StatsColumn) -> String {
 
 fn stats_column_tone(column: StatsColumn) -> TableTone {
     match column {
-        StatsColumn::Prompts
-        | StatsColumn::TokenEstimate
-        | StatsColumn::Words
-        | StatsColumn::AgentSessions => TableTone::Accent,
+        StatsColumn::Prompts | StatsColumn::TokenEstimate | StatsColumn::AgentSessions => {
+            TableTone::Accent
+        }
         StatsColumn::Working | StatsColumn::LiveAgents | StatsColumn::Active => TableTone::Good,
         StatsColumn::Waiting => TableTone::Warn,
         StatsColumn::Error => TableTone::Error,
@@ -1831,7 +1828,6 @@ fn stats_column_value(row: &GroupRow, column: StatsColumn) -> String {
         StatsColumn::Active => row.active.clone(),
         StatsColumn::AttentionEvents => row.attention_events.to_string(),
         StatsColumn::TokenEstimate => row.token_estimate.to_string(),
-        StatsColumn::Words => row.words.to_string(),
         StatsColumn::AgentSessions => row.agent_sessions.to_string(),
         StatsColumn::LiveAgents => row.live_agents.to_string(),
         StatsColumn::LastPromptAge => row.last_prompt_age.clone(),
@@ -2751,7 +2747,7 @@ mod tests {
         let rendered = render_stats_table(&doc, 140, CliTheme::plain());
 
         assert!(rendered.contains("TOK EST"));
-        assert!(rendered.contains("WORDS"));
+        assert!(rendered.contains("ACT"));
         assert!(rendered.contains("AGENTS"));
         for line in rendered.lines() {
             assert!(
