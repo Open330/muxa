@@ -816,7 +816,10 @@ fn add_thinking_rows(
 fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
     let mut intervals = Vec::new();
 
-    // (1) Submitted prompts.
+    // (1) Submitted prompts. `data.prompts` is already clipped to the range, so
+    // a prompt just outside a bounded `--since` whose padded window would poke
+    // into the range is not credited — a bounded-edge undercount of at most
+    // ACTIVE_TIMEOUT per session, accepted to keep prompt counts range-exact.
     for prompt in &data.prompts {
         let session_name = prompt
             .tmux_session
@@ -1099,6 +1102,12 @@ fn human_presence_intervals(data: &StatsData, thinking_only: bool) -> Vec<Scoped
                 }
             }
             ActivityEntry::HumanInteraction(entry) => {
+                // TmuxInput is an instantaneous input *marker* (a keypress tick),
+                // not a presence span — it feeds `active` directly, never HUMAN or
+                // THINK, so a stream of ticks can't inflate raw presence.
+                if entry.kind == HumanInteractionKind::TmuxInput {
+                    continue;
+                }
                 if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
                     continue;
                 }
