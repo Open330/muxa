@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multiple agents with the existing state glyphs instead of spelling out
   `N agents`. Single-agent views keep the simpler `1 agent` / session-name
   display, and one-off state counts omit the trailing `1` (for example,
-  `? ●2`).
+  `? ●2`). The default session view also drops the separate `ST` column because
+  the SESSION label now carries the full per-session state summary; pane view
+  and explicitly configured `state` columns still keep it.
 
 ## [0.8.4] - 2026-06-08
 

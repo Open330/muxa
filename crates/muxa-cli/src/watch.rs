@@ -1373,13 +1373,12 @@ impl App {
                 == [
                     WatchColumn::Pane,
                     WatchColumn::State,
-                    WatchColumn::Prompt,
                     WatchColumn::Activity,
+                    WatchColumn::Prompt,
                 ]
             {
                 columns = vec![
                     WatchColumn::Pane,
-                    WatchColumn::State,
                     WatchColumn::SessionTime,
                     WatchColumn::Activity,
                     WatchColumn::Prompt,
@@ -4974,7 +4973,6 @@ mod tests {
             app.columns,
             vec![
                 WatchColumn::Pane,
-                WatchColumn::State,
                 WatchColumn::SessionTime,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
@@ -4997,6 +4995,25 @@ mod tests {
             .join("\n");
         assert!(screen.contains("DUR"), "{screen}");
         assert!(screen.contains("1h05m"), "{screen}");
+    }
+
+    #[test]
+    fn session_view_explicit_state_column_is_preserved() {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            columns: vec!["pane".into(), "state".into(), "prompt".into()],
+            ..WatchConfig::default()
+        };
+        let app = App::with_config(cfg);
+        assert_eq!(
+            app.columns,
+            vec![
+                WatchColumn::Pane,
+                WatchColumn::State,
+                WatchColumn::SessionTime,
+                WatchColumn::Prompt,
+            ]
+        );
     }
 
     #[test]

@@ -909,10 +909,12 @@ pub enum WatchSortKey {
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        // Defaults: NAME / ST / ACT / LAST PROMPT — lead with identity,
-        // then state, then activity, with the variable-width prompt last
-        // so it can absorb the remaining width. Users who care about
-        // model/ctx/cost can opt back in via config.
+        // Pane-view defaults: NAME / ST / ACT / LAST PROMPT — lead with
+        // identity, then state, then activity, with the variable-width
+        // prompt last so it can absorb the remaining width. Session view
+        // folds state counts into the SESSION label and swaps ST for DUR
+        // at render setup time. Users who care about model/ctx/cost can
+        // opt back in via config.
         let columns = vec![
             "pane".to_string(),
             "state".to_string(),
