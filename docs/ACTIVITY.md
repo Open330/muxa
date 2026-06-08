@@ -48,7 +48,15 @@ patterns are case-sensitive and support `*` and `?`, e.g.
 `--exclude-session 'monitor*'`.
 
 `--sort` accepts: `prompts`, `work`, `wait`, `err`, `tmux`, `human`,
-`think`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
+`think`, `active`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
+
+`ACTIVE` (the `ACT` column, `active` / `active_secs` in JSON) estimates engaged
+human time as the union of short windows around each submitted prompt — 60s
+before and 5m after. Unlike `HUMAN` (raw presence: tmux foreground, prompt
+input, or attach), a pane left attached or a left-open `muxa watch` accrues no
+prompts and so does not inflate `ACTIVE`. It is a deliberate floor — time spent
+only reading agent output between prompts is not counted — and is not bounded by
+`HUMAN`, since driving agents without a tracked tmux attach can make it larger.
 
 The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows

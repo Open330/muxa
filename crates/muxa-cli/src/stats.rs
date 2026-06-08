@@ -36,7 +36,7 @@ pub struct Args {
     limit: usize,
 
     /// Column to sort rows by: prompts, work, wait, err, tmux, human, think,
-    /// block, tok, words, sess, agents, last, or name.
+    /// active, block, tok, words, sess, agents, last, or name.
     #[arg(long, value_enum, default_value_t = SortKey::Prompts)]
     sort: SortKey,
 
@@ -107,6 +107,7 @@ enum SortKey {
     Tmux,
     Human,
     Think,
+    Active,
     Block,
     Tok,
     Words,
@@ -116,10 +117,18 @@ enum SortKey {
     Name,
 }
 
-const FULL_STATS_TABLE_WIDTH: usize = 128;
+const FULL_STATS_TABLE_WIDTH: usize = 136;
 const COMPACT_STATS_TABLE_WIDTH: usize = 76;
 const MIN_GROUP_COLUMN_WIDTH: usize = 7;
 const MAX_GROUP_COLUMN_WIDTH: usize = 36;
+
+/// Credit a little reading/thinking time *before* each human action when
+/// estimating engaged ("active") time.
+const ACTIVE_LOOKBACK: time::Duration = time::Duration::seconds(60);
+/// Idle timeout: a human action keeps the "active" clock running for this
+/// long afterward. Gaps between actions longer than this read as away, so a
+/// pane left attached for hours with no activity contributes ~nothing.
+const ACTIVE_TIMEOUT: time::Duration = time::Duration::seconds(300);
 
 impl GroupBy {
     fn as_str(self) -> &'static str {
@@ -216,6 +225,8 @@ struct Totals {
     human: String,
     thinking_secs: u64,
     thinking: String,
+    active_secs: u64,
+    active: String,
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
@@ -242,6 +253,8 @@ struct GroupRow {
     human: String,
     thinking_secs: u64,
     thinking: String,
+    active_secs: u64,
+    active: String,
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
@@ -261,6 +274,7 @@ struct GroupAccumulator {
     foreground_secs: u64,
     human_secs: u64,
     thinking_secs: u64,
+    active_secs: u64,
     attention_events: usize,
     last_prompt_at: Option<OffsetDateTime>,
 }
@@ -540,6 +554,7 @@ fn build_totals(data: &StatsData) -> Totals {
         human_secs = human_secs.saturating_add(legacy_foreground_secs(data));
     }
     let thinking_secs = thinking_secs_total(data);
+    let active_secs = active_secs_total(data);
 
     Totals {
         prompts: data.prompts.len(),
@@ -564,6 +579,8 @@ fn build_totals(data: &StatsData) -> Totals {
         human: format_duration(human_secs),
         thinking_secs,
         thinking: format_duration(thinking_secs),
+        active_secs,
+        active: format_duration(active_secs),
         attention_events,
         last_prompt_at: last_prompt_at.map(format_rfc3339),
         last_prompt_age: last_prompt_at
@@ -596,6 +613,7 @@ fn build_rows(
     add_activity_rows(data, group_by, &mut rows);
     add_human_rows(data, group_by, &mut rows);
     add_thinking_rows(data, group_by, &mut rows);
+    add_active_rows(data, group_by, &mut rows);
 
     if group_by != GroupBy::Session || session_foreground_ledger {
         add_open_session_foreground_rows(data, group_by, &mut rows);
@@ -662,6 +680,8 @@ fn build_rows(
             human: format_duration(acc.human_secs),
             thinking_secs: acc.thinking_secs,
             thinking: format_duration(acc.thinking_secs),
+            active_secs: acc.active_secs,
+            active: format_duration(acc.active_secs),
             attention_events: acc.attention_events,
             last_prompt_at: acc.last_prompt_at.map(format_rfc3339),
             last_prompt_age: acc
@@ -687,6 +707,7 @@ fn sort_group_rows(rows: &mut [(String, GroupAccumulator)], sort: SortKey, rever
             SortKey::Tmux => b.foreground_secs.cmp(&a.foreground_secs),
             SortKey::Human => b.human_secs.cmp(&a.human_secs),
             SortKey::Think => b.thinking_secs.cmp(&a.thinking_secs),
+            SortKey::Active => b.active_secs.cmp(&a.active_secs),
             SortKey::Block => b.attention_events.cmp(&a.attention_events),
             SortKey::Tok => b.token_estimate.cmp(&a.token_estimate),
             SortKey::Words => b.words.cmp(&a.words),
@@ -771,6 +792,69 @@ fn add_thinking_rows(
         let secs = sum_merged_scoped_intervals(&intervals);
         if secs > 0 {
             rows.entry(key).or_default().thinking_secs += secs;
+        }
+    }
+}
+
+/// Estimate engaged ("active") human time: the union of short windows around
+/// each submitted prompt, padded by [`ACTIVE_LOOKBACK`] before and
+/// [`ACTIVE_TIMEOUT`] after. A prompt submission is the one unambiguous,
+/// discrete human action muxa records; raw presence signals are unreliable
+/// (a bare `TmuxAttach` or a left-open `muxa watch` accrue continuously while
+/// the human is away, and autonomous agent state transitions fire without one).
+/// Anchoring on prompts means a pane left attached with no prompts contributes
+/// nothing, which is what keeps a forgotten attach from ballooning the estimate
+/// to hours. It is a deliberate floor: time spent only reading agent output
+/// between prompts is not counted. (It is not bounded by `human`: driving agents
+/// without a tracked tmux attach can make `active` exceed it.)
+fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
+    let mut intervals = Vec::new();
+    for prompt in &data.prompts {
+        let session_name = prompt
+            .tmux_session
+            .clone()
+            .or_else(|| data.pane_sessions.get(&prompt.pane).cloned());
+        if let Some(interval) = scoped_interval(
+            data,
+            prompt.at - ACTIVE_LOOKBACK,
+            prompt.at + ACTIVE_TIMEOUT,
+            Some(prompt.pane.clone()),
+            session_name,
+            &prompt.session_id,
+        ) {
+            intervals.push(AttentionInterval {
+                interval,
+                group_key: prompt_group_key(data, prompt, group_by),
+            });
+        }
+    }
+    intervals
+}
+
+fn active_secs_total(data: &StatsData) -> u64 {
+    let intervals = anchor_intervals(data, GroupBy::Session)
+        .into_iter()
+        .map(|anchor| anchor.interval)
+        .collect::<Vec<_>>();
+    sum_merged_scoped_intervals(&intervals)
+}
+
+fn add_active_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+) {
+    let mut grouped: BTreeMap<String, Vec<ScopedInterval>> = BTreeMap::new();
+    for anchor in anchor_intervals(data, group_by) {
+        grouped
+            .entry(anchor.group_key)
+            .or_default()
+            .push(anchor.interval);
+    }
+    for (key, intervals) in grouped {
+        let secs = sum_merged_scoped_intervals(&intervals);
+        if secs > 0 {
+            rows.entry(key).or_default().active_secs += secs;
         }
     }
 }
@@ -1321,6 +1405,9 @@ fn notes(data: &StatsData) -> Vec<String> {
     notes.push(
         "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
     );
+    notes.push(
+        "ACTIVE estimates engaged human time as the union of windows around each submitted prompt, padded 60s before and 300s after. Idle attach and left-open watch sessions accrue no prompts, so ACTIVE discounts them. It is a floor (time spent only reading agent output between prompts is not counted) and is not bounded by HUMAN.".to_string(),
+    );
     notes
 }
 
@@ -1368,6 +1455,7 @@ enum StatsColumn {
     Foreground,
     Human,
     Thinking,
+    Active,
     AttentionEvents,
     TokenEstimate,
     Words,
@@ -1413,6 +1501,11 @@ const FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
         header: "HUMAN",
         width: 6,
         value: StatsColumn::Human,
+    },
+    StatsTableColumn {
+        header: "ACT",
+        width: 6,
+        value: StatsColumn::Active,
     },
     StatsTableColumn {
         header: "THINK",
@@ -1604,6 +1697,7 @@ fn stats_total_value(totals: &Totals, column: StatsColumn) -> String {
         StatsColumn::Foreground => totals.foreground.clone(),
         StatsColumn::Human => totals.human.clone(),
         StatsColumn::Thinking => totals.thinking.clone(),
+        StatsColumn::Active => totals.active.clone(),
         StatsColumn::AttentionEvents => totals.attention_events.to_string(),
         StatsColumn::TokenEstimate => totals.token_estimate.to_string(),
         StatsColumn::Words => totals.words.to_string(),
@@ -1619,7 +1713,7 @@ fn stats_column_tone(column: StatsColumn) -> TableTone {
         | StatsColumn::TokenEstimate
         | StatsColumn::Words
         | StatsColumn::AgentSessions => TableTone::Accent,
-        StatsColumn::Working | StatsColumn::LiveAgents => TableTone::Good,
+        StatsColumn::Working | StatsColumn::LiveAgents | StatsColumn::Active => TableTone::Good,
         StatsColumn::Waiting => TableTone::Warn,
         StatsColumn::Error => TableTone::Error,
         StatsColumn::Foreground => TableTone::Tmux,
@@ -1666,6 +1760,7 @@ fn stats_column_value(row: &GroupRow, column: StatsColumn) -> String {
         StatsColumn::Foreground => row.foreground.clone(),
         StatsColumn::Human => row.human.clone(),
         StatsColumn::Thinking => row.thinking.clone(),
+        StatsColumn::Active => row.active.clone(),
         StatsColumn::AttentionEvents => row.attention_events.to_string(),
         StatsColumn::TokenEstimate => row.token_estimate.to_string(),
         StatsColumn::Words => row.words.to_string(),
@@ -1746,6 +1841,7 @@ fn push_markdown_overview(out: &mut String, title: &str, doc: &StatsDocument) {
     push_metric(out, "Error time", &doc.totals.error);
     push_metric(out, "TMUX foreground", &doc.totals.foreground);
     push_metric(out, "Human presence", &doc.totals.human);
+    push_metric(out, "Active (engaged)", &doc.totals.active);
     push_metric(out, "Thinking", &doc.totals.thinking);
     push_metric(
         out,
@@ -1773,9 +1869,9 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         return;
     }
 
-    out.push_str("| Group | Prompts | Work | Wait | Error | TMUX | Human | Think | Block | Tok est | Words | Sessions | Agents | Last |\n");
+    out.push_str("| Group | Prompts | Work | Wait | Error | TMUX | Human | Active | Think | Block | Tok est | Words | Sessions | Agents | Last |\n");
     out.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
     );
     for row in rows {
         out.push_str("| ");
@@ -1792,6 +1888,8 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         out.push_str(&escape_markdown_cell(&row.foreground));
         out.push_str(" | ");
         out.push_str(&escape_markdown_cell(&row.human));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&row.active));
         out.push_str(" | ");
         out.push_str(&escape_markdown_cell(&row.thinking));
         out.push_str(" | ");
@@ -1992,6 +2090,53 @@ mod tests {
         let totals = build_totals(&d);
 
         assert_eq!(totals.waiting_secs, 1_800);
+    }
+
+    #[test]
+    fn active_excludes_idle_attach() {
+        let p1 = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "do a thing",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        let p2 = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "another",
+            datetime!(2026-05-30 10:33:00 UTC),
+        );
+        let mut d = data(vec![p1, p2]);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.pane_sessions.insert("%1".into(), "main".into());
+        // A two-hour tmux attach with no other activity inflates HUMAN but,
+        // having no anchoring action, must not inflate ACTIVE.
+        d.activity_entries = vec![ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+            HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxAttach,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 10:00:00 UTC),
+                ended_at: datetime!(2026-05-30 12:00:00 UTC),
+            },
+        ))];
+
+        let totals = build_totals(&d);
+
+        // Raw presence counts the whole attach.
+        assert_eq!(totals.human_secs, 7_200);
+        // Active = union of [t-60s, t+300s] around the two prompts (10:29–10:38).
+        assert_eq!(totals.active_secs, 540);
+        assert!(totals.active_secs < totals.human_secs);
     }
 
     #[test]
