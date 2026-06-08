@@ -1083,7 +1083,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  t              sort by state (ST)",
         "",
         "State markers",
-        "  ● working  ? input  ◆ choice  ! error  · idle  … starting  × stopped",
+        "  ● working  ◐ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped",
         "",
         "Quick actions (act on selected row)",
         "  c              copy last prompt to clipboard",
@@ -2031,11 +2031,11 @@ fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
 fn state_marker(state: AgentState, theme: WatchThemeSpec) -> (&'static str, Style) {
     let symbol = match state {
         AgentState::Working => "●",
-        AgentState::WaitingInput => "?",
+        AgentState::WaitingInput => "◐",
         AgentState::WaitingChoice => "◆",
-        AgentState::Error => "!",
-        AgentState::Idle => "·",
-        AgentState::Starting => "…",
+        AgentState::Error => "■",
+        AgentState::Idle => "○",
+        AgentState::Starting => "◌",
         AgentState::Stopped => "×",
     };
     (symbol, theme.state_style(state))
@@ -4509,6 +4509,23 @@ mod tests {
     use std::collections::HashMap;
     use time::OffsetDateTime;
 
+    #[test]
+    fn state_markers_are_single_cell() {
+        let theme = watch_theme(WatchTheme::Classic);
+        for state in [
+            AgentState::Working,
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+            AgentState::Idle,
+            AgentState::Starting,
+            AgentState::Stopped,
+        ] {
+            let (marker, _) = state_marker(state, theme);
+            assert_eq!(unicode_width::UnicodeWidthStr::width(marker), 1);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fake_agent(
         session: &str,
@@ -4887,7 +4904,7 @@ mod tests {
         };
         let text =
             WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
-        assert_eq!(plain_text(&text), "main  ! ? ●2 ·");
+        assert_eq!(plain_text(&text), "main  ■ ◐ ●2 ○");
     }
 
     #[test]
@@ -8503,7 +8520,7 @@ sort = ["state"]
                         \x20\x20t              sort by state (ST)\n\
                         \n\
                         State markers\n\
-                        \x20\x20● working  ? input  ◆ choice  ! error  · idle  … starting  × stopped\n\
+                        \x20\x20● working  ◐ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped\n\
                         \n\
                         Quick actions (act on selected row)\n\
                         \x20\x20c              copy last prompt to clipboard\n\

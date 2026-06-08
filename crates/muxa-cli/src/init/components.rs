@@ -87,7 +87,7 @@ impl Component {
     pub fn hint(self) -> &'static str {
         match self {
             Component::TmuxPopup => "drop-in replacement for tmux's choose-tree",
-            Component::TmuxStatusLine => "⚙ / · / ! per pane, refreshed every 2s",
+            Component::TmuxStatusLine => "● / ○ / ◐ per pane, refreshed every 2s",
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
             Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",

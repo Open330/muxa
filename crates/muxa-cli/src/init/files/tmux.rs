@@ -20,7 +20,7 @@ pub const POPUP_BODY: &str = r#"# Replace tmux's stock prefix+s (choose-tree) wi
 bind-key s display-popup -E -w 90% -h 85% "muxa watch""#;
 
 /// The body that goes inside the `tmux-statusline` marker block.
-pub const STATUSLINE_BODY: &str = r##"# Per-pane agent glyph (⚙ working / · idle / ! waiting / ✗ error)
+pub const STATUSLINE_BODY: &str = r##"# Per-pane agent glyph (● working / ○ idle / ◐ waiting / ■ error)
 set -g status-interval 2
 set -g status-right-length 140
 set -g status-right "#(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M""##;

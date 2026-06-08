@@ -7,7 +7,7 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
 │  NAME                   ST  ACT   LAST PROMPT                                                    │
-│> alpha:1.0              ?   <rel>approve permission?                                            │
+│> alpha:1.0              ◐   <rel>approve permission?                                            │
 │                                   ↳ approve permission?                                          │
 │                                                                                                  │
 │                                                                                                  │

@@ -901,7 +901,7 @@ async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
             let icon = state_icon(a.state);
             let kind = a.kind.to_string();
             // Prefer session:window when we can resolve it — makes the
-            // status-line read "⚙ main:2 claude_code" instead of a
+            // status-line read "● main:2 claude_code" instead of a
             // context-free glyph.
             // Resolve against the snapshot fetched once above instead
             // of shelling out per agent.
@@ -1055,13 +1055,13 @@ pub(crate) fn truncate_cell(value: &str, max_chars: usize) -> String {
 
 pub(crate) fn state_icon(state: AgentState) -> &'static str {
     match state {
-        AgentState::Working => "⚙",
-        AgentState::Idle => "·",
-        AgentState::WaitingInput => "!",
-        AgentState::WaitingChoice => "?",
-        AgentState::Error => "✗",
-        AgentState::Stopped => "∅",
-        AgentState::Starting => "…",
+        AgentState::Working => "●",
+        AgentState::Idle => "○",
+        AgentState::WaitingInput => "◐",
+        AgentState::WaitingChoice => "◆",
+        AgentState::Error => "■",
+        AgentState::Stopped => "×",
+        AgentState::Starting => "◌",
     }
 }
 
@@ -1390,6 +1390,21 @@ mod tests {
                 _ => panic!("expected {command} theme arg"),
             };
             assert_eq!(WatchTheme::from(theme), WatchTheme::HighContrast);
+        }
+    }
+
+    #[test]
+    fn status_line_icons_are_single_cell() {
+        for state in [
+            AgentState::Working,
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+            AgentState::Idle,
+            AgentState::Starting,
+            AgentState::Stopped,
+        ] {
+            assert_eq!(UnicodeWidthStr::width(state_icon(state)), 1);
         }
     }
 

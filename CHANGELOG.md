@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Legacy idle-prompt snapshots are normalized on restart** — previously
   persisted Claude rows whose only blocker was `Claude is waiting for your input`
   hydrate back to `Idle`, keeping `muxa watch` consistent with Codex rows.
+- **Status markers use balanced glyphs** — `muxa watch`, tmux status-line,
+  and webhook notifications now share single-cell geometric markers so idle,
+  waiting, working, and error states render at a consistent visual size.
 
 ## [0.8.5] - 2026-06-08
 

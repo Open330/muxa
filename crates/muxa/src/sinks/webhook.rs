@@ -414,13 +414,13 @@ fn format_message(transition: &Transition) -> String {
 /// their terminal — recognition memory is faster than reading.
 fn state_glyph(state: AgentState) -> &'static str {
     match state {
-        AgentState::Starting => "…",
-        AgentState::Working => "⚙",
-        AgentState::Idle => "·",
-        AgentState::WaitingInput => "!",
-        AgentState::WaitingChoice => "?",
-        AgentState::Error => "✗",
-        AgentState::Stopped => "■",
+        AgentState::Starting => "◌",
+        AgentState::Working => "●",
+        AgentState::Idle => "○",
+        AgentState::WaitingInput => "◐",
+        AgentState::WaitingChoice => "◆",
+        AgentState::Error => "■",
+        AgentState::Stopped => "×",
     }
 }
 
@@ -523,7 +523,7 @@ mod tests {
         let t = transition(AgentState::Working, AgentState::WaitingInput, a);
         assert_eq!(
             format_message(&t),
-            "⚙ → ! claude_code [main:2] needs input — \"do all\""
+            "● → ◐ claude_code [main:2] needs input — \"do all\""
         );
     }
 
@@ -534,7 +534,7 @@ mod tests {
         let t = transition(AgentState::Working, AgentState::Error, a);
         assert_eq!(
             format_message(&t),
-            "⚙ → ✗ codex [work:1] error — \"rate_limit\""
+            "● → ■ codex [work:1] error — \"rate_limit\""
         );
     }
 
