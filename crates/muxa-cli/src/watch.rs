@@ -1986,24 +1986,45 @@ const STATE_SUMMARY_ORDER: [AgentState; 7] = [
     AgentState::Stopped,
 ];
 
+const SESSION_STATE_GUTTER_WIDTH: usize = 6;
+const SESSION_STATE_GUTTER_CONTENT_WIDTH: usize = SESSION_STATE_GUTTER_WIDTH - 1;
+
+#[derive(Clone)]
+struct StateSummaryPart {
+    label: String,
+    style: Style,
+    count: usize,
+}
+
 fn state_summary_spans(
     states: impl IntoIterator<Item = AgentState>,
     theme: WatchThemeSpec,
 ) -> Vec<Span<'static>> {
-    let states: Vec<AgentState> = states.into_iter().collect();
-    if states.len() <= 1 {
-        return Vec::new();
-    }
+    state_summary_parts(states, theme)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, part)| {
+            let mut spans = Vec::with_capacity(2);
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(part.label, part.style));
+            spans
+        })
+        .collect()
+}
 
-    let mut spans = Vec::new();
+fn state_summary_parts(
+    states: impl IntoIterator<Item = AgentState>,
+    theme: WatchThemeSpec,
+) -> Vec<StateSummaryPart> {
+    let states: Vec<AgentState> = states.into_iter().collect();
+    let mut parts = Vec::new();
 
     for state in STATE_SUMMARY_ORDER {
         let count = states.iter().filter(|&&seen| seen == state).count();
         if count == 0 {
             continue;
-        }
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
         }
         let (symbol, style) = state_marker(state, theme);
         let label = if count == 1 {
@@ -2011,19 +2032,105 @@ fn state_summary_spans(
         } else {
             format!("{symbol}{count}")
         };
-        spans.push(Span::styled(label, style));
+        parts.push(StateSummaryPart {
+            label,
+            style,
+            count,
+        });
     }
 
+    parts
+}
+
+fn state_summary_parts_width(parts: &[StateSummaryPart]) -> usize {
+    let labels = parts
+        .iter()
+        .map(|part| unicode_width::UnicodeWidthStr::width(part.label.as_str()))
+        .sum::<usize>();
+    let spaces = parts.len().saturating_sub(1);
+    labels + spaces
+}
+
+fn overflow_label(count: usize, max_width: usize) -> String {
+    let label = format!("+{count}");
+    if unicode_width::UnicodeWidthStr::width(label.as_str()) <= max_width {
+        label
+    } else {
+        "+".to_string()
+    }
+}
+
+fn state_summary_gutter_spans(
+    states: impl IntoIterator<Item = AgentState>,
+    theme: WatchThemeSpec,
+) -> Vec<Span<'static>> {
+    let parts = state_summary_parts(states, theme);
+    let fitted = if state_summary_parts_width(&parts) <= SESSION_STATE_GUTTER_CONTENT_WIDTH {
+        parts
+    } else {
+        let total_count = parts.iter().map(|part| part.count).sum::<usize>();
+        let mut kept = Vec::new();
+        let mut omitted_count = total_count;
+
+        for (i, part) in parts.iter().enumerate() {
+            let remaining_count = parts[i + 1..].iter().map(|part| part.count).sum::<usize>();
+            let mut candidate = kept.clone();
+            candidate.push(part.clone());
+            let overflow_width = if remaining_count == 0 {
+                0
+            } else {
+                let separator = usize::from(!candidate.is_empty());
+                let label = overflow_label(remaining_count, SESSION_STATE_GUTTER_CONTENT_WIDTH);
+                separator + unicode_width::UnicodeWidthStr::width(label.as_str())
+            };
+            if state_summary_parts_width(&candidate) + overflow_width
+                <= SESSION_STATE_GUTTER_CONTENT_WIDTH
+            {
+                kept = candidate;
+                omitted_count = remaining_count;
+            } else {
+                break;
+            }
+        }
+
+        if omitted_count > 0 {
+            kept.push(StateSummaryPart {
+                label: overflow_label(omitted_count, SESSION_STATE_GUTTER_CONTENT_WIDTH),
+                style: theme.dim_style(),
+                count: omitted_count,
+            });
+        }
+        kept
+    };
+
+    let mut spans = state_summary_spans_from_parts(&fitted);
+    let width = spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    if width < SESSION_STATE_GUTTER_WIDTH {
+        spans.push(Span::raw(" ".repeat(SESSION_STATE_GUTTER_WIDTH - width)));
+    }
     spans
 }
 
+fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'static>> {
+    parts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, part)| {
+            let mut spans = Vec::with_capacity(2);
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(part.label.clone(), part.style));
+            spans
+        })
+        .collect()
+}
+
 fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
-    let mut spans = Vec::new();
-    let summary = state_summary_spans(s.agent_states.values().copied(), theme);
-    if !summary.is_empty() {
-        spans.extend(summary);
-        spans.push(Span::raw("  "));
-    }
+    let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme);
     spans.push(Span::raw(s.session.clone()));
 
     Text::from(Line::from(spans))
@@ -3779,6 +3886,17 @@ fn app_agent_states(app: &App) -> Vec<AgentState> {
     states
 }
 
+fn header_state_summary_spans(
+    states: Vec<AgentState>,
+    theme: WatchThemeSpec,
+) -> Vec<Span<'static>> {
+    if states.len() <= 1 {
+        Vec::new()
+    } else {
+        state_summary_spans(states, theme)
+    }
+}
+
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let agents = app
@@ -3800,7 +3918,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
     let agent_states = app_agent_states(app);
     let agent_total = agent_states.len();
-    let state_summary = state_summary_spans(agent_states, theme);
+    let state_summary = header_state_summary_spans(agent_states, theme);
 
     let mut spans = vec![
         Span::styled(theme.title, theme.accent_badge()),
@@ -4609,6 +4727,12 @@ mod tests {
             .collect()
     }
 
+    fn display_col_of(haystack: &str, needle: &str) -> Option<usize> {
+        haystack
+            .find(needle)
+            .map(|idx| unicode_width::UnicodeWidthStr::width(&haystack[..idx]))
+    }
+
     #[test]
     fn render_does_not_panic_on_test_backend() {
         let backend = TestBackend::new(140, 20);
@@ -4905,7 +5029,7 @@ mod tests {
         };
         let text =
             WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
-        assert_eq!(plain_text(&text), "■ ◐ ●2 ○  main");
+        assert_eq!(plain_text(&text), "■ +4  main");
     }
 
     #[test]
@@ -4951,7 +5075,7 @@ mod tests {
     }
 
     #[test]
-    fn session_view_suppresses_single_agent_state_summary() {
+    fn session_view_shows_single_agent_state_summary() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
             view: WatchView::Session,
@@ -4981,7 +5105,125 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
         );
-        assert_eq!(plain_text(&text), "main");
+        assert_eq!(plain_text(&text), "◐     main");
+    }
+
+    #[test]
+    fn session_view_state_gutter_keeps_names_aligned() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let mut multi_working = fake_agent_at("multi-working", "%1", now);
+        multi_working.state = AgentState::Working;
+        let mut multi_waiting = fake_agent_at("multi-waiting", "%2", now);
+        multi_waiting.state = AgentState::WaitingInput;
+        let mut single_idle = fake_agent_at("single-idle", "%3", now);
+        single_idle.state = AgentState::Idle;
+
+        app.set_data_with_sessions(
+            vec![multi_working, multi_waiting, single_idle],
+            vec![
+                fake_pane("%1", "multi", 0, 0, "claude"),
+                fake_pane("%2", "multi", 0, 1, "codex"),
+                fake_pane("%3", "single", 0, 0, "claude"),
+            ],
+            vec![
+                fake_session("$1", "multi", 1),
+                fake_session("$2", "single", 1),
+            ],
+            vec![],
+        );
+
+        let labels = app
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                WatchRow::Session(row) => {
+                    let text = WatchColumn::Pane.session_text(
+                        row,
+                        now,
+                        &app.panes,
+                        watch_theme(WatchTheme::Classic),
+                    );
+                    Some((row.session.as_str(), plain_text(&text)))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            display_col_of(&labels["multi"], "multi"),
+            Some(SESSION_STATE_GUTTER_WIDTH)
+        );
+        assert_eq!(
+            display_col_of(&labels["single"], "single"),
+            Some(SESSION_STATE_GUTTER_WIDTH)
+        );
+        assert_eq!(labels["multi"], "◐ ●   multi");
+        assert_eq!(labels["single"], "○     single");
+    }
+
+    #[test]
+    fn session_view_state_gutter_compresses_overflow_before_name() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let states = [
+            AgentState::Error,
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Working,
+            AgentState::Starting,
+            AgentState::Idle,
+            AgentState::Stopped,
+        ];
+        let agents = states
+            .into_iter()
+            .enumerate()
+            .map(|(i, state)| {
+                let mut agent = fake_agent_at(&format!("agent-{i}"), &format!("%{i}"), now);
+                agent.state = state;
+                agent
+            })
+            .collect::<Vec<_>>();
+        let panes = (0..states.len())
+            .map(|i| {
+                fake_pane(
+                    &format!("%{i}"),
+                    "crowded",
+                    0,
+                    u32::try_from(i).expect("fixture index fits u32"),
+                    "claude",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        app.set_data_with_sessions(
+            agents,
+            panes,
+            vec![fake_session("$1", "crowded", 1)],
+            vec![],
+        );
+
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        let text =
+            WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
+        let label = plain_text(&text);
+        assert_eq!(
+            display_col_of(&label, "crowded"),
+            Some(SESSION_STATE_GUTTER_WIDTH)
+        );
+        assert_eq!(label, "■ +6  crowded");
     }
 
     #[test]
