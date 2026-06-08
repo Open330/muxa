@@ -105,6 +105,11 @@ pub struct SessionInfo {
 
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
+    /// Stable identity of this client for its lifetime (tmux `#{client_name}`,
+    /// typically the controlling tty, e.g. `/dev/pts/3`). A reattach or an extra
+    /// client shows up as a *new* name, which lets input detection tell a fresh
+    /// attach apart from a keypress on an existing client.
+    pub name: String,
     /// Name of the session currently displayed by this tmux client.
     pub session: String,
     /// tmux control-mode clients are automation, not an interactive user
@@ -123,7 +128,8 @@ pub(crate) const PANE_FMT: &str =
     "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
-pub(crate) const CLIENT_FMT: &str = "#{client_session}\t#{client_control_mode}\t#{client_activity}";
+pub(crate) const CLIENT_FMT: &str =
+    "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -173,13 +179,14 @@ pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
     let mut clients = Vec::new();
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 2 || cols[0].is_empty() {
+        if cols.len() < 3 || cols[1].is_empty() {
             continue;
         }
         clients.push(ClientInfo {
-            session: cols[0].into(),
-            control_mode: matches!(cols[1].trim(), "1" | "true"),
-            last_activity: cols.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+            name: cols[0].into(),
+            session: cols[1].into(),
+            control_mode: matches!(cols[2].trim(), "1" | "true"),
+            last_activity: cols.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
         });
     }
     clients
@@ -447,13 +454,27 @@ mod tests {
 
     #[test]
     fn parses_client_lines() {
-        let stdout = "main\t0\nwork\t1\n\t0\n";
+        // name \t session \t control_mode \t client_activity
+        let stdout = "/dev/pts/0\tmain\t0\t1780900000\n\
+                      /dev/pts/1\twork\t1\t1780900050\n\
+                      /dev/pts/2\t\t0\t0\n";
         let clients = parse_client_lines(stdout);
+        // The third row has an empty session and is skipped.
         assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].name, "/dev/pts/0");
         assert_eq!(clients[0].session, "main");
         assert!(!clients[0].control_mode);
+        assert_eq!(clients[0].last_activity, 1_780_900_000);
         assert_eq!(clients[1].session, "work");
         assert!(clients[1].control_mode);
+    }
+
+    #[test]
+    fn parse_client_lines_tolerates_missing_activity_column() {
+        // Older tmux (no client_activity) still yields a valid row with epoch 0.
+        let clients = parse_client_lines("/dev/pts/0\tmain\t0\n");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].last_activity, 0);
     }
 
     #[test]

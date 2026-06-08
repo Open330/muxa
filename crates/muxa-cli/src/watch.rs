@@ -4495,7 +4495,6 @@ mod tests {
             total_attached_secs,
             attached_since,
             last_seen_at: OffsetDateTime::now_utc(),
-            last_input_at: None,
         }
     }
 

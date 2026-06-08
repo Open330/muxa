@@ -2294,7 +2294,6 @@ mod tests {
                 total_attached_secs: 60,
                 attached_since: None,
                 last_seen_at: datetime!(2026-05-30 11:00:00 UTC),
-                last_input_at: None,
             },
             SessionActivity {
                 session_id: "$monitor".into(),
@@ -2303,7 +2302,6 @@ mod tests {
                 total_attached_secs: 60,
                 attached_since: None,
                 last_seen_at: datetime!(2026-05-30 11:00:00 UTC),
-                last_input_at: None,
             },
         ];
 
