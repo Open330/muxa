@@ -910,14 +910,15 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
 }
 
 /// One active window for the last-touch sweep: the (possibly range-clipped)
-/// `[start, end)` span in whole unix seconds, the *unclipped* `anchor` second
-/// used only to rank recency, and the group key. Working in whole seconds (one
-/// truncation per endpoint) keeps the per-slice sweep and the grand total in
-/// exact agreement — summing fractional slice lengths would drift apart.
+/// `[start, end)` span in whole unix seconds, plus the *unclipped* `anchor`
+/// (nanoseconds, for ranking recency only) and the group key. The span is whole
+/// seconds — one truncation per endpoint — so the per-slice sweep and the grand
+/// total agree exactly; the anchor keeps nanosecond precision so two touches in
+/// the same second still order correctly.
 struct ActiveWindow {
     start: i64,
     end: i64,
-    anchor: i64,
+    anchor: i128,
     group_key: String,
 }
 
@@ -927,7 +928,7 @@ fn active_windows(data: &StatsData, group_by: GroupBy) -> Vec<ActiveWindow> {
         .map(|a| ActiveWindow {
             start: a.interval.started_at.unix_timestamp(),
             end: a.interval.ended_at.unix_timestamp(),
-            anchor: a.anchor.unix_timestamp(),
+            anchor: a.anchor.unix_timestamp_nanos(),
             group_key: a.group_key,
         })
         .collect()
@@ -981,8 +982,8 @@ fn last_touch_attribution(windows: &[ActiveWindow]) -> BTreeMap<String, u64> {
     }
     events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-    // Active windows as (anchor, index); the max element is the latest touch.
-    let mut active: BTreeSet<(i64, usize)> = BTreeSet::new();
+    // Active windows as (anchor_nanos, index); the max element is the latest touch.
+    let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
     let mut out: BTreeMap<String, u64> = BTreeMap::new();
     let mut i = 0;
     while i < events.len() {
@@ -2424,6 +2425,49 @@ mod tests {
         assert_eq!(secs("B"), 340);
         assert_eq!(secs("A"), 0);
         assert_eq!(build_totals(&d).active_secs, 340);
+    }
+
+    #[test]
+    fn last_touch_orders_subsecond_touches() {
+        // Two prompts in the same unix second; their windows clamp to identical
+        // whole-second spans, so only sub-second recency separates them. The
+        // anchor keeps nanosecond precision, so the later prompt wins even though
+        // history hands them over newest-first (which would otherwise tiebreak
+        // to the older one by index).
+        let mut newer = prompt(
+            AgentKind::Codex,
+            "agent-b",
+            "%2",
+            Some("/home/june/b"),
+            "y",
+            datetime!(2026-05-30 10:30:10.700 UTC),
+        );
+        newer.tmux_session = Some("B".into());
+        let mut older = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/a"),
+            "x",
+            datetime!(2026-05-30 10:30:10.100 UTC),
+        );
+        older.tmux_session = Some("A".into());
+        let mut d = data(vec![newer, older]); // newest-first
+        d.range = TimeRange {
+            label: "win".into(),
+            since_at: Some(datetime!(2026-05-30 10:30:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let secs = |key: &str| {
+            rows.iter()
+                .find(|r| r.key == key)
+                .map_or(0, |r| r.active_secs)
+        };
+        // Both span [10:30:00, 10:35:10] = 310s; the later (sub-second) prompt wins.
+        assert_eq!(secs("B"), 310);
+        assert_eq!(secs("A"), 0);
     }
 
     #[test]
