@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-06-08
+
 ### Added
 
 - **Engaged ("active") time estimate** — `muxa stats` and `muxa report` now
@@ -956,7 +958,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/Open330/muxa/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/Open330/muxa/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/Open330/muxa/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/Open330/muxa/compare/v0.8.0...v0.8.1
