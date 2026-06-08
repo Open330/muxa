@@ -122,14 +122,6 @@ const COMPACT_STATS_TABLE_WIDTH: usize = 76;
 const MIN_GROUP_COLUMN_WIDTH: usize = 7;
 const MAX_GROUP_COLUMN_WIDTH: usize = 36;
 
-/// Credit a little reading/thinking time *before* each human action when
-/// estimating engaged ("active") time.
-const ACTIVE_LOOKBACK: time::Duration = time::Duration::seconds(60);
-/// Idle timeout: a human action keeps the "active" clock running for this
-/// long afterward. Gaps between actions longer than this read as away, so a
-/// pane left attached for hours with no activity contributes ~nothing.
-const ACTIVE_TIMEOUT: time::Duration = time::Duration::seconds(300);
-
 impl GroupBy {
     fn as_str(self) -> &'static str {
         match self {
@@ -186,6 +178,10 @@ struct StatsData {
     pane_sessions: HashMap<String, String>,
     project_by_pane: HashMap<String, String>,
     project_by_agent_session: HashMap<String, String>,
+    /// Padding before each action when estimating ACTIVE time (`[stats]` config).
+    active_lookback: time::Duration,
+    /// Idle timeout after each action when estimating ACTIVE time.
+    active_timeout: time::Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -292,6 +288,11 @@ struct ScopedInterval {
 struct AttentionInterval {
     interval: ScopedInterval,
     group_key: String,
+    /// Recency time for last-touch attribution — the *unclipped* action moment
+    /// (prompt / tmux input / thinking start). Kept separate from
+    /// `interval.started_at`, which the range may clamp to the window boundary
+    /// (collapsing distinct starts to a tie); the anchor preserves true order.
+    anchor: OffsetDateTime,
 }
 
 async fn load_data(
@@ -348,9 +349,19 @@ async fn load_data(
         pane_sessions,
         project_by_pane,
         project_by_agent_session,
+        active_lookback: secs_to_duration(cfg.stats.active_lookback_secs),
+        active_timeout: secs_to_duration(cfg.stats.active_timeout_secs),
     };
     apply_exclusions(&mut data, exclusions);
     Ok(data)
+}
+
+/// Convert a config `u64` seconds value into a `time::Duration`, clamping the
+/// `> i64::MAX` case so the conversion itself can't panic. (A merely absurd
+/// multi-millennium value can still overflow later date arithmetic, but no sane
+/// `[stats]` setting reaches that.)
+fn secs_to_duration(secs: u64) -> time::Duration {
+    time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 fn apply_exclusions(data: &mut StatsData, exclusions: &ScopeExclusions) {
@@ -799,8 +810,9 @@ fn add_thinking_rows(
 /// Estimate engaged ("active") human time as the union of three signals, each
 /// discounting idle attach (the failure mode of raw `human` presence):
 ///
-/// 1. **Submitted prompts** — padded [`ACTIVE_LOOKBACK`] before / [`ACTIVE_TIMEOUT`]
-///    after each prompt. The unambiguous "I typed something" action.
+/// 1. **Submitted prompts** — padded `active_lookback` before / `active_timeout`
+///    after each prompt (both from `[stats]` config). The unambiguous "I typed
+///    something" action.
 /// 2. **tmux input ticks** (`HumanInteractionKind::TmuxInput`) — the daemon
 ///    records one whenever a client's `client_activity` advances (a keypress or
 ///    scroll), so *reading* while attached counts, not just typing. An idle
@@ -819,7 +831,7 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
     // (1) Submitted prompts. `data.prompts` is already clipped to the range, so
     // a prompt just outside a bounded `--since` whose padded window would poke
     // into the range is not credited — a bounded-edge undercount of at most
-    // ACTIVE_TIMEOUT per session, accepted to keep prompt counts range-exact.
+    // `active_timeout` per session, accepted to keep prompt counts range-exact.
     for prompt in &data.prompts {
         let session_name = prompt
             .tmux_session
@@ -827,8 +839,8 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
             .or_else(|| data.pane_sessions.get(&prompt.pane).cloned());
         if let Some(interval) = scoped_interval(
             data,
-            prompt.at - ACTIVE_LOOKBACK,
-            prompt.at + ACTIVE_TIMEOUT,
+            prompt.at - data.active_lookback,
+            prompt.at + data.active_timeout,
             Some(prompt.pane.clone()),
             session_name,
             &prompt.session_id,
@@ -836,6 +848,7 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
             intervals.push(AttentionInterval {
                 interval,
                 group_key: prompt_group_key(data, prompt, group_by),
+                anchor: prompt.at,
             });
         }
     }
@@ -857,15 +870,15 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
         }
         if let Some(interval) = scoped_interval(
             data,
-            entry.started_at - ACTIVE_LOOKBACK,
-            entry.ended_at + ACTIVE_TIMEOUT,
+            entry.started_at - data.active_lookback,
+            entry.ended_at + data.active_timeout,
             entry.pane.clone(),
             entry.session_name.clone(),
             entry.session_id.as_deref().unwrap_or("human_interaction"),
         ) {
             // Bucket by the tick's own time, not the padded window end — a tick
             // in the last 5m of a day must land on that day (like prompts keyed
-            // by `prompt.at`), not roll into the next via `+ACTIVE_TIMEOUT`.
+            // by `prompt.at`), not roll into the next via `+active_timeout`.
             let group_key = match group_by {
                 GroupBy::Day => Some(format_day(entry.ended_at)),
                 _ => human_presence_group_key(data, &interval, group_by),
@@ -874,6 +887,7 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
                 intervals.push(AttentionInterval {
                     interval,
                     group_key,
+                    anchor: entry.ended_at,
                 });
             }
         }
@@ -883,9 +897,11 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
     let presences = human_presence_intervals(data, true);
     for attention in attention_intervals(data, group_by) {
         for segment in overlapping_presence_segments(&attention.interval, &presences) {
+            let anchor = segment.started_at;
             intervals.push(AttentionInterval {
                 interval: segment,
                 group_key: attention.group_key.clone(),
+                anchor,
             });
         }
     }
@@ -893,32 +909,105 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
     intervals
 }
 
-fn active_secs_total(data: &StatsData) -> u64 {
-    let intervals = anchor_intervals(data, GroupBy::Session)
-        .into_iter()
-        .map(|anchor| anchor.interval)
-        .collect::<Vec<_>>();
-    sum_merged_scoped_intervals(&intervals)
+/// One active window for the last-touch sweep: the (possibly range-clipped)
+/// `[start, end)` span in whole unix seconds, plus the *unclipped* `anchor`
+/// (nanoseconds, for ranking recency only) and the group key. The span is whole
+/// seconds — one truncation per endpoint — so the per-slice sweep and the grand
+/// total agree exactly; the anchor keeps nanosecond precision so two touches in
+/// the same second still order correctly.
+struct ActiveWindow {
+    start: i64,
+    end: i64,
+    anchor: i128,
+    group_key: String,
 }
 
+fn active_windows(data: &StatsData, group_by: GroupBy) -> Vec<ActiveWindow> {
+    anchor_intervals(data, group_by)
+        .into_iter()
+        .map(|a| ActiveWindow {
+            start: a.interval.started_at.unix_timestamp(),
+            end: a.interval.ended_at.unix_timestamp(),
+            anchor: a.anchor.unix_timestamp_nanos(),
+            group_key: a.group_key,
+        })
+        .collect()
+}
+
+/// Grand-total ACTIVE: the wall-clock during which the human was engaged with
+/// *any* session. A human does one thing at a time, so this is the union of all
+/// active windows (overlaps counted once) — it does not multiply elapsed time
+/// when several agents are juggled at once. Equals the sum of the per-session
+/// `add_active_rows` shares (both run the same last-touch sweep).
+fn active_secs_total(data: &StatsData) -> u64 {
+    last_touch_attribution(&active_windows(data, GroupBy::Session))
+        .values()
+        .sum()
+}
+
+/// Per-group ACTIVE with cross-session de-duplication: every wall-clock instant
+/// is attributed to a single group via "last touch" — the active window with the
+/// most recent start covering it (whatever the human most recently acted on).
+/// The per-group values therefore sum to the de-duplicated total rather than
+/// over-counting overlapping windows from concurrent sessions.
 fn add_active_rows(
     data: &StatsData,
     group_by: GroupBy,
     rows: &mut BTreeMap<String, GroupAccumulator>,
 ) {
-    let mut grouped: BTreeMap<String, Vec<ScopedInterval>> = BTreeMap::new();
-    for anchor in anchor_intervals(data, group_by) {
-        grouped
-            .entry(anchor.group_key)
-            .or_default()
-            .push(anchor.interval);
-    }
-    for (key, intervals) in grouped {
-        let secs = sum_merged_scoped_intervals(&intervals);
+    for (key, secs) in last_touch_attribution(&active_windows(data, group_by)) {
         if secs > 0 {
             rows.entry(key).or_default().active_secs += secs;
         }
     }
+}
+
+/// Attribute each second of the union of `windows` to exactly one group key: the
+/// covering window with the latest `anchor` ("last touch" — whatever the human
+/// most recently acted on). Recency uses the unclipped `anchor`, not the span
+/// start, so windows clamped to the same range boundary still rank correctly.
+/// Returns seconds per group key; the values sum to the union of all windows
+/// (each second counted once), so a grand total taken as `values().sum()` never
+/// exceeds elapsed time.
+fn last_touch_attribution(windows: &[ActiveWindow]) -> BTreeMap<String, u64> {
+    // (time, is_end, window index). All events at a given instant are applied
+    // before the following slice is measured, so a window ending exactly as
+    // another starts hands off cleanly.
+    let mut events: Vec<(i64, bool, usize)> = Vec::new();
+    for (i, w) in windows.iter().enumerate() {
+        if w.end > w.start {
+            events.push((w.start, false, i));
+            events.push((w.end, true, i));
+        }
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    // Active windows as (anchor_nanos, index); the max element is the latest touch.
+    let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    let mut i = 0;
+    while i < events.len() {
+        let t = events[i].0;
+        while i < events.len() && events[i].0 == t {
+            let (_, is_end, idx) = events[i];
+            let key = (windows[idx].anchor, idx);
+            if is_end {
+                active.remove(&key);
+            } else {
+                active.insert(key);
+            }
+            i += 1;
+        }
+        if i < events.len() {
+            let secs = u64::try_from(events[i].0 - t).unwrap_or(0);
+            if secs > 0 {
+                if let Some(&(_, idx)) = active.iter().next_back() {
+                    *out.entry(windows[idx].group_key.clone()).or_default() += secs;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn add_state_transition_row(
@@ -1213,9 +1302,11 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
             session_name,
             &entry.session_id,
         ) {
+            let anchor = interval.started_at;
             intervals.push(AttentionInterval {
                 interval,
                 group_key: state_transition_group_key(data, entry, group_by),
+                anchor,
             });
         }
     }
@@ -1236,9 +1327,11 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
             session_name,
             &agent.session_id,
         ) {
+            let anchor = interval.started_at;
             intervals.push(AttentionInterval {
                 interval,
                 group_key: agent_group_key(data, agent, group_by),
+                anchor,
             });
         }
     }
@@ -1473,9 +1566,11 @@ fn notes(data: &StatsData) -> Vec<String> {
     notes.push(
         "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
     );
-    notes.push(
-        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded 60s before / 300s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). An idle attach advances none of these, so ACTIVE discounts it; it is not bounded by HUMAN.".to_string(),
-    );
+    notes.push(format!(
+        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded {lookback}s before / {timeout}s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). Overlapping windows across concurrent sessions are de-duplicated (last touch), so per-row ACTIVE sums to the total. An idle attach advances none of these, so ACTIVE discounts it; it is not bounded by HUMAN.",
+        lookback = data.active_lookback.whole_seconds().max(0),
+        timeout = data.active_timeout.whole_seconds().max(0),
+    ));
     notes
 }
 
@@ -2108,6 +2203,8 @@ mod tests {
             pane_sessions: HashMap::new(),
             project_by_pane: HashMap::new(),
             project_by_agent_session: HashMap::new(),
+            active_lookback: time::Duration::seconds(60),
+            active_timeout: time::Duration::seconds(300),
         }
     }
 
@@ -2239,6 +2336,164 @@ mod tests {
         // Window = [10:28:59, 10:35:00] around the 1s tick = 6m01s.
         assert_eq!(totals.active_secs, 361);
         assert!(totals.active_secs < totals.human_secs);
+    }
+
+    #[test]
+    fn active_dedups_overlapping_sessions_by_last_touch() {
+        // Two sessions whose padded windows overlap. A human does one thing at a
+        // time, so the overlap is counted once (total = union) and attributed to
+        // the most recently touched session (last-touch).
+        let mut a = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/a"),
+            "x",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        a.tmux_session = Some("A".into());
+        let mut b = prompt(
+            AgentKind::Codex,
+            "agent-b",
+            "%2",
+            Some("/home/june/b"),
+            "y",
+            datetime!(2026-05-30 10:33:00 UTC),
+        );
+        b.tmux_session = Some("B".into());
+        let mut d = data(vec![a, b]);
+        d.range = TimeRange {
+            label: "win".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+
+        // Windows: A [10:29,10:35], B [10:32,10:38]. Union = 540s (not 360+360).
+        let totals = build_totals(&d);
+        assert_eq!(totals.active_secs, 540);
+
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let secs = |key: &str| {
+            rows.iter()
+                .find(|r| r.key == key)
+                .map_or(0, |r| r.active_secs)
+        };
+        // Last touch: B started later (10:32), so it owns the [10:32,10:35] overlap.
+        assert_eq!(secs("A"), 180); // [10:29, 10:32)
+        assert_eq!(secs("B"), 360); // [10:32, 10:38)
+        assert_eq!(secs("A") + secs("B"), totals.active_secs);
+    }
+
+    #[test]
+    fn last_touch_uses_unclipped_anchor_at_range_boundary() {
+        // Two prompts within `active_lookback` of the range start, so both
+        // windows clamp to the same boundary (10:30:00). Recency must follow the
+        // *unclipped* prompt time, not the clipped span start — otherwise the
+        // overlap is mis-attributed by input order (history is newest-first).
+        // Prompts are passed newest-first to expose that ordering bug.
+        let mut newer = prompt(
+            AgentKind::Codex,
+            "agent-b",
+            "%2",
+            Some("/home/june/b"),
+            "y",
+            datetime!(2026-05-30 10:30:40 UTC),
+        );
+        newer.tmux_session = Some("B".into());
+        let mut older = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/a"),
+            "x",
+            datetime!(2026-05-30 10:30:10 UTC),
+        );
+        older.tmux_session = Some("A".into());
+        let mut d = data(vec![newer, older]); // newest-first, as history returns
+        d.range = TimeRange {
+            label: "win".into(),
+            since_at: Some(datetime!(2026-05-30 10:30:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let secs = |key: &str| {
+            rows.iter()
+                .find(|r| r.key == key)
+                .map_or(0, |r| r.active_secs)
+        };
+        // B's window [10:30:00, 10:35:40] (anchor 10:30:40) shadows A's
+        // [10:30:00, 10:35:10] (anchor 10:30:10), so B owns all 340s.
+        assert_eq!(secs("B"), 340);
+        assert_eq!(secs("A"), 0);
+        assert_eq!(build_totals(&d).active_secs, 340);
+    }
+
+    #[test]
+    fn last_touch_orders_subsecond_touches() {
+        // Two prompts in the same unix second; their windows clamp to identical
+        // whole-second spans, so only sub-second recency separates them. The
+        // anchor keeps nanosecond precision, so the later prompt wins even though
+        // history hands them over newest-first (which would otherwise tiebreak
+        // to the older one by index).
+        let mut newer = prompt(
+            AgentKind::Codex,
+            "agent-b",
+            "%2",
+            Some("/home/june/b"),
+            "y",
+            datetime!(2026-05-30 10:30:10.700 UTC),
+        );
+        newer.tmux_session = Some("B".into());
+        let mut older = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/a"),
+            "x",
+            datetime!(2026-05-30 10:30:10.100 UTC),
+        );
+        older.tmux_session = Some("A".into());
+        let mut d = data(vec![newer, older]); // newest-first
+        d.range = TimeRange {
+            label: "win".into(),
+            since_at: Some(datetime!(2026-05-30 10:30:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let secs = |key: &str| {
+            rows.iter()
+                .find(|r| r.key == key)
+                .map_or(0, |r| r.active_secs)
+        };
+        // Both span [10:30:00, 10:35:10] = 310s; the later (sub-second) prompt wins.
+        assert_eq!(secs("B"), 310);
+        assert_eq!(secs("A"), 0);
+    }
+
+    #[test]
+    fn active_window_respects_configured_padding() {
+        // The window size is driven by `[stats]` config, not a hardcoded const.
+        let p = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/a"),
+            "x",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        let mut d = data(vec![p]);
+        d.range = TimeRange {
+            label: "win".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.active_lookback = time::Duration::seconds(0);
+        d.active_timeout = time::Duration::seconds(120);
+
+        // Window = [10:30:00, 10:32:00] = 120s.
+        assert_eq!(build_totals(&d).active_secs, 120);
     }
 
     #[test]
