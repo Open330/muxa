@@ -541,7 +541,7 @@ impl WatchColumn {
         let dim = theme.dim_style().add_modifier(Modifier::DIM);
         let Some(agent) = s.latest_agent.as_ref() else {
             return match self {
-                Self::Pane => Text::from(session_label(s)),
+                Self::Pane => session_label(s, theme),
                 Self::Prompt => Text::from(Span::styled(
                     s.bare_summary.clone().unwrap_or_else(|| {
                         format!("{} pane{}", s.pane_count, plural(s.pane_count))
@@ -557,7 +557,7 @@ impl WatchColumn {
         };
 
         match self {
-            Self::Pane => Text::from(session_label(s)),
+            Self::Pane => session_label(s, theme),
             Self::Kind
             | Self::State
             | Self::Model
@@ -642,9 +642,9 @@ pub(crate) struct SessionRow {
     pub representative_pane: Option<String>,
     pub latest_agent: Option<Agent>,
     pub pane_count: usize,
-    pub agent_count: usize,
     pub bare_summary: Option<String>,
     pub activity: Option<SessionActivity>,
+    agent_states: HashMap<(AgentKind, String), AgentState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1859,15 +1859,20 @@ fn build_session_rows(
             } else {
                 None
             };
+            let agent_states = b
+                .agents
+                .iter()
+                .map(|agent| ((agent.kind, agent.session_id.clone()), agent.state))
+                .collect();
             SessionRow {
                 session: b.session,
                 pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
                 representative_pane,
                 latest_agent,
                 pane_count: b.panes.len(),
-                agent_count: b.agents.len(),
                 bare_summary,
                 activity: b.activity,
+                agent_states,
             }
         })
         .collect();
@@ -1972,12 +1977,56 @@ fn pane_display(pane_id: Option<&str>, panes: &[PaneInfo]) -> String {
     }
 }
 
-fn session_label(s: &SessionRow) -> String {
-    if s.agent_count > 1 {
-        format!("{} · {} agents", s.session, s.agent_count)
-    } else {
-        s.session.clone()
+const STATE_SUMMARY_ORDER: [AgentState; 7] = [
+    AgentState::Error,
+    AgentState::WaitingInput,
+    AgentState::WaitingChoice,
+    AgentState::Working,
+    AgentState::Starting,
+    AgentState::Idle,
+    AgentState::Stopped,
+];
+
+fn state_summary_spans(
+    states: impl IntoIterator<Item = AgentState>,
+    theme: WatchThemeSpec,
+) -> Vec<Span<'static>> {
+    let states: Vec<AgentState> = states.into_iter().collect();
+    if states.len() <= 1 {
+        return Vec::new();
     }
+
+    let mut spans = Vec::new();
+
+    for state in STATE_SUMMARY_ORDER {
+        let count = states.iter().filter(|&&seen| seen == state).count();
+        if count == 0 {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let (symbol, style) = state_marker(state, theme);
+        let label = if count == 1 {
+            symbol.to_string()
+        } else {
+            format!("{symbol}{count}")
+        };
+        spans.push(Span::styled(label, style));
+    }
+
+    spans
+}
+
+fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
+    let mut spans = vec![Span::raw(s.session.clone())];
+    let summary = state_summary_spans(s.agent_states.values().copied(), theme);
+    if !summary.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.extend(summary);
+    }
+
+    Text::from(Line::from(spans))
 }
 
 fn state_marker(state: AgentState, theme: WatchThemeSpec) -> (&'static str, Style) {
@@ -2253,31 +2302,35 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
         if s.session != session {
             continue;
         }
+        s.agent_states
+            .insert((agent.kind, agent.session_id.clone()), agent.state);
+        if let Some(pane) = agent.pane.as_ref() {
+            if !s.pane_ids.iter().any(|id| id == pane) {
+                s.pane_ids.push(pane.clone());
+            }
+        }
         let replace = s
             .latest_agent
             .as_ref()
             .is_none_or(|prior| agent.last_activity_at >= prior.last_activity_at);
         if replace {
             s.representative_pane = agent.pane.clone().or_else(|| s.representative_pane.clone());
-            if let Some(pane) = agent.pane.as_ref() {
-                if !s.pane_ids.iter().any(|id| id == pane) {
-                    s.pane_ids.push(pane.clone());
-                }
-            }
             s.latest_agent = Some(agent);
         }
         return;
     }
 
+    let mut agent_states = HashMap::new();
+    agent_states.insert((agent.kind, agent.session_id.clone()), agent.state);
     app.rows.push(WatchRow::Session(Box::new(SessionRow {
         session,
         pane_ids: agent.pane.clone().into_iter().collect(),
         representative_pane: agent.pane.clone(),
         latest_agent: Some(agent),
         pane_count: 0,
-        agent_count: 1,
         bare_summary: None,
         activity: None,
+        agent_states,
     })));
 }
 
@@ -3714,6 +3767,18 @@ fn push_section<'a>(out: &mut Vec<Line<'a>>, title: &str, body: Option<&'a str>)
     }
 }
 
+fn app_agent_states(app: &App) -> Vec<AgentState> {
+    let mut states = Vec::new();
+    for row in &app.rows {
+        match row {
+            WatchRow::Agent(agent) => states.push(agent.state),
+            WatchRow::Session(session) => states.extend(session.agent_states.values().copied()),
+            WatchRow::BarePane(_) => {}
+        }
+    }
+    states
+}
+
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let agents = app
@@ -3733,35 +3798,57 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         now.minute(),
         now.second()
     );
+    let agent_states = app_agent_states(app);
+    let agent_total = agent_states.len();
+    let state_summary = state_summary_spans(agent_states, theme);
 
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled(theme.title, theme.accent_badge()),
         Span::raw("  "),
-        Span::styled(
-            if app.watch_cfg.view == WatchView::Session {
-                format!("{} session{}", app.rows.len(), plural(app.rows.len()))
-            } else {
-                format!("{agents} agent{}", plural(agents))
-            },
+    ];
+
+    if app.watch_cfg.view == WatchView::Session {
+        spans.push(Span::styled(
+            format!("{} session{}", app.rows.len(), plural(app.rows.len())),
             Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            if app.watch_cfg.view == WatchView::Session {
-                format!("{agents} with agent{}", plural(agents))
-            } else {
-                format!("+ {bare} pane{}", plural(bare))
-            },
+        ));
+        spans.push(Span::raw("  "));
+        if state_summary.is_empty() {
+            spans.push(Span::styled(
+                format!("{agent_total} agent{}", plural(agent_total)),
+                theme.dim_style(),
+            ));
+        } else {
+            spans.extend(state_summary);
+        }
+    } else if state_summary.is_empty() {
+        spans.push(Span::styled(
+            format!("{agents} agent{}", plural(agents)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("+ {bare} pane{}", plural(bare)),
             theme.dim_style(),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!("sort {}", sort_label(&app.watch_cfg.sort)),
+        ));
+    } else {
+        spans.extend(state_summary);
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("+ {bare} pane{}", plural(bare)),
             theme.dim_style(),
-        ),
-        Span::raw("   "),
-        Span::styled(clock, theme.dim_style()),
-    ]);
+        ));
+    }
+
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(
+        format!("sort {}", sort_label(&app.watch_cfg.sort)),
+        theme.dim_style(),
+    ));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(clock, theme.dim_style()));
+
+    let title = Line::from(spans);
     let title = if app.refresh_pending {
         let mut spans = title.spans;
         spans.push(Span::raw("   "));
@@ -4498,6 +4585,13 @@ mod tests {
         }
     }
 
+    fn plain_text(text: &Text<'_>) -> String {
+        text.lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect()
+    }
+
     #[test]
     fn render_does_not_panic_on_test_backend() {
         let backend = TestBackend::new(140, 20);
@@ -4754,6 +4848,81 @@ mod tests {
             Some("new")
         );
         assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+    }
+
+    #[test]
+    fn session_view_label_summarizes_agent_states() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let mut working = fake_agent_at("working", "%1", now);
+        working.state = AgentState::Working;
+        let mut working_2 = fake_agent_at("working-2", "%5", now);
+        working_2.state = AgentState::Working;
+        let mut waiting = fake_agent_at("waiting", "%2", now);
+        waiting.state = AgentState::WaitingInput;
+        let mut idle = fake_agent_at("idle", "%3", now);
+        idle.state = AgentState::Idle;
+        let mut error = fake_agent_at("error", "%4", now);
+        error.state = AgentState::Error;
+
+        app.set_data_with_sessions(
+            vec![working, working_2, waiting, idle, error],
+            vec![
+                fake_pane("%1", "main", 0, 0, "claude"),
+                fake_pane("%2", "main", 0, 1, "codex"),
+                fake_pane("%3", "main", 0, 2, "gemini"),
+                fake_pane("%4", "main", 0, 3, "claude"),
+                fake_pane("%5", "main", 0, 4, "codex"),
+            ],
+            vec![fake_session("$1", "main", 1)],
+            vec![],
+        );
+
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        let text =
+            WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
+        assert_eq!(plain_text(&text), "main  ! ? ●2 ·");
+    }
+
+    #[test]
+    fn session_view_suppresses_single_agent_state_summary() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let mut agent = fake_agent_at("agent", "%1", now);
+        agent.state = AgentState::Idle;
+        app.set_data_with_sessions(
+            vec![agent.clone()],
+            vec![fake_pane("%1", "main", 0, 0, "claude")],
+            vec![fake_session("$1", "main", 1)],
+            vec![],
+        );
+
+        agent.state = AgentState::WaitingInput;
+        agent.last_activity_at = now + time::Duration::seconds(1);
+        apply_single_agent(&mut app, agent);
+
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        let text = WatchColumn::Pane.session_text(
+            row,
+            now + time::Duration::seconds(1),
+            &app.panes,
+            watch_theme(WatchTheme::Classic),
+        );
+        assert_eq!(plain_text(&text), "main");
     }
 
     #[test]

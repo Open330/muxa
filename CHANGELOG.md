@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-06-08
+
+### Changed
+
+- **`muxa watch` agent counts** — session rows and the watch header now summarize
+  multiple agents with the existing state glyphs instead of spelling out
+  `N agents`. Single-agent views keep the simpler `1 agent` / session-name
+  display, and one-off state counts omit the trailing `1` (for example,
+  `? ●2`).
+
 ## [0.8.4] - 2026-06-08
 
 ### Added
@@ -958,7 +968,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/Open330/muxa/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/Open330/muxa/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/Open330/muxa/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/Open330/muxa/compare/v0.8.1...v0.8.2
