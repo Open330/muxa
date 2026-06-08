@@ -2018,12 +2018,13 @@ fn state_summary_spans(
 }
 
 fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
-    let mut spans = vec![Span::raw(s.session.clone())];
+    let mut spans = Vec::new();
     let summary = state_summary_spans(s.agent_states.values().copied(), theme);
     if !summary.is_empty() {
-        spans.push(Span::raw("  "));
         spans.extend(summary);
+        spans.push(Span::raw("  "));
     }
+    spans.push(Span::raw(s.session.clone()));
 
     Text::from(Line::from(spans))
 }
@@ -4904,7 +4905,49 @@ mod tests {
         };
         let text =
             WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
-        assert_eq!(plain_text(&text), "main  ■ ◐ ●2 ○");
+        assert_eq!(plain_text(&text), "■ ◐ ●2 ○  main");
+    }
+
+    #[test]
+    fn session_view_state_summary_survives_long_session_name() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let session = "a-very-long-session-name-that-would-otherwise-eat-state-markers";
+        let mut working = fake_agent_at("working", "%1", now);
+        working.state = AgentState::Working;
+        let mut waiting = fake_agent_at("waiting", "%2", now);
+        waiting.state = AgentState::WaitingInput;
+        let mut idle = fake_agent_at("idle", "%3", now);
+        idle.state = AgentState::Idle;
+
+        app.set_data_with_sessions(
+            vec![working, waiting, idle],
+            vec![
+                fake_pane("%1", session, 0, 0, "claude"),
+                fake_pane("%2", session, 0, 1, "codex"),
+                fake_pane("%3", session, 0, 2, "gemini"),
+            ],
+            vec![fake_session("$1", session, 1)],
+            vec![],
+        );
+
+        let backend = TestBackend::new(64, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            screen.contains("◐ ● ○"),
+            "state summary should remain visible before a clipped long session name:\n{screen}"
+        );
     }
 
     #[test]

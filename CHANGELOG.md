@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-06-08
+
+### Fixed
+
+- **Session state markers stay visible with long names** — session view now
+  renders multi-agent state summaries before the session name, so narrow
+  columns or very long session names clip the name instead of hiding the
+  status markers.
+
 ## [0.8.6] - 2026-06-08
 
 ### Fixed
@@ -985,7 +994,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.7...HEAD
+[0.8.7]: https://github.com/Open330/muxa/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/Open330/muxa/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/Open330/muxa/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/Open330/muxa/compare/v0.8.3...v0.8.4
