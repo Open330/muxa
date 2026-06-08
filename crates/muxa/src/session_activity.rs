@@ -268,12 +268,13 @@ impl SessionActivityTracker {
             .map(|r| (r.session_id.clone(), r))
             .collect();
 
-        // Per-client (`#{client_name}`) last-seen `client_activity`, in memory
-        // only. A client we've seen before whose activity advances is real human
-        // input; a name we haven't is a fresh attach and only seeds. Cleared on
-        // restart, so the first poll after a restart seeds every client (no
-        // phantom input). Pruned each poll to the live client set.
-        let mut seen_clients: HashMap<String, i64> = HashMap::new();
+        // Per-client (`#{client_name}`) last-seen `(created, activity)`, in
+        // memory only. The same attach (matching `created`) whose activity
+        // advances is real human input; an unseen name, or the same tty with a
+        // new `created` (a reattach), is a fresh attach and only seeds. Cleared
+        // on restart (first poll seeds every client, no phantom). Pruned each
+        // poll to the live client set.
+        let mut seen_clients: HashMap<String, (i64, i64)> = HashMap::new();
         let mut tick = tokio::time::interval(self.interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -297,7 +298,7 @@ impl SessionActivityTracker {
     async fn poll_once(
         &self,
         records: &mut HashMap<String, SessionActivity>,
-        seen_clients: &mut HashMap<String, i64>,
+        seen_clients: &mut HashMap<String, (i64, i64)>,
     ) {
         let sample = tokio::task::spawn_blocking(sample_activity)
             .await
@@ -348,14 +349,16 @@ impl SessionActivityTracker {
     }
 }
 
-/// A single interactive tmux client's last-activity reading for this poll.
+/// A single interactive tmux client's reading for this poll.
 struct ClientInput {
     session_id: String,
     session_name: String,
-    /// Stable `#{client_name}` (tty), the per-client identity key.
+    /// `#{client_name}` (tty). Paired with `created` to identify one attach.
     name: String,
-    /// `#{client_activity}` unix epoch (seconds).
+    /// `#{client_activity}` unix epoch (seconds) — last keypress/scroll.
     epoch: i64,
+    /// `#{client_created}` unix epoch (seconds) — when this client attached.
+    created: i64,
 }
 
 /// One tmux poll: live sessions (with attached-client counts) plus the per-client
@@ -398,10 +401,10 @@ fn sample_activity() -> Result<ActivitySample, String> {
 }
 
 /// Build the per-client input readings for this poll: one entry per interactive
-/// client whose session is live, carrying the stable client name, its session
-/// id/name, and the `client_activity` epoch. Control-mode (automation) clients
-/// and unreported activity (`<= 0`) are dropped. Pure (no tmux) so it is tested
-/// directly.
+/// client whose session is live, carrying the client name + attach time, its
+/// session id/name, and the `client_activity` epoch. Control-mode (automation)
+/// clients and unreported activity (`<= 0`) are dropped. Pure (no tmux) so it is
+/// tested directly.
 fn client_inputs(sessions: &[SessionInfo], clients: &[tmux::ClientInfo]) -> Vec<ClientInput> {
     let id_by_name: HashMap<&str, &str> = sessions
         .iter()
@@ -418,30 +421,37 @@ fn client_inputs(sessions: &[SessionInfo], clients: &[tmux::ClientInfo]) -> Vec<
                 session_name: client.session.clone(),
                 name: client.name.clone(),
                 epoch: client.last_activity,
+                created: client.created,
             });
         }
     }
     out
 }
 
-/// Detect real human input by tracking each tmux client (`#{client_name}`)
-/// across polls. A client we've recorded before whose `client_activity` strictly
-/// advanced is a keypress/scroll; a client we haven't seen is a fresh attach
-/// (its `client_activity` is just the attach time) and is only seeded — so a
-/// reattach or an extra idle client never fabricates input. Emits at most one
-/// `TmuxInput` tick per session (at the latest advancing client's epoch).
-/// `seen` is updated to the current epochs and pruned to the live client set.
+/// Detect real human input by tracking each tmux client across polls, keyed by
+/// `#{client_name}` (the tty) and identified by `#{client_created}` (its attach
+/// time). Real input is the *same attach session* (matching `created`) whose
+/// `client_activity` strictly advanced — a keypress/scroll. A client we haven't
+/// seen, or the same tty with a newer `created` (a detach/reattach reusing the
+/// terminal), is a fresh attach whose `client_activity` is just the attach time;
+/// it only seeds the baseline. So neither a reattach (same or new tty) nor an
+/// extra idle client can fabricate input. Emits at most one `TmuxInput` tick per
+/// session (at the latest advancing client's epoch). `seen` is updated to the
+/// current `(created, activity)` and pruned to the live client set.
 fn detect_input_ticks(
-    seen: &mut HashMap<String, i64>,
+    seen: &mut HashMap<String, (i64, i64)>,
     inputs: &[ClientInput],
 ) -> Vec<HumanInteractionEntry> {
     // Per session id: (session name, latest epoch) among clients that advanced.
     let mut advanced: HashMap<&str, (&str, i64)> = HashMap::new();
     for input in inputs {
+        // Real input only when the same attach (matching `created`) advanced.
         let is_real = seen
             .get(&input.name)
-            .is_some_and(|&prev| input.epoch > prev);
-        seen.insert(input.name.clone(), input.epoch);
+            .is_some_and(|&(prev_created, prev_epoch)| {
+                input.created == prev_created && input.epoch > prev_epoch
+            });
+        seen.insert(input.name.clone(), (input.created, input.epoch));
         if is_real {
             let slot = advanced
                 .entry(&input.session_id)
@@ -551,6 +561,9 @@ mod tests {
         assert_eq!(record.attached_clients, 0);
     }
 
+    // Fixed attach time for helpers whose tests don't vary it (same attach).
+    const TEST_CREATED: i64 = 1_000;
+
     fn client(
         name: &str,
         session: &str,
@@ -562,6 +575,7 @@ mod tests {
             session: session.into(),
             control_mode,
             last_activity,
+            created: TEST_CREATED,
         }
     }
 
@@ -571,6 +585,7 @@ mod tests {
             session_name: session_name.into(),
             name: name.into(),
             epoch,
+            created: TEST_CREATED,
         }
     }
 
@@ -646,6 +661,36 @@ mod tests {
         // pts/3 returns at a much higher epoch: treated as new → seed, no emit.
         let e = detect_input_ticks(&mut seen, &[cinput("$1", "main", "/dev/pts/3", 999)]);
         assert!(e.is_empty(), "a returning (pruned) client reseeds");
+    }
+
+    #[test]
+    fn same_tty_reattach_does_not_emit() {
+        // A detach + reattach reusing the same tty between polls keeps the
+        // client_name but bumps client_created; the new client_activity is just
+        // the attach time. Keying on (name, created) treats it as a fresh attach
+        // → seed only, no phantom tick. A real keypress in the new attach emits.
+        let mut seen = HashMap::new();
+        let mk = |epoch: i64, created: i64| ClientInput {
+            session_id: "$1".into(),
+            session_name: "main".into(),
+            name: "/dev/pts/3".into(),
+            epoch,
+            created,
+        };
+
+        // Baseline: attach #1 (created 1000), last activity 1000.
+        detect_input_ticks(&mut seen, &[mk(1000, 1000)]);
+
+        // Reattach (created 1500), activity = attach time 1500, same tty.
+        let e = detect_input_ticks(&mut seen, &[mk(1500, 1500)]);
+        assert!(
+            e.is_empty(),
+            "an idle reattach reusing the tty must not emit"
+        );
+
+        // A genuine keypress within the new attach (same created 1500) emits.
+        let e = detect_input_ticks(&mut seen, &[mk(1600, 1500)]);
+        assert_eq!(e.len(), 1);
     }
 
     #[test]
