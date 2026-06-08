@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whenever it advances (a keypress or scroll), so *reading* while attached counts,
   not just typing; and `thinking` time (present while an agent is blocked on you).
   A pane left attached but untouched no longer balloons the figure the way raw
-  `human` presence does. `active` is not bounded by `human`.
+  `human` presence does. `active` is not bounded by `human`. In the terminal
+  table `ACT` takes the slot previously held by `WORDS` (kept in `--format json`
+  / `markdown`) so the full layout still fits a ~128-column terminal; the compact
+  layout shows `ACT` too.
 
 ## [0.8.3] - 2026-06-08
 
