@@ -1566,9 +1566,11 @@ fn notes(data: &StatsData) -> Vec<String> {
     notes.push(
         "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
     );
-    notes.push(
-        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded 60s before / 300s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). An idle attach advances none of these, so ACTIVE discounts it; it is not bounded by HUMAN.".to_string(),
-    );
+    notes.push(format!(
+        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded {lookback}s before / {timeout}s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). Overlapping windows across concurrent sessions are de-duplicated (last touch), so per-row ACTIVE sums to the total. An idle attach advances none of these, so ACTIVE discounts it; it is not bounded by HUMAN.",
+        lookback = data.active_lookback.whole_seconds().max(0),
+        timeout = data.active_timeout.whole_seconds().max(0),
+    ));
     notes
 }
 
