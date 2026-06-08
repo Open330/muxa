@@ -5,8 +5,8 @@ use comfy_table::{ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::{
-    ActivityEntry, Agent, Config, HistoryEntry, HumanInteractionKind, SessionActivity,
-    SessionForegroundEntry, StateTransitionEntry,
+    ActivityEntry, Agent, Config, HistoryEntry, HumanInteractionKind, ScopeExclusions,
+    SessionActivity, SessionForegroundEntry, StateTransitionEntry,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -19,7 +19,7 @@ use crate::{terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, last-week, 24h, 7d, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
     since: String,
 
@@ -44,6 +44,14 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     reverse: bool,
 
+    /// Exclude pane ids matching a glob. Repeat or comma-separate values.
+    #[arg(long = "exclude-pane", value_name = "GLOB", value_delimiter = ',')]
+    exclude_pane: Vec<String>,
+
+    /// Exclude tmux session names or ids matching a glob. Repeat or comma-separate values.
+    #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
+    exclude_session: Vec<String>,
+
     /// One-shot visual theme override for table output.
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
@@ -58,13 +66,21 @@ impl Args {
 
 #[derive(Debug, clap::Args)]
 pub struct ReportArgs {
-    /// Time window to include: today, yesterday, week, last-week, 24h, 7d, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
     since: String,
 
     /// Maximum rows per report section. Set 0 for all rows.
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    /// Exclude pane ids matching a glob. Repeat or comma-separate values.
+    #[arg(long = "exclude-pane", value_name = "GLOB", value_delimiter = ',')]
+    exclude_pane: Vec<String>,
+
+    /// Exclude tmux session names or ids matching a glob. Repeat or comma-separate values.
+    #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
+    exclude_session: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -126,7 +142,8 @@ impl GroupBy {
 }
 
 pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
-    let data = load_data(client, cfg, &args.since).await?;
+    let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
+    let data = load_data(client, cfg, &args.since, &exclusions).await?;
     let doc = build_document(&data, args.group_by, args.limit, args.sort, args.reverse);
     match args.format {
         OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
@@ -137,7 +154,8 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
 }
 
 pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Result<()> {
-    let data = load_data(client, cfg, &args.since).await?;
+    let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
+    let data = load_data(client, cfg, &args.since, &exclusions).await?;
     let docs = [
         build_document(&data, GroupBy::Day, args.limit, SortKey::Prompts, false),
         build_document(&data, GroupBy::Project, args.limit, SortKey::Prompts, false),
@@ -262,7 +280,12 @@ struct AttentionInterval {
     group_key: String,
 }
 
-async fn load_data(client: &Client, cfg: &Config, since: &str) -> Result<StatsData> {
+async fn load_data(
+    client: &Client,
+    cfg: &Config,
+    since: &str,
+    exclusions: &ScopeExclusions,
+) -> Result<StatsData> {
     let now = OffsetDateTime::now_utc();
     let range = parse_since(since, now)?;
 
@@ -301,7 +324,7 @@ async fn load_data(client: &Client, cfg: &Config, since: &str) -> Result<StatsDa
         }
     }
 
-    Ok(StatsData {
+    let mut data = StatsData {
         now,
         range,
         prompts,
@@ -311,7 +334,94 @@ async fn load_data(client: &Client, cfg: &Config, since: &str) -> Result<StatsDa
         pane_sessions,
         project_by_pane,
         project_by_agent_session,
-    })
+    };
+    apply_exclusions(&mut data, exclusions);
+    Ok(data)
+}
+
+fn apply_exclusions(data: &mut StatsData, exclusions: &ScopeExclusions) {
+    if exclusions.is_empty() {
+        return;
+    }
+
+    let pane_sessions = data.pane_sessions.clone();
+    data.prompts
+        .retain(|prompt| !prompt_excluded(exclusions, prompt, &pane_sessions));
+    data.activity_entries
+        .retain(|entry| !activity_entry_excluded(exclusions, entry, &pane_sessions));
+    data.agents
+        .retain(|agent| !agent_excluded(exclusions, agent, &pane_sessions));
+    data.activities
+        .retain(|activity| !session_activity_excluded(exclusions, activity));
+    data.project_by_pane.retain(|pane, _| {
+        !exclusions.excludes(
+            Some(pane),
+            None,
+            pane_sessions.get(pane).map(String::as_str),
+        )
+    });
+    data.project_by_agent_session
+        .retain(|session_id, _| !exclusions.excludes(None, Some(session_id), None));
+}
+
+fn prompt_excluded(
+    exclusions: &ScopeExclusions,
+    prompt: &HistoryEntry,
+    pane_sessions: &HashMap<String, String>,
+) -> bool {
+    let session_name = prompt
+        .tmux_session
+        .as_deref()
+        .or_else(|| pane_sessions.get(&prompt.pane).map(String::as_str));
+    exclusions.excludes(
+        Some(prompt.pane.as_str()),
+        Some(prompt.session_id.as_str()),
+        session_name,
+    )
+}
+
+fn activity_entry_excluded(
+    exclusions: &ScopeExclusions,
+    entry: &ActivityEntry,
+    pane_sessions: &HashMap<String, String>,
+) -> bool {
+    match entry {
+        ActivityEntry::StateTransition(entry) => {
+            let session_name = entry.session_name.as_deref().or_else(|| {
+                entry
+                    .pane
+                    .as_ref()
+                    .and_then(|pane| pane_sessions.get(pane))
+                    .map(String::as_str)
+            });
+            exclusions.excludes(entry.pane.as_deref(), Some(&entry.session_id), session_name)
+        }
+        ActivityEntry::SessionForeground(entry) => {
+            exclusions.excludes(None, Some(&entry.session_id), Some(&entry.session_name))
+        }
+        ActivityEntry::HumanInteraction(entry) => exclusions.excludes(
+            entry.pane.as_deref(),
+            entry.session_id.as_deref(),
+            entry.session_name.as_deref(),
+        ),
+    }
+}
+
+fn agent_excluded(
+    exclusions: &ScopeExclusions,
+    agent: &Agent,
+    pane_sessions: &HashMap<String, String>,
+) -> bool {
+    let session_name = agent
+        .pane
+        .as_ref()
+        .and_then(|pane| pane_sessions.get(pane))
+        .map(String::as_str);
+    exclusions.excludes(agent.pane.as_deref(), Some(&agent.session_id), session_name)
+}
+
+fn session_activity_excluded(exclusions: &ScopeExclusions, activity: &SessionActivity) -> bool {
+    exclusions.excludes(None, Some(&activity.session_id), Some(&activity.name))
 }
 
 async fn load_activity_entries(cfg: &Config) -> Vec<ActivityEntry> {
@@ -1882,6 +1992,97 @@ mod tests {
         let totals = build_totals(&d);
 
         assert_eq!(totals.waiting_secs, 1_800);
+    }
+
+    #[test]
+    fn scope_exclusions_remove_matching_source_data() {
+        let mut kept_prompt = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "ship",
+            datetime!(2026-05-30 11:00:00 UTC),
+        );
+        kept_prompt.tmux_session = Some("main".into());
+        let mut excluded_prompt = prompt(
+            AgentKind::Codex,
+            "agent-monitor",
+            "%monitor",
+            Some("/home/june/monitor"),
+            "watch",
+            datetime!(2026-05-30 11:01:00 UTC),
+        );
+        excluded_prompt.tmux_session = Some("monitoring".into());
+        let mut d = data(vec![kept_prompt, excluded_prompt]);
+        d.pane_sessions.insert("%1".into(), "main".into());
+        d.pane_sessions
+            .insert("%monitor".into(), "monitoring".into());
+        d.activity_entries = vec![
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-05-30 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::Idle,
+                state_entered_at: Some(datetime!(2026-05-30 11:00:00 UTC)),
+            })),
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-05-30 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-monitor".into(),
+                pane: Some("%monitor".into()),
+                session_name: Some("monitoring".into()),
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::Idle,
+                state_entered_at: Some(datetime!(2026-05-30 11:00:00 UTC)),
+            })),
+        ];
+        d.agents.push(live_agent(
+            AgentState::Working,
+            datetime!(2026-05-30 11:00:00 UTC),
+            Some("/home/june/monitor"),
+        ));
+        d.agents[0].session_id = "agent-monitor".into();
+        d.agents[0].pane = Some("%monitor".into());
+        d.activities = vec![
+            SessionActivity {
+                session_id: "$main".into(),
+                name: "main".into(),
+                attached_clients: 1,
+                total_attached_secs: 60,
+                attached_since: None,
+                last_seen_at: datetime!(2026-05-30 11:00:00 UTC),
+            },
+            SessionActivity {
+                session_id: "$monitor".into(),
+                name: "monitoring".into(),
+                attached_clients: 1,
+                total_attached_secs: 60,
+                attached_since: None,
+                last_seen_at: datetime!(2026-05-30 11:00:00 UTC),
+            },
+        ];
+
+        apply_exclusions(
+            &mut d,
+            &ScopeExclusions::new(vec!["%monitor*".into()], vec!["monitor*".into()]),
+        );
+
+        assert_eq!(d.prompts.len(), 1);
+        assert_eq!(d.prompts[0].tmux_session.as_deref(), Some("main"));
+        assert_eq!(d.activity_entries.len(), 1);
+        assert!(matches!(
+            &d.activity_entries[0],
+            ActivityEntry::StateTransition(entry) if entry.session_name.as_deref() == Some("main")
+        ));
+        assert!(d.agents.is_empty());
+        assert_eq!(d.activities.len(), 1);
+        assert_eq!(d.activities[0].name, "main");
     }
 
     #[test]

@@ -9,7 +9,9 @@
 muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
+muxa stats --since month --exclude-session 'monitor*'
 muxa report --since week
+muxa report --since last-month --exclude-pane '%42'
 muxa timeline --since today --session main
 muxa activity --since today --type human
 muxa activity --since today --type agent --format json
@@ -20,8 +22,10 @@ muxa activity --since today --type agent --format json
 - `today`: 로컬 날짜 기준 오늘 00:00부터 현재까지.
 - `yesterday`: 로컬 날짜 기준 어제 00:00부터 오늘 00:00 전까지.
 - `week`: 현재 시각 기준 최근 7일.
+- `month`: 현재 시각 기준 최근 30일.
 - `last-week`, `"last week"`: 로컬 날짜 기준 저번주 월요일 00:00부터 이번주 월요일 00:00 전까지.
-- `24h`, `7d`, `4w`: rolling duration.
+- `last-month`, `"last month"`: 로컬 날짜 기준 이전 달 1일 00:00부터 이번 달 1일 00:00 전까지.
+- `24h`, `7d`, `4w`, `30d`: rolling duration.
 - `YYYY-MM-DD`: 로컬 날짜 기준 해당 하루.
 - RFC3339 timestamp: 해당 시각 이후 전체.
 - `all`: 보관 중인 모든 ledger entry.
@@ -37,6 +41,11 @@ muxa stats --since today --sort wait              # 대기 시간이 긴 순
 muxa stats --since today --sort work --reverse    # 작업 시간이 짧은 순
 muxa stats --since today --group-by session --sort name
 ```
+
+계속 켜둔 monitoring scope는 `--exclude-pane`, `--exclude-session`으로 rows와
+totals에서 모두 제외할 수 있습니다. 값은 반복하거나 comma-separated로 줄 수
+있고, 패턴은 case-sensitive이며 `*`, `?` wildcard를 지원합니다. 예:
+`--exclude-session 'monitor*'`.
 
 `--sort` 는 다음 값을 받습니다: `prompts`, `work`, `wait`, `err`, `tmux`,
 `human`, `think`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
@@ -54,6 +63,7 @@ foreground lane을 보여줍니다. focus view는 선택한 lane을 timestamped 
 ```bash
 muxa timeline --since today
 muxa timeline --since today --session main
+muxa timeline --since today --exclude-session 'monitor*'
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w

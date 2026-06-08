@@ -100,6 +100,8 @@ muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
 muxa report --since last-week
 muxa timeline --since today --session main
+muxa timeline --since today --exclude-session 'monitor*'
+muxa stats --since month --exclude-pane '%42' --exclude-session 'monitor*'
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w
 muxa timeline --day 2026-06-06
@@ -107,11 +109,17 @@ muxa activity --since today --type human
 ```
 
 `--since` accepts `today`, `yesterday`, `week` for a rolling 7-day window,
-`last-week` / `"last week"` for the previous Monday-Sunday calendar week,
-rolling durations like `24h`/`7d`/`4w`, local dates like `2026-06-06`,
-RFC3339 timestamps, and `all`. See
+`month` for a rolling 30-day window, `last-week` / `"last week"` for the
+previous Monday-Sunday calendar week, `last-month` / `"last month"` for the
+previous calendar month, rolling durations like `24h`/`7d`/`4w`, local dates
+like `2026-06-06`, RFC3339 timestamps, and `all`. See
 [docs/ACTIVITY.md](docs/ACTIVITY.md) for ledger semantics, including
 `HUMAN` and `THINK`.
+
+`muxa stats`, `muxa report`, and `muxa timeline` also accept
+`--exclude-pane` and `--exclude-session` for long-lived monitoring scopes.
+Patterns are case-sensitive and support `*` and `?`, e.g.
+`--exclude-session 'monitor*'`.
 
 ## Supported Agents
 

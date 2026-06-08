@@ -5,6 +5,7 @@
 
 use crate::activity::{ActivityEntry, HumanInteractionKind};
 use crate::event::{AgentKind, AgentState};
+use crate::scope_filter::ScopeExclusions;
 use crate::session_activity::SessionActivity;
 use crate::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,7 @@ pub struct TimelineTotals {
 pub struct TimelineFilters {
     pub session: Option<String>,
     pub agent_kind: Option<AgentKind>,
+    pub exclusions: ScopeExclusions,
 }
 
 pub struct TimelineBuildInput<'a> {
@@ -457,7 +459,7 @@ pub fn parse_since(
     all_label: &str,
 ) -> Result<TimelineRange, String> {
     let trimmed = raw.trim();
-    let normalized = trimmed.to_ascii_lowercase().replace(['-', ' '], "_");
+    let normalized = normalize_since(trimmed);
     if normalized == "all" {
         return Ok(TimelineRange {
             label: all_label.to_string(),
@@ -467,7 +469,9 @@ pub fn parse_since(
     }
 
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    if let Some(date) = parse_iso_date(trimmed)? {
+    if let Some(date) =
+        parse_iso_date(trimmed).map_err(|error| format!("{error}\n{}", since_help()))?
+    {
         let next = date
             .next_day()
             .ok_or_else(|| "could not compute next date".to_string())?;
@@ -478,42 +482,8 @@ pub fn parse_since(
         });
     }
 
-    match normalized.as_str() {
-        "today" | "tod" => {
-            let start = local_day_start(now.to_offset(offset).date(), offset);
-            return Ok(TimelineRange {
-                label: "today".to_string(),
-                since_at: Some(start),
-                until_at: None,
-            });
-        }
-        "yesterday" | "yday" => {
-            let today = now.to_offset(offset).date();
-            let yesterday = today
-                .previous_day()
-                .ok_or_else(|| "could not compute yesterday date".to_string())?;
-            return Ok(TimelineRange {
-                label: "yesterday".to_string(),
-                since_at: Some(local_day_start(yesterday, offset)),
-                until_at: Some(local_day_start(today, offset)),
-            });
-        }
-        "last_week" | "lastweek" | "previous_week" | "previousweek" | "prev_week" | "prevweek" => {
-            let (since_at, until_at) = previous_calendar_week(now, offset)?;
-            return Ok(TimelineRange {
-                label: "last week".to_string(),
-                since_at: Some(since_at),
-                until_at: Some(until_at),
-            });
-        }
-        "week" | "last7d" | "last_7d" | "7days" => {
-            return Ok(TimelineRange {
-                label: "last 7d".to_string(),
-                since_at: Some(now - time::Duration::days(7)),
-                until_at: None,
-            });
-        }
-        _ => {}
+    if let Some(range) = parse_keyword_since(&normalized, now, offset)? {
+        return Ok(range);
     }
 
     if let Ok(at) = OffsetDateTime::parse(trimmed, &Rfc3339) {
@@ -524,19 +494,84 @@ pub fn parse_since(
         });
     }
     if trimmed.is_empty() {
-        return Err("--since must be today, yesterday, week, last-week, a date like 2026-06-06, a duration like 7d, an RFC3339 timestamp, or all".to_string());
+        return Err(invalid_since_value(trimmed));
     }
 
-    let unit = trimmed.chars().last().ok_or_else(|| {
-        "--since must be today, yesterday, week, last-week, a date like 2026-06-06, a duration like 7d, an RFC3339 timestamp, or all"
-            .to_string()
-    })?;
+    parse_duration_since(trimmed, now)
+}
+
+fn normalize_since(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn parse_keyword_since(
+    normalized: &str,
+    now: OffsetDateTime,
+    offset: UtcOffset,
+) -> Result<Option<TimelineRange>, String> {
+    match normalized {
+        "today" | "tod" => {
+            let start = local_day_start(now.to_offset(offset).date(), offset);
+            Ok(Some(TimelineRange {
+                label: "today".to_string(),
+                since_at: Some(start),
+                until_at: None,
+            }))
+        }
+        "yesterday" | "yday" => {
+            let today = now.to_offset(offset).date();
+            let yesterday = today
+                .previous_day()
+                .ok_or_else(|| "could not compute yesterday date".to_string())?;
+            Ok(Some(TimelineRange {
+                label: "yesterday".to_string(),
+                since_at: Some(local_day_start(yesterday, offset)),
+                until_at: Some(local_day_start(today, offset)),
+            }))
+        }
+        "last_week" | "lastweek" | "previous_week" | "previousweek" | "prev_week" | "prevweek" => {
+            let (since_at, until_at) = previous_calendar_week(now, offset)?;
+            Ok(Some(TimelineRange {
+                label: "last week".to_string(),
+                since_at: Some(since_at),
+                until_at: Some(until_at),
+            }))
+        }
+        "last_month" | "lastmonth" | "previous_month" | "previousmonth" | "prev_month"
+        | "prevmonth" => {
+            let (since_at, until_at) = previous_calendar_month(now, offset)?;
+            Ok(Some(TimelineRange {
+                label: "last month".to_string(),
+                since_at: Some(since_at),
+                until_at: Some(until_at),
+            }))
+        }
+        "week" | "last7d" | "last_7d" | "7days" => Ok(Some(TimelineRange {
+            label: "last 7d".to_string(),
+            since_at: Some(now - time::Duration::days(7)),
+            until_at: None,
+        })),
+        "month" | "last30d" | "last_30d" | "30days" => Ok(Some(TimelineRange {
+            label: "last 30d".to_string(),
+            since_at: Some(now - time::Duration::days(30)),
+            until_at: None,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn parse_duration_since(trimmed: &str, now: OffsetDateTime) -> Result<TimelineRange, String> {
+    let unit = trimmed
+        .chars()
+        .last()
+        .ok_or_else(|| invalid_since_value(trimmed))?;
     let number = &trimmed[..trimmed.len() - unit.len_utf8()];
-    let amount: i64 = number
-        .parse()
-        .map_err(|_| format!("invalid --since duration {trimmed:?}"))?;
+    let amount: i64 = number.parse().map_err(|_| invalid_since_value(trimmed))?;
     if amount <= 0 {
-        return Err("--since duration must be greater than zero".to_string());
+        return Err(format!(
+            "invalid --since duration {trimmed:?}: amount must be greater than zero\n{}",
+            since_help()
+        ));
     }
     let duration = match unit {
         's' => time::Duration::seconds(amount),
@@ -544,7 +579,12 @@ pub fn parse_since(
         'h' => time::Duration::hours(amount),
         'd' => time::Duration::days(amount),
         'w' => time::Duration::weeks(amount),
-        _ => return Err("--since duration unit must be one of s, m, h, d, w".to_string()),
+        _ => {
+            return Err(format!(
+                "invalid --since duration {trimmed:?}: unit must be one of s, m, h, d, w\n{}",
+                since_help()
+            ));
+        }
     };
 
     Ok(TimelineRange {
@@ -734,6 +774,9 @@ fn matches_session_filter(
     session_name: Option<&str>,
     pane: Option<&str>,
 ) -> bool {
+    if filters.exclusions.excludes(pane, session_id, session_name) {
+        return false;
+    }
     let Some(filter) = filters.session.as_deref().filter(|s| !s.is_empty()) else {
         return true;
     };
@@ -820,6 +863,18 @@ fn local_day_start(date: Date, offset: UtcOffset) -> OffsetDateTime {
     date.midnight().assume_offset(offset)
 }
 
+fn invalid_since_value(raw: &str) -> String {
+    if raw.is_empty() {
+        format!("missing --since value\n{}", since_help())
+    } else {
+        format!("unsupported --since value {raw:?}\n{}", since_help())
+    }
+}
+
+fn since_help() -> &'static str {
+    "supported --since values:\n  keywords: today, yesterday, week (rolling 7d), month (rolling 30d), last-week / \"last week\", last-month / \"last month\", all\n  durations: 24h, 7d, 4w, 30d (units: s, m, h, d, w)\n  dates: 2026-06-06\n  timestamps: 2026-06-06T09:00:00+09:00"
+}
+
 fn previous_calendar_week(
     now: OffsetDateTime,
     offset: UtcOffset,
@@ -830,6 +885,26 @@ fn previous_calendar_week(
         local_day_start(previous_week_start, offset),
         local_day_start(current_week_start, offset),
     ))
+}
+
+fn previous_calendar_month(
+    now: OffsetDateTime,
+    offset: UtcOffset,
+) -> Result<(OffsetDateTime, OffsetDateTime), String> {
+    let current_month_start = month_start(now.to_offset(offset).date())?;
+    let previous_month_anchor = current_month_start
+        .previous_day()
+        .ok_or_else(|| "could not compute previous month date".to_string())?;
+    let previous_month_start = month_start(previous_month_anchor)?;
+    Ok((
+        local_day_start(previous_month_start, offset),
+        local_day_start(current_month_start, offset),
+    ))
+}
+
+fn month_start(date: Date) -> Result<Date, String> {
+    Date::from_calendar_date(date.year(), date.month(), 1)
+        .map_err(|_| "could not compute month start date".to_string())
 }
 
 fn week_start_monday(mut date: Date) -> Result<Date, String> {
@@ -1019,6 +1094,58 @@ mod tests {
     }
 
     #[test]
+    fn scope_exclusions_drop_matching_lanes() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let entries = [
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-06-05 11:00:00 UTC)),
+            })),
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-monitor".into(),
+                pane: Some("%2".into()),
+                session_name: Some("monitoring".into()),
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-06-05 11:00:00 UTC)),
+            })),
+        ];
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            filters: TimelineFilters {
+                session: None,
+                agent_kind: None,
+                exclusions: ScopeExclusions::new(Vec::new(), vec!["monitor*".into()]),
+            },
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.lanes.len(), 1);
+        assert_eq!(doc.lanes[0].session_name.as_deref(), Some("main"));
+        assert_eq!(doc.totals.working_secs, 600);
+    }
+
+    #[test]
     fn parse_since_accepts_iso_date_as_single_day() {
         let range = parse_since(
             "2026-06-05",
@@ -1051,12 +1178,70 @@ mod tests {
     }
 
     #[test]
+    fn parse_since_accepts_month_as_rolling_thirty_days() {
+        let range = parse_since(
+            "month",
+            datetime!(2026-06-08 12:00:00 UTC),
+            "all retained activity",
+        )
+        .unwrap();
+
+        assert_eq!(range.label, "last 30d");
+        assert_eq!(range.since_at, Some(datetime!(2026-05-09 12:00:00 UTC)));
+        assert_eq!(range.until_at, None);
+    }
+
+    #[test]
+    fn parse_since_accepts_previous_calendar_month() {
+        let range = parse_since(
+            "last-month",
+            datetime!(2026-06-08 09:30:00 +9),
+            "all retained activity",
+        )
+        .unwrap();
+
+        assert_eq!(range.label, "last month");
+        assert_eq!(range.since_at, Some(datetime!(2026-05-01 00:00:00 +9)));
+        assert_eq!(range.until_at, Some(datetime!(2026-06-01 00:00:00 +9)));
+    }
+
+    #[test]
     fn previous_calendar_week_uses_monday_boundaries() {
         let (since_at, until_at) =
             previous_calendar_week(datetime!(2026-06-08 09:30:00 +9), offset!(+9)).unwrap();
 
         assert_eq!(since_at, datetime!(2026-06-01 00:00:00 +9));
         assert_eq!(until_at, datetime!(2026-06-08 00:00:00 +9));
+    }
+
+    #[test]
+    fn invalid_since_value_lists_supported_values() {
+        let error = parse_since(
+            "quarter",
+            datetime!(2026-06-08 12:00:00 UTC),
+            "all retained activity",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("unsupported --since value \"quarter\""));
+        assert!(error.contains("supported --since values:"));
+        assert!(error.contains("last-week"));
+        assert!(error.contains("month (rolling 30d)"));
+        assert!(error.contains("24h, 7d, 4w, 30d"));
+    }
+
+    #[test]
+    fn invalid_since_duration_unit_lists_supported_values() {
+        let error = parse_since(
+            "1y",
+            datetime!(2026-06-08 12:00:00 UTC),
+            "all retained activity",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid --since duration \"1y\""));
+        assert!(error.contains("unit must be one of s, m, h, d, w"));
+        assert!(error.contains("supported --since values:"));
     }
 
     #[test]

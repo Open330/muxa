@@ -9,7 +9,9 @@
 muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
+muxa stats --since month --exclude-session 'monitor*'
 muxa report --since week
+muxa report --since last-month --exclude-pane '%42'
 muxa timeline --since today --session main
 muxa activity --since today --type human
 muxa activity --since today --type agent --format json
@@ -20,8 +22,10 @@ muxa activity --since today --type agent --format json
 - `today`: local calendar day from 00:00 to now.
 - `yesterday`: previous local calendar day, 00:00 to 00:00.
 - `week`: rolling last 7 days.
+- `month`: rolling last 30 days.
 - `last-week`, `"last week"`: previous local Monday-Sunday calendar week.
-- `24h`, `7d`, `4w`: rolling durations.
+- `last-month`, `"last month"`: previous local calendar month.
+- `24h`, `7d`, `4w`, `30d`: rolling durations.
 - `YYYY-MM-DD`: one local calendar day.
 - RFC3339 timestamp: everything since that instant.
 - `all`: all retained ledger entries.
@@ -37,6 +41,11 @@ muxa stats --since today --sort wait              # longest waiting first
 muxa stats --since today --sort work --reverse    # least working first
 muxa stats --since today --group-by session --sort name
 ```
+
+Use `--exclude-pane` and `--exclude-session` to remove long-lived monitoring
+scopes from both rows and totals. Values can be repeated or comma-separated;
+patterns are case-sensitive and support `*` and `?`, e.g.
+`--exclude-session 'monitor*'`.
 
 `--sort` accepts: `prompts`, `work`, `wait`, `err`, `tmux`, `human`,
 `think`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
@@ -55,6 +64,7 @@ timestamped intervals.
 ```bash
 muxa timeline --since today
 muxa timeline --since today --session main
+muxa timeline --since today --exclude-session 'monitor*'
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w

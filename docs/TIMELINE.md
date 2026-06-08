@@ -9,6 +9,7 @@ the same duration data used by `muxa stats` and `muxa report`.
 ```bash
 muxa timeline --since today
 muxa timeline --since today --session main
+muxa timeline --since today --exclude-session 'monitor*'
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind
 muxa timeline --since today --sort waiting
@@ -29,9 +30,11 @@ The default overview is grouped by tmux session. Each session group can show:
 
 | Option | Values |
 | --- | --- |
-| `--since` | `today`, `yesterday`, `week` for rolling 7 days, `last-week` / `"last week"` for the previous Monday-Sunday calendar week, rolling durations like `24h`/`7d`/`4w`, local dates like `2026-06-06`, RFC3339 timestamps, or `all`. |
+| `--since` | `today`, `yesterday`, `week` for rolling 7 days, `month` for rolling 30 days, `last-week` / `"last week"` for the previous Monday-Sunday calendar week, `last-month` / `"last month"` for the previous calendar month, rolling durations like `24h`/`7d`/`4w`, local dates like `2026-06-06`, RFC3339 timestamps, or `all`. |
 | `--day` | Shortcut for one local calendar day, e.g. `--day 2026-06-06`. |
 | `--session` | tmux session name, tmux session id, or pane id. |
+| `--exclude-pane` | Drop pane ids matching a case-sensitive glob. Repeat or comma-separate values. |
+| `--exclude-session` | Drop tmux session names or ids matching a case-sensitive glob. Repeat or comma-separate values. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
 | `--view` | `timeline` default, or `heatmap` for a terminal contribution-map summary. |
 | `--group-by` | `session` default, `kind`, or `flat`. TUI only. |
@@ -88,4 +91,4 @@ lanes by session by default. It also renders a daily contribution-map style
 heatmap above the lane graph; click a day to drill into that calendar day.
 Use the dashboard when you want a persistent browser view; use
 `muxa timeline` when you want keyboard navigation, focus view, terminal
-heatmaps, and terminal-native JSON export.
+heatmaps, terminal-native JSON export, and scope exclusions.

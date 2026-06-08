@@ -99,17 +99,25 @@ muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
 muxa report --since last-week
 muxa timeline --since today --session main
+muxa timeline --since today --exclude-session 'monitor*'
+muxa stats --since month --exclude-pane '%42' --exclude-session 'monitor*'
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w
 muxa timeline --day 2026-06-06
 muxa activity --since today --type human
 ```
 
-`--since`는 `today`, `yesterday`, 최근 7일 rolling window인 `week`,
-저번주 월요일-일요일 구간인 `last-week` / `"last week"`, `24h`/`7d`/`4w`
+`--since`는 `today`, `yesterday`, 최근 7일 rolling window인 `week`, 최근
+30일 rolling window인 `month`, 저번주 월요일-일요일 구간인 `last-week` /
+`"last week"`, 이전 달력 월인 `last-month` / `"last month"`, `24h`/`7d`/`4w`
 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp,
 `all`을 받습니다. `HUMAN`, `THINK`를 포함한
 ledger 판정 기준은 [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md)에 있습니다.
+
+계속 켜둔 monitoring scope는 `muxa stats`, `muxa report`, `muxa timeline`에서
+`--exclude-pane`, `--exclude-session`으로 제외할 수 있습니다. 패턴은
+case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
+`--exclude-session 'monitor*'`.
 
 ## 지원 에이전트
 

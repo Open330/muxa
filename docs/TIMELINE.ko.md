@@ -9,6 +9,7 @@ tmux foreground 사이를 어떻게 오갔는지 보여주는 시각화입니다
 ```bash
 muxa timeline --since today
 muxa timeline --since today --session main
+muxa timeline --since today --exclude-session 'monitor*'
 muxa timeline --since 24h --agent codex
 muxa timeline --since today --group-by kind
 muxa timeline --since today --sort waiting
@@ -30,9 +31,11 @@ muxa timeline --since today --format json
 
 | Option | 값 |
 | --- | --- |
-| `--since` | `today`, `yesterday`, 최근 7일 rolling window인 `week`, 저번주 월요일-일요일 구간인 `last-week` / `"last week"`, `24h`/`7d`/`4w` 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`. |
+| `--since` | `today`, `yesterday`, 최근 7일 rolling window인 `week`, 최근 30일 rolling window인 `month`, 저번주 월요일-일요일 구간인 `last-week` / `"last week"`, 이전 달력 월인 `last-month` / `"last month"`, `24h`/`7d`/`4w` 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`. |
 | `--day` | 특정 local calendar day shortcut. 예: `--day 2026-06-06`. |
 | `--session` | tmux session 이름, tmux session id, pane id. |
+| `--exclude-pane` | case-sensitive glob에 맞는 pane id를 제외합니다. 반복하거나 comma-separated로 줄 수 있습니다. |
+| `--exclude-session` | case-sensitive glob에 맞는 tmux session name/id를 제외합니다. 반복하거나 comma-separated로 줄 수 있습니다. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
 | `--view` | 기본값 `timeline`, 또는 terminal contribution-map summary인 `heatmap`. |
 | `--group-by` | 기본값 `session`, 또는 `kind`, `flat`. TUI 전용. |
@@ -87,5 +90,5 @@ Dashboard timeline도 같은 `/api/timeline` 문서를 사용하며 기본적으
 lane을 묶습니다. lane graph 위에는 daily contribution-map style heatmap이
 표시되고, 날짜를 클릭하면 해당 calendar day로 drilldown됩니다. 브라우저에서 계속
 켜둘 화면이 필요하면 dashboard를 쓰고, keyboard navigation, focus view, terminal
-heatmap, terminal-native JSON export가 필요하면 `muxa timeline`을 쓰는 것이
-좋습니다.
+heatmap, terminal-native JSON export, scope exclusion이 필요하면
+`muxa timeline`을 쓰는 것이 좋습니다.

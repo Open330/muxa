@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, UtcOffset, Weekday};
 
@@ -32,7 +32,9 @@ pub(crate) fn parse_since(raw: &str, now: OffsetDateTime, all_label: &str) -> Re
     }
 
     let offset = local_offset();
-    if let Some(date) = parse_iso_date(trimmed)? {
+    if let Some(date) =
+        parse_iso_date(trimmed).map_err(|error| anyhow!("{error}\n{}", since_help()))?
+    {
         let next = date.next_day().context("could not compute next date")?;
         return Ok(TimeRange {
             label: date.to_string(),
@@ -41,42 +43,8 @@ pub(crate) fn parse_since(raw: &str, now: OffsetDateTime, all_label: &str) -> Re
         });
     }
 
-    match normalized.as_str() {
-        "today" | "tod" => {
-            let start = local_day_start(now.to_offset(offset).date(), offset);
-            return Ok(TimeRange {
-                label: "today".to_string(),
-                since_at: Some(start),
-                until_at: None,
-            });
-        }
-        "yesterday" | "yday" => {
-            let today = now.to_offset(offset).date();
-            let yesterday = today
-                .previous_day()
-                .context("could not compute yesterday date")?;
-            return Ok(TimeRange {
-                label: "yesterday".to_string(),
-                since_at: Some(local_day_start(yesterday, offset)),
-                until_at: Some(local_day_start(today, offset)),
-            });
-        }
-        "last_week" | "lastweek" | "previous_week" | "previousweek" | "prev_week" | "prevweek" => {
-            let (since_at, until_at) = previous_calendar_week(now, offset)?;
-            return Ok(TimeRange {
-                label: "last week".to_string(),
-                since_at: Some(since_at),
-                until_at: Some(until_at),
-            });
-        }
-        "week" | "last7d" | "last_7d" | "7days" => {
-            return Ok(TimeRange {
-                label: "last 7d".to_string(),
-                since_at: Some(now - time::Duration::days(7)),
-                until_at: None,
-            });
-        }
-        _ => {}
+    if let Some(range) = parse_keyword_since(&normalized, now, offset)? {
+        return Ok(range);
     }
 
     if let Ok(at) = OffsetDateTime::parse(trimmed, &Rfc3339) {
@@ -87,18 +55,82 @@ pub(crate) fn parse_since(raw: &str, now: OffsetDateTime, all_label: &str) -> Re
         });
     }
     if trimmed.is_empty() {
-        bail!("--since must be today, yesterday, week, last-week, a date like 2026-06-06, a duration like 7d, an RFC3339 timestamp, or all");
+        bail!("{}", invalid_since_value(trimmed));
     }
 
-    let unit = trimmed.chars().last().context(
-        "--since must be today, yesterday, week, last-week, a date like 2026-06-06, a duration like 7d, an RFC3339 timestamp, or all",
-    )?;
+    parse_duration_since(trimmed, now)
+}
+
+fn parse_keyword_since(
+    normalized: &str,
+    now: OffsetDateTime,
+    offset: UtcOffset,
+) -> Result<Option<TimeRange>> {
+    match normalized {
+        "today" | "tod" => {
+            let start = local_day_start(now.to_offset(offset).date(), offset);
+            Ok(Some(TimeRange {
+                label: "today".to_string(),
+                since_at: Some(start),
+                until_at: None,
+            }))
+        }
+        "yesterday" | "yday" => {
+            let today = now.to_offset(offset).date();
+            let yesterday = today
+                .previous_day()
+                .context("could not compute yesterday date")?;
+            Ok(Some(TimeRange {
+                label: "yesterday".to_string(),
+                since_at: Some(local_day_start(yesterday, offset)),
+                until_at: Some(local_day_start(today, offset)),
+            }))
+        }
+        "last_week" | "lastweek" | "previous_week" | "previousweek" | "prev_week" | "prevweek" => {
+            let (since_at, until_at) = previous_calendar_week(now, offset)?;
+            Ok(Some(TimeRange {
+                label: "last week".to_string(),
+                since_at: Some(since_at),
+                until_at: Some(until_at),
+            }))
+        }
+        "last_month" | "lastmonth" | "previous_month" | "previousmonth" | "prev_month"
+        | "prevmonth" => {
+            let (since_at, until_at) = previous_calendar_month(now, offset)?;
+            Ok(Some(TimeRange {
+                label: "last month".to_string(),
+                since_at: Some(since_at),
+                until_at: Some(until_at),
+            }))
+        }
+        "week" | "last7d" | "last_7d" | "7days" => Ok(Some(TimeRange {
+            label: "last 7d".to_string(),
+            since_at: Some(now - time::Duration::days(7)),
+            until_at: None,
+        })),
+        "month" | "last30d" | "last_30d" | "30days" => Ok(Some(TimeRange {
+            label: "last 30d".to_string(),
+            since_at: Some(now - time::Duration::days(30)),
+            until_at: None,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn parse_duration_since(trimmed: &str, now: OffsetDateTime) -> Result<TimeRange> {
+    let unit = trimmed
+        .chars()
+        .last()
+        .with_context(|| invalid_since_value(trimmed))?;
     let number = &trimmed[..trimmed.len() - unit.len_utf8()];
     let amount: i64 = number
         .parse()
-        .with_context(|| format!("invalid --since duration {trimmed:?}"))?;
+        .map_err(|_| anyhow!(invalid_since_value(trimmed)))?;
     if amount <= 0 {
-        bail!("--since duration must be greater than zero");
+        bail!(
+            "invalid --since duration {trimmed:?}: amount must be greater than zero\n{}",
+            since_help()
+        );
     }
     let duration = match unit {
         's' => time::Duration::seconds(amount),
@@ -106,7 +138,10 @@ pub(crate) fn parse_since(raw: &str, now: OffsetDateTime, all_label: &str) -> Re
         'h' => time::Duration::hours(amount),
         'd' => time::Duration::days(amount),
         'w' => time::Duration::weeks(amount),
-        _ => bail!("--since duration unit must be one of s, m, h, d, w"),
+        _ => bail!(
+            "invalid --since duration {trimmed:?}: unit must be one of s, m, h, d, w\n{}",
+            since_help()
+        ),
     };
 
     Ok(TimeRange {
@@ -118,6 +153,18 @@ pub(crate) fn parse_since(raw: &str, now: OffsetDateTime, all_label: &str) -> Re
 
 fn normalize(raw: &str) -> String {
     raw.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn invalid_since_value(raw: &str) -> String {
+    if raw.is_empty() {
+        format!("missing --since value\n{}", since_help())
+    } else {
+        format!("unsupported --since value {raw:?}\n{}", since_help())
+    }
+}
+
+fn since_help() -> &'static str {
+    "supported --since values:\n  keywords: today, yesterday, week (rolling 7d), month (rolling 30d), last-week / \"last week\", last-month / \"last month\", all\n  durations: 24h, 7d, 4w, 30d (units: s, m, h, d, w)\n  dates: 2026-06-06\n  timestamps: 2026-06-06T09:00:00+09:00"
 }
 
 fn local_offset() -> UtcOffset {
@@ -138,6 +185,26 @@ fn previous_calendar_week(
         local_day_start(previous_week_start, offset),
         local_day_start(current_week_start, offset),
     ))
+}
+
+fn previous_calendar_month(
+    now: OffsetDateTime,
+    offset: UtcOffset,
+) -> Result<(OffsetDateTime, OffsetDateTime)> {
+    let current_month_start = month_start(now.to_offset(offset).date())?;
+    let previous_month_anchor = current_month_start
+        .previous_day()
+        .context("could not compute previous month date")?;
+    let previous_month_start = month_start(previous_month_anchor)?;
+    Ok((
+        local_day_start(previous_month_start, offset),
+        local_day_start(current_month_start, offset),
+    ))
+}
+
+fn month_start(date: Date) -> Result<Date> {
+    Date::from_calendar_date(date.year(), date.month(), 1)
+        .context("could not compute month start date")
 }
 
 fn week_start_monday(mut date: Date) -> Result<Date> {
@@ -222,6 +289,16 @@ mod tests {
     }
 
     #[test]
+    fn month_alias_means_last_thirty_days() {
+        let now = datetime!(2026-06-08 12:00:00 UTC);
+        let range = parse_since("month", now, "all retained").unwrap();
+
+        assert_eq!(range.label, "last 30d");
+        assert_eq!(range.since_at, Some(datetime!(2026-05-09 12:00:00 UTC)));
+        assert_eq!(range.until_at, None);
+    }
+
+    #[test]
     fn last_week_alias_means_previous_calendar_week() {
         let now = datetime!(2026-06-08 12:00:00 UTC);
         let range = parse_since("last-week", now, "all retained").unwrap();
@@ -231,6 +308,20 @@ mod tests {
             range.until_at.unwrap() - range.since_at.unwrap(),
             time::Duration::days(7)
         );
+    }
+
+    #[test]
+    fn last_month_alias_means_previous_calendar_month() {
+        let range = parse_since(
+            "last-month",
+            datetime!(2026-06-08 09:30:00 +9),
+            "all retained",
+        )
+        .unwrap();
+
+        assert_eq!(range.label, "last month");
+        assert_eq!(range.since_at, Some(datetime!(2026-05-01 00:00:00 +9)));
+        assert_eq!(range.until_at, Some(datetime!(2026-06-01 00:00:00 +9)));
     }
 
     #[test]
@@ -252,6 +343,32 @@ mod tests {
             range.until_at.unwrap() - range.since_at.unwrap(),
             time::Duration::days(1)
         );
+    }
+
+    #[test]
+    fn invalid_since_value_lists_supported_values() {
+        let now = datetime!(2026-06-08 12:00:00 UTC);
+        let error = parse_since("quarter", now, "all retained")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsupported --since value \"quarter\""));
+        assert!(error.contains("supported --since values:"));
+        assert!(error.contains("last-week"));
+        assert!(error.contains("month (rolling 30d)"));
+        assert!(error.contains("24h, 7d, 4w, 30d"));
+    }
+
+    #[test]
+    fn invalid_since_duration_unit_lists_supported_values() {
+        let now = datetime!(2026-06-08 12:00:00 UTC);
+        let error = parse_since("1y", now, "all retained")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid --since duration \"1y\""));
+        assert!(error.contains("unit must be one of s, m, h, d, w"));
+        assert!(error.contains("supported --since values:"));
     }
 
     #[test]

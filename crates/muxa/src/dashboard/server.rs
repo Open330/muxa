@@ -40,6 +40,7 @@ use tower_http::trace::TraceLayer;
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::metrics::Metrics;
+use crate::scope_filter::ScopeExclusions;
 use crate::session::{SessionBackend, SharedSessionBackend};
 use crate::state::{Agent, SharedStore, Transition};
 use crate::timeline::{self, TimelineBuildInput, TimelineFilters};
@@ -275,10 +276,16 @@ async fn terminal_capture_handler(
 
 #[derive(Debug, Deserialize)]
 struct TimelineQuery {
-    /// Same grammar as the CLI: today, yesterday, week, last-week, 24h, 7d, RFC3339, all.
+    /// Same grammar as the CLI: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339, all.
     since: Option<String>,
     /// tmux session name, tmux session id, or pane id.
     session: Option<String>,
+    /// Comma-separated pane id glob exclusions. `exclude-pane` is accepted too.
+    #[serde(alias = "exclude-pane")]
+    exclude_pane: Option<String>,
+    /// Comma-separated tmux session name/id glob exclusions. `exclude-session` is accepted too.
+    #[serde(alias = "exclude-session")]
+    exclude_session: Option<String>,
     /// Agent kind in `snake_case`.
     agent: Option<String>,
 }
@@ -345,10 +352,27 @@ async fn timeline_handler(
         filters: TimelineFilters {
             session: query.session,
             agent_kind,
+            exclusions: ScopeExclusions::new(
+                split_query_patterns(query.exclude_pane),
+                split_query_patterns(query.exclude_session),
+            ),
         },
         notes,
     }))
     .into_response()
+}
+
+fn split_query_patterns(raw: Option<String>) -> Vec<String> {
+    raw.into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {

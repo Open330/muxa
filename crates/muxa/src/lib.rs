@@ -47,6 +47,7 @@ pub mod metrics;
 pub mod notify;
 pub mod paths;
 pub mod reconcile;
+pub mod scope_filter;
 pub mod session;
 pub mod session_activity;
 pub mod sinks;
@@ -105,6 +106,8 @@ pub use history::{CompactReport, HistoryOptions, PaneSessionCache};
 pub use metrics::{Metrics, MetricsSnapshot};
 #[doc(hidden)]
 pub use reconcile::{LivenessSource, Reconciler};
+#[doc(hidden)]
+pub use scope_filter::ScopeExclusions;
 #[doc(hidden)]
 pub use session::{
     PtySessionBackend, SessionBackend, SessionBackendCaps, SessionBackendKind, SessionError,

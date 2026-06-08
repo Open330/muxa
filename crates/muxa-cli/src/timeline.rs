@@ -13,7 +13,7 @@ use muxa::timeline::{
     self as core_timeline, TimelineBuildInput, TimelineDocument, TimelineFilters, TimelineInterval,
     TimelineIntervalSource, TimelineLane, TimelineLaneKind, TimelineTotals,
 };
-use muxa::{AgentKind, AgentState, Config};
+use muxa::{AgentKind, AgentState, Config, ScopeExclusions};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -36,7 +36,7 @@ const MIN_WINDOW_SECS: i64 = 60;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, last-week, 24h, 7d, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "today")]
     since: String,
 
@@ -47,6 +47,14 @@ pub struct Args {
     /// Focus a tmux session by name, session id, or pane id.
     #[arg(long)]
     session: Option<String>,
+
+    /// Exclude pane ids matching a glob. Repeat or comma-separate values.
+    #[arg(long = "exclude-pane", value_name = "GLOB", value_delimiter = ',')]
+    exclude_pane: Vec<String>,
+
+    /// Exclude tmux session names or ids matching a glob. Repeat or comma-separate values.
+    #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
+    exclude_session: Vec<String>,
 
     /// Filter agent lanes by kind.
     #[arg(long, value_enum)]
@@ -251,6 +259,10 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
         filters: TimelineFilters {
             session: args.session.clone(),
             agent_kind: args.agent.map(AgentKind::from),
+            exclusions: ScopeExclusions::new(
+                args.exclude_pane.clone(),
+                args.exclude_session.clone(),
+            ),
         },
         notes,
     });
