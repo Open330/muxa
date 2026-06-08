@@ -439,14 +439,15 @@ fn client_inputs(sessions: &[SessionInfo], clients: &[tmux::ClientInfo]) -> Vec<
 
 /// Detect real human input by tracking each tmux client across polls, keyed by
 /// `#{client_name}` (the tty) and identified by `#{client_created}` (its attach
-/// time). Real input is the *same attach session* (matching `created`) whose
-/// `client_activity` strictly advanced — a keypress/scroll. A client we haven't
-/// seen, or the same tty with a newer `created` (a detach/reattach reusing the
-/// terminal), is a fresh attach whose `client_activity` is just the attach time;
-/// it only seeds the baseline. So neither a reattach (same or new tty) nor an
-/// extra idle client can fabricate input. Emits at most one `TmuxInput` tick per
-/// session (at the latest advancing client's epoch). `seen` is updated to the
-/// current `(created, activity)` and pruned to the live client set.
+/// time). Input is `client_activity` past a *baseline*: for a client/attach we
+/// already saw (same `created`), the baseline is its last activity; for a first
+/// sight or a new attach (unseen name, or same tty with a newer `created`), the
+/// baseline is `created` itself. So `activity > created` on first sight counts
+/// real post-attach reading (attach-and-read before the first poll), while a pure
+/// attach (`activity == created`) only seeds — no reattach or extra idle client
+/// can fabricate input. Emits at most one `TmuxInput` tick per session (at the
+/// latest advancing client's epoch). `seen` is updated to the current
+/// `(created, activity)` and pruned to the live client set.
 fn detect_input_ticks(
     seen: &mut HashMap<String, (i64, i64)>,
     inputs: &[ClientInput],
@@ -454,12 +455,13 @@ fn detect_input_ticks(
     // Per session id: (session name, latest epoch) among clients that advanced.
     let mut advanced: HashMap<&str, (&str, i64)> = HashMap::new();
     for input in inputs {
-        // Real input only when the same attach (matching `created`) advanced.
-        let is_real = seen
-            .get(&input.name)
-            .is_some_and(|&(prev_created, prev_epoch)| {
-                input.created == prev_created && input.epoch > prev_epoch
-            });
+        // Baseline = the last activity of this exact attach if we've seen it,
+        // else the attach time. Activity strictly past the baseline is real input.
+        let baseline = match seen.get(&input.name) {
+            Some(&(prev_created, prev_epoch)) if prev_created == input.created => prev_epoch,
+            _ => input.created,
+        };
+        let is_real = input.epoch > baseline;
         seen.insert(input.name.clone(), (input.created, input.epoch));
         if is_real {
             let slot = advanced
@@ -629,6 +631,21 @@ mod tests {
         // No further advance → nothing.
         let e = detect_input_ticks(&mut seen, &[cinput("$1", "main", "/dev/pts/3", 130)]);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn detect_input_emits_on_first_sight_with_post_attach_activity() {
+        // Attach-and-read before the first poll samples the client: its
+        // client_activity is already later than client_created (the attach time),
+        // so the very first sight is genuine input, not just an attach. `cinput`
+        // uses created = 1000, so epoch 1100 sits past the attach baseline.
+        let mut seen = HashMap::new();
+        let e = detect_input_ticks(&mut seen, &[cinput("$1", "main", "/dev/pts/3", 1100)]);
+        assert_eq!(
+            e.len(),
+            1,
+            "post-attach activity on first sight is real input"
+        );
     }
 
     #[test]

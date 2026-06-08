@@ -848,6 +848,13 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
         if entry.kind != HumanInteractionKind::TmuxInput {
             continue;
         }
+        // Only ticks whose own time is in range count, mirroring prompts (which
+        // `load_data` pre-filters by `prompt.at`). Otherwise an out-of-range tick
+        // whose padded window merely overlaps the range would create a row for a
+        // day outside the request and mis-bucket its clipped seconds.
+        if !data.range.includes(entry.ended_at) {
+            continue;
+        }
         if let Some(interval) = scoped_interval(
             data,
             entry.started_at - ACTIVE_LOOKBACK,
