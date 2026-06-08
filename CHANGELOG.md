@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-06-08
+
+### Added
+
+- **Daily timeline heatmaps** — `muxa timeline --view heatmap` prints a
+  terminal contribution-map style summary, `muxa timeline --day YYYY-MM-DD`
+  focuses one local calendar day, and the dashboard renders a clickable daily
+  heatmap above the lane graph.
+- **Previous calendar week ranges** — `--since last-week`, `"last week"`,
+  `previous-week`, and `prev-week` now select the previous local
+  Monday-Sunday calendar week across `muxa stats`, `muxa report`,
+  `muxa activity`, `muxa timeline`, and the dashboard timeline API. CLI range
+  parsing for stats/activity/report also accepts `YYYY-MM-DD` local day
+  ranges, matching timeline.
+
+### Fixed
+
+- **Timeline heatmap week alignment** — CLI and dashboard heatmaps now render
+  ISO-style Monday-first weekday rows, so `--since last-week` visually lines
+  up with its Monday-Sunday range.
+
 ## [0.8.1] - 2026-06-06
 
 ### Added
@@ -894,7 +915,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/Open330/muxa/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/Open330/muxa/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Open330/muxa/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Open330/muxa/releases/tag/v0.7.0
