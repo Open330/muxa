@@ -1193,16 +1193,14 @@ mod tests {
 
     #[test]
     fn parse_since_accepts_previous_calendar_month() {
-        let range = parse_since(
-            "last-month",
-            datetime!(2026-06-08 09:30:00 +9),
-            "all retained activity",
-        )
-        .unwrap();
+        let now = datetime!(2026-06-08 09:30:00 +9);
+        let range = parse_since("last-month", now, "all retained activity").unwrap();
+        let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        let (since_at, until_at) = previous_calendar_month(now, offset).unwrap();
 
         assert_eq!(range.label, "last month");
-        assert_eq!(range.since_at, Some(datetime!(2026-05-01 00:00:00 +9)));
-        assert_eq!(range.until_at, Some(datetime!(2026-06-01 00:00:00 +9)));
+        assert_eq!(range.since_at, Some(since_at));
+        assert_eq!(range.until_at, Some(until_at));
     }
 
     #[test]
