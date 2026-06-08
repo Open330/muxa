@@ -856,7 +856,14 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
             entry.session_name.clone(),
             entry.session_id.as_deref().unwrap_or("human_interaction"),
         ) {
-            if let Some(group_key) = human_presence_group_key(data, &interval, group_by) {
+            // Bucket by the tick's own time, not the padded window end — a tick
+            // in the last 5m of a day must land on that day (like prompts keyed
+            // by `prompt.at`), not roll into the next via `+ACTIVE_TIMEOUT`.
+            let group_key = match group_by {
+                GroupBy::Day => Some(format_day(entry.ended_at)),
+                _ => human_presence_group_key(data, &interval, group_by),
+            };
+            if let Some(group_key) = group_key {
                 intervals.push(AttentionInterval {
                     interval,
                     group_key,
@@ -2229,6 +2236,42 @@ mod tests {
         // Window = [10:28:59, 10:35:00] around the 1s tick = 6m01s.
         assert_eq!(totals.active_secs, 361);
         assert!(totals.active_secs < totals.human_secs);
+    }
+
+    #[test]
+    fn active_tmux_input_buckets_by_tick_day_not_padded_window() {
+        // A tmux input tick in the last 5 minutes of a day: its padded ACTIVE
+        // window ends after midnight, but per-day attribution must follow the
+        // tick time, landing on the tick's day — not rolling into the next.
+        let mut d = data(Vec::new());
+        d.range = TimeRange {
+            label: "two days".into(),
+            since_at: Some(datetime!(2026-05-29 00:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-31 00:00:00 UTC)),
+        };
+        d.activity_entries = vec![ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+            HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxInput,
+                pane: None,
+                session_id: Some("$1".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-29 23:57:59 UTC),
+                ended_at: datetime!(2026-05-29 23:58:00 UTC),
+            },
+        ))];
+
+        let rows = build_rows(&d, GroupBy::Day, 0, SortKey::Prompts, false);
+        let day29 = rows.iter().find(|r| r.key == "2026-05-29");
+        let day30 = rows.iter().find(|r| r.key == "2026-05-30");
+
+        assert!(
+            day29.is_some_and(|r| r.active_secs > 0),
+            "the tick's ACTIVE window must land on its own day"
+        );
+        assert!(
+            day30.is_none_or(|r| r.active_secs == 0),
+            "the padded window must not roll ACTIVE into the next day"
+        );
     }
 
     #[test]
