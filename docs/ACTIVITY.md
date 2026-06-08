@@ -65,7 +65,14 @@ triggers:
 Unlike `HUMAN` (raw presence: tmux foreground, prompt input, or attach), a pane
 left attached and untouched accrues none of these, so it does not inflate
 `ACTIVE`. `ACTIVE` is not bounded by `HUMAN` — driving agents without a tracked
-tmux attach can make it larger.
+tmux attach can make a single session's `ACT` exceed it.
+
+Across sessions, `ACTIVE` is **de-duplicated**: a human does one thing at a time,
+so each instant is attributed to the most recently touched session ("last
+touch"). Per-session `ACT` therefore sums to a grand total that stays within real
+elapsed time, rather than multiplying it when many agents run at once. Window
+padding is configurable — `[stats] active_lookback_secs` (default 60) and
+`active_timeout_secs` (default 300); smaller values count more conservatively.
 
 The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows

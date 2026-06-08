@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `human` presence does. `active` is not bounded by `human`. In the terminal
   table `ACT` takes the slot previously held by `WORDS` (kept in `--format json`
   / `markdown`) so the full layout still fits a ~128-column terminal; the compact
-  layout shows `ACT` too.
+  layout shows `ACT` too. ACTIVE is **de-duplicated across concurrent sessions**
+  (a human does one thing at a time): each instant is attributed to the most
+  recently touched session ("last touch"), so per-session `ACT` values sum to a
+  grand total that stays within real elapsed time instead of multiplying it.
+  Window padding is configurable via `[stats] active_lookback_secs` /
+  `active_timeout_secs` (default 60 / 300).
 
 ## [0.8.3] - 2026-06-08
 

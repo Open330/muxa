@@ -110,6 +110,37 @@ pub struct Config {
     pub state: StateConfig,
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
+    pub stats: StatsConfig,
+}
+
+/// `[stats]` config — tuning for the engaged ("active") time estimate in
+/// `muxa stats` / `muxa report`. ACTIVE pads each human action (a prompt or a
+/// tmux input tick) into a window; these control its size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatsConfig {
+    /// Seconds credited *before* each action (reading/orienting just prior).
+    pub active_lookback_secs: u64,
+    /// Idle timeout: seconds an action keeps the "active" clock running after
+    /// it. Gaps longer than this read as away. Larger = more generous.
+    pub active_timeout_secs: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            active_lookback_secs: default_active_lookback_secs(),
+            active_timeout_secs: default_active_timeout_secs(),
+        }
+    }
+}
+
+fn default_active_lookback_secs() -> u64 {
+    60
+}
+
+fn default_active_timeout_secs() -> u64 {
+    300
 }
 
 /// `[ui]` config — shared visual defaults for human-facing terminal output.
