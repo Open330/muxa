@@ -29,7 +29,7 @@ The default overview is grouped by tmux session. Each session group can show:
 
 | Option | Values |
 | --- | --- |
-| `--since` | `today`, `yesterday`, `week`, rolling durations like `24h`/`7d`/`4w`, local dates like `2026-06-06`, RFC3339 timestamps, or `all`. |
+| `--since` | `today`, `yesterday`, `week` for rolling 7 days, `last-week` / `"last week"` for the previous Monday-Sunday calendar week, rolling durations like `24h`/`7d`/`4w`, local dates like `2026-06-06`, RFC3339 timestamps, or `all`. |
 | `--day` | Shortcut for one local calendar day, e.g. `--day 2026-06-06`. |
 | `--session` | tmux session name, tmux session id, or pane id. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
@@ -44,6 +44,7 @@ The default overview is grouped by tmux session. Each session group can show:
 `muxa timeline --view heatmap --since 12w` prints a compact daily activity
 map in the terminal. Each cell is a local calendar day; intensity is based on
 agent work, waiting, errors, human interaction, and tmux foreground time.
+Week rows are ISO-style Monday-first, matching `--since last-week`.
 Below the grid, muxa lists the busiest days and, for a single-day view, the
 top sessions for that day.
 

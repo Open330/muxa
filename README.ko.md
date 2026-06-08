@@ -97,7 +97,7 @@ muxa watch
 ```bash
 muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
-muxa report --since week
+muxa report --since last-week
 muxa timeline --since today --session main
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w
@@ -105,8 +105,10 @@ muxa timeline --day 2026-06-06
 muxa activity --since today --type human
 ```
 
-`--since`는 `today`, `yesterday`, `week`, `24h`/`7d`/`4w` 같은 rolling
-duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`을 받습니다. `HUMAN`, `THINK`를 포함한
+`--since`는 `today`, `yesterday`, 최근 7일 rolling window인 `week`,
+저번주 월요일-일요일 구간인 `last-week` / `"last week"`, `24h`/`7d`/`4w`
+같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp,
+`all`을 받습니다. `HUMAN`, `THINK`를 포함한
 ledger 판정 기준은 [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md)에 있습니다.
 
 ## 지원 에이전트

@@ -20,7 +20,9 @@ muxa activity --since today --type agent --format json
 - `today`: 로컬 날짜 기준 오늘 00:00부터 현재까지.
 - `yesterday`: 로컬 날짜 기준 어제 00:00부터 오늘 00:00 전까지.
 - `week`: 현재 시각 기준 최근 7일.
+- `last-week`, `"last week"`: 로컬 날짜 기준 저번주 월요일 00:00부터 이번주 월요일 00:00 전까지.
 - `24h`, `7d`, `4w`: rolling duration.
+- `YYYY-MM-DD`: 로컬 날짜 기준 해당 하루.
 - RFC3339 timestamp: 해당 시각 이후 전체.
 - `all`: 보관 중인 모든 ledger entry.
 

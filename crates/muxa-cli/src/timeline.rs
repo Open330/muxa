@@ -36,7 +36,7 @@ const MIN_WINDOW_SECS: i64 = 60;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, 24h, 7d, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, last-week, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "today")]
     since: String,
 
@@ -1740,13 +1740,13 @@ fn print_heatmap_grid(buckets: &[TimelineDayBucket]) {
     let weeks = cells.chunks(7).collect::<Vec<_>>();
     println!("{}", heatmap_month_header(&weeks));
     for weekday in [
-        Weekday::Sunday,
         Weekday::Monday,
         Weekday::Tuesday,
         Weekday::Wednesday,
         Weekday::Thursday,
         Weekday::Friday,
         Weekday::Saturday,
+        Weekday::Sunday,
     ] {
         let row = weekday_index(weekday);
         let mut line = format!("{:>3} ", weekday_short_label(weekday));
@@ -1993,25 +1993,25 @@ fn local_day_start(date: Date, offset: UtcOffset) -> OffsetDateTime {
 
 fn weekday_index(weekday: Weekday) -> usize {
     match weekday {
-        Weekday::Sunday => 0,
-        Weekday::Monday => 1,
-        Weekday::Tuesday => 2,
-        Weekday::Wednesday => 3,
-        Weekday::Thursday => 4,
-        Weekday::Friday => 5,
-        Weekday::Saturday => 6,
+        Weekday::Monday => 0,
+        Weekday::Tuesday => 1,
+        Weekday::Wednesday => 2,
+        Weekday::Thursday => 3,
+        Weekday::Friday => 4,
+        Weekday::Saturday => 5,
+        Weekday::Sunday => 6,
     }
 }
 
 fn weekday_short_label(weekday: Weekday) -> &'static str {
     match weekday {
-        Weekday::Sunday => "Sun",
         Weekday::Monday => "Mon",
         Weekday::Tuesday => "Tue",
         Weekday::Wednesday => "Wed",
         Weekday::Thursday => "Thu",
         Weekday::Friday => "Fri",
         Weekday::Saturday => "Sat",
+        Weekday::Sunday => "Sun",
     }
 }
 
@@ -2142,6 +2142,13 @@ mod tests {
         assert_eq!(heatmap_level(1, 100), 1);
         assert_eq!(heatmap_level(50, 100), 2);
         assert_eq!(heatmap_level(100, 100), 4);
+    }
+
+    #[test]
+    fn heatmap_weekday_index_is_monday_first() {
+        assert_eq!(weekday_index(Weekday::Monday), 0);
+        assert_eq!(weekday_index(Weekday::Tuesday), 1);
+        assert_eq!(weekday_index(Weekday::Sunday), 6);
     }
 
     #[test]

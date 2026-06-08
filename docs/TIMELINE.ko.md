@@ -30,7 +30,7 @@ muxa timeline --since today --format json
 
 | Option | 값 |
 | --- | --- |
-| `--since` | `today`, `yesterday`, `week`, `24h`/`7d`/`4w` 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`. |
+| `--since` | `today`, `yesterday`, 최근 7일 rolling window인 `week`, 저번주 월요일-일요일 구간인 `last-week` / `"last week"`, `24h`/`7d`/`4w` 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp, `all`. |
 | `--day` | 특정 local calendar day shortcut. 예: `--day 2026-06-06`. |
 | `--session` | tmux session 이름, tmux session id, pane id. |
 | `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
@@ -45,6 +45,7 @@ muxa timeline --since today --format json
 `muxa timeline --view heatmap --since 12w`는 terminal에 compact daily
 activity map을 출력합니다. 각 cell은 local calendar day이고, intensity는 agent
 work, waiting, error, human interaction, tmux foreground 시간을 기준으로 합니다.
+요일 행은 `--since last-week`와 맞게 ISO 스타일 Monday-first 순서를 씁니다.
 grid 아래에는 가장 바쁜 날짜가 표시되고, 하루 view에서는 해당 날짜의 top session도
 같이 표시됩니다.
 

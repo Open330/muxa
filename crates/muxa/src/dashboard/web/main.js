@@ -31,7 +31,7 @@ const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
-const TIMELINE_RANGES = ["24h", "today", "7d", "30d", "12w"];
+const TIMELINE_RANGES = ["24h", "today", "last week", "7d", "30d", "12w"];
 const SESSION_SORTS = new Set(["priority", "latest", "name", "human", "tmux"]);
 
 // ── Token bootstrap ────────────────────────────────────────────────
@@ -635,14 +635,14 @@ function renderTimelineHeatmap(buckets) {
     return;
   }
   const maxSecs = Math.max(...buckets.map((bucket) => activeTimelineSecs(bucket.totals)));
-  const leading = new Date(buckets[0].dateMs).getDay();
+  const leading = mondayWeekdayIndex(buckets[0].dateMs);
   const cells = Array.from({ length: leading }, () => null).concat(buckets);
   while (cells.length % 7 !== 0) cells.push(null);
   const selected =
     buckets.find((bucket) => bucket.key === store.ui.selectedTimelineDay) ||
     [...buckets].reverse().find((bucket) => activeTimelineSecs(bucket.totals) > 0) ||
     buckets[buckets.length - 1];
-  const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+  const weekdayLabels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     .map((label) => `<span>${label}</span>`)
     .join("");
   const dayCells = cells
@@ -819,6 +819,10 @@ function addLocalDays(ms, days) {
   date.setDate(date.getDate() + days);
   date.setHours(0, 0, 0, 0);
   return date.getTime();
+}
+
+function mondayWeekdayIndex(ms) {
+  return (new Date(ms).getDay() + 6) % 7;
 }
 
 function localDateKey(ms) {

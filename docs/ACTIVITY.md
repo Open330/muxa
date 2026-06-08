@@ -20,7 +20,9 @@ muxa activity --since today --type agent --format json
 - `today`: local calendar day from 00:00 to now.
 - `yesterday`: previous local calendar day, 00:00 to 00:00.
 - `week`: rolling last 7 days.
+- `last-week`, `"last week"`: previous local Monday-Sunday calendar week.
 - `24h`, `7d`, `4w`: rolling durations.
+- `YYYY-MM-DD`: one local calendar day.
 - RFC3339 timestamp: everything since that instant.
 - `all`: all retained ledger entries.
 

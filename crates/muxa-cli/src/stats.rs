@@ -19,7 +19,7 @@ use crate::{terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, 24h, 7d, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, last-week, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
     since: String,
 
@@ -58,7 +58,7 @@ impl Args {
 
 #[derive(Debug, clap::Args)]
 pub struct ReportArgs {
-    /// Time window to include: today, yesterday, week, 24h, 7d, RFC3339 timestamp, or all.
+    /// Time window to include: today, yesterday, week, last-week, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
     since: String,
 

@@ -275,7 +275,7 @@ async fn terminal_capture_handler(
 
 #[derive(Debug, Deserialize)]
 struct TimelineQuery {
-    /// Same grammar as the CLI: today, yesterday, week, 24h, 7d, RFC3339, all.
+    /// Same grammar as the CLI: today, yesterday, week, last-week, 24h, 7d, RFC3339, all.
     since: Option<String>,
     /// tmux session name, tmux session id, or pane id.
     session: Option<String>,
