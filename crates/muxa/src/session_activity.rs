@@ -412,7 +412,16 @@ fn client_inputs(sessions: &[SessionInfo], clients: &[tmux::ClientInfo]) -> Vec<
         .collect();
     let mut out = Vec::new();
     for client in clients {
-        if client.control_mode || client.last_activity <= 0 {
+        // Need a usable attach identity (name + created) to tell a keypress from
+        // a reattach; without it (control-mode, or tmux didn't report the
+        // fields) skip input detection rather than risk a false tick. Reading
+        // detection simply goes dark on such clients; `active` still has prompts
+        // and thinking.
+        if client.control_mode
+            || client.last_activity <= 0
+            || client.created <= 0
+            || client.name.is_empty()
+        {
             continue;
         }
         if let Some(&session_id) = id_by_name.get(client.session.as_str()) {
@@ -709,5 +718,31 @@ mod tests {
         assert_eq!(inputs[0].session_id, "$1");
         assert_eq!(inputs[0].name, "/dev/pts/1");
         assert_eq!(inputs[0].epoch, 100);
+    }
+
+    #[test]
+    fn client_inputs_skips_clients_without_attach_identity() {
+        // tmux that doesn't report client_name/client_created (parsed as
+        // empty/0) leaves no way to tell a keypress from a reattach, so such
+        // clients must be excluded from input detection entirely.
+        let sessions = vec![session("$1", "main", 9)];
+        let no_created = tmux::ClientInfo {
+            name: "/dev/pts/1".into(),
+            session: "main".into(),
+            control_mode: false,
+            last_activity: 100,
+            created: 0,
+        };
+        let no_name = tmux::ClientInfo {
+            name: String::new(),
+            session: "main".into(),
+            control_mode: false,
+            last_activity: 100,
+            created: 1000,
+        };
+
+        let inputs = client_inputs(&sessions, &[no_created, no_name]);
+
+        assert!(inputs.is_empty());
     }
 }
