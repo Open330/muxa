@@ -32,7 +32,7 @@ const TIMELINE_REFETCH_INTERVAL_MS = 5000;
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
 const TIMELINE_RANGES = ["24h", "today", "last week", "month", "last month", "7d", "30d", "12w"];
-const SESSION_SORTS = new Set(["priority", "latest", "name", "human", "tmux"]);
+const SESSION_SORTS = new Set(["priority", "latest", "name", "active", "human", "tmux"]);
 
 // ── Token bootstrap ────────────────────────────────────────────────
 
@@ -147,6 +147,7 @@ const dom = {
   metricWorking: document.getElementById("metric-working"),
   metricWaiting: document.getElementById("metric-waiting"),
   metricErrors: document.getElementById("metric-errors"),
+  metricActive: document.getElementById("metric-active"),
   metricHuman: document.getElementById("metric-human"),
   metricTmux: document.getElementById("metric-tmux"),
   agentsBody: document.getElementById("agents-tbody"),
@@ -364,6 +365,7 @@ function renderOverview() {
   dom.metricWorking.textContent = String(working);
   dom.metricWaiting.textContent = String(waiting);
   dom.metricErrors.textContent = String(errors);
+  dom.metricActive.textContent = formatDuration(totals.active_secs || 0);
   dom.metricHuman.textContent = formatDuration(humanPresenceSecs(lanes));
   dom.metricTmux.textContent = formatDuration(totals.foreground_secs || 0);
 }
@@ -450,6 +452,9 @@ function buildSessionSummaries() {
   for (const pane of store.panes) {
     ensure(pane.session).panes += 1;
   }
+  for (const active of store.timeline?.active_sessions || []) {
+    ensure(active.label).totals.active_secs = active.active_secs || 0;
+  }
   for (const summary of map.values()) {
     summary.human_presence_secs = humanPresenceSecs(
       (store.timeline?.lanes || []).filter((lane) =>
@@ -466,6 +471,7 @@ function sessionSummaryLine(s) {
   if (s.working) parts.push(`${s.working} work`);
   if (s.waiting) parts.push(`${s.waiting} wait`);
   if (s.errors) parts.push(`${s.errors} err`);
+  if (s.totals?.active_secs) parts.push(`act ${formatDuration(s.totals.active_secs)}`);
   if (s.agents) parts.push(`${s.agents} agents`);
   if (s.panes) parts.push(`${s.panes} panes`);
   return parts.slice(0, 3).join(" · ") || `${s.lanes} lanes`;
@@ -477,6 +483,10 @@ function compareSessionSummaries(a, b) {
       return compareLatest(a, b) || comparePriority(a, b) || compareName(a, b);
     case "name":
       return compareName(a, b);
+    case "active":
+      return compareNumeric(b.totals.active_secs || 0, a.totals.active_secs || 0) ||
+        compareLatest(a, b) ||
+        compareName(a, b);
     case "human":
       return compareNumeric(b.human_presence_secs, a.human_presence_secs) ||
         compareLatest(a, b) ||
@@ -511,6 +521,7 @@ function compareNumeric(a, b) {
 
 function sessionScoreLabel(s, sort) {
   if (sort === "latest") return relTime(s.latest);
+  if (sort === "active") return formatDuration(s.totals.active_secs || 0);
   if (sort === "human") return formatDuration(s.human_presence_secs || 0);
   if (sort === "tmux") return formatDuration(s.totals.foreground_secs || 0);
   if (s.errors > 0) return String(s.errors);
@@ -602,6 +613,7 @@ function renderTimelineLane(lane, start, end, grouped) {
 
 function groupTimelineLanesBySession(lanes) {
   const groups = new Map();
+  const activeBySession = activeSessionsByLabel();
   for (const lane of lanes) {
     const label = lane.session_name || lane.session_id || "no session";
     const key = label === "no session" ? "zzzz:no-session" : `session:${label.toLowerCase()}`;
@@ -624,6 +636,7 @@ function groupTimelineLanesBySession(lanes) {
       group.lanes.sort(compareTimelineLanesInGroup);
       group.human_presence_secs = humanPresenceSecs(group.lanes);
       group.totals.human_presence_secs = group.human_presence_secs;
+      group.totals.active_secs = activeBySession.get(group.label) || 0;
       return group;
     });
 }
@@ -890,6 +903,7 @@ function timelineLaneRank(kind) {
 
 function emptyTimelineTotals() {
   return {
+    active_secs: 0,
     working_secs: 0,
     waiting_secs: 0,
     error_secs: 0,
@@ -906,6 +920,14 @@ function addTimelineTotals(total, next) {
   for (const key of Object.keys(total)) {
     total[key] += next[key] || 0;
   }
+}
+
+function activeSessionsByLabel() {
+  const map = new Map();
+  for (const session of store.timeline?.active_sessions || []) {
+    if (session.label) map.set(session.label, session.active_secs || 0);
+  }
+  return map;
 }
 
 function humanPresenceSecs(lanes) {
@@ -1032,6 +1054,7 @@ function timelineSegmentLabel(interval) {
 
 function laneTotalsLabel(totals) {
   const parts = [
+    ["act", totals.active_secs],
     ["work", totals.working_secs],
     ["wait", totals.waiting_secs],
     ["err", totals.error_secs],
@@ -1049,6 +1072,9 @@ function renderTimelineSessionOptions(doc) {
   for (const lane of doc.lanes || []) {
     if (lane.session_name) store.timelineSessions.add(lane.session_name);
     if (lane.session_id) store.timelineSessions.add(lane.session_id);
+  }
+  for (const session of doc.active_sessions || []) {
+    if (session.label) store.timelineSessions.add(session.label);
   }
   const current = store.filters.timelineSession;
   const options = [`<option value="">all sessions</option>`]
@@ -1454,6 +1480,7 @@ function renderInspector() {
       ${inspectorMetric("work", activeSummary.working)}
       ${inspectorMetric("wait", activeSummary.waiting)}
       ${inspectorMetric("err", activeSummary.errors)}
+      ${inspectorMetric("act", formatDuration(activeSummary.totals.active_secs || 0))}
       ${inspectorMetric("human", formatDuration(humanSecs))}
       ${inspectorMetric("tmux", formatDuration(activeSummary.totals.foreground_secs || 0))}
       ${inspectorMetric("panes", panes.length)}

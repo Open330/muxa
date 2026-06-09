@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
         let store_for_dash = store.clone();
         let shutdown_rx = shutdown_tx.subscribe();
         let dash_cfg_for_task = dash_cfg.clone();
+        let dashboard_stats_config = cfg.stats.clone();
         let dashboard_activity_path = cfg
             .activity
             .enabled
@@ -227,14 +228,18 @@ async fn main() -> Result<()> {
             })
             .flatten();
         let sessions_for_dash = sessions.clone();
+        let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
+            activity_path: dashboard_activity_path,
+            session_activity_path: dashboard_session_activity_path,
+            stats_config: dashboard_stats_config,
+        };
         tokio::spawn(async move {
             if let Err(e) = muxa::dashboard::serve(
                 dash_cfg_for_task,
                 store_for_dash,
                 pane_cache,
                 sessions_for_dash,
-                dashboard_activity_path,
-                dashboard_session_activity_path,
+                dashboard_runtime,
                 shutdown_rx,
             )
             .await

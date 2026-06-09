@@ -37,6 +37,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
+use crate::config::StatsConfig;
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::metrics::Metrics;
@@ -94,10 +95,19 @@ pub struct AppState {
     /// Session activity file used only for currently-open tmux foreground
     /// intervals. Closed foreground intervals come from `activity_path`.
     pub session_activity_path: Option<PathBuf>,
+    /// ACTIVE estimate tuning shared with `muxa stats`.
+    pub stats_config: StatsConfig,
     /// 1-second cache for the `agents_by_state` histogram. See the
     /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
     /// and the eventual plan to replace this with per-state atomics.
     agents_by_state_cache: Arc<tokio::sync::Mutex<AgentsByStateCache>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DashboardRuntimeConfig {
+    pub activity_path: Option<PathBuf>,
+    pub session_activity_path: Option<PathBuf>,
+    pub stats_config: StatsConfig,
 }
 
 impl AppState {
@@ -117,6 +127,7 @@ impl AppState {
             metrics,
             activity_path: None,
             session_activity_path: None,
+            stats_config: StatsConfig::default(),
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
         }
     }
@@ -129,6 +140,12 @@ impl AppState {
     ) -> Self {
         self.activity_path = activity_path;
         self.session_activity_path = session_activity_path;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stats_config(mut self, stats_config: StatsConfig) -> Self {
+        self.stats_config = stats_config;
         self
     }
 }
@@ -166,12 +183,12 @@ pub async fn serve(
     store: SharedStore,
     pane_cache: Arc<PaneCache>,
     sessions: SharedSessionBackend,
-    activity_path: Option<PathBuf>,
-    session_activity_path: Option<PathBuf>,
+    runtime: DashboardRuntimeConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
     let state = AppState::new(store, config.clone(), pane_cache, sessions)
-        .with_activity_paths(activity_path, session_activity_path);
+        .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
+        .with_stats_config(runtime.stats_config);
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
@@ -335,6 +352,7 @@ async fn timeline_handler(
         None => Vec::new(),
     };
     let agents = state.store.snapshot().await;
+    let prompt_entries = state.store.recent_prompts(None, 0).await;
     let pane_scan = state.pane_cache.get_or_refresh(scanner::scan).await;
     let pane_sessions = pane_scan
         .panes
@@ -345,10 +363,13 @@ async fn timeline_handler(
     Json(timeline::build_document(TimelineBuildInput {
         now,
         range,
+        prompt_entries: &prompt_entries,
         activity_entries: &activity_entries,
         agents: &agents,
         session_activities: &session_activities,
         pane_sessions: &pane_sessions,
+        active_lookback_secs: state.stats_config.active_lookback_secs,
+        active_timeout_secs: state.stats_config.active_timeout_secs,
         filters: TimelineFilters {
             session: query.session,
             agent_kind,
@@ -771,6 +792,8 @@ mod tests {
         assert!(v["window_started_at"].is_string());
         assert!(v["window_ended_at"].is_string());
         assert!(v["lanes"].is_array());
+        assert!(v["active_sessions"].is_array());
+        assert!(v["totals"]["active_secs"].is_number());
         assert!(v["notes"].is_array());
     }
 

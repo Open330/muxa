@@ -26,4 +26,4 @@ pub mod config;
 pub mod server;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
-pub use server::{router, serve, AppState};
+pub use server::{router, serve, AppState, DashboardRuntimeConfig};

@@ -151,10 +151,17 @@ into that local calendar day. Timeline
 lanes are grouped by session by default, with agent, human, and tmux
 foreground lanes shown under the same session header.
 
-The overview's `human` metric follows the same meaning as `muxa stats
-HUMAN`: the union of tmux foreground time and muxa-recorded human
-interaction intervals. Timeline lanes still show raw human-interaction
-spans separately as `interaction`.
+The overview's `act` metric follows the same meaning as `muxa stats ACT`:
+engaged human time estimated from submitted prompts, tmux input ticks, and
+time spent present while agents are waiting for a human answer. The `human`
+metric follows `muxa stats HUMAN`: the union of tmux foreground time and
+muxa-recorded human interaction intervals. Timeline lanes still show raw
+human-interaction spans separately as `interaction`.
+
+The session sidebar can sort by `active`, `human`, or `tmux`. `active` uses
+the same last-touch attribution as `muxa stats`, so overlapping work across
+multiple sessions is counted once and assigned to the most recently touched
+session.
 
 Closed intervals come from `activity.ndjson`. Currently-open agent states
 come from the live `Store` snapshot, and currently-open tmux foreground spans

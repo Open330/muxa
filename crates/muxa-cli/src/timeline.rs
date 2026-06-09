@@ -242,6 +242,10 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
         .snapshot()
         .await
         .context("querying daemon agent snapshot")?;
+    let prompt_entries = client
+        .recent_prompts(None, Some(0))
+        .await
+        .context("querying daemon prompt history")?;
     let session_activities = load_session_activities(cfg).await;
     let pane_sessions = muxa::default_backend()
         .list_panes()
@@ -252,10 +256,13 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
     let mut doc = core_timeline::build_document(TimelineBuildInput {
         now,
         range,
+        prompt_entries: &prompt_entries,
         activity_entries: &activity_entries,
         agents: &agents,
         session_activities: &session_activities,
         pane_sessions: &pane_sessions,
+        active_lookback_secs: cfg.stats.active_lookback_secs,
+        active_timeout_secs: cfg.stats.active_timeout_secs,
         filters: TimelineFilters {
             session: args.session.clone(),
             agent_kind: args.agent.map(AgentKind::from),
@@ -2082,6 +2089,7 @@ mod tests {
             window_ended_at: end,
             lanes: Vec::new(),
             totals: core_timeline::TimelineTotals::default(),
+            active_sessions: Vec::new(),
             notes: Vec::new(),
         }
     }

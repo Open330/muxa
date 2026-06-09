@@ -34,6 +34,7 @@
             <option value="priority">priority</option>
             <option value="latest">latest</option>
             <option value="name">A-Z</option>
+            <option value="active">active</option>
             <option value="human">human</option>
             <option value="tmux">tmux</option>
           </select>
@@ -58,6 +59,10 @@
         <div class="metric-card danger">
           <span>errors</span>
           <strong id="metric-errors">—</strong>
+        </div>
+        <div class="metric-card active">
+          <span title="engaged human time estimated from prompts, tmux input, and thinking">act</span>
+          <strong id="metric-active">—</strong>
         </div>
         <div class="metric-card">
           <span title="tmux foreground plus muxa-recorded human interactions">human</span>

@@ -233,7 +233,7 @@ button, select {
 
 .overview-strip {
   display: grid;
-  grid-template-columns: repeat(5, minmax(112px, 1fr));
+  grid-template-columns: repeat(6, minmax(104px, 1fr));
   gap: 10px;
 }
 
@@ -264,6 +264,7 @@ button, select {
 
 .metric-card.attention strong { color: var(--yellow); }
 .metric-card.danger strong { color: var(--red); }
+.metric-card.active strong { color: var(--cyan); }
 
 .session-panel,
 .inspector-panel {
@@ -286,7 +287,7 @@ button, select {
   width: 100%;
   min-height: 52px;
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) 28px;
+  grid-template-columns: 10px minmax(0, 1fr) minmax(34px, max-content);
   align-items: center;
   gap: 9px;
   padding: 7px 8px;

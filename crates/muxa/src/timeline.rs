@@ -5,11 +5,12 @@
 
 use crate::activity::{ActivityEntry, HumanInteractionKind};
 use crate::event::{AgentKind, AgentState};
+use crate::history::HistoryEntry;
 use crate::scope_filter::ScopeExclusions;
 use crate::session_activity::SessionActivity;
 use crate::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, UtcOffset, Weekday};
 
@@ -54,6 +55,7 @@ pub struct TimelineDocument {
     pub window_ended_at: OffsetDateTime,
     pub lanes: Vec<TimelineLane>,
     pub totals: TimelineTotals,
+    pub active_sessions: Vec<TimelineActiveSession>,
     pub notes: Vec<String>,
 }
 
@@ -114,6 +116,7 @@ pub enum TimelineIntervalSource {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TimelineTotals {
+    pub active_secs: u64,
     pub working_secs: u64,
     pub waiting_secs: u64,
     pub error_secs: u64,
@@ -122,6 +125,12 @@ pub struct TimelineTotals {
     pub stopped_secs: u64,
     pub human_secs: u64,
     pub foreground_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TimelineActiveSession {
+    pub label: String,
+    pub active_secs: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,10 +143,13 @@ pub struct TimelineFilters {
 pub struct TimelineBuildInput<'a> {
     pub now: OffsetDateTime,
     pub range: TimelineRange,
+    pub prompt_entries: &'a [HistoryEntry],
     pub activity_entries: &'a [ActivityEntry],
     pub agents: &'a [Agent],
     pub session_activities: &'a [SessionActivity],
     pub pane_sessions: &'a HashMap<String, String>,
+    pub active_lookback_secs: u64,
+    pub active_timeout_secs: u64,
     pub filters: TimelineFilters,
     pub notes: Vec<String>,
 }
@@ -431,12 +443,17 @@ pub fn build_document(input: TimelineBuildInput<'_>) -> TimelineDocument {
             .unwrap_or(window_started_at);
     }
 
-    let totals = lanes
+    let mut totals = lanes
         .iter()
         .fold(TimelineTotals::default(), |mut acc, lane| {
             acc.add_totals(&lane.totals);
             acc
         });
+    let active_sessions = active_sessions_for_input(&input);
+    totals.active_secs = active_sessions
+        .iter()
+        .map(|session| session.active_secs)
+        .sum();
     let mut notes = input.notes;
     if lanes.is_empty() {
         notes.push("no timeline intervals in this view".to_string());
@@ -449,6 +466,7 @@ pub fn build_document(input: TimelineBuildInput<'_>) -> TimelineDocument {
         window_ended_at,
         lanes,
         totals,
+        active_sessions,
         notes,
     }
 }
@@ -720,6 +738,7 @@ impl TimelineTotals {
     }
 
     fn add_totals(&mut self, other: &Self) {
+        self.active_secs = self.active_secs.saturating_add(other.active_secs);
         self.working_secs = self.working_secs.saturating_add(other.working_secs);
         self.waiting_secs = self.waiting_secs.saturating_add(other.waiting_secs);
         self.error_secs = self.error_secs.saturating_add(other.error_secs);
@@ -729,6 +748,458 @@ impl TimelineTotals {
         self.human_secs = self.human_secs.saturating_add(other.human_secs);
         self.foreground_secs = self.foreground_secs.saturating_add(other.foreground_secs);
     }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveScopedInterval {
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    pane: Option<String>,
+    session_name: Option<String>,
+    scope_key: String,
+    group_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAnchor {
+    interval: ActiveScopedInterval,
+    group_key: String,
+    anchor: OffsetDateTime,
+}
+
+struct ActiveWindow {
+    start: i64,
+    end: i64,
+    anchor: i128,
+    group_key: String,
+}
+
+fn active_sessions_for_input(input: &TimelineBuildInput<'_>) -> Vec<TimelineActiveSession> {
+    let mut sessions = last_touch_attribution(&active_windows(input))
+        .into_iter()
+        .filter(|(_, secs)| *secs > 0)
+        .map(|(label, active_secs)| TimelineActiveSession { label, active_secs })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| a.label.cmp(&b.label));
+    sessions
+}
+
+fn active_windows(input: &TimelineBuildInput<'_>) -> Vec<ActiveWindow> {
+    active_anchor_intervals(input)
+        .into_iter()
+        .map(|anchor| ActiveWindow {
+            start: anchor.interval.started_at.unix_timestamp(),
+            end: anchor.interval.ended_at.unix_timestamp(),
+            anchor: anchor.anchor.unix_timestamp_nanos(),
+            group_key: anchor.group_key,
+        })
+        .collect()
+}
+
+fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> {
+    let mut intervals = Vec::new();
+    let active_lookback = secs_to_duration(input.active_lookback_secs);
+    let active_timeout = secs_to_duration(input.active_timeout_secs);
+
+    for prompt in input.prompt_entries {
+        if !input.range.includes_end(prompt.at) {
+            continue;
+        }
+        let session_name = prompt
+            .tmux_session
+            .clone()
+            .or_else(|| input.pane_sessions.get(&prompt.pane).cloned());
+        let group_key = session_name
+            .clone()
+            .unwrap_or_else(|| prompt.session_id.clone());
+        if !matches_session_filter(
+            &input.filters,
+            Some(&prompt.session_id),
+            session_name.as_deref(),
+            Some(&prompt.pane),
+        ) || !matches_agent_filter(&input.filters, Some(prompt.kind))
+        {
+            continue;
+        }
+        if let Some(interval) = active_scoped_interval(
+            input,
+            prompt.at - active_lookback,
+            prompt.at + active_timeout,
+            Some(prompt.pane.clone()),
+            session_name,
+            &prompt.session_id,
+        ) {
+            intervals.push(ActiveAnchor {
+                interval,
+                group_key,
+                anchor: prompt.at,
+            });
+        }
+    }
+
+    for entry in input.activity_entries {
+        let ActivityEntry::HumanInteraction(entry) = entry else {
+            continue;
+        };
+        if entry.kind != HumanInteractionKind::TmuxInput
+            || !input.range.includes_end(entry.ended_at)
+        {
+            continue;
+        }
+        if !matches_session_filter(
+            &input.filters,
+            entry.session_id.as_deref(),
+            entry.session_name.as_deref(),
+            entry.pane.as_deref(),
+        ) {
+            continue;
+        }
+        if let Some(interval) = active_scoped_interval(
+            input,
+            entry.started_at - active_lookback,
+            entry.ended_at + active_timeout,
+            entry.pane.clone(),
+            entry.session_name.clone(),
+            entry.session_id.as_deref().unwrap_or("human_interaction"),
+        ) {
+            let group_key = active_human_group_key(&interval);
+            intervals.push(ActiveAnchor {
+                interval,
+                group_key,
+                anchor: entry.ended_at,
+            });
+        }
+    }
+
+    let presences = active_human_presence_intervals(input, true);
+    for attention in active_attention_intervals(input) {
+        for segment in overlapping_active_presence_segments(&attention.interval, &presences) {
+            let anchor = segment.started_at;
+            intervals.push(ActiveAnchor {
+                interval: segment,
+                group_key: attention.group_key.clone(),
+                anchor,
+            });
+        }
+    }
+
+    intervals
+}
+
+fn active_human_presence_intervals(
+    input: &TimelineBuildInput<'_>,
+    thinking_only: bool,
+) -> Vec<ActiveScopedInterval> {
+    let mut intervals = Vec::new();
+    for entry in input.activity_entries {
+        match entry {
+            ActivityEntry::SessionForeground(entry) => {
+                if !matches_session_filter(
+                    &input.filters,
+                    Some(&entry.session_id),
+                    Some(&entry.session_name),
+                    None,
+                ) {
+                    continue;
+                }
+                if let Some(interval) = active_scoped_interval(
+                    input,
+                    entry.started_at,
+                    entry.ended_at,
+                    None,
+                    Some(entry.session_name.clone()),
+                    &entry.session_id,
+                ) {
+                    intervals.push(interval);
+                }
+            }
+            ActivityEntry::HumanInteraction(entry) => {
+                if entry.kind == HumanInteractionKind::TmuxInput {
+                    continue;
+                }
+                if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
+                    continue;
+                }
+                if !matches_session_filter(
+                    &input.filters,
+                    entry.session_id.as_deref(),
+                    entry.session_name.as_deref(),
+                    entry.pane.as_deref(),
+                ) {
+                    continue;
+                }
+                if let Some(interval) = active_scoped_interval(
+                    input,
+                    entry.started_at,
+                    entry.ended_at,
+                    entry.pane.clone(),
+                    entry.session_name.clone(),
+                    entry.session_id.as_deref().unwrap_or("human_interaction"),
+                ) {
+                    intervals.push(interval);
+                }
+            }
+            ActivityEntry::StateTransition(_) => {}
+        }
+    }
+
+    for activity in input.session_activities {
+        let Some(since) = activity.attached_since else {
+            continue;
+        };
+        if !matches_session_filter(
+            &input.filters,
+            Some(&activity.session_id),
+            Some(&activity.name),
+            None,
+        ) {
+            continue;
+        }
+        if let Some(interval) = active_scoped_interval(
+            input,
+            since,
+            input.now,
+            None,
+            Some(activity.name.clone()),
+            &activity.session_id,
+        ) {
+            intervals.push(interval);
+        }
+    }
+
+    intervals
+}
+
+fn active_attention_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> {
+    let mut intervals = Vec::new();
+
+    for entry in input.activity_entries {
+        let ActivityEntry::StateTransition(entry) = entry else {
+            continue;
+        };
+        if !is_attention_state(entry.from)
+            || !matches_agent_filter(&input.filters, Some(entry.kind))
+        {
+            continue;
+        }
+        let session_name = entry.session_name.clone().or_else(|| {
+            entry
+                .pane
+                .as_ref()
+                .and_then(|pane| input.pane_sessions.get(pane))
+                .cloned()
+        });
+        let group_key = session_name
+            .clone()
+            .unwrap_or_else(|| entry.session_id.clone());
+        if !matches_session_filter(
+            &input.filters,
+            Some(&entry.session_id),
+            session_name.as_deref(),
+            entry.pane.as_deref(),
+        ) {
+            continue;
+        }
+        let started_at = entry.state_entered_at.unwrap_or_else(|| {
+            entry.at
+                - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
+        });
+        if let Some(interval) = active_scoped_interval(
+            input,
+            started_at,
+            entry.at,
+            entry.pane.clone(),
+            session_name,
+            &entry.session_id,
+        ) {
+            let anchor = interval.started_at;
+            intervals.push(ActiveAnchor {
+                interval,
+                group_key,
+                anchor,
+            });
+        }
+    }
+
+    for agent in input.agents {
+        if !is_attention_state(agent.state)
+            || !matches_agent_filter(&input.filters, Some(agent.kind))
+        {
+            continue;
+        }
+        let session_name = agent
+            .pane
+            .as_ref()
+            .and_then(|pane| input.pane_sessions.get(pane))
+            .cloned();
+        let group_key = session_name
+            .clone()
+            .unwrap_or_else(|| agent.session_id.clone());
+        if !matches_session_filter(
+            &input.filters,
+            Some(&agent.session_id),
+            session_name.as_deref(),
+            agent.pane.as_deref(),
+        ) {
+            continue;
+        }
+        if let Some(interval) = active_scoped_interval(
+            input,
+            agent.state_entered_at,
+            input.now,
+            agent.pane.clone(),
+            session_name,
+            &agent.session_id,
+        ) {
+            let anchor = interval.started_at;
+            intervals.push(ActiveAnchor {
+                interval,
+                group_key,
+                anchor,
+            });
+        }
+    }
+
+    intervals
+}
+
+fn active_scoped_interval(
+    input: &TimelineBuildInput<'_>,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    pane: Option<String>,
+    session_name: Option<String>,
+    fallback_scope: &str,
+) -> Option<ActiveScopedInterval> {
+    let (started_at, ended_at) = clip_interval(&input.range, input.now, started_at, ended_at)?;
+    let scope_key = active_scope_key(pane.as_deref(), session_name.as_deref(), fallback_scope);
+    let group_key = session_name
+        .clone()
+        .or_else(|| pane.clone())
+        .unwrap_or_else(|| fallback_scope.to_string());
+    Some(ActiveScopedInterval {
+        started_at,
+        ended_at,
+        pane,
+        session_name,
+        scope_key,
+        group_key,
+    })
+}
+
+fn active_scope_key(pane: Option<&str>, session_name: Option<&str>, fallback: &str) -> String {
+    if let Some(session_name) = session_name {
+        return format!("session:{session_name}");
+    }
+    if let Some(pane) = pane {
+        return format!("pane:{pane}");
+    }
+    format!("unknown:{fallback}")
+}
+
+fn active_human_group_key(interval: &ActiveScopedInterval) -> String {
+    interval
+        .session_name
+        .clone()
+        .or_else(|| interval.pane.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn human_interaction_counts_for_thinking(kind: HumanInteractionKind) -> bool {
+    matches!(
+        kind,
+        HumanInteractionKind::MuxaPromptInput | HumanInteractionKind::TmuxAttach
+    )
+}
+
+fn is_attention_state(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error
+    )
+}
+
+fn active_intervals_relate(a: &ActiveScopedInterval, b: &ActiveScopedInterval) -> bool {
+    if let (Some(a_pane), Some(b_pane)) = (a.pane.as_deref(), b.pane.as_deref()) {
+        if a_pane == b_pane {
+            return true;
+        }
+    }
+    if let (Some(a_session), Some(b_session)) =
+        (a.session_name.as_deref(), b.session_name.as_deref())
+    {
+        return a_session == b_session;
+    }
+    false
+}
+
+fn overlapping_active_presence_segments(
+    attention: &ActiveScopedInterval,
+    presences: &[ActiveScopedInterval],
+) -> Vec<ActiveScopedInterval> {
+    let mut segments = Vec::new();
+    for presence in presences {
+        if !active_intervals_relate(attention, presence) {
+            continue;
+        }
+        let started_at = attention.started_at.max(presence.started_at);
+        let ended_at = attention.ended_at.min(presence.ended_at);
+        if ended_at <= started_at {
+            continue;
+        }
+        segments.push(ActiveScopedInterval {
+            started_at,
+            ended_at,
+            pane: attention.pane.clone(),
+            session_name: attention.session_name.clone(),
+            scope_key: attention.scope_key.clone(),
+            group_key: attention.group_key.clone(),
+        });
+    }
+    segments
+}
+
+fn last_touch_attribution(windows: &[ActiveWindow]) -> BTreeMap<String, u64> {
+    let mut events: Vec<(i64, bool, usize)> = Vec::new();
+    for (i, window) in windows.iter().enumerate() {
+        if window.end > window.start {
+            events.push((window.start, false, i));
+            events.push((window.end, true, i));
+        }
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    let mut i = 0;
+    while i < events.len() {
+        let t = events[i].0;
+        while i < events.len() && events[i].0 == t {
+            let (_, is_end, idx) = events[i];
+            let key = (windows[idx].anchor, idx);
+            if is_end {
+                active.remove(&key);
+            } else {
+                active.insert(key);
+            }
+            i += 1;
+        }
+        let next_t = events.get(i).map_or(t, |event| event.0);
+        if next_t <= t {
+            continue;
+        }
+        let Some((_, idx)) = active.iter().next_back().copied() else {
+            continue;
+        };
+        let secs = u64::try_from(next_t - t).unwrap_or(0);
+        *out.entry(windows[idx].group_key.clone()).or_default() += secs;
+    }
+
+    out
+}
+
+fn secs_to_duration(secs: u64) -> time::Duration {
+    time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 fn totals_for_intervals(intervals: &[TimelineInterval]) -> TimelineTotals {
@@ -996,10 +1467,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &[entry],
             agents: &[],
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1032,10 +1506,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &[entry],
             agents: &[],
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1073,10 +1550,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &entries,
             agents: &[],
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1092,6 +1572,164 @@ mod tests {
             .iter()
             .all(|lane| lane.kind == TimelineLaneKind::Human));
         assert_eq!(doc.totals.human_secs, 240);
+    }
+
+    #[test]
+    fn active_sessions_use_prompt_anchors_with_last_touch_dedup() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let prompts = [
+            HistoryEntry::new(
+                AgentKind::Codex,
+                "agent-main",
+                "%1",
+                "prompt main",
+                datetime!(2026-06-05 11:00:00 UTC),
+                None,
+            ),
+            HistoryEntry::new(
+                AgentKind::ClaudeCode,
+                "agent-side",
+                "%2",
+                "prompt side",
+                datetime!(2026-06-05 11:03:00 UTC),
+                None,
+            ),
+        ];
+        let pane_sessions = HashMap::from([
+            ("%1".to_string(), "main".to_string()),
+            ("%2".to_string(), "side".to_string()),
+        ]);
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &prompts,
+            activity_entries: &[],
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &pane_sessions,
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.totals.active_secs, 540);
+        assert_eq!(
+            doc.active_sessions,
+            vec![
+                TimelineActiveSession {
+                    label: "main".into(),
+                    active_secs: 180,
+                },
+                TimelineActiveSession {
+                    label: "side".into(),
+                    active_secs: 360,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn active_sessions_count_tmux_input_ticks() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let entries = [ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+            HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxInput,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-06-05 11:00:00 UTC),
+                ended_at: datetime!(2026-06-05 11:00:01 UTC),
+            },
+        ))];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &[],
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.totals.active_secs, 361);
+        assert_eq!(
+            doc.active_sessions,
+            vec![TimelineActiveSession {
+                label: "main".into(),
+                active_secs: 361,
+            }]
+        );
+    }
+
+    #[test]
+    fn active_sessions_count_presence_while_agent_needs_attention() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let entries = [
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 11:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: None,
+                from: AgentState::WaitingInput,
+                to: AgentState::Working,
+                state_entered_at: Some(datetime!(2026-06-05 11:00:00 UTC)),
+            })),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxAttach,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-06-05 10:50:00 UTC),
+                ended_at: datetime!(2026-06-05 11:05:00 UTC),
+            })),
+        ];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &[],
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.totals.active_secs, 300);
+        assert_eq!(
+            doc.active_sessions,
+            vec![TimelineActiveSession {
+                label: "main".into(),
+                active_secs: 300,
+            }]
+        );
     }
 
     #[test]
@@ -1129,10 +1767,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &entries,
             agents: &[],
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters {
                 session: None,
                 agent_kind: None,
@@ -1261,10 +1902,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &[],
             agents: &agents,
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1294,10 +1938,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &[],
             agents: &agents,
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1331,10 +1978,13 @@ mod tests {
         let doc = build_document(TimelineBuildInput {
             now,
             range,
+            prompt_entries: &[],
             activity_entries: &[],
             agents: &agents,
             session_activities: &[],
             pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
