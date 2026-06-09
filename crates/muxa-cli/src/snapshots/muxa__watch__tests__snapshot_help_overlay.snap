@@ -6,9 +6,8 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  NAME                   ST  ACT   LAST PROMPT                                                                                            │
-│> alpha:0.0              ○ ┌ help · ? to close ───────────────────────────────────────────────────────────────┐                           │
-│                           │Keybindings                                                                       │                           │
+│  NAME                   ST┌ help · ? to close ───────────────────────────────────────────────────────────────┐                           │
+│> alpha:0.0              ○ │Keybindings                                                                       │                           │
 │                           │                                                                                  │                           │
 │                           │Navigation                                                                        │                           │
 │                           │  ↑ / k          move selection up                                                │                           │
@@ -20,6 +19,7 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 │                           │                                                                                  │                           │
 │                           │Inspection                                                                        │                           │
 │                           │  p              open preview overlay                                             │                           │
+│                           │  [ / ]          (in preview) previous / next agent                               │                           │
 │                           │  f              (in preview) toggle popup ↔ fullscreen                           │                           │
 │                           │  c              (in preview) toggle prompt ↔ live pane                           │                           │
 │                           │  Enter          (in preview) compose prompt                                      │                           │

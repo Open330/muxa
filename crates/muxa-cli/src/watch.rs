@@ -641,6 +641,7 @@ pub(crate) struct SessionRow {
     pub pane_ids: Vec<String>,
     pub representative_pane: Option<String>,
     pub latest_agent: Option<Agent>,
+    pub agents: Vec<Agent>,
     pub pane_count: usize,
     pub bare_summary: Option<String>,
     pub activity: Option<SessionActivity>,
@@ -748,7 +749,11 @@ impl WatchRow {
         match self {
             Self::Agent(a) => a.pane.as_deref() == Some(pane_id),
             Self::BarePane(p) => p.pane_id == pane_id,
-            Self::Session(s) => s.pane_ids.iter().any(|id| id == pane_id),
+            Self::Session(s) => {
+                s.representative_pane.as_deref() == Some(pane_id)
+                    || s.pane_ids.iter().any(|id| id == pane_id)
+                    || s.agents.iter().any(|a| a.pane.as_deref() == Some(pane_id))
+            }
         }
     }
 }
@@ -1072,6 +1077,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "",
         "Inspection",
         "  p              open preview overlay",
+        "  [ / ]          (in preview) previous / next agent",
         "  f              (in preview) toggle popup ↔ fullscreen",
         "  c              (in preview) toggle prompt ↔ live pane",
         "  Enter          (in preview) compose prompt",
@@ -1868,6 +1874,7 @@ fn build_session_rows(
                 pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
                 representative_pane,
                 latest_agent,
+                agents: b.agents,
                 pane_count: b.panes.len(),
                 bare_summary,
                 activity: b.activity,
@@ -2306,6 +2313,61 @@ pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
     }
 }
 
+fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
+    // Preserve rich optional fields when the incoming payload carries
+    // None. A Transition broadcast captures the Agent row exactly as it
+    // exists after the event, but events that don't touch a field leave
+    // it at its current value. The only way the payload has None is
+    // when the row was freshly created (Starting placeholder) or the
+    // event legitimately cleared the field. We distinguish the two
+    // cases by keeping the UI's prior value when the new one is None —
+    // a real clear would require an explicit Some("") or similar,
+    // which no event produces today.
+    let mut merged = incoming.clone();
+    if merged.state == AgentState::Starting && prior.state != AgentState::Starting {
+        merged.state = prior.state;
+    }
+    if merged.last_prompt.is_none() {
+        merged.last_prompt.clone_from(&prior.last_prompt);
+    }
+    if merged.last_response.is_none() {
+        merged.last_response.clone_from(&prior.last_response);
+    }
+    if merged.last_notification.is_none() {
+        merged
+            .last_notification
+            .clone_from(&prior.last_notification);
+    }
+    if merged.model.is_none() {
+        merged.model.clone_from(&prior.model);
+    }
+    if merged.context_used_pct.is_none() {
+        merged.context_used_pct = prior.context_used_pct;
+    }
+    if merged.cost_usd.is_none() {
+        merged.cost_usd = prior.cost_usd;
+    }
+    if merged.rate_limit_5h_pct.is_none() {
+        merged.rate_limit_5h_pct = prior.rate_limit_5h_pct;
+    }
+    if merged.rate_limit_5h_resets_at.is_none() {
+        merged.rate_limit_5h_resets_at = prior.rate_limit_5h_resets_at;
+    }
+    if merged.rate_limit_7d_pct.is_none() {
+        merged.rate_limit_7d_pct = prior.rate_limit_7d_pct;
+    }
+    if merged.rate_limit_7d_resets_at.is_none() {
+        merged.rate_limit_7d_resets_at = prior.rate_limit_7d_resets_at;
+    }
+    // NOTE: rate_limited_until, rate_limit_scope, and
+    // rate_limit_source are intentionally NOT merged. Events like
+    // `Started` and `TurnStopped` legitimately clear these fields (a
+    // new session or a successful turn means the cap is lifted), and
+    // preserving old values would make the UI show stale rate-limit
+    // badges forever.
+    merged
+}
+
 /// Apply a single push-driven `Transition.agent` to the matching
 /// row in `app.rows`, leaving everything else untouched. If we don't
 /// find a row for `(kind, session_id)`, append it — that's the
@@ -2322,56 +2384,7 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
     for row in &mut app.rows {
         if let WatchRow::Agent(a) = row {
             if (a.kind, a.session_id.clone()) == key {
-                // Preserve rich optional fields when the incoming push
-                // payload carries None. A Transition broadcast captures
-                // the Agent row exactly as it exists after the event,
-                // but events that don't touch a field leave it at its
-                // current value. The only way the payload has None is
-                // when the row was freshly created (Starting placeholder)
-                // or the event legitimately cleared the field. We
-                // distinguish the two cases by keeping the UI's prior
-                // value when the new one is None — a real clear would
-                // require an explicit Some("") or similar, which no
-                // event produces today.
-                let mut merged = agent.clone();
-                if merged.last_prompt.is_none() {
-                    merged.last_prompt.clone_from(&a.last_prompt);
-                }
-                if merged.last_response.is_none() {
-                    merged.last_response.clone_from(&a.last_response);
-                }
-                if merged.last_notification.is_none() {
-                    merged.last_notification.clone_from(&a.last_notification);
-                }
-                if merged.model.is_none() {
-                    merged.model.clone_from(&a.model);
-                }
-                if merged.context_used_pct.is_none() {
-                    merged.context_used_pct = a.context_used_pct;
-                }
-                if merged.cost_usd.is_none() {
-                    merged.cost_usd = a.cost_usd;
-                }
-                if merged.rate_limit_5h_pct.is_none() {
-                    merged.rate_limit_5h_pct = a.rate_limit_5h_pct;
-                }
-                if merged.rate_limit_5h_resets_at.is_none() {
-                    merged.rate_limit_5h_resets_at = a.rate_limit_5h_resets_at;
-                }
-                if merged.rate_limit_7d_pct.is_none() {
-                    merged.rate_limit_7d_pct = a.rate_limit_7d_pct;
-                }
-                if merged.rate_limit_7d_resets_at.is_none() {
-                    merged.rate_limit_7d_resets_at = a.rate_limit_7d_resets_at;
-                }
-                // NOTE: rate_limited_until, rate_limit_scope, and
-                // rate_limit_source are intentionally NOT merged.
-                // Events like `Started` and `TurnStopped` legitimately
-                // clear these fields (a new session or a successful
-                // turn means the cap is lifted), and preserving the
-                // old values would make the UI show stale rate-limit
-                // badges forever.
-                *a = merged;
+                *a = merge_agent_for_ui(a, &agent);
                 updated = true;
                 break;
             }
@@ -2409,21 +2422,36 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
         if s.session != session {
             continue;
         }
-        s.agent_states
-            .insert((agent.kind, agent.session_id.clone()), agent.state);
-        if let Some(pane) = agent.pane.as_ref() {
+        let key = (agent.kind, agent.session_id.clone());
+        let mut updated_agent = agent.clone();
+        if let Some(existing) = s
+            .agents
+            .iter_mut()
+            .find(|a| (a.kind, a.session_id.clone()) == key)
+        {
+            updated_agent = merge_agent_for_ui(existing, &agent);
+            *existing = updated_agent.clone();
+        } else {
+            s.agents.push(updated_agent.clone());
+        }
+        s.agents.sort_by(|a, b| {
+            b.last_activity_at
+                .cmp(&a.last_activity_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        if let Some(pane) = updated_agent.pane.as_ref() {
             if !s.pane_ids.iter().any(|id| id == pane) {
                 s.pane_ids.push(pane.clone());
+                s.pane_count = s.pane_count.max(s.pane_ids.len());
             }
         }
-        let replace = s
+        s.agent_states.insert(key, updated_agent.state);
+        s.latest_agent = s.agents.first().cloned();
+        s.representative_pane = s
             .latest_agent
             .as_ref()
-            .is_none_or(|prior| agent.last_activity_at >= prior.last_activity_at);
-        if replace {
-            s.representative_pane = agent.pane.clone().or_else(|| s.representative_pane.clone());
-            s.latest_agent = Some(agent);
-        }
+            .and_then(|a| a.pane.clone())
+            .or_else(|| s.representative_pane.clone());
         return;
     }
 
@@ -2433,7 +2461,8 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
         session,
         pane_ids: agent.pane.clone().into_iter().collect(),
         representative_pane: agent.pane.clone(),
-        latest_agent: Some(agent),
+        latest_agent: Some(agent.clone()),
+        agents: vec![agent],
         pane_count: 0,
         bare_summary: None,
         activity: None,
@@ -2452,78 +2481,30 @@ fn apply_full(app: &mut App, full: FullRefresh) {
 
     app.last_error = error;
 
-    // Build a lookup of the previously-known rows so the merge can
+    // Build a lookup of the previously-known agents so the merge can
     // distinguish a genuine daemon-driven change from a transient
     // `Starting` placeholder that also regressed optional fields to
-    // None. Only `WatchRow::Agent` rows participate; bare panes are
-    // reconstructed from the inventory each refresh.
-    let prev_rows: HashMap<(AgentKind, String), &Agent> = app
-        .rows
-        .iter()
-        .filter_map(|row| match row {
-            WatchRow::Agent(a) => Some(((a.kind, a.session_id.clone()), a)),
-            WatchRow::BarePane(_) => None,
-            WatchRow::Session(s) => s
-                .latest_agent
-                .as_ref()
-                .map(|a| ((a.kind, a.session_id.clone()), a)),
-        })
-        .collect();
+    // None. In session view, this must include every collapsed agent,
+    // not just the session's latest representative.
+    let mut prev_rows: HashMap<(AgentKind, String), &Agent> = HashMap::new();
+    for row in &app.rows {
+        match row {
+            WatchRow::Agent(a) => {
+                prev_rows.insert((a.kind, a.session_id.clone()), a);
+            }
+            WatchRow::Session(s) => {
+                for agent in &s.agents {
+                    prev_rows.insert((agent.kind, agent.session_id.clone()), agent);
+                }
+            }
+            WatchRow::BarePane(_) => {}
+        }
+    }
 
     for agent in &mut new_agents {
         let key = (agent.kind, agent.session_id.clone());
         if let Some(&prior) = prev_rows.get(&key) {
-            // Anti-flicker: a `Starting` placeholder from a fresh
-            // snapshot must not override a steady state we already
-            // know. This covers the common case where a new store
-            // entry was inserted by an event that doesn't carry an
-            // explicit state transition (e.g. Heartbeat on a row
-            // created via `or_insert_with`).
-            if agent.state == AgentState::Starting && prior.state != AgentState::Starting {
-                agent.state = prior.state;
-            }
-            // Anti-data-loss: when the snapshot regresses optional
-            // fields to None (synthetic placeholder, or a snapshot
-            // taken before the event that populated the field),
-            // preserve the richer prior values instead of blanking
-            // them in the UI.
-            if agent.last_prompt.is_none() {
-                agent.last_prompt.clone_from(&prior.last_prompt);
-            }
-            if agent.last_response.is_none() {
-                agent.last_response.clone_from(&prior.last_response);
-            }
-            if agent.last_notification.is_none() {
-                agent.last_notification.clone_from(&prior.last_notification);
-            }
-            if agent.model.is_none() {
-                agent.model.clone_from(&prior.model);
-            }
-            if agent.context_used_pct.is_none() {
-                agent.context_used_pct = prior.context_used_pct;
-            }
-            if agent.cost_usd.is_none() {
-                agent.cost_usd = prior.cost_usd;
-            }
-            if agent.rate_limit_5h_pct.is_none() {
-                agent.rate_limit_5h_pct = prior.rate_limit_5h_pct;
-            }
-            if agent.rate_limit_5h_resets_at.is_none() {
-                agent.rate_limit_5h_resets_at = prior.rate_limit_5h_resets_at;
-            }
-            if agent.rate_limit_7d_pct.is_none() {
-                agent.rate_limit_7d_pct = prior.rate_limit_7d_pct;
-            }
-            if agent.rate_limit_7d_resets_at.is_none() {
-                agent.rate_limit_7d_resets_at = prior.rate_limit_7d_resets_at;
-            }
-            // NOTE: rate_limited_until, rate_limit_scope, and
-            // rate_limit_source are intentionally NOT merged.
-            // Events like `Started` and `TurnStopped` legitimately
-            // clear these fields (a new session or a successful
-            // turn means the cap is lifted), and preserving the
-            // old values would make the UI show stale rate-limit
-            // badges forever.
+            *agent = merge_agent_for_ui(prior, agent);
         }
     }
 
@@ -3315,6 +3296,83 @@ fn handle_prompt_event(code: KeyCode, modifiers: KeyModifiers, prompt: &mut Prom
     }
 }
 
+fn preview_targets_for_pane(app: &App, pane_id: &str) -> Vec<String> {
+    let Some(row) = app.rows.iter().find(|row| row.contains_pane(pane_id)) else {
+        return Vec::new();
+    };
+    match row {
+        WatchRow::Agent(a) => a.pane.clone().into_iter().collect(),
+        WatchRow::BarePane(p) => vec![p.pane_id.clone()],
+        WatchRow::Session(s) => session_preview_targets(s),
+    }
+}
+
+fn session_preview_targets(s: &SessionRow) -> Vec<String> {
+    let agent_panes: HashSet<String> = s.agents.iter().filter_map(|a| a.pane.clone()).collect();
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    for pane in &s.pane_ids {
+        if agent_panes.contains(pane) && seen.insert(pane.clone()) {
+            targets.push(pane.clone());
+        }
+    }
+    for agent in &s.agents {
+        let Some(pane) = agent.pane.as_ref() else {
+            continue;
+        };
+        if seen.insert(pane.clone()) {
+            targets.push(pane.clone());
+        }
+    }
+    if targets.is_empty() {
+        if let Some(pane) = s.representative_pane.as_ref() {
+            targets.push(pane.clone());
+        }
+    }
+
+    targets
+}
+
+fn preview_target_position(app: &App, pane_id: &str) -> Option<(usize, usize)> {
+    let targets = preview_targets_for_pane(app, pane_id);
+    let idx = targets.iter().position(|target| target == pane_id)?;
+    Some((idx + 1, targets.len()))
+}
+
+fn cycle_preview_agent(app: &mut App, delta: isize) {
+    let Some(current) = app.preview.as_ref().map(|p| p.pane_id.clone()) else {
+        return;
+    };
+    let targets = preview_targets_for_pane(app, &current);
+    if targets.len() <= 1 {
+        return;
+    }
+    let Some(current_idx) = targets.iter().position(|pane| pane == &current) else {
+        return;
+    };
+    let next_idx = if delta >= 0 {
+        (current_idx + 1) % targets.len()
+    } else if current_idx == 0 {
+        targets.len() - 1
+    } else {
+        current_idx - 1
+    };
+    let next_pane = targets[next_idx].clone();
+
+    let mut changed = false;
+    if let Some(preview) = app.preview.as_mut() {
+        if preview.pane_id != next_pane {
+            preview.pane_id = next_pane;
+            preview.scroll = 0;
+            changed = true;
+        }
+    }
+    if changed {
+        app.pane_capture = None;
+    }
+}
+
 /// Preview mode scrolls the overlay instead of the table and opens the
 /// prompt composer against the preview-pinned pane, not the table cursor.
 fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
@@ -3328,29 +3386,41 @@ fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
         return Action::OpenPrompt(PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id)));
     }
 
-    let preview = app.preview.as_mut().expect("preview present");
     match code {
         KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
         KeyCode::Char('f') => Action::TogglePreviewMode,
         KeyCode::Char('c') => Action::TogglePreviewContent,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char(']') | KeyCode::Tab => {
+            cycle_preview_agent(app, 1);
+            Action::None
+        }
+        KeyCode::Char('[') | KeyCode::BackTab => {
+            cycle_preview_agent(app, -1);
+            Action::None
+        }
         KeyCode::Down | KeyCode::Char('j') => {
+            let preview = app.preview.as_mut().expect("preview present");
             preview.scroll = preview.scroll.saturating_add(1);
             Action::None
         }
         KeyCode::Up | KeyCode::Char('k') => {
+            let preview = app.preview.as_mut().expect("preview present");
             preview.scroll = preview.scroll.saturating_sub(1);
             Action::None
         }
         KeyCode::PageDown => {
+            let preview = app.preview.as_mut().expect("preview present");
             preview.scroll = preview.scroll.saturating_add(10);
             Action::None
         }
         KeyCode::PageUp => {
+            let preview = app.preview.as_mut().expect("preview present");
             preview.scroll = preview.scroll.saturating_sub(10);
             Action::None
         }
         KeyCode::Home => {
+            let preview = app.preview.as_mut().expect("preview present");
             preview.scroll = 0;
             Action::None
         }
@@ -3480,10 +3550,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // help (handled by `handle_event`'s mode gates) so we render
     // whichever is active without worrying about z-order between them.
     if app.help_open {
-        // 60 × 90 % — the help body is the complete keybinding matrix.
-        // Keeping it inside the table chunk preserves the surrounding
-        // context and leaves the footer untouched.
-        let popup_area = centered_rect(60, 90, chunks[1]);
+        // The help body is the complete keybinding matrix. Size it by
+        // the actual line count so new bindings don't silently clip the
+        // final rows on common terminal heights.
+        let popup_area = help_popup_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
         render_help(f, popup_area, app);
     }
@@ -3701,6 +3771,21 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(v[1])[1]
 }
 
+fn centered_rect_by_size(width: u16, height: u16, r: Rect) -> Rect {
+    let width = width.min(r.width);
+    let height = height.min(r.height);
+    let x = r.x + r.width.saturating_sub(width) / 2;
+    let y = r.y + r.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn help_popup_rect(r: Rect) -> Rect {
+    let width = r.width.saturating_mul(60) / 100;
+    let body_height = u16::try_from(help_overlay_text().len()).unwrap_or(u16::MAX);
+    let height = body_height.saturating_add(2);
+    centered_rect_by_size(width, height, r)
+}
+
 /// Full-screen detail view for the agent / pane the user pinned with `p`.
 ///
 /// Lays out as: title (pane label + kind/state) → bold "Last prompt"
@@ -3722,7 +3807,16 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
         PreviewContent::PromptResponse => "prompt",
         PreviewContent::LivePane => "live",
     };
-    let title = format!(" preview · {} · {} ", preview.pane_id, mode_tag);
+    let target_tag = preview_target_position(app, &preview.pane_id)
+        .filter(|(_, total)| *total > 1)
+        .map(|(idx, total)| format!(" · {idx}/{total}"))
+        .unwrap_or_default();
+    let title = format!(
+        " preview · {} · {}{} ",
+        app.pane_label(&preview.pane_id),
+        mode_tag,
+        target_tag
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style())
@@ -3792,10 +3886,18 @@ fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
 
     let agent = app.rows.iter().find_map(|r| match r {
         WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a),
-        WatchRow::Session(s) if s.representative_pane.as_deref() == Some(pane_id) => {
-            s.latest_agent.as_ref()
-        }
-        WatchRow::Agent(_) | WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+        WatchRow::Session(s) => s
+            .agents
+            .iter()
+            .find(|a| a.pane.as_deref() == Some(pane_id))
+            .or_else(|| {
+                if s.representative_pane.as_deref() == Some(pane_id) {
+                    s.latest_agent.as_ref()
+                } else {
+                    None
+                }
+            }),
+        WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
     });
 
     let pane_label = pane_display(Some(pane_id), &app.panes);
@@ -4512,7 +4614,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if let Some(preview) = app.preview.as_ref() {
-        render_preview_footer(f, area, preview, theme);
+        render_preview_footer(f, area, app, preview, theme);
         return;
     }
 
@@ -4577,7 +4679,13 @@ fn render_prompt_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState, theme: WatchThemeSpec) {
+fn render_preview_footer(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    preview: &PreviewState,
+    theme: WatchThemeSpec,
+) {
     // Preview mode rebinds the table-mode keybinds to their preview-pane
     // analogues. Toggle labels describe where the next keypress goes.
     let toggle_label = match preview.mode {
@@ -4588,11 +4696,17 @@ fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState, them
         PreviewContent::PromptResponse => " live pane  ",
         PreviewContent::LivePane => " prompt  ",
     };
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(" ↑/↓ ", theme.key_badge()),
         Span::raw(" scroll  "),
         Span::styled(" PgUp/PgDn ", theme.key_badge()),
         Span::raw(" page  "),
+    ];
+    if preview_target_position(app, &preview.pane_id).is_some_and(|(_, total)| total > 1) {
+        spans.push(Span::styled(" [ / ] ", theme.key_badge()));
+        spans.push(Span::raw(" agent  "));
+    }
+    spans.extend([
         Span::styled(" f ", theme.key_badge()),
         Span::raw(toggle_label),
         Span::styled(" c ", theme.key_badge()),
@@ -4603,7 +4717,7 @@ fn render_preview_footer(f: &mut Frame, area: Rect, preview: &PreviewState, them
         Span::raw(" refresh  "),
         Span::styled(" p/q/Esc ", theme.key_badge()),
         Span::raw(" back"),
-    ];
+    ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -7909,6 +8023,117 @@ sort = ["state"]
         assert_eq!(app.table_state.selected(), Some(0));
     }
 
+    fn session_preview_app() -> App {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            preview: muxa::config::PreviewConfig {
+                default_content: PreviewContent::PromptResponse,
+            },
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let mut alpha = fake_agent_at("alpha", "%1", t0);
+        alpha.last_prompt = Some("ALPHAprompt".into());
+        alpha.last_response = Some("ALPHAresp".into());
+        let mut beta = fake_agent_at("beta", "%2", t1);
+        beta.last_prompt = Some("BETAprompt".into());
+        beta.last_response = Some("BETAresp".into());
+        app.set_data_with_sessions(
+            vec![alpha, beta],
+            vec![
+                fake_pane("%1", "main", 0, 0, "claude"),
+                fake_pane("%2", "main", 0, 1, "codex"),
+            ],
+            vec![fake_session("$1", "main", 1)],
+            vec![],
+        );
+        app.table_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn session_preview_keeps_all_agent_panes_available() {
+        let app = session_preview_app();
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        assert_eq!(row.representative_pane.as_deref(), Some("%2"));
+        assert_eq!(row.agents.len(), 2);
+        assert_eq!(
+            session_preview_targets(row),
+            vec!["%1".to_string(), "%2".to_string()]
+        );
+        assert_eq!(preview_target_position(&app, "%2"), Some((2, 2)));
+    }
+
+    #[test]
+    fn preview_brackets_cycle_session_agents_and_reset_cache() {
+        let mut app = session_preview_app();
+        app.preview = Some(PreviewState {
+            pane_id: "%2".into(),
+            scroll: 7,
+            mode: PreviewMode::Popup,
+            content: PreviewContent::LivePane,
+        });
+        app.pane_capture = Some(CapturedPane {
+            pane_id: "%2".into(),
+            text: "old screen".into(),
+            fetched_at: std::time::Instant::now(),
+        });
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        let preview = app.preview.as_ref().unwrap();
+        assert_eq!(
+            preview.pane_id, "%1",
+            "] should wrap to the first agent pane"
+        );
+        assert_eq!(preview.scroll, 0, "agent switch must reset scroll");
+        assert!(
+            app.pane_capture.is_none(),
+            "agent switch must invalidate live capture cache",
+        );
+
+        let _ = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert_eq!(
+            app.preview.as_ref().map(|p| p.pane_id.as_str()),
+            Some("%2"),
+            "[ should wrap back to the previous agent pane",
+        );
+    }
+
+    #[test]
+    fn preview_lines_show_non_representative_session_agent() {
+        let app = session_preview_app();
+        let lines = build_preview_lines(&app, "%1");
+        let dump = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(dump.contains("ALPHAprompt"), "missing non-latest prompt");
+        assert!(dump.contains("ALPHAresp"), "missing non-latest response");
+        assert!(
+            !dump.contains("BETAprompt"),
+            "preview leaked the session representative agent",
+        );
+    }
+
     #[test]
     fn preview_lines_show_prompt_response_and_notification_for_active_agent() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
@@ -8794,6 +9019,7 @@ sort = ["state"]
                         \n\
                         Inspection\n\
                         \x20\x20p              open preview overlay\n\
+                        \x20\x20[ / ]          (in preview) previous / next agent\n\
                         \x20\x20f              (in preview) toggle popup ↔ fullscreen\n\
                         \x20\x20c              (in preview) toggle prompt ↔ live pane\n\
                         \x20\x20Enter          (in preview) compose prompt\n\
