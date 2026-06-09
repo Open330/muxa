@@ -10,19 +10,18 @@
 #   1. muxa status                — table, run from inside the tmux pane
 #   2. muxa stats                 — duration summary with WORK/WAIT/HUMAN/THINK
 #   3. muxa activity              — raw human interaction intervals
-#   4. prefix + s                 — muxa watch popup (the switcher)
-#                                   Cursor lands on the user's current pane
-#                                   (the claude agent on main:0) thanks to
-#                                   `set_initial_pane`, so the next two
-#                                   keystrokes already act on a row with
-#                                   real prompt + response data.
+#   4. prefix + s                 — muxa watch session dashboard
+#                                   Cursor lands on the current session
+#                                   thanks to `set_initial_pane`, so the
+#                                   preview acts on a row with real prompt
+#                                   + response data.
 #   5. p                          — open the preview popup over the table
 #   6. j j                        — scroll the assistant response inside
 #                                   the popup to show the multi-line body
 #   7. f                          — toggle full-screen for long content
 #   8. f                          — back to popup
 #   9. q                          — close preview, back to picker
-#  10. j / k                      — walk the agent list, watch the detail
+#  10. j / k                      — walk the session list, watch the detail
 #                                   line update for each row
 #  11. Enter                      — switch to the selected pane
 #  12. prefix + d                 — detach
@@ -30,10 +29,11 @@
 Output docs/demo.gif
 
 Set Shell bash
-Set FontSize 14
+Set FontFamily "JetBrainsMono Nerd Font Mono"
+Set FontSize 15
 Set Width 1200
 Set Height 720
-Set Theme "TokyoNight"
+Set Theme "GitHub Dark"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
@@ -41,6 +41,10 @@ Set PlaybackSpeed 1
 # this same shell so the recording starts already inside tmux.
 Hide
 Type "export PATH=$HOME/.cargo/bin:/tmp/muxa-demo-shim:$PATH"
+Enter
+Type "export LANG=C.UTF-8"
+Enter
+Type "export LC_ALL=C.UTF-8"
 Enter
 Type "export MUXA_SOCKET=/tmp/muxa-demo.sock"
 Enter
@@ -50,11 +54,17 @@ Type "export XDG_DATA_HOME=/tmp/muxa-demo-data"
 Enter
 Type "cat > $MUXA_CONFIG <<'EOF'"
 Enter
+Type "[ui]"
+Enter
+Type "theme = 'high-contrast'"
+Enter
 Type "[watch]"
 Enter
-Type "view = 'pane'"
+Type "theme = 'high-contrast'"
 Enter
-Type "sort = ['pane_id']"
+Type "view = 'session'"
+Enter
+Type "sort = ['session']"
 Enter
 Type "[watch.preview]"
 Enter
@@ -78,7 +88,7 @@ Type "clear"
 Enter
 # Attach in-place so the recording opens already inside the tmux session.
 # `exec` replaces the bash, so vhs records the tmux UI directly.
-Type "exec /usr/bin/tmux -L muxa-demo attach -t main:0"
+Type "exec /usr/bin/tmux -u -L muxa-demo attach -t main:0"
 Enter
 Sleep 1500ms
 Show
@@ -109,12 +119,11 @@ Sleep 2600ms
 Type "clear"
 Enter
 
-# 4. prefix + s — pop the muxa watch picker. This is the "switch"
-#    experience: same gesture as tmux's stock prefix + s, but with
-#    agent-aware rows. Cursor lands on the user's current pane (the
-#    claude agent on main:0) via `set_initial_pane`, so the row already
-#    under the highlight has rich prompt + response data ready for the
-#    preview demo.
+# 4. prefix + s — pop the muxa watch session dashboard. This is the
+#    "switch" experience: same gesture as tmux's stock prefix + s, but
+#    with agent-aware session rows. Cursor lands on the current session
+#    via `set_initial_pane`, and the status gutter shows multi-agent,
+#    single-agent, and bare sessions without moving the session names.
 Ctrl+B
 Type "s"
 Sleep 2200ms
@@ -148,10 +157,8 @@ Type "q"
 Sleep 700ms
 
 # 10. Walk a row or two so the detail line updates for each highlight —
-#    showcases the `{last_response|last_prompt}` fallback (codex/gemini
-#    fall back to last_prompt, claude shows the response).
-Type "j"
-Sleep 1000ms
+#     showcases the `{last_response|last_prompt}` fallback while keeping
+#     the compact session status gutter aligned.
 Type "j"
 Sleep 1000ms
 Type "k"
@@ -169,7 +176,7 @@ Sleep 600ms
 
 # Postlude — tear down everything.
 Hide
-Type "/usr/bin/tmux -L muxa-demo kill-server 2>/dev/null"
+Type "/usr/bin/tmux -u -L muxa-demo kill-server 2>/dev/null"
 Enter
 Type "kill %1 2>/dev/null"
 Enter

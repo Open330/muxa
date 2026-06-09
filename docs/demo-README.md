@@ -12,7 +12,7 @@ to re-record it.
 | `docs/demo.tape`       | [VHS](https://github.com/charmbracelet/vhs) script — the recording itself.            |
 | `docs/demo-setup.sh`   | Bootstraps an isolated `tmux -L muxa-demo` server with a few seeded panes + windows.  |
 | `docs/demo-seed.sh`    | Older pane-seed script (kept for reference; the live setup script does this inline).  |
-| `docs/demo.gif`        | The output. 1200 × 720; includes status, stats, activity, and watch.                  |
+| `docs/demo.gif`        | The output. 1200 × 720; includes status, stats, activity, and the session watch view. |
 
 The tape's prelude (`Hide` block) does the boring setup so the visible
 recording stays focused on the muxa UI:
@@ -21,8 +21,8 @@ recording stays focused on the muxa UI:
 2. Writes a demo-local `MUXA_CONFIG` and `XDG_DATA_HOME` so local watch
    defaults and real activity ledgers do not leak into the recording.
 3. Runs `docs/demo-setup.sh`, which stands up the labelled tmux server
-   with three seeded agent panes (Claude / Codex / Gemini) plus a few
-   bare panes for variety, writes sample activity intervals for
+   with a multi-agent `main` session, a single-agent `ops` session, and
+   a bare `lab` session, writes sample activity intervals for
    stats/activity, and binds `prefix + s` to the watch popup.
 4. `exec`s into `tmux -L muxa-demo attach -t main:0` so the recording
    opens already inside the demo session.
@@ -111,12 +111,18 @@ A few patterns that come up:
 * **New key in muxa watch**: add the keystroke after `Type "p"` /
   `Type "j"` blocks. Keep the prelude untouched — it's already
   carrying `prefix + s` keybind, status bar wiring, and the
-  three-agent seed.
+  session-view seed.
 * **Higher resolution**: bump `Set Width` / `Set Height`. The README
   embed scales to its container width; 1200 × 720 lands cleanly on
-  most monitors and keeps the file under 300 KB.
-* **Theme**: `Set Theme "TokyoNight"` matches the muxa colour palette;
-  see `vhs themes` for alternatives.
+  most monitors and keeps the file under 1 MB.
+* **Theme/font**: `Set Theme "GitHub Dark"` and the demo-local
+  `high-contrast` muxa theme keep text readable after GitHub scales the
+  README GIF down. `Set FontFamily "JetBrainsMono Nerd Font Mono"` keeps
+  single-cell state glyphs (`●`, `◐`, `○`) readable. See `vhs themes`
+  for theme alternatives.
+* **State glyphs render as dashes**: make sure the tape exports a UTF-8
+  locale and the demo tmux server starts with `tmux -u`; otherwise tmux
+  can degrade `●` / `◐` / `○` before VHS ever sees them.
 
 ## Troubleshooting
 

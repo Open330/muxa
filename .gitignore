@@ -4,5 +4,6 @@
 .DS_Store
 .envrc
 .direnv/
+.context/
 # Claude Code's sub-agent isolation worktrees + local agent state.
 .claude/
