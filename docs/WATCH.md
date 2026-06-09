@@ -23,6 +23,7 @@ row per pane.
 | `Enter` | Open prompt composer for the selected pane. Empty `Enter` attaches. |
 | `Esc` / `q` | Quit or close the active popup. |
 | `p` | Open live preview. |
+| `[` / `]` | In preview, show the previous / next agent in the selected session. |
 | `c` | Toggle preview content. |
 | `f` | Toggle popup/fullscreen preview. |
 | `?` | Help. |
@@ -40,6 +41,13 @@ If the composer is empty, `Enter` attaches to the pane instead.
 
 Prompt input time is recorded as a human interaction interval in
 `activity.ndjson` when activity logging is enabled.
+
+## Preview
+
+Press `p` to preview the selected pane. In session view, if the selected
+session has multiple agent panes, press `]` for the next agent or `[` for the
+previous agent. `Tab` and `Shift+Tab` work as aliases. The preview title shows
+the current position, such as `2/3`, when more than one agent is available.
 
 ## tmux Popup Binding
 

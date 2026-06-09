@@ -38,7 +38,7 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa watch` | agent/pane 실시간 TUI. attach와 prompt composer 포함. |
+| `muxa watch` | agent/pane 실시간 TUI. attach, prompt composer, live preview 포함. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |

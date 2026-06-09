@@ -39,7 +39,7 @@ backend; zellij has a CLI baseline and a planned richer plugin path.
 | Surface | What it does |
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
-| `muxa watch` | Full-screen TUI for agents and panes, with attach and prompt composition. |
+| `muxa watch` | Full-screen TUI for agents and panes, with attach, prompt composition, and live previews. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |

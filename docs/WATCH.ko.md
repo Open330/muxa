@@ -22,6 +22,7 @@ muxa watch --include-paneless
 | `Enter` | 선택한 pane의 prompt composer 열기. 빈 `Enter`는 attach. |
 | `Esc` / `q` | 종료 또는 popup 닫기. |
 | `p` | live preview 열기. |
+| `[` / `]` | preview에서 선택 session의 이전 / 다음 agent 보기. |
 | `c` | preview content toggle. |
 | `f` | popup/fullscreen preview toggle. |
 | `?` | 도움말. |
@@ -39,6 +40,13 @@ pane이 있는 row에서 `Enter`를 누르면 prompt composer가 열립니다. �
 
 activity logging이 켜져 있으면 prompt input 시간은 `activity.ndjson`에 human
 interaction interval로 기록됩니다.
+
+## Preview
+
+`p`를 누르면 선택 pane의 preview가 열립니다. session view에서 선택한 session에
+agent pane이 여러 개 있으면 `]`로 다음 agent, `[`로 이전 agent를 볼 수 있습니다.
+`Tab`, `Shift+Tab`도 같은 동작입니다. agent가 둘 이상이면 preview title에
+`2/3`처럼 현재 위치가 표시됩니다.
 
 ## tmux Popup Binding
 
