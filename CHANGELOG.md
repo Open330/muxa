@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-06-10
+
+### Added
+
+- **`[ui] icons` glyph toggle** — choose `unicode` (default) or `ascii`
+  agent-state markers. The ASCII set (`* > ? ! o ~ x`) is for terminals whose
+  font lacks the Geometric Shapes glyphs or substitutes a mismatched-size
+  fallback font for them. Applies across `status`, `status-line`, `attend`,
+  and `watch`; webhook notifications keep Unicode.
+
+### Changed
+
+- **`muxa stats` notes are quieter** — the table now reports only that
+  explanatory notes exist and points to `--verbose` / `muxa doctor`; pass
+  `--verbose` (`-v`) to print the full methodology text. JSON and markdown
+  output still carry the complete notes array.
+
+### Fixed
+
+- **WaitingInput marker no longer renders oversized** — replaced `◐`
+  (a half-circle codepoint that many terminals draw from a mismatched-size
+  fallback font) with `▶`, which lives in the basic Geometric Shapes block
+  alongside the other single-cell state glyphs.
+
 ## [0.8.7] - 2026-06-08
 
 ### Fixed
