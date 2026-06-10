@@ -149,14 +149,34 @@ fn default_active_timeout_secs() -> u64 {
 pub struct UiConfig {
     /// Visual preset used by table output and, unless overridden, `muxa watch`.
     pub theme: WatchTheme,
+    /// Glyph set for agent-state icons across `status`, `status-line`,
+    /// `attend`, and `watch`. Defaults to the Unicode geometric glyphs;
+    /// set `ascii` for terminals whose font lacks them (or substitutes a
+    /// mismatched-size fallback font).
+    pub icons: IconSet,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: WatchTheme::Classic,
+            icons: IconSet::Unicode,
         }
     }
+}
+
+/// Glyph set for agent-state icons in human-facing terminal output.
+///
+/// `unicode` uses the basic Geometric Shapes glyphs (`●▶◆■○◌×`), which are
+/// present in virtually every monospace font. `ascii` falls back to single
+/// `[char]` markers for terminals whose primary font lacks those codepoints
+/// and would otherwise borrow a mismatched-size glyph from a fallback font.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconSet {
+    #[default]
+    Unicode,
+    Ascii,
 }
 
 /// `[sinks]` config — opt-in fan-out to external systems.

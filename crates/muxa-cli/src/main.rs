@@ -19,7 +19,7 @@ use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{
     claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
 };
-use muxa::config::{WatchConfig, WatchSortKey, WatchTheme};
+use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
 use muxa::state::Agent;
 use muxa::{
@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    set_icon_set(cfg.ui.icons);
     let socket = args
         .socket
         .or_else(|| cfg.socket.clone())
@@ -1053,7 +1054,30 @@ pub(crate) fn truncate_cell(value: &str, max_chars: usize) -> String {
     out
 }
 
+/// Process-wide glyph set, recorded once at startup from `[ui] icons`.
+///
+/// Mirrors `use_colors()` as a global display predicate so the pure
+/// `state_icon` / `state_marker` helpers don't need a config parameter
+/// threaded through every call site. Unset (e.g. in unit tests) defaults
+/// to `Unicode`, preserving prior behavior.
+static ICON_SET: std::sync::OnceLock<IconSet> = std::sync::OnceLock::new();
+
+pub(crate) fn set_icon_set(set: IconSet) {
+    let _ = ICON_SET.set(set);
+}
+
+pub(crate) fn icon_set() -> IconSet {
+    ICON_SET.get().copied().unwrap_or_default()
+}
+
 pub(crate) fn state_icon(state: AgentState) -> &'static str {
+    match icon_set() {
+        IconSet::Unicode => state_icon_unicode(state),
+        IconSet::Ascii => state_icon_ascii(state),
+    }
+}
+
+fn state_icon_unicode(state: AgentState) -> &'static str {
     match state {
         AgentState::Working => "●",
         AgentState::Idle => "○",
@@ -1062,6 +1086,18 @@ pub(crate) fn state_icon(state: AgentState) -> &'static str {
         AgentState::Error => "■",
         AgentState::Stopped => "×",
         AgentState::Starting => "◌",
+    }
+}
+
+fn state_icon_ascii(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "*",
+        AgentState::Idle => "o",
+        AgentState::WaitingInput => ">",
+        AgentState::WaitingChoice => "?",
+        AgentState::Error => "!",
+        AgentState::Stopped => "x",
+        AgentState::Starting => "~",
     }
 }
 
@@ -1393,18 +1429,42 @@ mod tests {
         }
     }
 
+    const ALL_STATES: [AgentState; 7] = [
+        AgentState::Working,
+        AgentState::WaitingInput,
+        AgentState::WaitingChoice,
+        AgentState::Error,
+        AgentState::Idle,
+        AgentState::Starting,
+        AgentState::Stopped,
+    ];
+
     #[test]
     fn status_line_icons_are_single_cell() {
-        for state in [
-            AgentState::Working,
-            AgentState::WaitingInput,
-            AgentState::WaitingChoice,
-            AgentState::Error,
-            AgentState::Idle,
-            AgentState::Starting,
-            AgentState::Stopped,
-        ] {
+        for state in ALL_STATES {
             assert_eq!(UnicodeWidthStr::width(state_icon(state)), 1);
+        }
+    }
+
+    #[test]
+    fn icon_sets_are_single_cell_and_distinct() {
+        // Both glyph sets must stay one cell wide and unambiguous so the
+        // [ui] icons toggle never breaks column alignment or readability.
+        for build in [state_icon_unicode, state_icon_ascii] {
+            let mut seen = std::collections::HashSet::new();
+            for state in ALL_STATES {
+                let glyph = build(state);
+                assert_eq!(
+                    UnicodeWidthStr::width(glyph),
+                    1,
+                    "{glyph:?} not single-cell"
+                );
+                assert!(seen.insert(glyph), "duplicate glyph {glyph:?}");
+            }
+        }
+        // The ascii set must be pure ASCII to survive font-less terminals.
+        for state in ALL_STATES {
+            assert!(state_icon_ascii(state).is_ascii());
         }
     }
 
