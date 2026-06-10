@@ -417,7 +417,7 @@ fn state_glyph(state: AgentState) -> &'static str {
         AgentState::Starting => "◌",
         AgentState::Working => "●",
         AgentState::Idle => "○",
-        AgentState::WaitingInput => "◐",
+        AgentState::WaitingInput => "▶",
         AgentState::WaitingChoice => "◆",
         AgentState::Error => "■",
         AgentState::Stopped => "×",
@@ -523,7 +523,7 @@ mod tests {
         let t = transition(AgentState::Working, AgentState::WaitingInput, a);
         assert_eq!(
             format_message(&t),
-            "● → ◐ claude_code [main:2] needs input — \"do all\""
+            "● → ▶ claude_code [main:2] needs input — \"do all\""
         );
     }
 

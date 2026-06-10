@@ -31,7 +31,7 @@ expression: "snapshot_helpers::buffer_string(&terminal)"
 │                           │  t              sort by state (ST)                                               │                           │
 │                           │                                                                                  │                           │
 │                           │State markers                                                                     │                           │
-│                           │  ● working  ◐ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped            │                           │
+│                           │  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped            │                           │
 │                           │                                                                                  │                           │
 │                           │Quick actions (act on selected row)                                               │                           │
 │                           │  c              copy last prompt to clipboard                                    │                           │

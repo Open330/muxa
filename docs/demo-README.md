@@ -118,11 +118,11 @@ A few patterns that come up:
 * **Theme/font**: `Set Theme "GitHub Dark"` and the demo-local
   `high-contrast` muxa theme keep text readable after GitHub scales the
   README GIF down. `Set FontFamily "JetBrainsMono Nerd Font Mono"` keeps
-  single-cell state glyphs (`●`, `◐`, `○`) readable. See `vhs themes`
+  single-cell state glyphs (`●`, `▶`, `○`) readable. See `vhs themes`
   for theme alternatives.
 * **State glyphs render as dashes**: make sure the tape exports a UTF-8
   locale and the demo tmux server starts with `tmux -u`; otherwise tmux
-  can degrade `●` / `◐` / `○` before VHS ever sees them.
+  can degrade `●` / `▶` / `○` before VHS ever sees them.
 
 ## Troubleshooting
 

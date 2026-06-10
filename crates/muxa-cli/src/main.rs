@@ -1057,7 +1057,7 @@ pub(crate) fn state_icon(state: AgentState) -> &'static str {
     match state {
         AgentState::Working => "●",
         AgentState::Idle => "○",
-        AgentState::WaitingInput => "◐",
+        AgentState::WaitingInput => "▶",
         AgentState::WaitingChoice => "◆",
         AgentState::Error => "■",
         AgentState::Stopped => "×",

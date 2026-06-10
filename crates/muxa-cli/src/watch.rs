@@ -1089,7 +1089,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  t              sort by state (ST)",
         "",
         "State markers",
-        "  ● working  ◐ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped",
+        "  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped",
         "",
         "Quick actions (act on selected row)",
         "  c              copy last prompt to clipboard",
@@ -2146,7 +2146,7 @@ fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
 fn state_marker(state: AgentState, theme: WatchThemeSpec) -> (&'static str, Style) {
     let symbol = match state {
         AgentState::Working => "●",
-        AgentState::WaitingInput => "◐",
+        AgentState::WaitingInput => "▶",
         AgentState::WaitingChoice => "◆",
         AgentState::Error => "■",
         AgentState::Idle => "○",
@@ -5183,7 +5183,7 @@ mod tests {
             .join("\n");
 
         assert!(
-            screen.contains("◐ ● ○"),
+            screen.contains("▶ ● ○"),
             "state summary should remain visible before a clipped long session name:\n{screen}"
         );
     }
@@ -5219,7 +5219,7 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
         );
-        assert_eq!(plain_text(&text), "◐     main");
+        assert_eq!(plain_text(&text), "▶     main");
     }
 
     #[test]
@@ -5277,7 +5277,7 @@ mod tests {
             display_col_of(&labels["single"], "single"),
             Some(SESSION_STATE_GUTTER_WIDTH)
         );
-        assert_eq!(labels["multi"], "◐ ●   multi");
+        assert_eq!(labels["multi"], "▶ ●   multi");
         assert_eq!(labels["single"], "○     single");
     }
 
@@ -9031,7 +9031,7 @@ sort = ["state"]
                         \x20\x20t              sort by state (ST)\n\
                         \n\
                         State markers\n\
-                        \x20\x20● working  ◐ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped\n\
+                        \x20\x20● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped\n\
                         \n\
                         Quick actions (act on selected row)\n\
                         \x20\x20c              copy last prompt to clipboard\n\
