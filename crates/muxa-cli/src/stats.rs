@@ -55,6 +55,12 @@ pub struct Args {
     /// One-shot visual theme override for table output.
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
+
+    /// Print the full explanatory notes (methodology for THINK/ACTIVE, the
+    /// retained-history window, ledger fallbacks). Without this, the table
+    /// only reports that notes exist. JSON/markdown always include them.
+    #[arg(long, short = 'v', default_value_t = false)]
+    verbose: bool,
 }
 
 impl Args {
@@ -147,7 +153,11 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let data = load_data(client, cfg, &args.since, &exclusions).await?;
     let doc = build_document(&data, args.group_by, args.limit, args.sort, args.reverse);
     match args.format {
-        OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
+        OutputFormat::Table => render_table(
+            &doc,
+            theme::for_config(cfg, args.theme, use_colors()),
+            args.verbose,
+        ),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
         OutputFormat::Markdown => print!("{}", render_markdown_stats(&doc)),
     }
@@ -1574,7 +1584,7 @@ fn notes(data: &StatsData) -> Vec<String> {
     notes
 }
 
-fn render_table(doc: &StatsDocument, theme: CliTheme) {
+fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
     println!("muxa stats");
     println!("Range: {}", doc.range.label);
     if let Some(since_at) = doc.range.since_at.as_deref() {
@@ -1597,8 +1607,18 @@ fn render_table(doc: &StatsDocument, theme: CliTheme) {
         }
     }
 
-    for note in &doc.notes {
-        println!("note: {note}");
+    if !doc.notes.is_empty() {
+        if verbose {
+            for note in &doc.notes {
+                println!("note: {note}");
+            }
+        } else {
+            println!(
+                "note: {n} explanatory note{plural} hidden; run `muxa stats --verbose` for methodology, or `muxa doctor` to check health.",
+                n = doc.notes.len(),
+                plural = if doc.notes.len() == 1 { "" } else { "s" },
+            );
+        }
     }
 }
 
