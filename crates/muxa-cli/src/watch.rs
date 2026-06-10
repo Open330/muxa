@@ -33,7 +33,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa::config::{WatchConfig, WatchSortKey, WatchTheme, WatchView, WidthSpec};
+use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme, WatchView, WidthSpec};
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
 use muxa::session_activity::SessionActivity;
@@ -1089,7 +1089,14 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  t              sort by state (ST)",
         "",
         "State markers",
-        "  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped",
+        match crate::icon_set() {
+            IconSet::Unicode => {
+                "  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped"
+            }
+            IconSet::Ascii => {
+                "  * working  > input  ? choice  ! error  o idle  ~ starting  x stopped"
+            }
+        },
         "",
         "Quick actions (act on selected row)",
         "  c              copy last prompt to clipboard",
@@ -2144,16 +2151,9 @@ fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
 }
 
 fn state_marker(state: AgentState, theme: WatchThemeSpec) -> (&'static str, Style) {
-    let symbol = match state {
-        AgentState::Working => "●",
-        AgentState::WaitingInput => "▶",
-        AgentState::WaitingChoice => "◆",
-        AgentState::Error => "■",
-        AgentState::Idle => "○",
-        AgentState::Starting => "◌",
-        AgentState::Stopped => "×",
-    };
-    (symbol, theme.state_style(state))
+    // Share the one glyph source of truth with `muxa status`/`status-line`
+    // so the `[ui] icons` toggle (unicode|ascii) applies everywhere.
+    (crate::state_icon(state), theme.state_style(state))
 }
 
 fn session_time_text(s: &SessionRow, now: OffsetDateTime) -> Text<'static> {

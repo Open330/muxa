@@ -69,6 +69,26 @@ template = "{last_response || last_prompt || last_notification}"
 
 TUI 동작, column, sort, keybinding은 [WATCH.ko.md](WATCH.ko.md)에 있습니다.
 
+## UI
+
+```toml
+[ui]
+theme = "classic"
+icons = "unicode"
+```
+
+사람이 보는 터미널 출력(`status`, `status-line`, `attend`, `watch`)의 공통
+시각 기본값입니다.
+
+- `theme` — 시각 프리셋: `classic`, `oh-my-muxa`, `focus`, `ops`, 또는
+  모노크롬 프리셋. 한 번만 적용하려면 `--theme` 플래그로 덮어씁니다.
+- `icons` — agent 상태 글리프 세트:
+  - `unicode` (기본) — Geometric Shapes 글리프(`●` working, `▶` input,
+    `◆` choice, `■` error, `○` idle, `◌` starting, `×` stopped).
+  - `ascii` — 단일 문자 폴백(`*` working, `>` input, `?` choice, `!` error,
+    `o` idle, `~` starting, `x` stopped). 기본 폰트에 유니코드 글리프가 없거나
+    크기가 다른 폴백 폰트로 대체되는 터미널을 위한 옵션.
+
 ## Reconciler
 
 ```toml

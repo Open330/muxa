@@ -70,6 +70,27 @@ template = "{last_response || last_prompt || last_notification}"
 
 See [WATCH.md](WATCH.md) for TUI behavior, columns, sort, and keybindings.
 
+## UI
+
+```toml
+[ui]
+theme = "classic"
+icons = "unicode"
+```
+
+Shared visual defaults for human-facing terminal output (`status`,
+`status-line`, `attend`, and `watch`).
+
+- `theme` — visual preset: `classic`, `oh-my-muxa`, `focus`, `ops`, or a
+  monochrome preset. A one-shot `--theme` flag overrides it per run.
+- `icons` — agent-state glyph set:
+  - `unicode` (default) — Geometric Shapes glyphs (`●` working, `▶` input,
+    `◆` choice, `■` error, `○` idle, `◌` starting, `×` stopped).
+  - `ascii` — single-character fallbacks (`*` working, `>` input, `?`
+    choice, `!` error, `o` idle, `~` starting, `x` stopped) for terminals
+    whose font lacks the Unicode glyphs or substitutes a mismatched-size
+    fallback font for them.
+
 ## Reconciler
 
 ```toml
