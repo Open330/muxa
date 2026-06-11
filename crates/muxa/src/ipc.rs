@@ -412,35 +412,44 @@ impl Server {
     }
 }
 
-/// Rewrite v2-only enum string values to their v1 equivalents so an old
-/// client doesn't choke on unknown variants. Walks the JSON tree and
+/// Rewrite enum string values introduced in a newer protocol to their
+/// older-protocol equivalents so a client that negotiated an older
+/// protocol doesn't choke on unknown variants. Walks the JSON tree and
 /// mutates standalone string values; substrings inside larger strings
-/// (e.g. a prompt that happens to contain the word `waiting_choice`)
-/// are deliberately left alone. Called on the write path only when the
-/// negotiated protocol is below the variant's introducing version.
-fn downgrade_to_v1(v: &mut serde_json::Value) {
+/// (e.g. a prompt that happens to contain the word `waiting_choice`) are
+/// deliberately left alone. Called on the write path only when the
+/// negotiated protocol is below the current `PROTOCOL_VERSION`.
+fn downgrade_wire(v: &mut serde_json::Value, protocol: u32) {
     match v {
         serde_json::Value::String(s) => {
-            if s == "waiting_choice" {
-                *s = "waiting_input".to_string();
-            } else if s == "needs_choice" {
-                *s = "needs_input".to_string();
+            // `task` AgentKind is a v3 addition → Unknown for older peers.
+            if protocol < 3 && s == "task" {
+                *s = "unknown".to_string();
+            }
+            // `waiting_choice` / `needs_choice` are v2 additions.
+            if protocol < 2 {
+                if s == "waiting_choice" {
+                    *s = "waiting_input".to_string();
+                } else if s == "needs_choice" {
+                    *s = "needs_input".to_string();
+                }
             }
         }
-        serde_json::Value::Array(xs) => xs.iter_mut().for_each(downgrade_to_v1),
-        serde_json::Value::Object(m) => m.values_mut().for_each(downgrade_to_v1),
+        serde_json::Value::Array(xs) => xs.iter_mut().for_each(|x| downgrade_wire(x, protocol)),
+        serde_json::Value::Object(m) => m.values_mut().for_each(|x| downgrade_wire(x, protocol)),
         _ => {}
     }
 }
 
-/// Serialize a payload as a single JSON line, applying the v1 downgrade
-/// when the connection negotiated a protocol older than v2. Keeps the
-/// fast path (no negotiation, or v2+) on a direct `to_vec` so we don't
-/// pay for a `Value` round-trip on every response.
+/// Serialize a payload as a single JSON line, applying the wire downgrade
+/// when the connection negotiated a protocol older than the current
+/// `PROTOCOL_VERSION`. Keeps the fast path (no negotiation, or current)
+/// on a direct `to_vec` so we don't pay for a `Value` round-trip on every
+/// response.
 fn encode_line<T: Serialize>(value: &T, protocol: u32) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = if protocol < 2 {
+    let mut bytes = if protocol < PROTOCOL_VERSION {
         let mut v = serde_json::to_value(value)?;
-        downgrade_to_v1(&mut v);
+        downgrade_wire(&mut v, protocol);
         serde_json::to_vec(&v)?
     } else {
         serde_json::to_vec(value)?
@@ -617,9 +626,13 @@ async fn handle(
                     command,
                 } => {
                     kind = "register";
-                    let session_id = store.register_task(name, pid, cwd, pane, command).await;
-                    tracing::debug!(session_id, ?pid, "register task");
-                    Response::ok()
+                    match store.register_task(name, pid, cwd, pane, command).await {
+                        Ok(session_id) => {
+                            tracing::debug!(session_id, ?pid, "register task");
+                            Response::ok()
+                        }
+                        Err(e) => Response::err(e),
+                    }
                 }
                 RequestBody::Snapshot => {
                     kind = "snapshot";
@@ -682,7 +695,9 @@ async fn handle(
                         Ok(session) => {
                             // Surface the PTY child as a pid-tracked Task row
                             // so `muxa run` processes appear in `muxa status`.
-                            store
+                            // Best-effort: a name collision with a real agent
+                            // just skips the task row, the session still runs.
+                            let _ = store
                                 .register_task(
                                     session
                                         .display_name
@@ -1601,6 +1616,54 @@ mod tests {
         assert!(
             !body.contains("waiting_choice"),
             "v1 snapshot still contains waiting_choice: {body}"
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A `task` row (v3 `AgentKind`) must be downgraded to `unknown` for a
+    /// client that negotiated v2, so older `muxa status`/`watch` can still
+    /// deserialize the snapshot.
+    #[tokio::test]
+    async fn v2_hello_downgrades_task_kind_in_snapshot() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-task-v2.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        store
+            .register_task("job".into(), Some(std::process::id()), None, None, None)
+            .await
+            .unwrap();
+
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut hello = serde_json::to_vec(&serde_json::json!({
+            "protocol": 2, "kind": "hello", "client": "v2-test",
+        }))
+        .unwrap();
+        hello.push(b'\n');
+        stream.write_all(&hello).await.unwrap();
+        let mut snap = serde_json::to_vec(&serde_json::json!({ "kind": "snapshot" })).unwrap();
+        snap.push(b'\n');
+        stream.write_all(&snap).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap(); // hello ack
+        line.clear();
+        reader.read_line(&mut line).await.unwrap(); // snapshot
+        let snap_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let agents = snap_resp["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["kind"], "unknown");
+        assert!(
+            !line.contains("\"task\""),
+            "v2 snapshot still contains task kind: {line}"
         );
 
         tx.send(()).unwrap();
