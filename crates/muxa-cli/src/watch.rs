@@ -1456,7 +1456,9 @@ impl App {
         self.paneless_hidden = 0;
         if self.watch_cfg.hide_paneless {
             let before = agents.len();
-            agents.retain(|a| a.pane.is_some());
+            // Background tasks are intentionally paneless but are the whole
+            // point of being visible, so they're exempt from the hide.
+            agents.retain(|a| a.pane.is_some() || a.kind == AgentKind::Task);
             self.paneless_hidden = before - agents.len();
         }
 
@@ -1822,11 +1824,11 @@ fn build_session_rows(
             .pane
             .as_deref()
             .and_then(|id| sort_context.pane(id).map(|p| p.session.clone()))
-            .unwrap_or_else(|| {
-                agent
-                    .pane
-                    .as_deref()
-                    .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"))
+            .unwrap_or_else(|| match agent.pane.as_deref() {
+                Some(p) => format!("(stale {p})"),
+                // Paneless background tasks group under their own name.
+                None if agent.kind == AgentKind::Task => agent.session_id.clone(),
+                None => "(no session)".to_string(),
             });
         let entry = builders.entry(session.clone()).or_insert_with(|| Builder {
             session,
@@ -4776,6 +4778,7 @@ mod tests {
             session_id: session.into(),
             surface: None,
             pane: pane.map(Into::into),
+            pid: None,
             cwd: None,
             state,
             last_prompt: prompt.map(Into::into),

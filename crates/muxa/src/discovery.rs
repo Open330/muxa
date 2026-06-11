@@ -239,8 +239,8 @@ impl DiscoveryReport {
             AgentKind::ClaudeCode => self.claude_code += 1,
             AgentKind::Codex => self.codex += 1,
             AgentKind::GeminiCli => self.gemini_cli += 1,
-            // We never synthesize for Opencode/Unknown today.
-            AgentKind::Opencode | AgentKind::Unknown => {}
+            // We never synthesize for Opencode/Unknown/Task today.
+            AgentKind::Opencode | AgentKind::Unknown | AgentKind::Task => {}
         }
     }
 }

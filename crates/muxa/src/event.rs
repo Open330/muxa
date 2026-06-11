@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 /// when the IPC envelope schema evolves. Pinning to a specific value across
 /// muxa upgrades is not supported; treat it as a runtime negotiation token,
 /// not a stable API constant.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +22,12 @@ pub enum AgentKind {
     Opencode,
     Codex,
     GeminiCli,
+    /// A non-agent background process (shell script, game, automation loop,
+    /// or a `muxa run` PTY child) registered via `muxa register` / the
+    /// `Register` IPC. Tracked by pid liveness rather than tmux pane
+    /// presence; it has no attention states, only `Working` (alive) and
+    /// `Stopped` (exited).
+    Task,
     Unknown,
 }
 

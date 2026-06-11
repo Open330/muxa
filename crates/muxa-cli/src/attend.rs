@@ -288,6 +288,7 @@ mod tests {
             session_id: session.into(),
             surface: None,
             pane: pane.map(Into::into),
+            pid: None,
             cwd: None,
             state,
             last_prompt: None,

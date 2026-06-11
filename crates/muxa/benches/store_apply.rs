@@ -52,6 +52,7 @@ fn make_realistic_agent() -> Agent {
         session_id: "sess-bench-0001".into(),
         surface: None,
         pane: Some("%42".into()),
+        pid: None,
         cwd: Some("/home/user/projects/some-large-codebase".into()),
         state: muxa::AgentState::Idle,
         last_prompt: Some(prompt),

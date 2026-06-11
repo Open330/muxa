@@ -2187,6 +2187,7 @@ mod tests {
             session_id: "agent-live".into(),
             surface: None,
             pane: Some("%1".into()),
+            pid: None,
             cwd: cwd.map(str::to_string),
             state,
             last_prompt: None,

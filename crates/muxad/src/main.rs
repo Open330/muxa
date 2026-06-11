@@ -282,6 +282,7 @@ async fn main() -> Result<()> {
     if listener_ready {
         maybe_heal_tmux_socket_env(&socket, cfg.socket.as_deref());
         spawn_startup_discovery(&cfg, socket.clone(), backend.clone());
+        spawn_periodic_discovery(&cfg, socket.clone(), backend.clone(), &shutdown_tx);
     }
 
     // Shutdown sequence (each step depends on the previous):
@@ -828,6 +829,7 @@ async fn enrich_from_history(
             surface: None,
             pane: Some(pane.pane_id.clone()),
             cwd: entry.cwd,
+            pid: None,
             state: muxa::AgentState::Idle,
             last_prompt: Some(entry.prompt),
             last_response: None,
@@ -1075,6 +1077,51 @@ fn spawn_startup_discovery(cfg: &Config, socket: PathBuf, backend: muxa::SharedB
     true
 }
 
+/// Spawn the periodic discovery rescan. Startup discovery covers t=0; this
+/// keeps newly-created panes appearing in `muxa status` within
+/// `[discovery] interval_secs` instead of only after the agent's first hook.
+/// Cheap — it reuses the same `tmux list-panes` the reconciler already runs.
+/// No-op when discovery is disabled or `interval_secs == 0`.
+fn spawn_periodic_discovery(
+    cfg: &Config,
+    socket: PathBuf,
+    backend: muxa::SharedBackend,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    if !cfg.discovery.enabled || cfg.discovery.interval_secs == 0 {
+        return;
+    }
+    let interval_secs = cfg.discovery.interval_secs;
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first fire — startup discovery already ran t=0.
+        tick.tick().await;
+        let client = Client::new(socket);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    match discovery::run_discovery(&client, backend.as_ref()).await {
+                        Ok(report) => tracing::debug!(
+                            claude_code = report.claude_code,
+                            codex = report.codex,
+                            gemini_cli = report.gemini_cli,
+                            skipped_known = report.skipped_known,
+                            "periodic discovery pass",
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "periodic discovery failed"),
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::debug!("periodic discovery shutting down");
+                    break;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,7 +1162,10 @@ mod tests {
     #[tokio::test]
     async fn startup_discovery_runs_when_enabled() {
         let cfg = Config {
-            discovery: DiscoveryConfig { enabled: true },
+            discovery: DiscoveryConfig {
+                enabled: true,
+                ..DiscoveryConfig::default()
+            },
             ..Config::default()
         };
         let spawned = spawn_startup_discovery(
@@ -1129,7 +1179,10 @@ mod tests {
     #[tokio::test]
     async fn startup_discovery_skipped_when_disabled() {
         let cfg = Config {
-            discovery: DiscoveryConfig { enabled: false },
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
             ..Config::default()
         };
         let spawned = spawn_startup_discovery(

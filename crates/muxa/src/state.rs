@@ -82,6 +82,12 @@ pub struct Agent {
     pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
     pub cwd: Option<String>,
+    /// OS process id for pid-tracked rows (`AgentKind::Task`). When set,
+    /// the reconciler governs this agent's liveness by checking whether the
+    /// process is still alive instead of by tmux pane presence, and flips
+    /// it to `Stopped` once the pid is gone. `None` for hook/pane agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     pub state: AgentState,
     pub last_prompt: Option<String>,
     /// Last assistant response captured for this agent. Populated by the
@@ -158,6 +164,28 @@ fn default_state_entered_at() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
+/// Whether an OS process is still alive, used for pid-tracked task rows.
+/// Dependency-free: a fast `/proc/<pid>` check on Linux (the primary
+/// target), falling back to `kill -0` elsewhere (macOS/BSD have no
+/// `/proc`). A live entry — including a zombie, which vanishes once reaped
+/// — counts as alive.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 impl Agent {
     fn new(
         kind: AgentKind,
@@ -173,6 +201,7 @@ impl Agent {
             surface,
             pane,
             cwd,
+            pid: None,
             state: AgentState::Starting,
             last_prompt: None,
             last_response: None,
@@ -349,6 +378,63 @@ impl Store {
             self.dirty.notify_one();
         }
         inserted
+    }
+
+    /// Insert (or replace) a pid-tracked background task row, surfacing an
+    /// arbitrary process in `muxa status` / `muxa watch`. Used by the
+    /// `Register` IPC (`muxa register`) and `muxa run` PTY spawns. The row
+    /// starts `Working` and is flipped to `Stopped` by `reap_dead_pids`
+    /// once its pid dies. `name` becomes the session id (and the displayed
+    /// NAME); falls back to `task-<pid>` when empty.
+    pub async fn register_task(
+        &self,
+        name: String,
+        pid: Option<u32>,
+        cwd: Option<String>,
+        pane: Option<String>,
+        command: Option<String>,
+    ) -> Result<String, String> {
+        let now = OffsetDateTime::now_utc();
+        let base = if name.trim().is_empty() {
+            format!("task-{}", pid.unwrap_or(0))
+        } else {
+            name
+        };
+        let mut agents = self.agents.write().await;
+        // Resolve the registry key, handling name collisions:
+        let key = match agents.get(&base) {
+            // Never clobber a real (non-Task) agent row sharing this name.
+            Some(existing) if existing.kind != AgentKind::Task => {
+                return Err(format!(
+                    "'{base}' already names a live {} agent; pick another --name",
+                    existing.kind
+                ));
+            }
+            // Same task re-registering (same pid) — idempotent update in place.
+            Some(existing) if existing.pid == pid => base.clone(),
+            // A different task already holds this name (e.g. two `muxa run`
+            // of the same command). Disambiguate so both coexist.
+            Some(_) => {
+                if let Some(p) = pid {
+                    format!("{base}#{p}")
+                } else {
+                    let mut n = 2;
+                    while agents.contains_key(&format!("{base}#{n}")) {
+                        n += 1;
+                    }
+                    format!("{base}#{n}")
+                }
+            }
+            None => base.clone(),
+        };
+        let mut agent = Agent::new(AgentKind::Task, key.clone(), None, pane, cwd, now);
+        agent.state = AgentState::Working;
+        agent.pid = pid;
+        agent.last_prompt = command;
+        agents.insert(key.clone(), agent);
+        drop(agents);
+        self.dirty.notify_one();
+        Ok(key)
     }
 
     /// Handle to the dirty-signal Notify. Snapshotter tasks subscribe via
@@ -965,6 +1051,13 @@ impl Store {
         let mut agents = self.agents.write().await;
         let mut flipped = 0_usize;
         for agent in agents.values_mut() {
+            // Background tasks have no attention states — they're Working
+            // while alive and Stopped when dead (governed by pid liveness),
+            // and never emit activity, so the stuck-idle sweep must not
+            // demote a live task to Idle.
+            if agent.kind == AgentKind::Task {
+                continue;
+            }
             if agent.state != from {
                 continue;
             }
@@ -984,6 +1077,46 @@ impl Store {
                 to: agent.state,
                 agent: Arc::new(agent.clone()),
             });
+        }
+        flipped
+    }
+
+    /// Flip pid-tracked rows (`AgentKind::Task`) whose process has exited to
+    /// `Stopped`. Run every reconciler tick. Conservative by design: it only
+    /// changes state, never deletes — the regular GC reaps `Stopped` rows
+    /// after their inactivity TTL. Returns the number of rows flipped.
+    pub async fn reap_dead_pids(&self) -> usize {
+        let mut agents = self.agents.write().await;
+        let mut flipped = 0_usize;
+        for agent in agents.values_mut() {
+            let Some(pid) = agent.pid else { continue };
+            if agent.state == AgentState::Stopped {
+                continue;
+            }
+            if pid_alive(pid) {
+                continue;
+            }
+            let prev = agent.state;
+            let now = OffsetDateTime::now_utc();
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = now;
+            // Touch last_activity_at so the GC's Stopped-row TTL is measured
+            // from when the task died, not from registration — otherwise a
+            // task that ran longer than the TTL is evicted on the next sweep
+            // instead of lingering as Stopped for the window.
+            agent.last_activity_at = now;
+            flipped += 1;
+            // Same broadcast shape as `apply`/`mark_stuck_idle_from` so live
+            // subscribers see the row go Stopped immediately.
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: Arc::new(agent.clone()),
+            });
+        }
+        if flipped > 0 {
+            drop(agents);
+            self.dirty.notify_one();
         }
         flipped
     }
@@ -1018,15 +1151,30 @@ impl Store {
         // Sweep 1: drop agents whose pane is gone. Done as a single retain
         // pass to avoid building an intermediate Vec of doomed session ids.
         let before = agents.len();
-        agents.retain(|_, a| match a.pane.as_deref() {
-            Some(pane_id) => live.contains(pane_id),
-            None => true, // paneless agents (rare) aren't governed by tmux
+        agents.retain(|_, a| {
+            // pid-tracked rows (Task) are governed by process liveness in
+            // `reap_dead_pids`, never by tmux pane presence — they may be
+            // paneless or carry a pane id that isn't a tmux pane.
+            if a.pid.is_some() {
+                return true;
+            }
+            match a.pane.as_deref() {
+                Some(pane_id) => live.contains(pane_id),
+                None => true, // paneless agents (rare) aren't governed by tmux
+            }
         });
         report.stale_panes_reaped = before - agents.len();
 
         // Sweeps 2 & 3: per-pane dedup. Group surviving agents by pane id.
+        // pid-tracked rows (Task) are excluded entirely — they're governed
+        // by process liveness, never by pane ownership, so a task that
+        // carries a `--pane` must not be deduped against the pane's real
+        // agent (that would delete one of them).
         let mut by_pane: HashMap<&str, Vec<String>> = HashMap::new();
         for (sid, a) in agents.iter() {
+            if a.pid.is_some() {
+                continue;
+            }
             if let Some(p) = a.pane.as_deref() {
                 by_pane.entry(p).or_default().push(sid.clone());
             }
@@ -1145,6 +1293,7 @@ mod tests {
             kind,
             session_id: session.into(),
             surface: None,
+            pid: None,
             pane: Some("%1".into()),
             cwd: None,
             state,
@@ -1165,6 +1314,194 @@ mod tests {
             last_activity_at: at,
             state_entered_at: at,
         }
+    }
+
+    #[tokio::test]
+    async fn register_task_inserts_working_pid_tracked_row() {
+        let store = Store::shared();
+        let sid = store
+            .register_task(
+                "game".into(),
+                Some(4242),
+                Some("/home/u/game".into()),
+                None,
+                Some("./play.sh".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "game");
+        let agent = store.by_session("game").await.unwrap();
+        assert_eq!(agent.kind, AgentKind::Task);
+        assert_eq!(agent.state, AgentState::Working);
+        assert_eq!(agent.pid, Some(4242));
+        assert_eq!(agent.last_prompt.as_deref(), Some("./play.sh"));
+    }
+
+    #[tokio::test]
+    async fn register_task_empty_name_falls_back_to_task_pid() {
+        let store = Store::shared();
+        let sid = store
+            .register_task(String::new(), Some(99), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(sid, "task-99");
+    }
+
+    #[tokio::test]
+    async fn register_task_refuses_to_clobber_real_agent() {
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "claude-1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        // A task registration that collides with the real agent's id is
+        // rejected — the real row (kind + pane) must be preserved.
+        let err = store
+            .register_task("claude-1".into(), Some(123), None, None, None)
+            .await;
+        assert!(err.is_err());
+        let agent = store.by_session("claude-1").await.unwrap();
+        assert_eq!(agent.kind, AgentKind::ClaudeCode);
+        assert_eq!(agent.pid, None);
+    }
+
+    #[tokio::test]
+    async fn register_task_disambiguates_duplicate_names() {
+        let store = Store::shared();
+        // Two `muxa run sleep` with distinct pids must coexist, not clobber.
+        let a = store
+            .register_task("sleep".into(), Some(111), None, None, None)
+            .await
+            .unwrap();
+        let b = store
+            .register_task("sleep".into(), Some(222), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(a, "sleep");
+        assert_ne!(a, b);
+        assert!(store.by_session(&a).await.is_some());
+        assert!(store.by_session(&b).await.is_some());
+        // Same pid re-registering is idempotent (same key).
+        let a2 = store
+            .register_task("sleep".into(), Some(111), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(a2, "sleep");
+    }
+
+    #[tokio::test]
+    async fn reap_dead_pids_stops_dead_keeps_alive() {
+        let store = Store::shared();
+        // A pid that cannot exist (max u32) is dead; our own pid is alive.
+        store
+            .register_task("dead".into(), Some(u32::MAX), None, None, None)
+            .await
+            .unwrap();
+        store
+            .register_task("alive".into(), Some(std::process::id()), None, None, None)
+            .await
+            .unwrap();
+        let flipped = store.reap_dead_pids().await;
+        assert_eq!(flipped, 1);
+        let dead = store.by_session("dead").await.unwrap();
+        assert_eq!(dead.state, AgentState::Stopped);
+        // last_activity_at is refreshed so GC measures the TTL from death.
+        assert!(dead.last_activity_at >= dead.started_at);
+        assert_eq!(
+            store.by_session("alive").await.unwrap().state,
+            AgentState::Working
+        );
+        // Idempotent: a second pass flips nothing new.
+        assert_eq!(store.reap_dead_pids().await, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_reaps_pid_tracked_rows() {
+        let store = Store::shared();
+        // Pid-tracked task carrying a pane id that is NOT in the live set.
+        store
+            .register_task(
+                "task".into(),
+                Some(std::process::id()),
+                None,
+                Some("%999".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Reconcile against an empty live-pane set — a normal pane agent
+        // would be reaped, but the pid-tracked row must survive.
+        let report = store.reconcile(&[]).await;
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert!(store.by_session("task").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_task_and_agent_sharing_a_pane() {
+        // Regression: a Task that carries a `--pane` must NOT be deduped
+        // against the real agent owning that pane — both must survive.
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "agent".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        store
+            .register_task(
+                "task".into(),
+                Some(std::process::id()),
+                None,
+                Some("%1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let pane = PaneInfo {
+            pane_id: "%1".into(),
+            session: "s".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            pane_pid: 0,
+        };
+        store.reconcile(std::slice::from_ref(&pane)).await;
+        assert!(store.by_session("agent").await.is_some());
+        assert!(store.by_session("task").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn stuck_idle_sweep_never_demotes_tasks() {
+        let store = Store::shared();
+        store
+            .register_task("task".into(), Some(std::process::id()), None, None, None)
+            .await
+            .unwrap();
+        // A 1ns threshold makes everything "stuck"; the task must stay Working.
+        let flipped = store
+            .mark_stuck_idle_from(AgentState::Working, std::time::Duration::from_nanos(1))
+            .await;
+        assert_eq!(flipped, 0);
+        assert_eq!(
+            store.by_session("task").await.unwrap().state,
+            AgentState::Working
+        );
     }
 
     #[tokio::test]
@@ -2679,6 +3016,7 @@ mod tests {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-old".into(),
                     surface: None,
+                    pid: None,
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Stopped,
@@ -2706,6 +3044,7 @@ mod tests {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-new".into(),
                     surface: None,
+                    pid: None,
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Working,
@@ -2762,6 +3101,7 @@ mod tests {
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
                         surface: None,
+                        pid: None,
                         pane: Some("%1".into()),
                         cwd: None,
                         state: AgentState::Working,
@@ -2822,6 +3162,7 @@ mod tests {
             kind: AgentKind::ClaudeCode,
             session_id: sid.into(),
             surface: None,
+            pid: None,
             pane: Some(pane.into()),
             cwd: None,
             state: AgentState::Idle,

@@ -149,6 +149,7 @@ mod tests {
             session_id: "s".into(),
             surface: None,
             pane: Some("%7".into()),
+            pid: None,
             cwd: None,
             state,
             last_prompt: Some("refactor the ipc module to use tokio io_uring".into()),
