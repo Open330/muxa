@@ -89,6 +89,22 @@ icons = "unicode"
     `o` idle, `~` starting, `x` stopped). 기본 폰트에 유니코드 글리프가 없거나
     크기가 다른 폴백 폰트로 대체되는 터미널을 위한 옵션.
 
+## Discovery
+
+```toml
+[discovery]
+enabled = true
+interval_secs = 30
+```
+
+discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`gemini`)를
+찾아 hook이 오기 전에 레지스트리를 채웁니다. 데몬 시작 시 1회 실행되고 이후
+`interval_secs`마다 재스캔하므로, 새 tmux 세션에서 갓 시작한 agent가 첫 hook을
+쏘기 전이라도 그 주기 안에 `muxa status`에 뜹니다. `interval_secs = 0`이면
+기존 "시작 시 1회"만, `enabled = false`면 discovery를 완전히 끕니다. 재스캔은
+reconciler가 이미 호출하는 `tmux list-panes`를 재사용하므로 비용은 무시할
+수준입니다.
+
 ## Reconciler
 
 ```toml
@@ -100,6 +116,8 @@ stuck_waiting_timeout_secs = 0
 ```
 
 stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 timeout 비활성화입니다.
+같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa register` 참고)는
+프로세스가 종료되면 `stopped`로 전환됩니다.
 
 ## Dashboard
 

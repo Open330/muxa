@@ -55,6 +55,11 @@ pub struct SessionRef {
     pub attached_clients: usize,
     pub exited: bool,
     pub exit_status: Option<i32>,
+    /// OS pid of the PTY child, when known. Lets the daemon register the
+    /// session as a pid-tracked `Task` row so `muxa run` processes show up
+    /// in `muxa status`.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 impl SessionRef {
@@ -214,11 +219,13 @@ impl PtySessionBackend {
             .take_writer()
             .map_err(|e| SessionError::Pty(e.to_string()))?;
         let killer = child.clone_killer();
+        let pid = child.process_id();
         let session = Arc::new(PtySession {
             meta: Mutex::new(SessionMeta {
                 id: id.clone(),
                 display_name: input.name.or_else(|| Some(input.command.clone())),
                 cwd: input.cwd.map(|p| p.display().to_string()),
+                pid,
                 cols,
                 rows,
                 attached_clients: 0,
@@ -416,6 +423,7 @@ impl PtySession {
             attached_clients: meta.attached_clients,
             exited: meta.exited,
             exit_status: meta.exit_status,
+            pid: meta.pid,
         }
     }
 
@@ -460,6 +468,7 @@ struct SessionMeta {
     id: String,
     display_name: Option<String>,
     cwd: Option<String>,
+    pid: Option<u32>,
     cols: u16,
     rows: u16,
     attached_clients: usize,

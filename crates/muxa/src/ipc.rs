@@ -156,6 +156,19 @@ enum RequestBody {
     TerminateSession {
         session_id: String,
     },
+    /// Register an arbitrary background process as a pid-tracked `Task` row
+    /// so it shows up in `muxa status`/`muxa watch`. Backs `muxa register`.
+    Register {
+        name: String,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,6 +609,18 @@ async fn handle(
                     store.apply(&event).await;
                     Response::ok()
                 }
+                RequestBody::Register {
+                    name,
+                    pid,
+                    cwd,
+                    pane,
+                    command,
+                } => {
+                    kind = "register";
+                    let session_id = store.register_task(name, pid, cwd, pane, command).await;
+                    tracing::debug!(session_id, ?pid, "register task");
+                    Response::ok()
+                }
                 RequestBody::Snapshot => {
                     kind = "snapshot";
                     Response::with_agents(store.snapshot().await)
@@ -654,7 +679,23 @@ async fn handle(
                         cols,
                         rows,
                     }) {
-                        Ok(session) => Response::with_session(session),
+                        Ok(session) => {
+                            // Surface the PTY child as a pid-tracked Task row
+                            // so `muxa run` processes appear in `muxa status`.
+                            store
+                                .register_task(
+                                    session
+                                        .display_name
+                                        .clone()
+                                        .unwrap_or_else(|| session.id.clone()),
+                                    session.pid,
+                                    session.cwd.clone(),
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            Response::with_session(session)
+                        }
                         Err(e) => Response::err(e.to_string()),
                     }
                 }
@@ -1040,6 +1081,29 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "terminate_session",
             "session_id": session_id,
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
+    /// Register an arbitrary background process as a pid-tracked `Task` row.
+    /// Backs the `muxa register` CLI.
+    pub async fn register(
+        &self,
+        name: &str,
+        pid: Option<u32>,
+        cwd: Option<&str>,
+        pane: Option<&str>,
+        command: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "register",
+            "name": name,
+            "pid": pid,
+            "cwd": cwd,
+            "pane": pane,
+            "command": command,
         });
         let _ = self.call_checked(&req).await?;
         Ok(())

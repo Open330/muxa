@@ -82,6 +82,12 @@ pub struct Agent {
     pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
     pub cwd: Option<String>,
+    /// OS process id for pid-tracked rows (`AgentKind::Task`). When set,
+    /// the reconciler governs this agent's liveness by checking whether the
+    /// process is still alive instead of by tmux pane presence, and flips
+    /// it to `Stopped` once the pid is gone. `None` for hook/pane agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     pub state: AgentState,
     pub last_prompt: Option<String>,
     /// Last assistant response captured for this agent. Populated by the
@@ -158,6 +164,14 @@ fn default_state_entered_at() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
+/// Whether an OS process is still alive, used for pid-tracked task rows.
+/// Linux-only `/proc` check — dependency-free and sufficient for muxa's
+/// target. A pid with a live `/proc/<pid>` entry (including zombies, which
+/// is fine — they vanish once reaped) counts as alive.
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
 impl Agent {
     fn new(
         kind: AgentKind,
@@ -173,6 +187,7 @@ impl Agent {
             surface,
             pane,
             cwd,
+            pid: None,
             state: AgentState::Starting,
             last_prompt: None,
             last_response: None,
@@ -349,6 +364,37 @@ impl Store {
             self.dirty.notify_one();
         }
         inserted
+    }
+
+    /// Insert (or replace) a pid-tracked background task row, surfacing an
+    /// arbitrary process in `muxa status` / `muxa watch`. Used by the
+    /// `Register` IPC (`muxa register`) and `muxa run` PTY spawns. The row
+    /// starts `Working` and is flipped to `Stopped` by `reap_dead_pids`
+    /// once its pid dies. `name` becomes the session id (and the displayed
+    /// NAME); falls back to `task-<pid>` when empty.
+    pub async fn register_task(
+        &self,
+        name: String,
+        pid: Option<u32>,
+        cwd: Option<String>,
+        pane: Option<String>,
+        command: Option<String>,
+    ) -> String {
+        let now = OffsetDateTime::now_utc();
+        let session_id = if name.trim().is_empty() {
+            format!("task-{}", pid.unwrap_or(0))
+        } else {
+            name
+        };
+        let mut agent = Agent::new(AgentKind::Task, session_id.clone(), None, pane, cwd, now);
+        agent.state = AgentState::Working;
+        agent.pid = pid;
+        agent.last_prompt = command;
+        let mut agents = self.agents.write().await;
+        agents.insert(session_id.clone(), agent);
+        drop(agents);
+        self.dirty.notify_one();
+        session_id
     }
 
     /// Handle to the dirty-signal Notify. Snapshotter tasks subscribe via
@@ -988,6 +1034,40 @@ impl Store {
         flipped
     }
 
+    /// Flip pid-tracked rows (`AgentKind::Task`) whose process has exited to
+    /// `Stopped`. Run every reconciler tick. Conservative by design: it only
+    /// changes state, never deletes — the regular GC reaps `Stopped` rows
+    /// after their inactivity TTL. Returns the number of rows flipped.
+    pub async fn reap_dead_pids(&self) -> usize {
+        let mut agents = self.agents.write().await;
+        let mut flipped = 0_usize;
+        for agent in agents.values_mut() {
+            let Some(pid) = agent.pid else { continue };
+            if agent.state == AgentState::Stopped {
+                continue;
+            }
+            if pid_alive(pid) {
+                continue;
+            }
+            let prev = agent.state;
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = OffsetDateTime::now_utc();
+            flipped += 1;
+            // Same broadcast shape as `apply`/`mark_stuck_idle_from` so live
+            // subscribers see the row go Stopped immediately.
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: Arc::new(agent.clone()),
+            });
+        }
+        if flipped > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+        }
+        flipped
+    }
+
     /// Converge the registry against ground truth from tmux.
     ///
     /// This is the periodic control-loop pass — analogous to a Kubernetes
@@ -1018,9 +1098,17 @@ impl Store {
         // Sweep 1: drop agents whose pane is gone. Done as a single retain
         // pass to avoid building an intermediate Vec of doomed session ids.
         let before = agents.len();
-        agents.retain(|_, a| match a.pane.as_deref() {
-            Some(pane_id) => live.contains(pane_id),
-            None => true, // paneless agents (rare) aren't governed by tmux
+        agents.retain(|_, a| {
+            // pid-tracked rows (Task) are governed by process liveness in
+            // `reap_dead_pids`, never by tmux pane presence — they may be
+            // paneless or carry a pane id that isn't a tmux pane.
+            if a.pid.is_some() {
+                return true;
+            }
+            match a.pane.as_deref() {
+                Some(pane_id) => live.contains(pane_id),
+                None => true, // paneless agents (rare) aren't governed by tmux
+            }
         });
         report.stale_panes_reaped = before - agents.len();
 
@@ -1145,6 +1233,7 @@ mod tests {
             kind,
             session_id: session.into(),
             surface: None,
+            pid: None,
             pane: Some("%1".into()),
             cwd: None,
             state,
@@ -1165,6 +1254,79 @@ mod tests {
             last_activity_at: at,
             state_entered_at: at,
         }
+    }
+
+    #[tokio::test]
+    async fn register_task_inserts_working_pid_tracked_row() {
+        let store = Store::shared();
+        let sid = store
+            .register_task(
+                "game".into(),
+                Some(4242),
+                Some("/home/u/game".into()),
+                None,
+                Some("./play.sh".into()),
+            )
+            .await;
+        assert_eq!(sid, "game");
+        let agent = store.by_session("game").await.unwrap();
+        assert_eq!(agent.kind, AgentKind::Task);
+        assert_eq!(agent.state, AgentState::Working);
+        assert_eq!(agent.pid, Some(4242));
+        assert_eq!(agent.last_prompt.as_deref(), Some("./play.sh"));
+    }
+
+    #[tokio::test]
+    async fn register_task_empty_name_falls_back_to_task_pid() {
+        let store = Store::shared();
+        let sid = store
+            .register_task(String::new(), Some(99), None, None, None)
+            .await;
+        assert_eq!(sid, "task-99");
+    }
+
+    #[tokio::test]
+    async fn reap_dead_pids_stops_dead_keeps_alive() {
+        let store = Store::shared();
+        // A pid that cannot exist (max u32) is dead; our own pid is alive.
+        store
+            .register_task("dead".into(), Some(u32::MAX), None, None, None)
+            .await;
+        store
+            .register_task("alive".into(), Some(std::process::id()), None, None, None)
+            .await;
+        let flipped = store.reap_dead_pids().await;
+        assert_eq!(flipped, 1);
+        assert_eq!(
+            store.by_session("dead").await.unwrap().state,
+            AgentState::Stopped
+        );
+        assert_eq!(
+            store.by_session("alive").await.unwrap().state,
+            AgentState::Working
+        );
+        // Idempotent: a second pass flips nothing new.
+        assert_eq!(store.reap_dead_pids().await, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_reaps_pid_tracked_rows() {
+        let store = Store::shared();
+        // Pid-tracked task carrying a pane id that is NOT in the live set.
+        store
+            .register_task(
+                "task".into(),
+                Some(std::process::id()),
+                None,
+                Some("%999".into()),
+                None,
+            )
+            .await;
+        // Reconcile against an empty live-pane set — a normal pane agent
+        // would be reaped, but the pid-tracked row must survive.
+        let report = store.reconcile(&[]).await;
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert!(store.by_session("task").await.is_some());
     }
 
     #[tokio::test]
@@ -2679,6 +2841,7 @@ mod tests {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-old".into(),
                     surface: None,
+                    pid: None,
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Stopped,
@@ -2706,6 +2869,7 @@ mod tests {
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-new".into(),
                     surface: None,
+                    pid: None,
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Working,
@@ -2762,6 +2926,7 @@ mod tests {
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
                         surface: None,
+                        pid: None,
                         pane: Some("%1".into()),
                         cwd: None,
                         state: AgentState::Working,
@@ -2822,6 +2987,7 @@ mod tests {
             kind: AgentKind::ClaudeCode,
             session_id: sid.into(),
             surface: None,
+            pid: None,
             pane: Some(pane.into()),
             cwd: None,
             state: AgentState::Idle,

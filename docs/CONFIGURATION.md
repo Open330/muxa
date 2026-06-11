@@ -91,6 +91,23 @@ Shared visual defaults for human-facing terminal output (`status`,
     whose font lacks the Unicode glyphs or substitutes a mismatched-size
     fallback font for them.
 
+## Discovery
+
+```toml
+[discovery]
+enabled = true
+interval_secs = 30
+```
+
+Discovery scans tmux panes for known agent CLIs (`claude` / `codex` /
+`gemini`) and backfills the registry without waiting for a hook to fire. It
+runs once at daemon startup and then every `interval_secs`, so a fresh agent
+session in a new tmux session shows up in `muxa status` within that window
+instead of only after its first hook. Set `interval_secs = 0` to keep the
+legacy run-once-at-startup behavior; `enabled = false` turns discovery off
+entirely. The rescan reuses the same `tmux list-panes` the reconciler
+already runs, so the cost is negligible.
+
 ## Reconciler
 
 ```toml
@@ -102,7 +119,9 @@ stuck_waiting_timeout_secs = 0
 ```
 
 The reconciler keeps stale states from staying misleading forever. Timeout
-values of `0` disable that timeout.
+values of `0` disable that timeout. The same loop also runs the pid-liveness
+sweep that flips registered background tasks (see `muxa register`) to
+`stopped` once their process exits.
 
 ## Dashboard
 

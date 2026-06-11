@@ -90,6 +90,8 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
+| `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
+| `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
 

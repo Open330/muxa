@@ -2003,6 +2003,7 @@ mod tests {
             session_id: session_id.into(),
             surface: None,
             pane: Some("%1".into()),
+            pid: None,
             cwd: None,
             state,
             last_prompt: None,

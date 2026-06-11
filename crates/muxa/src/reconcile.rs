@@ -162,6 +162,11 @@ impl<L: LivenessSource> Reconciler<L> {
                 self.stuck_waiting_timeout,
             )
             .await;
+        // Flip pid-tracked task rows whose process has exited to Stopped.
+        let dead_tasks = self.store.reap_dead_pids().await;
+        if dead_tasks > 0 {
+            tracing::info!("pid-liveness sweep stopped {dead_tasks} dead task row(s)");
+        }
         if let Some(m) = &self.metrics {
             m.record_reconcile_pass();
         }
@@ -420,6 +425,7 @@ mod tests {
             surface: None,
             pane: Some("%3".into()),
             cwd: None,
+            pid: None,
             state,
             last_prompt: None,
             last_response: None,

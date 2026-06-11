@@ -502,7 +502,7 @@ pub fn agent_kind_to_source(kind: AgentKind) -> Option<&'static str> {
         AgentKind::Codex => Some("codex"),
         AgentKind::GeminiCli => Some("gemini"),
         AgentKind::Opencode => Some("opencode"),
-        AgentKind::Unknown => None,
+        AgentKind::Unknown | AgentKind::Task => None,
     }
 }
 
@@ -513,7 +513,7 @@ pub fn agent_kind_to_cli_name(kind: AgentKind) -> Option<&'static str> {
         AgentKind::Codex => Some("codex"),
         AgentKind::GeminiCli => Some("gemini"),
         AgentKind::Opencode => Some("opencode"),
-        AgentKind::Unknown => None,
+        AgentKind::Unknown | AgentKind::Task => None,
     }
 }
 

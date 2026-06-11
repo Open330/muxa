@@ -487,6 +487,7 @@ mod tests {
             session_id: "sess-1".into(),
             surface: None,
             pane: pane.map(str::to_string),
+            pid: None,
             cwd: None,
             state: AgentState::WaitingInput,
             last_prompt: prompt.map(str::to_string),

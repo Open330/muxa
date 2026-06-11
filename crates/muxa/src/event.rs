@@ -22,6 +22,12 @@ pub enum AgentKind {
     Opencode,
     Codex,
     GeminiCli,
+    /// A non-agent background process (shell script, game, automation loop,
+    /// or a `muxa run` PTY child) registered via `muxa register` / the
+    /// `Register` IPC. Tracked by pid liveness rather than tmux pane
+    /// presence; it has no attention states, only `Working` (alive) and
+    /// `Stopped` (exited).
+    Task,
     Unknown,
 }
 

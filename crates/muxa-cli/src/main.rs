@@ -23,7 +23,7 @@ use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
 use muxa::state::Agent;
 use muxa::{
-    discovery, paths, tmux, ActivityEntry, AgentState, Config, HumanInteractionEntry,
+    discovery, paths, tmux, ActivityEntry, AgentKind, AgentState, Config, HumanInteractionEntry,
     HumanInteractionInput, HumanInteractionKind,
 };
 use owo_colors::Style;
@@ -140,6 +140,24 @@ enum Cmd {
     Attach { session: String },
     /// Mark a muxa-owned PTY session as detached.
     Detach { session: String },
+    /// Register an arbitrary background process (shell script, game,
+    /// automation loop) so it shows up in `muxa status`/`muxa watch`,
+    /// tracked by pid liveness. Defaults `--pid` to the calling shell.
+    Register {
+        /// Display name shown in the NAME column.
+        #[arg(long)]
+        name: String,
+        /// Process id to track. Defaults to the parent process (the shell
+        /// that invoked `muxa register`).
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Working directory to record (informational).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// tmux pane id to associate, when the process lives in one.
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Internal bridge used by the zellij WASM plugin.
     #[command(hide = true)]
     ZellijPluginSnapshot {
@@ -306,6 +324,12 @@ async fn main() -> Result<()> {
         } => cmd_run(&client, &socket, name, cwd, detach, command).await,
         Cmd::Attach { session } => cmd_attach(&client, &session).await,
         Cmd::Detach { session } => cmd_detach(&client, &session).await,
+        Cmd::Register {
+            name,
+            pid,
+            cwd,
+            pane,
+        } => cmd_register(&client, name, pid, cwd, pane).await,
         Cmd::ZellijPluginSnapshot { json } => cmd_zellij_plugin_snapshot(&client, &json).await,
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
@@ -380,6 +404,26 @@ async fn cmd_attach(client: &Client, session: &str) -> Result<()> {
 async fn cmd_detach(client: &Client, session: &str) -> Result<()> {
     client.set_session_attached(session, false).await?;
     println!("muxa: detached {session}");
+    Ok(())
+}
+
+async fn cmd_register(
+    client: &Client,
+    name: String,
+    pid: Option<u32>,
+    cwd: Option<String>,
+    pane: Option<String>,
+) -> Result<()> {
+    // Default to the calling shell so `muxa register --name X` from a pane
+    // tracks that shell without the user hunting for a pid.
+    let pid = pid.or_else(|| Some(std::os::unix::process::parent_id()));
+    client
+        .register(&name, pid, cwd.as_deref(), pane.as_deref(), None)
+        .await?;
+    match pid {
+        Some(p) => println!("muxa: registered {name} (pid {p})"),
+        None => println!("muxa: registered {name}"),
+    }
     Ok(())
 }
 
@@ -1124,6 +1168,11 @@ pub(crate) fn state_style(state: AgentState) -> Style {
 /// pass it down.
 pub(crate) fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String {
     let Some(raw) = a.pane.as_deref() else {
+        // Paneless background tasks have no tmux location — show their
+        // registered name instead of a context-free "-".
+        if a.kind == AgentKind::Task {
+            return a.session_id.clone();
+        }
         return "-".to_string();
     };
     match panes.iter().find(|p| p.pane_id == raw) {
@@ -1333,6 +1382,7 @@ mod tests {
             session_id: session_id.into(),
             surface: None,
             pane: pane.map(str::to_string),
+            pid: None,
             cwd: None,
             state,
             last_prompt: Some(prompt.into()),
@@ -1505,6 +1555,17 @@ mod tests {
         assert_eq!(truncate_cell("short", 10), "short");
         assert_eq!(truncate_cell("0123456789abc", 8), "01234...");
         assert_eq!(truncate_cell("한글테스트입니다", 6), "한...");
+    }
+
+    #[test]
+    fn pane_display_shows_task_name_when_paneless() {
+        // A paneless background task shows its registered name in NAME...
+        let mut task = agent("game", None, AgentState::Working, "");
+        task.kind = AgentKind::Task;
+        assert_eq!(pane_display(&task, &[]), "game");
+        // ...while other paneless agents (e.g. SDK sessions) still show "-".
+        let sdk = agent("sdk-1", None, AgentState::Idle, "");
+        assert_eq!(pane_display(&sdk, &[]), "-");
     }
 
     #[test]

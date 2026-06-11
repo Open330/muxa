@@ -314,11 +314,23 @@ pub enum NotifierBackend {
 pub struct DiscoveryConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Cadence of the periodic discovery rescan, in seconds. Startup
+    /// discovery always runs once; this keeps newly-created panes (a fresh
+    /// `claude`/`codex`/`gemini` session in a new tmux session) appearing in
+    /// `muxa status` within `interval_secs` instead of only after the agent
+    /// fires its first hook. Set `0` to keep the legacy run-once-at-startup
+    /// behavior. Cheap — it reuses the same `tmux list-panes` the reconciler
+    /// already shells out for.
+    #[serde(default = "default_discovery_interval_secs")]
+    pub interval_secs: u64,
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            interval_secs: default_discovery_interval_secs(),
+        }
     }
 }
 
@@ -381,6 +393,10 @@ impl Default for ReconcilerConfig {
 }
 
 fn default_reconciler_interval_secs() -> u64 {
+    30
+}
+
+fn default_discovery_interval_secs() -> u64 {
     30
 }
 
@@ -1094,6 +1110,14 @@ mod tests {
     fn discovery_can_be_disabled() {
         let cfg: Config = toml::from_str("[discovery]\nenabled = false\n").unwrap();
         assert!(!cfg.discovery.enabled);
+    }
+
+    #[test]
+    fn discovery_interval_defaults_to_30s() {
+        let cfg = Config::default();
+        assert_eq!(cfg.discovery.interval_secs, 30);
+        let parsed: Config = toml::from_str("[discovery]\ninterval_secs = 5\n").unwrap();
+        assert_eq!(parsed.discovery.interval_secs, 5);
     }
 
     #[test]
