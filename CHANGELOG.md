@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-06-11
+
+### Added
+
+- **Background tasks in `muxa status`** — arbitrary processes can be surfaced
+  as pid-tracked rows. `muxa register --name X [--pid N]` adopts an existing
+  process (defaults `--pid` to the calling shell); `muxa run` PTY sessions
+  auto-register with the child's pid. Liveness is governed by pid (not tmux
+  pane): the reconciler flips dead pids to `stopped` and the GC evicts them
+  after the usual TTL. A name collision with a real agent is refused;
+  duplicate task names are disambiguated.
+- **Periodic discovery** — `[discovery] interval_secs` (default 30, `0` =
+  run-once-at-startup) reruns the tmux agent scan on a timer, so a fresh
+  agent session shows up in `muxa status` within the window instead of only
+  after its first hook. Reuses the reconciler's existing `tmux list-panes`,
+  so the cost is negligible.
+
+### Changed
+
+- **IPC protocol bumped to v3.** The new `task` agent kind is downgraded to
+  `unknown` for clients that negotiated an older protocol, so an older
+  `muxa status`/`watch` can still deserialize snapshots that contain task
+  rows.
+
 ## [0.8.8] - 2026-06-10
 
 ### Added
