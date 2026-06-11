@@ -64,8 +64,9 @@ triggers:
 
 Unlike `HUMAN` (raw presence: tmux foreground, prompt input, or attach), a pane
 left attached and untouched accrues none of these, so it does not inflate
-`ACTIVE`. `ACTIVE` is not bounded by `HUMAN` — driving agents without a tracked
-tmux attach can make a single session's `ACT` exceed it.
+`ACTIVE`. Prompt and tmux-input windows are also clipped to matching `HUMAN`
+presence, so padding cannot make a single session's `ACT` exceed its observed
+foreground/interaction time.
 
 Across sessions, `ACTIVE` is **de-duplicated**: a human does one thing at a time,
 so each instant is attributed to the most recently touched session ("last

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bound `ACT` by observed human presence** — `muxa stats`, `report`, timeline,
+  and dashboard active-session totals now clip prompt/tmux-input padding to the
+  matching `HUMAN` presence interval. This prevents short foreground visits from
+  being inflated by the default 60s-before/5m-after active window, so a
+  session's `ACT` no longer exceeds its observed foreground/interaction time.
+
 ## [0.8.9] - 2026-06-11
 
 ### Added

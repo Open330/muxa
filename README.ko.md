@@ -111,7 +111,7 @@ muxa activity --since today --type human
 30일 rolling window인 `month`, 저번주 월요일-일요일 구간인 `last-week` /
 `"last week"`, 이전 달력 월인 `last-month` / `"last month"`, `24h`/`7d`/`4w`
 같은 rolling duration, `2026-06-06` 같은 local date, RFC3339 timestamp,
-`all`을 받습니다. `HUMAN`, `THINK`를 포함한
+`all`을 받습니다. `HUMAN`, `THINK`, `ACT`를 포함한
 ledger 판정 기준은 [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md)에 있습니다.
 
 계속 켜둔 monitoring scope는 `muxa stats`, `muxa report`, `muxa timeline`에서

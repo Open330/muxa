@@ -800,6 +800,7 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
     let mut intervals = Vec::new();
     let active_lookback = secs_to_duration(input.active_lookback_secs);
     let active_timeout = secs_to_duration(input.active_timeout_secs);
+    let active_presences = active_human_presence_intervals(input, false);
 
     for prompt in input.prompt_entries {
         if !input.range.includes_end(prompt.at) {
@@ -829,11 +830,13 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
             session_name,
             &prompt.session_id,
         ) {
-            intervals.push(ActiveAnchor {
-                interval,
-                group_key,
-                anchor: prompt.at,
-            });
+            for segment in overlapping_active_presence_segments(&interval, &active_presences) {
+                intervals.push(ActiveAnchor {
+                    interval: segment,
+                    group_key: group_key.clone(),
+                    anchor: prompt.at,
+                });
+            }
         }
     }
 
@@ -863,11 +866,13 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
             entry.session_id.as_deref().unwrap_or("human_interaction"),
         ) {
             let group_key = active_human_group_key(&interval);
-            intervals.push(ActiveAnchor {
-                interval,
-                group_key,
-                anchor: entry.ended_at,
-            });
+            for segment in overlapping_active_presence_segments(&interval, &active_presences) {
+                intervals.push(ActiveAnchor {
+                    interval: segment,
+                    group_key: group_key.clone(),
+                    anchor: entry.ended_at,
+                });
+            }
         }
     }
 
@@ -1439,7 +1444,8 @@ fn parse_iso_date(raw: &str) -> Result<Option<Date>, String> {
 mod tests {
     use super::*;
     use crate::activity::{
-        HumanInteractionEntry, HumanInteractionInput, StateTransitionEntry, StateTransitionInput,
+        HumanInteractionEntry, HumanInteractionInput, SessionForegroundEntry, StateTransitionEntry,
+        StateTransitionInput,
     };
     use crate::event::{AgentKind, AgentState};
     use time::macros::{datetime, offset};
@@ -1605,11 +1611,26 @@ mod tests {
             ("%2".to_string(), "side".to_string()),
         ]);
 
+        let entries = [
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-06-05 10:00:00 UTC),
+                datetime!(2026-06-05 12:00:00 UTC),
+            )),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$2",
+                "side",
+                datetime!(2026-06-05 10:00:00 UTC),
+                datetime!(2026-06-05 12:00:00 UTC),
+            )),
+        ];
+
         let doc = build_document(TimelineBuildInput {
             now,
             range,
             prompt_entries: &prompts,
-            activity_entries: &[],
+            activity_entries: &entries,
             agents: &[],
             session_activities: &[],
             pane_sessions: &pane_sessions,
@@ -1643,16 +1664,22 @@ mod tests {
             since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
             until_at: None,
         };
-        let entries = [ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
-            HumanInteractionInput {
+        let entries = [
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-06-05 10:59:00 UTC),
+                datetime!(2026-06-05 11:05:01 UTC),
+            )),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
                 kind: HumanInteractionKind::TmuxInput,
                 pane: Some("%1".into()),
                 session_id: Some("agent-main".into()),
                 session_name: Some("main".into()),
                 started_at: datetime!(2026-06-05 11:00:00 UTC),
                 ended_at: datetime!(2026-06-05 11:00:01 UTC),
-            },
-        ))];
+            })),
+        ];
 
         let doc = build_document(TimelineBuildInput {
             now,
@@ -1674,6 +1701,58 @@ mod tests {
             vec![TimelineActiveSession {
                 label: "main".into(),
                 active_secs: 361,
+            }]
+        );
+    }
+
+    #[test]
+    fn active_sessions_clip_prompt_padding_to_presence() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let prompts = [HistoryEntry::new(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            "prompt main",
+            datetime!(2026-06-05 11:00:00 UTC),
+            None,
+        )];
+        let pane_sessions = HashMap::from([("%1".to_string(), "main".to_string())]);
+        let entries = [ActivityEntry::SessionForeground(
+            SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-06-05 10:59:30 UTC),
+                datetime!(2026-06-05 11:01:00 UTC),
+            ),
+        )];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &prompts,
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &pane_sessions,
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.totals.foreground_secs, 90);
+        assert_eq!(doc.totals.human_secs, 0);
+        assert_eq!(doc.totals.active_secs, 90);
+        assert_eq!(
+            doc.active_sessions,
+            vec![TimelineActiveSession {
+                label: "main".into(),
+                active_secs: 90,
             }]
         );
     }

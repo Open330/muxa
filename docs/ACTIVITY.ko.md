@@ -48,7 +48,17 @@ totals에서 모두 제외할 수 있습니다. 값은 반복하거나 comma-sep
 `--exclude-session 'monitor*'`.
 
 `--sort` 는 다음 값을 받습니다: `prompts`, `work`, `wait`, `err`, `tmux`,
-`human`, `think`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
+`human`, `think`, `active`, `block`, `tok`, `words`, `sess`, `agents`, `last`,
+`name`.
+
+`ACTIVE`(`ACT` column, JSON의 `active` / `active_secs`)는 실제로 몰입해
+다룬 human time 추정값입니다. submitted prompt 주변 window, tmux input tick
+(keypress/scroll), agent가 human 답변을 기다리는 동안의 thinking time을
+합칩니다. 다만 prompt/input padding은 같은 session/pane의 `HUMAN` presence
+(tmux foreground, prompt input, attach 등)와 겹치는 구간으로 자릅니다. 그래서
+padding 때문에 한 session의 `ACT`가 관측된 foreground/interaction 시간을
+넘어가지 않습니다. 여러 session의 window가 겹치면 가장 최근 touch session에
+귀속해서 중복 집계하지 않습니다.
 
 표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
 `--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.

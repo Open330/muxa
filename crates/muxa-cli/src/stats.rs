@@ -818,7 +818,8 @@ fn add_thinking_rows(
 }
 
 /// Estimate engaged ("active") human time as the union of three signals, each
-/// discounting idle attach (the failure mode of raw `human` presence):
+/// clipped to observed human presence so padded windows cannot outlive the
+/// session foreground/interaction that made them plausible:
 ///
 /// 1. **Submitted prompts** — padded `active_lookback` before / `active_timeout`
 ///    after each prompt (both from `[stats]` config). The unambiguous "I typed
@@ -833,10 +834,11 @@ fn add_thinking_rows(
 ///
 /// A pane left attached with no prompts, no input, and no waiting agent yields
 /// none of the three, which is what keeps a forgotten attach from ballooning the
-/// estimate to hours. It is not bounded by `human`: driving agents without a
-/// tracked tmux attach can make `active` larger.
+/// estimate to hours. Prompt/input padding is a confidence window, not extra
+/// presence: if no matching human presence was observed, it contributes nothing.
 fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
     let mut intervals = Vec::new();
+    let active_presences = human_presence_intervals(data, false);
 
     // (1) Submitted prompts. `data.prompts` is already clipped to the range, so
     // a prompt just outside a bounded `--since` whose padded window would poke
@@ -855,11 +857,14 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
             session_name,
             &prompt.session_id,
         ) {
-            intervals.push(AttentionInterval {
-                interval,
-                group_key: prompt_group_key(data, prompt, group_by),
-                anchor: prompt.at,
-            });
+            let group_key = prompt_group_key(data, prompt, group_by);
+            for segment in overlapping_presence_segments(&interval, &active_presences) {
+                intervals.push(AttentionInterval {
+                    interval: segment,
+                    group_key: group_key.clone(),
+                    anchor: prompt.at,
+                });
+            }
         }
     }
 
@@ -894,11 +899,13 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
                 _ => human_presence_group_key(data, &interval, group_by),
             };
             if let Some(group_key) = group_key {
-                intervals.push(AttentionInterval {
-                    interval,
-                    group_key,
-                    anchor: entry.ended_at,
-                });
+                for segment in overlapping_presence_segments(&interval, &active_presences) {
+                    intervals.push(AttentionInterval {
+                        interval: segment,
+                        group_key: group_key.clone(),
+                        anchor: entry.ended_at,
+                    });
+                }
             }
         }
     }
@@ -1577,7 +1584,7 @@ fn notes(data: &StatsData) -> Vec<String> {
         "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
     );
     notes.push(format!(
-        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded {lookback}s before / {timeout}s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). Overlapping windows across concurrent sessions are de-duplicated (last touch), so per-row ACTIVE sums to the total. An idle attach advances none of these, so ACTIVE discounts it; it is not bounded by HUMAN.",
+        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded {lookback}s before / {timeout}s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). Prompt/input windows are clipped to matching HUMAN presence, so padding cannot outlive observed foreground/interaction time. Overlapping windows across concurrent sessions are de-duplicated (last touch), so per-row ACTIVE sums to the total. An idle attach advances none of these, so ACTIVE discounts it.",
         lookback = data.active_lookback.whole_seconds().max(0),
         timeout = data.active_timeout.whole_seconds().max(0),
     ));
@@ -2360,6 +2367,68 @@ mod tests {
     }
 
     #[test]
+    fn active_clips_prompt_padding_to_human_presence() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "do a thing",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        p.tmux_session = Some("main".into());
+        let mut d = data(vec![p]);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.activity_entries = vec![ActivityEntry::SessionForeground(
+            SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-05-30 10:29:00 UTC),
+                datetime!(2026-05-30 10:31:00 UTC),
+            ),
+        )];
+
+        let totals = build_totals(&d);
+        let row = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false)
+            .into_iter()
+            .find(|row| row.key == "main")
+            .unwrap();
+
+        assert_eq!(totals.foreground_secs, 120);
+        assert_eq!(totals.human_secs, 120);
+        assert_eq!(totals.active_secs, 120);
+        assert_eq!(row.active_secs, 120);
+    }
+
+    #[test]
+    fn active_omits_prompt_padding_without_presence() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "do a thing",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        p.tmux_session = Some("main".into());
+        let mut d = data(vec![p]);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+
+        let totals = build_totals(&d);
+
+        assert_eq!(totals.human_secs, 0);
+        assert_eq!(totals.active_secs, 0);
+    }
+
+    #[test]
     fn active_dedups_overlapping_sessions_by_last_touch() {
         // Two sessions whose padded windows overlap. A human does one thing at a
         // time, so the overlap is counted once (total = union) and attributed to
@@ -2388,6 +2457,20 @@ mod tests {
             since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
             until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
         };
+        d.activity_entries = vec![
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$a",
+                "A",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$b",
+                "B",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+        ];
 
         // Windows: A [10:29,10:35], B [10:32,10:38]. Union = 540s (not 360+360).
         let totals = build_totals(&d);
@@ -2436,6 +2519,20 @@ mod tests {
             since_at: Some(datetime!(2026-05-30 10:30:00 UTC)),
             until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
         };
+        d.activity_entries = vec![
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$a",
+                "A",
+                datetime!(2026-05-30 10:30:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$b",
+                "B",
+                datetime!(2026-05-30 10:30:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+        ];
 
         let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
         let secs = |key: &str| {
@@ -2481,6 +2578,20 @@ mod tests {
             since_at: Some(datetime!(2026-05-30 10:30:00 UTC)),
             until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
         };
+        d.activity_entries = vec![
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$a",
+                "A",
+                datetime!(2026-05-30 10:30:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$b",
+                "B",
+                datetime!(2026-05-30 10:30:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+        ];
 
         let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
         let secs = |key: &str| {
@@ -2510,6 +2621,15 @@ mod tests {
             since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
             until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
         };
+        d.pane_sessions.insert("%1".into(), "A".into());
+        d.activity_entries = vec![ActivityEntry::SessionForeground(
+            SessionForegroundEntry::new(
+                "$a",
+                "A",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            ),
+        )];
         d.active_lookback = time::Duration::seconds(0);
         d.active_timeout = time::Duration::seconds(120);
 
@@ -2538,6 +2658,14 @@ mod tests {
                 ended_at: datetime!(2026-05-29 23:58:00 UTC),
             },
         ))];
+        d.activity_entries.push(ActivityEntry::SessionForeground(
+            SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-05-29 23:50:00 UTC),
+                datetime!(2026-05-29 23:59:00 UTC),
+            ),
+        ));
 
         let rows = build_rows(&d, GroupBy::Day, 0, SortKey::Prompts, false);
         let day29 = rows.iter().find(|r| r.key == "2026-05-29");

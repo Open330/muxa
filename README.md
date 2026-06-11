@@ -116,7 +116,7 @@ previous Monday-Sunday calendar week, `last-month` / `"last month"` for the
 previous calendar month, rolling durations like `24h`/`7d`/`4w`, local dates
 like `2026-06-06`, RFC3339 timestamps, and `all`. See
 [docs/ACTIVITY.md](docs/ACTIVITY.md) for ledger semantics, including
-`HUMAN` and `THINK`.
+`HUMAN`, `THINK`, and `ACT`.
 
 `muxa stats`, `muxa report`, and `muxa timeline` also accept
 `--exclude-pane` and `--exclude-session` for long-lived monitoring scopes.
