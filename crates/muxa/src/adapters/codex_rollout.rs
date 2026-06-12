@@ -35,6 +35,11 @@
 //! polls this via [`session_rate_limits`] and feeds the result through the
 //! existing `Heartbeat` (percentages) and `RateLimited` (hard cap) paths.
 //!
+//! Codex also has a **credit-based plan**: once the rolling windows are
+//! spent, `primary`/`secondary` go null and a `credits` object takes over
+//! (`{"has_credits":false,"unlimited":false,"balance":"0"}` = out of
+//! credits). We treat that as a cap too — see [`RateLimits::reached`].
+//!
 //! This mirrors the Claude [`transcript`](super::transcript) module: an
 //! unofficial on-disk format read best-effort, guarded by golden fixtures.
 //! Every function returns `None` on any failure (missing dir, malformed
@@ -72,10 +77,12 @@ pub struct RateLimits {
     pub five_hour: Option<Window>,
     /// `secondary` window — the 7-day weekly cap.
     pub seven_day: Option<Window>,
-    /// `rate_limit_reached_type`, mapped to a scope, when codex reports a
-    /// cap was *actually hit* (the field is `null` in the common case).
-    /// This is the hard, unambiguous "you're blocked right now" signal —
-    /// distinct from a window merely reading 100%.
+    /// Set when codex is *blocked right now*, mapped to the scope that
+    /// tripped. Three signals feed it (see [`parse_line`]):
+    /// 1. `rate_limit_reached_type` is non-null (explicit, but codex rarely
+    ///    sets it), 2. a window reads `used_percent >= 100`, or 3. the
+    ///    account is on the credit model (`primary`/`secondary` both null)
+    ///    and its `credits` are exhausted. `None` when none apply.
     pub reached: Option<RateLimitScope>,
 }
 
@@ -96,6 +103,10 @@ struct Payload {
 struct RawRateLimits {
     primary: Option<RawWindow>,
     secondary: Option<RawWindow>,
+    /// Present (and `primary`/`secondary` null) on the credit-based plan —
+    /// codex switches an account here once its rolling windows are spent.
+    #[serde(default)]
+    credits: Option<RawCredits>,
     /// `null` normally; a window name (`"primary"` / `"secondary"`) when a
     /// cap was reached.
     #[serde(default)]
@@ -108,6 +119,19 @@ struct RawWindow {
     /// Unix epoch *seconds*. Optional even when `used_percent` is present.
     resets_at: Option<i64>,
 }
+
+#[derive(Deserialize)]
+struct RawCredits {
+    /// Whether the account currently has credits available. `false` with
+    /// `unlimited == false` is codex's "out of credits" signal.
+    #[serde(default)]
+    has_credits: Option<bool>,
+    #[serde(default)]
+    unlimited: Option<bool>,
+}
+
+/// A window counts as capped at 100% utilization (`used_percent` is 0–100).
+const SATURATED_PCT: f32 = 100.0;
 
 fn window(w: Option<RawWindow>) -> Option<Window> {
     let w = w?;
@@ -126,17 +150,45 @@ fn parse_line(line: &str) -> Option<RateLimits> {
     let rec: Record = serde_json::from_str(line.trim()).ok()?;
     let raw = rec.payload?.rate_limits?;
 
-    let reached = raw.rate_limit_reached_type.as_deref().map(|t| match t {
-        "primary" => RateLimitScope::FiveHour,
-        "secondary" => RateLimitScope::SevenDay,
-        _ => RateLimitScope::Unknown,
-    });
+    let five_hour = window(raw.primary);
+    let seven_day = window(raw.secondary);
+
+    // An explicit `rate_limit_reached_type` is the most authoritative signal,
+    // but codex sets it rarely. Fall back to window saturation, then — for
+    // credit-plan accounts, where the windows are absent — to credit
+    // exhaustion. The "both windows null" guard matters: an account on the
+    // window plan can carry a `credits` object with `has_credits: false`
+    // while still having window quota, and that is NOT a cap.
+    let reached = match raw.rate_limit_reached_type.as_deref() {
+        Some("primary") => Some(RateLimitScope::FiveHour),
+        Some("secondary") => Some(RateLimitScope::SevenDay),
+        Some(_) => Some(RateLimitScope::Unknown),
+        None if five_hour.is_some_and(|w| w.used_percent >= SATURATED_PCT) => {
+            Some(RateLimitScope::FiveHour)
+        }
+        None if seven_day.is_some_and(|w| w.used_percent >= SATURATED_PCT) => {
+            Some(RateLimitScope::SevenDay)
+        }
+        None if five_hour.is_none()
+            && seven_day.is_none()
+            && raw.credits.is_some_and(credits_exhausted) =>
+        {
+            Some(RateLimitScope::Unknown)
+        }
+        None => None,
+    };
 
     Some(RateLimits {
-        five_hour: window(raw.primary),
-        seven_day: window(raw.secondary),
+        five_hour,
+        seven_day,
         reached,
     })
+}
+
+/// True when a `credits` object says the account is out of credits: it isn't
+/// an unlimited plan and `has_credits` is explicitly `false`.
+fn credits_exhausted(c: RawCredits) -> bool {
+    c.unlimited != Some(true) && c.has_credits == Some(false)
 }
 
 /// Read the tail of a rollout file and return the most recent `rate_limits`
@@ -284,6 +336,54 @@ mod tests {
         assert_eq!(secondary.reached, Some(RateLimitScope::SevenDay));
         let weird = parse_line(&rate_limit_line(20.0, 30.0, r#""something_new""#)).unwrap();
         assert_eq!(weird.reached, Some(RateLimitScope::Unknown));
+    }
+
+    #[test]
+    fn window_saturation_marks_reached_without_reached_type() {
+        // 100% on the 5h window with rate_limit_reached_type still null —
+        // codex rarely sets the explicit field, so saturation must suffice.
+        let five = parse_line(&rate_limit_line(100.0, 46.0, "null")).unwrap();
+        assert_eq!(five.reached, Some(RateLimitScope::FiveHour));
+        let seven = parse_line(&rate_limit_line(80.0, 100.0, "null")).unwrap();
+        assert_eq!(seven.reached, Some(RateLimitScope::SevenDay));
+        // 99% is not yet capped.
+        let under = parse_line(&rate_limit_line(99.0, 99.0, "null")).unwrap();
+        assert!(under.reached.is_none());
+    }
+
+    /// Credit-plan line: windows null, `credits.has_credits:false` → capped.
+    /// This is the real shape seen on a credit-exhausted `pro` account.
+    fn credit_line(has_credits: bool, unlimited: bool) -> String {
+        format!(
+            r#"{{"timestamp":"2026-06-12T06:26:08.491Z","type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":{{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{{"has_credits":{has_credits},"unlimited":{unlimited},"balance":"0"}},"individual_limit":null,"plan_type":"pro","rate_limit_reached_type":null}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn credit_exhaustion_marks_reached() {
+        let exhausted = parse_line(&credit_line(false, false)).unwrap();
+        assert!(exhausted.five_hour.is_none() && exhausted.seven_day.is_none());
+        assert_eq!(exhausted.reached, Some(RateLimitScope::Unknown));
+
+        // Has credits, or unlimited → not capped.
+        assert!(parse_line(&credit_line(true, false))
+            .unwrap()
+            .reached
+            .is_none());
+        assert!(parse_line(&credit_line(false, true))
+            .unwrap()
+            .reached
+            .is_none());
+    }
+
+    #[test]
+    fn has_credits_false_with_live_window_is_not_capped() {
+        // The window-plan account can carry credits.has_credits:false while a
+        // window still has quota (real: ~849 such records on disk). The
+        // "both windows null" guard must keep this from reading as a cap.
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":40.0,"window_minutes":300,"resets_at":1781262859},"secondary":{"used_percent":50.0,"window_minutes":10080,"resets_at":1781745469},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"rate_limit_reached_type":null}}}"#;
+        let rl = parse_line(line).unwrap();
+        assert!(rl.reached.is_none());
     }
 
     #[test]

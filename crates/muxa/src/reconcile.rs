@@ -712,6 +712,45 @@ mod tests {
         assert_eq!(agent.rate_limit_5h_pct, Some(100.0));
     }
 
+    /// Credit-plan exhaustion (windows null, `credits.has_credits:false`)
+    /// must also flip the row to `Error`. This is the real shape that left a
+    /// rate-limited codex session showing `working` before the fix.
+    #[tokio::test]
+    async fn reconcile_flips_to_error_on_credit_exhaustion() {
+        use crate::event::{RateLimitScope, RateLimitSource};
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&codex_started("cdxc", "%11", t0)).await;
+
+        let now = time::OffsetDateTime::now_utc();
+        let root = tempfile::tempdir().unwrap();
+        let day = root
+            .path()
+            .join(format!("{:04}", now.year()))
+            .join(format!("{:02}", u8::from(now.month())))
+            .join(format!("{:02}", now.day()));
+        std::fs::create_dir_all(&day).unwrap();
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"rate_limit_reached_type":null}}}"#;
+        std::fs::write(
+            day.join("rollout-2026-06-12T15-24-44-cdxc.jsonl"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+
+        let mut p = pane("%11");
+        p.current_command = "codex".into();
+        let fake = FakeLiveness::new(vec![p]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10))
+            .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        let agent = snap.iter().find(|a| a.session_id == "cdxc").expect("row");
+        assert_eq!(agent.state, AgentState::Error);
+        assert_eq!(agent.rate_limit_scope, Some(RateLimitScope::Unknown));
+        assert_eq!(agent.rate_limit_source, Some(RateLimitSource::CodexRollout));
+    }
+
     /// A rollout with utilization but no reached cap fills the percentage
     /// columns without flipping the row's state (Heartbeat semantics).
     #[tokio::test]
