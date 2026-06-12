@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.10] - 2026-06-12
+
+### Added
+
+- **Codex rate-limit detection** — Codex exposes no error/rate-limit hook, so a
+  usage cap (often one that blocks a turn before it even starts) never moved a
+  Codex row's state. The reconciler now reads each live Codex session's rollout
+  file (`~/.codex/sessions/.../rollout-*.jsonl`), maps its `payload.rate_limits`
+  (`primary` → 5-hour, `secondary` → 7-day) onto the existing rate-limit
+  columns, and flips the row to `error` when Codex stamps a reached cap.
+  Emissions are change-guarded so the poll doesn't disturb the stuck-state
+  sweeps. Toggle via `[reconciler] codex_rollout_enabled` (default `true`).
 
 ### Fixed
 
