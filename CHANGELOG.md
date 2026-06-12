@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.11] - 2026-06-12
+
+### Fixed
+
+- **Codex rate-limit detection now catches the common cases** — the initial
+  reader only flipped to `error` on a non-null `rate_limit_reached_type`,
+  which codex rarely sets, so a genuinely rate-limited session still showed
+  `working`. It now also treats window saturation (`used_percent >= 100`) and
+  credit-plan exhaustion (`primary`/`secondary` null with
+  `credits.has_credits:false`) as caps. The credit check is guarded on both
+  windows being null so a window-plan row carrying an incidental
+  `has_credits:false` is not misread as a cap.
+
 ## [0.8.10] - 2026-06-12
 
 ### Added
