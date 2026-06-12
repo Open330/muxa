@@ -379,6 +379,17 @@ pub struct ReconcilerConfig {
     /// keyboard, so the cutoff should be generous.
     #[serde(default = "default_zero")]
     pub stuck_waiting_timeout_secs: u64,
+    /// Poll codex session-rollout files (`~/.codex/sessions`) each tick for
+    /// rate-limit state. Codex exposes no error/rate-limit hook, so this is
+    /// the only way muxa learns a codex usage cap — including a cap that
+    /// blocks a turn before any hook fires. Reads the tail of each live
+    /// codex session's JSONL; cost scales with the number of live codex
+    /// sessions, not history size.
+    ///
+    /// Default `true`. Set `false` to disable (e.g. non-codex deployments
+    /// that want to skip the per-tick directory scan entirely).
+    #[serde(default = "default_true")]
+    pub codex_rollout_enabled: bool,
 }
 
 impl Default for ReconcilerConfig {
@@ -388,6 +399,7 @@ impl Default for ReconcilerConfig {
             interval_secs: default_reconciler_interval_secs(),
             stuck_working_timeout_secs: 0,
             stuck_waiting_timeout_secs: 0,
+            codex_rollout_enabled: true,
         }
     }
 }

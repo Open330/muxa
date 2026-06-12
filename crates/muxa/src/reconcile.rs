@@ -25,16 +25,43 @@
 //! could plug in a multi-server tmux scanner, a screen/zellij adapter, or
 //! a remote-host probe — all without touching `Reconciler` or `Store`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::debug;
 
+use crate::adapters::codex_rollout;
+use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, RateLimitScope, RateLimitSource};
 use crate::metrics::Metrics;
 use crate::state::{ReconcileReport, SharedStore};
 use crate::tmux::PaneInfo;
+
+/// How many days back from "now" to scan codex's date-partitioned sessions
+/// tree when locating a live session's rollout file. Today + yesterday
+/// covers any session a human is actively driving; older active sessions
+/// are rare enough to skip rather than pay a wider directory scan. (The
+/// scan also looks one day *forward* — see [`codex_rollout::locate_rollout`]
+/// — to cover timezones where the local rollout date is ahead of UTC.)
+const ROLLOUT_LOOKBACK_DAYS: u16 = 1;
+
+/// A live codex row snapshotted with its current rate-limit fields, captured
+/// before the off-runtime rollout read so [`Reconciler::poll_codex_rollouts`]
+/// can suppress no-op re-emissions (a `Heartbeat`/`RateLimited` that wouldn't
+/// change the row).
+struct CodexPollTarget {
+    id: AgentId,
+    cur_5h_pct: Option<f32>,
+    cur_5h_reset: Option<OffsetDateTime>,
+    cur_7d_pct: Option<f32>,
+    cur_7d_reset: Option<OffsetDateTime>,
+    state: AgentState,
+    scope: Option<RateLimitScope>,
+    source: Option<RateLimitSource>,
+}
 
 /// Source of truth for which panes are currently alive.
 ///
@@ -87,6 +114,12 @@ pub struct Reconciler<L: LivenessSource> {
     /// Covers Codex's permission-grant case where the row gets
     /// pinned yellow with no follow-up hook to recover from.
     stuck_waiting_timeout: Duration,
+    /// Root of codex's session-rollout tree (`~/.codex/sessions`). When
+    /// `Some`, each tick reads every live codex row's rollout file and
+    /// feeds its `rate_limits` through the store — the only way muxa learns
+    /// a codex usage cap, since codex exposes no error/rate-limit hook.
+    /// `None` (default) disables the poll.
+    codex_sessions_root: Option<PathBuf>,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -98,6 +131,7 @@ impl<L: LivenessSource> Reconciler<L> {
             metrics: None,
             stuck_working_timeout: Duration::ZERO,
             stuck_waiting_timeout: Duration::ZERO,
+            codex_sessions_root: None,
         }
     }
 
@@ -126,6 +160,146 @@ impl<L: LivenessSource> Reconciler<L> {
     pub fn with_stuck_waiting_timeout(mut self, t: Duration) -> Self {
         self.stuck_waiting_timeout = t;
         self
+    }
+
+    /// Enable per-tick polling of codex session-rollout files for
+    /// rate-limit state. `root` is codex's sessions tree
+    /// (`~/.codex/sessions`). `None` (the default) keeps the poll off, so
+    /// non-codex deployments pay nothing.
+    #[must_use]
+    pub fn with_codex_sessions_root(mut self, root: Option<PathBuf>) -> Self {
+        self.codex_sessions_root = root;
+        self
+    }
+
+    /// Read every live codex row's rollout file and feed its `rate_limits`
+    /// into the store. Codex ships no error/rate-limit hook, so this poll is
+    /// muxa's only path to a codex usage cap — including the common case
+    /// where the cap blocks a turn *before it starts* and not even a `Stop`
+    /// hook fires.
+    ///
+    /// Two events per reading:
+    /// * a `Heartbeat` carrying the 5h/7d utilization (keeps the LIMITS
+    ///   column live and gives the existing soft-saturation handling), and
+    /// * a `RateLimited` when codex stamped `rate_limit_reached_type` —
+    ///   the hard signal that flips the row to `Error`.
+    ///
+    /// File IO runs on the blocking pool; absent files / unreadable rollouts
+    /// are silently skipped (a session that hasn't written a `rate_limits`
+    /// record yet just contributes nothing this tick).
+    async fn poll_codex_rollouts(&self, root: &Path) {
+        let now = OffsetDateTime::now_utc();
+        // Snapshot the live codex rows first (cheap, async), then do the
+        // file reads off-runtime. Stopped rows can't be rate-limited. We
+        // carry each row's current rate-limit fields so we can emit only on
+        // change (see the no-op guards below).
+        let targets: Vec<CodexPollTarget> = self
+            .store
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|a| a.kind == AgentKind::Codex && a.state != AgentState::Stopped)
+            .map(|a| CodexPollTarget {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: a.session_id,
+                    surface: a.surface,
+                    pane: a.pane,
+                    cwd: a.cwd,
+                },
+                cur_5h_pct: a.rate_limit_5h_pct,
+                cur_5h_reset: a.rate_limit_5h_resets_at,
+                cur_7d_pct: a.rate_limit_7d_pct,
+                cur_7d_reset: a.rate_limit_7d_resets_at,
+                state: a.state,
+                scope: a.rate_limit_scope,
+                source: a.rate_limit_source,
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
+        let root = root.to_path_buf();
+        let readings = tokio::task::spawn_blocking(move || {
+            targets
+                .into_iter()
+                .filter_map(|t| {
+                    codex_rollout::session_rate_limits(
+                        &root,
+                        &t.id.session_id,
+                        now,
+                        ROLLOUT_LOOKBACK_DAYS,
+                    )
+                    .map(|rl| (t, rl))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+
+        for (t, rl) in readings {
+            // `Window` is `Copy`, so read each scope's fields straight off
+            // `rl` rather than aliasing into similarly-named locals.
+            let five = rl.five_hour;
+            let seven = rl.seven_day;
+
+            // Emit a Heartbeat only when a reading actually moved. Every
+            // `apply()` refreshes `last_activity_at`, and `mark_stuck_idle_from`
+            // skips any row whose `last_activity_at` is newer than its cutoff —
+            // so a no-op Heartbeat every tick would permanently defeat the
+            // `stuck_working_timeout` / `stuck_waiting_timeout` recovery for
+            // codex, the very agent those sweeps target. Suppressing unchanged
+            // readings also avoids waking the snapshotter each tick.
+            let hb_changed = five.map(|w| w.used_percent) != t.cur_5h_pct
+                || five.and_then(|w| w.resets_at) != t.cur_5h_reset
+                || seven.map(|w| w.used_percent) != t.cur_7d_pct
+                || seven.and_then(|w| w.resets_at) != t.cur_7d_reset;
+            if hb_changed {
+                self.store
+                    .apply(&AgentEvent::Heartbeat {
+                        id: t.id.clone(),
+                        model: None,
+                        context_used_pct: None,
+                        cost_usd: None,
+                        rate_limit_5h_pct: five.map(|w| w.used_percent),
+                        rate_limit_5h_resets_at: five.and_then(|w| w.resets_at),
+                        rate_limit_7d_pct: seven.map(|w| w.used_percent),
+                        rate_limit_7d_resets_at: seven.and_then(|w| w.resets_at),
+                        at: now,
+                    })
+                    .await;
+            }
+
+            if let Some(scope) = rl.reached {
+                // Re-assert the cap only when the row isn't already showing
+                // this exact codex cap. It persists in the store once set, so
+                // re-emitting every tick would only refresh `last_activity_at`
+                // (same sweep-defeating problem as above).
+                let already_capped = t.state == AgentState::Error
+                    && t.scope == Some(scope)
+                    && t.source == Some(RateLimitSource::CodexRollout);
+                if !already_capped {
+                    // Reset time comes from whichever window actually tripped.
+                    let resets_at = match scope {
+                        RateLimitScope::SevenDay => seven.and_then(|w| w.resets_at),
+                        RateLimitScope::FiveHour | RateLimitScope::Unknown => {
+                            five.and_then(|w| w.resets_at)
+                        }
+                    };
+                    self.store
+                        .apply(&AgentEvent::RateLimited {
+                            id: t.id,
+                            scope,
+                            source: RateLimitSource::CodexRollout,
+                            resets_at,
+                            message: None,
+                            at: now,
+                        })
+                        .await;
+                }
+            }
+        }
     }
 
     /// Run a single reconciliation pass on demand. Useful for tests, for
@@ -162,6 +336,13 @@ impl<L: LivenessSource> Reconciler<L> {
                 self.stuck_waiting_timeout,
             )
             .await;
+        // Poll codex rollouts for rate-limit state (no-op unless a sessions
+        // root is configured). Codex has no rate-limit hook, so this is the
+        // only signal — and it's the only path that catches a cap which
+        // blocked a turn before any hook could fire.
+        if let Some(root) = &self.codex_sessions_root {
+            self.poll_codex_rollouts(root).await;
+        }
         // Flip pid-tracked task rows whose process has exited to Stopped.
         let dead_tasks = self.store.reap_dead_pids().await;
         if dead_tasks > 0 {
@@ -462,5 +643,166 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].session_id, "real");
+    }
+
+    // --- codex rollout polling ------------------------------------------
+
+    fn codex_started(sid: &str, pane_id: &str, at: time::OffsetDateTime) -> AgentEvent {
+        AgentEvent::Started {
+            id: AgentId {
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane_id.into()),
+                cwd: None,
+            },
+            at,
+        }
+    }
+
+    /// Write a real-shape codex rollout for `session_id` under
+    /// `root/YYYY/MM/DD` for *today* (the poll resolves the date from the
+    /// wall clock), with one `token_count` line carrying the given windows.
+    fn write_codex_rollout(
+        root: &std::path::Path,
+        session_id: &str,
+        primary_pct: f32,
+        reached: &str,
+    ) {
+        let now = time::OffsetDateTime::now_utc();
+        let day = root
+            .join(format!("{:04}", now.year()))
+            .join(format!("{:02}", u8::from(now.month())))
+            .join(format!("{:02}", now.day()));
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(format!("rollout-2026-06-12T15-24-44-{session_id}.jsonl"));
+        let line = format!(
+            r#"{{"timestamp":"2026-06-12T06:26:08.491Z","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{primary_pct},"window_minutes":300,"resets_at":1781262859}},"secondary":{{"used_percent":46.0,"window_minutes":10080,"resets_at":1781745469}},"rate_limit_reached_type":{reached}}}}}}}"#
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+    }
+
+    /// A reached cap in the rollout flips the codex row to `Error` with a
+    /// `CodexRollout` source — the no-hook signal the daemon would otherwise
+    /// miss entirely.
+    #[tokio::test]
+    async fn reconcile_polls_codex_rollout_and_flips_to_error_on_reached_cap() {
+        use crate::event::{RateLimitScope, RateLimitSource};
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&codex_started("cdx", "%7", t0)).await;
+
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "cdx", 100.0, r#""primary""#);
+
+        // Codex's pane must stay live or the reconcile pass reaps the row
+        // before the poll runs.
+        let mut p = pane("%7");
+        p.current_command = "codex".into();
+        let fake = FakeLiveness::new(vec![p]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10))
+            .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        let agent = snap.iter().find(|a| a.session_id == "cdx").expect("row");
+        assert_eq!(agent.state, AgentState::Error);
+        assert_eq!(agent.rate_limit_scope, Some(RateLimitScope::FiveHour));
+        assert_eq!(agent.rate_limit_source, Some(RateLimitSource::CodexRollout));
+        assert_eq!(agent.rate_limit_5h_pct, Some(100.0));
+    }
+
+    /// A rollout with utilization but no reached cap fills the percentage
+    /// columns without flipping the row's state (Heartbeat semantics).
+    #[tokio::test]
+    async fn reconcile_polls_codex_rollout_percentages_without_state_change() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&codex_started("cdx2", "%8", t0)).await;
+
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "cdx2", 42.0, "null");
+
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let fake = FakeLiveness::new(vec![p]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10))
+            .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        let agent = snap.iter().find(|a| a.session_id == "cdx2").expect("row");
+        // Idle (from Started) — Heartbeat doesn't drive state transitions.
+        assert_eq!(agent.state, AgentState::Idle);
+        assert_eq!(agent.rate_limit_5h_pct, Some(42.0));
+        assert_eq!(agent.rate_limit_7d_pct, Some(46.0));
+        assert!(agent.rate_limit_scope.is_none());
+    }
+
+    /// An unchanged rollout reading must NOT re-emit events: every `apply()`
+    /// refreshes `last_activity_at`, which would permanently defeat the
+    /// stuck-state sweep for codex. Two passes over an identical rollout must
+    /// leave `last_activity_at` untouched after the first.
+    #[tokio::test]
+    async fn reconcile_codex_rollout_unchanged_reading_does_not_refresh_activity() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&codex_started("cdx4", "%10", t0)).await;
+
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "cdx4", 42.0, "null");
+
+        let mut p = pane("%10");
+        p.current_command = "codex".into();
+        let fake = FakeLiveness::new(vec![p]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10))
+            .with_codex_sessions_root(Some(root.path().to_path_buf()));
+
+        // First pass: the reading is new, so a Heartbeat lands and bumps
+        // last_activity_at.
+        r.reconcile_once().await;
+        let la1 = store
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|a| a.session_id == "cdx4")
+            .unwrap()
+            .last_activity_at;
+
+        // Second pass: identical reading → no event → activity clock frozen.
+        r.reconcile_once().await;
+        let la2 = store
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|a| a.session_id == "cdx4")
+            .unwrap()
+            .last_activity_at;
+
+        assert_eq!(
+            la1, la2,
+            "unchanged rollout must not refresh last_activity_at"
+        );
+    }
+
+    /// With no sessions root configured the poll is inert — non-codex
+    /// deployments (and the historical default) pay nothing and see no
+    /// codex-specific behavior.
+    #[tokio::test]
+    async fn reconcile_without_codex_root_does_not_poll() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&codex_started("cdx3", "%9", t0)).await;
+
+        let mut p = pane("%9");
+        p.current_command = "codex".into();
+        let fake = FakeLiveness::new(vec![p]);
+        let r = Reconciler::new(store.clone(), fake, Duration::from_millis(10));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        let agent = snap.iter().find(|a| a.session_id == "cdx3").expect("row");
+        assert_eq!(agent.state, AgentState::Idle);
+        assert!(agent.rate_limit_5h_pct.is_none());
     }
 }

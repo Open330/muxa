@@ -699,14 +699,18 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
 }
 
 /// True for sources that should persist until the next `Started` —
-/// `StopFailure` is a confirmed upstream 429 and `Transcript` is the
-/// fallback path that observed Claude Code's own synthetic message.
-/// Both are stronger evidence than statusline saturation alone, which
-/// is just a reading off Claude Code's local counter.
+/// `StopFailure` is a confirmed upstream 429, `Transcript` observed Claude
+/// Code's own synthetic message, and `CodexRollout` saw codex stamp
+/// `rate_limit_reached_type` on disk. All three are stronger evidence than
+/// statusline saturation alone, which is just a reading off a local counter.
 fn is_hard_source(s: Option<RateLimitSource>) -> bool {
     matches!(
         s,
-        Some(RateLimitSource::StopFailure | RateLimitSource::Transcript)
+        Some(
+            RateLimitSource::StopFailure
+                | RateLimitSource::Transcript
+                | RateLimitSource::CodexRollout
+        )
     )
 }
 
@@ -736,11 +740,12 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
     if !regressing_scope {
         agent.rate_limit_scope = Some(*scope);
     }
-    // Source precedence: hard signals (StopFailure / Transcript) must
-    // not be downgraded to soft (Statusline) by a later, weaker event.
+    // Source precedence: hard signals (StopFailure / Transcript /
+    // CodexRollout) must not be downgraded to soft (Statusline) by a later,
+    // weaker event.
     let new_is_hard = matches!(
         source,
-        RateLimitSource::StopFailure | RateLimitSource::Transcript
+        RateLimitSource::StopFailure | RateLimitSource::Transcript | RateLimitSource::CodexRollout
     );
     if !is_hard_source(agent.rate_limit_source) || new_is_hard {
         agent.rate_limit_source = Some(*source);

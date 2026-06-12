@@ -661,6 +661,14 @@ fn spawn_reconciler_task(
     // by the same definition the watch loop, hook ancestry, and
     // discovery do. `LivenessSource` reaches the reconciler via the
     // blanket impl on `PaneBackend`.
+    // Codex has no rate-limit hook; the reconciler learns codex usage caps
+    // by polling the on-disk session rollouts. Resolve the tree once here so
+    // the per-tick poll just reads files.
+    let codex_sessions_root = if cfg.reconciler.codex_rollout_enabled {
+        muxa::adapters::codex_rollout::default_sessions_root()
+    } else {
+        None
+    };
     let runner = Reconciler::new(
         store.clone(),
         backend,
@@ -672,13 +680,15 @@ fn spawn_reconciler_task(
     ))
     .with_stuck_waiting_timeout(std::time::Duration::from_secs(
         cfg.reconciler.stuck_waiting_timeout_secs,
-    ));
+    ))
+    .with_codex_sessions_root(codex_sessions_root.clone());
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(runner.run(shutdown_rx));
     tracing::info!(
         interval_secs = cfg.reconciler.interval_secs,
         stuck_working_timeout_secs = cfg.reconciler.stuck_working_timeout_secs,
         stuck_waiting_timeout_secs = cfg.reconciler.stuck_waiting_timeout_secs,
+        codex_rollout_polling = codex_sessions_root.is_some(),
         "reconciler enabled",
     );
 }

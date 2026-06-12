@@ -128,6 +128,12 @@ pub enum RateLimitSource {
     /// the hooks didn't catch (e.g., older Claude Code versions, sub-agent
     /// rate limits surfaced as `tool_result` text).
     Transcript,
+    /// Picked up by parsing a Codex rollout JSONL's `rate_limits` record
+    /// (`payload.rate_limits.rate_limit_reached_type`). Codex exposes no
+    /// error/rate-limit hook, so the on-disk rollout is the only signal —
+    /// the reconciler polls it. Treated as a *hard* source: a reached cap
+    /// persists until the next `Started`, same as `StopFailure`/`Transcript`.
+    CodexRollout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

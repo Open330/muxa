@@ -11,6 +11,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod codex_rollout;
 pub mod gemini;
 pub mod hook;
 pub mod opencode;
