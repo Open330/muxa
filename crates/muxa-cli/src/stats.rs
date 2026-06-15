@@ -190,8 +190,11 @@ struct StatsData {
     project_by_agent_session: HashMap<String, String>,
     /// Padding before each action when estimating ACTIVE time (`[stats]` config).
     active_lookback: time::Duration,
-    /// Idle timeout after each action when estimating ACTIVE time.
+    /// Idle timeout after each *prompt* when estimating ACTIVE time.
     active_timeout: time::Duration,
+    /// Idle timeout after each *tmux input tick* (keypress / scroll). Shorter than
+    /// `active_timeout` so sparse scrolling cannot chain into hours of active time.
+    active_tick_timeout: time::Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +236,8 @@ struct Totals {
     thinking: String,
     active_secs: u64,
     active: String,
+    work_active_secs: u64,
+    work_active: String,
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
@@ -261,6 +266,8 @@ struct GroupRow {
     thinking: String,
     active_secs: u64,
     active: String,
+    work_active_secs: u64,
+    work_active: String,
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
@@ -281,6 +288,7 @@ struct GroupAccumulator {
     human_secs: u64,
     thinking_secs: u64,
     active_secs: u64,
+    work_active_secs: u64,
     attention_events: usize,
     last_prompt_at: Option<OffsetDateTime>,
 }
@@ -361,6 +369,7 @@ async fn load_data(
         project_by_agent_session,
         active_lookback: secs_to_duration(cfg.stats.active_lookback_secs),
         active_timeout: secs_to_duration(cfg.stats.active_timeout_secs),
+        active_tick_timeout: secs_to_duration(cfg.stats.active_tick_timeout_secs),
     };
     apply_exclusions(&mut data, exclusions);
     Ok(data)
@@ -576,6 +585,7 @@ fn build_totals(data: &StatsData) -> Totals {
     }
     let thinking_secs = thinking_secs_total(data);
     let active_secs = active_secs_total(data);
+    let work_active_secs = work_active_secs_total(data);
 
     Totals {
         prompts: data.prompts.len(),
@@ -602,6 +612,8 @@ fn build_totals(data: &StatsData) -> Totals {
         thinking: format_duration(thinking_secs),
         active_secs,
         active: format_duration(active_secs),
+        work_active_secs,
+        work_active: format_duration(work_active_secs),
         attention_events,
         last_prompt_at: last_prompt_at.map(format_rfc3339),
         last_prompt_age: last_prompt_at
@@ -635,6 +647,7 @@ fn build_rows(
     add_human_rows(data, group_by, &mut rows);
     add_thinking_rows(data, group_by, &mut rows);
     add_active_rows(data, group_by, &mut rows);
+    add_work_active_rows(data, group_by, &mut rows);
 
     if group_by != GroupBy::Session || session_foreground_ledger {
         add_open_session_foreground_rows(data, group_by, &mut rows);
@@ -703,6 +716,8 @@ fn build_rows(
             thinking: format_duration(acc.thinking_secs),
             active_secs: acc.active_secs,
             active: format_duration(acc.active_secs),
+            work_active_secs: acc.work_active_secs,
+            work_active: format_duration(acc.work_active_secs),
             attention_events: acc.attention_events,
             last_prompt_at: acc.last_prompt_at.map(format_rfc3339),
             last_prompt_age: acc
@@ -817,17 +832,30 @@ fn add_thinking_rows(
     }
 }
 
-/// Estimate engaged ("active") human time as the union of three signals, each
-/// clipped to observed human presence so padded windows cannot outlive the
-/// session foreground/interaction that made them plausible:
+/// Which flavour of active time to estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveMode {
+    /// `active` — engaged/attended time: prompts + thinking + *all* input ticks
+    /// (keypress and scroll). Counts time spent watching/reading agent output.
+    Engaged,
+    /// `work_active` — hands-on time: prompts + thinking + *keypress* ticks only.
+    /// Scrollback (`TmuxScroll`) ticks are excluded, so passively watching a long
+    /// agent run does not read as active work.
+    Work,
+}
+
+/// Estimate active human time as the union of three signals, each clipped to
+/// observed human presence so padded windows cannot outlive the session
+/// foreground/interaction that made them plausible:
 ///
 /// 1. **Submitted prompts** — padded `active_lookback` before / `active_timeout`
 ///    after each prompt (both from `[stats]` config). The unambiguous "I typed
 ///    something" action.
-/// 2. **tmux input ticks** (`HumanInteractionKind::TmuxInput`) — the daemon
-///    records one whenever a client's `client_activity` advances (a keypress or
-///    scroll), so *reading* while attached counts, not just typing. An idle
-///    attach never advances, so it still contributes nothing.
+/// 2. **tmux input ticks** — the daemon records one whenever a client's
+///    `client_activity` advances. A `TmuxInput` (keypress) tick counts in both
+///    modes; a `TmuxScroll` (scrollback) tick counts only in [`ActiveMode::Engaged`].
+///    Each is padded `active_lookback` before / `active_tick_timeout` after — a
+///    shorter timeout than prompts, so sparse scrolling can't chain into hours.
 /// 3. **Thinking** — time spent present while an agent is blocked on you
 ///    (`WaitingInput`/`WaitingChoice`/`Error`), i.e. reading its question and
 ///    deciding even without a keystroke.
@@ -836,7 +864,11 @@ fn add_thinking_rows(
 /// none of the three, which is what keeps a forgotten attach from ballooning the
 /// estimate to hours. Prompt/input padding is a confidence window, not extra
 /// presence: if no matching human presence was observed, it contributes nothing.
-fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
+fn anchor_intervals(
+    data: &StatsData,
+    group_by: GroupBy,
+    mode: ActiveMode,
+) -> Vec<AttentionInterval> {
     let mut intervals = Vec::new();
     let active_presences = human_presence_intervals(data, false);
 
@@ -873,7 +905,11 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
         let ActivityEntry::HumanInteraction(entry) = entry else {
             continue;
         };
-        if entry.kind != HumanInteractionKind::TmuxInput {
+        if !entry.kind.is_input_tick() {
+            continue;
+        }
+        // In Work mode, scrollback (reading) ticks don't count as hands-on work.
+        if mode == ActiveMode::Work && !entry.kind.is_work_input() {
             continue;
         }
         // Only ticks whose own time is in range count, mirroring prompts (which
@@ -886,14 +922,14 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
         if let Some(interval) = scoped_interval(
             data,
             entry.started_at - data.active_lookback,
-            entry.ended_at + data.active_timeout,
+            entry.ended_at + data.active_tick_timeout,
             entry.pane.clone(),
             entry.session_name.clone(),
             entry.session_id.as_deref().unwrap_or("human_interaction"),
         ) {
             // Bucket by the tick's own time, not the padded window end — a tick
-            // in the last 5m of a day must land on that day (like prompts keyed
-            // by `prompt.at`), not roll into the next via `+active_timeout`.
+            // near the end of a day must land on that day (like prompts keyed by
+            // `prompt.at`), not roll into the next via `+active_tick_timeout`.
             let group_key = match group_by {
                 GroupBy::Day => Some(format_day(entry.ended_at)),
                 _ => human_presence_group_key(data, &interval, group_by),
@@ -939,8 +975,8 @@ struct ActiveWindow {
     group_key: String,
 }
 
-fn active_windows(data: &StatsData, group_by: GroupBy) -> Vec<ActiveWindow> {
-    anchor_intervals(data, group_by)
+fn active_windows(data: &StatsData, group_by: GroupBy, mode: ActiveMode) -> Vec<ActiveWindow> {
+    anchor_intervals(data, group_by, mode)
         .into_iter()
         .map(|a| ActiveWindow {
             start: a.interval.started_at.unix_timestamp(),
@@ -957,7 +993,15 @@ fn active_windows(data: &StatsData, group_by: GroupBy) -> Vec<ActiveWindow> {
 /// when several agents are juggled at once. Equals the sum of the per-session
 /// `add_active_rows` shares (both run the same last-touch sweep).
 fn active_secs_total(data: &StatsData) -> u64 {
-    last_touch_attribution(&active_windows(data, GroupBy::Session))
+    last_touch_attribution(&active_windows(data, GroupBy::Session, ActiveMode::Engaged))
+        .values()
+        .sum()
+}
+
+/// Grand-total `WORK_ACTIVE`: like [`active_secs_total`] but excluding scrollback
+/// ticks — hands-on work rather than watching.
+fn work_active_secs_total(data: &StatsData) -> u64 {
+    last_touch_attribution(&active_windows(data, GroupBy::Session, ActiveMode::Work))
         .values()
         .sum()
 }
@@ -972,9 +1016,23 @@ fn add_active_rows(
     group_by: GroupBy,
     rows: &mut BTreeMap<String, GroupAccumulator>,
 ) {
-    for (key, secs) in last_touch_attribution(&active_windows(data, group_by)) {
+    for (key, secs) in last_touch_attribution(&active_windows(data, group_by, ActiveMode::Engaged))
+    {
         if secs > 0 {
             rows.entry(key).or_default().active_secs += secs;
+        }
+    }
+}
+
+/// Per-group `WORK_ACTIVE`: as [`add_active_rows`] but excluding scrollback ticks.
+fn add_work_active_rows(
+    data: &StatsData,
+    group_by: GroupBy,
+    rows: &mut BTreeMap<String, GroupAccumulator>,
+) {
+    for (key, secs) in last_touch_attribution(&active_windows(data, group_by, ActiveMode::Work)) {
+        if secs > 0 {
+            rows.entry(key).or_default().work_active_secs += secs;
         }
     }
 }
@@ -1222,10 +1280,10 @@ fn human_presence_intervals(data: &StatsData, thinking_only: bool) -> Vec<Scoped
                 }
             }
             ActivityEntry::HumanInteraction(entry) => {
-                // TmuxInput is an instantaneous input *marker* (a keypress tick),
-                // not a presence span — it feeds `active` directly, never HUMAN or
+                // Input ticks (keypress/scroll) are instantaneous input *markers*,
+                // not presence spans — they feed `active` directly, never HUMAN or
                 // THINK, so a stream of ticks can't inflate raw presence.
-                if entry.kind == HumanInteractionKind::TmuxInput {
+                if entry.kind.is_input_tick() {
                     continue;
                 }
                 if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
@@ -1646,6 +1704,7 @@ enum StatsColumn {
     Human,
     Thinking,
     Active,
+    WorkActive,
     AttentionEvents,
     TokenEstimate,
     AgentSessions,
@@ -1695,6 +1754,11 @@ const FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
         header: "ACT",
         width: 6,
         value: StatsColumn::Active,
+    },
+    StatsTableColumn {
+        header: "WACT",
+        width: 6,
+        value: StatsColumn::WorkActive,
     },
     StatsTableColumn {
         header: "THINK",
@@ -1887,6 +1951,7 @@ fn stats_total_value(totals: &Totals, column: StatsColumn) -> String {
         StatsColumn::Human => totals.human.clone(),
         StatsColumn::Thinking => totals.thinking.clone(),
         StatsColumn::Active => totals.active.clone(),
+        StatsColumn::WorkActive => totals.work_active.clone(),
         StatsColumn::AttentionEvents => totals.attention_events.to_string(),
         StatsColumn::TokenEstimate => totals.token_estimate.to_string(),
         StatsColumn::AgentSessions => totals.agent_sessions.to_string(),
@@ -1900,7 +1965,10 @@ fn stats_column_tone(column: StatsColumn) -> TableTone {
         StatsColumn::Prompts | StatsColumn::TokenEstimate | StatsColumn::AgentSessions => {
             TableTone::Accent
         }
-        StatsColumn::Working | StatsColumn::LiveAgents | StatsColumn::Active => TableTone::Good,
+        StatsColumn::Working
+        | StatsColumn::LiveAgents
+        | StatsColumn::Active
+        | StatsColumn::WorkActive => TableTone::Good,
         StatsColumn::Waiting => TableTone::Warn,
         StatsColumn::Error => TableTone::Error,
         StatsColumn::Foreground => TableTone::Tmux,
@@ -1948,6 +2016,7 @@ fn stats_column_value(row: &GroupRow, column: StatsColumn) -> String {
         StatsColumn::Human => row.human.clone(),
         StatsColumn::Thinking => row.thinking.clone(),
         StatsColumn::Active => row.active.clone(),
+        StatsColumn::WorkActive => row.work_active.clone(),
         StatsColumn::AttentionEvents => row.attention_events.to_string(),
         StatsColumn::TokenEstimate => row.token_estimate.to_string(),
         StatsColumn::AgentSessions => row.agent_sessions.to_string(),
@@ -2028,6 +2097,7 @@ fn push_markdown_overview(out: &mut String, title: &str, doc: &StatsDocument) {
     push_metric(out, "TMUX foreground", &doc.totals.foreground);
     push_metric(out, "Human presence", &doc.totals.human);
     push_metric(out, "Active (engaged)", &doc.totals.active);
+    push_metric(out, "Work active (hands-on)", &doc.totals.work_active);
     push_metric(out, "Thinking", &doc.totals.thinking);
     push_metric(
         out,
@@ -2233,6 +2303,10 @@ mod tests {
             project_by_agent_session: HashMap::new(),
             active_lookback: time::Duration::seconds(60),
             active_timeout: time::Duration::seconds(300),
+            // Match active_timeout in the shared fixture so existing prompt/tick
+            // assertions are unaffected; tests exercising the shorter tick timeout
+            // set this explicitly.
+            active_tick_timeout: time::Duration::seconds(300),
         }
     }
 
@@ -2364,6 +2438,67 @@ mod tests {
         // Window = [10:28:59, 10:35:00] around the 1s tick = 6m01s.
         assert_eq!(totals.active_secs, 361);
         assert!(totals.active_secs < totals.human_secs);
+    }
+
+    /// Build a bounded-range fixture whose only activity is a long attach plus one
+    /// input tick of `kind` at 10:30, used to compare `active` vs `work_active`.
+    fn data_with_single_tick(kind: HumanInteractionKind) -> StatsData {
+        let mut d = data(Vec::new());
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.pane_sessions.insert("%1".into(), "main".into());
+        d.activity_entries = vec![
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxAttach,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 10:00:00 UTC),
+                ended_at: datetime!(2026-05-30 12:00:00 UTC),
+            })),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind,
+                pane: None,
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 10:29:59 UTC),
+                ended_at: datetime!(2026-05-30 10:30:00 UTC),
+            })),
+        ];
+        d
+    }
+
+    #[test]
+    fn work_active_excludes_scroll_ticks() {
+        // A keypress tick feeds both `active` and `work_active`; a scrollback tick
+        // feeds `active` (engaged/watching) but not `work_active` (hands-on).
+        let keypress = build_totals(&data_with_single_tick(HumanInteractionKind::TmuxInput));
+        assert_eq!(keypress.active_secs, 361);
+        assert_eq!(keypress.work_active_secs, 361);
+
+        let scroll = build_totals(&data_with_single_tick(HumanInteractionKind::TmuxScroll));
+        // Scroll still counts as engaged time...
+        assert_eq!(scroll.active_secs, 361);
+        // ...but is excluded from hands-on work.
+        assert_eq!(scroll.work_active_secs, 0);
+    }
+
+    #[test]
+    fn active_tick_uses_shorter_timeout_than_prompts() {
+        // With a 90s tick timeout, the same keypress tick's window shrinks from
+        // [10:28:59, 10:35:00] (361s) to [10:28:59, 10:31:30] (151s) — sparse
+        // scrolling can no longer chain into long active spans.
+        let mut d = data_with_single_tick(HumanInteractionKind::TmuxInput);
+        d.active_tick_timeout = time::Duration::seconds(90);
+
+        let totals = build_totals(&d);
+
+        // 10:28:59 → 10:31:30 inclusive of the boundary second = 151s.
+        assert_eq!(totals.active_secs, 151);
+        assert_eq!(totals.work_active_secs, 151);
     }
 
     #[test]

@@ -125,6 +125,14 @@ pub struct ClientInfo {
     /// detection treat an idle reattach as a fresh client rather than input.
     /// `0` when tmux did not report it.
     pub created: i64,
+    /// Whether the client's active pane is in copy/view mode, from tmux
+    /// `#{pane_in_mode}`. When `true`, an activity advance is almost always
+    /// scrollback navigation (reading) rather than typing input to the program,
+    /// so input detection tags the tick as scroll. `false` when tmux did not
+    /// report it (older tmux / other backends) — defaults to "not scrolling".
+    /// Caveat: a TUI that handles its own scroll without entering tmux copy-mode
+    /// keeps this `false`, so it catches tmux scrollback, not in-app scroll.
+    pub in_copy_mode: bool,
 }
 
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
@@ -134,7 +142,7 @@ pub(crate) const PANE_FMT: &str =
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
 pub(crate) const CLIENT_FMT: &str =
-    "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}\t#{client_created}";
+    "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}\t#{client_created}\t#{pane_in_mode}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -193,6 +201,7 @@ pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
             control_mode: matches!(cols[2].trim(), "1" | "true"),
             last_activity: cols.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
             created: cols.get(4).and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+            in_copy_mode: matches!(cols.get(5).map(|s| s.trim()), Some("1" | "true")),
         });
     }
     clients

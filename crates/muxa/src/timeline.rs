@@ -844,9 +844,9 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
         let ActivityEntry::HumanInteraction(entry) = entry else {
             continue;
         };
-        if entry.kind != HumanInteractionKind::TmuxInput
-            || !input.range.includes_end(entry.ended_at)
-        {
+        // Both keypress (TmuxInput) and scrollback (TmuxScroll) ticks count toward
+        // the timeline's engaged-ACTIVE lane.
+        if !entry.kind.is_input_tick() || !input.range.includes_end(entry.ended_at) {
             continue;
         }
         if !matches_session_filter(
@@ -919,7 +919,7 @@ fn active_human_presence_intervals(
                 }
             }
             ActivityEntry::HumanInteraction(entry) => {
-                if entry.kind == HumanInteractionKind::TmuxInput {
+                if entry.kind.is_input_tick() {
                     continue;
                 }
                 if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
@@ -1333,6 +1333,7 @@ fn human_kind_label(kind: HumanInteractionKind) -> &'static str {
         HumanInteractionKind::MuxaPromptInput => "muxa_prompt_input",
         HumanInteractionKind::TmuxAttach => "tmux_attach",
         HumanInteractionKind::TmuxInput => "tmux_input",
+        HumanInteractionKind::TmuxScroll => "tmux_scroll",
     }
 }
 

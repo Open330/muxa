@@ -121,9 +121,15 @@ pub struct Config {
 pub struct StatsConfig {
     /// Seconds credited *before* each action (reading/orienting just prior).
     pub active_lookback_secs: u64,
-    /// Idle timeout: seconds an action keeps the "active" clock running after
+    /// Idle timeout: seconds a *prompt* keeps the "active" clock running after
     /// it. Gaps longer than this read as away. Larger = more generous.
     pub active_timeout_secs: u64,
+    /// Idle timeout applied to *tmux input ticks* (keypress / scroll) instead of
+    /// `active_timeout_secs`. A single keypress or scroll implies far less
+    /// sustained work than submitting a prompt, so this is shorter to stop sparse
+    /// scrolling while watching an agent from chaining into hours of "active"
+    /// time. Applies to both `active` and `work_active`.
+    pub active_tick_timeout_secs: u64,
 }
 
 impl Default for StatsConfig {
@@ -131,6 +137,7 @@ impl Default for StatsConfig {
         Self {
             active_lookback_secs: default_active_lookback_secs(),
             active_timeout_secs: default_active_timeout_secs(),
+            active_tick_timeout_secs: default_active_tick_timeout_secs(),
         }
     }
 }
@@ -141,6 +148,10 @@ fn default_active_lookback_secs() -> u64 {
 
 fn default_active_timeout_secs() -> u64 {
     300
+}
+
+fn default_active_tick_timeout_secs() -> u64 {
+    90
 }
 
 /// `[ui]` config — shared visual defaults for human-facing terminal output.

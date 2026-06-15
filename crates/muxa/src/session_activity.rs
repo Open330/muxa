@@ -359,6 +359,10 @@ struct ClientInput {
     epoch: i64,
     /// `#{client_created}` unix epoch (seconds) — when this client attached.
     created: i64,
+    /// `#{pane_in_mode}` at poll time: the client's active pane is in copy/view
+    /// mode, so an activity advance is scrollback navigation (reading), not
+    /// typing. Tags the emitted tick as scroll vs. keypress.
+    in_copy_mode: bool,
 }
 
 /// One tmux poll: live sessions (with attached-client counts) plus the per-client
@@ -431,6 +435,7 @@ fn client_inputs(sessions: &[SessionInfo], clients: &[tmux::ClientInfo]) -> Vec<
                 name: client.name.clone(),
                 epoch: client.last_activity,
                 created: client.created,
+                in_copy_mode: client.in_copy_mode,
             });
         }
     }
@@ -445,15 +450,18 @@ fn client_inputs(sessions: &[SessionInfo], clients: &[tmux::ClientInfo]) -> Vec<
 /// baseline is `created` itself. So `activity > created` on first sight counts
 /// real post-attach reading (attach-and-read before the first poll), while a pure
 /// attach (`activity == created`) only seeds — no reattach or extra idle client
-/// can fabricate input. Emits at most one `TmuxInput` tick per session (at the
-/// latest advancing client's epoch). `seen` is updated to the current
-/// `(created, activity)` and pruned to the live client set.
+/// can fabricate input. Emits at most one input tick per session (at the latest
+/// advancing client's epoch), tagged `TmuxScroll` when that client's active pane
+/// was in copy mode (scrollback reading) or `TmuxInput` otherwise (keypress).
+/// `seen` is updated to the current `(created, activity)` and pruned to the live
+/// client set.
 fn detect_input_ticks(
     seen: &mut HashMap<String, (i64, i64)>,
     inputs: &[ClientInput],
 ) -> Vec<HumanInteractionEntry> {
-    // Per session id: (session name, latest epoch) among clients that advanced.
-    let mut advanced: HashMap<&str, (&str, i64)> = HashMap::new();
+    // Per session id: (session name, latest epoch, that client's copy-mode flag)
+    // among clients that advanced.
+    let mut advanced: HashMap<&str, (&str, i64, bool)> = HashMap::new();
     for input in inputs {
         // Baseline = the last activity of this exact attach if we've seen it,
         // else the attach time. Activity strictly past the baseline is real input.
@@ -464,22 +472,29 @@ fn detect_input_ticks(
         let is_real = input.epoch > baseline;
         seen.insert(input.name.clone(), (input.created, input.epoch));
         if is_real {
-            let slot = advanced
-                .entry(&input.session_id)
-                .or_insert((&input.session_name, input.epoch));
+            let slot = advanced.entry(&input.session_id).or_insert((
+                &input.session_name,
+                input.epoch,
+                input.in_copy_mode,
+            ));
             if input.epoch > slot.1 {
-                *slot = (&input.session_name, input.epoch);
+                *slot = (&input.session_name, input.epoch, input.in_copy_mode);
             }
         }
     }
 
     let mut entries = Vec::new();
-    for (session_id, (session_name, epoch)) in advanced {
+    for (session_id, (session_name, epoch, in_copy_mode)) in advanced {
         let Ok(at) = OffsetDateTime::from_unix_timestamp(epoch) else {
             continue;
         };
+        let kind = if in_copy_mode {
+            HumanInteractionKind::TmuxScroll
+        } else {
+            HumanInteractionKind::TmuxInput
+        };
         entries.push(HumanInteractionEntry::new(HumanInteractionInput {
-            kind: HumanInteractionKind::TmuxInput,
+            kind,
             pane: None,
             session_id: Some(session_id.to_string()),
             session_name: Some(session_name.to_string()),
@@ -587,16 +602,28 @@ mod tests {
             control_mode,
             last_activity,
             created: TEST_CREATED,
+            in_copy_mode: false,
         }
     }
 
     fn cinput(session_id: &str, session_name: &str, name: &str, epoch: i64) -> ClientInput {
+        cinput_mode(session_id, session_name, name, epoch, false)
+    }
+
+    fn cinput_mode(
+        session_id: &str,
+        session_name: &str,
+        name: &str,
+        epoch: i64,
+        in_copy_mode: bool,
+    ) -> ClientInput {
         ClientInput {
             session_id: session_id.into(),
             session_name: session_name.into(),
             name: name.into(),
             epoch,
             created: TEST_CREATED,
+            in_copy_mode,
         }
     }
 
@@ -631,6 +658,32 @@ mod tests {
         // No further advance → nothing.
         let e = detect_input_ticks(&mut seen, &[cinput("$1", "main", "/dev/pts/3", 130)]);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn detect_input_tags_scroll_when_client_in_copy_mode() {
+        let mut seen = HashMap::new();
+        // Seed.
+        detect_input_ticks(
+            &mut seen,
+            &[cinput_mode("$1", "main", "/dev/pts/3", 100, true)],
+        );
+
+        // Advance while the active pane is in copy mode → a scroll tick.
+        let e = detect_input_ticks(
+            &mut seen,
+            &[cinput_mode("$1", "main", "/dev/pts/3", 130, true)],
+        );
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].kind, HumanInteractionKind::TmuxScroll);
+
+        // A later advance with the pane no longer in copy mode → a keypress tick.
+        let e = detect_input_ticks(
+            &mut seen,
+            &[cinput_mode("$1", "main", "/dev/pts/3", 160, false)],
+        );
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].kind, HumanInteractionKind::TmuxInput);
     }
 
     #[test]
@@ -702,6 +755,7 @@ mod tests {
             name: "/dev/pts/3".into(),
             epoch,
             created,
+            in_copy_mode: false,
         };
 
         // Baseline: attach #1 (created 1000), last activity 1000.
@@ -749,6 +803,7 @@ mod tests {
             control_mode: false,
             last_activity: 100,
             created: 0,
+            in_copy_mode: false,
         };
         let no_name = tmux::ClientInfo {
             name: String::new(),
@@ -756,6 +811,7 @@ mod tests {
             control_mode: false,
             last_activity: 100,
             created: 1000,
+            in_copy_mode: false,
         };
 
         let inputs = client_inputs(&sessions, &[no_created, no_name]);

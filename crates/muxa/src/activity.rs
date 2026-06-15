@@ -151,11 +151,33 @@ pub enum HumanInteractionKind {
     MuxaWatch,
     MuxaPromptInput,
     TmuxAttach,
-    /// A tmux client's `client_activity` advanced between polls — the human
-    /// pressed a key or scrolled. Unlike [`Self::TmuxAttach`] (which spans the
-    /// whole attach, idle included), this marks an instant of real input, so it
-    /// distinguishes active reading from a forgotten attach.
+    /// A tmux client's `client_activity` advanced between polls while its active
+    /// pane was *not* in copy mode — a keypress / interaction with the program.
+    /// Unlike [`Self::TmuxAttach`] (which spans the whole attach, idle included),
+    /// this marks an instant of real hands-on input, so it distinguishes active
+    /// work from a forgotten attach. Counts toward both `active` and `work_active`.
     TmuxInput,
+    /// Like [`Self::TmuxInput`], but the active pane was in copy/view mode, so the
+    /// advance is scrollback navigation (reading agent output) rather than typing.
+    /// Counts toward `active` (engaged/attended) but is excluded from `work_active`
+    /// so passively watching a long agent run does not read as hands-on work.
+    TmuxScroll,
+}
+
+impl HumanInteractionKind {
+    /// Input ticks ([`Self::TmuxInput`] / [`Self::TmuxScroll`]) are instantaneous
+    /// input markers, not presence spans: they feed the `active` estimate via their
+    /// own padding window and must never be treated as raw human-presence time.
+    pub fn is_input_tick(self) -> bool {
+        matches!(self, Self::TmuxInput | Self::TmuxScroll)
+    }
+
+    /// Whether this tick is hands-on work (typing) rather than scrollback reading.
+    /// Only relevant for input ticks; non-tick kinds return `true` (they are not
+    /// scroll) but callers should gate on [`Self::is_input_tick`] first.
+    pub fn is_work_input(self) -> bool {
+        !matches!(self, Self::TmuxScroll)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

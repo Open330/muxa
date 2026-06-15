@@ -257,6 +257,7 @@ fn human_kind_label(kind: HumanInteractionKind) -> &'static str {
         HumanInteractionKind::MuxaPromptInput => "muxa_prompt_input",
         HumanInteractionKind::TmuxAttach => "tmux_attach",
         HumanInteractionKind::TmuxInput => "tmux_input",
+        HumanInteractionKind::TmuxScroll => "tmux_scroll",
     }
 }
 
