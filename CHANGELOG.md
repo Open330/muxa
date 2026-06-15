@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.12] - 2026-06-15
+
+### Added
+
+- **`--json` and `--markdown` shortcuts on `muxa stats` and `muxa report`** —
+  both commands now accept the two boolean flags (mutually exclusive). On
+  `stats` they override `--format`; on `report` they opt out of the new
+  default tables. `report` also gained `--theme` and `-v/--verbose` so its
+  table mode matches `stats`.
+
+### Changed
+
+- **`muxa report` now renders tables like `muxa stats`** instead of always
+  emitting Markdown — a range header followed by one bordered table per
+  breakdown (day/project/agent/session), each with the shared `TOTAL` footer.
+  The previous Markdown output is still available via `--markdown`, and
+  `--json` emits the four section documents as a JSON array.
+- **`stats`/`report` split hands-on `WORK ACT` from engaged `ACT`** — engaged
+  time no longer inflates from scrollback or idle attach; hands-on active time
+  counts prompts, thinking, and keypress ticks only.
+
 ## [0.8.11] - 2026-06-12
 
 ### Fixed
@@ -1074,7 +1095,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.7...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.12...HEAD
+[0.8.12]: https://github.com/Open330/muxa/compare/v0.8.11...v0.8.12
 [0.8.7]: https://github.com/Open330/muxa/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/Open330/muxa/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/Open330/muxa/compare/v0.8.4...v0.8.5
