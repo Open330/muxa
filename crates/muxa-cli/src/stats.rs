@@ -18,6 +18,8 @@ use crate::time_range::TimeRange;
 use crate::{terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
+// CLI flags are independent toggles, not a state machine to fold into an enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
     #[arg(long, default_value = "7d")]
@@ -30,6 +32,14 @@ pub struct Args {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
+
+    /// Shortcut for `--format json`. Overrides `--format`.
+    #[arg(long, conflicts_with = "markdown")]
+    json: bool,
+
+    /// Shortcut for `--format markdown`. Overrides `--format`.
+    #[arg(long)]
+    markdown: bool,
 
     /// Maximum rows to print. Set 0 for all rows.
     #[arg(long, default_value_t = 10)]
@@ -80,6 +90,14 @@ pub struct ReportArgs {
     #[arg(long, default_value_t = 10)]
     limit: usize,
 
+    /// Emit JSON instead of the section tables.
+    #[arg(long, conflicts_with = "markdown")]
+    json: bool,
+
+    /// Emit Markdown instead of the section tables.
+    #[arg(long)]
+    markdown: bool,
+
     /// Exclude pane ids matching a glob. Repeat or comma-separate values.
     #[arg(long = "exclude-pane", value_name = "GLOB", value_delimiter = ',')]
     exclude_pane: Vec<String>,
@@ -87,6 +105,16 @@ pub struct ReportArgs {
     /// Exclude tmux session names or ids matching a glob. Repeat or comma-separate values.
     #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
     exclude_session: Vec<String>,
+
+    /// One-shot visual theme override for table output.
+    #[arg(long, value_enum)]
+    theme: Option<ThemeArg>,
+
+    /// Print the full explanatory notes (methodology for THINK/ACTIVE, the
+    /// retained-history window, ledger fallbacks). Without this, the tables
+    /// only report that notes exist. JSON/markdown always include them.
+    #[arg(long, short = 'v', default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -94,6 +122,21 @@ enum OutputFormat {
     Table,
     Json,
     Markdown,
+}
+
+impl OutputFormat {
+    /// Fold the boolean `--json` / `--markdown` shortcuts onto a base format.
+    /// `--json` and `--markdown` are mutually exclusive at the clap layer, so at
+    /// most one is set; either one wins over the base, otherwise the base stands.
+    fn resolve(base: OutputFormat, json: bool, markdown: bool) -> OutputFormat {
+        if json {
+            OutputFormat::Json
+        } else if markdown {
+            OutputFormat::Markdown
+        } else {
+            base
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -152,7 +195,7 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
     let data = load_data(client, cfg, &args.since, &exclusions).await?;
     let doc = build_document(&data, args.group_by, args.limit, args.sort, args.reverse);
-    match args.format {
+    match OutputFormat::resolve(args.format, args.json, args.markdown) {
         OutputFormat::Table => render_table(
             &doc,
             theme::for_config(cfg, args.theme, use_colors()),
@@ -173,7 +216,17 @@ pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Resu
         build_document(&data, GroupBy::Agent, args.limit, SortKey::Prompts, false),
         build_document(&data, GroupBy::Session, args.limit, SortKey::Prompts, false),
     ];
-    print!("{}", render_markdown_report(&docs));
+    // Report defaults to the same tables as `stats`; `--json`/`--markdown` opt
+    // into the machine- and document-friendly formats.
+    match OutputFormat::resolve(OutputFormat::Table, args.json, args.markdown) {
+        OutputFormat::Table => render_report_tables(
+            &docs,
+            theme::for_config(cfg, args.theme, use_colors()),
+            args.verbose,
+        ),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&docs)?),
+        OutputFormat::Markdown => print!("{}", render_markdown_report(&docs)),
+    }
     Ok(())
 }
 
@@ -1650,14 +1703,7 @@ fn notes(data: &StatsData) -> Vec<String> {
 }
 
 fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
-    println!("muxa stats");
-    println!("Range: {}", doc.range.label);
-    if let Some(since_at) = doc.range.since_at.as_deref() {
-        println!("Since: {since_at}");
-    }
-    if let Some(until_at) = doc.range.until_at.as_deref() {
-        println!("Until: {until_at}");
-    }
+    print_range_header("muxa stats", doc);
     println!();
 
     if doc.rows.is_empty() {
@@ -1666,24 +1712,72 @@ fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
         let terminal_width = terminal_width();
         println!("{}", render_stats_table(doc, terminal_width, theme));
         if stats_table_layout(terminal_width) != StatsTableLayout::Full {
-            println!(
-                "note: Table compacted for terminal width; use --format json or --format markdown for every column."
-            );
+            println!("{}", compaction_hint());
         }
     }
 
-    if !doc.notes.is_empty() {
-        if verbose {
-            for note in &doc.notes {
-                println!("note: {note}");
-            }
+    print_notes(&doc.notes, verbose, "muxa stats --verbose");
+}
+
+/// Table output for `muxa report`: the same range header and per-section tables
+/// as `stats`, one table per group-by dimension. Totals/notes are identical
+/// across the documents (they aggregate the same data), so the range header and
+/// notes are printed once, from the first document.
+fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) {
+    let Some(first) = docs.first() else {
+        return;
+    };
+    print_range_header("muxa report", first);
+    println!();
+
+    let terminal_width = terminal_width();
+    let mut compacted = false;
+    for doc in docs {
+        println!("By {}", GroupByLabel(&doc.group_by));
+        if doc.rows.is_empty() {
+            println!("no rows in this view");
         } else {
-            println!(
-                "note: {n} explanatory note{plural} hidden; run `muxa stats --verbose` for methodology, or `muxa doctor` to check health.",
-                n = doc.notes.len(),
-                plural = if doc.notes.len() == 1 { "" } else { "s" },
-            );
+            println!("{}", render_stats_table(doc, terminal_width, theme));
+            compacted |= stats_table_layout(terminal_width) != StatsTableLayout::Full;
         }
+        println!();
+    }
+    if compacted {
+        println!("{}", compaction_hint());
+    }
+
+    print_notes(&first.notes, verbose, "muxa report --verbose");
+}
+
+fn print_range_header(title: &str, doc: &StatsDocument) {
+    println!("{title}");
+    println!("Range: {}", doc.range.label);
+    if let Some(since_at) = doc.range.since_at.as_deref() {
+        println!("Since: {since_at}");
+    }
+    if let Some(until_at) = doc.range.until_at.as_deref() {
+        println!("Until: {until_at}");
+    }
+}
+
+fn compaction_hint() -> &'static str {
+    "note: Table compacted for terminal width; use --json or --markdown for every column."
+}
+
+fn print_notes(notes: &[String], verbose: bool, verbose_cmd: &str) {
+    if notes.is_empty() {
+        return;
+    }
+    if verbose {
+        for note in notes {
+            println!("note: {note}");
+        }
+    } else {
+        println!(
+            "note: {n} explanatory note{plural} hidden; run `{verbose_cmd}` for methodology, or `muxa doctor` to check health.",
+            n = notes.len(),
+            plural = if notes.len() == 1 { "" } else { "s" },
+        );
     }
 }
 
@@ -3013,6 +3107,27 @@ mod tests {
             lines[total_idx - 1].starts_with('╞'),
             "expected a separator rule above TOTAL, got {:?}",
             lines[total_idx - 1]
+        );
+    }
+
+    #[test]
+    fn output_format_resolve_applies_shortcut_precedence() {
+        // --json / --markdown override the base; neither set leaves the base.
+        assert_eq!(
+            OutputFormat::resolve(OutputFormat::Table, true, false),
+            OutputFormat::Json
+        );
+        assert_eq!(
+            OutputFormat::resolve(OutputFormat::Table, false, true),
+            OutputFormat::Markdown
+        );
+        assert_eq!(
+            OutputFormat::resolve(OutputFormat::Markdown, false, false),
+            OutputFormat::Markdown
+        );
+        assert_eq!(
+            OutputFormat::resolve(OutputFormat::Table, false, false),
+            OutputFormat::Table
         );
     }
 
