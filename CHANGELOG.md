@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.14] - 2026-06-16
+
+### Fixed
+
+- **`muxa watch`/`muxa status` were slow to first paint when stale tmux sockets
+  piled up** — `list_panes()` enumerated every socket file under
+  `/tmp/tmux-<uid>` and spawned a `tmux -S <sock> list-panes` per file. Orphan
+  sockets left behind by tmux servers that exited abnormally (tmux never
+  unlinks another server's socket, and a container without a working
+  `/tmp` reaper never sweeps them) turned into hundreds of process spawns per
+  refresh (~0.5s with ~220 orphans), surfacing as a visibly late first paint.
+  `enumerate_sockets()` now drops dead sockets with a cheap `connect()` probe
+  before spawning tmux, so cost scales with *live* servers, not orphan files.
+  Measured: `muxa status` 485ms → ~20ms with ~220 orphans present.
+
 ## [0.8.13] - 2026-06-16
 
 ### Fixed
@@ -1114,7 +1129,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.13...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.14...HEAD
+[0.8.14]: https://github.com/Open330/muxa/compare/v0.8.13...v0.8.14
 [0.8.13]: https://github.com/Open330/muxa/compare/v0.8.12...v0.8.13
 [0.8.12]: https://github.com/Open330/muxa/compare/v0.8.11...v0.8.12
 [0.8.7]: https://github.com/Open330/muxa/compare/v0.8.6...v0.8.7
