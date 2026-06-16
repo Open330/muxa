@@ -72,6 +72,13 @@ const STREAMING_FALLBACK_INTERVAL: Duration = Duration::from_secs(5);
 /// responsiveness.
 const INPUT_POLL: Duration = Duration::from_millis(16);
 
+/// Idle repaint cadence. The render loop normally repaints only when
+/// something changed (input, a refresh outcome, a preview recapture). This
+/// floor keeps time-derived cells fresh anyway — the Activity column renders
+/// `relative_time` at second granularity — without the old behaviour of one
+/// full render per `INPUT_POLL` tick (~62 fps) even on a completely idle UI.
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
+
 /// How long a transient action hint stays visible in the footer before
 /// the renderer falls back to the default keybinding strip. 2 s is the
 /// sweet spot from the spec: long enough to catch with a glance after
@@ -2311,7 +2318,21 @@ pub(crate) struct FullRefresh {
 pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
     match outcome {
         RefreshOutcome::Full(full) => apply_full(app, full),
-        RefreshOutcome::SingleAgent(agent) => apply_single_agent(app, agent),
+        RefreshOutcome::SingleAgent(agent) => {
+            apply_single_agent(app, agent);
+            // Re-sort immediately so a pushed state/activity change moves the
+            // row to its sorted position now instead of waiting for the 5 s
+            // `Full` fallback tick. This matters most for `sort = ["state",
+            // …]`, where the sort key is itself a pushed field: without it the
+            // badge updates instantly but the row stays put for up to 5 s.
+            // The push already merged surgically into the existing rows
+            // (`apply_single_agent`), and `sort_by` is stable, so only the row
+            // that actually changed moves — this no longer reintroduces the
+            // "all rows jumped" jitter that the original per-push full-snapshot
+            // refresh caused. Selection is pinned by `pane_id`, so the cursor
+            // stays on the same agent.
+            app.resort_rows_preserving_selection();
+        }
     }
 }
 
@@ -2395,10 +2416,11 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
     if !updated {
         app.rows.push(WatchRow::Agent(agent));
     }
-    // Don't re-sort here: the fallback `Full` tick re-runs the sort
-    // every 5 s and that's plenty for keeping order roughly fresh.
-    // Re-sorting on every push would re-introduce the "all rows
-    // jumped" jitter we're trying to fix.
+    // Caller (`apply_outcome`) re-sorts after this returns so a pushed change
+    // reaches its sorted position without waiting for the 5 s `Full` tick. The
+    // re-sort lives there (not here) so it runs once per outcome and the unit
+    // tests that drive `apply_single_agent` directly can assert the pre-sort
+    // merge in isolation.
 }
 
 fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
@@ -2773,11 +2795,21 @@ pub async fn run(
 
     let mut jump_target: Option<String> = None;
 
+    // Repaint only when something actually changed (`needs_render`) or the
+    // idle cadence elapsed, instead of once per input-poll tick. `true` here
+    // forces the first in-loop frame; `Instant::now()` seeds the cadence.
+    let mut needs_render = true;
+    let mut last_render = std::time::Instant::now();
+
     loop {
-        guard
-            .terminal_mut()
-            .draw(|f| render(f, &mut app))
-            .map_err(anyhow::Error::from)?;
+        if needs_render || last_render.elapsed() >= IDLE_REDRAW_INTERVAL {
+            guard
+                .terminal_mut()
+                .draw(|f| render(f, &mut app))
+                .map_err(anyhow::Error::from)?;
+            last_render = std::time::Instant::now();
+            needs_render = false;
+        }
 
         // Drain every event already in the OS buffer in one go before
         // rendering again. Holding a key (or typing in bursts) used to
@@ -2802,6 +2834,13 @@ pub async fn run(
             if let Some(ev) = waited {
                 events.push(ev);
             }
+        }
+
+        // Any input (key, resize, mouse) may change what's on screen, so
+        // repaint next pass. An event that turns out to be a no-op costs one
+        // extra render — negligible next to skipping the idle ~62 fps redraw.
+        if !events.is_empty() {
+            needs_render = true;
         }
 
         let mut quit = false;
@@ -3004,6 +3043,8 @@ pub async fn run(
                         text: captured.unwrap_or_default(),
                         fetched_at: std::time::Instant::now(),
                     });
+                    // Fresh preview bytes — repaint to show them.
+                    needs_render = true;
                 }
             }
         }
@@ -3018,6 +3059,7 @@ pub async fn run(
         }
         if received_outcome {
             app.refresh_pending = false;
+            needs_render = true;
         }
 
         if quit {
@@ -5069,6 +5111,52 @@ mod tests {
         // alpha: %11 (newer t2) before %10 (older t0); then beta: %21
         // (newer t3) before %20 (older t1).
         assert_eq!(order, vec!["%11", "%10", "%21", "%20"]);
+    }
+
+    #[test]
+    fn push_resorts_rows_so_a_state_change_moves_immediately() {
+        // sort = [State, Activity]. A pushed `Error` transition must move the
+        // row to its sorted position now, not on the next 5 s `Full` tick —
+        // otherwise the badge updates but the row stays put ("한 박자 늦음").
+        let t_old = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t_new = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Pane,
+            sort: vec![WatchSortKey::State, WatchSortKey::Activity],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent_at("a", "%1", t_old), // Idle, older
+                fake_agent_at("b", "%2", t_new), // Idle, newer
+            ],
+            vec![
+                fake_pane("%1", "main", 0, 0, "claude"),
+                fake_pane("%2", "main", 0, 1, "claude"),
+            ],
+        );
+
+        let order = |app: &App| -> Vec<String> {
+            app.rows
+                .iter()
+                .filter_map(|r| match r {
+                    WatchRow::Agent(a) => a.pane.clone(),
+                    WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                })
+                .collect()
+        };
+
+        // Both Idle → newer activity floats first, so %2 leads, %1 trails.
+        assert_eq!(order(&app), vec!["%2", "%1"]);
+
+        // Push: agent "a" (pane %1) flips to Error (state rank 0 → top).
+        let mut updated = fake_agent_at("a", "%1", t_old);
+        updated.state = AgentState::Error;
+        apply_outcome(&mut app, RefreshOutcome::SingleAgent(updated));
+
+        // The re-sort ran as part of the push, so %1 is already on top.
+        assert_eq!(order(&app), vec!["%1", "%2"]);
     }
 
     #[test]
