@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.13] - 2026-06-16
+
+### Fixed
+
+- **`muxa watch` reflected pushed state changes a beat late** — a streaming
+  transition updated the row in place but never re-sorted, so with
+  `sort = ["state", …]` (the sort key is itself a pushed field) the badge
+  changed instantly while the row's position lagged up to 5s until the next
+  full fallback refresh. Pushes now re-sort immediately, preserving selection
+  by pane id; the surgical merge plus a stable sort means only the changed row
+  moves (no row-jump jitter).
+
+### Changed
+
+- **`muxa watch` repaints only when something changed** — the render loop no
+  longer does a full redraw on every input-poll tick (~62 fps) while idle. It
+  repaints on input, a refresh outcome, or a preview recapture, plus a 1s idle
+  cadence that keeps the Activity column's relative timestamps current.
+
 ## [0.8.12] - 2026-06-15
 
 ### Added
@@ -1095,7 +1114,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.12...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.13...HEAD
+[0.8.13]: https://github.com/Open330/muxa/compare/v0.8.12...v0.8.13
 [0.8.12]: https://github.com/Open330/muxa/compare/v0.8.11...v0.8.12
 [0.8.7]: https://github.com/Open330/muxa/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/Open330/muxa/compare/v0.8.5...v0.8.6
