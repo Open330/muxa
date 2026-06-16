@@ -263,6 +263,7 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
         pane_sessions: &pane_sessions,
         active_lookback_secs: cfg.stats.active_lookback_secs,
         active_timeout_secs: cfg.stats.active_timeout_secs,
+        active_tick_timeout_secs: cfg.stats.active_tick_timeout_secs,
         filters: TimelineFilters {
             session: args.session.clone(),
             agent_kind: args.agent.map(AgentKind::from),

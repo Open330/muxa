@@ -62,18 +62,27 @@ triggers:
 - **Thinking** — time present while an agent is blocked on you
   (`WaitingInput`/`WaitingChoice`/`Error`): reading its question and deciding.
 
-Unlike `HUMAN` (raw presence: tmux foreground, prompt input, or attach), a pane
-left attached and untouched accrues none of these, so it does not inflate
-`ACTIVE`. Prompt and tmux-input windows are also clipped to matching `HUMAN`
-presence, so padding cannot make a single session's `ACT` exceed its observed
-foreground/interaction time.
+Unlike `HUMAN` (raw presence: tmux foreground, prompt input, attach, or
+`muxa watch`), a pane left attached and untouched accrues none of these, so it
+does not inflate `ACTIVE`. Prompt and tmux-input windows are clipped to matching
+active presence (tmux foreground, prompt input, or attach; not a plain open
+`muxa watch` interval), so padding cannot make a single session's `ACT` exceed
+its observed foreground/interaction time.
 
 Across sessions, `ACTIVE` is **de-duplicated**: a human does one thing at a time,
 so each instant is attributed to the most recently touched session ("last
 touch"). Per-session `ACT` therefore sums to a grand total that stays within real
 elapsed time, rather than multiplying it when many agents run at once. Window
-padding is configurable — `[stats] active_lookback_secs` (default 60) and
-`active_timeout_secs` (default 300); smaller values count more conservatively.
+padding is configurable — `[stats] active_lookback_secs` (default 60),
+`active_timeout_secs` for prompts (default 300), and
+`active_tick_timeout_secs` for tmux input ticks (default 90); smaller values
+count more conservatively.
+
+`WACT` (`work_active` / `work_active_secs` in JSON) is the hands-on subset of
+`ACT`: the same last-touch attribution is used, but a second only counts when
+the winning window came from a prompt, keypress, or thinking span. Scrollback
+ticks can still count as engaged `ACT`, but not as `WACT`, so every row's
+`WACT` stays within that row's `ACT`.
 
 The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows
@@ -126,6 +135,8 @@ details, see [docs/TIMELINE.md](TIMELINE.md).
 | `TMUX` | Time a tmux session was foregrounded by an interactive tmux client. |
 | `HUMAN` | Union of tmux foreground time plus muxa human interaction intervals. |
 | `THINK` | Overlap of attention states with human presence. |
+| `ACT` | Engaged human time from prompts, tmux input ticks, and thinking. |
+| `WACT` | Hands-on subset of `ACT`; excludes scrollback-owned engaged time. |
 | `BLOCK` | Count of transitions into Waiting/Error attention states. |
 
 `THINK` is intentionally narrower than `HUMAN`. It counts time where the

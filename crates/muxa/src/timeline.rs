@@ -150,6 +150,7 @@ pub struct TimelineBuildInput<'a> {
     pub pane_sessions: &'a HashMap<String, String>,
     pub active_lookback_secs: u64,
     pub active_timeout_secs: u64,
+    pub active_tick_timeout_secs: u64,
     pub filters: TimelineFilters,
     pub notes: Vec<String>,
 }
@@ -800,7 +801,8 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
     let mut intervals = Vec::new();
     let active_lookback = secs_to_duration(input.active_lookback_secs);
     let active_timeout = secs_to_duration(input.active_timeout_secs);
-    let active_presences = active_human_presence_intervals(input, false);
+    let active_tick_timeout = secs_to_duration(input.active_tick_timeout_secs);
+    let active_presences = active_human_presence_intervals(input, ActivePresenceMode::Active);
 
     for prompt in input.prompt_entries {
         if !input.range.includes_end(prompt.at) {
@@ -860,7 +862,7 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
         if let Some(interval) = active_scoped_interval(
             input,
             entry.started_at - active_lookback,
-            entry.ended_at + active_timeout,
+            entry.ended_at + active_tick_timeout,
             entry.pane.clone(),
             entry.session_name.clone(),
             entry.session_id.as_deref().unwrap_or("human_interaction"),
@@ -876,7 +878,7 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
         }
     }
 
-    let presences = active_human_presence_intervals(input, true);
+    let presences = active_human_presence_intervals(input, ActivePresenceMode::Thinking);
     for attention in active_attention_intervals(input) {
         for segment in overlapping_active_presence_segments(&attention.interval, &presences) {
             let anchor = segment.started_at;
@@ -891,9 +893,15 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
     intervals
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivePresenceMode {
+    Active,
+    Thinking,
+}
+
 fn active_human_presence_intervals(
     input: &TimelineBuildInput<'_>,
-    thinking_only: bool,
+    mode: ActivePresenceMode,
 ) -> Vec<ActiveScopedInterval> {
     let mut intervals = Vec::new();
     for entry in input.activity_entries {
@@ -922,7 +930,14 @@ fn active_human_presence_intervals(
                 if entry.kind.is_input_tick() {
                     continue;
                 }
-                if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
+                if mode == ActivePresenceMode::Active
+                    && !human_interaction_counts_for_active(entry.kind)
+                {
+                    continue;
+                }
+                if mode == ActivePresenceMode::Thinking
+                    && !human_interaction_counts_for_thinking(entry.kind)
+                {
                     continue;
                 }
                 if !matches_session_filter(
@@ -1111,6 +1126,13 @@ fn active_human_group_key(interval: &ActiveScopedInterval) -> String {
 }
 
 fn human_interaction_counts_for_thinking(kind: HumanInteractionKind) -> bool {
+    matches!(
+        kind,
+        HumanInteractionKind::MuxaPromptInput | HumanInteractionKind::TmuxAttach
+    )
+}
+
+fn human_interaction_counts_for_active(kind: HumanInteractionKind) -> bool {
     matches!(
         kind,
         HumanInteractionKind::MuxaPromptInput | HumanInteractionKind::TmuxAttach
@@ -1481,6 +1503,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1520,6 +1543,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1564,6 +1588,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1637,6 +1662,7 @@ mod tests {
             pane_sessions: &pane_sessions,
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1692,6 +1718,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1702,6 +1729,56 @@ mod tests {
             vec![TimelineActiveSession {
                 label: "main".into(),
                 active_secs: 361,
+            }]
+        );
+    }
+
+    #[test]
+    fn active_sessions_use_tick_timeout_for_tmux_input_ticks() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let entries = [
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-06-05 10:59:00 UTC),
+                datetime!(2026-06-05 11:01:31 UTC),
+            )),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxInput,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-06-05 11:00:00 UTC),
+                ended_at: datetime!(2026-06-05 11:00:01 UTC),
+            })),
+        ];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &[],
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            active_tick_timeout_secs: 90,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.totals.active_secs, 151);
+        assert_eq!(
+            doc.active_sessions,
+            vec![TimelineActiveSession {
+                label: "main".into(),
+                active_secs: 151,
             }]
         );
     }
@@ -1742,6 +1819,7 @@ mod tests {
             pane_sessions: &pane_sessions,
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1756,6 +1834,53 @@ mod tests {
                 active_secs: 90,
             }]
         );
+    }
+
+    #[test]
+    fn active_sessions_ignore_watch_only_presence() {
+        let now = datetime!(2026-06-05 12:00:00 UTC);
+        let range = TimelineRange {
+            label: "today".into(),
+            since_at: Some(datetime!(2026-06-05 10:00:00 UTC)),
+            until_at: None,
+        };
+        let prompts = [HistoryEntry::new(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            "prompt main",
+            datetime!(2026-06-05 11:00:00 UTC),
+            None,
+        )];
+        let entries = [ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+            HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaWatch,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-06-05 10:00:00 UTC),
+                ended_at: datetime!(2026-06-05 12:00:00 UTC),
+            },
+        ))];
+
+        let doc = build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &prompts,
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &HashMap::new(),
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+
+        assert_eq!(doc.totals.human_secs, 7_200);
+        assert_eq!(doc.totals.active_secs, 0);
+        assert!(doc.active_sessions.is_empty());
     }
 
     #[test]
@@ -1798,6 +1923,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1854,6 +1980,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters {
                 session: None,
                 agent_kind: None,
@@ -1989,6 +2116,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -2025,6 +2153,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -2065,6 +2194,7 @@ mod tests {
             pane_sessions: &HashMap::new(),
             active_lookback_secs: 60,
             active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });

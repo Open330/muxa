@@ -359,6 +359,7 @@ struct ScopedInterval {
 struct AttentionInterval {
     interval: ScopedInterval,
     group_key: String,
+    work_eligible: bool,
     /// Recency time for last-touch attribution — the *unclipped* action moment
     /// (prompt / tmux input / thinking start). Kept separate from
     /// `interval.started_at`, which the range may clamp to the window boundary
@@ -632,7 +633,8 @@ fn build_totals(data: &StatsData) -> Totals {
             &mut error_secs,
         );
     }
-    human_secs = sum_merged_scoped_intervals(&human_presence_intervals(data, false));
+    human_secs =
+        sum_merged_scoped_intervals(&human_presence_intervals(data, HumanPresenceMode::Human));
     if !has_session_foreground_ledger {
         human_secs = human_secs.saturating_add(legacy_foreground_secs(data));
     }
@@ -849,7 +851,7 @@ fn add_human_rows(
     rows: &mut BTreeMap<String, GroupAccumulator>,
 ) {
     let mut grouped: BTreeMap<String, Vec<ScopedInterval>> = BTreeMap::new();
-    for interval in human_presence_intervals(data, false) {
+    for interval in human_presence_intervals(data, HumanPresenceMode::Human) {
         if let Some(key) = human_presence_group_key(data, &interval, group_by) {
             grouped.entry(key).or_default().push(interval);
         }
@@ -867,7 +869,7 @@ fn add_thinking_rows(
     group_by: GroupBy,
     rows: &mut BTreeMap<String, GroupAccumulator>,
 ) {
-    let presences = human_presence_intervals(data, true);
+    let presences = human_presence_intervals(data, HumanPresenceMode::Thinking);
     let mut grouped: BTreeMap<String, Vec<ScopedInterval>> = BTreeMap::new();
     for attention in attention_intervals(data, group_by) {
         for segment in overlapping_presence_segments(&attention.interval, &presences) {
@@ -885,18 +887,6 @@ fn add_thinking_rows(
     }
 }
 
-/// Which flavour of active time to estimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveMode {
-    /// `active` — engaged/attended time: prompts + thinking + *all* input ticks
-    /// (keypress and scroll). Counts time spent watching/reading agent output.
-    Engaged,
-    /// `work_active` — hands-on time: prompts + thinking + *keypress* ticks only.
-    /// Scrollback (`TmuxScroll`) ticks are excluded, so passively watching a long
-    /// agent run does not read as active work.
-    Work,
-}
-
 /// Estimate active human time as the union of three signals, each clipped to
 /// observed human presence so padded windows cannot outlive the session
 /// foreground/interaction that made them plausible:
@@ -905,10 +895,10 @@ enum ActiveMode {
 ///    after each prompt (both from `[stats]` config). The unambiguous "I typed
 ///    something" action.
 /// 2. **tmux input ticks** — the daemon records one whenever a client's
-///    `client_activity` advances. A `TmuxInput` (keypress) tick counts in both
-///    modes; a `TmuxScroll` (scrollback) tick counts only in [`ActiveMode::Engaged`].
-///    Each is padded `active_lookback` before / `active_tick_timeout` after — a
-///    shorter timeout than prompts, so sparse scrolling can't chain into hours.
+///    `client_activity` advances. A `TmuxInput` (keypress) tick is work-eligible;
+///    a `TmuxScroll` (scrollback) tick is engaged-only. Each is padded
+///    `active_lookback` before / `active_tick_timeout` after — a shorter timeout
+///    than prompts, so sparse scrolling can't chain into hours.
 /// 3. **Thinking** — time spent present while an agent is blocked on you
 ///    (`WaitingInput`/`WaitingChoice`/`Error`), i.e. reading its question and
 ///    deciding even without a keystroke.
@@ -917,13 +907,9 @@ enum ActiveMode {
 /// none of the three, which is what keeps a forgotten attach from ballooning the
 /// estimate to hours. Prompt/input padding is a confidence window, not extra
 /// presence: if no matching human presence was observed, it contributes nothing.
-fn anchor_intervals(
-    data: &StatsData,
-    group_by: GroupBy,
-    mode: ActiveMode,
-) -> Vec<AttentionInterval> {
+fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterval> {
     let mut intervals = Vec::new();
-    let active_presences = human_presence_intervals(data, false);
+    let active_presences = human_presence_intervals(data, HumanPresenceMode::Active);
 
     // (1) Submitted prompts. `data.prompts` is already clipped to the range, so
     // a prompt just outside a bounded `--since` whose padded window would poke
@@ -947,6 +933,7 @@ fn anchor_intervals(
                 intervals.push(AttentionInterval {
                     interval: segment,
                     group_key: group_key.clone(),
+                    work_eligible: true,
                     anchor: prompt.at,
                 });
             }
@@ -959,10 +946,6 @@ fn anchor_intervals(
             continue;
         };
         if !entry.kind.is_input_tick() {
-            continue;
-        }
-        // In Work mode, scrollback (reading) ticks don't count as hands-on work.
-        if mode == ActiveMode::Work && !entry.kind.is_work_input() {
             continue;
         }
         // Only ticks whose own time is in range count, mirroring prompts (which
@@ -992,6 +975,7 @@ fn anchor_intervals(
                     intervals.push(AttentionInterval {
                         interval: segment,
                         group_key: group_key.clone(),
+                        work_eligible: entry.kind.is_work_input(),
                         anchor: entry.ended_at,
                     });
                 }
@@ -1000,13 +984,14 @@ fn anchor_intervals(
     }
 
     // (3) Thinking: present while an agent is blocked on you (reading/deciding).
-    let presences = human_presence_intervals(data, true);
+    let presences = human_presence_intervals(data, HumanPresenceMode::Thinking);
     for attention in attention_intervals(data, group_by) {
         for segment in overlapping_presence_segments(&attention.interval, &presences) {
             let anchor = segment.started_at;
             intervals.push(AttentionInterval {
                 interval: segment,
                 group_key: attention.group_key.clone(),
+                work_eligible: true,
                 anchor,
             });
         }
@@ -1026,16 +1011,18 @@ struct ActiveWindow {
     end: i64,
     anchor: i128,
     group_key: String,
+    work_eligible: bool,
 }
 
-fn active_windows(data: &StatsData, group_by: GroupBy, mode: ActiveMode) -> Vec<ActiveWindow> {
-    anchor_intervals(data, group_by, mode)
+fn active_windows(data: &StatsData, group_by: GroupBy) -> Vec<ActiveWindow> {
+    anchor_intervals(data, group_by)
         .into_iter()
         .map(|a| ActiveWindow {
             start: a.interval.started_at.unix_timestamp(),
             end: a.interval.ended_at.unix_timestamp(),
             anchor: a.anchor.unix_timestamp_nanos(),
             group_key: a.group_key,
+            work_eligible: a.work_eligible,
         })
         .collect()
 }
@@ -1046,15 +1033,19 @@ fn active_windows(data: &StatsData, group_by: GroupBy, mode: ActiveMode) -> Vec<
 /// when several agents are juggled at once. Equals the sum of the per-session
 /// `add_active_rows` shares (both run the same last-touch sweep).
 fn active_secs_total(data: &StatsData) -> u64 {
-    last_touch_attribution(&active_windows(data, GroupBy::Session, ActiveMode::Engaged))
+    last_touch_attribution(&active_windows(data, GroupBy::Session))
+        .active
         .values()
         .sum()
 }
 
-/// Grand-total `WORK_ACTIVE`: like [`active_secs_total`] but excluding scrollback
-/// ticks — hands-on work rather than watching.
+/// Grand-total `WORK_ACTIVE`: the subset of [`active_secs_total`] whose winning
+/// last-touch window is work-eligible (prompt, keypress, or thinking). Scrollback
+/// ticks still participate in ACT attribution, but their slices do not count as
+/// hands-on work.
 fn work_active_secs_total(data: &StatsData) -> u64 {
-    last_touch_attribution(&active_windows(data, GroupBy::Session, ActiveMode::Work))
+    last_touch_attribution(&active_windows(data, GroupBy::Session))
+        .work_active
         .values()
         .sum()
 }
@@ -1069,21 +1060,21 @@ fn add_active_rows(
     group_by: GroupBy,
     rows: &mut BTreeMap<String, GroupAccumulator>,
 ) {
-    for (key, secs) in last_touch_attribution(&active_windows(data, group_by, ActiveMode::Engaged))
-    {
+    for (key, secs) in last_touch_attribution(&active_windows(data, group_by)).active {
         if secs > 0 {
             rows.entry(key).or_default().active_secs += secs;
         }
     }
 }
 
-/// Per-group `WORK_ACTIVE`: as [`add_active_rows`] but excluding scrollback ticks.
+/// Per-group `WORK_ACTIVE`: the work-eligible subset of the same last-touch
+/// attribution used for ACT, so every row's WACT stays within that row's ACT.
 fn add_work_active_rows(
     data: &StatsData,
     group_by: GroupBy,
     rows: &mut BTreeMap<String, GroupAccumulator>,
 ) {
-    for (key, secs) in last_touch_attribution(&active_windows(data, group_by, ActiveMode::Work)) {
+    for (key, secs) in last_touch_attribution(&active_windows(data, group_by)).work_active {
         if secs > 0 {
             rows.entry(key).or_default().work_active_secs += secs;
         }
@@ -1094,10 +1085,17 @@ fn add_work_active_rows(
 /// covering window with the latest `anchor` ("last touch" — whatever the human
 /// most recently acted on). Recency uses the unclipped `anchor`, not the span
 /// start, so windows clamped to the same range boundary still rank correctly.
-/// Returns seconds per group key; the values sum to the union of all windows
-/// (each second counted once), so a grand total taken as `values().sum()` never
-/// exceeds elapsed time.
-fn last_touch_attribution(windows: &[ActiveWindow]) -> BTreeMap<String, u64> {
+/// Returns active and work-active seconds per group key; active values sum to
+/// the union of all windows (each second counted once), so a grand total taken
+/// as `values().sum()` never exceeds elapsed time. Work-active is a subset of
+/// that same attribution, which keeps WACT within ACT for every row.
+#[derive(Default)]
+struct ActiveAttribution {
+    active: BTreeMap<String, u64>,
+    work_active: BTreeMap<String, u64>,
+}
+
+fn last_touch_attribution(windows: &[ActiveWindow]) -> ActiveAttribution {
     // (time, is_end, window index). All events at a given instant are applied
     // before the following slice is measured, so a window ending exactly as
     // another starts hands off cleanly.
@@ -1112,7 +1110,7 @@ fn last_touch_attribution(windows: &[ActiveWindow]) -> BTreeMap<String, u64> {
 
     // Active windows as (anchor_nanos, index); the max element is the latest touch.
     let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
-    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    let mut out = ActiveAttribution::default();
     let mut i = 0;
     while i < events.len() {
         let t = events[i].0;
@@ -1130,7 +1128,14 @@ fn last_touch_attribution(windows: &[ActiveWindow]) -> BTreeMap<String, u64> {
             let secs = u64::try_from(events[i].0 - t).unwrap_or(0);
             if secs > 0 {
                 if let Some(&(_, idx)) = active.iter().next_back() {
-                    *out.entry(windows[idx].group_key.clone()).or_default() += secs;
+                    *out.active
+                        .entry(windows[idx].group_key.clone())
+                        .or_default() += secs;
+                    if windows[idx].work_eligible {
+                        *out.work_active
+                            .entry(windows[idx].group_key.clone())
+                            .or_default() += secs;
+                    }
                 }
             }
         }
@@ -1316,7 +1321,17 @@ fn has_session_foreground_ledger(data: &StatsData) -> bool {
         .any(|entry| matches!(entry, ActivityEntry::SessionForeground(_)))
 }
 
-fn human_presence_intervals(data: &StatsData, thinking_only: bool) -> Vec<ScopedInterval> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HumanPresenceMode {
+    /// Raw HUMAN: foreground plus muxa-recorded human intervals.
+    Human,
+    /// Presence strong enough to bound ACT/WACT padding.
+    Active,
+    /// Presence strong enough to count time spent resolving attention states.
+    Thinking,
+}
+
+fn human_presence_intervals(data: &StatsData, mode: HumanPresenceMode) -> Vec<ScopedInterval> {
     let mut intervals = Vec::new();
     for entry in &data.activity_entries {
         match entry {
@@ -1339,7 +1354,14 @@ fn human_presence_intervals(data: &StatsData, thinking_only: bool) -> Vec<Scoped
                 if entry.kind.is_input_tick() {
                     continue;
                 }
-                if thinking_only && !human_interaction_counts_for_thinking(entry.kind) {
+                if mode == HumanPresenceMode::Active
+                    && !human_interaction_counts_for_active(entry.kind)
+                {
+                    continue;
+                }
+                if mode == HumanPresenceMode::Thinking
+                    && !human_interaction_counts_for_thinking(entry.kind)
+                {
                     continue;
                 }
                 if let Some(interval) = scoped_interval(
@@ -1372,6 +1394,13 @@ fn human_presence_intervals(data: &StatsData, thinking_only: bool) -> Vec<Scoped
         }
     }
     intervals
+}
+
+fn human_interaction_counts_for_active(kind: HumanInteractionKind) -> bool {
+    matches!(
+        kind,
+        HumanInteractionKind::MuxaPromptInput | HumanInteractionKind::TmuxAttach
+    )
 }
 
 fn human_interaction_counts_for_thinking(kind: HumanInteractionKind) -> bool {
@@ -1434,6 +1463,7 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
             intervals.push(AttentionInterval {
                 interval,
                 group_key: state_transition_group_key(data, entry, group_by),
+                work_eligible: true,
                 anchor,
             });
         }
@@ -1459,6 +1489,7 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
             intervals.push(AttentionInterval {
                 interval,
                 group_key: agent_group_key(data, agent, group_by),
+                work_eligible: true,
                 anchor,
             });
         }
@@ -1467,7 +1498,7 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
 }
 
 fn thinking_secs_total(data: &StatsData) -> u64 {
-    let presences = human_presence_intervals(data, true);
+    let presences = human_presence_intervals(data, HumanPresenceMode::Thinking);
     let mut segments = Vec::new();
     for attention in attention_intervals(data, GroupBy::Session) {
         segments.extend(overlapping_presence_segments(
@@ -1695,10 +1726,14 @@ fn notes(data: &StatsData) -> Vec<String> {
         "THINK is the overlap of attention states (WaitingInput, WaitingChoice, Error) with human presence (tmux foreground, prompt input, or tmux attach).".to_string(),
     );
     notes.push(format!(
-        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded {lookback}s before / {timeout}s after for (a) and (b), and (c) thinking (present while an agent is blocked on you). Prompt/input windows are clipped to matching HUMAN presence, so padding cannot outlive observed foreground/interaction time. Overlapping windows across concurrent sessions are de-duplicated (last touch), so per-row ACTIVE sums to the total. An idle attach advances none of these, so ACTIVE discounts it.",
+        "ACTIVE estimates engaged human time: the union of (a) windows around each submitted prompt, padded {lookback}s before / {prompt_timeout}s after, (b) tmux input ticks recorded when a client's activity advances (keypress/scroll, so reading counts too), padded {lookback}s before / {tick_timeout}s after, and (c) thinking (present while an agent is blocked on you). Prompt/input windows are clipped to matching active presence (tmux foreground, prompt input, or tmux attach; plain muxa_watch does not extend ACT), so padding cannot outlive observed foreground/interaction time. Overlapping windows across concurrent sessions are de-duplicated (last touch), so per-row ACTIVE sums to the total. An idle attach advances none of these, so ACTIVE discounts it.",
         lookback = data.active_lookback.whole_seconds().max(0),
-        timeout = data.active_timeout.whole_seconds().max(0),
+        prompt_timeout = data.active_timeout.whole_seconds().max(0),
+        tick_timeout = data.active_tick_timeout.whole_seconds().max(0),
     ));
+    notes.push(
+        "WACT is the hands-on subset of ACT: the same last-touch owner is used, but seconds owned by scrollback-only windows are excluded, so each row's WACT stays within its ACT.".to_string(),
+    );
     notes
 }
 
@@ -2581,6 +2616,61 @@ mod tests {
     }
 
     #[test]
+    fn work_active_is_subset_of_same_last_touch_active_attribution() {
+        let mut prompt_a = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/a"),
+            "do a thing",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        prompt_a.tmux_session = Some("A".into());
+        let mut d = data(vec![prompt_a]);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.activity_entries = vec![
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$a",
+                "A",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$b",
+                "B",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::TmuxScroll,
+                pane: None,
+                session_id: Some("$b".into()),
+                session_name: Some("B".into()),
+                started_at: datetime!(2026-05-30 10:30:59 UTC),
+                ended_at: datetime!(2026-05-30 10:31:00 UTC),
+            })),
+        ];
+
+        let totals = build_totals(&d);
+        assert_eq!(totals.active_secs, 420);
+        assert_eq!(totals.work_active_secs, 59);
+
+        let rows = build_rows(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let row = |key: &str| rows.iter().find(|r| r.key == key).unwrap();
+        assert_eq!(row("A").active_secs, 59);
+        assert_eq!(row("A").work_active_secs, 59);
+        assert_eq!(row("B").active_secs, 361);
+        assert_eq!(row("B").work_active_secs, 0);
+        assert!(rows
+            .iter()
+            .all(|row| row.work_active_secs <= row.active_secs));
+    }
+
+    #[test]
     fn active_tick_uses_shorter_timeout_than_prompts() {
         // With a 90s tick timeout, the same keypress tick's window shrinks from
         // [10:28:59, 10:35:00] (361s) to [10:28:59, 10:31:30] (151s) — sparse
@@ -2655,6 +2745,41 @@ mod tests {
 
         assert_eq!(totals.human_secs, 0);
         assert_eq!(totals.active_secs, 0);
+    }
+
+    #[test]
+    fn active_omits_prompt_padding_with_watch_only_presence() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "do a thing",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        p.tmux_session = Some("main".into());
+        let mut d = data(vec![p]);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.activity_entries = vec![ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+            HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaWatch,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-05-30 10:00:00 UTC),
+                ended_at: datetime!(2026-05-30 12:00:00 UTC),
+            },
+        ))];
+
+        let totals = build_totals(&d);
+
+        assert_eq!(totals.human_secs, 7_200);
+        assert_eq!(totals.active_secs, 0);
+        assert_eq!(totals.work_active_secs, 0);
     }
 
     #[test]

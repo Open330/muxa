@@ -54,11 +54,18 @@ totals에서 모두 제외할 수 있습니다. 값은 반복하거나 comma-sep
 `ACTIVE`(`ACT` column, JSON의 `active` / `active_secs`)는 실제로 몰입해
 다룬 human time 추정값입니다. submitted prompt 주변 window, tmux input tick
 (keypress/scroll), agent가 human 답변을 기다리는 동안의 thinking time을
-합칩니다. 다만 prompt/input padding은 같은 session/pane의 `HUMAN` presence
-(tmux foreground, prompt input, attach 등)와 겹치는 구간으로 자릅니다. 그래서
-padding 때문에 한 session의 `ACT`가 관측된 foreground/interaction 시간을
-넘어가지 않습니다. 여러 session의 window가 겹치면 가장 최근 touch session에
-귀속해서 중복 집계하지 않습니다.
+합칩니다. 다만 prompt/input padding은 같은 session/pane의 active presence
+(tmux foreground, prompt input, tmux attach)와 겹치는 구간으로 자릅니다.
+단순히 열려 있는 `muxa watch` interval은 `HUMAN`에는 들어가지만 `ACT`를
+늘리는 presence로 쓰지 않습니다. 그래서 padding 때문에 한 session의 `ACT`가
+관측된 foreground/interaction 시간을 넘어가지 않습니다. 여러 session의 window가
+겹치면 가장 최근 touch session에 귀속해서 중복 집계하지 않습니다.
+
+`WACT`(JSON의 `work_active` / `work_active_secs`)는 `ACT`의 hands-on subset입니다.
+같은 last-touch attribution을 쓰되, 해당 초를 소유한 window가 prompt, keypress,
+thinking에서 온 경우에만 셉니다. scrollback tick은 engaged `ACT`에는 들어갈 수
+있지만 `WACT`에는 들어가지 않으므로 각 row의 `WACT`는 해당 row의 `ACT`를
+넘지 않습니다.
 
 표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
 `--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.
@@ -111,6 +118,8 @@ TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
 | `TMUX` | interactive tmux client 에서 해당 session 이 foreground였던 시간. |
 | `HUMAN` | tmux foreground 시간과 muxa human interaction interval 의 union. |
 | `THINK` | attention 상태와 human presence 가 겹친 시간. |
+| `ACT` | prompt, tmux input tick, thinking으로 추정한 engaged human time. |
+| `WACT` | `ACT`의 hands-on subset. scrollback이 소유한 engaged time은 제외합니다. |
 | `BLOCK` | Waiting/Error attention 상태로 진입한 횟수. |
 
 `THINK`는 `HUMAN`보다 의도적으로 좁습니다. agent 가 attention 을 필요로 하는

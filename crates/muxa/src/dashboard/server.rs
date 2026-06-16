@@ -370,6 +370,7 @@ async fn timeline_handler(
         pane_sessions: &pane_sessions,
         active_lookback_secs: state.stats_config.active_lookback_secs,
         active_timeout_secs: state.stats_config.active_timeout_secs,
+        active_tick_timeout_secs: state.stats_config.active_tick_timeout_secs,
         filters: TimelineFilters {
             session: query.session,
             agent_kind,

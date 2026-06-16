@@ -154,7 +154,8 @@ foreground lanes shown under the same session header.
 The overview's `act` metric follows the same meaning as `muxa stats ACT`:
 engaged human time estimated from submitted prompts, tmux input ticks, and
 time spent present while agents are waiting for a human answer. Prompt/input
-padding is clipped to matching human presence. The `human` metric follows
+padding is clipped to active presence (tmux foreground, prompt input, or tmux
+attach; not a plain open `muxa watch` interval). The `human` metric follows
 `muxa stats HUMAN`: the union of tmux foreground time and muxa-recorded human
 interaction intervals. Timeline lanes still show raw human-interaction spans
 separately as `interaction`.
