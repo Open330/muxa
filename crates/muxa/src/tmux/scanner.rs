@@ -86,7 +86,36 @@ pub struct ScanResult {
 /// so we deduplicate by canonical path). Each entry must be a Unix
 /// socket; regular files and subdirectories are filtered out.
 pub fn enumerate_sockets() -> Vec<PathBuf> {
-    enumerate_sockets_in(&default_socket_dirs())
+    let mut socks = enumerate_sockets_in(&default_socket_dirs());
+    // Drop dead socket files before any caller spawns a `tmux -S <sock>`
+    // against them. tmux only unlinks a server's *own* socket on a clean
+    // shutdown, so a server killed abnormally (test timeout, SIGKILL,
+    // parent shell dying) leaves an orphan file behind, and tmux has no
+    // sweep for other servers' sockets. On a host without a working /tmp
+    // reaper (e.g. a container where systemd-tmpfiles never runs) these
+    // accumulate without bound — hundreds were observed in the wild. The
+    // old code paid a full `tmux` process spawn per orphan on every scan
+    // (≈2 ms each → ~0.5 s for a few hundred), which surfaced as a visibly
+    // late first paint in `muxa watch`. A connect() refuses instantly on a
+    // dead socket, so we keep the per-socket cost at one cheap syscall and
+    // only spawn tmux for sockets that actually have a server.
+    socks.retain(|p| socket_is_live(p));
+    socks
+}
+
+/// Best-effort liveness probe for a tmux socket file. A live server is
+/// accepting on its socket, so `connect()` succeeds; an orphaned socket file
+/// (server gone) refuses immediately with `ECONNREFUSED` — no blocking, no
+/// process spawn. We treat *only* "refused" and "not found" as dead; any other
+/// error (e.g. permission denied) keeps the socket so we never hide one we
+/// merely failed to probe — the worst case there is the old per-socket cost
+/// for that single file.
+fn socket_is_live(path: &Path) -> bool {
+    use std::io::ErrorKind;
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => true,
+        Err(e) => !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
+    }
 }
 
 fn default_socket_dirs() -> Vec<PathBuf> {
@@ -384,6 +413,29 @@ mod tests {
         ];
         let found = enumerate_sockets_in(&dirs);
         assert_eq!(found, vec![sock]);
+    }
+
+    #[test]
+    fn socket_is_live_distinguishes_listening_from_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Live: a bound listener accepts, so connect() succeeds.
+        let live = dir.path().join("live");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(socket_is_live(&live));
+
+        // Orphan: bind then drop the listener. std's UnixListener does not
+        // unlink on drop, so the socket file persists with no one listening —
+        // exactly the stale-tmux-socket shape — and connect() must refuse.
+        let dead = dir.path().join("dead");
+        {
+            let _tmp = std::os::unix::net::UnixListener::bind(&dead).unwrap();
+        }
+        assert!(dead.exists(), "socket file should outlive its listener");
+        assert!(!socket_is_live(&dead));
+
+        // Missing file → dead.
+        assert!(!socket_is_live(&dir.path().join("does-not-exist")));
     }
 
     #[test]
