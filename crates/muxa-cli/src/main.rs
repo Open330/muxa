@@ -2,6 +2,7 @@
 
 mod activity_query;
 mod attend;
+mod dashboard_tui;
 mod doctor;
 mod init;
 mod logs;
@@ -92,6 +93,8 @@ enum Cmd {
     Report(stats::ReportArgs),
     /// Explore agent work/wait/error intervals as an interactive timeline.
     Timeline(timeline::Args),
+    /// Session-card TUI console for inspecting and operating agents.
+    Dashboard(dashboard_tui::Args),
     /// Query raw activity ledger intervals.
     Activity(activity_query::Args),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
@@ -293,6 +296,7 @@ async fn main() -> Result<()> {
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
+        Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
         Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => {
@@ -668,6 +672,29 @@ async fn cmd_watch(
     .await?
     {
         jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
+    }
+    Ok(())
+}
+
+async fn cmd_dashboard(client: &Client, cfg: &Config, args: dashboard_tui::Args) -> Result<()> {
+    let activity_path = cfg
+        .activity
+        .enabled
+        .then(|| {
+            cfg.activity
+                .path
+                .clone()
+                .or_else(paths::default_activity_file)
+        })
+        .flatten();
+    match dashboard_tui::run(client, cfg, args).await? {
+        Some(dashboard_tui::OpenTarget::Pane(pane_id)) => {
+            jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
+        }
+        Some(dashboard_tui::OpenTarget::PtySession(session_id)) => {
+            attach_session(client, &session_id).await?;
+        }
+        None => {}
     }
     Ok(())
 }

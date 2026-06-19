@@ -39,6 +39,7 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
 | `muxa watch` | agent/pane 실시간 TUI. attach, prompt composer, live preview 포함. |
+| `muxa dashboard` | attach 없이 pane을 확인하고 prompt를 보내는 session-card TUI console. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
@@ -81,6 +82,7 @@ muxa watch
 | --- | --- |
 | `muxa status` | 추적 중인 agent 테이블. |
 | `muxa watch [--view pane\|session]` | live TUI picker/dashboard. |
+| `muxa dashboard [--since today]` | live capture, prompt composer, abort/terminate action, ACT/WACT total을 보여주는 session-card TUI console. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
@@ -134,6 +136,7 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 | --- | --- |
 | 설치와 wiring | [docs/INSTALL.ko.md](docs/INSTALL.ko.md) |
 | Live TUI와 prompt composer | [docs/WATCH.ko.md](docs/WATCH.ko.md) |
+| CLI dashboard | [docs/DASHBOARD_CLI.ko.md](docs/DASHBOARD_CLI.ko.md) |
 | Stats, report, activity ledger | [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md) |
 | Timeline TUI와 dashboard graph | [docs/TIMELINE.ko.md](docs/TIMELINE.ko.md) |
 | 설정 레퍼런스 | [docs/CONFIGURATION.ko.md](docs/CONFIGURATION.ko.md) |
