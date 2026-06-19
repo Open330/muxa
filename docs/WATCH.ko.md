@@ -3,6 +3,10 @@
 `muxa watch`는 주요 interactive surface입니다. 추적 중인 agent와 일반 tmux
 pane을 보여주고, pane attach, live preview, prompt composer를 제공합니다.
 
+TUI 안에 머문 채 prompt 전송, turn abort, live capture 확인까지 하는
+session-card console이 필요하면 [`muxa dashboard`](DASHBOARD_CLI.ko.md)를
+사용하세요.
+
 ## 실행
 
 ```bash

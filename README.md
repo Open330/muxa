@@ -40,6 +40,7 @@ backend; zellij has a CLI baseline and a planned richer plugin path.
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
 | `muxa watch` | Full-screen TUI for agents and panes, with attach, prompt composition, and live previews. |
+| `muxa dashboard` | Session-card TUI console for inspecting panes and sending prompts without attaching. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
@@ -82,6 +83,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | --- | --- |
 | `muxa status` | Human-readable table of tracked agents. |
 | `muxa watch [--view pane\|session]` | Live TUI picker/dashboard. |
+| `muxa dashboard [--since today]` | Session-card TUI console with live capture, prompt composer, abort/terminate actions, and ACT/WACT totals. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
@@ -138,6 +140,7 @@ Patterns are case-sensitive and support `*` and `?`, e.g.
 | --- | --- |
 | Install and wiring | [docs/INSTALL.md](docs/INSTALL.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |
+| CLI dashboard | [docs/DASHBOARD_CLI.md](docs/DASHBOARD_CLI.md) |
 | Stats, reports, activity ledger | [docs/ACTIVITY.md](docs/ACTIVITY.md) |
 | Timeline TUI and dashboard graph | [docs/TIMELINE.md](docs/TIMELINE.md) |
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |

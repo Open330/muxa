@@ -4,6 +4,10 @@
 plain tmux panes, lets you jump to panes, and can compose prompts directly
 from the picker.
 
+For the session-card console that keeps you inside the TUI while sending
+prompts, aborting turns, and inspecting live captures, use
+[`muxa dashboard`](DASHBOARD_CLI.md).
+
 ## Open
 
 ```bash

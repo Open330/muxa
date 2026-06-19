@@ -816,7 +816,7 @@ pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
 }
 
 /// Client-side helper. Single-shot request/response.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
 }

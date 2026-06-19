@@ -346,6 +346,18 @@ struct GroupAccumulator {
     last_prompt_at: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActiveDuration {
+    pub active_secs: u64,
+    pub work_active_secs: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionActiveStats {
+    pub totals: ActiveDuration,
+    pub by_session: BTreeMap<String, ActiveDuration>,
+}
+
 #[derive(Debug, Clone)]
 struct ScopedInterval {
     started_at: OffsetDateTime,
@@ -427,6 +439,34 @@ async fn load_data(
     };
     apply_exclusions(&mut data, exclusions);
     Ok(data)
+}
+
+pub(crate) async fn session_active_stats(
+    client: &Client,
+    cfg: &Config,
+    since: &str,
+    exclusions: &ScopeExclusions,
+) -> Result<SessionActiveStats> {
+    let data = load_data(client, cfg, since, exclusions).await?;
+    let attribution = last_touch_attribution(&active_windows(&data, GroupBy::Session));
+    let mut by_session = BTreeMap::<String, ActiveDuration>::new();
+
+    for (session, secs) in attribution.active {
+        by_session.entry(session).or_default().active_secs = secs;
+    }
+    for (session, secs) in attribution.work_active {
+        by_session.entry(session).or_default().work_active_secs = secs;
+    }
+
+    let totals = by_session
+        .values()
+        .fold(ActiveDuration::default(), |mut total, row| {
+            total.active_secs = total.active_secs.saturating_add(row.active_secs);
+            total.work_active_secs = total.work_active_secs.saturating_add(row.work_active_secs);
+            total
+        });
+
+    Ok(SessionActiveStats { totals, by_session })
 }
 
 /// Convert a config `u64` seconds value into a `time::Duration`, clamping the
