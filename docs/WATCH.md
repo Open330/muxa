@@ -66,18 +66,20 @@ Columns are configured under `[watch]`:
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
+columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
 
 [watch.widths]
 prompt = "min:20"
-workload = 14
-activity = 5
+workload = 8
+activity = 6
 ```
 
 Available column keys include `pane`, `state`, `kind`, `model`, `ctx`,
 `cost`, `limits`, `workload`, `prompt`, `activity`, and `session_time`.
-`workload` summarizes child shell/subagent work under the pane's primary
-agent, for example `sh:1 p:1`.
+By default, child shell/subagent work is shown only on the selected row's
+detail line as `tree ◇1 ▸1 +2`. Add `workload` to `columns` to render the
+always-visible `TREE` column. `◇` means subagent, `▸` means shell, and `+`
+means other visible process.
 
 ## Sort
 
@@ -108,6 +110,9 @@ template = "{last_response || last_prompt || last_notification}"
 Available variables include `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
 `activity`, `workload`, `last_prompt`, `last_response`, `last_notification`,
 and `cwd`.
+
+When visible workload exists, the selected row uses the detail line for
+`tree ...` in the session/name column before falling back to the template.
 
 Long detail content is truncated for the table. Use preview mode for pane
 captures or prompt/response text when you need more context.

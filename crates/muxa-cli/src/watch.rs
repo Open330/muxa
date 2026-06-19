@@ -418,7 +418,7 @@ impl WatchColumn {
             Self::Ctx => "CTX%",
             Self::Cost => "COST$",
             Self::Limits => "LIMITS",
-            Self::Workload => "WORK",
+            Self::Workload => "TREE",
             Self::Prompt => "LAST PROMPT",
             Self::Activity => "ACT",
             Self::SessionTime => "DUR",
@@ -434,16 +434,16 @@ impl WatchColumn {
             // available in detail placeholders and structured snapshots.
             Self::State => Constraint::Length(3),
             Self::Model => Constraint::Length(16),
-            Self::Ctx | Self::Activity => Constraint::Length(5),
+            Self::Ctx => Constraint::Length(5),
+            Self::Activity | Self::SessionTime => Constraint::Length(6),
             Self::Cost => Constraint::Length(7),
             // LIMITS — widest realistic payload is `⛔ 7d in 23h 59m`
             // (~17 cells with a wide-cell emoji). Wider columns crowd the
             // prompt; narrower ones clip the duration suffix on
             // emoji-greedy fonts.
             Self::Limits => Constraint::Length(18),
-            Self::Workload => Constraint::Length(14),
+            Self::Workload => Constraint::Length(8),
             Self::Prompt => Constraint::Min(20),
-            Self::SessionTime => Constraint::Length(6),
         }
     }
 
@@ -579,9 +579,9 @@ impl WatchColumn {
             | Self::Ctx
             | Self::Cost
             | Self::Limits
-            | Self::Workload
             | Self::Prompt
             | Self::Activity => self.agent_text(agent, now, panes, theme),
+            Self::Workload => session_workload_text(s),
             Self::SessionTime => session_time_text(s, now),
         }
     }
@@ -1118,6 +1118,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
                 "  * working  > input  ? choice  ! error  o idle  ~ starting  x stopped"
             }
         },
+        "  TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden",
         "",
         "Quick actions (act on selected row)",
         "  c              copy last prompt to clipboard",
@@ -1408,7 +1409,6 @@ impl App {
                     WatchColumn::Pane,
                     WatchColumn::State,
                     WatchColumn::Activity,
-                    WatchColumn::Workload,
                     WatchColumn::Prompt,
                 ]
             {
@@ -1416,7 +1416,6 @@ impl App {
                     WatchColumn::Pane,
                     WatchColumn::SessionTime,
                     WatchColumn::Activity,
-                    WatchColumn::Workload,
                     WatchColumn::Prompt,
                 ];
             } else {
@@ -4187,6 +4186,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let now = OffsetDateTime::now_utc();
     let selected = app.table_state.selected();
     let detail_host = detail_host_column(&app.columns);
+    let status_host = status_host_column(&app.columns);
     let rows: Vec<Row> = app
         .rows
         .iter()
@@ -4208,7 +4208,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 
             let mut expanded = false;
             if Some(i) == selected && app.watch_cfg.detail.enabled {
-                if let Some(host) = detail_host {
+                if let Some(workload) = row_workload_badge(r) {
+                    if let Some(host) = status_host {
+                        let detail = format!("tree {workload}");
+                        texts[host] = stack_detail(std::mem::take(&mut texts[host]), &detail);
+                        expanded = true;
+                    }
+                } else if let Some(host) = detail_host {
                     if let Some(detail) =
                         format_detail(&app.watch_cfg.detail.template, r, &app.panes, now)
                     {
@@ -4263,6 +4269,15 @@ fn detail_host_column(cols: &[WatchColumn]) -> Option<usize> {
     cols.iter()
         .position(|c| matches!(c, WatchColumn::Prompt))
         .or(Some(cols.len() - 1))
+}
+
+fn status_host_column(cols: &[WatchColumn]) -> Option<usize> {
+    if cols.is_empty() {
+        return None;
+    }
+    cols.iter()
+        .position(|c| matches!(c, WatchColumn::Pane))
+        .or(Some(0))
 }
 
 /// Stack a dim "↳ detail" hint underneath `top` so the host cell renders
@@ -4491,7 +4506,7 @@ fn resolve_var_chain(
 }
 
 fn workload_text(a: &Agent) -> Text<'static> {
-    let label = workload_cell_string(a);
+    let label = agent_workload_badge(a).unwrap_or_else(|| "-".into());
     if label == "-" {
         return Text::from(Span::styled(
             "-",
@@ -4503,29 +4518,83 @@ fn workload_text(a: &Agent) -> Text<'static> {
     Text::from(Span::styled(label, Style::default().fg(Color::Cyan)))
 }
 
-fn workload_cell_string(a: &Agent) -> String {
-    let w = &a.workload;
-    if w.visible_count() == 0 {
-        return "-".into();
+fn session_workload_text(s: &SessionRow) -> Text<'static> {
+    let label = session_workload_badge(s).unwrap_or_else(|| "-".into());
+    if label == "-" {
+        return Text::from(Span::styled(
+            "-",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
     }
+    Text::from(Span::styled(label, Style::default().fg(Color::Cyan)))
+}
+
+fn row_workload_badge(row: &WatchRow) -> Option<String> {
+    match row {
+        WatchRow::Agent(a) => agent_workload_badge(a),
+        WatchRow::Session(s) => session_workload_badge(s),
+        WatchRow::BarePane(_) => None,
+    }
+}
+
+fn agent_workload_badge(a: &Agent) -> Option<String> {
     let mut parts = Vec::new();
-    if w.subagent_count > 0 {
-        parts.push(format!("sub:{}", w.subagent_count));
-    }
-    if w.shell_count > 0 {
-        parts.push(format!("sh:{}", w.shell_count));
-    }
-    let other = w
-        .process_count
-        .saturating_sub(w.subagent_count)
-        .saturating_sub(w.shell_count);
-    if other > 0 {
-        parts.push(format!("p:{other}"));
-    }
+    push_workload_parts(
+        &mut parts,
+        u32::from(a.workload.subagent_count),
+        u32::from(a.workload.shell_count),
+        workload_other_count(
+            u32::from(a.workload.process_count),
+            u32::from(a.workload.subagent_count),
+            u32::from(a.workload.shell_count),
+        ),
+    );
     if parts.is_empty() {
-        "-".into()
+        None
     } else {
-        parts.join(" ")
+        Some(parts.join(" "))
+    }
+}
+
+fn session_workload_badge(s: &SessionRow) -> Option<String> {
+    let (subagents, shells, other) = s.agents.iter().fold((0u32, 0u32, 0u32), |acc, a| {
+        (
+            acc.0 + u32::from(a.workload.subagent_count),
+            acc.1 + u32::from(a.workload.shell_count),
+            acc.2
+                + workload_other_count(
+                    u32::from(a.workload.process_count),
+                    u32::from(a.workload.subagent_count),
+                    u32::from(a.workload.shell_count),
+                ),
+        )
+    });
+    let mut parts = Vec::new();
+    push_workload_parts(&mut parts, subagents, shells, other);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn workload_other_count(process_count: u32, subagent_count: u32, shell_count: u32) -> u32 {
+    process_count
+        .saturating_sub(subagent_count)
+        .saturating_sub(shell_count)
+}
+
+fn push_workload_parts(parts: &mut Vec<String>, subagent_count: u32, shell_count: u32, other: u32) {
+    if subagent_count > 0 {
+        parts.push(format!("◇{subagent_count}"));
+    }
+    if shell_count > 0 {
+        parts.push(format!("▸{shell_count}"));
+    }
+    if other > 0 {
+        parts.push(format!("+{other}"));
     }
 }
 
@@ -4983,7 +5052,7 @@ mod tests {
             ],
         };
 
-        assert_eq!(workload_cell_string(&agent), "sh:1 p:1");
+        assert_eq!(agent_workload_badge(&agent).as_deref(), Some("▸1 +1"));
         assert_eq!(
             workload_detail_string(&agent),
             "shell:1 · process:1 · helper:1 · zsh(sh) -> python3"
@@ -5011,7 +5080,7 @@ mod tests {
             preview: Vec::new(),
         };
 
-        assert_eq!(workload_cell_string(&agent), "-");
+        assert_eq!(agent_workload_badge(&agent), None);
         assert_eq!(workload_detail_string(&agent), "helper:1");
     }
 
@@ -5655,7 +5724,6 @@ mod tests {
                 WatchColumn::Pane,
                 WatchColumn::SessionTime,
                 WatchColumn::Activity,
-                WatchColumn::Workload,
                 WatchColumn::Prompt,
             ]
         );
@@ -6300,7 +6368,6 @@ sort = ["state"]
                 WatchColumn::Pane,
                 WatchColumn::State,
                 WatchColumn::Activity,
-                WatchColumn::Workload,
                 WatchColumn::Prompt,
             ]
         );
@@ -6952,6 +7019,48 @@ sort = ["state"]
             .collect();
         // The ↳ marker is unique to the detail line.
         assert!(text.contains("↳"), "expected detail marker in render");
+    }
+
+    #[test]
+    fn selected_row_prefers_tree_detail_when_workload_is_visible() {
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        let mut agent = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("prompt"),
+            None,
+            None,
+            None,
+        );
+        agent.last_response = Some("assistant detail should be hidden".into());
+        agent.workload = muxa::WorkloadSummary {
+            primary_pid: Some(20),
+            process_count: 2,
+            shell_count: 1,
+            subagent_count: 0,
+            helper_count: 0,
+            preview: Vec::new(),
+        };
+        app.set_data(vec![agent], vec![]);
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(text.contains("↳ tree ▸1 +1"), "missing tree detail: {text}");
+        assert!(
+            !text.contains("assistant detail should be hidden"),
+            "tree detail should replace prompt/response detail when workload is visible"
+        );
     }
 
     #[test]
@@ -9298,6 +9407,7 @@ sort = ["state"]
                         \n\
                         State markers\n\
                         \x20\x20● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped\n\
+                        \x20\x20TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden\n\
                         \n\
                         Quick actions (act on selected row)\n\
                         \x20\x20c              copy last prompt to clipboard\n\
@@ -9663,11 +9773,17 @@ sort = ["state"]
                     // variable-length (2-4 chars) so without this the
                     // column-trailing whitespace would drift across runs
                     // as the value crosses the 60s / 60m / 48h boundaries.
+                    // Keep one separator so adjacent columns still read like
+                    // the production table after normalization.
                     i += 1;
+                    let space_start = i;
                     while i < bytes.len() && bytes[i] == b' ' {
                         i += 1;
                     }
                     out.push_str("<rel>");
+                    if i > space_start {
+                        out.push(' ');
+                    }
                 } else {
                     // Not a relative-time token — copy the digit run and the
                     // following char (if any) verbatim.

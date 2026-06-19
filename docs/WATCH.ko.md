@@ -65,18 +65,20 @@ bind-key s display-popup -E -w 90% -h 80% "muxa watch"
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
+columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
 
 [watch.widths]
 prompt = "min:20"
-workload = 14
-activity = 5
+workload = 8
+activity = 6
 ```
 
 사용 가능한 column key: `pane`, `state`, `kind`, `model`, `ctx`, `cost`,
 `limits`, `workload`, `prompt`, `activity`, `session_time`.
-`workload`는 pane의 primary agent 아래에서 실행 중인 child shell/subagent
-작업을 `sh:1 p:1` 같은 형태로 요약합니다.
+기본값에서는 child shell/subagent 작업이 선택된 row의 detail line에만
+`tree ◇1 ▸1 +2`처럼 표시됩니다. `workload`를 `columns`에 추가하면 항상 보이는
+`TREE` 컬럼으로 렌더링합니다. `◇`는 subagent, `▸`는 shell, `+`는 기타 표시 대상
+process를 의미합니다.
 
 ## Sort
 
@@ -106,6 +108,9 @@ template = "{last_response || last_prompt || last_notification}"
 
 사용 가능한 변수: `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`,
 `workload`, `last_prompt`, `last_response`, `last_notification`, `cwd`.
+
+표시 가능한 workload가 있으면 선택 row의 detail line은 template보다 먼저
+session/name 컬럼에 `tree ...`를 보여줍니다.
 
 긴 detail 내용은 table에 맞게 잘립니다. 더 많은 맥락이 필요하면 preview를
 사용하세요.

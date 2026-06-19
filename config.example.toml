@@ -81,8 +81,8 @@
 #   RUST_LOG=muxa=debug,tokio=warn muxad
 # Default when unset: "muxa=info".
 
-# `muxa watch` TUI columns. Default leads with the last prompt; uncomment
-# to opt back into model / ctx / cost or to reorder.
+# `muxa watch` TUI columns. Default keeps the table prompt-forward; uncomment
+# to opt back into model / ctx / cost, always-visible workload, or to reorder.
 #
 # Valid column keys: pane, kind, state, model, ctx, cost, limits, workload,
 # prompt, activity, session_time.
@@ -134,14 +134,14 @@
 # [watch.widths]
 # pane     = 22
 # state    = 3
-# workload = 14
+# workload = 8
 # prompt   = "min:20"
-# activity = 5
+# activity = 6
 # session_time = 6
 
-# Selected-row detail: a dim "↳ <text>" line rendered under whatever row
-# is currently highlighted. Useful for glancing at the agent's last
-# response while it's in WaitingInput state without attaching to the pane.
+# Selected-row detail: a dim "↳ <text>" line rendered under the highlighted
+# row. Visible child shell/subagent work is shown as `tree ◇1 ▸1 +2` in the
+# session/name column; otherwise this falls back to the template below.
 #
 # Default `template = "{last_response|last_prompt}"` — pipe-separated
 # alternatives resolve left-to-right and pick the first non-dash value.

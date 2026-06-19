@@ -970,10 +970,12 @@ pub enum WatchSortKey {
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        // Pane-view defaults: NAME / ST / ACT / WORK / LAST PROMPT — lead
-        // with identity, then state/activity, then any child shell/subagent
-        // workload, with the variable-width prompt last so it can absorb
-        // the remaining width. Session view
+        // Pane-view defaults: NAME / ST / ACT / LAST PROMPT — lead with
+        // identity, then state/activity, with the variable-width prompt last
+        // so it can absorb the remaining width. Child shell/subagent workload
+        // is shown in the selected row's detail line by default; users can
+        // opt back into an always-visible `workload` column if they prefer.
+        // Session view
         // folds state counts into the SESSION label and swaps ST for DUR
         // at render setup time. Users who care about model/ctx/cost can
         // opt back in via config.
@@ -981,15 +983,14 @@ impl Default for WatchConfig {
             "pane".to_string(),
             "state".to_string(),
             "activity".to_string(),
-            "workload".to_string(),
             "prompt".to_string(),
         ];
         let mut widths = HashMap::new();
         widths.insert("pane".to_string(), WidthSpec::Length(22));
         widths.insert("state".to_string(), WidthSpec::Length(3));
         widths.insert("prompt".to_string(), WidthSpec::Min(20));
-        widths.insert("activity".to_string(), WidthSpec::Length(5));
-        widths.insert("workload".to_string(), WidthSpec::Length(14));
+        widths.insert("activity".to_string(), WidthSpec::Length(6));
+        widths.insert("workload".to_string(), WidthSpec::Length(8));
         widths.insert("session_time".to_string(), WidthSpec::Length(6));
         Self {
             theme: None,
@@ -1158,10 +1159,7 @@ mod tests {
     fn watch_default_is_prompt_forward() {
         let cfg = WatchConfig::default();
         assert_eq!(cfg.theme, None);
-        assert_eq!(
-            cfg.columns,
-            vec!["pane", "state", "activity", "workload", "prompt"]
-        );
+        assert_eq!(cfg.columns, vec!["pane", "state", "activity", "prompt"]);
         assert!(matches!(
             cfg.widths.get("pane"),
             Some(WidthSpec::Length(22))
@@ -1173,11 +1171,11 @@ mod tests {
         assert!(matches!(cfg.widths.get("prompt"), Some(WidthSpec::Min(20))));
         assert!(matches!(
             cfg.widths.get("activity"),
-            Some(WidthSpec::Length(5))
+            Some(WidthSpec::Length(6))
         ));
         assert!(matches!(
             cfg.widths.get("workload"),
-            Some(WidthSpec::Length(14))
+            Some(WidthSpec::Length(8))
         ));
     }
 

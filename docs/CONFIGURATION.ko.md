@@ -54,14 +54,14 @@ compatibility source이자 stats fallback으로 사용됩니다.
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
+columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
 sort = ["session", "latest"]
 hide_paneless = true
 
 [watch.widths]
 prompt = "min:20"
-workload = 14
-activity = 5
+workload = 8
+activity = 6
 
 [watch.detail]
 enabled = true
