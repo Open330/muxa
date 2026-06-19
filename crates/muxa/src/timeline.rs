@@ -2214,6 +2214,7 @@ mod tests {
             surface: None,
             pane: Some("%1".into()),
             pid: None,
+            workload: crate::WorkloadSummary::default(),
             cwd: None,
             state,
             last_prompt: None,

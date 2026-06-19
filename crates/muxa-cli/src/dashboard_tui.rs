@@ -3345,6 +3345,7 @@ mod tests {
             pane: pane.map(str::to_string),
             cwd: Some("/tmp/project".into()),
             pid: None,
+            workload: muxa::WorkloadSummary::default(),
             state,
             last_prompt: prompt.map(str::to_string),
             last_response: None,

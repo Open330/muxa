@@ -150,6 +150,7 @@ mod tests {
             surface: None,
             pane: Some("%7".into()),
             pid: None,
+            workload: crate::WorkloadSummary::default(),
             cwd: None,
             state,
             last_prompt: Some("refactor the ipc module to use tokio io_uring".into()),

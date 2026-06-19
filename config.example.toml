@@ -84,14 +84,14 @@
 # `muxa watch` TUI columns. Default leads with the last prompt; uncomment
 # to opt back into model / ctx / cost or to reorder.
 #
-# Valid column keys: pane, kind, state, model, ctx, cost, limits, prompt,
-# activity, session_time.
+# Valid column keys: pane, kind, state, model, ctx, cost, limits, workload,
+# prompt, activity, session_time.
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
 # theme = "classic"   # optional watch-only override for [ui].theme
 # view = "session"    # one row per tmux session; panes merge by latest activity (default)
 # view = "pane"       # one row per agent/pane
-# columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+# columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because picker actions
 # can't target them anyway; the footer surfaces a `+N paneless` count so
@@ -134,6 +134,7 @@
 # [watch.widths]
 # pane     = 22
 # state    = 3
+# workload = 14
 # prompt   = "min:20"
 # activity = 5
 # session_time = 6
@@ -151,7 +152,7 @@
 # itself — that's normal for a freshly-discovered pane, not a bug.
 #
 # Available variables: pane, kind, state, model, ctx, cost, activity,
-# last_prompt, last_response, last_notification, cwd. Unknown
+# workload, last_prompt, last_response, last_notification, cwd. Unknown
 # placeholders are preserved verbatim so typos surface visually.
 # [watch.detail]
 # enabled  = true

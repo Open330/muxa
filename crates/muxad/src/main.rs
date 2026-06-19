@@ -840,6 +840,7 @@ async fn enrich_from_history(
             pane: Some(pane.pane_id.clone()),
             cwd: entry.cwd,
             pid: None,
+            workload: muxa::WorkloadSummary::default(),
             state: muxa::AgentState::Idle,
             last_prompt: Some(entry.prompt),
             last_response: None,

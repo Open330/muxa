@@ -23,6 +23,7 @@ const WATCH_COLUMN_KEYS: &[&str] = &[
     "ctx",
     "cost",
     "limits",
+    "workload",
     "prompt",
     "activity",
     "session_time",
@@ -44,6 +45,7 @@ const WATCH_DETAIL_PLACEHOLDERS: &[&str] = &[
     "last_response",
     "last_notification",
     "cwd",
+    "workload",
     "rate_limit",
     "rate_limit_resets_at",
     "rate_limit_scope",
@@ -968,9 +970,10 @@ pub enum WatchSortKey {
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        // Pane-view defaults: NAME / ST / ACT / LAST PROMPT — lead with
-        // identity, then state, then activity, with the variable-width
-        // prompt last so it can absorb the remaining width. Session view
+        // Pane-view defaults: NAME / ST / ACT / WORK / LAST PROMPT — lead
+        // with identity, then state/activity, then any child shell/subagent
+        // workload, with the variable-width prompt last so it can absorb
+        // the remaining width. Session view
         // folds state counts into the SESSION label and swaps ST for DUR
         // at render setup time. Users who care about model/ctx/cost can
         // opt back in via config.
@@ -978,6 +981,7 @@ impl Default for WatchConfig {
             "pane".to_string(),
             "state".to_string(),
             "activity".to_string(),
+            "workload".to_string(),
             "prompt".to_string(),
         ];
         let mut widths = HashMap::new();
@@ -985,6 +989,7 @@ impl Default for WatchConfig {
         widths.insert("state".to_string(), WidthSpec::Length(3));
         widths.insert("prompt".to_string(), WidthSpec::Min(20));
         widths.insert("activity".to_string(), WidthSpec::Length(5));
+        widths.insert("workload".to_string(), WidthSpec::Length(14));
         widths.insert("session_time".to_string(), WidthSpec::Length(6));
         Self {
             theme: None,
@@ -1008,7 +1013,7 @@ impl Default for WatchConfig {
 /// without leaving the picker.
 ///
 /// `template` is interpolated with `{name}` placeholders. Supported names:
-/// `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`,
+/// `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`, `workload`,
 /// `last_prompt`, `last_response`, `last_notification`, `cwd`,
 /// `rate_limit`, `rate_limit_resets_at`, `rate_limit_scope`. Unknown
 /// placeholders are preserved verbatim.
@@ -1153,7 +1158,10 @@ mod tests {
     fn watch_default_is_prompt_forward() {
         let cfg = WatchConfig::default();
         assert_eq!(cfg.theme, None);
-        assert_eq!(cfg.columns, vec!["pane", "state", "activity", "prompt"]);
+        assert_eq!(
+            cfg.columns,
+            vec!["pane", "state", "activity", "workload", "prompt"]
+        );
         assert!(matches!(
             cfg.widths.get("pane"),
             Some(WidthSpec::Length(22))
@@ -1166,6 +1174,10 @@ mod tests {
         assert!(matches!(
             cfg.widths.get("activity"),
             Some(WidthSpec::Length(5))
+        ));
+        assert!(matches!(
+            cfg.widths.get("workload"),
+            Some(WidthSpec::Length(14))
         ));
     }
 

@@ -36,6 +36,7 @@ use crossterm::terminal::{
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme, WatchView, WidthSpec};
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
+use muxa::process_tree::WorkloadProcessKind;
 use muxa::session_activity::SessionActivity;
 use muxa::state::Agent;
 use muxa::tmux::{PaneInfo, SessionInfo};
@@ -382,6 +383,7 @@ pub(crate) enum WatchColumn {
     Ctx,
     Cost,
     Limits,
+    Workload,
     Prompt,
     Activity,
     SessionTime,
@@ -399,6 +401,7 @@ impl WatchColumn {
             "ctx" => Self::Ctx,
             "cost" => Self::Cost,
             "limits" => Self::Limits,
+            "workload" => Self::Workload,
             "prompt" => Self::Prompt,
             "activity" => Self::Activity,
             "session_time" => Self::SessionTime,
@@ -415,6 +418,7 @@ impl WatchColumn {
             Self::Ctx => "CTX%",
             Self::Cost => "COST$",
             Self::Limits => "LIMITS",
+            Self::Workload => "WORK",
             Self::Prompt => "LAST PROMPT",
             Self::Activity => "ACT",
             Self::SessionTime => "DUR",
@@ -437,6 +441,7 @@ impl WatchColumn {
             // prompt; narrower ones clip the duration suffix on
             // emoji-greedy fonts.
             Self::Limits => Constraint::Length(18),
+            Self::Workload => Constraint::Length(14),
             Self::Prompt => Constraint::Min(20),
             Self::SessionTime => Constraint::Length(6),
         }
@@ -486,6 +491,7 @@ impl WatchColumn {
                 .map_or_else(|| "-".into(), |c| format!("${c:.2}"))
                 .into(),
             Self::Limits => limits_text(a, now),
+            Self::Workload => workload_text(a),
             Self::Prompt => a
                 .last_prompt
                 .as_deref()
@@ -533,6 +539,7 @@ impl WatchColumn {
             | Self::Ctx
             | Self::Cost
             | Self::Limits
+            | Self::Workload
             | Self::Activity
             | Self::SessionTime => Text::from(Span::styled("-", dim)),
         }
@@ -560,6 +567,7 @@ impl WatchColumn {
                 Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
                     Text::from(Span::styled("-", dim))
                 }
+                Self::Workload => Text::from(Span::styled("-", dim)),
             };
         };
 
@@ -571,6 +579,7 @@ impl WatchColumn {
             | Self::Ctx
             | Self::Cost
             | Self::Limits
+            | Self::Workload
             | Self::Prompt
             | Self::Activity => self.agent_text(agent, now, panes, theme),
             Self::SessionTime => session_time_text(s, now),
@@ -626,6 +635,7 @@ impl WatchColumn {
             Self::Ctx => "ctx",
             Self::Cost => "cost",
             Self::Limits => "limits",
+            Self::Workload => "workload",
             Self::Prompt => "prompt",
             Self::Activity => "activity",
             Self::SessionTime => "session_time",
@@ -637,7 +647,7 @@ impl WatchColumn {
 /// pane the daemon doesn't know about — listing both makes `muxa watch` a
 /// drop-in replacement for tmux's `choose-tree -Zs`.
 pub(crate) enum WatchRow {
-    Agent(Agent),
+    Agent(Box<Agent>),
     BarePane(PaneInfo),
     Session(Box<SessionRow>),
 }
@@ -744,6 +754,10 @@ fn persist_watch_sort(path: &Path, keys: &[WatchSortKey]) -> std::result::Result
 }
 
 impl WatchRow {
+    fn agent(agent: Agent) -> Self {
+        Self::Agent(Box::new(agent))
+    }
+
     fn pane_id(&self) -> Option<&str> {
         match self {
             Self::Agent(a) => a.pane.as_deref(),
@@ -1394,6 +1408,7 @@ impl App {
                     WatchColumn::Pane,
                     WatchColumn::State,
                     WatchColumn::Activity,
+                    WatchColumn::Workload,
                     WatchColumn::Prompt,
                 ]
             {
@@ -1401,6 +1416,7 @@ impl App {
                     WatchColumn::Pane,
                     WatchColumn::SessionTime,
                     WatchColumn::Activity,
+                    WatchColumn::Workload,
                     WatchColumn::Prompt,
                 ];
             } else {
@@ -1517,7 +1533,7 @@ impl App {
         });
 
         let mut rows: Vec<WatchRow> = Vec::with_capacity(agents.len() + bare.len());
-        rows.extend(agents.into_iter().map(WatchRow::Agent));
+        rows.extend(agents.into_iter().map(WatchRow::agent));
         rows.extend(bare.into_iter().map(WatchRow::BarePane));
 
         self.rows = rows;
@@ -2361,6 +2377,9 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
             .last_notification
             .clone_from(&prior.last_notification);
     }
+    if merged.workload.is_empty() {
+        merged.workload.clone_from(&prior.workload);
+    }
     if merged.model.is_none() {
         merged.model.clone_from(&prior.model);
     }
@@ -2407,14 +2426,14 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
     for row in &mut app.rows {
         if let WatchRow::Agent(a) = row {
             if (a.kind, a.session_id.clone()) == key {
-                *a = merge_agent_for_ui(a, &agent);
+                **a = merge_agent_for_ui(a, &agent);
                 updated = true;
                 break;
             }
         }
     }
     if !updated {
-        app.rows.push(WatchRow::Agent(agent));
+        app.rows.push(WatchRow::agent(agent));
     }
     // Caller (`apply_outcome`) re-sorts after this returns so a pushed change
     // reaches its sorted position without waiting for the 5 s `Full` tick. The
@@ -3929,7 +3948,7 @@ fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
     let mut out: Vec<Line<'a>> = Vec::new();
 
     let agent = app.rows.iter().find_map(|r| match r {
-        WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a),
+        WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a.as_ref()),
         WatchRow::Session(s) => s
             .agents
             .iter()
@@ -4357,6 +4376,7 @@ fn resolve_var(
             "last_response" => a.last_response.clone().unwrap_or_else(|| "—".into()),
             "last_notification" => a.last_notification.clone().unwrap_or_else(|| "—".into()),
             "cwd" => a.cwd.clone().unwrap_or_else(|| "—".into()),
+            "workload" => workload_detail_string(a),
             "rate_limit" => limits_string(a, now),
             // `rate_limit_resets_at` prefers an active cap's reset time
             // (matches the badge the user sees), falling back to whichever
@@ -4399,6 +4419,7 @@ fn resolve_var(
             | "last_response"
             | "last_notification"
             | "cwd"
+            | "workload"
             | "rate_limit"
             | "rate_limit_resets_at"
             | "rate_limit_scope" => "—".into(),
@@ -4406,7 +4427,7 @@ fn resolve_var(
         }),
         WatchRow::Session(s) => {
             if let Some(a) = s.latest_agent.as_ref() {
-                return resolve_var(name, &WatchRow::Agent(a.clone()), panes, now);
+                return resolve_var(name, &WatchRow::agent(a.clone()), panes, now);
             }
             Some(match name {
                 "pane" => s.session.clone(),
@@ -4423,6 +4444,7 @@ fn resolve_var(
                 | "last_response"
                 | "last_notification"
                 | "cwd"
+                | "workload"
                 | "rate_limit"
                 | "rate_limit_resets_at"
                 | "rate_limit_scope" => "—".into(),
@@ -4465,6 +4487,88 @@ fn resolve_var_chain(
         Some("—".into())
     } else {
         None
+    }
+}
+
+fn workload_text(a: &Agent) -> Text<'static> {
+    let label = workload_cell_string(a);
+    if label == "-" {
+        return Text::from(Span::styled(
+            "-",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    Text::from(Span::styled(label, Style::default().fg(Color::Cyan)))
+}
+
+fn workload_cell_string(a: &Agent) -> String {
+    let w = &a.workload;
+    if w.visible_count() == 0 {
+        return "-".into();
+    }
+    let mut parts = Vec::new();
+    if w.subagent_count > 0 {
+        parts.push(format!("sub:{}", w.subagent_count));
+    }
+    if w.shell_count > 0 {
+        parts.push(format!("sh:{}", w.shell_count));
+    }
+    let other = w
+        .process_count
+        .saturating_sub(w.subagent_count)
+        .saturating_sub(w.shell_count);
+    if other > 0 {
+        parts.push(format!("p:{other}"));
+    }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn workload_detail_string(a: &Agent) -> String {
+    let w = &a.workload;
+    if w.is_empty() {
+        return "—".into();
+    }
+    let mut parts = Vec::new();
+    if w.subagent_count > 0 {
+        parts.push(format!("subagent:{}", w.subagent_count));
+    }
+    if w.shell_count > 0 {
+        parts.push(format!("shell:{}", w.shell_count));
+    }
+    let other = w
+        .process_count
+        .saturating_sub(w.subagent_count)
+        .saturating_sub(w.shell_count);
+    if other > 0 {
+        parts.push(format!("process:{other}"));
+    }
+    if w.helper_count > 0 {
+        parts.push(format!("helper:{}", w.helper_count));
+    }
+    if !w.preview.is_empty() {
+        let chain = w
+            .preview
+            .iter()
+            .map(|p| match p.kind {
+                WorkloadProcessKind::Shell => format!("{}(sh)", p.command),
+                WorkloadProcessKind::Subagent => format!("{}(sub)", p.command),
+                WorkloadProcessKind::Helper => format!("{}(helper)", p.command),
+                WorkloadProcessKind::Process => p.command.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        parts.push(chain);
+    }
+    if parts.is_empty() {
+        "—".into()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -4821,6 +4925,7 @@ mod tests {
             surface: None,
             pane: pane.map(Into::into),
             pid: None,
+            workload: muxa::WorkloadSummary::default(),
             cwd: None,
             state,
             last_prompt: prompt.map(Into::into),
@@ -4840,6 +4945,74 @@ mod tests {
             last_activity_at: now,
             state_entered_at: now,
         }
+    }
+
+    #[test]
+    fn workload_cell_summarizes_shells_and_processes() {
+        let mut agent = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("prompt"),
+            None,
+            None,
+            None,
+        );
+        agent.workload = muxa::WorkloadSummary {
+            primary_pid: Some(20),
+            process_count: 2,
+            shell_count: 1,
+            subagent_count: 0,
+            helper_count: 1,
+            preview: vec![
+                muxa::WorkloadProcess {
+                    pid: 30,
+                    parent_pid: 20,
+                    depth: 2,
+                    kind: WorkloadProcessKind::Shell,
+                    command: "zsh".into(),
+                },
+                muxa::WorkloadProcess {
+                    pid: 31,
+                    parent_pid: 30,
+                    depth: 3,
+                    kind: WorkloadProcessKind::Process,
+                    command: "python3".into(),
+                },
+            ],
+        };
+
+        assert_eq!(workload_cell_string(&agent), "sh:1 p:1");
+        assert_eq!(
+            workload_detail_string(&agent),
+            "shell:1 · process:1 · helper:1 · zsh(sh) -> python3"
+        );
+    }
+
+    #[test]
+    fn helper_only_workload_stays_out_of_primary_cell() {
+        let mut agent = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("prompt"),
+            None,
+            None,
+            None,
+        );
+        agent.workload = muxa::WorkloadSummary {
+            primary_pid: Some(20),
+            process_count: 0,
+            shell_count: 0,
+            subagent_count: 0,
+            helper_count: 1,
+            preview: Vec::new(),
+        };
+
+        assert_eq!(workload_cell_string(&agent), "-");
+        assert_eq!(workload_detail_string(&agent), "helper:1");
     }
 
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
@@ -5482,6 +5655,7 @@ mod tests {
                 WatchColumn::Pane,
                 WatchColumn::SessionTime,
                 WatchColumn::Activity,
+                WatchColumn::Workload,
                 WatchColumn::Prompt,
             ]
         );
@@ -6126,6 +6300,7 @@ sort = ["state"]
                 WatchColumn::Pane,
                 WatchColumn::State,
                 WatchColumn::Activity,
+                WatchColumn::Workload,
                 WatchColumn::Prompt,
             ]
         );
@@ -6607,7 +6782,7 @@ sort = ["state"]
             Some(7.0),
             Some(0.05),
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         let s = format_detail("{model} · {last_prompt}", &row, &[], now).unwrap();
         assert!(s.contains("Opus"));
         assert!(s.contains("first line · second line"));
@@ -6627,7 +6802,7 @@ sort = ["state"]
             None,
         );
         a.last_response = Some("here is what I did".into());
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         let s = format_detail("{last_response}", &row, &[], now).unwrap();
         assert_eq!(s, "here is what I did");
     }
@@ -6645,7 +6820,7 @@ sort = ["state"]
             None,
             None,
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         // Default template renders `—` because last_prompt is missing —
         // detail should be suppressed instead of cluttering the row.
         assert!(format_detail("{last_prompt}", &row, &[], now).is_none());
@@ -6670,7 +6845,7 @@ sort = ["state"]
             None,
         );
         a.last_response = None;
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         let s = format_detail("{last_response|last_prompt}", &row, &[], now).unwrap();
         assert_eq!(s, "review the diff");
     }
@@ -6691,7 +6866,7 @@ sort = ["state"]
             None,
         );
         a.last_response = Some("the response".into());
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         let s = format_detail("{last_response|last_prompt}", &row, &[], now).unwrap();
         assert_eq!(s, "the response");
     }
@@ -6714,7 +6889,7 @@ sort = ["state"]
             None,
             None,
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         assert!(format_detail("{last_response|last_prompt}", &row, &[], now).is_none());
     }
 
@@ -6731,7 +6906,7 @@ sort = ["state"]
             None,
             None,
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         let s = format_detail("{nope} {last_prompt}", &row, &[], now).unwrap();
         assert!(s.contains("{nope}"));
         assert!(s.contains("hi"));
@@ -7783,7 +7958,7 @@ sort = ["state"]
             None,
             None,
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         // Empty after trimming -> suppress.
         assert!(format_detail("", &row, &[], now).is_none());
         assert!(format_detail("   ", &row, &[], now).is_none());
@@ -7802,7 +7977,7 @@ sort = ["state"]
             None,
             None,
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         let s = format_detail("just a literal string", &row, &[], now).unwrap();
         assert_eq!(s, "just a literal string");
     }
@@ -7820,7 +7995,7 @@ sort = ["state"]
             None,
             None,
         );
-        let row = WatchRow::Agent(a);
+        let row = WatchRow::agent(a);
         // Trailing `{last_prompt` (no closing `}`) — current behavior
         // emits the literal so the user sees their typo.
         let s = format_detail("oops {last_prompt", &row, &[], now).unwrap();

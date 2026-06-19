@@ -53,6 +53,7 @@ fn make_realistic_agent() -> Agent {
         surface: None,
         pane: Some("%42".into()),
         pid: None,
+        workload: muxa::WorkloadSummary::default(),
         cwd: Some("/home/user/projects/some-large-codebase".into()),
         state: muxa::AgentState::Idle,
         last_prompt: Some(prompt),

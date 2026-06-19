@@ -46,6 +46,7 @@ pub mod ipc;
 pub mod metrics;
 pub mod notify;
 pub mod paths;
+pub mod process_tree;
 pub mod reconcile;
 pub mod scope_filter;
 pub mod session;
@@ -70,6 +71,7 @@ pub use event::{
     AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, SurfaceKind, SurfaceRef,
 };
 pub use history::{HistoryEntry, PromptHistory};
+pub use process_tree::{WorkloadProcess, WorkloadProcessKind, WorkloadSummary};
 pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
 
 // ---------------------------------------------------------------------------

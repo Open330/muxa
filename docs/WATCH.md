@@ -66,15 +66,18 @@ Columns are configured under `[watch]`:
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
 
 [watch.widths]
 prompt = "min:20"
+workload = 14
 activity = 5
 ```
 
-Available column keys include `pane`, `pane_id`, `state`, `kind`, `model`,
-`ctx`, `cost`, `limits`, `prompt`, `activity`, and `session_time`.
+Available column keys include `pane`, `state`, `kind`, `model`, `ctx`,
+`cost`, `limits`, `workload`, `prompt`, `activity`, and `session_time`.
+`workload` summarizes child shell/subagent work under the pane's primary
+agent, for example `sh:1 p:1`.
 
 ## Sort
 
@@ -103,7 +106,8 @@ template = "{last_response || last_prompt || last_notification}"
 ```
 
 Available variables include `pane`, `kind`, `state`, `model`, `ctx`, `cost`,
-`activity`, `last_prompt`, `last_response`, `last_notification`, and `cwd`.
+`activity`, `workload`, `last_prompt`, `last_response`, `last_notification`,
+and `cwd`.
 
 Long detail content is truncated for the table. Use preview mode for pane
 captures or prompt/response text when you need more context.

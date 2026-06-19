@@ -37,6 +37,7 @@ use tracing::debug;
 use crate::adapters::codex_rollout;
 use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, RateLimitScope, RateLimitSource};
 use crate::metrics::Metrics;
+use crate::process_tree;
 use crate::state::{ReconcileReport, SharedStore};
 use crate::tmux::PaneInfo;
 
@@ -314,7 +315,14 @@ impl<L: LivenessSource> Reconciler<L> {
         let panes = tokio::task::spawn_blocking(move || src.list_panes())
             .await
             .unwrap_or_default();
+        let panes_for_workload = panes.clone();
+        let workloads = tokio::task::spawn_blocking(move || {
+            process_tree::scan_pane_workloads(&panes_for_workload)
+        })
+        .await
+        .unwrap_or_default();
         let report = self.store.reconcile(&panes).await;
+        let workload_changed = self.store.update_workloads(&workloads).await;
         let stuck_w = self
             .store
             .mark_stuck_idle_from(
@@ -369,6 +377,7 @@ impl<L: LivenessSource> Reconciler<L> {
             stale = report.stale_panes_reaped,
             synthetic = report.synthetic_demoted,
             duplicates = report.duplicates_collapsed,
+            workload_changed,
             "reconciler.tick",
         );
         report
@@ -607,6 +616,7 @@ mod tests {
             pane: Some("%3".into()),
             cwd: None,
             pid: None,
+            workload: crate::WorkloadSummary::default(),
             state,
             last_prompt: None,
             last_response: None,

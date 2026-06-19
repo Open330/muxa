@@ -65,15 +65,18 @@ bind-key s display-popup -E -w 90% -h 80% "muxa watch"
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
 
 [watch.widths]
 prompt = "min:20"
+workload = 14
 activity = 5
 ```
 
-사용 가능한 column key: `pane`, `pane_id`, `state`, `kind`, `model`, `ctx`,
-`cost`, `limits`, `prompt`, `activity`, `session_time`.
+사용 가능한 column key: `pane`, `state`, `kind`, `model`, `ctx`, `cost`,
+`limits`, `workload`, `prompt`, `activity`, `session_time`.
+`workload`는 pane의 primary agent 아래에서 실행 중인 child shell/subagent
+작업을 `sh:1 p:1` 같은 형태로 요약합니다.
 
 ## Sort
 
@@ -102,7 +105,7 @@ template = "{last_response || last_prompt || last_notification}"
 ```
 
 사용 가능한 변수: `pane`, `kind`, `state`, `model`, `ctx`, `cost`, `activity`,
-`last_prompt`, `last_response`, `last_notification`, `cwd`.
+`workload`, `last_prompt`, `last_response`, `last_notification`, `cwd`.
 
 긴 detail 내용은 table에 맞게 잘립니다. 더 많은 맥락이 필요하면 preview를
 사용하세요.

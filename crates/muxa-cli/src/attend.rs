@@ -289,6 +289,7 @@ mod tests {
             surface: None,
             pane: pane.map(Into::into),
             pid: None,
+            workload: muxa::WorkloadSummary::default(),
             cwd: None,
             state,
             last_prompt: None,

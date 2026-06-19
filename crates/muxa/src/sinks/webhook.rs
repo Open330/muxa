@@ -488,6 +488,7 @@ mod tests {
             surface: None,
             pane: pane.map(str::to_string),
             pid: None,
+            workload: crate::WorkloadSummary::default(),
             cwd: None,
             state: AgentState::WaitingInput,
             last_prompt: prompt.map(str::to_string),

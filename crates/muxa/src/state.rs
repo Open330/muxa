@@ -19,6 +19,7 @@ use crate::event::{
 };
 use crate::history::{HistoryEntry, HistoryOptions, PromptHistory};
 use crate::metrics::Metrics;
+use crate::process_tree::WorkloadSummary;
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -88,6 +89,12 @@ pub struct Agent {
     /// it to `Stopped` once the pid is gone. `None` for hook/pane agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Best-effort summary of extra work spawned below this pane's primary
+    /// agent process: shell commands, nested agent sessions, and helper
+    /// processes. Refreshed by the reconciler from OS process-tree state.
+    /// Empty on hosts/backends that cannot expose pane PIDs.
+    #[serde(default, skip_serializing_if = "WorkloadSummary::is_empty")]
+    pub workload: WorkloadSummary,
     pub state: AgentState,
     pub last_prompt: Option<String>,
     /// Last assistant response captured for this agent. Populated by the
@@ -202,6 +209,7 @@ impl Agent {
             pane,
             cwd,
             pid: None,
+            workload: WorkloadSummary::default(),
             state: AgentState::Starting,
             last_prompt: None,
             last_response: None,
@@ -1126,6 +1134,36 @@ impl Store {
         flipped
     }
 
+    /// Refresh pane-backed workload summaries from the latest OS
+    /// process-tree scan. This is metadata enrichment only: it must not
+    /// touch `last_activity_at`, `state_entered_at`, or emit transitions,
+    /// because a shell child appearing below an agent is not itself an
+    /// agent lifecycle transition.
+    pub async fn update_workloads(&self, by_pane: &HashMap<String, WorkloadSummary>) -> usize {
+        let mut agents = self.agents.write().await;
+        let mut changed = 0_usize;
+        for agent in agents.values_mut() {
+            if agent.pid.is_some() {
+                continue;
+            }
+            let next = agent
+                .pane
+                .as_ref()
+                .and_then(|pane| by_pane.get(pane))
+                .cloned()
+                .unwrap_or_default();
+            if agent.workload != next {
+                agent.workload = next;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+        }
+        changed
+    }
+
     /// Converge the registry against ground truth from tmux.
     ///
     /// This is the periodic control-loop pass — analogous to a Kubernetes
@@ -1299,6 +1337,7 @@ mod tests {
             session_id: session.into(),
             surface: None,
             pid: None,
+            workload: crate::WorkloadSummary::default(),
             pane: Some("%1".into()),
             cwd: None,
             state,
@@ -1447,6 +1486,47 @@ mod tests {
         let report = store.reconcile(&[]).await;
         assert_eq!(report.stale_panes_reaped, 0);
         assert!(store.by_session("task").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_workloads_refreshes_metadata_without_touching_activity() {
+        let store = Store::shared();
+        let at = datetime!(2026-05-10 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "agent".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at,
+            })
+            .await;
+
+        let mut by_pane = HashMap::new();
+        by_pane.insert(
+            "%1".to_string(),
+            WorkloadSummary {
+                primary_pid: Some(20),
+                process_count: 2,
+                shell_count: 1,
+                subagent_count: 0,
+                helper_count: 1,
+                preview: Vec::new(),
+            },
+        );
+
+        assert_eq!(store.update_workloads(&by_pane).await, 1);
+        let snap = store.snapshot().await;
+        assert_eq!(snap[0].workload.shell_count, 1);
+        assert_eq!(snap[0].workload.process_count, 2);
+        assert_eq!(snap[0].last_activity_at, at);
+
+        assert_eq!(store.update_workloads(&by_pane).await, 0);
+        assert_eq!(store.update_workloads(&HashMap::new()).await, 1);
+        assert!(store.snapshot().await[0].workload.is_empty());
     }
 
     #[tokio::test]
@@ -3022,6 +3102,7 @@ mod tests {
                     session_id: "real-old".into(),
                     surface: None,
                     pid: None,
+                    workload: crate::WorkloadSummary::default(),
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Stopped,
@@ -3050,6 +3131,7 @@ mod tests {
                     session_id: "real-new".into(),
                     surface: None,
                     pid: None,
+                    workload: crate::WorkloadSummary::default(),
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Working,
@@ -3107,6 +3189,7 @@ mod tests {
                         session_id: sid.into(),
                         surface: None,
                         pid: None,
+                        workload: crate::WorkloadSummary::default(),
                         pane: Some("%1".into()),
                         cwd: None,
                         state: AgentState::Working,
@@ -3168,6 +3251,7 @@ mod tests {
             session_id: sid.into(),
             surface: None,
             pid: None,
+            workload: crate::WorkloadSummary::default(),
             pane: Some(pane.into()),
             cwd: None,
             state: AgentState::Idle,
