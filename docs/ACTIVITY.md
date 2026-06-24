@@ -50,6 +50,23 @@ patterns are case-sensitive and support `*` and `?`, e.g.
 `--sort` accepts: `prompts`, `work`, `wait`, `err`, `tmux`, `human`,
 `think`, `active`, `block`, `tok`, `words`, `sess`, `agents`, `last`, `name`.
 
+## Stats Time Graph
+
+Add `--graph` to `muxa stats` to render only a terminal-native time graph for
+`WACT`, the hands-on subset of active human time:
+
+```bash
+muxa stats --since today --graph
+muxa stats --since week --graph
+```
+
+The bucket size follows the selected window: ranges up to two days use hourly
+buckets, ranges up to 60 days use daily buckets, ranges up to 400 days use
+weekly buckets, and longer ranges use monthly buckets. JSON output includes the
+same data under `time_graph` only when `--graph` is set, with both
+`work_active_secs` and `active_secs` per bucket. Markdown output includes a
+bucket table plus the usual stats tables when `--graph` is set.
+
 `ACTIVE` (the `ACT` column, `active` / `active_secs` in JSON) estimates engaged
 human time as the union of three signals, none of which a forgotten attach ever
 triggers:

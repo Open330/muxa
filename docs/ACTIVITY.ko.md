@@ -51,6 +51,22 @@ totals에서 모두 제외할 수 있습니다. 값은 반복하거나 comma-sep
 `human`, `think`, `active`, `block`, `tok`, `words`, `sess`, `agents`, `last`,
 `name`.
 
+## Stats 시간 그래프
+
+`muxa stats`에 `--graph`를 추가하면 active human time의 hands-on subset인
+`WACT`만 terminal-native 시간 그래프로 보여줍니다.
+
+```bash
+muxa stats --since today --graph
+muxa stats --since week --graph
+```
+
+버킷 크기는 선택한 window에 따라 자동으로 정해집니다: 2일 이하는 시간별, 60일
+이하는 일자별, 400일 이하는 주별, 그보다 긴 범위는 월별입니다. JSON 출력에는
+`--graph`가 켜졌을 때만 같은 데이터가 `time_graph`로 들어가며 각 버킷마다
+`work_active_secs`와 `active_secs`를 함께 제공합니다. Markdown 출력은
+`--graph`가 켜졌을 때 버킷 table과 기존 stats table을 함께 포함합니다.
+
 `ACTIVE`(`ACT` column, JSON의 `active` / `active_secs`)는 실제로 몰입해
 다룬 human time 추정값입니다. submitted prompt 주변 window, tmux input tick
 (keypress/scroll), agent가 human 답변을 기다리는 동안의 thinking time을

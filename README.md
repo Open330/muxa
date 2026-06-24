@@ -87,7 +87,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
-| `muxa stats --since today` | Summary table; group by day/project/agent/session. |
+| `muxa stats --since today` | Summary table; group by day/project/agent/session. Add `--graph` for graph-only WACT over time. |
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |

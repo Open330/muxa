@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use comfy_table::presets::UTF8_BORDERS_ONLY;
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::{UTF8_BORDERS_ONLY, UTF8_FULL_CONDENSED};
 use comfy_table::{ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
@@ -10,8 +11,9 @@ use muxa::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::path::Path;
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime, UtcOffset, Weekday};
 
 use crate::theme::{self, CliTheme, TableTone, ThemeArg};
 use crate::time_range::TimeRange;
@@ -32,6 +34,10 @@ pub struct Args {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
+
+    /// Render only the WACT time graph. Buckets adapt to the selected range.
+    #[arg(long, default_value_t = false)]
+    graph: bool,
 
     /// Shortcut for `--format json`. Overrides `--format`.
     #[arg(long, conflicts_with = "markdown")]
@@ -194,7 +200,14 @@ impl GroupBy {
 pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
     let data = load_data(client, cfg, &args.since, &exclusions).await?;
-    let doc = build_document(&data, args.group_by, args.limit, args.sort, args.reverse);
+    let doc = build_document(
+        &data,
+        args.group_by,
+        args.limit,
+        args.sort,
+        args.reverse,
+        args.graph,
+    );
     match OutputFormat::resolve(args.format, args.json, args.markdown) {
         OutputFormat::Table => render_table(
             &doc,
@@ -211,10 +224,38 @@ pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Resu
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
     let data = load_data(client, cfg, &args.since, &exclusions).await?;
     let docs = [
-        build_document(&data, GroupBy::Day, args.limit, SortKey::Prompts, false),
-        build_document(&data, GroupBy::Project, args.limit, SortKey::Prompts, false),
-        build_document(&data, GroupBy::Agent, args.limit, SortKey::Prompts, false),
-        build_document(&data, GroupBy::Session, args.limit, SortKey::Prompts, false),
+        build_document(
+            &data,
+            GroupBy::Day,
+            args.limit,
+            SortKey::Prompts,
+            false,
+            false,
+        ),
+        build_document(
+            &data,
+            GroupBy::Project,
+            args.limit,
+            SortKey::Prompts,
+            false,
+            false,
+        ),
+        build_document(
+            &data,
+            GroupBy::Agent,
+            args.limit,
+            SortKey::Prompts,
+            false,
+            false,
+        ),
+        build_document(
+            &data,
+            GroupBy::Session,
+            args.limit,
+            SortKey::Prompts,
+            false,
+            false,
+        ),
     ];
     // Report defaults to the same tables as `stats`; `--json`/`--markdown` opt
     // into the machine- and document-friendly formats.
@@ -256,6 +297,8 @@ struct StatsDocument {
     range: RangeDocument,
     group_by: String,
     totals: Totals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_graph: Option<TimeGraph>,
     rows: Vec<GroupRow>,
     notes: Vec<String>,
 }
@@ -324,6 +367,28 @@ struct GroupRow {
     attention_events: usize,
     last_prompt_at: Option<String>,
     last_prompt_age: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TimeGraph {
+    metric: String,
+    bucket: String,
+    total_secs: u64,
+    total: String,
+    max_secs: u64,
+    max: String,
+    buckets: Vec<TimeGraphBucket>,
+}
+
+#[derive(Debug, Serialize)]
+struct TimeGraphBucket {
+    label: String,
+    started_at: String,
+    ended_at: String,
+    active_secs: u64,
+    active: String,
+    work_active_secs: u64,
+    work_active: String,
 }
 
 #[derive(Default)]
@@ -598,6 +663,7 @@ fn build_document(
     limit: usize,
     sort: SortKey,
     reverse: bool,
+    include_graph: bool,
 ) -> StatsDocument {
     let rows = build_rows(data, group_by, limit, sort, reverse);
     StatsDocument {
@@ -609,6 +675,7 @@ fn build_document(
         },
         group_by: group_by.as_str().to_string(),
         totals: build_totals(data),
+        time_graph: include_graph.then(|| build_time_graph(data)).flatten(),
         rows,
         notes: notes(data),
     }
@@ -1181,6 +1248,299 @@ fn last_touch_attribution(windows: &[ActiveWindow]) -> ActiveAttribution {
         }
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeBucketKind {
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+impl TimeBucketKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TimeBucketAccumulator {
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    label: String,
+    active_secs: u64,
+    work_active_secs: u64,
+}
+
+fn build_time_graph(data: &StatsData) -> Option<TimeGraph> {
+    let windows = active_windows(data, GroupBy::Session);
+    let (window_start, window_end) = time_graph_window(data, &windows)?;
+    let kind = choose_time_bucket(window_start, window_end);
+    let offset = local_offset();
+    let mut buckets = time_bucket_accumulators(window_start, window_end, kind, offset);
+    if buckets.is_empty() {
+        return None;
+    }
+
+    add_active_windows_to_time_buckets(&mut buckets, &windows);
+
+    let total_secs = buckets
+        .iter()
+        .map(|bucket| bucket.work_active_secs)
+        .sum::<u64>();
+    let max_secs = buckets
+        .iter()
+        .map(|bucket| bucket.work_active_secs)
+        .max()
+        .unwrap_or(0);
+    Some(TimeGraph {
+        metric: "work_active".to_string(),
+        bucket: kind.as_str().to_string(),
+        total_secs,
+        total: format_duration(total_secs),
+        max_secs,
+        max: format_duration(max_secs),
+        buckets: buckets
+            .into_iter()
+            .map(|bucket| TimeGraphBucket {
+                label: bucket.label,
+                started_at: format_rfc3339(bucket.started_at),
+                ended_at: format_rfc3339(bucket.ended_at),
+                active_secs: bucket.active_secs,
+                active: format_duration(bucket.active_secs),
+                work_active_secs: bucket.work_active_secs,
+                work_active: format_duration(bucket.work_active_secs),
+            })
+            .collect(),
+    })
+}
+
+fn time_graph_window(
+    data: &StatsData,
+    windows: &[ActiveWindow],
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let end = data.range.effective_end(data.now);
+    let start = if let Some(since_at) = data.range.since_at {
+        since_at
+    } else {
+        let first_window = windows
+            .iter()
+            .filter(|window| window.end > window.start)
+            .map(|window| window.start)
+            .min()?;
+        OffsetDateTime::from_unix_timestamp(first_window).ok()?
+    };
+    (end > start).then_some((start, end))
+}
+
+fn choose_time_bucket(start: OffsetDateTime, end: OffsetDateTime) -> TimeBucketKind {
+    let secs = (end - start).whole_seconds().max(0);
+    if secs <= 2 * 24 * 60 * 60 {
+        TimeBucketKind::Hour
+    } else if secs <= 60 * 24 * 60 * 60 {
+        TimeBucketKind::Day
+    } else if secs <= 400 * 24 * 60 * 60 {
+        TimeBucketKind::Week
+    } else {
+        TimeBucketKind::Month
+    }
+}
+
+fn time_bucket_accumulators(
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
+    kind: TimeBucketKind,
+    offset: UtcOffset,
+) -> Vec<TimeBucketAccumulator> {
+    let mut buckets = Vec::new();
+    let mut cursor = floor_time_bucket(window_start, kind, offset);
+    let end_anchor = (window_end - time::Duration::seconds(1)).max(window_start);
+    let hour_labels_include_date = kind == TimeBucketKind::Hour
+        && window_start.to_offset(offset).date() != end_anchor.to_offset(offset).date();
+    while cursor < window_end {
+        let next = advance_time_bucket(cursor, kind, offset);
+        if next <= cursor {
+            break;
+        }
+        buckets.push(TimeBucketAccumulator {
+            started_at: cursor,
+            ended_at: next,
+            label: time_bucket_label(cursor, kind, offset, hour_labels_include_date),
+            active_secs: 0,
+            work_active_secs: 0,
+        });
+        cursor = next;
+    }
+    buckets
+}
+
+fn add_active_windows_to_time_buckets(
+    buckets: &mut [TimeBucketAccumulator],
+    windows: &[ActiveWindow],
+) {
+    let mut events: Vec<(i64, bool, usize)> = Vec::new();
+    for (i, window) in windows.iter().enumerate() {
+        if window.end > window.start {
+            events.push((window.start, false, i));
+            events.push((window.end, true, i));
+        }
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
+    let mut i = 0;
+    while i < events.len() {
+        let t = events[i].0;
+        while i < events.len() && events[i].0 == t {
+            let (_, is_end, idx) = events[i];
+            let key = (windows[idx].anchor, idx);
+            if is_end {
+                active.remove(&key);
+            } else {
+                active.insert(key);
+            }
+            i += 1;
+        }
+        if i < events.len() {
+            let next = events[i].0;
+            if next > t {
+                if let Some(&(_, idx)) = active.iter().next_back() {
+                    add_active_slice_to_time_buckets(buckets, t, next, windows[idx].work_eligible);
+                }
+            }
+        }
+    }
+}
+
+fn add_active_slice_to_time_buckets(
+    buckets: &mut [TimeBucketAccumulator],
+    started_at: i64,
+    ended_at: i64,
+    work_eligible: bool,
+) {
+    for bucket in buckets {
+        let bucket_start = bucket.started_at.unix_timestamp();
+        let bucket_end = bucket.ended_at.unix_timestamp();
+        let start = started_at.max(bucket_start);
+        let end = ended_at.min(bucket_end);
+        if end <= start {
+            continue;
+        }
+        let secs = u64::try_from(end - start).unwrap_or(0);
+        bucket.active_secs = bucket.active_secs.saturating_add(secs);
+        if work_eligible {
+            bucket.work_active_secs = bucket.work_active_secs.saturating_add(secs);
+        }
+    }
+}
+
+fn floor_time_bucket(
+    at: OffsetDateTime,
+    kind: TimeBucketKind,
+    offset: UtcOffset,
+) -> OffsetDateTime {
+    let local = at.to_offset(offset);
+    match kind {
+        TimeBucketKind::Hour => local
+            .date()
+            .with_hms(local.hour(), 0, 0)
+            .unwrap_or_else(|_| local.date().midnight())
+            .assume_offset(offset),
+        TimeBucketKind::Day => local_day_start(local.date(), offset),
+        TimeBucketKind::Week => local_day_start(week_start_monday(local.date()), offset),
+        TimeBucketKind::Month => month_start(local.date()).midnight().assume_offset(offset),
+    }
+}
+
+fn advance_time_bucket(
+    at: OffsetDateTime,
+    kind: TimeBucketKind,
+    offset: UtcOffset,
+) -> OffsetDateTime {
+    match kind {
+        TimeBucketKind::Hour => at + time::Duration::hours(1),
+        TimeBucketKind::Day => at + time::Duration::days(1),
+        TimeBucketKind::Week => at + time::Duration::weeks(1),
+        TimeBucketKind::Month => next_month_start(at, offset),
+    }
+}
+
+fn time_bucket_label(
+    at: OffsetDateTime,
+    kind: TimeBucketKind,
+    offset: UtcOffset,
+    hour_includes_date: bool,
+) -> String {
+    let local = at.to_offset(offset);
+    let formatted = match kind {
+        TimeBucketKind::Hour if hour_includes_date => {
+            local.format(time::macros::format_description!("[month]-[day] [hour]:00"))
+        }
+        TimeBucketKind::Hour => local.format(time::macros::format_description!("[hour]:00")),
+        TimeBucketKind::Day | TimeBucketKind::Week => {
+            local.format(time::macros::format_description!("[year]-[month]-[day]"))
+        }
+        TimeBucketKind::Month => local.format(time::macros::format_description!("[year]-[month]")),
+    };
+    formatted.unwrap_or_else(|_| local.to_string())
+}
+
+fn local_offset() -> UtcOffset {
+    UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
+}
+
+fn local_day_start(date: Date, offset: UtcOffset) -> OffsetDateTime {
+    date.midnight().assume_offset(offset)
+}
+
+fn week_start_monday(mut date: Date) -> Date {
+    for _ in 0..weekday_days_from_monday(date.weekday()) {
+        let Some(previous) = date.previous_day() else {
+            break;
+        };
+        date = previous;
+    }
+    date
+}
+
+fn weekday_days_from_monday(weekday: Weekday) -> u8 {
+    match weekday {
+        Weekday::Monday => 0,
+        Weekday::Tuesday => 1,
+        Weekday::Wednesday => 2,
+        Weekday::Thursday => 3,
+        Weekday::Friday => 4,
+        Weekday::Saturday => 5,
+        Weekday::Sunday => 6,
+    }
+}
+
+fn month_start(date: Date) -> Date {
+    Date::from_calendar_date(date.year(), date.month(), 1).unwrap_or(date)
+}
+
+fn next_month_start(at: OffsetDateTime, offset: UtcOffset) -> OffsetDateTime {
+    let local = at.to_offset(offset);
+    let date = local.date();
+    let month = u8::from(date.month());
+    let (year, month) = if month == 12 {
+        (date.year().saturating_add(1), Month::January)
+    } else {
+        (
+            date.year(),
+            Month::try_from(month.saturating_add(1)).unwrap_or(Month::December),
+        )
+    };
+    Date::from_calendar_date(year, month, 1)
+        .unwrap_or(date)
+        .midnight()
+        .assume_offset(offset)
 }
 
 fn add_state_transition_row(
@@ -1781,10 +2141,15 @@ fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
     print_range_header("muxa stats", doc);
     println!();
 
+    let terminal_width = terminal_width();
+    if let Some(graph) = &doc.time_graph {
+        println!("{}", render_time_graph(graph, terminal_width, theme));
+        return;
+    }
+
     if doc.rows.is_empty() {
         println!("no retained prompts, live agents, or tracked session activity in this view");
     } else {
-        let terminal_width = terminal_width();
         println!("{}", render_stats_table(doc, terminal_width, theme));
         if stats_table_layout(terminal_width) != StatsTableLayout::Full {
             println!("{}", compaction_hint());
@@ -1853,6 +2218,125 @@ fn print_notes(notes: &[String], verbose: bool, verbose_cmd: &str) {
             n = notes.len(),
             plural = if notes.len() == 1 { "" } else { "s" },
         );
+    }
+}
+
+fn render_time_graph(graph: &TimeGraph, terminal_width: usize, theme: CliTheme) -> String {
+    if graph.max_secs == 0 {
+        return format!(
+            "WACT graph · {} · no work-active time in this range",
+            graph.bucket
+        );
+    }
+
+    let raw_label_width = graph
+        .buckets
+        .iter()
+        .map(|bucket| bucket.label.len())
+        .max()
+        .unwrap_or(6)
+        .max("BUCKET".len())
+        .clamp(6, 12);
+    let value_width = graph
+        .buckets
+        .iter()
+        .map(|bucket| bucket.work_active.len())
+        .chain(std::iter::once(graph.total.len()))
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let max_label_width = terminal_width
+        .saturating_sub(value_width.saturating_mul(2) + 14)
+        .clamp(1, 12);
+    let label_width = raw_label_width.min(max_label_width);
+    let reserved_width = label_width + value_width.saturating_mul(2) + 13;
+    let bar_width = terminal_width.saturating_sub(reserved_width).clamp(1, 56);
+
+    let mut out = String::new();
+    let header = format!(
+        "WACT over time · {} buckets · total {} · peak {}",
+        graph.bucket, graph.total, graph.max
+    );
+    let _ = writeln!(out, "{}", truncate_cell(&header, terminal_width.max(1)));
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_constraints([
+            ColumnConstraint::Absolute(Width::Fixed(
+                u16::try_from(label_width).unwrap_or(u16::MAX),
+            )),
+            ColumnConstraint::Absolute(Width::Fixed(
+                u16::try_from(value_width).unwrap_or(u16::MAX),
+            )),
+            ColumnConstraint::Absolute(Width::Fixed(
+                u16::try_from(value_width).unwrap_or(u16::MAX),
+            )),
+            ColumnConstraint::Absolute(Width::Fixed(u16::try_from(bar_width).unwrap_or(u16::MAX))),
+        ])
+        .set_header([
+            theme.cell(truncate_cell("BUCKET", label_width), TableTone::Header),
+            theme.right_cell(truncate_cell("WACT", value_width), TableTone::Header),
+            theme.right_cell(truncate_cell("ACT", value_width), TableTone::Header),
+            theme.cell(truncate_cell("DISTRIBUTION", bar_width), TableTone::Header),
+        ]);
+
+    for bucket in &graph.buckets {
+        table.add_row([
+            theme.cell(truncate_cell(&bucket.label, label_width), TableTone::Accent),
+            theme.right_cell(
+                truncate_cell(&bucket.work_active, value_width),
+                TableTone::Good,
+            ),
+            theme.right_cell(truncate_cell(&bucket.active, value_width), TableTone::Human),
+            theme.cell(
+                smooth_bar(bucket.work_active_secs, graph.max_secs, bar_width),
+                TableTone::Good,
+            ),
+        ]);
+    }
+
+    let _ = write!(out, "{table}");
+    out.trim_end().to_string()
+}
+
+fn smooth_bar(secs: u64, max_secs: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if secs == 0 || max_secs == 0 {
+        return " ".repeat(width);
+    }
+    let width_units = u128::try_from(width).unwrap_or(u128::MAX).saturating_mul(8);
+    let units = u128::from(secs)
+        .saturating_mul(width_units)
+        .div_ceil(u128::from(max_secs))
+        .clamp(1, width_units);
+    let full = usize::try_from(units / 8).unwrap_or(width).min(width);
+    let partial = usize::try_from(units % 8).unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str(&"█".repeat(full));
+    if full < width && partial > 0 {
+        out.push(partial_block(partial));
+    }
+    let used = full + usize::from(full < width && partial > 0);
+    out.push_str(&"░".repeat(width.saturating_sub(used)));
+    out
+}
+
+fn partial_block(eighths: usize) -> char {
+    match eighths {
+        1 => '▏',
+        2 => '▎',
+        3 => '▍',
+        4 => '▌',
+        5 => '▋',
+        6 => '▊',
+        7 => '▉',
+        _ => '█',
     }
 }
 
@@ -2197,6 +2681,7 @@ fn stats_column_value(row: &GroupRow, column: StatsColumn) -> String {
 fn render_markdown_stats(doc: &StatsDocument) -> String {
     let mut out = String::new();
     push_markdown_overview(&mut out, "muxa stats", doc);
+    push_markdown_time_graph(&mut out, doc.time_graph.as_ref());
     push_markdown_rows(&mut out, &format!("By {}", doc.group_by), &doc.rows);
     push_markdown_notes(&mut out, &doc.notes);
     out
@@ -2329,6 +2814,25 @@ fn push_markdown_rows(out: &mut String, title: &str, rows: &[GroupRow]) {
         out.push_str(&row.live_agents.to_string());
         out.push_str(" | ");
         out.push_str(&escape_markdown_cell(&row.last_prompt_age));
+        out.push_str(" |\n");
+    }
+    out.push('\n');
+}
+
+fn push_markdown_time_graph(out: &mut String, graph: Option<&TimeGraph>) {
+    let Some(graph) = graph else {
+        return;
+    };
+    out.push_str("## Time Graph\n\n");
+    out.push_str("| Bucket | WACT | ACT |\n");
+    out.push_str("| --- | ---: | ---: |\n");
+    for bucket in &graph.buckets {
+        out.push_str("| ");
+        out.push_str(&escape_markdown_cell(&bucket.label));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&bucket.work_active));
+        out.push_str(" | ");
+        out.push_str(&escape_markdown_cell(&bucket.active));
         out.push_str(" |\n");
     }
     out.push('\n');
@@ -3077,6 +3581,120 @@ mod tests {
     }
 
     #[test]
+    fn time_graph_uses_hour_buckets_for_day_range() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            Some("/home/june/main"),
+            "do a thing",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        p.tmux_session = Some("main".into());
+        let mut d = data(vec![p]);
+        d.range = TimeRange {
+            label: "day".into(),
+            since_at: Some(datetime!(2026-05-30 00:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-31 00:00:00 UTC)),
+        };
+        d.activity_entries = vec![ActivityEntry::SessionForeground(
+            SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 11:00:00 UTC),
+            ),
+        )];
+
+        let totals = build_totals(&d);
+        let graph = build_time_graph(&d).expect("day range should produce a graph");
+
+        assert_eq!(graph.bucket, "hour");
+        assert_eq!(graph.total_secs, totals.work_active_secs);
+        assert!(graph
+            .buckets
+            .iter()
+            .any(|bucket| bucket.work_active_secs == 360));
+    }
+
+    #[test]
+    fn time_graph_uses_day_buckets_for_week_range() {
+        let mut d = data(Vec::new());
+        d.range = TimeRange {
+            label: "week".into(),
+            since_at: Some(datetime!(2026-05-23 12:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+
+        let graph = build_time_graph(&d).expect("bounded week should produce a graph");
+
+        assert_eq!(graph.bucket, "day");
+    }
+
+    #[test]
+    fn time_graph_keeps_active_and_work_active_separate() {
+        let d = data_with_single_tick(HumanInteractionKind::TmuxScroll);
+        let graph = build_time_graph(&d).expect("scroll activity should produce a graph");
+
+        assert_eq!(graph.total_secs, 0);
+        assert_eq!(
+            graph
+                .buckets
+                .iter()
+                .map(|bucket| bucket.active_secs)
+                .sum::<u64>(),
+            361
+        );
+        assert_eq!(
+            graph
+                .buckets
+                .iter()
+                .map(|bucket| bucket.work_active_secs)
+                .sum::<u64>(),
+            0
+        );
+    }
+
+    #[test]
+    fn time_graph_render_clamps_to_narrow_width() {
+        let graph = TimeGraph {
+            metric: "work_active".into(),
+            bucket: "hour".into(),
+            total_secs: 3_600,
+            total: "1h".into(),
+            max_secs: 3_600,
+            max: "1h".into(),
+            buckets: vec![TimeGraphBucket {
+                label: "06-24 10:00".into(),
+                started_at: "2026-06-24T10:00:00Z".into(),
+                ended_at: "2026-06-24T11:00:00Z".into(),
+                active_secs: 3_600,
+                active: "1h".into(),
+                work_active_secs: 3_600,
+                work_active: "1h".into(),
+            }],
+        };
+
+        let rendered = render_time_graph(&graph, 40, CliTheme::plain());
+
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 40,
+                "line exceeded graph width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_document_omits_time_graph_by_default() {
+        let d = data(Vec::new());
+
+        let doc = build_document(&d, GroupBy::Day, 0, SortKey::Prompts, false, false);
+
+        assert!(doc.time_graph.is_none());
+    }
+
+    #[test]
     fn scope_exclusions_remove_matching_source_data() {
         let mut kept_prompt = prompt(
             AgentKind::Codex,
@@ -3259,7 +3877,7 @@ mod tests {
     #[test]
     fn stats_table_appends_total_footer() {
         let d = sort_fixture();
-        let doc = build_document(&d, GroupBy::Project, 0, SortKey::Prompts, false);
+        let doc = build_document(&d, GroupBy::Project, 0, SortKey::Prompts, false, false);
         let rendered = render_stats_table(&doc, 140, CliTheme::plain());
 
         let lines: Vec<&str> = rendered.lines().collect();
@@ -3533,7 +4151,7 @@ mod tests {
         );
         long.tmux_session = Some("9248e2a7-88f8-4229-ad96-eaf257accdfc".into());
         let d = data(vec![p, long]);
-        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
 
         let rendered = render_stats_table(&doc, 88, CliTheme::plain());
 
@@ -3562,7 +4180,7 @@ mod tests {
         );
         p.tmux_session = Some("callabo-auto-label".into());
         let d = data(vec![p]);
-        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false);
+        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
 
         let rendered = render_stats_table(&doc, 140, CliTheme::plain());
 
