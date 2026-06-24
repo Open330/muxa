@@ -371,6 +371,7 @@ async fn timeline_handler(
         active_lookback_secs: state.stats_config.active_lookback_secs,
         active_timeout_secs: state.stats_config.active_timeout_secs,
         active_tick_timeout_secs: state.stats_config.active_tick_timeout_secs,
+        count_tmux_input: state.stats_config.count_tmux_input,
         filters: TimelineFilters {
             session: query.session,
             agent_kind,

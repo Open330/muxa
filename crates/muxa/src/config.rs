@@ -132,6 +132,18 @@ pub struct StatsConfig {
     /// scrolling while watching an agent from chaining into hours of "active"
     /// time. Applies to both `active` and `work_active`.
     pub active_tick_timeout_secs: u64,
+    /// Whether tmux input ticks (keypress / scrollback, derived from a client's
+    /// `#{client_activity}` advancing between polls) seed ACTIVE windows.
+    ///
+    /// tmux advances `client_activity` for *any* client input — and with
+    /// `mouse on`, that includes mouse motion, wheel, clicks, and focus events,
+    /// which tmux exposes no way to tell apart from a keypress. So a session left
+    /// attached can keep accruing `ACTIVE`/`WORK_ACTIVE` purely from the mouse
+    /// passing over it, even while its agent is idle. Set this to `false` to drop tmux
+    /// ticks entirely and anchor ACTIVE only on deliberate actions — submitted
+    /// prompts and time spent while an agent waits on you (thinking). Default
+    /// `true` keeps the historical behavior (tmux ticks counted).
+    pub count_tmux_input: bool,
 }
 
 impl Default for StatsConfig {
@@ -140,6 +152,7 @@ impl Default for StatsConfig {
             active_lookback_secs: default_active_lookback_secs(),
             active_timeout_secs: default_active_timeout_secs(),
             active_tick_timeout_secs: default_active_tick_timeout_secs(),
+            count_tmux_input: default_count_tmux_input(),
         }
     }
 }
@@ -154,6 +167,10 @@ fn default_active_timeout_secs() -> u64 {
 
 fn default_active_tick_timeout_secs() -> u64 {
     90
+}
+
+fn default_count_tmux_input() -> bool {
+    true
 }
 
 /// `[ui]` config — shared visual defaults for human-facing terminal output.

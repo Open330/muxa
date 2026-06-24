@@ -289,6 +289,10 @@ struct StatsData {
     /// Idle timeout after each *tmux input tick* (keypress / scroll). Shorter than
     /// `active_timeout` so sparse scrolling cannot chain into hours of active time.
     active_tick_timeout: time::Duration,
+    /// Whether tmux input ticks seed ACTIVE windows at all (`[stats]` config). When
+    /// `false`, keypress/scroll ticks are ignored and ACTIVE anchors only on
+    /// submitted prompts and thinking — see `StatsConfig::count_tmux_input`.
+    count_tmux_input: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -501,6 +505,7 @@ async fn load_data(
         active_lookback: secs_to_duration(cfg.stats.active_lookback_secs),
         active_timeout: secs_to_duration(cfg.stats.active_timeout_secs),
         active_tick_timeout: secs_to_duration(cfg.stats.active_tick_timeout_secs),
+        count_tmux_input: cfg.stats.count_tmux_input,
     };
     apply_exclusions(&mut data, exclusions);
     Ok(data)
@@ -1047,8 +1052,17 @@ fn anchor_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInterva
         }
     }
 
-    // (2) tmux input ticks (keypress / scroll while attached).
-    for entry in &data.activity_entries {
+    // (2) tmux input ticks (keypress / scroll while attached). Skipped entirely
+    // when `count_tmux_input` is off: tmux can't distinguish a keypress from mouse
+    // motion/wheel/focus behind `#{client_activity}`, so with `mouse on` these
+    // ticks credit ACTIVE to a session the human only hovered over. Disabling them
+    // leaves prompts and thinking — deliberate actions — as the only ACT anchors.
+    for entry in data
+        .count_tmux_input
+        .then_some(&data.activity_entries)
+        .into_iter()
+        .flatten()
+    {
         let ActivityEntry::HumanInteraction(entry) = entry else {
             continue;
         };
@@ -2981,6 +2995,9 @@ mod tests {
             // assertions are unaffected; tests exercising the shorter tick timeout
             // set this explicitly.
             active_tick_timeout: time::Duration::seconds(300),
+            // Existing tick assertions assume ticks count; the opt-out is exercised
+            // by its own test, which flips this to false.
+            count_tmux_input: true,
         }
     }
 
@@ -3158,6 +3175,22 @@ mod tests {
         assert_eq!(scroll.active_secs, 361);
         // ...but is excluded from hands-on work.
         assert_eq!(scroll.work_active_secs, 0);
+    }
+
+    #[test]
+    fn count_tmux_input_off_drops_tick_active() {
+        // With `count_tmux_input = false`, tmux keypress/scroll ticks seed no ACTIVE
+        // windows at all — only prompts and thinking would. The fixture's only
+        // anchor is a single tick plus an idle attach, so ACTIVE collapses to zero.
+        // This is the opt-out for `mouse on` sessions, where tmux reports mouse
+        // motion/wheel as indistinguishable from a keypress behind client_activity.
+        for kind in [HumanInteractionKind::TmuxInput, HumanInteractionKind::TmuxScroll] {
+            let mut d = data_with_single_tick(kind);
+            d.count_tmux_input = false;
+            let totals = build_totals(&d);
+            assert_eq!(totals.active_secs, 0, "kind={kind:?}");
+            assert_eq!(totals.work_active_secs, 0, "kind={kind:?}");
+        }
     }
 
     #[test]

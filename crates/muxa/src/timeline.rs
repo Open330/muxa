@@ -151,6 +151,11 @@ pub struct TimelineBuildInput<'a> {
     pub active_lookback_secs: u64,
     pub active_timeout_secs: u64,
     pub active_tick_timeout_secs: u64,
+    /// Whether tmux input ticks (keypress / scroll) seed the engaged-ACTIVE lane.
+    /// `false` drops them so ACTIVE anchors only on prompts and thinking — see
+    /// `StatsConfig::count_tmux_input` for why (mouse motion is indistinguishable
+    /// from keypresses behind tmux `#{client_activity}`).
+    pub count_tmux_input: bool,
     pub filters: TimelineFilters,
     pub notes: Vec<String>,
 }
@@ -842,12 +847,19 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
         }
     }
 
-    for entry in input.activity_entries {
+    for entry in input
+        .count_tmux_input
+        .then_some(input.activity_entries)
+        .into_iter()
+        .flatten()
+    {
         let ActivityEntry::HumanInteraction(entry) = entry else {
             continue;
         };
         // Both keypress (TmuxInput) and scrollback (TmuxScroll) ticks count toward
-        // the timeline's engaged-ACTIVE lane.
+        // the timeline's engaged-ACTIVE lane — unless `count_tmux_input` is off, in
+        // which case the loop above never yields (mouse-vs-keypress is ambiguous
+        // behind `#{client_activity}`; see `StatsConfig::count_tmux_input`).
         if !entry.kind.is_input_tick() || !input.range.includes_end(entry.ended_at) {
             continue;
         }
@@ -1504,6 +1516,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1544,6 +1557,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1589,6 +1603,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1663,6 +1678,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1719,6 +1735,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1769,6 +1786,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 90,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1820,6 +1838,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1874,6 +1893,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1924,6 +1944,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -1981,6 +2002,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters {
                 session: None,
                 agent_kind: None,
@@ -2117,6 +2139,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -2154,6 +2177,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });
@@ -2195,6 +2219,7 @@ mod tests {
             active_lookback_secs: 60,
             active_timeout_secs: 300,
             active_tick_timeout_secs: 300,
+            count_tmux_input: true,
             filters: TimelineFilters::default(),
             notes: Vec::new(),
         });

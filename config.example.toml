@@ -76,6 +76,13 @@
 # active_tick_timeout_secs = 90    # idle timeout after a tmux input tick (keypress/scroll);
 #                                  # shorter than prompts so watching/scrolling an agent does
 #                                  # not chain into hours of "active" time
+# count_tmux_input         = true  # whether tmux input ticks (keypress/scroll) count toward
+#                                  # ACTIVE/WORK_ACTIVE at all. tmux advances client_activity
+#                                  # for any client input, and with `mouse on` that includes
+#                                  # mouse motion/wheel/clicks — indistinguishable from a
+#                                  # keypress — so an attached idle session keeps accruing
+#                                  # ACTIVE just from the mouse. Set false to anchor ACTIVE
+#                                  # only on submitted prompts and thinking.
 
 # Logging is controlled via the standard RUST_LOG env var, e.g.:
 #   RUST_LOG=muxa=debug,tokio=warn muxad
