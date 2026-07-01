@@ -3184,7 +3184,10 @@ mod tests {
         // anchor is a single tick plus an idle attach, so ACTIVE collapses to zero.
         // This is the opt-out for `mouse on` sessions, where tmux reports mouse
         // motion/wheel as indistinguishable from a keypress behind client_activity.
-        for kind in [HumanInteractionKind::TmuxInput, HumanInteractionKind::TmuxScroll] {
+        for kind in [
+            HumanInteractionKind::TmuxInput,
+            HumanInteractionKind::TmuxScroll,
+        ] {
             let mut d = data_with_single_tick(kind);
             d.count_tmux_input = false;
             let totals = build_totals(&d);

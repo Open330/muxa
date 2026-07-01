@@ -457,6 +457,23 @@ impl Store {
 
 pub type SharedStore = Arc<Store>;
 
+fn event_touches_activity(agent: &Agent, ev: &AgentEvent) -> bool {
+    match ev {
+        AgentEvent::Heartbeat { .. } => false,
+        AgentEvent::ToolCompleted { .. } => matches!(
+            agent.state,
+            AgentState::Working | AgentState::WaitingInput | AgentState::WaitingChoice
+        ),
+        AgentEvent::ToolStarted { .. } => agent.state != AgentState::Error,
+        AgentEvent::Started { .. }
+        | AgentEvent::PromptSubmitted { .. }
+        | AgentEvent::NotificationFired { .. }
+        | AgentEvent::TurnStopped { .. }
+        | AgentEvent::SessionEnded { .. }
+        | AgentEvent::RateLimited { .. } => true,
+    }
+}
+
 /// Apply one event's mutations to a single agent row, returning side
 /// effects for the caller to fire after dropping the agents write lock.
 ///
@@ -475,20 +492,7 @@ fn mutate_for_event(
     let mut prompt_record: Option<PromptRecord> = None;
     let mut history_entry: Option<HistoryEntry> = None;
     let prev_state = agent.state;
-    let touches_activity = match ev {
-        AgentEvent::Heartbeat { .. } => false,
-        AgentEvent::ToolCompleted { .. } => matches!(
-            agent.state,
-            AgentState::Working | AgentState::WaitingInput | AgentState::WaitingChoice
-        ),
-        AgentEvent::ToolStarted { .. } => agent.state != AgentState::Error,
-        AgentEvent::Started { .. }
-        | AgentEvent::PromptSubmitted { .. }
-        | AgentEvent::NotificationFired { .. }
-        | AgentEvent::TurnStopped { .. }
-        | AgentEvent::SessionEnded { .. }
-        | AgentEvent::RateLimited { .. } => true,
-    };
+    let touches_activity = event_touches_activity(agent, ev);
 
     match ev {
         AgentEvent::Started { .. } => {
