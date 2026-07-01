@@ -10,8 +10,17 @@
 pub mod scanner;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Bound every synchronous tmux shell-out used by watch/status paths.
+///
+/// The async dashboard scanner already has a per-socket timeout. These
+/// wrappers are the older synchronous path used by `muxa watch` and the
+/// daemon reconciler; without a guard, a wedged tmux server can hold the
+/// first watch refresh for many seconds.
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Absolute path to the `tmux` binary, resolved once per process.
 ///
@@ -70,10 +79,43 @@ pub fn tmux_binary() -> &'static Path {
 pub enum TmuxError {
     #[error("running tmux: {0}")]
     Spawn(#[from] std::io::Error),
+    #[error("{command} timed out after {timeout:?}")]
+    Timeout { command: String, timeout: Duration },
     #[error("tmux returned non-zero exit: {0}")]
     NonZero(String),
     #[error("unexpected tmux output: {0}")]
     BadOutput(String),
+}
+
+fn command_output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    command: String,
+) -> Result<Output, TmuxError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(TmuxError::Spawn);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TmuxError::Timeout { command, timeout });
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn tmux_output(args: &[&str]) -> Result<Output, TmuxError> {
+    let mut cmd = tmux_command();
+    cmd.args(args);
+    command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux {}", args.join(" ")),
+    )
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -225,10 +267,7 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
         let Some(sock_str) = sock.to_str() else {
             continue;
         };
-        match tmux_command()
-            .args(["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT])
-            .output()
-        {
+        match tmux_output(&["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT]) {
             Ok(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 all.extend(parse_pane_lines(&stdout));
@@ -243,7 +282,7 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
                 }
             }
             Err(e) => {
-                last_err = Some(TmuxError::Spawn(e));
+                last_err = Some(e);
             }
         }
     }
@@ -256,9 +295,7 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
 }
 
 fn list_panes_bare() -> Result<Vec<PaneInfo>, TmuxError> {
-    let out = tmux_command()
-        .args(["list-panes", "-a", "-F", PANE_FMT])
-        .output()?;
+    let out = tmux_output(&["list-panes", "-a", "-F", PANE_FMT])?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
             String::from_utf8_lossy(&out.stderr).into(),
@@ -269,9 +306,7 @@ fn list_panes_bare() -> Result<Vec<PaneInfo>, TmuxError> {
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
-    let out = tmux_command()
-        .args(["list-sessions", "-F", SESSION_FMT])
-        .output()?;
+    let out = tmux_output(&["list-sessions", "-F", SESSION_FMT])?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
             String::from_utf8_lossy(&out.stderr).into(),
@@ -282,9 +317,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
 }
 
 pub fn list_clients() -> Result<Vec<ClientInfo>, TmuxError> {
-    let out = tmux_command()
-        .args(["list-clients", "-F", CLIENT_FMT])
-        .output()?;
+    let out = tmux_output(&["list-clients", "-F", CLIENT_FMT])?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
             String::from_utf8_lossy(&out.stderr).into(),
@@ -312,9 +345,7 @@ pub fn inside_tmux() -> bool {
 /// status is non-zero, the stderr is short — so callers should treat
 /// `NonZero` as "ephemeral, retry next tick" rather than fatal.
 pub fn capture_pane(pane_id: &str) -> Result<String, TmuxError> {
-    let out = tmux_command()
-        .args(["capture-pane", "-ep", "-t", pane_id])
-        .output()?;
+    let out = tmux_output(&["capture-pane", "-ep", "-t", pane_id])?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
             String::from_utf8_lossy(&out.stderr).into(),
@@ -339,10 +370,7 @@ pub fn current_pane() -> Option<String> {
         return Some(p);
     }
     let target = parse_tmux_session_target(&std::env::var("TMUX").ok()?)?;
-    let out = tmux_command()
-        .args(["display-message", "-p", "-t", &target, "#{pane_id}"])
-        .output()
-        .ok()?;
+    let out = tmux_output(&["display-message", "-p", "-t", &target, "#{pane_id}"]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -392,10 +420,7 @@ pub fn resolve_pane(pane_id: &str) -> Option<PaneInfo> {
 /// treat the empty map as "no fallback available" and proceed with
 /// `pane: None`.
 pub fn pane_pid_map() -> std::collections::HashMap<u32, String> {
-    let out = match tmux_command()
-        .args(["list-panes", "-a", "-F", "#{pane_pid}\t#{pane_id}"])
-        .output()
-    {
+    let out = match tmux_output(&["list-panes", "-a", "-F", "#{pane_pid}\t#{pane_id}"]) {
         Ok(o) if o.status.success() => o.stdout,
         _ => return std::collections::HashMap::new(),
     };
@@ -424,6 +449,37 @@ pub(crate) fn parse_pane_pid_map(stdout: &str) -> std::collections::HashMap<u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_command_returns_fast_output() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "printf ok"]);
+        let out = command_output_with_timeout(
+            cmd,
+            Duration::from_secs(1),
+            "test fast command".to_string(),
+        )
+        .expect("fast command should complete");
+
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    #[test]
+    fn bounded_command_times_out_slow_process() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 2"]);
+        let started = Instant::now();
+        let err = command_output_with_timeout(
+            cmd,
+            Duration::from_millis(50),
+            "test slow command".to_string(),
+        )
+        .expect_err("slow command should time out");
+
+        assert!(matches!(err, TmuxError::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn parses_pane_pid_map_well_formed() {

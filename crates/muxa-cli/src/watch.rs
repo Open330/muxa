@@ -2567,24 +2567,34 @@ async fn compute_refresh(
     // The backend's `list_panes` may shell out (tmux) or hit a cache
     // (zellij + plugin); either way it MUST NOT run on a tokio worker.
     let backend_for_blocking = backend.clone();
-    let panes = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes())
-        .await
-        .unwrap_or_default();
+    let panes_task = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes());
 
-    let sessions = if backend.kind() == muxa::HostKind::Tmux {
-        tokio::task::spawn_blocking(|| muxa::tmux::list_sessions().unwrap_or_default())
-            .await
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let is_tmux = backend.kind() == muxa::HostKind::Tmux;
+    let sessions_task = tokio::task::spawn_blocking(move || {
+        if is_tmux {
+            muxa::tmux::list_sessions().unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    });
+
+    let session_activity_task = async move {
+        match session_activity_path {
+            Some(path) => muxa::session_activity::load(&path).await,
+            None => Vec::new(),
+        }
     };
 
-    let session_activity = match session_activity_path {
-        Some(path) => muxa::session_activity::load(&path).await,
-        None => Vec::new(),
-    };
+    let (panes, sessions, session_activity, snapshot) = tokio::join!(
+        panes_task,
+        sessions_task,
+        session_activity_task,
+        client.snapshot()
+    );
+    let panes = panes.unwrap_or_default();
+    let sessions = sessions.unwrap_or_default();
 
-    let full = match client.snapshot().await {
+    let full = match snapshot {
         Ok(agents) => FullRefresh {
             agents,
             panes,
