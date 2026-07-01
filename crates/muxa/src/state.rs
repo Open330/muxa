@@ -471,10 +471,24 @@ fn mutate_for_event(
     ev: &AgentEvent,
     id: &AgentId,
     at: OffsetDateTime,
-) -> (Option<PromptRecord>, Option<HistoryEntry>) {
+) -> (Option<PromptRecord>, Option<HistoryEntry>, bool) {
     let mut prompt_record: Option<PromptRecord> = None;
     let mut history_entry: Option<HistoryEntry> = None;
     let prev_state = agent.state;
+    let touches_activity = match ev {
+        AgentEvent::Heartbeat { .. } => false,
+        AgentEvent::ToolCompleted { .. } => matches!(
+            agent.state,
+            AgentState::Working | AgentState::WaitingInput | AgentState::WaitingChoice
+        ),
+        AgentEvent::ToolStarted { .. } => agent.state != AgentState::Error,
+        AgentEvent::Started { .. }
+        | AgentEvent::PromptSubmitted { .. }
+        | AgentEvent::NotificationFired { .. }
+        | AgentEvent::TurnStopped { .. }
+        | AgentEvent::SessionEnded { .. }
+        | AgentEvent::RateLimited { .. } => true,
+    };
 
     match ev {
         AgentEvent::Started { .. } => {
@@ -610,7 +624,7 @@ fn mutate_for_event(
         agent.state_entered_at = at;
     }
 
-    (prompt_record, history_entry)
+    (prompt_record, history_entry, touches_activity)
 }
 
 /// Copy the model/cost/limit fields from a `Heartbeat` onto the agent
@@ -919,10 +933,11 @@ impl Store {
         if agent.cwd.is_none() {
             agent.cwd.clone_from(&id.cwd);
         }
-        agent.last_activity_at = at;
-
         let prev_state = agent.state;
-        let (prompt_record, history_entry) = mutate_for_event(agent, ev, id, at);
+        let (prompt_record, history_entry, touches_activity) = mutate_for_event(agent, ev, id, at);
+        if touches_activity {
+            agent.last_activity_at = at;
+        }
 
         if agent.state != prev_state {
             // Wrap the post-transition snapshot in an `Arc` exactly once
@@ -1832,11 +1847,12 @@ mod tests {
         // shouldn't fake activity — only the WaitingInput → Working
         // recovery path is special.
         let store = Store::shared();
-        let now = datetime!(2026-05-05 12:00:00 UTC);
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = datetime!(2026-05-05 12:05:00 UTC);
         store
             .apply(&AgentEvent::Started {
                 id: id("i"),
-                at: now,
+                at: t0,
             })
             .await;
         assert_eq!(store.by_session("i").await.unwrap().state, AgentState::Idle);
@@ -1846,13 +1862,14 @@ mod tests {
                 id: id("i"),
                 tool: "Read".into(),
                 success: true,
-                at: now,
+                at: t1,
             })
             .await;
+        let agent = store.by_session("i").await.unwrap();
+        assert_eq!(agent.state, AgentState::Idle);
         assert_eq!(
-            store.by_session("i").await.unwrap().state,
-            AgentState::Idle,
-            "ToolCompleted must not flip Idle to Working on its own"
+            agent.last_activity_at, t0,
+            "stray ToolCompleted must not refresh ACT for an idle row"
         );
     }
 
@@ -3345,9 +3362,12 @@ mod tests {
             .await;
         let a = store.by_session("h").await.unwrap();
         // Heartbeat carries metadata only, doesn't move state — the
-        // stuck-duration clock must keep ticking from t0.
+        // stuck-duration clock and ACT column must keep ticking from t0.
         assert_eq!(a.state, AgentState::Idle);
         assert_eq!(a.state_entered_at, t0);
+        assert_eq!(a.last_activity_at, t0);
+        assert_eq!(a.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(a.context_used_pct, Some(12.5));
     }
 
     #[tokio::test]
