@@ -36,6 +36,13 @@ function sessionId(ctx: { sessionManager?: { getSessionId?: () => string } }): s
   }
 }
 
+// `__MUXA_BIN__` is substituted at install time by `muxa init` with the
+// absolute path to the `muxa` binary. This matters because the extension
+// runs inside Pi's process, whose PATH may not include ~/.cargo/bin; a
+// bare `spawn("muxa")` would then ENOENT and we'd silently lose every
+// event (the error is swallowed below by design).
+const MUXA_BIN = "__MUXA_BIN__";
+
 // Forward one event object to `muxa hook pi`. Fire-and-forget: errors
 // are swallowed so a down daemon never blocks the agent loop. We spawn
 // detached and unref so the child can never hold Pi's process alive.
@@ -49,7 +56,7 @@ function forward(type: string, payload: Record<string, unknown>, ctx: ExtensionC
       pid: process.pid,
       ...payload,
     });
-    const child = spawn("muxa", ["hook", "pi", "--event", "event"], {
+    const child = spawn(MUXA_BIN, ["hook", "pi", "--event", "event"], {
       stdio: ["pipe", "ignore", "ignore"],
       detached: true,
       env: SOCKET ? { ...process.env, MUXA_SOCKET: SOCKET } : process.env,
@@ -133,9 +140,10 @@ pub fn default_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn upsert(original: &str) -> (String, Outcome) {
-    marker::upsert(original, ID, BODY)
+    let body = BODY.replace("__MUXA_BIN__", &super::super::util::locate_muxa());
+    marker::upsert_with(original, ID, &body, marker::CommentStyle::Slash)
 }
 
 pub fn remove(original: &str) -> (String, Outcome) {
-    marker::remove(original, ID)
+    marker::remove_with(original, ID, marker::CommentStyle::Slash)
 }

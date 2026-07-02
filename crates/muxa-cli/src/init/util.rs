@@ -29,6 +29,32 @@ pub fn default_muxad_socket() -> PathBuf {
     muxa::paths::default_socket()
 }
 
+/// Resolve the absolute path to the `muxa` CLI binary.
+///
+/// Used by integrations that invoke `muxa` from a context where PATH
+/// may not include `~/.cargo/bin` — e.g. a TypeScript extension spawned
+/// inside another agent's process. Mirrors [`locate_muxad`] in
+/// `files/launchd.rs`: PATH first, then the well-known install
+/// locations, finally a bare `muxa` fallback (relies on PATH again).
+pub fn locate_muxa() -> String {
+    if let Ok(path) = which::which("muxa") {
+        return path.to_string_lossy().into_owned();
+    }
+    let candidates: &[PathBuf] = &[
+        dirs::home_dir()
+            .map(|h| h.join(".cargo/bin/muxa"))
+            .unwrap_or_default(),
+        PathBuf::from("/opt/homebrew/bin/muxa"),
+        PathBuf::from("/usr/local/bin/muxa"),
+    ];
+    for cand in candidates {
+        if cand.is_file() {
+            return cand.to_string_lossy().into_owned();
+        }
+    }
+    "muxa".into()
+}
+
 /// Is `muxad` actually serving requests on `socket`? Lightweight: we
 /// just confirm we can establish a unix-socket connection. A
 /// listening daemon accepts the connect immediately; a stale socket

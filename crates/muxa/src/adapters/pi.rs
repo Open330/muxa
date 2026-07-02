@@ -92,20 +92,6 @@ pub fn normalize_event(input: Value, fallback_pane: Option<String>) -> AgentEven
             success: !has_error(&input),
             at,
         },
-        // turn_end doubles as the per-turn heartbeat carrier: the
-        // extension attaches model + cost here once per turn instead of
-        // per streamed message, keeping daemon churn low.
-        "turn_end" => AgentEvent::Heartbeat {
-            id,
-            model: first_string(&input, &["model", "model_id"]),
-            context_used_pct: first_percent(&input, &["context_used_pct", "context_used"]),
-            cost_usd: first_number(&input, &["cost_usd", "cost"]),
-            rate_limit_5h_pct: None,
-            rate_limit_5h_resets_at: None,
-            rate_limit_7d_pct: None,
-            rate_limit_7d_resets_at: None,
-            at,
-        },
         "agent_end" => AgentEvent::TurnStopped {
             id,
             response: first_string(&input, &["response", "content"]),
@@ -122,8 +108,11 @@ pub fn normalize_event(input: Value, fallback_pane: Option<String>) -> AgentEven
             ),
             at,
         },
-        // Everything else collapses to a plain Heartbeat so the daemon
-        // refreshes `last_activity_at` without polluting the state machine.
+        // Everything else — including `turn_end`, which the extension
+        // attaches model + cost to once per turn instead of per streamed
+        // message to keep daemon churn low — collapses to a Heartbeat so
+        // the daemon refreshes `last_activity_at` without polluting the
+        // state machine.
         _ => AgentEvent::Heartbeat {
             id,
             model: first_string(&input, &["model", "model_id"]),
