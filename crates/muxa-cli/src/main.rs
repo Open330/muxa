@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{
-    claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
+    claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter, PiAdapter,
 };
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
@@ -222,6 +222,11 @@ enum HookCmd {
     },
     /// opencode hook handler.
     Opencode {
+        #[arg(long)]
+        event: String,
+    },
+    /// Pi coding agent hook handler.
+    Pi {
         #[arg(long)]
         event: String,
     },
@@ -934,6 +939,10 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
         HookCmd::Opencode { event } => {
             let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;
+            best_effort_ingest(client, &ev).await;
+        }
+        HookCmd::Pi { event } => {
+            let ev = run_hook::<PiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
         }
     }

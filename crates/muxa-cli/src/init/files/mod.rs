@@ -11,6 +11,7 @@ pub mod dashboard;
 pub mod gemini;
 pub mod launchd;
 pub mod opencode;
+pub mod pi;
 pub mod shellrc;
 pub mod systemd;
 pub mod tmux;

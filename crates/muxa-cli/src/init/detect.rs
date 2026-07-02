@@ -22,6 +22,7 @@ pub struct Detection {
     pub claude_settings: Option<PathBuf>,
     pub codex_config: Option<PathBuf>,
     pub gemini_settings: Option<PathBuf>,
+    pub pi_agent_dir: Option<PathBuf>,
     pub muxad_running: bool,
     pub systemd_user_available: bool,
     pub launchctl_available: bool,
@@ -36,6 +37,7 @@ impl Detection {
             claude_settings: existing_file(home_join(".claude/settings.json")),
             codex_config: existing_file(home_join(".codex/config.toml")),
             gemini_settings: existing_file(home_join(".gemini/settings.json")),
+            pi_agent_dir: existing_dir(home_join(".pi/agent")),
             muxad_running: muxad_is_running(),
             systemd_user_available: super::files::systemd::systemd_available(),
             launchctl_available: super::files::launchd::launchctl_available(),
@@ -58,6 +60,9 @@ impl Detection {
         }
         if self.gemini_settings.is_some() {
             out.push(Component::GeminiHooks);
+        }
+        if self.pi_agent_dir.is_some() {
+            out.push(Component::PiHooks);
         }
         // Pre-check the daemon-manager that fits this host so the
         // wizard's default produces a working install. The picker
@@ -126,6 +131,14 @@ fn tool_version(name: &str, args: &[&str]) -> Option<String> {
 
 fn existing_file(p: PathBuf) -> Option<PathBuf> {
     if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn existing_dir(p: PathBuf) -> Option<PathBuf> {
+    if p.is_dir() {
         Some(p)
     } else {
         None

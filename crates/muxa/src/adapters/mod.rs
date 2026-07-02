@@ -15,6 +15,7 @@ pub mod codex_rollout;
 pub mod gemini;
 pub mod hook;
 pub mod opencode;
+pub mod pi;
 pub mod proc_ancestry;
 pub mod transcript;
 
@@ -24,3 +25,4 @@ pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
 pub use opencode::OpencodeAdapter;
+pub use pi::PiAdapter;

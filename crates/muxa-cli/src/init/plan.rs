@@ -103,6 +103,7 @@ pub fn build(
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
             Component::GeminiHooks => plan_gemini(direction, *c, &mut actions)?,
             Component::OpencodeHooks => plan_opencode(direction, *c, &mut actions)?,
+            Component::PiHooks => plan_pi(direction, *c, &mut actions)?,
             Component::MuxadSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
             Component::MuxadLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
             Component::MuxadShellrc => plan_shellrc(direction, *c, &mut actions)?,
@@ -175,6 +176,30 @@ fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) 
     let (after, outcome) = match direction {
         Direction::Install => files::opencode::upsert(&original),
         Direction::Uninstall => files::opencode::remove(&original),
+    };
+    actions.push(Action::EditFile {
+        component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+/// Install/uninstall the Pi extension. Uses the same marker-block
+/// upsert/remove pattern as opencode: the extension file is owned by
+/// muxa but the marker fence lets `--uninstall` strip only our block,
+/// preserving anything the user appended by hand.
+fn plan_pi(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::pi::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => files::pi::upsert(&original),
+        Direction::Uninstall => files::pi::remove(&original),
     };
     actions.push(Action::EditFile {
         component: c,

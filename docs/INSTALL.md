@@ -7,7 +7,7 @@ This page keeps the detailed install and wiring notes out of the README.
 - Rust 1.88+
 - tmux 3.x
 - Unix-like OS
-- One supported agent CLI: Claude Code, OpenAI Codex, or Google Gemini CLI
+- One supported agent CLI: Claude Code, OpenAI Codex, Google Gemini CLI, or Pi
 
 ## One-Shot Install
 
@@ -137,6 +137,7 @@ hook commands without overwriting existing user hooks.
 | Claude Code | Merge `examples/claude-settings.json` into `~/.claude/settings.json`. |
 | OpenAI Codex | Add the `[[hooks.*]]` blocks documented in `crates/muxa/src/adapters/codex.rs`. |
 | Google Gemini CLI | Merge the hooks from `crates/muxa/src/adapters/gemini.rs` into `~/.gemini/settings.json`. |
+| Pi | Drop the extension body from `crates/muxa-cli/src/init/files/pi.rs` at `~/.pi/agent/extensions/muxa/index.ts`. |
 
 ## Verify
 

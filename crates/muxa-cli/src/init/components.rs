@@ -21,6 +21,8 @@ pub enum Component {
     GeminiHooks,
     /// opencode plugin event bridge
     OpencodeHooks,
+    /// Pi coding agent extension bridge
+    PiHooks,
     /// `muxad` user-level systemd service (Linux only)
     MuxadSystemd,
     /// `muxad` `launchd` `LaunchAgent` (macOS only)
@@ -41,6 +43,7 @@ impl Component {
         Component::CodexHooks,
         Component::GeminiHooks,
         Component::OpencodeHooks,
+        Component::PiHooks,
         Component::MuxadSystemd,
         Component::MuxadLaunchd,
         Component::MuxadShellrc,
@@ -56,6 +59,7 @@ impl Component {
             Component::CodexHooks => "codex-hooks",
             Component::GeminiHooks => "gemini-hooks",
             Component::OpencodeHooks => "opencode-hooks",
+            Component::PiHooks => "pi-hooks",
             Component::MuxadSystemd => "muxad-systemd",
             Component::MuxadLaunchd => "muxad-launchd",
             Component::MuxadShellrc => "muxad-shellrc",
@@ -76,6 +80,7 @@ impl Component {
             Component::CodexHooks => "OpenAI Codex: shell hooks",
             Component::GeminiHooks => "Gemini CLI: shell hooks",
             Component::OpencodeHooks => "opencode: plugin event bridge",
+            Component::PiHooks => "Pi coding agent: extension event bridge",
             Component::MuxadSystemd => "muxad: systemd user service (auto-start on login)",
             Component::MuxadLaunchd => "muxad: launchd LaunchAgent (auto-start on login)",
             Component::MuxadShellrc => "muxad: shellrc autostart hook (no service manager)",
@@ -92,6 +97,7 @@ impl Component {
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
             Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",
             Component::OpencodeHooks => "installs ~/.config/opencode/plugins/muxa.ts",
+            Component::PiHooks => "installs ~/.pi/agent/extensions/muxa/index.ts",
             Component::MuxadSystemd => "Linux only; skipped on macOS / launchd hosts",
             Component::MuxadLaunchd => "macOS only; skipped on Linux / systemd hosts",
             Component::MuxadShellrc => "appends to ~/.zshrc or ~/.bashrc; cross-platform",
@@ -136,6 +142,7 @@ impl Component {
                 Component::CodexHooks,
                 Component::GeminiHooks,
                 Component::OpencodeHooks,
+                Component::PiHooks,
                 dm,
             ],
             Preset::Full => {

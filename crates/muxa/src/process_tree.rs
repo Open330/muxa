@@ -226,6 +226,7 @@ fn display_command(proc: &ProcInfo, kind: WorkloadProcessKind) -> String {
                 AgentKind::Codex => "codex".to_string(),
                 AgentKind::GeminiCli => "gemini".to_string(),
                 AgentKind::Opencode => "opencode".to_string(),
+                AgentKind::Pi => "pi".to_string(),
                 AgentKind::Task | AgentKind::Unknown => command_name(&proc.comm).to_string(),
             };
         }

@@ -132,6 +132,7 @@ Patterns are case-sensitive and support `*` and `?`, e.g.
 | Claude Code | Supported | `~/.claude/settings.json` |
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
 | Google Gemini CLI | Supported | `~/.gemini/settings.json` |
+| Pi | Supported | `~/.pi/agent/extensions/muxa/index.ts` |
 | opencode | Planned | [tracking issue](https://github.com/Open330/muxa/issues/14) |
 
 ## More Docs

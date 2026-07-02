@@ -22,6 +22,10 @@ pub enum AgentKind {
     Opencode,
     Codex,
     GeminiCli,
+    /// Pi coding agent (earendil-works/pi-coding-agent). Wired via an
+    /// in-process TypeScript extension that forwards lifecycle events to
+    /// `muxa hook pi`, mirroring the opencode plugin model.
+    Pi,
     /// A non-agent background process (shell script, game, automation loop,
     /// or a `muxa run` PTY child) registered via `muxa register` / the
     /// `Register` IPC. Tracked by pid liveness rather than tmux pane
