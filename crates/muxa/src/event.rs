@@ -67,6 +67,10 @@ pub enum SurfaceKind {
     Tmux,
     Zellij,
     Pty,
+    /// A pane inside the cmux native macOS multiplexer. The `id` is the
+    /// cmux surface UUID (from `$CMUX_SURFACE_ID`), used by the cmux
+    /// sink to target `cmux notify --surface`.
+    Cmux,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -58,15 +58,24 @@ where
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
-    let surface = muxa_session_env();
-    let pane = if surface.is_some() {
+    // muxa-owned PTY sessions (MUXA_SESSION_ID) genuinely have no host
+    // pane — the session IS the surface — so we suppress pane lookup only
+    // for that case. A cmux surface (CMUX_SURFACE_ID) is *additive*
+    // identity metadata: it must not blank out a real tmux pane, because
+    // the two are independent (an agent can run in tmux nested inside
+    // cmux, and even standalone cmux terminals report no tmux pane
+    // anyway, so the suppression would be a no-op in production but a
+    // footgun in tests that leak CMUX_SURFACE_ID into subprocesses).
+    let muxa_surface = muxa_session_env();
+    let cmux_surface = cmux_surface_env();
+    let pane = if muxa_surface.is_some() {
         None
     } else {
         host_pane_env()
             .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()))
     };
     let mut ev = A::normalize(event, input, pane);
-    if let Some(surface) = surface {
+    if let Some(surface) = muxa_surface.or(cmux_surface) {
         ev.id_mut().surface = Some(surface);
     }
     Ok(ev)
@@ -83,6 +92,24 @@ fn muxa_session_env() -> Option<SurfaceRef> {
         _ => SurfaceKind::Pty,
     };
     Some(SurfaceRef { kind, id })
+}
+
+/// Detect a cmux surface identity from the environment.
+///
+/// cmux sets `$CMUX_SURFACE_ID` in every terminal it spawns. When a
+/// hook fires inside a cmux pane, we attach it as the event's surface
+/// so the cmux sink can target `cmux notify --surface <id>` back to the
+/// exact pane the agent is running in. Sibling to [`muxa_session_env`]
+/// (muxa-owned PTYs); the two are mutually exclusive in practice and
+/// the muxa-PTY path wins because it is the more specific identity.
+fn cmux_surface_env() -> Option<SurfaceRef> {
+    let id = std::env::var("CMUX_SURFACE_ID")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some(SurfaceRef {
+        kind: SurfaceKind::Cmux,
+        id,
+    })
 }
 
 /// Read whichever host-set "this pane" env var is present, in

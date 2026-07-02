@@ -19,8 +19,10 @@
 //! because the only consumer (`muxad`) calls each impl by name and the
 //! shapes diverge enough that a uniform interface would be premature.
 
+pub mod cmux;
 pub mod ohmyprompt;
 pub mod webhook;
 
+pub use cmux::{CmuxError, CmuxSink};
 pub use ohmyprompt::{OhMyPromptError, OhMyPromptSink};
 pub use webhook::{WebhookError, WebhookSink};

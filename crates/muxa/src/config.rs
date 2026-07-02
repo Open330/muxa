@@ -220,6 +220,7 @@ pub enum IconSet {
 pub struct SinksConfig {
     pub oh_my_prompt: OhMyPromptToml,
     pub webhook: WebhookToml,
+    pub cmux: CmuxToml,
 }
 
 /// `[sinks.oh_my_prompt]` raw TOML schema. The daemon resolves these
@@ -271,6 +272,28 @@ pub struct WebhookToml {
     /// Per-`(kind, session_id, state)` rate-limit window in seconds.
     /// Defaults to 60. Set to 0 to disable (one notification per
     /// transition, even if the agent flaps).
+    pub rate_limit_secs: Option<u64>,
+}
+
+/// `[sinks.cmux]` raw TOML schema. The daemon resolves these fields
+/// against defaults via `CmuxSink::resolve` at startup. Unlike the
+/// webhook sink, cmux needs no endpoint: it shells out to the local
+/// `cmux` CLI, which auto-discovers the cmux socket. Notifications are
+/// targeted at the originating surface via the agent's `SurfaceRef`
+/// (populated from `$CMUX_SURFACE_ID` by the hook adapter).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CmuxToml {
+    pub enabled: Option<bool>,
+    /// Path to the `cmux` binary. Defaults to `cmux` (resolved via
+    /// PATH); set explicitly when muxad runs with a PATH that doesn't
+    /// include the cmux app bundle's bin directory.
+    pub binary: Option<String>,
+    /// State transitions to forward. Defaults to the same
+    /// attention-needing set as the webhook sink.
+    pub on_states: Option<Vec<String>>,
+    /// Per-`(kind, session_id, state)` rate-limit window in seconds.
+    /// Defaults to 60. Set to 0 to disable.
     pub rate_limit_secs: Option<u64>,
 }
 

@@ -14,6 +14,7 @@ required credentials.
 | Name                | Purpose                                              | Section                                  |
 | ------------------- | ---------------------------------------------------- | ---------------------------------------- |
 | `oh_my_prompt`      | Forward `PromptSubmitted` events to an omp instance. | [`oh-my-prompt`](#oh-my-prompt)          |
+| `cmux`              | Surface attention-needing state transitions as cmux sidebar notifications. | [`cmux`](#cmux) |
 
 ## oh-my-prompt
 
@@ -133,3 +134,37 @@ intentionally never blocks ingest because the omp endpoint is slow.
   endpoint has been unreachable long enough that 1000 records piled
   up. Fix the upstream and the sink will recover; older prompts are
   permanently lost.
+
+## cmux
+
+The cmux sink forwards agent state transitions to the [cmux](https://cmux.com/)
+native macOS multiplexer's sidebar via `cmux notify`. When an agent
+transitions into an attention-needing state (defaults:
+`WaitingInput`, `WaitingChoice`, `Error`), muxa runs
+`cmux notify --title <kind> --subtitle <state> --body <prompt> --surface <id>`
+targeted at the exact cmux surface the agent is running in.
+
+### Setup
+
+```toml
+[sinks.cmux]
+enabled = true
+# Optional: override if muxad's PATH doesn't include the cmux app bundle.
+# binary = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+# Optional: which states trigger a notification (defaults shown).
+# on_states = ["WaitingInput", "WaitingChoice", "Error"]
+# Optional: per-(agent, state) rate-limit seconds. Default 60.
+# rate_limit_secs = 60
+```
+
+The sink resolves the target surface from each agent's `surface`
+identity, which the hook adapter populates from `$CMUX_SURFACE_ID`
+(set by cmux in every terminal it spawns). Agents without a cmux
+surface (running under tmux/zellij) are skipped — there is no useful
+cmux target for them.
+
+Verify:
+
+```bash
+cmux list-notifications   # notifications forwarded by the sink appear here
+```
