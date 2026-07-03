@@ -463,8 +463,28 @@ impl Drop for RawModeGuard {
 
 async fn attach_session(client: &Client, session_id: &str) -> Result<()> {
     let _guard = RawModeGuard::enter()?;
+
+    // Enable bracketed paste in the parent terminal. When active, the
+    // terminal wraps clipboard pastes (Cmd+V) in \e[2004 ... \e[2014,
+    // which crossterm surfaces as `Event::Paste`. Without this, paste
+    // content gets mangled or dropped while we relay stdin to the
+    // muxa-owned PTY. Disabled again on drop regardless of outcome.
+    {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(b"\x1b[?2004h")?;
+        stdout.flush()?;
+    }
+
     client.set_session_attached(session_id, true).await?;
     let result = attach_session_loop(client, session_id).await;
+
+    // Restore the terminal's bracketed-paste state on the way out.
+    {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(b"\x1b[?2004l");
+        let _ = stdout.flush();
+    }
+
     let detach_result = client.set_session_attached(session_id, false).await;
     match (result, detach_result) {
         (Err(e), _) => Err(e),
@@ -493,6 +513,13 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
 
         while crossterm::event::poll(Duration::ZERO)? {
             match crossterm::event::read()? {
+                // Bracketed-paste payloads from the parent terminal.
+                // Relay verbatim to the PTY, converting LF -> CR to match
+                // how a physical Enter key is encoded for the child.
+                Event::Paste(text) => {
+                    let input = text.replace('\n', "\r");
+                    client.write_session(session_id, &input).await?;
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if detach_armed {
                         detach_armed = false;
@@ -528,6 +555,15 @@ fn is_detach_prefix(key: crossterm::event::KeyEvent) -> bool {
 
 fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Ignore Cmd (SUPER) key combos. On macOS the parent terminal owns
+    // clipboard/shortcut handling; if crossterm still surfaces such an
+    // event we must not emit the bare character into the PTY, otherwise
+    // Cmd+V would type a literal "v" instead of pasting.
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        return None;
+    }
+
     Some(match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let lower = c.to_ascii_lowercase();
