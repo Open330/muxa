@@ -20,6 +20,8 @@ set -euo pipefail
 : "${MUXA_SOCKET:=/tmp/muxa-demo.sock}"
 TMUX_LBL=muxa-demo
 SHIM_DIR=/tmp/muxa-demo-shim
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PAINT="$SCRIPT_DIR/demo-paint.sh"  # believable agent frames instead of bare `cat`
 
 rfc3339_ago() {
   local seconds="$1"
@@ -32,14 +34,17 @@ rfc3339_ago() {
 
 # 1) PATH shim — every later `tmux` call (ours and muxa's children) routes
 #    through `tmux -L muxa-demo`.
+# Real tmux binary, resolved absolutely so it bypasses the PATH shim below.
+# Docker/CI has it at /usr/bin/tmux; a Homebrew mac has it elsewhere, so the
+# tape passes MUXA_DEMO_TMUX after resolving `command -v tmux` pre-shim.
+TM="${MUXA_DEMO_TMUX:-/usr/bin/tmux}"
+
 mkdir -p "$SHIM_DIR"
 cat > "$SHIM_DIR/tmux" <<EOF
 #!/bin/sh
-exec /usr/bin/tmux -u -L $TMUX_LBL "\$@"
+exec $TM -u -L $TMUX_LBL "\$@"
 EOF
 chmod +x "$SHIM_DIR/tmux"
-
-TM=/usr/bin/tmux  # use absolute path here so we don't depend on PATH ordering
 
 # 2) Isolated demo server.
 #    - main:0 runs an interactive bash with a dead-simple rcfile so we
@@ -58,9 +63,11 @@ BASHRC
 # `-d` keeps the current window as main:0 — without it new-window switches
 # focus to itself, so attach would land on `vim` (cat-stdin) instead of
 # the bash pane.
-"$TM" -u -L "$TMUX_LBL" new-window -d -t main: -n review cat
+# `review` hosts codex mid-approval — this is where `muxa attend` lands, so it
+# paints a believable approval prompt instead of an empty shell.
+"$TM" -u -L "$TMUX_LBL" new-window -d -t main: -n review "bash '$PAINT' codex"
 "$TM" -u -L "$TMUX_LBL" new-window -d -t main: -n vim    cat
-"$TM" -u -L "$TMUX_LBL" new-session -d -s ops  -x 200 -y 40 cat
+"$TM" -u -L "$TMUX_LBL" new-session -d -s ops  -x 200 -y 40 "bash '$PAINT' gemini"
 "$TM" -u -L "$TMUX_LBL" new-window -d -t ops:  -n logs cat
 "$TM" -u -L "$TMUX_LBL" new-session -d -s lab  -x 200 -y 40 cat
 # Belt-and-suspenders: be explicit about which window the recording

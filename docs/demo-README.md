@@ -11,8 +11,24 @@ to re-record it.
 | ---------------------- | ------------------------------------------------------------------------------------- |
 | `docs/demo.tape`       | [VHS](https://github.com/charmbracelet/vhs) script — the recording itself.            |
 | `docs/demo-setup.sh`   | Bootstraps an isolated `tmux -L muxa-demo` server with a few seeded panes + windows.  |
+| `docs/demo-paint.sh`   | Paints believable static agent frames (claude/codex/gemini) into the demo panes so `muxa attend` / attach land on real-looking content instead of an empty `cat`. |
 | `docs/demo-seed.sh`    | Older pane-seed script (kept for reference; the live setup script does this inline).  |
-| `docs/demo.gif`        | The output. 1200 × 720; includes status, stats, activity, and the session watch view. |
+| `docs/demo.gif`        | The output. 1200 × 720; the status → stats → watch → attend story arc.                |
+
+## Story arc
+
+The recording is a four-beat narrative, not a feature tour — the point is
+to make "which of my agents needs me?" felt, then answered:
+
+1. **Overwhelm** — `muxa status`: claude working, codex blocked on an
+   approval, gemini waiting.
+2. **The accountant** — `muxa stats`: where the day actually went
+   (WORK / WAIT / TMUX / ACT / THINK).
+3. **The god view** — `prefix + s` → `muxa watch`, every agent on one
+   screen, with the real prompt + response in the preview popup.
+4. **The finale** — `muxa attend` teleports the tmux client straight to
+   the longest-blocked agent (codex, mid shell-approval). Strongest note
+   to end on, so it comes last: attend moves us off the shell pane.
 
 The tape's prelude (`Hide` block) does the boring setup so the visible
 recording stays focused on the muxa UI:
@@ -74,9 +90,10 @@ docker cp ~/.cargo/bin/muxa  "$CID":/usr/local/bin/muxa
 docker cp ~/.cargo/bin/muxad "$CID":/usr/local/bin/muxad
 docker cp docs/demo.tape       "$CID":/work/docs/demo.tape
 docker cp docs/demo-setup.sh   "$CID":/work/docs/demo-setup.sh
+docker cp docs/demo-paint.sh   "$CID":/work/docs/demo-paint.sh
 docker cp docs/demo-seed.sh    "$CID":/work/docs/demo-seed.sh
 
-# 4) Record. The visible flow shows status, stats, activity, and watch.
+# 4) Record. The visible flow shows status, stats, watch, and attend.
 docker exec -w /work "$CID" vhs docs/demo.tape
 
 # 5) Pull the resulting GIF out and tear the container down.
@@ -105,7 +122,7 @@ docker exec -w /src "$CID" sh -c \
 
 A few patterns that come up:
 
-* **Pacing**: the visible flow targets ~17 s. `Sleep` durations are in
+* **Pacing**: the visible flow targets ~19 s. `Sleep` durations are in
   milliseconds; ~1500 ms after a key gives the viewer time to read,
   ~500 ms is right between consecutive keystrokes.
 * **New key in muxa watch**: add the keystroke after `Type "p"` /
