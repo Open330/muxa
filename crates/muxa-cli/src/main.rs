@@ -514,10 +514,22 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
         while crossterm::event::poll(Duration::ZERO)? {
             match crossterm::event::read()? {
                 // Bracketed-paste payloads from the parent terminal.
-                // Relay verbatim to the PTY, converting LF -> CR to match
-                // how a physical Enter key is encoded for the child.
+                // crossterm strips the `CSI 200~` / `CSI 201~` framing
+                // before surfacing `Event::Paste`, so we must re-wrap the
+                // payload in those delimiters before writing it to the
+                // child PTY. Otherwise a multi-line paste reaches the
+                // child as bare text with LF→CR per line, and any line
+                // the child treats as a complete input gets executed
+                // immediately — a shell paste like `ls\nrm -rf x` would
+                // run both commands instead of sitting on the prompt
+                // for review. Restoring the framing lets a child that
+                // itself understands bracketed paste buffer the whole
+                // blob as one input.
                 Event::Paste(text) => {
-                    let input = text.replace('\n', "\r");
+                    let mut input = String::with_capacity(text.len() + 12);
+                    input.push_str("\x1b[200~");
+                    input.push_str(&text.replace('\n', "\r"));
+                    input.push_str("\x1b[201~");
                     client.write_session(session_id, &input).await?;
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {

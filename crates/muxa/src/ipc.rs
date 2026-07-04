@@ -422,6 +422,18 @@ impl Server {
 fn downgrade_wire(v: &mut serde_json::Value, protocol: u32) {
     match v {
         serde_json::Value::String(s) => {
+            // `pi` AgentKind is a v4 addition → Unknown for older peers.
+            if protocol < 4 && s == "pi" {
+                *s = "unknown".to_string();
+            }
+            // `cmux` SurfaceKind is a v4 addition. Downgrade to `pty`,
+            // the closest non-host surface: like cmux it is not a
+            // tmux/zellij pane, so a v3 client's host-pane reconciler
+            // still treats it as non-reapable. The id is opaque to the
+            // older client and harmlessly ignored.
+            if protocol < 4 && s == "cmux" {
+                *s = "pty".to_string();
+            }
             // `task` AgentKind is a v3 addition → Unknown for older peers.
             if protocol < 3 && s == "task" {
                 *s = "unknown".to_string();
@@ -1206,7 +1218,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AgentEvent, AgentId, AgentKind, AgentState};
+    use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, SurfaceKind, SurfaceRef};
     use crate::state::Store;
     use tempfile::tempdir;
     use time::OffsetDateTime;
@@ -1723,6 +1735,75 @@ mod tests {
         let snap_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         let agents = snap_resp["agents"].as_array().unwrap();
         assert_eq!(agents[0]["state"], "waiting_choice");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// v4 enum variants (`pi` `AgentKind`, `cmux` `SurfaceKind`) must be
+    /// downgraded for a v3-negotiated client so its deserializer doesn't
+    /// fall back to an empty agent list. `pi` → `unknown`, `cmux` →
+    /// `pty` (closest non-host surface; keeps the host-pane reconciler
+    /// from reaping it).
+    #[tokio::test]
+    async fn v3_hello_downgrades_pi_and_cmux_in_snapshot() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-v4-downgrade.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let id = AgentId {
+            kind: AgentKind::Pi,
+            session_id: "pi-v4-test".into(),
+            surface: Some(SurfaceRef {
+                kind: SurfaceKind::Cmux,
+                id: "cmux-surface-1".into(),
+            }),
+            pane: Some("%7".into()),
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut hello = serde_json::to_vec(&serde_json::json!({
+            "protocol": 3, "kind": "hello", "client": "v3-test",
+        }))
+        .unwrap();
+        hello.push(b'\n');
+        stream.write_all(&hello).await.unwrap();
+        let mut snap = serde_json::to_vec(&serde_json::json!({ "kind": "snapshot" })).unwrap();
+        snap.push(b'\n');
+        stream.write_all(&snap).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap(); // hello ack
+        line.clear();
+        reader.read_line(&mut line).await.unwrap(); // snapshot
+        let snap_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let agents = snap_resp["agents"].as_array().unwrap();
+        // The agent must still be visible (not dropped by a deser
+        // failure) and its v4-only variants rewritten.
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["kind"], "unknown");
+        assert_eq!(agents[0]["surface"]["kind"], "pty");
+        assert!(
+            !line.contains("\"pi\""),
+            "v3 snapshot still contains pi kind: {line}"
+        );
+        assert!(
+            !line.contains("\"cmux\""),
+            "v3 snapshot still contains cmux surface: {line}"
+        );
 
         tx.send(()).unwrap();
         handle.await.unwrap();

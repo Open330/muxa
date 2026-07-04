@@ -404,6 +404,7 @@ fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
         "codex" => Ok(AgentKind::Codex),
         "gemini_cli" => Ok(AgentKind::GeminiCli),
         "opencode" => Ok(AgentKind::Opencode),
+        "pi" => Ok(AgentKind::Pi),
         "unknown" => Ok(AgentKind::Unknown),
         _ => Err(format!("unknown agent kind {raw:?}")),
     }
