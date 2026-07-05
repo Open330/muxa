@@ -14,6 +14,15 @@ ignore = [
     # Revisit when zellij-tile moves off clap 3.
     "RUSTSEC-2024-0370", # proc-macro-error
     "RUSTSEC-2024-0375", # atty
+    # Transitive through notify-rust -> tauri-winrt-notification -> quick-xml.
+    # tauri-winrt-notification is a Windows-only (WinRT toast) dependency, so
+    # quick-xml is not compiled into muxa on the Unix targets we ship. Both are
+    # DoS-on-untrusted-XML issues; muxa never feeds attacker-controlled XML to
+    # this crate (Windows notification templates only), and tauri-winrt-notification
+    # 0.7.2 pins quick-xml ^0.37 so the fixed 0.41 can't be selected yet.
+    # Revisit when notify-rust ships a tauri-winrt-notification that allows quick-xml >=0.41.
+    "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute names
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation (NsReader)
 ]
 
 [licenses]

@@ -1,30 +1,18 @@
-# muxa demo script — regenerate `docs/demo.gif` via:
+# muxa demo — "which of your agents needs you right now?"
 #
-#   vhs docs/demo.tape
+#   vhs docs/demo.tape   →   docs/demo.gif
 #
-# Requires charmbracelet/vhs, ttyd, ffmpeg, and a Chromium-based browser.
-# docs/demo-setup.sh handles the muxad + tmux bootstrap so this file
-# stays focused on the recording.
+# Story arc (see docs/demo-README.md):
+#   0–3s   overwhelm     — muxa status: claude working, codex blocked, gemini waiting
+#   3–7s   the accountant — muxa stats: where the day actually went
+#   7–12s  the god view  — prefix+s → muxa watch, all agents one screen, with the
+#                          real prompt/response in the preview
+#   12–17s the finale    — `muxa attend` teleports to the longest-blocked agent
+#                          (codex, mid shell-approval) — the strongest note to end on
 #
-# Visible flow (the recording starts already attached to tmux):
-#   1. muxa status                — table, run from inside the tmux pane
-#   2. muxa stats                 — duration summary with WORK/WAIT/HUMAN/THINK
-#   3. muxa activity              — raw human interaction intervals
-#   4. prefix + s                 — muxa watch session dashboard
-#                                   Cursor lands on the current session
-#                                   thanks to `set_initial_pane`, so the
-#                                   preview acts on a row with real prompt
-#                                   + response data.
-#   5. p                          — open the preview popup over the table
-#   6. j j                        — scroll the assistant response inside
-#                                   the popup to show the multi-line body
-#   7. f                          — toggle full-screen for long content
-#   8. f                          — back to popup
-#   9. q                          — close preview, back to picker
-#  10. j / k                      — walk the session list, watch the detail
-#                                   line update for each row
-#  11. Enter                      — switch to the selected pane
-#  12. prefix + d                 — detach
+# Depends on docs/demo-setup.sh painting the codex/gemini panes with
+# docs/demo-paint.sh instead of bare `cat`, so attend/attach land on a
+# believable agent frame rather than an empty shell.
 
 Output docs/demo.gif
 
@@ -37,9 +25,12 @@ Set Theme "GitHub Dark"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
-# Prelude — invisible setup. We attach to the demo tmux server inside
-# this same shell so the recording starts already inside tmux.
+# ── Prelude — invisible setup (same isolation as the old tape) ───────────
 Hide
+# Resolve the real tmux BEFORE the shim shadows it on PATH, so attach/detach
+# work whether tmux lives at /usr/bin (Docker/CI) or Homebrew (mac).
+Type "export MUXA_DEMO_TMUX=$(command -v tmux)"
+Enter
 Type "export PATH=$HOME/.cargo/bin:/tmp/muxa-demo-shim:$PATH"
 Enter
 Type "export LANG=C.UTF-8"
@@ -64,7 +55,7 @@ Type "theme = 'high-contrast'"
 Enter
 Type "view = 'session'"
 Enter
-Type "sort = ['session']"
+Type "sort = ['state']"
 Enter
 Type "[watch.preview]"
 Enter
@@ -86,97 +77,64 @@ Enter
 Sleep 300ms
 Type "clear"
 Enter
-# Attach in-place so the recording opens already inside the tmux session.
-# `exec` replaces the bash, so vhs records the tmux UI directly.
-Type "exec /usr/bin/tmux -u -L muxa-demo attach -t main:0"
+Type "exec $MUXA_DEMO_TMUX -u -L muxa-demo attach -t main:0"
 Enter
 Sleep 1500ms
 Show
 
-# 1. muxa status — read the data, from inside the tmux pane. The
-#    status-right at the top already reflects this pane's agent state,
-#    so the viewer sees both surfaces at once.
+# All shell commands run FIRST, from the main:0 bash pane, so nothing is
+# ever typed into a non-shell (painted) pane. `muxa attend` teleports us
+# away for the finale, so it must come last.
+
+# ── 1. Overwhelm (0–3s) ──────────────────────────────────────────────────
+# status-right at the top already shows this pane's agent glyph. The table
+# makes the fleet legible: one working, one blocked on approval, one waiting.
 Type "muxa status"
 Enter
-Sleep 2200ms
+Sleep 3000ms
 
-# 2. muxa stats — show that muxa is more than live status. The demo seed
-#    writes activity.ndjson intervals, so WORK / WAIT / HUMAN / THINK are
-#    already populated instead of waiting for a long recording.
+# ── 2. The accountant (3–7s) ─────────────────────────────────────────────
+# muxa also quantifies the day: how long agents worked, how long they sat
+# blocked on you, how long you actually spent driving.
 Type "clear"
 Enter
 Type "muxa stats --since today --limit 4"
 Enter
 Sleep 3200ms
 
-# 3. muxa activity — raw ledger view for debugging stats/report inputs.
+# ── 3. The god view (7–12s) ──────────────────────────────────────────────
+# prefix + s pops muxa watch. sort=['state'] floats blocked/error agents to
+# the top; the status gutter shows multi/single/bare sessions at a glance.
 Type "clear"
 Enter
-Type "muxa activity --since today --type human --limit 4"
-Enter
-Sleep 2600ms
-
-Type "clear"
-Enter
-
-# 4. prefix + s — pop the muxa watch session dashboard. This is the
-#    "switch" experience: same gesture as tmux's stock prefix + s, but
-#    with agent-aware session rows. Cursor lands on the current session
-#    via `set_initial_pane`, and the status gutter shows multi-agent,
-#    single-agent, and bare sessions without moving the session names.
 Ctrl+B
 Type "s"
 Sleep 2200ms
-
-# 5. p — open the preview popup. The selected claude row has a real
-#    prompt + a multi-paragraph assistant response (seeded via fake
-#    transcript), so the popup body is full of content rather than
-#    `—` placeholders.
+# p — preview the highlighted agent's real prompt + response body
+# (default_content=prompt_response), then q q back out to the shell.
 Type "p"
-Sleep 2400ms
-
-# 6. j j — scroll the assistant response inside the popup so the
-#    viewer sees the body wraps and scrolls as expected.
-Type "j"
-Sleep 600ms
-Type "j"
-Sleep 1200ms
-
-# 7. f — toggle full-screen for long content where the popup wraps too
-#    aggressively. Footer hint flips to "f popup" so the next press is
-#    self-documenting.
-Type "f"
-Sleep 1700ms
-
-# 8. f — back to popup.
-Type "f"
-Sleep 1000ms
-
-# 9. q — close the preview, return to the picker.
+Sleep 2600ms
 Type "q"
-Sleep 700ms
+Sleep 400ms
+Type "q"
+Sleep 600ms
 
-# 10. Walk a row or two so the detail line updates for each highlight —
-#     showcases the `{last_response|last_prompt}` fallback while keeping
-#     the compact session status gutter aligned.
-Type "j"
-Sleep 1000ms
-Type "k"
-Sleep 800ms
-
-# 11. Enter — switch the client to the selected pane. The popup closes
-#    and tmux pulls us into the chosen window.
+# ── 4. The finale — teleport to whoever needs you (12–17s) ───────────────
+# Don't hunt across windows. One command jumps the tmux client to whichever
+# agent has been blocked the longest — here, codex on the shell approval.
+# demo-paint.sh has painted a real-looking approval prompt, so the teleport
+# lands somewhere that reads as genuine. Strongest note to end on.
+Type "muxa attend"
 Enter
-Sleep 1500ms
-
-# 12. Detach — clean exit out of the demo server.
+Sleep 700ms
+Sleep 3200ms
 Ctrl+B
 Type "d"
 Sleep 600ms
 
-# Postlude — tear down everything.
+# ── Postlude — tear everything down ──────────────────────────────────────
 Hide
-Type "/usr/bin/tmux -u -L muxa-demo kill-server 2>/dev/null"
+Type "$MUXA_DEMO_TMUX -u -L muxa-demo kill-server 2>/dev/null"
 Enter
 Type "kill %1 2>/dev/null"
 Enter
