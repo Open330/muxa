@@ -83,6 +83,11 @@ thinking에서 온 경우에만 셉니다. scrollback tick은 engaged `ACT`에�
 있지만 `WACT`에는 들어가지 않으므로 각 row의 `WACT`는 해당 row의 `ACT`를
 넘지 않습니다.
 
+기본 terminal table은 일부러 좁게 유지하며 그룹명, `WACT`, `ACT`, `WORK`,
+`WAIT`, `BLK`, `PROMPTS`, `LAST`를 보여줍니다. 나머지 진단 컬럼이 필요할
+때는 `--verbose`를 사용하세요. JSON과 Markdown 출력에는 전체 field set이
+유지됩니다.
+
 표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
 `--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.
 
@@ -126,8 +131,13 @@ TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
 
 ## Stats 컬럼
 
+기본 terminal table은 핵심 review 컬럼을 표시합니다. 나머지 진단 컬럼은
+terminal 출력에서 `--verbose`를 붙였을 때 보이며, JSON과 Markdown export에는
+항상 포함됩니다.
+
 | Column | 기준 |
 | ------ | ---- |
+| `PROMPTS` | 선택한 범위에서 daemon history에 남아 있는 prompt 수. |
 | `WORK` | agent working 상태에 머문 시간. |
 | `WAIT` | input/choice 를 기다린 시간. |
 | `ERR` | error 상태에 머문 시간. agent 가 quota/rate-limit 류 block 을 error 로 보고하면 여기에 포함됩니다. |
@@ -136,7 +146,8 @@ TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
 | `THINK` | attention 상태와 human presence 가 겹친 시간. |
 | `ACT` | prompt, tmux input tick, thinking으로 추정한 engaged human time. |
 | `WACT` | `ACT`의 hands-on subset. scrollback이 소유한 engaged time은 제외합니다. |
-| `BLOCK` | Waiting/Error attention 상태로 진입한 횟수. |
+| `BLOCK` / `BLK` | Waiting/Error attention 상태로 진입한 횟수. |
+| `LAST` | 해당 group에서 가장 최근 retained prompt가 얼마나 오래됐는지. |
 
 `THINK`는 `HUMAN`보다 의도적으로 좁습니다. agent 가 attention 을 필요로 하는
 상태(`WaitingInput`, `WaitingChoice`, `Error`)이고, 동시에 human presence 가

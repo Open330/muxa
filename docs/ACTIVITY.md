@@ -101,6 +101,11 @@ the winning window came from a prompt, keypress, or thinking span. Scrollback
 ticks can still count as engaged `ACT`, but not as `WACT`, so every row's
 `WACT` stays within that row's `ACT`.
 
+The default terminal table is intentionally narrow and shows the core review
+columns: group name, `WACT`, `ACT`, `WORK`, `WAIT`, `BLK`, `PROMPTS`, and
+`LAST`. Use `--verbose` when you need the remaining diagnostic columns. JSON
+and Markdown output keep the full field set.
+
 The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows
 above it.
@@ -144,8 +149,13 @@ details, see [docs/TIMELINE.md](TIMELINE.md).
 
 ## Stats Columns
 
+The default terminal table shows the core review columns. Remaining diagnostic
+columns are shown in terminal output with `--verbose` and are always present in
+JSON and Markdown exports.
+
 | Column | Source |
 | ------ | ------ |
+| `PROMPTS` | Prompt count retained in daemon history for the selected range. |
 | `WORK` | Time spent in agent working states. |
 | `WAIT` | Time spent waiting for input or choice. |
 | `ERR` | Time spent in error states, including quota/rate-limit style blocks when the agent reports them as error. |
@@ -154,7 +164,8 @@ details, see [docs/TIMELINE.md](TIMELINE.md).
 | `THINK` | Overlap of attention states with human presence. |
 | `ACT` | Engaged human time from prompts, tmux input ticks, and thinking. |
 | `WACT` | Hands-on subset of `ACT`; excludes scrollback-owned engaged time. |
-| `BLOCK` | Count of transitions into Waiting/Error attention states. |
+| `BLOCK` / `BLK` | Count of transitions into Waiting/Error attention states. |
+| `LAST` | Age of the latest retained prompt in the group. |
 
 `THINK` is intentionally narrower than `HUMAN`. It counts time where the
 agent needs attention (`WaitingInput`, `WaitingChoice`, or `Error`) and

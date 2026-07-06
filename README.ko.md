@@ -86,8 +86,8 @@ muxa watch
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
-| `muxa stats --since today` | day/project/agent/session 단위 summary. `--graph`를 추가하면 WACT 시간 그래프만 표시. |
-| `muxa report --since week` | day/project/agent/session 모든 breakdown을 테이블로 표시 (`--json` / `--markdown`로 export). |
+| `muxa stats --since today` | WACT/ACT/WORK/WAIT 중심 summary. day/project/agent/session 단위로 묶을 수 있고, `--graph`는 WACT 시간 그래프만, `--verbose`는 진단 컬럼을 표시. |
+| `muxa report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |

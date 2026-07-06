@@ -72,9 +72,10 @@ pub struct Args {
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
 
-    /// Print the full explanatory notes (methodology for THINK/ACTIVE, the
-    /// retained-history window, ledger fallbacks). Without this, the table
-    /// only reports that notes exist. JSON/markdown always include them.
+    /// Print diagnostic table columns plus the full explanatory notes
+    /// (methodology for THINK/ACTIVE, the retained-history window, ledger
+    /// fallbacks). Without this, the table focuses on ACT/WACT and only
+    /// reports that notes exist. JSON/markdown always include all fields.
     #[arg(long, short = 'v', default_value_t = false)]
     verbose: bool,
 }
@@ -116,9 +117,10 @@ pub struct ReportArgs {
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
 
-    /// Print the full explanatory notes (methodology for THINK/ACTIVE, the
-    /// retained-history window, ledger fallbacks). Without this, the tables
-    /// only report that notes exist. JSON/markdown always include them.
+    /// Print diagnostic table columns plus the full explanatory notes
+    /// (methodology for THINK/ACTIVE, the retained-history window, ledger
+    /// fallbacks). Without this, the tables focus on ACT/WACT and only report
+    /// that notes exist. JSON/markdown always include all fields.
     #[arg(long, short = 'v', default_value_t = false)]
     verbose: bool,
 }
@@ -2164,8 +2166,11 @@ fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
     if doc.rows.is_empty() {
         println!("no retained prompts, live agents, or tracked session activity in this view");
     } else {
-        println!("{}", render_stats_table(doc, terminal_width, theme));
-        if stats_table_layout(terminal_width) != StatsTableLayout::Full {
+        println!(
+            "{}",
+            render_stats_table(doc, terminal_width, theme, verbose)
+        );
+        if verbose && stats_table_layout(terminal_width) != StatsTableLayout::Full {
             println!("{}", compaction_hint());
         }
     }
@@ -2191,8 +2196,11 @@ fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) 
         if doc.rows.is_empty() {
             println!("no rows in this view");
         } else {
-            println!("{}", render_stats_table(doc, terminal_width, theme));
-            compacted |= stats_table_layout(terminal_width) != StatsTableLayout::Full;
+            println!(
+                "{}",
+                render_stats_table(doc, terminal_width, theme, verbose)
+            );
+            compacted |= verbose && stats_table_layout(terminal_width) != StatsTableLayout::Full;
         }
         println!();
     }
@@ -2215,7 +2223,7 @@ fn print_range_header(title: &str, doc: &StatsDocument) {
 }
 
 fn compaction_hint() -> &'static str {
-    "note: Table compacted for terminal width; use --json or --markdown for every column."
+    "note: Diagnostic table compacted for terminal width; use --json or --markdown for every field."
 }
 
 fn print_notes(notes: &[String], verbose: bool, verbose_cmd: &str) {
@@ -2459,6 +2467,105 @@ const FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
     },
 ];
 
+const SUMMARY_FULL_STATS_COLUMNS: &[StatsTableColumn] = &[
+    StatsTableColumn {
+        header: "WACT",
+        width: 6,
+        value: StatsColumn::WorkActive,
+    },
+    StatsTableColumn {
+        header: "ACT",
+        width: 6,
+        value: StatsColumn::Active,
+    },
+    StatsTableColumn {
+        header: "WORK",
+        width: 6,
+        value: StatsColumn::Working,
+    },
+    StatsTableColumn {
+        header: "WAIT",
+        width: 6,
+        value: StatsColumn::Waiting,
+    },
+    StatsTableColumn {
+        header: "BLK",
+        width: 5,
+        value: StatsColumn::AttentionEvents,
+    },
+    StatsTableColumn {
+        header: "PROMPTS",
+        width: 7,
+        value: StatsColumn::Prompts,
+    },
+    StatsTableColumn {
+        header: "LAST",
+        width: 7,
+        value: StatsColumn::LastPromptAge,
+    },
+];
+
+const SUMMARY_COMPACT_STATS_COLUMNS: &[StatsTableColumn] = &[
+    StatsTableColumn {
+        header: "WACT",
+        width: 6,
+        value: StatsColumn::WorkActive,
+    },
+    StatsTableColumn {
+        header: "ACT",
+        width: 6,
+        value: StatsColumn::Active,
+    },
+    StatsTableColumn {
+        header: "WORK",
+        width: 6,
+        value: StatsColumn::Working,
+    },
+    StatsTableColumn {
+        header: "WAIT",
+        width: 6,
+        value: StatsColumn::Waiting,
+    },
+    StatsTableColumn {
+        header: "BLK",
+        width: 5,
+        value: StatsColumn::AttentionEvents,
+    },
+    StatsTableColumn {
+        header: "PRM",
+        width: 5,
+        value: StatsColumn::Prompts,
+    },
+    StatsTableColumn {
+        header: "LAST",
+        width: 7,
+        value: StatsColumn::LastPromptAge,
+    },
+];
+
+const SUMMARY_MINIMAL_STATS_COLUMNS: &[StatsTableColumn] = &[
+    StatsTableColumn {
+        header: "WACT",
+        width: 6,
+        value: StatsColumn::WorkActive,
+    },
+    StatsTableColumn {
+        header: "ACT",
+        width: 6,
+        value: StatsColumn::Active,
+    },
+    StatsTableColumn {
+        header: "PRM",
+        width: 5,
+        value: StatsColumn::Prompts,
+    },
+    StatsTableColumn {
+        header: "LAST",
+        width: 7,
+        value: StatsColumn::LastPromptAge,
+    },
+];
+
 const COMPACT_STATS_COLUMNS: &[StatsTableColumn] = &[
     StatsTableColumn {
         header: "PRM",
@@ -2525,9 +2632,14 @@ const MINIMAL_STATS_COLUMNS: &[StatsTableColumn] = &[
     },
 ];
 
-fn render_stats_table(doc: &StatsDocument, terminal_width: usize, theme: CliTheme) -> String {
+fn render_stats_table(
+    doc: &StatsDocument,
+    terminal_width: usize,
+    theme: CliTheme,
+    verbose: bool,
+) -> String {
     let layout = stats_table_layout(terminal_width);
-    let columns = stats_table_columns(layout);
+    let columns = stats_table_columns(layout, verbose);
     let group_width = stats_group_column_width(terminal_width, columns);
     let mut table = Table::new();
     let mut constraints = Vec::with_capacity(columns.len() + 1);
@@ -2656,11 +2768,14 @@ fn stats_table_layout(terminal_width: usize) -> StatsTableLayout {
     }
 }
 
-fn stats_table_columns(layout: StatsTableLayout) -> &'static [StatsTableColumn] {
-    match layout {
-        StatsTableLayout::Full => FULL_STATS_COLUMNS,
-        StatsTableLayout::Compact => COMPACT_STATS_COLUMNS,
-        StatsTableLayout::Minimal => MINIMAL_STATS_COLUMNS,
+fn stats_table_columns(layout: StatsTableLayout, verbose: bool) -> &'static [StatsTableColumn] {
+    match (verbose, layout) {
+        (true, StatsTableLayout::Full) => FULL_STATS_COLUMNS,
+        (true, StatsTableLayout::Compact) => COMPACT_STATS_COLUMNS,
+        (true, StatsTableLayout::Minimal) => MINIMAL_STATS_COLUMNS,
+        (false, StatsTableLayout::Full) => SUMMARY_FULL_STATS_COLUMNS,
+        (false, StatsTableLayout::Compact) => SUMMARY_COMPACT_STATS_COLUMNS,
+        (false, StatsTableLayout::Minimal) => SUMMARY_MINIMAL_STATS_COLUMNS,
     }
 }
 
@@ -3914,7 +4029,7 @@ mod tests {
     fn stats_table_appends_total_footer() {
         let d = sort_fixture();
         let doc = build_document(&d, GroupBy::Project, 0, SortKey::Prompts, false, false);
-        let rendered = render_stats_table(&doc, 140, CliTheme::plain());
+        let rendered = render_stats_table(&doc, 140, CliTheme::plain(), false);
 
         let lines: Vec<&str> = rendered.lines().collect();
         let total_idx = lines
@@ -4167,7 +4282,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_table_compacts_without_wrapping_at_88_cols() {
+    fn stats_table_verbose_compacts_without_wrapping_at_88_cols() {
         let mut p = prompt(
             AgentKind::Codex,
             "agent-a",
@@ -4189,7 +4304,7 @@ mod tests {
         let d = data(vec![p, long]);
         let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
 
-        let rendered = render_stats_table(&doc, 88, CliTheme::plain());
+        let rendered = render_stats_table(&doc, 88, CliTheme::plain(), true);
 
         assert!(rendered.contains("PRM"));
         assert!(!rendered.contains("TOK EST"));
@@ -4205,7 +4320,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_table_full_layout_keeps_all_columns_when_wide() {
+    fn stats_table_summary_layout_keeps_review_columns_when_wide() {
         let mut p = prompt(
             AgentKind::Codex,
             "agent-a",
@@ -4218,15 +4333,53 @@ mod tests {
         let d = data(vec![p]);
         let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
 
-        let rendered = render_stats_table(&doc, 140, CliTheme::plain());
+        let rendered = render_stats_table(&doc, 140, CliTheme::plain(), false);
 
+        assert!(rendered.contains("ACT"));
+        assert!(rendered.contains("WACT"));
+        assert!(rendered.contains("WORK"));
+        assert!(rendered.contains("WAIT"));
+        assert!(rendered.contains("BLK"));
+        assert!(rendered.contains("PROMPTS"));
+        assert!(rendered.contains("LAST"));
+        assert!(!rendered.contains("ERR"));
+        assert!(!rendered.contains("TMUX"));
+        assert!(!rendered.contains("HUMAN"));
+        assert!(!rendered.contains("THINK"));
+        assert!(!rendered.contains("TOK EST"));
+        assert!(!rendered.contains("AGENTS"));
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 140,
+                "line exceeded summary table width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_table_verbose_layout_keeps_diagnostic_columns_when_wide() {
+        let mut p = prompt(
+            AgentKind::Codex,
+            "agent-a",
+            "%1",
+            Some("/home/june/muxa"),
+            "hello",
+            datetime!(2026-05-30 11:00:00 UTC),
+        );
+        p.tmux_session = Some("callabo-auto-label".into());
+        let d = data(vec![p]);
+        let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
+
+        let rendered = render_stats_table(&doc, 140, CliTheme::plain(), true);
+
+        assert!(rendered.contains("WORK"));
         assert!(rendered.contains("TOK EST"));
         assert!(rendered.contains("ACT"));
         assert!(rendered.contains("AGENTS"));
         for line in rendered.lines() {
             assert!(
                 UnicodeWidthStr::width(line) <= 140,
-                "line exceeded full table width: {line:?}"
+                "line exceeded verbose table width: {line:?}"
             );
         }
     }

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.15] - 2026-07-06
+
+### Added
+
+- `muxa stats --graph` now renders a graph-only WACT timeline with buckets that
+  adapt to the selected range.
+- `muxa dashboard` adds a session-card TUI for live capture, prompt composition,
+  and session ACT/WACT totals.
+
+### Changed
+
+- `muxa stats` table output is now focused by default, showing
+  `WACT`/`ACT`/`WORK`/`WAIT`/`BLK`/`PROMPTS`/`LAST`; `--verbose` keeps the
+  diagnostic columns.
+- ACTIVE/WACT attribution is tighter and can exclude mouse-driven tmux ticks via
+  `[stats] count_tmux_input`.
+- `muxa watch` surfaces pane workload trees and bounds tmux refresh calls.
+
+### Fixed
+
+- Restored CI checks and ignored quick-xml advisories from the Windows-only
+  notify dependency path.
+
 ## [0.8.14] - 2026-06-16
 
 ### Fixed
@@ -1129,7 +1152,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.14...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.15...HEAD
+[0.8.15]: https://github.com/Open330/muxa/compare/v0.8.14...v0.8.15
 [0.8.14]: https://github.com/Open330/muxa/compare/v0.8.13...v0.8.14
 [0.8.13]: https://github.com/Open330/muxa/compare/v0.8.12...v0.8.13
 [0.8.12]: https://github.com/Open330/muxa/compare/v0.8.11...v0.8.12
