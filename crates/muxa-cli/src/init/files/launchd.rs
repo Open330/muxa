@@ -45,6 +45,15 @@ pub fn render_plist(muxad_path: &str) -> String {
     s.push_str("  <true/>\n");
     s.push_str("  <key>ProcessType</key>\n");
     s.push_str("  <string>Background</string>\n");
+    // Raise the file-descriptor soft limit well above launchd's stingy
+    // default (256 on macOS). The daemon caps concurrent IPC handlers below
+    // this, so it's headroom, not a hard reliance — but a 256-fd ceiling is
+    // exactly what let a burst of hung hook connections wedge `accept()`.
+    s.push_str("  <key>SoftResourceLimits</key>\n");
+    s.push_str("  <dict>\n");
+    s.push_str("    <key>NumberOfFiles</key>\n");
+    s.push_str("    <integer>4096</integer>\n");
+    s.push_str("  </dict>\n");
     s.push_str("  <key>StandardOutPath</key>\n");
     s.push_str("  <string>/tmp/muxad.log</string>\n");
     s.push_str("  <key>StandardErrorPath</key>\n");

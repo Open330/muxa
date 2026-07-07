@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.16] - 2026-07-07
+
+### Fixed
+
+- **`muxad` could wedge into refusing every connection after a burst of hung
+  hook clients.** Each agent tool call spawns a short-lived `muxa hook`
+  connection; under a stall these accumulated on the daemon with no bound,
+  and once the process hit its file-descriptor soft limit (256 on macOS
+  launchd) `accept()` began returning `EMFILE` — which propagated out of the
+  accept loop and killed it, leaving a live-but-deaf daemon. Hardened the IPC
+  server so this failure mode is no longer reachable:
+  - `accept()` errors are non-fatal: on `EMFILE`/`ENFILE` the loop logs and
+    backs off briefly instead of exiting, so the listener always recovers.
+  - Concurrent connection handlers are capped by a semaphore well under the fd
+    budget; connections over budget are shed immediately rather than queued.
+  - The per-connection request loop has an idle-read timeout, so a client that
+    connects but never sends a complete request (or `EOF`) can't pin an fd.
+  - `Subscribe` streams emit a periodic keepalive so a dead `muxa watch` client
+    is detected and reaped promptly instead of lingering on an idle daemon.
+  - The launchd plist / systemd unit now raise the fd soft limit to 4096 as
+    defense-in-depth.
+
+- **Hooks could block the agent's critical path when the daemon was slow or
+  wedged.** `muxa hook` ingest had no timeout, so a stalled daemon stalled the
+  agent (observed: hook processes blocked for minutes, one per tool call). The
+  IPC client now bounds every round trip — a tight deadline for hook ingest
+  (fail fast to a best-effort no-op) and a general deadline for all other
+  queries and the subscribe handshake — so a degraded daemon can never hang a
+  caller.
+
+- **`muxad` did not exit promptly on `SIGTERM` during startup discovery**,
+  adding a multi-second tail to every restart and pushing operators toward
+  `SIGKILL` (which in turn wedged launchd's relaunch). Startup discovery now
+  races against the shutdown signal and is cancelled cleanly.
+
 ## [0.8.15] - 2026-07-06
 
 ### Added

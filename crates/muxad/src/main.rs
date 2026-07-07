@@ -281,7 +281,7 @@ async fn main() -> Result<()> {
     // `muxa init` after every daemon or tmux server restart.
     if listener_ready {
         maybe_heal_tmux_socket_env(&socket, cfg.socket.as_deref());
-        spawn_startup_discovery(&cfg, socket.clone(), backend.clone());
+        spawn_startup_discovery(&cfg, socket.clone(), backend.clone(), &shutdown_tx);
         spawn_periodic_discovery(&cfg, socket.clone(), backend.clone(), &shutdown_tx);
     }
 
@@ -1059,30 +1059,52 @@ fn should_heal_tmux_socket_env(
 /// Returns `true` when a task was spawned. Extracted from `main` so tests
 /// can drive both branches of the `discovery.enabled` flag without having
 /// to spawn the real daemon.
-fn spawn_startup_discovery(cfg: &Config, socket: PathBuf, backend: muxa::SharedBackend) -> bool {
+fn spawn_startup_discovery(
+    cfg: &Config,
+    socket: PathBuf,
+    backend: muxa::SharedBackend,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> bool {
     if !cfg.discovery.enabled {
         tracing::debug!("startup discovery disabled by config");
         return false;
     }
+    let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         // Small grace so the listener's `accept` loop is actually running
         // by the time we connect. The 250 ms figure matches the design
         // doc — anything less is racy on slower hosts, anything more
         // delays the visible backfill needlessly.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let client = Client::new(socket);
-        match discovery::run_discovery(&client, backend.as_ref()).await {
-            Ok(report) => {
-                tracing::info!(
-                    claude_code = report.claude_code,
-                    codex = report.codex,
-                    gemini_cli = report.gemini_cli,
-                    skipped_known = report.skipped_known,
-                    failed = report.failed,
-                    "startup discovery complete",
-                );
+        //
+        // Race the grace sleep AND the discovery pass against shutdown: a
+        // SIGTERM arriving mid-discovery must not keep the process alive for
+        // the full scan (which used to add a ~13 s tail to every restart and
+        // pushed operators toward SIGKILL, wedging launchd's relaunch).
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::debug!("startup discovery cancelled before start (shutdown)");
+                return;
             }
-            Err(e) => tracing::warn!(error = %e, "startup discovery failed"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
+        let client = Client::new(socket);
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::debug!("startup discovery cancelled mid-pass (shutdown)");
+            }
+            result = discovery::run_discovery(&client, backend.as_ref()) => match result {
+                Ok(report) => {
+                    tracing::info!(
+                        claude_code = report.claude_code,
+                        codex = report.codex,
+                        gemini_cli = report.gemini_cli,
+                        skipped_known = report.skipped_known,
+                        failed = report.failed,
+                        "startup discovery complete",
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "startup discovery failed"),
+            },
         }
     });
     true
@@ -1179,10 +1201,12 @@ mod tests {
             },
             ..Config::default()
         };
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let spawned = spawn_startup_discovery(
             &cfg,
             PathBuf::from("/tmp/never-bound.sock"),
             muxa::default_backend(),
+            &shutdown_tx,
         );
         assert!(spawned, "discovery should spawn when enabled");
     }
@@ -1196,10 +1220,12 @@ mod tests {
             },
             ..Config::default()
         };
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let spawned = spawn_startup_discovery(
             &cfg,
             PathBuf::from("/tmp/never-bound.sock"),
             muxa::default_backend(),
+            &shutdown_tx,
         );
         assert!(!spawned, "discovery must not spawn when disabled");
     }

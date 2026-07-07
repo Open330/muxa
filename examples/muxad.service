@@ -9,6 +9,11 @@ ExecStart=%h/.cargo/bin/muxad
 Restart=on-failure
 RestartSec=2
 
+# Headroom above the default fd limit. The daemon caps concurrent IPC
+# handlers below this, so it's a safety margin rather than a hard reliance —
+# but a low ceiling is what let a burst of hung hook connections wedge accept().
+LimitNOFILE=4096
+
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true

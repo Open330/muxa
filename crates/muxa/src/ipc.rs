@@ -44,6 +44,37 @@ use tokio::task::JoinSet;
 const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upper bound on concurrent connection handlers. Kept well under the
+/// daemon's file-descriptor budget so a burst — or a leak — of handlers can
+/// never drive `accept()` into `EMFILE` and wedge the whole listener the way
+/// a runaway of hung hook connections once did. Connections over budget are
+/// shed immediately rather than queued.
+const MAX_INFLIGHT_HANDLERS: usize = 256;
+
+/// How long a connection may sit between requests without sending a complete
+/// line before the handler closes it. Generous enough that a legitimately
+/// idle persistent client is never dropped mid-session, tight enough that a
+/// client which connects and never sends EOF cannot pin a file descriptor
+/// indefinitely. Does not apply to the streaming pump — a `Subscribe`
+/// connection leaves the request loop entirely (see [`stream_transitions`]).
+const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cadence of keepalive writes on a `Subscribe` stream. A dead watch client
+/// that has stopped reading is detected on the next keepalive write (broken
+/// pipe) instead of lingering until the next real transition — bounding a
+/// dead stream's fd lifetime to roughly one interval.
+const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Overall deadline for a client request/response round trip (connect +
+/// hello + write + read). No caller should ever block forever against a
+/// wedged or half-dead daemon.
+const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Tighter deadline for hook ingest, which runs on the agent's critical path
+/// (every prompt / every tool call). A wedged daemon must never stall the
+/// agent, so fail fast and let `best_effort_ingest` treat it as a no-op.
+const HOOK_CALL_TIMEOUT: Duration = Duration::from_millis(750);
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("i/o error: {0}")]
@@ -63,6 +94,9 @@ pub enum RuntimeError {
 
     #[error("ipc message exceeds {0} bytes")]
     MessageTooLarge(usize),
+
+    #[error("ipc request timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,15 +379,59 @@ impl Server {
         tracing::info!(socket = %self.socket_path.display(), "listening");
 
         let mut handlers: JoinSet<()> = JoinSet::new();
+        // Fixed budget of concurrent handlers. A permit is held for the
+        // lifetime of each handler and released when it ends, so live fds
+        // from handlers can never exceed `MAX_INFLIGHT_HANDLERS` — keeping
+        // the process comfortably below its fd limit no matter how many
+        // clients (or hung hooks) pile up.
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDLERS));
 
         loop {
             tokio::select! {
                 accept = listener.accept() => {
-                    let (stream, _) = accept?;
+                    let (stream, _) = match accept {
+                        Ok(pair) => pair,
+                        Err(e) if is_fd_exhaustion(&e) => {
+                            // Out of file descriptors. Do NOT propagate: a
+                            // returned error kills the accept loop and wedges
+                            // the daemon into refusing every connection
+                            // forever (the failure mode this whole change
+                            // exists to prevent). Back off briefly so we
+                            // neither spin at 100% CPU nor starve in-flight
+                            // handlers of the CPU they need to free fds.
+                            tracing::error!(
+                                error = %e,
+                                inflight = MAX_INFLIGHT_HANDLERS - permits.available_permits(),
+                                "accept hit fd exhaustion; backing off",
+                            );
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            // Per-connection errors (client aborted mid-accept,
+                            // etc.) are transient; log and keep serving.
+                            tracing::warn!(error = %e, "accept error; continuing");
+                            continue;
+                        }
+                    };
+                    // Shed load past the budget instead of queuing it. Dropping
+                    // the stream closes the fd immediately; well-behaved clients
+                    // retry, and hook clients (bounded by HOOK_CALL_TIMEOUT)
+                    // treat it as a soft no-op.
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        tracing::warn!(
+                            limit = MAX_INFLIGHT_HANDLERS,
+                            "handler budget exhausted; shedding connection",
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     let store = self.store.clone();
                     let backend = self.backend.clone();
                     let sessions = self.sessions.clone();
                     handlers.spawn(async move {
+                        // Held for the handler's lifetime; released here on exit.
+                        let _permit = permit;
                         if let Err(e) = handle(stream, store, backend, sessions).await {
                             tracing::warn!(error = %e, "connection handler failed");
                         }
@@ -505,23 +583,45 @@ async fn stream_transitions(
     protocol: u32,
 ) -> Result<(), RuntimeError> {
     let mut rx = store.subscribe();
+    // Periodic keepalive so a watch client that dies without a clean close is
+    // detected on the next write (broken pipe) rather than lingering until the
+    // next real transition — which, on an idle daemon, might be never.
+    let mut keepalive = tokio::time::interval(STREAM_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick fires immediately; consume it so we don't emit a
+    // keepalive the instant the stream opens.
+    keepalive.tick().await;
     loop {
-        match rx.recv().await {
-            Ok(t) => {
-                let bytes = encode_line(&t, protocol)?;
-                if writer.write_all(&bytes).await.is_err() {
+        tokio::select! {
+            recv = rx.recv() => match recv {
+                Ok(t) => {
+                    let bytes = encode_line(&t, protocol)?;
+                    if writer.write_all(&bytes).await.is_err() {
+                        return Ok(());
+                    }
+                    if writer.flush().await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        dropped = n,
+                        "subscribe lagged; client will reconcile via fallback poll"
+                    );
+                }
+            },
+            _ = keepalive.tick() => {
+                // A bare newline: an empty line the client's stream reader
+                // skips (see `TransitionStream::recv`). Its only purpose is to
+                // provoke a write error against a dead peer so this task exits
+                // and frees the fd.
+                if writer.write_all(b"\n").await.is_err() {
                     return Ok(());
                 }
                 if writer.flush().await.is_err() {
                     return Ok(());
                 }
-            }
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(
-                    dropped = n,
-                    "subscribe lagged; client will reconcile via fallback poll"
-                );
             }
         }
     }
@@ -548,7 +648,20 @@ async fn handle(
 
     loop {
         line.clear();
-        let n = read_limited_line(&mut reader, &mut line).await?;
+        // Bound the wait for the *next* request line. A client that connects
+        // and then neither sends a complete request nor closes its half would
+        // otherwise park this handler — and pin its fd — forever. A live
+        // persistent client simply reconnects; a half-open one can't leak.
+        // (A `Subscribe` connection never reaches a second iteration: it hands
+        // off to `stream_transitions` and returns, so streams are unaffected.)
+        let Ok(read_result) =
+            tokio::time::timeout(IDLE_CONN_TIMEOUT, read_limited_line(&mut reader, &mut line))
+                .await
+        else {
+            tracing::debug!("idle connection timed out; closing");
+            return Ok(());
+        };
+        let n = read_result?;
         if n == 0 {
             return Ok(());
         }
@@ -809,6 +922,16 @@ async fn handle(
     }
 }
 
+/// True for the "too many open files" family of `accept()` errors:
+/// `EMFILE` (this process hit its fd limit) or `ENFILE` (system-wide table
+/// full). Both are transient — shedding load frees descriptors — so the
+/// accept loop backs off and retries rather than treating them as fatal.
+fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    // `ErrorKind` has no stable variant for either, so match the raw errno.
+    // EMFILE = 24, ENFILE = 23 on both Linux and macOS.
+    matches!(e.raw_os_error(), Some(24 | 23))
+}
+
 /// After `UnixListener::bind`, chmod the path so only the owner can connect.
 pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
@@ -833,14 +956,24 @@ pub struct TransitionStream {
 
 impl TransitionStream {
     /// Wait for and return the next streamed `Transition`.
+    ///
+    /// Blank lines are the daemon's keepalive frames (a bare newline it emits
+    /// on an idle stream to detect dead clients); they carry no payload, so we
+    /// skip them and keep waiting for the next real transition.
     pub async fn recv(&mut self) -> Result<Option<crate::state::Transition>, RuntimeError> {
-        self.line.clear();
-        let n = read_limited_line(&mut self.reader, &mut self.line).await?;
-        if n == 0 {
-            return Ok(None);
+        loop {
+            self.line.clear();
+            let n = read_limited_line(&mut self.reader, &mut self.line).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let trimmed = self.line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let t: crate::state::Transition = serde_json::from_str(trimmed)?;
+            return Ok(Some(t));
         }
-        let t: crate::state::Transition = serde_json::from_str(self.line.trim())?;
-        Ok(Some(t))
     }
 }
 
@@ -855,7 +988,10 @@ impl Client {
             "kind": "ingest",
             "event": event
         });
-        let _ = self.call(&req).await?;
+        // Hook ingest is on the agent's critical path — use the tighter
+        // deadline so a wedged daemon fails fast (the caller treats any error
+        // as a best-effort no-op) instead of stalling the agent.
+        let _ = self.call_with_timeout(&req, HOOK_CALL_TIMEOUT).await?;
         Ok(())
     }
 
@@ -945,6 +1081,14 @@ impl Client {
     /// to ~1 ms while keeping a slower fallback poll for catch-up
     /// after reconnects or `Lagged` drops on the server side.
     pub async fn subscribe(&self) -> Result<TransitionStream, RuntimeError> {
+        // Only the handshake is bounded — the returned stream is long-lived by
+        // design. A wedged daemon must not block watch's background setup here.
+        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.subscribe_inner())
+            .await
+            .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    async fn subscribe_inner(&self) -> Result<TransitionStream, RuntimeError> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| match e.kind() {
@@ -1155,6 +1299,24 @@ impl Client {
     }
 
     pub async fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, RuntimeError> {
+        self.call_with_timeout(req, CLIENT_CALL_TIMEOUT).await
+    }
+
+    /// Like [`Self::call`] but with an explicit overall deadline covering the
+    /// whole round trip (connect + hello + write + read). Guarantees no caller
+    /// blocks forever against a wedged or half-dead daemon — the failure mode
+    /// where hung hook connections once exhausted the daemon's fd budget.
+    async fn call_with_timeout(
+        &self,
+        req: &serde_json::Value,
+        deadline: Duration,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        tokio::time::timeout(deadline, self.call_inner(req))
+            .await
+            .map_err(|_| RuntimeError::Timeout(deadline))?
+    }
+
+    async fn call_inner(&self, req: &serde_json::Value) -> Result<serde_json::Value, RuntimeError> {
         // Connect-time ECONNREFUSED/ENOENT mean the daemon socket isn't there
         // or nothing is listening — surface a friendly message that names the
         // socket path. Other IO errors (timeouts, permission denied, …) keep

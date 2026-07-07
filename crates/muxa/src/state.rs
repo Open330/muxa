@@ -275,6 +275,17 @@ pub struct PromptRecord {
 }
 
 pub struct Store {
+    /// Registry of live agents, keyed by session id.
+    ///
+    /// **Invariant — never hold this write guard across an `.await`.** Every
+    /// mutator (`apply`, `register_task`, `reconcile`, `update_workloads`, …)
+    /// does only synchronous work under the guard and `drop`s it *before* any
+    /// suspending call (disk I/O, `notify_one`, channel sends). Holding it
+    /// across a suspension point would serialize — and, if that future stalls,
+    /// deadlock — every reader (`snapshot`/`by_pane`/…), which in turn parks
+    /// every IPC handler waiting on the store and pins its fd. The IPC layer
+    /// bounds the blast radius (handler cap + timeouts), but this invariant is
+    /// what keeps lock hold time in the microsecond range to begin with.
     agents: RwLock<HashMap<String, Agent>>,
     transitions: broadcast::Sender<Transition>,
     prompts: broadcast::Sender<PromptRecord>,
