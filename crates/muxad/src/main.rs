@@ -1113,7 +1113,8 @@ fn spawn_startup_discovery(
 /// Spawn the periodic discovery rescan. Startup discovery covers t=0; this
 /// keeps newly-created panes appearing in `muxa status` within
 /// `[discovery] interval_secs` instead of only after the agent's first hook.
-/// Cheap — it reuses the same `tmux list-panes` the reconciler already runs.
+/// The pass uses one `tmux list-panes` and, for wrapper foreground commands,
+/// a single bounded process-table snapshot.
 /// No-op when discovery is disabled or `interval_secs == 0`.
 fn spawn_periodic_discovery(
     cfg: &Config,

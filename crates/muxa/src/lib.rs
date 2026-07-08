@@ -46,6 +46,7 @@ pub mod ipc;
 pub mod metrics;
 pub mod notify;
 pub mod paths;
+mod process_snapshot;
 pub mod process_tree;
 pub mod reconcile;
 pub mod scope_filter;

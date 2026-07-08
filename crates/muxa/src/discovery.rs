@@ -17,10 +17,9 @@
 //! fires for the same pane, the store replaces the synthetic entry in
 //! place — see `Store::apply`.
 //!
-//! Detection is intentionally simple: just `current_command`. We don't
-//! walk process trees because that's noisy across kernels (`/proc` on
-//! Linux, `ps` on macOS) and the foreground command is good enough at
-//! the resolution we need.
+//! Detection prefers the cheap `current_command` field. For common wrapper
+//! foreground processes such as `node`, it does a bounded descendant lookup
+//! so npm-shimmed CLIs still recover after daemon restarts.
 //!
 //! ## Capability gating
 //!
@@ -33,6 +32,8 @@
 use crate::backend::PaneBackend;
 use crate::event::{AgentEvent, AgentId, AgentKind};
 use crate::ipc::{Client, RuntimeError};
+#[cfg(not(target_os = "linux"))]
+use crate::process_snapshot::ProcessTable;
 use crate::state::SYNTHETIC_SESSION_PREFIX;
 use crate::tmux::PaneInfo;
 use time::OffsetDateTime;
@@ -76,9 +77,10 @@ fn is_wrapper_command(cmd: &str) -> bool {
 
 /// Filter a list of panes down to the ones running a known agent CLI.
 ///
-/// Pure on `panes`, but reaches out to `/proc` (or `pgrep`/`ps` on
-/// non-Linux) for panes whose foreground is a known wrapper —
-/// see [`is_wrapper_command`] / [`classify_descendants`].
+/// Pure on `panes` for direct foreground commands. For wrapper panes it
+/// reaches out to `/proc` on Linux, or takes one in-memory `ps` snapshot on
+/// non-Linux and reuses it across every pane in this pass.
+#[cfg(target_os = "linux")]
 pub fn discover_from_panes(panes: &[PaneInfo]) -> Vec<Discovered> {
     panes
         .iter()
@@ -99,6 +101,36 @@ pub fn discover_from_panes(panes: &[PaneInfo]) -> Vec<Discovered> {
         .collect()
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn discover_from_panes(panes: &[PaneInfo]) -> Vec<Discovered> {
+    let needs_tree = panes.iter().any(|p| {
+        classify_command(&p.current_command).is_none()
+            && is_wrapper_command(&p.current_command)
+            && p.pane_pid != 0
+    });
+    let table = needs_tree.then(crate::process_snapshot::read_current_process_table);
+
+    panes
+        .iter()
+        .filter_map(|p| {
+            classify_command(&p.current_command)
+                .or_else(|| {
+                    if is_wrapper_command(&p.current_command) {
+                        table
+                            .as_ref()
+                            .and_then(|table| classify_descendants_in_table(p.pane_pid, table))
+                    } else {
+                        None
+                    }
+                })
+                .map(|kind| Discovered {
+                    pane: p.clone(),
+                    kind,
+                })
+        })
+        .collect()
+}
+
 /// Walk descendants of `pane_pid` looking for an agent binary. Returns
 /// the first match (BFS-ish) within `MAX_TREE_DEPTH` levels. `pane_pid
 /// == 0` means "backend didn't supply it" — bail without touching the
@@ -107,7 +139,42 @@ pub fn classify_descendants(pane_pid: u32) -> Option<AgentKind> {
     if pane_pid == 0 {
         return None;
     }
-    classify_descendants_with(pane_pid, MAX_TREE_DEPTH, &read_children, &read_comm)
+    #[cfg(target_os = "linux")]
+    {
+        classify_descendants_with(pane_pid, MAX_TREE_DEPTH, &read_children, &read_comm)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let table = crate::process_snapshot::read_current_process_table();
+        classify_descendants_in_table(pane_pid, &table)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn classify_descendants_in_table(pane_pid: u32, table: &ProcessTable) -> Option<AgentKind> {
+    classify_descendants_in_table_with_depth(pane_pid, MAX_TREE_DEPTH, table)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn classify_descendants_in_table_with_depth(
+    root: u32,
+    max_depth: u8,
+    table: &ProcessTable,
+) -> Option<AgentKind> {
+    if max_depth == 0 {
+        return None;
+    }
+    for child in table.children(root) {
+        if let Some(name) = table.comm(*child) {
+            if let Some(k) = classify_command(name) {
+                return Some(k);
+            }
+        }
+        if let Some(k) = classify_descendants_in_table_with_depth(*child, max_depth - 1, table) {
+            return Some(k);
+        }
+    }
+    None
 }
 
 /// Cap on how far we descend below the pane's initial process. The
@@ -118,6 +185,7 @@ const MAX_TREE_DEPTH: u8 = 4;
 
 /// Pure tree-walk so the recursion is unit-testable without touching
 /// `/proc`. Production callers pass [`read_children`] and [`read_comm`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn classify_descendants_with(
     root: u32,
     max_depth: u8,
@@ -152,45 +220,12 @@ fn read_children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_children(pid: u32) -> Vec<u32> {
-    use std::process::Command;
-    Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(target_os = "linux")]
 fn read_comm(pid: u32) -> Option<String> {
     let path = format!("/proc/{pid}/comm");
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_comm(pid: u32) -> Option<String> {
-    use std::process::Command;
-    Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        })
 }
 
 /// Live scan: ask the backend for the current pane inventory and
@@ -265,7 +300,13 @@ pub async fn run_discovery(
     client: &Client,
     backend: &dyn PaneBackend,
 ) -> Result<DiscoveryReport, RuntimeError> {
-    let discovered = scan_panes(backend);
+    // `scan_panes` shells out to tmux and (on non-Linux) reads the whole
+    // process table via `ps`; both block. Keep them off the async worker so a
+    // slow host can't stall other daemon tasks each discovery tick — mirroring
+    // the `spawn_blocking` treatment the reconciler already gives this work.
+    // `block_in_place` (vs `spawn_blocking`) lets us keep the `&dyn` borrow;
+    // both `muxad` and the CLI run on the multi-threaded runtime.
+    let discovered = tokio::task::block_in_place(|| scan_panes(backend));
     if discovered.is_empty() {
         // Either no panes (host down / outside multiplexer) or the
         // backend can't classify by command (zellij CLI-only). Skip
@@ -403,6 +444,34 @@ mod tests {
         assert_eq!(
             classify_descendants_with(1, MAX_TREE_DEPTH, &children, &comm),
             Some(AgentKind::Codex),
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn classify_descendants_from_process_table_finds_full_path_agent() {
+        use crate::process_snapshot::{ProcessInfo, ProcessTable};
+
+        let table = ProcessTable::from_processes(vec![
+            ProcessInfo {
+                pid: 100,
+                parent_pid: 1,
+                depth: 0,
+                comm: "MainThread".into(),
+                cmdline: "node shim.js".into(),
+            },
+            ProcessInfo {
+                pid: 200,
+                parent_pid: 100,
+                depth: 0,
+                comm: "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex".into(),
+                cmdline: "codex".into(),
+            },
+        ]);
+
+        assert_eq!(
+            classify_descendants_in_table(1, &table),
+            Some(AgentKind::Codex)
         );
     }
 

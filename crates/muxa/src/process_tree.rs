@@ -8,9 +8,12 @@
 
 use crate::discovery::classify_command;
 use crate::event::AgentKind;
+use crate::process_snapshot::ProcessInfo;
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::{HashSet, VecDeque};
 
 const MAX_DEPTH: u8 = 10;
 const MAX_NODES: usize = 256;
@@ -64,23 +67,34 @@ impl WorkloadSummary {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ProcInfo {
-    pid: u32,
-    parent_pid: u32,
-    depth: u8,
-    comm: String,
-    cmdline: String,
-}
-
 /// Scan every pane and return non-empty workload summaries keyed by pane id.
 ///
 /// Empty summaries are omitted so callers can clear stale data by treating a
 /// missing key as [`WorkloadSummary::default`].
+#[cfg(target_os = "linux")]
 pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummary> {
     let mut out = HashMap::new();
     for pane in panes {
         let summary = scan_pane_workload(pane);
+        if !summary.is_empty() {
+            out.insert(pane.pane_id.clone(), summary);
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummary> {
+    if !panes.iter().any(|pane| pane.pane_pid != 0) {
+        return HashMap::new();
+    }
+    let table = crate::process_snapshot::read_current_process_table();
+    let mut out = HashMap::new();
+    for pane in panes {
+        if pane.pane_pid == 0 {
+            continue;
+        }
+        let summary = summarize(table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES));
         if !summary.is_empty() {
             out.insert(pane.pane_id.clone(), summary);
         }
@@ -95,7 +109,7 @@ pub fn scan_pane_workload(pane: &PaneInfo) -> WorkloadSummary {
     summarize(read_descendants(pane.pane_pid))
 }
 
-fn summarize(procs: Vec<ProcInfo>) -> WorkloadSummary {
+fn summarize(procs: Vec<ProcessInfo>) -> WorkloadSummary {
     let parent_by_pid: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.parent_pid)).collect();
     let primary_pid = procs
         .iter()
@@ -165,7 +179,7 @@ fn has_ancestor(pid: u32, ancestor: u32, parent_by_pid: &HashMap<u32, u32>) -> b
     false
 }
 
-fn classify_workload_process(proc: &ProcInfo) -> WorkloadProcessKind {
+fn classify_workload_process(proc: &ProcessInfo) -> WorkloadProcessKind {
     if is_helper(proc) {
         WorkloadProcessKind::Helper
     } else if agent_kind(proc).is_some() {
@@ -177,7 +191,7 @@ fn classify_workload_process(proc: &ProcInfo) -> WorkloadProcessKind {
     }
 }
 
-fn agent_kind(proc: &ProcInfo) -> Option<AgentKind> {
+fn agent_kind(proc: &ProcessInfo) -> Option<AgentKind> {
     classify_command(command_name(&proc.comm)).or_else(|| {
         if is_claude_fork_session(&proc.cmdline) {
             Some(AgentKind::ClaudeCode)
@@ -193,7 +207,7 @@ fn is_claude_fork_session(cmdline: &str) -> bool {
         && (cmdline.contains("/claude/versions/") || cmdline.contains(".claude"))
 }
 
-fn is_helper(proc: &ProcInfo) -> bool {
+fn is_helper(proc: &ProcessInfo) -> bool {
     let comm = command_name(&proc.comm).to_ascii_lowercase();
     let cmdline = proc.cmdline.to_ascii_lowercase();
     comm.ends_with("-mcp")
@@ -211,14 +225,14 @@ fn is_helper(proc: &ProcInfo) -> bool {
         || cmdline.contains("rust-analyzer")
 }
 
-fn is_shell(proc: &ProcInfo) -> bool {
+fn is_shell(proc: &ProcessInfo) -> bool {
     matches!(
         command_name(&proc.comm).to_ascii_lowercase().as_str(),
         "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "csh" | "tcsh" | "pwsh"
     )
 }
 
-fn display_command(proc: &ProcInfo, kind: WorkloadProcessKind) -> String {
+fn display_command(proc: &ProcessInfo, kind: WorkloadProcessKind) -> String {
     if kind == WorkloadProcessKind::Subagent {
         if let Some(agent) = agent_kind(proc) {
             return match agent {
@@ -238,7 +252,7 @@ fn command_name(s: &str) -> &str {
 }
 
 #[cfg(target_os = "linux")]
-fn read_descendants(root: u32) -> Vec<ProcInfo> {
+fn read_descendants(root: u32) -> Vec<ProcessInfo> {
     let mut out = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut q: VecDeque<(u32, u8)> = read_children(root)
@@ -269,7 +283,7 @@ fn read_children(pid: u32) -> Vec<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc(pid: u32, depth: u8) -> Option<ProcInfo> {
+fn read_proc(pid: u32, depth: u8) -> Option<ProcessInfo> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let parent_pid = parse_ppid(&status)?;
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -286,7 +300,7 @@ fn read_proc(pid: u32, depth: u8) -> Option<ProcInfo> {
                 .join(" ")
         })
         .unwrap_or_default();
-    Some(ProcInfo {
+    Some(ProcessInfo {
         pid,
         parent_pid,
         depth,
@@ -304,66 +318,16 @@ fn parse_ppid(status: &str) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_descendants(root: u32) -> Vec<ProcInfo> {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,comm=,args="])
-        .output()
-        .ok();
-    let Some(output) = output.filter(|o| o.status.success()) else {
-        return Vec::new();
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut children: HashMap<u32, Vec<ProcInfo>> = HashMap::new();
-    for line in stdout.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(pid), Some(parent_pid), Some(comm)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        let (Ok(pid), Ok(parent_pid)) = (pid.parse(), parent_pid.parse()) else {
-            continue;
-        };
-        let cmdline = parts.collect::<Vec<_>>().join(" ");
-        children.entry(parent_pid).or_default().push(ProcInfo {
-            pid,
-            parent_pid,
-            depth: 0,
-            comm: comm.to_string(),
-            cmdline,
-        });
-    }
-
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut q: VecDeque<(u32, u8)> = children
-        .get(&root)
-        .into_iter()
-        .flatten()
-        .map(|p| (p.pid, 1))
-        .collect();
-    while let Some((pid, depth)) = q.pop_front() {
-        if depth > MAX_DEPTH || !seen.insert(pid) || out.len() >= MAX_NODES {
-            continue;
-        }
-        if let Some(mut proc) = children.values().flatten().find(|p| p.pid == pid).cloned() {
-            proc.depth = depth;
-            if let Some(kids) = children.get(&pid) {
-                for child in kids {
-                    q.push_back((child.pid, depth.saturating_add(1)));
-                }
-            }
-            out.push(proc);
-        }
-    }
-    out
+fn read_descendants(root: u32) -> Vec<ProcessInfo> {
+    crate::process_snapshot::read_current_process_table().descendants(root, MAX_DEPTH, MAX_NODES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn proc(pid: u32, parent_pid: u32, depth: u8, comm: &str, cmdline: &str) -> ProcInfo {
-        ProcInfo {
+    fn proc(pid: u32, parent_pid: u32, depth: u8, comm: &str, cmdline: &str) -> ProcessInfo {
+        ProcessInfo {
             pid,
             parent_pid,
             depth,

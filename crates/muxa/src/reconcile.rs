@@ -312,17 +312,25 @@ impl<L: LivenessSource> Reconciler<L> {
         let started = Instant::now();
         // `list_panes` shells out to tmux and must not block the runtime.
         let src = self.source.clone();
+        let list_started = Instant::now();
         let panes = tokio::task::spawn_blocking(move || src.list_panes())
             .await
             .unwrap_or_default();
+        let list_panes_us = u64::try_from(list_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let panes_for_workload = panes.clone();
+        let workload_started = Instant::now();
         let workloads = tokio::task::spawn_blocking(move || {
             process_tree::scan_pane_workloads(&panes_for_workload)
         })
         .await
         .unwrap_or_default();
+        let workload_scan_us =
+            u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let reconcile_started = Instant::now();
         let report = self.store.reconcile(&panes).await;
         let workload_changed = self.store.update_workloads(&workloads).await;
+        let store_update_us =
+            u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let stuck_w = self
             .store
             .mark_stuck_idle_from(
@@ -373,7 +381,11 @@ impl<L: LivenessSource> Reconciler<L> {
         // when investigating a stuck reconciler.
         debug!(
             elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            list_panes_us,
+            workload_scan_us,
+            store_update_us,
             panes = panes.len(),
+            workloads = workloads.len(),
             stale = report.stale_panes_reaped,
             synthetic = report.synthetic_demoted,
             duplicates = report.duplicates_collapsed,

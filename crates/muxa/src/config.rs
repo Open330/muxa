@@ -349,8 +349,8 @@ pub struct DiscoveryConfig {
     /// `claude`/`codex`/`gemini` session in a new tmux session) appearing in
     /// `muxa status` within `interval_secs` instead of only after the agent
     /// fires its first hook. Set `0` to keep the legacy run-once-at-startup
-    /// behavior. Cheap — it reuses the same `tmux list-panes` the reconciler
-    /// already shells out for.
+    /// behavior. The pass uses one `tmux list-panes` and, only for wrapper
+    /// foreground commands, one bounded process-table snapshot.
     #[serde(default = "default_discovery_interval_secs")]
     pub interval_secs: u64,
 }
