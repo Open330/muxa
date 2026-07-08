@@ -296,6 +296,12 @@ struct StatsData {
 #[derive(Debug, Serialize)]
 struct StatsDocument {
     generated_at: String,
+    /// Raw instant behind `generated_at`, kept for human-facing headers that
+    /// render in the viewer's local offset (truncated to whole seconds) so they
+    /// reconcile with the local calendar-day rows. Not serialized: JSON keeps
+    /// the RFC3339 `generated_at` for machine consumers.
+    #[serde(skip)]
+    generated_instant: OffsetDateTime,
     range: RangeDocument,
     group_by: String,
     totals: Totals,
@@ -310,6 +316,12 @@ struct RangeDocument {
     label: String,
     since_at: Option<String>,
     until_at: Option<String>,
+    /// Raw instants behind `since_at`/`until_at`, kept for local-offset headers.
+    /// Not serialized (see `StatsDocument::generated_instant`).
+    #[serde(skip)]
+    since_instant: Option<OffsetDateTime>,
+    #[serde(skip)]
+    until_instant: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Serialize)]
@@ -692,10 +704,13 @@ fn build_document(
     let rows = build_rows(data, group_by, limit, sort, reverse);
     StatsDocument {
         generated_at: format_rfc3339(data.now),
+        generated_instant: data.now,
         range: RangeDocument {
             label: data.range.label.clone(),
             since_at: data.range.since_at.map(format_rfc3339),
             until_at: data.range.until_at.map(format_rfc3339),
+            since_instant: data.range.since_at,
+            until_instant: data.range.until_at,
         },
         group_by: group_by.as_str().to_string(),
         totals: build_totals(data),
@@ -2241,11 +2256,11 @@ fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) 
 fn print_range_header(title: &str, doc: &StatsDocument) {
     println!("{title}");
     println!("Range: {}", doc.range.label);
-    if let Some(since_at) = doc.range.since_at.as_deref() {
-        println!("Since: {since_at}");
+    if let Some(since_at) = doc.range.since_instant {
+        println!("Since: {}", format_local_seconds(since_at));
     }
-    if let Some(until_at) = doc.range.until_at.as_deref() {
-        println!("Until: {until_at}");
+    if let Some(until_at) = doc.range.until_instant {
+        println!("Until: {}", format_local_seconds(until_at));
     }
 }
 
@@ -2886,13 +2901,17 @@ fn push_markdown_overview(out: &mut String, title: &str, doc: &StatsDocument) {
     out.push_str(title);
     out.push_str("\n\n");
     out.push_str("| Metric | Value |\n| --- | --- |\n");
-    push_metric(out, "Generated", &doc.generated_at);
+    push_metric(
+        out,
+        "Generated",
+        &format_local_seconds(doc.generated_instant),
+    );
     push_metric(out, "Range", &doc.range.label);
-    if let Some(since_at) = doc.range.since_at.as_deref() {
-        push_metric(out, "Since", since_at);
+    if let Some(since_at) = doc.range.since_instant {
+        push_metric(out, "Since", &format_local_seconds(since_at));
     }
-    if let Some(until_at) = doc.range.until_at.as_deref() {
-        push_metric(out, "Until", until_at);
+    if let Some(until_at) = doc.range.until_instant {
+        push_metric(out, "Until", &format_local_seconds(until_at));
     }
     push_metric(out, "Prompts", &doc.totals.prompts.to_string());
     push_metric(
@@ -3032,6 +3051,19 @@ fn format_rfc3339(at: OffsetDateTime) -> String {
         .unwrap_or_else(|_| at.to_string())
 }
 
+/// Render a report-header instant in the viewer's local offset, truncated to
+/// whole seconds, with the offset spelled out. This keeps the `Generated` /
+/// `Since` / `Until` rows readable against the local calendar-day rows (which
+/// also work in local time) instead of the raw UTC-microsecond RFC3339 string.
+fn format_local_seconds(at: OffsetDateTime) -> String {
+    let local = at.to_offset(local_offset());
+    local
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]"
+        ))
+        .unwrap_or_else(|_| local.to_string())
+}
+
 fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
     let secs = (now - then).whole_seconds().max(0);
     if secs < 60 {
@@ -3153,6 +3185,47 @@ mod tests {
             // by its own test, which flips this to false.
             count_tmux_input: true,
         }
+    }
+
+    #[test]
+    fn format_local_seconds_drops_microseconds_and_keeps_local_offset() {
+        // A raw `Generated` instant carries sub-second precision and is UTC.
+        let at = datetime!(2026-07-08 13:12:57.919314 UTC);
+        let rendered = format_local_seconds(at);
+        // The header must reconcile with the local-day rows: no microseconds and
+        // no bare-UTC `Z`, rendered in the viewer's local offset.
+        assert!(
+            !rendered.contains('.'),
+            "unexpected microseconds: {rendered}"
+        );
+        assert!(!rendered.contains('Z'), "unexpected Z suffix: {rendered}");
+        let expected = at
+            .to_offset(local_offset())
+            .format(time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]"
+            ))
+            .unwrap();
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn markdown_header_uses_local_seconds_not_rfc3339() {
+        let mut d = data(Vec::new());
+        d.now = datetime!(2026-07-08 13:12:57.919314 UTC);
+        let doc = build_document(&d, GroupBy::Day, 10, SortKey::Name, false, false);
+        let mut out = String::new();
+        push_markdown_overview(&mut out, "Report", &doc);
+        // JSON still carries the machine RFC3339 timestamp for consumers.
+        assert!(doc.generated_at.contains('T') && doc.generated_at.ends_with('Z'));
+        // The human header row does not leak the UTC-microsecond string.
+        assert!(
+            !out.contains("13:12:57.919314"),
+            "markdown header leaked microseconds: {out}"
+        );
+        assert!(
+            out.contains(&format_local_seconds(d.now)),
+            "markdown header missing local-seconds Generated: {out}"
+        );
     }
 
     #[test]

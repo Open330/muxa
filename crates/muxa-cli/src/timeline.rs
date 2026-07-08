@@ -875,7 +875,7 @@ fn render_overview(f: &mut Frame, area: Rect, app: &TimelineApp) {
 fn render_focus(f: &mut Frame, area: Rect, app: &TimelineApp) {
     let title = app.selected_lane_ref().map_or_else(
         || " focus ".to_string(),
-        |lane| format!(" focus · {} ", lane.label),
+        |lane| format!(" focus · {} ", lane_display_label(lane)),
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -924,7 +924,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &TimelineApp) {
     }
     if let (Some(lane), Some(interval)) = (app.selected_lane_ref(), app.selected_interval_ref()) {
         lines.push(Line::from(vec![
-            Span::styled(lane.label.clone(), app.theme.accent_style(app.colors)),
+            Span::styled(lane_display_label(lane), app.theme.accent_style(app.colors)),
             Span::raw("  "),
             Span::styled(interval_label(interval), interval_style(interval, app)),
             Span::raw("  "),
@@ -1129,18 +1129,15 @@ fn selected_overview_row(rows: &[OverviewRow], selected_lane: usize) -> Option<u
 fn lane_group_key_label(lane: &TimelineLane, group_by: TimelineGroupBy) -> (String, String) {
     match group_by {
         TimelineGroupBy::Session => {
-            let label = lane
-                .session_name
-                .as_deref()
-                .or(lane.session_id.as_deref())
-                .unwrap_or("no session")
-                .to_string();
-            let key = if label == "no session" {
-                "zzzz:no-session".to_string()
+            if lane_has_anchor(lane) {
+                // Anchor by name / project / short id rather than the raw UUID
+                // so the group header reads like a session, not a hash.
+                let label = lane_anchor(lane);
+                let key = format!("session:{}", label.to_ascii_lowercase());
+                (key, label)
             } else {
-                format!("session:{}", label.to_ascii_lowercase())
-            };
-            (key, label)
+                ("zzzz:no-session".to_string(), "no session".to_string())
+            }
         }
         TimelineGroupBy::Kind => {
             let label = lane_kind_label(lane.kind).to_string();
@@ -1340,17 +1337,80 @@ fn render_lane_line(
 
 fn overview_lane_label(lane: &TimelineLane, group_by: TimelineGroupBy) -> String {
     if group_by != TimelineGroupBy::Session {
-        return lane.label.clone();
+        // Flat / by-kind views show the full lane label. The core lane label
+        // falls back to the raw session UUID when there is no session name, so
+        // prefer a human anchor (project / session name) instead.
+        return lane_display_label(lane);
     }
 
-    let short = match lane.kind {
+    // Grouped by session the group header already carries the anchor, so each
+    // lane row only needs its kind, indented under the header.
+    format!("  {}", lane_kind_prefix(lane))
+}
+
+/// The `kind/anchor` label shown for a lane, e.g. `codex/muxa` or `tmux/main`.
+/// Leads with a human anchor rather than the raw session UUID.
+fn lane_display_label(lane: &TimelineLane) -> String {
+    format!("{}/{}", lane_kind_prefix(lane), lane_anchor(lane))
+}
+
+/// Short kind tag used as the label prefix.
+fn lane_kind_prefix(lane: &TimelineLane) -> String {
+    match lane.kind {
         TimelineLaneKind::Agent => lane
             .agent_kind
             .map_or_else(|| "agent".to_string(), |kind| kind.to_string()),
         TimelineLaneKind::Human => "human".to_string(),
         TimelineLaneKind::Tmux => "tmux".to_string(),
-    };
-    format!("  {short}")
+    }
+}
+
+/// Best human anchor for a lane: the session *name* if we have one, otherwise
+/// the project directory (basename of a cwd carried by the lane's intervals),
+/// otherwise a short slice of the session UUID. This is what makes a lane
+/// recognizable at a glance instead of a 36-char UUID.
+fn lane_anchor(lane: &TimelineLane) -> String {
+    if let Some(name) = lane.session_name.as_deref().filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    if let Some(project) = lane_project(lane) {
+        return project;
+    }
+    if let Some(id) = lane.session_id.as_deref().filter(|s| !s.is_empty()) {
+        return short_id(id);
+    }
+    short_id(&lane.id)
+}
+
+/// Whether a lane has any real anchor (name, project cwd, or session id) beyond
+/// its synthetic lane id. Used to keep the "no session" grouping bucket.
+fn lane_has_anchor(lane: &TimelineLane) -> bool {
+    lane.session_name.as_deref().is_some_and(|s| !s.is_empty())
+        || lane_project(lane).is_some()
+        || lane.session_id.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// Project directory name derived from the first interval carrying a cwd.
+fn lane_project(lane: &TimelineLane) -> Option<String> {
+    lane.intervals
+        .iter()
+        .find_map(|interval| interval.cwd.as_deref())
+        .filter(|cwd| !cwd.is_empty())
+        .and_then(project_basename)
+}
+
+/// Basename of a working-directory path, e.g. `/Users/x/personal/muxa` -> `muxa`.
+fn project_basename(cwd: &str) -> Option<String> {
+    std::path::Path::new(cwd.trim_end_matches('/'))
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// First UUID segment (capped at 8 chars) — a stable, terminal-friendly
+/// disambiguator when no name or project is available.
+fn short_id(id: &str) -> String {
+    id.split('-').next().unwrap_or(id).chars().take(8).collect()
 }
 
 fn lane_kind_label(kind: TimelineLaneKind) -> &'static str {
@@ -1957,7 +2017,7 @@ fn interval_session_label(lane: &TimelineLane, interval: &TimelineInterval) -> S
         .or(interval.session_id.as_ref())
         .or(lane.session_id.as_ref())
         .cloned()
-        .unwrap_or_else(|| lane.label.clone())
+        .unwrap_or_else(|| lane_display_label(lane))
 }
 
 fn day_totals_label(totals: &TimelineTotals) -> String {
@@ -2374,6 +2434,83 @@ mod tests {
             .map(|lane| lane.label.as_str())
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["codex/newer", "codex/older", "codex/empty"]);
+    }
+
+    fn unnamed_agent_lane(cwd: Option<&str>) -> TimelineLane {
+        // An agent lane whose only identifier is a session UUID, mirroring the
+        // audit case `claude_code/019f3f6e-...`.
+        let mut lane = lane(
+            "codex/uuid",
+            TimelineLaneKind::Agent,
+            None,
+            TimelineTotals::default(),
+        );
+        lane.session_id = Some("019f3f6e-dc26-77e3-8a1b-2cface".to_string());
+        if let Some(cwd) = cwd {
+            let mut interval = agent_interval(
+                datetime!(2026-07-08 10:00:00 UTC),
+                datetime!(2026-07-08 10:05:00 UTC),
+            );
+            interval.cwd = Some(cwd.to_string());
+            lane.intervals.push(interval);
+        }
+        lane
+    }
+
+    #[test]
+    fn lane_label_prefers_session_name_over_uuid() {
+        let lane = lane(
+            "codex/main",
+            TimelineLaneKind::Agent,
+            Some("main"),
+            TimelineTotals::default(),
+        );
+        assert_eq!(lane_display_label(&lane), "codex/main");
+    }
+
+    #[test]
+    fn lane_label_falls_back_to_project_basename_when_unnamed() {
+        let lane = unnamed_agent_lane(Some("/Users/jiun/personal/muxa/"));
+        // Project basename beats the raw UUID.
+        assert_eq!(lane_display_label(&lane), "codex/muxa");
+    }
+
+    #[test]
+    fn lane_label_uses_short_uuid_when_no_name_or_project() {
+        let lane = unnamed_agent_lane(None);
+        // Last resort keeps only a truncated UUID segment, never the full id.
+        assert_eq!(lane_display_label(&lane), "codex/019f3f6e");
+    }
+
+    #[test]
+    fn flat_view_lane_label_prefers_project_over_uuid() {
+        let lane = unnamed_agent_lane(Some("/repo/alpha"));
+        assert_eq!(
+            overview_lane_label(&lane, TimelineGroupBy::Flat),
+            "codex/alpha"
+        );
+    }
+
+    #[test]
+    fn session_group_label_anchors_on_project_not_uuid() {
+        let lane = unnamed_agent_lane(Some("/repo/alpha"));
+        let (key, label) = lane_group_key_label(&lane, TimelineGroupBy::Session);
+        assert_eq!(label, "alpha");
+        assert_eq!(key, "session:alpha");
+    }
+
+    #[test]
+    fn session_group_label_keeps_no_session_bucket() {
+        // A lane with no name, no cwd, and no session id stays anchorless.
+        let lane = lane(
+            "agent/none",
+            TimelineLaneKind::Agent,
+            None,
+            TimelineTotals::default(),
+        );
+        let (key, label) = lane_group_key_label(&lane, TimelineGroupBy::Session);
+        assert_eq!(label, "no session");
+        assert_eq!(key, "zzzz:no-session");
     }
 
     #[test]
