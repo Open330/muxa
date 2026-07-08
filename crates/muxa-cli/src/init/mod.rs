@@ -274,7 +274,13 @@ fn pick(uninstall: bool, args: &Args, detect: &Detection, mode: Mode) -> Result<
     }
 
     if let Some(p) = args.preset {
-        let picked = Component::preset(p);
+        // Presets list every agent hook, but only wire up the ones whose
+        // config is actually on disk — otherwise `--preset standard` on a
+        // host without Codex/Gemini/opencode would create their configs
+        // from scratch for tools the user never installed. Mirrors the
+        // wizard's `Detection::default_selection` pre-check. Non-agent
+        // components (tmux, daemon-manager, dashboard) are always kept.
+        let picked = filter_absent_agents(Component::preset(p), detect);
         return Ok(filter_excluded(picked, &args.no));
     }
 
@@ -305,6 +311,18 @@ fn manages_daemon(components: &[Component]) -> bool {
         .any(|c| matches!(c, Component::MuxadSystemd | Component::MuxadLaunchd))
 }
 
+/// Drop agent-hook components (Claude/Codex/Gemini/opencode) whose
+/// config file/dir is absent, per `Detection::agent_config_present`.
+/// Non-agent components pass through untouched. Used only on the
+/// preset path — `--component` opt-ins bypass this so an explicit
+/// request always installs.
+fn filter_absent_agents(components: Vec<Component>, detect: &Detection) -> Vec<Component> {
+    components
+        .into_iter()
+        .filter(|c| detect.agent_config_present(*c) != Some(false))
+        .collect()
+}
+
 fn filter_excluded(components: Vec<Component>, no: &[String]) -> Vec<Component> {
     if no.is_empty() {
         return components;
@@ -313,4 +331,67 @@ fn filter_excluded(components: Vec<Component>, no: &[String]) -> Vec<Component> 
         .into_iter()
         .filter(|c| !no.iter().any(|n| n == c.id()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_agent_hook(c: Component) -> bool {
+        matches!(
+            c,
+            Component::ClaudeHooks
+                | Component::CodexHooks
+                | Component::GeminiHooks
+                | Component::OpencodeHooks
+        )
+    }
+
+    #[test]
+    fn preset_skips_agents_with_absent_config() {
+        // `Detection::default()` = no agent config anywhere on disk. A
+        // preset must not wire up hooks for tools the user doesn't have.
+        let detect = Detection::default();
+        let filtered = filter_absent_agents(Component::preset(Preset::Standard), &detect);
+        assert!(
+            !filtered.iter().copied().any(is_agent_hook),
+            "no agent hooks should survive when no agent config is present, got {filtered:?}"
+        );
+        // Non-agent components (tmux, daemon-manager) still come through.
+        assert!(filtered.contains(&Component::TmuxPopup));
+        assert!(filtered.iter().any(|c| matches!(
+            c,
+            Component::MuxadSystemd | Component::MuxadLaunchd | Component::MuxadShellrc
+        )));
+    }
+
+    #[test]
+    fn preset_keeps_agent_when_its_config_present() {
+        let detect = Detection {
+            claude_settings: Some(PathBuf::from("/home/u/.claude/settings.json")),
+            ..Detection::default()
+        };
+        let filtered = filter_absent_agents(Component::preset(Preset::Standard), &detect);
+        assert!(
+            filtered.contains(&Component::ClaudeHooks),
+            "Claude hook must survive when its settings file is present"
+        );
+        // The others are still absent → still dropped.
+        assert!(!filtered.contains(&Component::CodexHooks));
+        assert!(!filtered.contains(&Component::OpencodeHooks));
+    }
+
+    #[test]
+    fn explicit_component_bypasses_absence_filter() {
+        // `--component` requests are honoured verbatim even when the
+        // agent's config is absent — filter_absent_agents is never
+        // applied on that path.
+        let args = Args {
+            component: vec!["opencode-hooks".into()],
+            ..Default::default()
+        };
+        let detect = Detection::default();
+        let picked = pick(false, &args, &detect, Mode::NonInteractive).unwrap();
+        assert_eq!(picked, vec![Component::OpencodeHooks]);
+    }
 }

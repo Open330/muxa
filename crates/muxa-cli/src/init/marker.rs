@@ -1,7 +1,8 @@
 //! Reusable comment-fenced "managed block" editor.
 //!
-//! Used by any config file that takes shell-style `#`-prefix comments —
-//! `~/.tmux.conf` today, potentially others later. The format is:
+//! Used by any config file that takes a line-comment syntax —
+//! shell-style `#` for `~/.tmux.conf`, C-style `//` for the opencode
+//! `muxa.ts` plugin, and potentially others later. The format is:
 //!
 //! ```text
 //! # >>> muxa managed (<id>) >>>
@@ -9,16 +10,45 @@
 //! # <<< muxa managed (<id>) <<<
 //! ```
 //!
+//! (The `#` lead is swapped for `//` when [`Style::Slash`] is used so
+//! the fence lines are valid comments in JS/TS.)
+//!
 //! Each component owns its own block keyed by `id`, which means
 //! `--uninstall` can surgically remove just the block we own without
 //! touching anything the user added by hand.
 
 use std::fmt::Write as _;
 
-const OPEN_PREFIX: &str = "# >>> muxa managed (";
 const OPEN_SUFFIX: &str = ") >>>";
-const CLOSE_PREFIX: &str = "# <<< muxa managed (";
 const CLOSE_SUFFIX: &str = ") <<<";
+
+/// Line-comment syntax used for the fence lines. Each managed file
+/// picks the one that keeps its content syntactically valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// `#`-prefixed fences — shell/tmux/toml-style configs.
+    Hash,
+    /// `//`-prefixed fences — JS/TS (e.g. the opencode plugin).
+    Slash,
+}
+
+impl Style {
+    /// The comment lead that starts each fence line.
+    fn lead(self) -> &'static str {
+        match self {
+            Style::Hash => "#",
+            Style::Slash => "//",
+        }
+    }
+
+    fn open_prefix(self) -> String {
+        format!("{} >>> muxa managed (", self.lead())
+    }
+
+    fn close_prefix(self) -> String {
+        format!("{} <<< muxa managed (", self.lead())
+    }
+}
 
 /// Result of a marker-block edit on a file's content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,16 +75,29 @@ impl Outcome {
     }
 }
 
+/// Insert or replace the block keyed by `id` with `body` in `original`,
+/// using shell-style `#` fences. Convenience wrapper over
+/// [`upsert_styled`] for the common case.
+pub fn upsert(original: &str, id: &str, body: &str) -> (String, Outcome) {
+    upsert_styled(original, id, body, Style::Hash)
+}
+
+/// Remove the block keyed by `id` from `original`, if present, using
+/// shell-style `#` fences. Convenience wrapper over [`remove_styled`].
+pub fn remove(original: &str, id: &str) -> (String, Outcome) {
+    remove_styled(original, id, Style::Hash)
+}
+
 /// Insert or replace the block keyed by `id` with `body` in `original`.
 /// Returns the new file content + an `Outcome` describing what happened.
 ///
 /// `body` should be the inner lines without the fence comments. A
 /// trailing newline on `body` is normalized away — the renderer adds
 /// exactly one between body and close fence.
-pub fn upsert(original: &str, id: &str, body: &str) -> (String, Outcome) {
+pub fn upsert_styled(original: &str, id: &str, body: &str, style: Style) -> (String, Outcome) {
     let body = body.trim_end_matches('\n');
-    let rendered = render(id, body);
-    match find_block(original, id) {
+    let rendered = render(id, body, style);
+    match find_block(original, id, style) {
         Some((start, end)) => {
             let existing = &original[start..end];
             if existing == rendered {
@@ -71,9 +114,10 @@ pub fn upsert(original: &str, id: &str, body: &str) -> (String, Outcome) {
     }
 }
 
-/// Remove the block keyed by `id` from `original`, if present.
-pub fn remove(original: &str, id: &str) -> (String, Outcome) {
-    let Some((start, end)) = find_block(original, id) else {
+/// Remove the block keyed by `id` from `original`, if present, matching
+/// the fence `style` that was used to write it.
+pub fn remove_styled(original: &str, id: &str, style: Style) -> (String, Outcome) {
+    let Some((start, end)) = find_block(original, id, style) else {
         return (original.to_string(), Outcome::AlreadyAbsent);
     };
     // Also eat one leading newline if there is one — keeps the file from
@@ -89,12 +133,12 @@ pub fn remove(original: &str, id: &str) -> (String, Outcome) {
     (out, Outcome::Removed)
 }
 
-fn render(id: &str, body: &str) -> String {
+fn render(id: &str, body: &str, style: Style) -> String {
     let mut s = String::with_capacity(body.len() + 80);
-    let _ = writeln!(s, "{OPEN_PREFIX}{id}{OPEN_SUFFIX}");
+    let _ = writeln!(s, "{}{id}{OPEN_SUFFIX}", style.open_prefix());
     s.push_str(body);
     s.push('\n');
-    let _ = writeln!(s, "{CLOSE_PREFIX}{id}{CLOSE_SUFFIX}");
+    let _ = writeln!(s, "{}{id}{CLOSE_SUFFIX}", style.close_prefix());
     s
 }
 
@@ -114,9 +158,9 @@ fn append_block(original: &str, rendered: &str) -> String {
 /// Locate the byte range `[start, end)` of the block for `id`,
 /// inclusive of the fence lines and trailing newline. Returns `None`
 /// when the block is absent or malformed (open without matching close).
-fn find_block(haystack: &str, id: &str) -> Option<(usize, usize)> {
-    let open = format!("{OPEN_PREFIX}{id}{OPEN_SUFFIX}");
-    let close = format!("{CLOSE_PREFIX}{id}{CLOSE_SUFFIX}");
+fn find_block(haystack: &str, id: &str, style: Style) -> Option<(usize, usize)> {
+    let open = format!("{}{id}{OPEN_SUFFIX}", style.open_prefix());
+    let close = format!("{}{id}{CLOSE_SUFFIX}", style.close_prefix());
     let open_idx = line_start_of(haystack, &open)?;
     // Search for the matching close *after* the open fence, scoped to
     // the same id — this gracefully tolerates other components' blocks
@@ -216,8 +260,8 @@ mod tests {
         assert_eq!(o, Outcome::Removed);
         assert!(s.contains("BBB"));
         assert!(!s.contains("AAA"));
-        assert!(find_block(&s, "b").is_some());
-        assert!(find_block(&s, "a").is_none());
+        assert!(find_block(&s, "b", Style::Hash).is_some());
+        assert!(find_block(&s, "a", Style::Hash).is_none());
     }
 
     #[test]
@@ -225,6 +269,40 @@ mod tests {
         // Defensive: a status-right that quotes the literal must not
         // be confused for a fence line.
         let s = "set -g status-right \"# >>> muxa managed (x) >>> not a fence\"\n";
-        assert!(find_block(s, "x").is_none());
+        assert!(find_block(s, "x", Style::Hash).is_none());
+    }
+
+    #[test]
+    fn slash_style_emits_valid_comment_fences() {
+        // JS/TS files can't have `#`-prefixed lines. The Slash style
+        // must fence with `//` so the result parses as a comment.
+        let (out, o) = upsert_styled("", "opencode-plugin", "export const X = 1;", Style::Slash);
+        assert_eq!(o, Outcome::Inserted);
+        assert!(out.contains("// >>> muxa managed (opencode-plugin) >>>"));
+        assert!(out.contains("// <<< muxa managed (opencode-plugin) <<<"));
+        assert!(out.contains("export const X = 1;"));
+        // No line may start with a bare `#` — that would be a TS syntax error.
+        assert!(
+            !out.lines().any(|l| l.starts_with('#')),
+            "slash-styled output must not contain shell-comment fences"
+        );
+    }
+
+    #[test]
+    fn slash_style_round_trips_through_remove() {
+        let (installed, _) = upsert_styled("", "opencode-plugin", "body", Style::Slash);
+        let (removed, o) = remove_styled(&installed, "opencode-plugin", Style::Slash);
+        assert_eq!(o, Outcome::Removed);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn styles_do_not_match_each_others_fences() {
+        // A `//`-fenced block must be invisible to a Hash-style remove
+        // (and vice-versa) so we never half-strip a block.
+        let (slash, _) = upsert_styled("", "x", "body", Style::Slash);
+        let (out, o) = remove_styled(&slash, "x", Style::Hash);
+        assert_eq!(o, Outcome::AlreadyAbsent);
+        assert_eq!(out, slash);
     }
 }

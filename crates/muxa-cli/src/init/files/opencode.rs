@@ -1,6 +1,6 @@
 //! `~/.config/opencode/plugins/muxa.ts` content layer.
 
-use crate::init::marker::{self, Outcome};
+use crate::init::marker::{self, Outcome, Style};
 
 const ID: &str = "opencode-plugin";
 
@@ -46,9 +46,36 @@ pub fn default_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn upsert(original: &str) -> (String, Outcome) {
-    marker::upsert(original, ID, BODY)
+    // `muxa.ts` is a TS/ESM module, so the managed block must be fenced
+    // with `//` line comments — `#`-prefixed fences are a syntax error.
+    marker::upsert_styled(original, ID, BODY, Style::Slash)
 }
 
 pub fn remove(original: &str) -> (String, Outcome) {
-    marker::remove(original, ID)
+    marker::remove_styled(original, ID, Style::Slash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_plugin_is_valid_ts_comment_fenced() {
+        let (out, o) = upsert("");
+        assert_eq!(o, Outcome::Inserted);
+        // Every fence line is a `//` comment; no bare `#` lines that
+        // would break the TS parser.
+        assert!(out.contains("// >>> muxa managed (opencode-plugin) >>>"));
+        assert!(out.contains("// <<< muxa managed (opencode-plugin) <<<"));
+        assert!(!out.lines().any(|l| l.trim_start().starts_with('#')));
+        assert!(out.contains("export const MuxaPlugin"));
+    }
+
+    #[test]
+    fn round_trips_to_empty_on_remove() {
+        let (installed, _) = upsert("");
+        let (removed, o) = remove(&installed);
+        assert_eq!(o, Outcome::Removed);
+        assert!(removed.is_empty());
+    }
 }

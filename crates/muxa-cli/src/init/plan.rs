@@ -176,14 +176,41 @@ fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) 
         Direction::Install => files::opencode::upsert(&original),
         Direction::Uninstall => files::opencode::remove(&original),
     };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+/// Push an `EditFile`, but on **uninstall** demote it to a `DeleteFile`
+/// when stripping our block leaves the file empty. This keeps us from
+/// leaving a zero-byte orphan behind for files muxa created from scratch
+/// (the opencode `muxa.ts`, or a codex/gemini config that held nothing
+/// but our hooks). An empty remainder is itself proof there was no
+/// pre-existing user content to preserve, so this never deletes a file
+/// the user had populated by hand.
+fn push_edit_or_delete(
+    direction: Direction,
+    component: Component,
+    path: PathBuf,
+    before: Option<String>,
+    after: String,
+    outcome: Outcome,
+    actions: &mut Vec<Action>,
+) {
+    if direction == Direction::Uninstall
+        && before.is_some()
+        && outcome.changed()
+        && after.trim().is_empty()
+    {
+        actions.push(Action::DeleteFile { component, path });
+        return;
+    }
     actions.push(Action::EditFile {
-        component: c,
+        component,
         path,
         before,
         after,
         outcome,
     });
-    Ok(())
 }
 
 /// Append an `EditFile` for the auto-managed `tmux-env` block. Uses the
@@ -306,13 +333,7 @@ fn plan_codex(direction: Direction, c: Component, actions: &mut Vec<Action>) -> 
             files::codex::remove(&original).context("scrubbing codex config.toml")?
         }
     };
-    actions.push(Action::EditFile {
-        component: c,
-        path,
-        before,
-        after,
-        outcome,
-    });
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
     Ok(())
 }
 
@@ -330,13 +351,7 @@ fn plan_gemini(direction: Direction, c: Component, actions: &mut Vec<Action>) ->
             files::gemini::remove(&original).context("scrubbing gemini settings.json")?
         }
     };
-    actions.push(Action::EditFile {
-        component: c,
-        path,
-        before,
-        after,
-        outcome,
-    });
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
     Ok(())
 }
 
@@ -510,5 +525,77 @@ mod tests {
             )
         });
         assert!(pinned, "env block must pin the resolved socket path");
+    }
+
+    #[test]
+    fn uninstall_deletes_file_emptied_by_removal() {
+        // A file muxa created from scratch (opencode muxa.ts, or a
+        // codex config with nothing but our hooks) is empty after the
+        // block is stripped — we should delete it, not leave a 0-byte orphan.
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Uninstall,
+            Component::OpencodeHooks,
+            PathBuf::from("/home/u/.config/opencode/plugins/muxa.ts"),
+            Some("// block\n".into()),
+            "   \n".into(),
+            Outcome::Removed,
+            &mut actions,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::DeleteFile { .. }]),
+            "empty remainder on uninstall must become a DeleteFile, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn uninstall_keeps_file_with_remaining_user_content() {
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Uninstall,
+            Component::CodexHooks,
+            PathBuf::from("/home/u/.codex/config.toml"),
+            Some("[user]\nkey = 1\n\n[[hooks.X]]\n".into()),
+            "[user]\nkey = 1\n".into(),
+            Outcome::Removed,
+            &mut actions,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::EditFile { .. }]),
+            "a non-empty remainder must stay an EditFile so user content survives"
+        );
+    }
+
+    #[test]
+    fn install_never_deletes_even_with_empty_after() {
+        // Defensive: the demotion is uninstall-only. An empty `after`
+        // on install (shouldn't happen, but be safe) must not delete.
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Install,
+            Component::OpencodeHooks,
+            PathBuf::from("/x"),
+            Some("x".into()),
+            String::new(),
+            Outcome::Replaced,
+            &mut actions,
+        );
+        assert!(matches!(actions.as_slice(), [Action::EditFile { .. }]));
+    }
+
+    #[test]
+    fn uninstall_absent_file_is_not_deleted() {
+        // File never existed (before None) → nothing to delete.
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Uninstall,
+            Component::GeminiHooks,
+            PathBuf::from("/x"),
+            None,
+            String::new(),
+            Outcome::AlreadyAbsent,
+            &mut actions,
+        );
+        assert!(matches!(actions.as_slice(), [Action::EditFile { .. }]));
     }
 }

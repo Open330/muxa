@@ -22,6 +22,7 @@ pub struct Detection {
     pub claude_settings: Option<PathBuf>,
     pub codex_config: Option<PathBuf>,
     pub gemini_settings: Option<PathBuf>,
+    pub opencode_config: Option<PathBuf>,
     pub muxad_running: bool,
     pub systemd_user_available: bool,
     pub launchctl_available: bool,
@@ -36,6 +37,7 @@ impl Detection {
             claude_settings: existing_file(home_join(".claude/settings.json")),
             codex_config: existing_file(home_join(".codex/config.toml")),
             gemini_settings: existing_file(home_join(".gemini/settings.json")),
+            opencode_config: existing_dir(opencode_config_dir()),
             muxad_running: muxad_is_running(),
             systemd_user_available: super::files::systemd::systemd_available(),
             launchctl_available: super::files::launchd::launchctl_available(),
@@ -65,6 +67,24 @@ impl Detection {
         out.push(self.recommended_daemon_manager());
         // Dashboard stays opt-in — costs a port and a token.
         out
+    }
+
+    /// Whether an agent-hook component's config is present on disk.
+    ///
+    /// Returns `Some(true)`/`Some(false)` for the four agent hooks
+    /// (Claude/Codex/Gemini/opencode) and `None` for every other
+    /// component — the caller reads `None` as "not an agent hook, always
+    /// keep". This is what lets the non-interactive/preset path skip
+    /// wiring up an agent the user doesn't actually have installed,
+    /// mirroring the pre-check logic in `default_selection`.
+    pub fn agent_config_present(&self, c: Component) -> Option<bool> {
+        match c {
+            Component::ClaudeHooks => Some(self.claude_settings.is_some()),
+            Component::CodexHooks => Some(self.codex_config.is_some()),
+            Component::GeminiHooks => Some(self.gemini_settings.is_some()),
+            Component::OpencodeHooks => Some(self.opencode_config.is_some()),
+            _ => None,
+        }
     }
 
     /// The OS-appropriate auto-start manager for this host. Defers to
@@ -130,6 +150,18 @@ fn existing_file(p: PathBuf) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn existing_dir(p: Option<PathBuf>) -> Option<PathBuf> {
+    p.filter(|p| p.is_dir())
+}
+
+/// opencode has no single well-known settings file the way the other
+/// agents do — it keeps state under `~/.config/opencode/` (that's also
+/// where its `plugins/` dir lives). Presence of that directory is our
+/// "opencode is installed" signal.
+fn opencode_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("opencode"))
 }
 
 fn home_join(rel: &str) -> PathBuf {
