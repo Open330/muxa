@@ -858,8 +858,11 @@ pub struct WatchConfig {
     /// Stale agents (pane closed) always bucket at the end, regardless of
     /// what's listed here.
     ///
-    /// Default: `["session", "latest"]` — groups by tmux session, then
-    /// floats the most-recently-active agent inside each group to the top.
+    /// Default: `["state", "session", "latest"]` — floats needs-attention
+    /// rows (error / input / choice) to the top so a blocked agent is never
+    /// buried below busy/idle ones, then groups by tmux session, then floats
+    /// the most-recently-active agent inside each group. `t` (sort by state)
+    /// and any user-configured order still take over verbatim.
     pub sort: Vec<WatchSortKey>,
     /// Hide agents that aren't bound to a tmux pane.
     ///
@@ -1015,11 +1018,19 @@ impl Default for WatchConfig {
             widths,
             view: WatchView::Session,
             detail: DetailConfig::default(),
-            // Group by session, then bring the most recently active agent
-            // in each group to the top — covers both "what's moving" and
-            // "where is it" at a glance, without losing the grouping
-            // shipped in c9a6572.
-            sort: vec![WatchSortKey::Session, WatchSortKey::Activity],
+            // Lead with State so needs-attention rows (error / input /
+            // choice) float to the top and a blocked agent is never buried
+            // below busy/idle ones. Then group by session and bring the most
+            // recently active agent in each group to the top — covers "who
+            // needs me", "what's moving", and "where is it" at a glance,
+            // without losing the grouping shipped in c9a6572. Users who
+            // preferred the old session-first order can set
+            // `sort = ["session", "latest"]`.
+            sort: vec![
+                WatchSortKey::State,
+                WatchSortKey::Session,
+                WatchSortKey::Activity,
+            ],
             hide_paneless: true,
             preview: PreviewConfig::default(),
         }
@@ -1054,12 +1065,17 @@ impl Default for DetailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Prefer the assistant's last response (the PROMPT column
-            // already surfaces the user's last prompt), but fall back to
-            // `last_prompt` when no response has been captured yet — older
-            // agents that pre-date transcript tailing, agents mid-turn,
-            // or hooks that fire `PromptSubmitted` without ever reaching
-            // `TurnStopped`. Without the fallback the detail row vanishes
+            // Prefer `last_notification` — the message the agent explicitly
+            // pushed ("approve permission to run X?", a choice prompt, an
+            // error line) — because that's the "why does this need me"
+            // context the PROMPT column and preview overlay otherwise hide.
+            // It's populated almost exclusively on blocked/error rows, so
+            // for working/idle rows it's empty and the chain falls through
+            // to the assistant's last response, then to the user's last
+            // prompt when no response has been captured yet (older agents
+            // that pre-date transcript tailing, agents mid-turn, or hooks
+            // that fire `PromptSubmitted` without ever reaching
+            // `TurnStopped`). Without the fallbacks the detail row vanishes
             // entirely in those cases, which reads as "the feature is
             // broken" rather than "no response yet".
             //
@@ -1067,7 +1083,7 @@ impl Default for DetailConfig {
             // left-to-right and pick the first non-dash value. Users who
             // want both visible can override with e.g.
             // `template = "{last_prompt} → {last_response}"`.
-            template: "{last_response|last_prompt}".to_string(),
+            template: "{last_notification|last_response|last_prompt}".to_string(),
         }
     }
 }
@@ -1244,18 +1260,25 @@ broken = "what"
     }
 
     #[test]
-    fn detail_defaults_to_last_response_fallback_to_last_prompt_template() {
+    fn detail_defaults_to_notification_then_response_then_prompt_template() {
         let cfg = WatchConfig::default();
         assert!(cfg.detail.enabled);
-        assert_eq!(cfg.detail.template, "{last_response|last_prompt}");
+        assert_eq!(
+            cfg.detail.template,
+            "{last_notification|last_response|last_prompt}"
+        );
     }
 
     #[test]
-    fn watch_sort_default_keeps_session_grouping_then_activity() {
+    fn watch_sort_default_leads_with_state_then_session_then_activity() {
         let cfg = WatchConfig::default();
         assert_eq!(
             cfg.sort,
-            vec![WatchSortKey::Session, WatchSortKey::Activity]
+            vec![
+                WatchSortKey::State,
+                WatchSortKey::Session,
+                WatchSortKey::Activity
+            ]
         );
     }
 
@@ -1383,8 +1406,8 @@ template = "{cwd} · {last_prompt}"
     }
 
     /// Missing `[watch.detail]` section -> defaults applied (enabled +
-    /// `{last_response|last_prompt}` fallback template). The
-    /// `default = WatchConfig::default` machinery on the parent struct
+    /// `{last_notification|last_response|last_prompt}` fallback template).
+    /// The `default = WatchConfig::default` machinery on the parent struct
     /// must kick in.
     #[test]
     fn missing_watch_detail_section_uses_defaults() {
@@ -1394,7 +1417,10 @@ columns = ["pane", "prompt"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.watch.detail.enabled);
-        assert_eq!(cfg.watch.detail.template, "{last_response|last_prompt}");
+        assert_eq!(
+            cfg.watch.detail.template,
+            "{last_notification|last_response|last_prompt}"
+        );
     }
 
     /// Partial `[watch.detail]` (only `enabled`, no `template`) — the
@@ -1408,7 +1434,10 @@ enabled = false
 ";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(!cfg.watch.detail.enabled);
-        assert_eq!(cfg.watch.detail.template, "{last_response|last_prompt}");
+        assert_eq!(
+            cfg.watch.detail.template,
+            "{last_notification|last_response|last_prompt}"
+        );
     }
 
     /// `deny_unknown_fields` is in force on `DetailConfig` — a stray

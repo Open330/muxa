@@ -20,10 +20,15 @@ pub const POPUP_BODY: &str = r#"# Replace tmux's stock prefix+s (choose-tree) wi
 bind-key s display-popup -E -w 90% -h 85% "muxa watch""#;
 
 /// The body that goes inside the `tmux-statusline` marker block.
-pub const STATUSLINE_BODY: &str = r##"# Per-pane agent glyph (● working / ○ idle / ▶ waiting / ■ error)
+///
+/// Two segments: a GLOBAL attention summary (`⚠ N need you`, red, empty
+/// when all-clear) so a blocked agent in any pane surfaces even while you
+/// look elsewhere, followed by the per-pane agent glyph
+/// (● working / ○ idle / ▶ waiting / ■ error) for the focused pane.
+pub const STATUSLINE_BODY: &str = r##"# Global attention summary + per-pane agent glyph (● working / ○ idle / ▶ waiting / ■ error)
 set -g status-interval 2
 set -g status-right-length 140
-set -g status-right "#(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M""##;
+set -g status-right "#(muxa status-line --needs-attention) #(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M""##;
 
 /// Render the body of the `tmux-env` marker block. We pin the socket
 /// path inside `~/.tmux.conf` so it survives `tmux kill-server` and
@@ -100,6 +105,21 @@ mod tests {
         let (after3, o3) = remove(&after2, Component::TmuxPopup);
         assert_eq!(o3, Outcome::Removed);
         assert!(!after3.contains("display-popup"));
+    }
+
+    #[test]
+    fn statusline_wires_global_and_per_pane_segments() {
+        let (after, o) = upsert("", Component::TmuxStatusLine);
+        assert_eq!(o, Outcome::Inserted);
+        // Global attention summary segment (surfaces a blocked agent in any
+        // pane) precedes the per-pane detail segment.
+        assert!(after.contains("muxa status-line --needs-attention"));
+        assert!(after.contains("muxa status-line --pane #{pane_id}"));
+
+        // Stays idempotent/detectable under the marker system.
+        let (after2, o2) = upsert(&after, Component::TmuxStatusLine);
+        assert_eq!(o2, Outcome::Unchanged);
+        assert_eq!(after, after2);
     }
 
     #[test]

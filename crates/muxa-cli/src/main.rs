@@ -69,6 +69,12 @@ enum Cmd {
     StatusLine {
         #[arg(long)]
         pane: Option<String>,
+        /// Emit a GLOBAL attention summary (`⚠ N need you`) counting every
+        /// tracked agent that's blocked on a human, instead of the per-pane
+        /// detail. Prints an empty line when nothing is blocked, so the tmux
+        /// segment disappears when all-clear. Ignores `--pane`.
+        #[arg(long)]
+        needs_attention: bool,
     },
     /// Show recent prompts for the given pane (default: `$TMUX_PANE`).
     ///
@@ -292,7 +298,10 @@ async fn main() -> Result<()> {
 
     match args.cmd {
         Cmd::Status { theme } => cmd_status(&client, &cfg, theme).await,
-        Cmd::StatusLine { pane } => cmd_status_line(&client, pane).await,
+        Cmd::StatusLine {
+            pane,
+            needs_attention,
+        } => cmd_status_line(&client, pane, needs_attention).await,
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
@@ -959,7 +968,41 @@ async fn cmd_status(client: &Client, cfg: &Config, theme: Option<ThemeArg>) -> R
     Ok(())
 }
 
-async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
+/// Format the global attention segment for tmux `status-right`. Empty when
+/// nothing is blocked so the segment vanishes when all-clear; otherwise
+/// tmux-style color markup — never raw ANSI, since tmux renders `#[...]`
+/// itself exactly like the per-pane path relies on.
+fn attention_segment(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        let verb = if count == 1 { "needs" } else { "need" };
+        format!("#[fg=red]⚠ {count} {verb} you#[default]")
+    }
+}
+
+async fn cmd_status_line(
+    client: &Client,
+    pane: Option<String>,
+    needs_attention: bool,
+) -> Result<()> {
+    // Global attention summary: a blocked agent in ANY pane surfaces
+    // passively, even while you're focused on a different pane. Keep the
+    // tight IPC deadline + empty-on-timeout contract of the status-line
+    // path so a slow daemon can never stall the tmux status bar.
+    if needs_attention {
+        let agents = client
+            .snapshot_with_timeout(STATUS_LINE_IPC_TIMEOUT)
+            .await
+            .unwrap_or_default();
+        let count = agents
+            .iter()
+            .filter(|a| attend::needs_attention(a.state))
+            .count();
+        println!("{}", attention_segment(count));
+        return Ok(());
+    }
+
     let backend = muxa::default_backend();
     let pane = pane.or_else(|| backend.current_pane());
     let agents = match &pane {
@@ -1534,6 +1577,29 @@ mod tests {
         for state in ALL_STATES {
             assert_eq!(UnicodeWidthStr::width(state_icon(state)), 1);
         }
+    }
+
+    #[test]
+    fn attention_segment_is_empty_when_all_clear() {
+        // Nothing blocked → empty string so the tmux segment disappears.
+        assert_eq!(attention_segment(0), "");
+    }
+
+    #[test]
+    fn attention_segment_renders_count_with_tmux_markup() {
+        let seg = attention_segment(2);
+        assert_eq!(seg, "#[fg=red]⚠ 2 need you#[default]");
+        // tmux styling, never raw ANSI (no ESC).
+        assert!(!seg.contains('\u{1b}'));
+        // Wraps the visible text in tmux color markup.
+        assert!(seg.starts_with("#[fg=red]"));
+        assert!(seg.ends_with("#[default]"));
+        assert!(seg.contains("2 need you"));
+
+        // Count is faithfully interpolated for other N, with subject-verb
+        // agreement (singular "needs", plural "need").
+        assert!(attention_segment(1).contains("1 needs you"));
+        assert!(attention_segment(7).contains("7 need you"));
     }
 
     #[test]

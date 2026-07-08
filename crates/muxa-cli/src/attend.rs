@@ -44,7 +44,10 @@ pub struct Args {
 /// you" and is a jump target; `Working` / `Idle` / `Starting` / `Stopped`
 /// agents are skipped. `WaitingChoice` is folded in alongside
 /// `WaitingInput` here exactly as the notifier and sink filters do.
-fn needs_attention(state: AgentState) -> bool {
+///
+/// Shared with `status-line --needs-attention` so the passive tmux segment
+/// and the active `attend` jump agree on what "needs you" means.
+pub(crate) fn needs_attention(state: AgentState) -> bool {
     matches!(
         state,
         AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error
@@ -153,24 +156,34 @@ pub async fn run(client: &Client, backend: &dyn PaneBackend, args: Args) -> Resu
     // and it's empty (harmless) on backends without pane metadata.
     let panes = backend.list_panes();
     let cands = candidates(&agents, &panes);
+    // Agents that need a human but have no pane to focus. `candidates`
+    // drops these (there's nothing to jump to), which used to make a
+    // detached/SDK-hosted agent that goes WaitingInput invisible here.
+    // We still count and name them so they aren't lost — we just can't
+    // send you there.
+    let paneless = paneless_waiters(&agents);
 
-    if cands.is_empty() {
-        // Separate "nothing tracked" from "everything's busy" so the line
-        // tells the user which it is.
-        if agents.is_empty() {
-            println!("no agents tracked");
+    if args.list {
+        if cands.is_empty() && paneless.is_empty() {
+            print_nothing(&agents);
         } else {
-            let n = agents.len();
-            println!(
-                "nothing needs you — {n} agent{} working or idle",
-                if n == 1 { "" } else { "s" }
-            );
+            if !cands.is_empty() {
+                print_queue(&cands, &panes);
+            }
+            // Separate the un-jumpable section from the queue with a
+            // blank line only when both are present.
+            print_paneless(&paneless, !cands.is_empty());
         }
         return Ok(None);
     }
 
-    if args.list {
-        print_queue(&cands, &panes);
+    if cands.is_empty() {
+        if paneless.is_empty() {
+            print_nothing(&agents);
+        } else {
+            // There ARE waiters — we just can't focus any of them.
+            print_paneless(&paneless, false);
+        }
         return Ok(None);
     }
 
@@ -223,6 +236,90 @@ fn print_queue(cands: &[Candidate<'_>], panes: &[PaneInfo]) {
             .agent
             .last_prompt
             .as_deref()
+            .and_then(|p| p.lines().next())
+            .map(|line| {
+                let snippet_width = terminal_width
+                    .saturating_sub(visible_head.chars().count())
+                    .saturating_sub(2);
+                truncate_cell(line, snippet_width)
+            })
+            .unwrap_or_default();
+        if snippet.is_empty() {
+            println!("{styled_head}");
+        } else {
+            println!("{styled_head}  {snippet}");
+        }
+    }
+}
+
+/// Attention-needing agents with no pane, ordered like the main queue
+/// (most urgent first: error > choice > input, then blocked longest). These
+/// can't be jumped to, but `attend --list` still names them so a paneless
+/// waiter isn't invisible in every surface.
+fn paneless_waiters(agents: &[Agent]) -> Vec<&Agent> {
+    let mut waiters: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| needs_attention(a.state) && a.pane.is_none())
+        .collect();
+    waiters.sort_by(|a, b| {
+        attention_rank(a.state)
+            .cmp(&attention_rank(b.state))
+            .then_with(|| a.state_entered_at.cmp(&b.state_entered_at))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    waiters
+}
+
+/// "nothing to do" line — separates "nothing tracked" from "everything's
+/// busy" so the message tells the user which it is.
+fn print_nothing(agents: &[Agent]) {
+    if agents.is_empty() {
+        println!("no agents tracked");
+    } else {
+        let n = agents.len();
+        println!(
+            "nothing needs you — {n} agent{} working or idle",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+}
+
+/// Render the "can't jump" section: agents that need you but have no pane.
+/// Each row is the state glyph, agent kind, a short session id, how long
+/// it's been blocked, and the first line of its notification / prompt.
+/// `leading_blank` inserts a spacer above the section when it follows the
+/// jumpable queue.
+fn print_paneless(waiters: &[&Agent], leading_blank: bool) {
+    if waiters.is_empty() {
+        return;
+    }
+    let now = OffsetDateTime::now_utc();
+    let color = use_colors();
+    let terminal_width = terminal_width();
+    if leading_blank {
+        println!();
+    }
+    let n = waiters.len();
+    println!(
+        "can't jump — {n} waiter{} with no pane:",
+        if n == 1 { "" } else { "s" }
+    );
+    for a in waiters {
+        let icon = state_icon(a.state);
+        let kind = truncate_cell(&a.kind.to_string(), 12);
+        let sid = truncate_cell(&a.session_id, 16);
+        let waited = humanize_since(a.state_entered_at, now);
+        let visible_head = format!("  {icon} {kind:<12} {sid:<16} waiting {waited:>4}");
+        let styled_head = if color {
+            visible_head.style(state_style(a.state)).to_string()
+        } else {
+            visible_head.clone()
+        };
+        // Prefer the notification (the "why") over the user's own prompt.
+        let snippet = a
+            .last_notification
+            .as_deref()
+            .or(a.last_prompt.as_deref())
             .and_then(|p| p.lines().next())
             .map(|line| {
                 let snippet_width = terminal_width
@@ -365,6 +462,22 @@ mod tests {
         let cands = candidates(&agents, &panes);
         let panes_out: Vec<&str> = cands.iter().map(|c| c.pane).collect();
         assert_eq!(panes_out, vec!["%2", "%1"]);
+    }
+
+    /// Paneless waiters are exactly the attention-needing agents with no
+    /// pane, ordered like the main queue (error outranks input) — busy and
+    /// pane-bound agents are excluded.
+    #[test]
+    fn paneless_waiters_filters_and_sorts() {
+        let agents = vec![
+            agent("wi", None, AgentState::WaitingInput, t(50)),
+            agent("err", None, AgentState::Error, t(100)), // error outranks input
+            agent("busy", None, AgentState::Working, t(0)), // not waiting → dropped
+            agent("paned", Some("%1"), AgentState::Error, t(0)), // has pane → dropped
+        ];
+        let waiters = paneless_waiters(&agents);
+        let ids: Vec<&str> = waiters.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["err", "wi"]);
     }
 
     /// `longest_waiting` returns whoever entered its blocked state earliest.

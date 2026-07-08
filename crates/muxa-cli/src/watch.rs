@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -43,7 +44,7 @@ use muxa::tmux::{PaneInfo, SessionInfo};
 use muxa::{ActivityEntry, HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind};
 use muxa::{AgentKind, AgentState};
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -1297,6 +1298,13 @@ pub(crate) struct App {
     /// users know the rows aren't lost — they just aren't actionable from
     /// the picker. Always 0 when `hide_paneless = false`.
     pub paneless_hidden: usize,
+    /// Of the `paneless_hidden` agents, how many are blocked on a human
+    /// (`WaitingInput` / `WaitingChoice` / `Error`). These would otherwise
+    /// be completely invisible — no row, and the plain `+N paneless` footer
+    /// hint doesn't say any of them need you — so the header attention
+    /// summary folds this count in. Always 0 when `hide_paneless = false`
+    /// (they're shown as normal rows and counted there).
+    pub paneless_attention: usize,
     /// Most recent `tmux capture-pane -ep` result, keyed by `pane_id`.
     /// Populated on demand when the preview is in
     /// [`PreviewContent::LivePane`] and re-captured on every refresh
@@ -1440,6 +1448,7 @@ impl App {
             initial_pane: None,
             preview: None,
             paneless_hidden: 0,
+            paneless_attention: 0,
             pane_capture: None,
             confirm: None,
             prompt: None,
@@ -1476,10 +1485,20 @@ impl App {
         // The count is preserved on `paneless_hidden` so the footer can
         // surface a `+N paneless` hint and the rows aren't silently lost.
         self.paneless_hidden = 0;
+        self.paneless_attention = 0;
         if self.watch_cfg.hide_paneless {
             let before = agents.len();
             // Background tasks are intentionally paneless but are the whole
             // point of being visible, so they're exempt from the hide.
+            // Before dropping the rest, tally how many of them are blocked
+            // on a human — a detached/SDK-hosted agent that goes
+            // WaitingInput has no row and no attend target, so the header
+            // attention summary is the only place it can surface.
+            self.paneless_attention = agents
+                .iter()
+                .filter(|a| a.pane.is_none() && a.kind != AgentKind::Task)
+                .filter(|a| agent_needs_attention(a.state))
+                .count();
             agents.retain(|a| a.pane.is_some() || a.kind == AgentKind::Task);
             self.paneless_hidden = before - agents.len();
         }
@@ -1737,6 +1756,16 @@ impl<'a> SortContext<'a> {
             .and_then(|id| self.pane(id))
             .map_or(0, |p| self.session_duration_secs(&p.session))
     }
+}
+
+/// Whether an agent state is blocked on a human — the same predicate the
+/// notifier and `attend` use. Kept in sync with `state_sort_rank`'s top
+/// three ranks.
+fn agent_needs_attention(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error
+    )
 }
 
 fn state_sort_rank(state: AgentState) -> u8 {
@@ -2250,7 +2279,12 @@ impl<B: Backend + io::Write> Drop for TerminalGuard<B> {
     fn drop(&mut self) {
         if let Some(mut t) = self.terminal.take() {
             let _ = disable_raw_mode();
-            let _ = execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(
+                t.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                DisableBracketedPaste
+            );
             let _ = t.show_cursor();
         }
     }
@@ -2259,7 +2293,18 @@ impl<B: Backend + io::Write> Drop for TerminalGuard<B> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste lets the terminal wrap pasted content in escape
+    // markers so crossterm delivers it as a single `Event::Paste(String)`
+    // — including any embedded newlines — instead of a stream of key
+    // events where a pasted `\n` is indistinguishable from a real Enter.
+    // The prompt composer relies on this to keep a multi-line paste from
+    // submitting itself at the first newline.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -2993,15 +3038,18 @@ pub async fn run(
                             )
                             .await;
                         }
-                        let mut fx = RealEffects;
-                        let outcome = dispatch_quick_action(
-                            QuickAction::SendPrompt {
+                        // Don't inject keystrokes+Enter into a live pane on a
+                        // single Enter — route the send through the same
+                        // confirm popup `K`/`R` use so it takes a deliberate
+                        // `y`. The confirm's default focus is "No", so a
+                        // fat-fingered Enter cancels rather than sends.
+                        app.confirm = Some(ConfirmPopup {
+                            message: format!("Send to {}?", popup.label),
+                            on_confirm: QuickAction::SendPrompt {
                                 pane_id: popup.pane_id,
                                 text: popup.input,
                             },
-                            &mut fx,
-                        );
-                        apply_outcome_to_app(&mut app, outcome);
+                        });
                     }
                 }
                 Action::CancelPrompt => {
@@ -3020,8 +3068,20 @@ pub async fn run(
                 }
                 Action::ConfirmYes => {
                     if let Some(popup) = app.confirm.take() {
-                        let mut fx = RealEffects;
-                        let outcome = dispatch_quick_action(popup.on_confirm, &mut fx);
+                        // The confirmed action (kill-pane, abort-turn, or a
+                        // prompt send) shells out to tmux synchronously —
+                        // and the send path also grace-sleeps between the
+                        // text and the Enter. Run the whole thing on a
+                        // blocking worker so neither the tmux fork nor the
+                        // sleep stalls the input/render loop.
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            let mut fx = RealEffects;
+                            dispatch_quick_action(popup.on_confirm, &mut fx)
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            ActionOutcome::Err(format!("✗ action task failed: {e}"))
+                        });
                         apply_outcome_to_app(&mut app, outcome);
                     }
                 }
@@ -3032,8 +3092,17 @@ pub async fn run(
                     if matches!(qa, QuickAction::ShowHelp) {
                         app.help_open = !app.help_open;
                     } else {
-                        let mut fx = RealEffects;
-                        let outcome = dispatch_quick_action(qa, &mut fx);
+                        // Copy shells out to clipboard helpers (and can fall
+                        // back to a /tmp write) — off the loop thread it
+                        // goes, same as the confirmed destructive actions.
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            let mut fx = RealEffects;
+                            dispatch_quick_action(qa, &mut fx)
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            ActionOutcome::Err(format!("✗ action task failed: {e}"))
+                        });
                         apply_outcome_to_app(&mut app, outcome);
                     }
                 }
@@ -3239,6 +3308,20 @@ pub(crate) enum Action {
 }
 
 fn handle_event(ev: Event, app: &mut App) -> Action {
+    // Bracketed paste arrives as one event carrying the whole payload,
+    // newlines and all. Route it into the prompt composer as literal text
+    // so a pasted `\n` lands in the buffer instead of being read as a
+    // submit — only a real Enter keypress (a separate `Event::Key`)
+    // submits. Outside the composer a paste has nowhere to go, so drop it.
+    if let Event::Paste(pasted) = ev {
+        if let Some(prompt) = app.prompt.as_mut() {
+            for c in pasted.chars() {
+                prompt.insert(c);
+            }
+        }
+        return Action::None;
+    }
+
     let Event::Key(KeyEvent {
         code,
         modifiers,
@@ -4071,6 +4154,7 @@ fn header_state_summary_spans(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let agents = app
@@ -4132,6 +4216,19 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Paneless waiters have no row and no attend target, so fold them into
+    // the header's attention count — otherwise a detached/SDK-hosted agent
+    // that goes WaitingInput is invisible in the primary loop.
+    if app.paneless_attention > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("+{} paneless waiting", app.paneless_attention),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     spans.push(Span::raw("   "));
     spans.push(Span::styled(
         format!("sort {}", sort_label(&app.watch_cfg.sort)),
@@ -4183,6 +4280,16 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+
+    // Empty grid reads as "muxa is broken" rather than "nothing is
+    // running yet". Replace it with a centered hint that tells the user
+    // what to do — and, when rows exist but are all hidden paneless
+    // agents, says so instead of implying there's nothing at all.
+    if app.rows.is_empty() {
+        render_empty_table(f, area, app, theme);
+        return;
+    }
+
     let header_cells = app.columns.iter().map(|c| {
         let header = if app.watch_cfg.view == WatchView::Session && matches!(c, WatchColumn::Pane) {
             "SESSION"
@@ -4266,6 +4373,79 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// Render the "no rows" placeholder inside the usual bordered table block.
+/// Centered vertically and horizontally so it reads as a deliberate empty
+/// state, not a rendering glitch. Distinguishes "nothing tracked at all"
+/// from "everything visible is hidden as paneless" so the hint is
+/// actionable in both cases.
+fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
+    let title = if app.watch_cfg.view == WatchView::Session {
+        " Sessions "
+    } else {
+        " Agents "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.paneless_attention > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} agent{} waiting — but with no tmux pane to show.",
+                app.paneless_attention,
+                plural(app.paneless_attention)
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Run `muxa watch --include-paneless` to list them.",
+            theme.dim_style(),
+        )));
+    } else if app.paneless_hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "No panes to show — {} paneless agent{} hidden.",
+                app.paneless_hidden,
+                plural(app.paneless_hidden)
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Run `muxa watch --include-paneless` to list them.",
+            theme.dim_style(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No agents tracked.",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Start an agent, or run `muxa doctor` to check setup.",
+            theme.dim_style(),
+        )));
+    }
+
+    // Pad with blank lines above so the message sits vertically centered
+    // in the block's inner area.
+    let text_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let top_pad = inner.height.saturating_sub(text_lines) / 2;
+    let mut padded: Vec<Line> = Vec::with_capacity((top_pad as usize) + lines.len());
+    for _ in 0..top_pad {
+        padded.push(Line::from(""));
+    }
+    padded.extend(lines);
+
+    let paragraph = Paragraph::new(padded).alignment(Alignment::Center);
+    f.render_widget(paragraph, inner);
 }
 
 /// Pick which column hosts the expanded detail line. Prefer `Prompt` (the
@@ -6884,6 +7064,52 @@ sort = ["state"]
         assert_eq!(s, "here is what I did");
     }
 
+    /// The default detail template leads with `last_notification` so a
+    /// blocked row answers "why does this need me" (the permission / choice
+    /// text) at a glance, then falls back to response, then prompt.
+    #[test]
+    fn default_detail_template_prefers_notification_then_response_then_prompt() {
+        let now = OffsetDateTime::now_utc();
+        let template = &muxa::config::DetailConfig::default().template;
+
+        // Notification present → wins.
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::WaitingInput,
+            Some("run the migration?"),
+            None,
+            None,
+            None,
+        );
+        a.last_response = Some("a response".into());
+        a.last_notification = Some("approve permission to run rm -rf?".into());
+        let row = WatchRow::agent(a);
+        assert_eq!(
+            format_detail(template, &row, &[], now).unwrap(),
+            "approve permission to run rm -rf?"
+        );
+
+        // No notification → falls through to the response.
+        let mut a = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("my prompt"),
+            None,
+            None,
+            None,
+        );
+        a.last_response = Some("assistant reply".into());
+        let row = WatchRow::agent(a);
+        assert_eq!(
+            format_detail(template, &row, &[], now).unwrap(),
+            "assistant reply"
+        );
+    }
+
     #[test]
     fn format_detail_returns_none_when_only_dashes() {
         let now = OffsetDateTime::now_utc();
@@ -7368,6 +7594,53 @@ sort = ["state"]
         );
         assert_eq!(app.rows.len(), 2);
         assert_eq!(app.paneless_hidden, 0);
+    }
+
+    /// Hidden paneless agents that are blocked on a human are tallied into
+    /// `paneless_attention` so the header can surface them — otherwise a
+    /// detached agent that goes `WaitingInput` is invisible in the picker.
+    /// Idle/working paneless agents count toward `paneless_hidden` but not
+    /// `paneless_attention`.
+    #[test]
+    fn paneless_attention_counts_only_blocked_hidden_agents() {
+        let mut app = App::new(); // default hides paneless
+        app.set_data(
+            vec![
+                fake_agent(
+                    "waiting-nopane",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::WaitingInput,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "error-nopane",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "idle-nopane",
+                    None,
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(app.paneless_hidden, 3);
+        assert_eq!(app.paneless_attention, 2);
     }
 
     /// Footer surfaces the hidden-paneless count so the rows aren't
@@ -9232,6 +9505,36 @@ sort = ["state"]
         );
         assert_eq!(fx.send_prompt_calls, vec![("%42".into(), "hello".into())]);
         assert!(matches!(outcome, ActionOutcome::Ok(msg) if msg.contains("sent prompt")));
+    }
+
+    #[test]
+    fn pasted_text_with_newline_goes_to_buffer_not_submit() {
+        // Bracketed paste delivers the whole payload — newlines and all —
+        // as one `Event::Paste`. It must land in the composer buffer, not
+        // submit at the embedded `\n` the way a stream of key events would.
+        let mut app = app_with_paneless_and_pane();
+        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
+
+        let action = handle_event(Event::Paste("line one\nline two".into()), &mut app);
+        assert!(matches!(action, Action::None));
+        assert_eq!(app.prompt.as_ref().unwrap().input, "line one\nline two");
+
+        // A subsequent real Enter is what submits.
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::SubmitPrompt));
+    }
+
+    #[test]
+    fn paste_outside_composer_is_ignored() {
+        let mut app = app_with_paneless_and_pane();
+        // No prompt open — a stray paste has nowhere to go and must not
+        // panic or mutate anything.
+        let action = handle_event(Event::Paste("junk".into()), &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(app.prompt.is_none());
     }
 
     #[test]
