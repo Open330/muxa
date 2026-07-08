@@ -226,6 +226,8 @@ mod tests {
 
     fn agent(state: AgentState) -> Agent {
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: "s".into(),
             surface: None,

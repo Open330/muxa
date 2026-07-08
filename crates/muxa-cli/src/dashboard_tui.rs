@@ -3339,6 +3339,8 @@ mod tests {
         at: OffsetDateTime,
     ) -> Agent {
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::Codex,
             session_id: session.to_string(),
             surface: None,
@@ -3368,6 +3370,7 @@ mod tests {
 
     fn fake_pane(pane_id: &str, session: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: pane_id.to_string(),
             session: session.to_string(),
             window_index: "1".into(),

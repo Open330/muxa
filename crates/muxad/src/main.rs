@@ -838,6 +838,8 @@ async fn enrich_from_history(
             session_id: entry.session_id,
             surface: None,
             pane: Some(pane.pane_id.clone()),
+            tmux_socket: pane.socket.clone(),
+            tmux_session: Some(pane.session.clone()),
             cwd: entry.cwd,
             pid: None,
             workload: muxa::WorkloadSummary::default(),

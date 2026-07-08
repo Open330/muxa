@@ -1485,6 +1485,7 @@ mod tests {
         client
             .ingest(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "sess-a".into(),
                     surface: None,
@@ -1525,6 +1526,7 @@ mod tests {
 
         // Drive a state transition: Started → Idle (initial).
         let id = AgentId {
+            tmux_socket: None,
             kind: AgentKind::ClaudeCode,
             session_id: "sub-test".into(),
             surface: None,
@@ -1892,6 +1894,7 @@ mod tests {
         wait_for_socket(&sock).await;
 
         let id = AgentId {
+            tmux_socket: None,
             kind: AgentKind::ClaudeCode,
             session_id: "v1-test".into(),
             surface: None,
@@ -2012,6 +2015,7 @@ mod tests {
         wait_for_socket(&sock).await;
 
         let id = AgentId {
+            tmux_socket: None,
             kind: AgentKind::ClaudeCode,
             session_id: "v2-test".into(),
             surface: None,
@@ -2110,6 +2114,7 @@ mod tests {
         assert!(backend.list_panes().is_empty());
 
         let pane = PaneInfo {
+            socket: None,
             pane_id: "zellij:3".into(),
             session: "z".into(),
             window_index: "0".into(),

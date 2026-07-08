@@ -24,7 +24,7 @@
 //! `/api/events`) is host-agnostic. This is intentional and matches
 //! the design doc's "Zellij has no multi-server enumeration" note.
 
-use crate::tmux::{parse_pane_lines, PaneInfo, PANE_FMT};
+use crate::tmux::{PaneInfo, PANE_FMT};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -239,7 +239,11 @@ async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<PaneInfo>, String> {
         return Err(stderr);
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(parse_pane_lines(&stdout))
+    let socket = crate::tmux::socket_short_name(sock_str);
+    Ok(crate::tmux::parse_pane_lines_for_socket(
+        &stdout,
+        Some(&socket),
+    ))
 }
 
 fn is_no_server_running(stderr: &str) -> bool {
@@ -350,6 +354,7 @@ mod tests {
     use std::sync::Arc;
     fn fake_pane(id: &str, session: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: session.into(),
             window_index: "0".into(),

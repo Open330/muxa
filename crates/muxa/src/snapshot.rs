@@ -361,6 +361,7 @@ mod tests {
     fn started_event(sid: &str, pane: &str, at: OffsetDateTime) -> AgentEvent {
         AgentEvent::Started {
             id: AgentId {
+                tmux_socket: None,
                 kind: AgentKind::ClaudeCode,
                 session_id: sid.into(),
                 surface: None,

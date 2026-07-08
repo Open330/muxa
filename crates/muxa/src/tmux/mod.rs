@@ -132,6 +132,25 @@ pub struct PaneInfo {
     /// truncated lines from older tmux) leave it zeroed out, and downstream
     /// discovery treats `0` as "no process tree to walk."
     pub pane_pid: u32,
+    /// Short name of the tmux server socket this pane lives on (the socket
+    /// file's basename, e.g. `default` or `amux`). Pane ids are only unique
+    /// per server, so consumers matching by pane id use this to
+    /// disambiguate. `None` when the row came from a bare `tmux` call whose
+    /// socket couldn't be named (or from a backend without sockets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+}
+
+/// The short display name for a tmux socket path: its file basename
+/// (`/private/tmp/tmux-501/amux` → `amux`). Falls back to the input when
+/// there is no basename. Used to compare `$TMUX`-derived paths against
+/// scanner socket names.
+pub fn socket_short_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +211,12 @@ pub(crate) const CLIENT_FMT: &str =
 /// 0.5.x; rows from older `PANE_FMT` outputs (or other backends that
 /// don't emit it) get `pane_pid = 0`.
 pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
+    parse_pane_lines_for_socket(stdout, None)
+}
+
+/// `parse_pane_lines` with the originating server's socket short name
+/// stamped on every row (see [`PaneInfo::socket`]).
+pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) -> Vec<PaneInfo> {
     let mut panes = Vec::new();
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split('\t').collect();
@@ -208,6 +233,7 @@ pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
             current_command: cols[5].into(),
             title: cols[6].into(),
             pane_pid,
+            socket: socket.map(Into::into),
         });
     }
     panes
@@ -270,7 +296,8 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
         match tmux_output(&["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT]) {
             Ok(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                all.extend(parse_pane_lines(&stdout));
+                let socket = socket_short_name(sock_str);
+                all.extend(parse_pane_lines_for_socket(&stdout, Some(&socket)));
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();

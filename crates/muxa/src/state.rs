@@ -23,7 +23,7 @@ use crate::process_tree::WorkloadSummary;
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -82,6 +82,18 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
+    /// Short name of the tmux server socket `pane` lives on (the socket
+    /// file's basename, e.g. `default` or `amux`) — from the adapter's
+    /// `$TMUX` at hook time, or backfilled by the reconciler's pane scan.
+    /// Pane ids are only unique per server; wire consumers matching by pane
+    /// use this to disambiguate. Optional and purely additive on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
+    /// Name of the tmux session `pane` belongs to, backfilled by the
+    /// reconciler's multi-socket pane scan each tick. Optional and purely
+    /// additive on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session: Option<String>,
     pub cwd: Option<String>,
     /// OS process id for pid-tracked rows (`AgentKind::Task`). When set,
     /// the reconciler governs this agent's liveness by checking whether the
@@ -207,6 +219,8 @@ impl Agent {
             session_id,
             surface,
             pane,
+            tmux_socket: None,
+            tmux_session: None,
             cwd,
             pid: None,
             workload: WorkloadSummary::default(),
@@ -942,6 +956,14 @@ impl Store {
         if agent.pane.is_none() {
             agent.pane.clone_from(&id.pane);
         }
+        if agent.tmux_socket.is_none() {
+            // `$TMUX` carries the socket *path*; store the short name so it
+            // compares directly against the pane scan's socket tags.
+            agent.tmux_socket = id
+                .tmux_socket
+                .as_deref()
+                .map(crate::tmux::socket_short_name);
+        }
         if agent.surface.is_none() {
             agent.surface.clone_from(&id.surface);
         }
@@ -1194,6 +1216,44 @@ impl Store {
         changed
     }
 
+    /// Backfills tmux session/socket names from the pane scan so agent rows
+    /// carry them on the wire (clients join workspaces by session name).
+    /// Deliberately silent — no state transition is broadcast for a name
+    /// refresh. Ambiguous untagged rows (same pane id on several servers,
+    /// agent without `$TMUX` info) prefer the default server.
+    fn backfill_tmux_names(
+        agents: &mut HashMap<String, Agent>,
+        panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+    ) {
+        for a in agents.values_mut() {
+            if a.pid.is_some() {
+                continue;
+            }
+            let Some(pane_id) = a.pane.as_deref() else {
+                continue;
+            };
+            let Some(cands) = panes_by_id.get(pane_id) else {
+                continue;
+            };
+            let chosen = match a.tmux_socket.as_deref() {
+                Some(sock) => cands.iter().find(|p| p.socket.as_deref() == Some(sock)),
+                None => match cands.len() {
+                    1 => cands.first(),
+                    _ => cands
+                        .iter()
+                        .find(|p| p.socket.as_deref() == Some("default"))
+                        .or(cands.first()),
+                },
+            };
+            if let Some(p) = chosen {
+                a.tmux_session = Some(p.session.clone());
+                if a.tmux_socket.is_none() {
+                    a.tmux_socket.clone_from(&p.socket);
+                }
+            }
+        }
+    }
+
     /// Converge the registry against ground truth from tmux.
     ///
     /// This is the periodic control-loop pass — analogous to a Kubernetes
@@ -1217,12 +1277,20 @@ impl Store {
     /// Idempotent and safe to run on a timer regardless of event traffic.
     /// Returns counts so callers can log non-trivial sweeps without spamming.
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
-        let live: HashSet<&str> = live_panes.iter().map(|p| p.pane_id.as_str()).collect();
         let mut agents = self.agents.write().await;
         let mut report = ReconcileReport::default();
 
         // Sweep 1: drop agents whose pane is gone. Done as a single retain
         // pass to avoid building an intermediate Vec of doomed session ids.
+        // Candidate panes per pane id: the scan spans every tmux server
+        // socket, and pane ids are only unique per server, so one id can
+        // map to several panes. Liveness and the session-name backfill both
+        // use the agent's `tmux_socket` (when known) to pick the right one.
+        let mut panes_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for p in live_panes {
+            panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
+        }
+
         let before = agents.len();
         agents.retain(|_, a| {
             // pid-tracked rows (Task) are governed by process liveness in
@@ -1232,24 +1300,43 @@ impl Store {
                 return true;
             }
             match a.pane.as_deref() {
-                Some(pane_id) => live.contains(pane_id),
+                Some(pane_id) => match (panes_by_id.get(pane_id), a.tmux_socket.as_deref()) {
+                    (None, _) => false,
+                    // Socket-aware rows must match a pane on THEIR server —
+                    // a same-numbered pane on another server is not this
+                    // agent's pane. Untagged candidates (bare-call rows)
+                    // stay acceptable to avoid reaping across tmux quirks.
+                    (Some(cands), Some(sock)) => cands
+                        .iter()
+                        .any(|p| p.socket.as_deref().is_none_or(|s| s == sock)),
+                    (Some(_), None) => true,
+                },
                 None => true, // paneless agents (rare) aren't governed by tmux
             }
         });
         report.stale_panes_reaped = before - agents.len();
 
-        // Sweeps 2 & 3: per-pane dedup. Group surviving agents by pane id.
+        Self::backfill_tmux_names(&mut agents, &panes_by_id);
+
+        // Sweeps 2 & 3: per-pane dedup. Group surviving agents by pane id
+        // AND server socket — pane ids repeat across tmux servers, and two
+        // agents on same-numbered panes of different servers are different
+        // agents, never duplicates. (The backfill above just stamped every
+        // pane-bearing agent's socket, so the key is populated.)
         // pid-tracked rows (Task) are excluded entirely — they're governed
         // by process liveness, never by pane ownership, so a task that
         // carries a `--pane` must not be deduped against the pane's real
         // agent (that would delete one of them).
-        let mut by_pane: HashMap<&str, Vec<String>> = HashMap::new();
+        let mut by_pane: HashMap<(&str, Option<&str>), Vec<String>> = HashMap::new();
         for (sid, a) in agents.iter() {
             if a.pid.is_some() {
                 continue;
             }
             if let Some(p) = a.pane.as_deref() {
-                by_pane.entry(p).or_default().push(sid.clone());
+                by_pane
+                    .entry((p, a.tmux_socket.as_deref()))
+                    .or_default()
+                    .push(sid.clone());
             }
         }
 
@@ -1347,6 +1434,7 @@ mod tests {
 
     fn id(session: &str) -> AgentId {
         AgentId {
+            tmux_socket: None,
             kind: AgentKind::ClaudeCode,
             session_id: session.into(),
             surface: None,
@@ -1363,6 +1451,8 @@ mod tests {
     ) -> Agent {
         let at = datetime!(2026-05-05 12:00:00 UTC);
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind,
             session_id: session.into(),
             surface: None,
@@ -1427,6 +1517,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "claude-1".into(),
                     surface: None,
@@ -1525,6 +1616,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "agent".into(),
                     surface: None,
@@ -1567,6 +1659,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "agent".into(),
                     surface: None,
@@ -1587,6 +1680,7 @@ mod tests {
             .await
             .unwrap();
         let pane = PaneInfo {
+            socket: None,
             pane_id: "%1".into(),
             session: "s".into(),
             window_index: "0".into(),
@@ -2811,6 +2905,7 @@ mod tests {
 
         // First synthetic from `muxa sync` lands an Idle agent on %1.
         let synthetic = AgentId {
+            tmux_socket: None,
             kind: AgentKind::ClaudeCode,
             session_id: "synthetic-%1".into(),
             surface: None,
@@ -2849,6 +2944,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%7".into(),
                     surface: None,
@@ -2865,6 +2961,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-sess".into(),
                     surface: None,
@@ -2892,6 +2989,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-sess".into(),
                     surface: None,
@@ -2906,6 +3004,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%9".into(),
                     surface: None,
@@ -2958,6 +3057,7 @@ mod tests {
 
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: "s".into(),
             window_index: "0".into(),
@@ -2987,6 +3087,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "real".into(),
                     surface: None,
@@ -2999,6 +3100,7 @@ mod tests {
         store
             .apply(&AgentEvent::SessionEnded {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "real".into(),
                     surface: None,
@@ -3016,6 +3118,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%5".into(),
                     surface: None,
@@ -3040,6 +3143,71 @@ mod tests {
         );
     }
 
+    /// One pane id, two servers: the reconciler must backfill each agent's
+    /// `tmux_session` from the pane on ITS server (socket-tagged rows), and
+    /// prefer the default server for legacy untagged rows.
+    #[tokio::test]
+    async fn reconcile_backfills_session_names_per_socket() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let mk_started = |sid: &str, socket: Option<&str>| AgentEvent::Started {
+            id: AgentId {
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some("%1".into()),
+                tmux_socket: socket.map(Into::into),
+                cwd: None,
+            },
+            at: t0,
+        };
+        store
+            .apply(&mk_started("on-amux", Some("/tmp/tmux-501/amux")))
+            .await;
+        store.apply(&mk_started("untagged", None)).await;
+
+        let mut amux_pane = pane("%1");
+        amux_pane.socket = Some("amux".into());
+        amux_pane.session = "amux-spike".into();
+        let mut default_pane = pane("%1");
+        default_pane.socket = Some("default".into());
+        default_pane.session = "main".into();
+        store.reconcile(&[amux_pane, default_pane]).await;
+
+        let on_amux = store.by_session("on-amux").await.expect("agent kept");
+        assert_eq!(on_amux.tmux_socket.as_deref(), Some("amux"));
+        assert_eq!(on_amux.tmux_session.as_deref(), Some("amux-spike"));
+        let untagged = store.by_session("untagged").await.expect("agent kept");
+        assert_eq!(untagged.tmux_session.as_deref(), Some("main"));
+        assert_eq!(untagged.tmux_socket.as_deref(), Some("default"));
+    }
+
+    /// A socket-tagged agent whose server no longer has its pane is reaped
+    /// even when another server has a same-numbered pane.
+    #[tokio::test]
+    async fn reconcile_reaps_socket_tagged_agent_when_its_server_lacks_the_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "amux-only".into(),
+                    surface: None,
+                    pane: Some("%9".into()),
+                    tmux_socket: Some("/tmp/tmux-501/amux".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+        let mut default_pane = pane("%9");
+        default_pane.socket = Some("default".into());
+        let report = store.reconcile(&[default_pane]).await;
+        assert_eq!(report.stale_panes_reaped, 1);
+        assert!(store.by_session("amux-only").await.is_none());
+    }
+
     #[tokio::test]
     async fn reconcile_reaps_agents_whose_pane_is_gone() {
         let store = Store::shared();
@@ -3048,6 +3216,7 @@ mod tests {
             store
                 .apply(&AgentEvent::Started {
                     id: AgentId {
+                        tmux_socket: None,
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
                         surface: None,
@@ -3078,6 +3247,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "no-pane".into(),
                     surface: None,
@@ -3110,6 +3280,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "synthetic-%1".into(),
                     surface: None,
@@ -3130,6 +3301,8 @@ mod tests {
             agents.insert(
                 "real-old".into(),
                 Agent {
+                    tmux_socket: None,
+                    tmux_session: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-old".into(),
                     surface: None,
@@ -3159,6 +3332,8 @@ mod tests {
             agents.insert(
                 "real-new".into(),
                 Agent {
+                    tmux_socket: None,
+                    tmux_session: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "real-new".into(),
                     surface: None,
@@ -3217,6 +3392,8 @@ mod tests {
                 agents.insert(
                     sid.into(),
                     Agent {
+                        tmux_socket: None,
+                        tmux_session: None,
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
                         surface: None,
@@ -3266,6 +3443,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "live".into(),
                     surface: None,
@@ -3279,6 +3457,8 @@ mod tests {
         // Two candidates: "live" already exists (must skip),
         // "fresh" is new (must insert).
         let mk = |sid: &str, pane: &str, prompt: &str| Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: sid.into(),
             surface: None,
@@ -3433,6 +3613,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "lone".into(),
                     surface: None,

@@ -872,6 +872,7 @@ mod tests {
                 .store
                 .apply(&AgentEvent::Started {
                     id: AgentId {
+                        tmux_socket: None,
                         kind,
                         session_id: sid.into(),
                         surface: None,
@@ -1208,6 +1209,7 @@ mod tests {
             .store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "s1".into(),
                     surface: None,
@@ -1251,6 +1253,7 @@ mod tests {
             .store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "snap-1".into(),
                     surface: None,
@@ -1320,6 +1323,7 @@ mod tests {
         store
             .apply(&AgentEvent::Started {
                 id: AgentId {
+                    tmux_socket: None,
                     kind: AgentKind::ClaudeCode,
                     session_id: "s1".into(),
                     surface: None,
@@ -1348,6 +1352,7 @@ mod tests {
             store_for_task
                 .apply(&AgentEvent::NotificationFired {
                     id: AgentId {
+                        tmux_socket: None,
                         kind: AgentKind::ClaudeCode,
                         session_id: "s1".into(),
                         surface: None,
@@ -1391,6 +1396,8 @@ mod tests {
         let mut stream = BroadcastStream::new(rx);
 
         let agent = Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: "s1".into(),
             surface: None,
@@ -1496,6 +1503,8 @@ mod tests {
         // Fill + overflow the buffer. Capacity is 2; we send 5 so the
         // receiver is now 3 messages behind.
         let agent = Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: "lag".into(),
             surface: None,
@@ -1586,6 +1595,7 @@ mod tests {
                 .store
                 .apply(&AgentEvent::Started {
                     id: AgentId {
+                        tmux_socket: None,
                         kind,
                         session_id: sid.into(),
                         surface: None,

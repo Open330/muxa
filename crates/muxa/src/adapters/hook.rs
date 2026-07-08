@@ -69,7 +69,22 @@ where
     if let Some(surface) = surface {
         ev.id_mut().surface = Some(surface);
     }
+    if ev.id_mut().tmux_socket.is_none() {
+        ev.id_mut().tmux_socket = tmux_socket_env();
+    }
     Ok(ev)
+}
+
+/// The tmux server socket path from `$TMUX` (`"<socket>,<pid>,<session>"`),
+/// when the hook process runs inside tmux. Empty/absent yields `None`.
+fn tmux_socket_env() -> Option<String> {
+    let value = std::env::var("TMUX").ok()?;
+    let path = value.split(',').next()?.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
 }
 
 fn muxa_session_env() -> Option<SurfaceRef> {

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Agent rows now carry `tmux_socket` and `tmux_session` on the wire**
+  (additive, optional). The reconciler backfills both from its multi-socket
+  pane scan each tick, and hook adapters send the pane's server socket path
+  from `$TMUX`, so pane ids are no longer ambiguous across tmux servers
+  (e.g. a dedicated `tmux -L amux` server vs the default one). Clients such
+  as amux join agents to workspaces by session name instead of guessing by
+  pane id.
+- **Socket-aware liveness and dedup**: an agent tagged with a server socket
+  is only considered alive while *that* server has its pane, and two agents
+  on same-numbered panes of different servers are never collapsed as
+  duplicates.
+
 ## [0.8.17] - 2026-07-08
 
 ### Fixed

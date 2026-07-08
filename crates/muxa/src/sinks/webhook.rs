@@ -483,6 +483,8 @@ mod tests {
 
     fn agent(kind: AgentKind, pane: Option<&str>, prompt: Option<&str>) -> Agent {
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind,
             session_id: "sess-1".into(),
             surface: None,

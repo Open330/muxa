@@ -251,6 +251,7 @@ pub fn synthesize_started(d: &Discovered, at: OffsetDateTime) -> AgentEvent {
             session_id: format!("{}{}", SYNTHETIC_SESSION_PREFIX, d.pane.pane_id),
             surface: None,
             pane: Some(d.pane.pane_id.clone()),
+            tmux_socket: d.pane.socket.clone(),
             cwd: None,
         },
         at,
@@ -351,6 +352,7 @@ mod tests {
 
     fn pane(id: &str, cmd: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: "s".into(),
             window_index: "0".into(),

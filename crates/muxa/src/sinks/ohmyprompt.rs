@@ -579,6 +579,7 @@ mod tests {
     fn rec(kind: AgentKind, prompt: &str, cwd: Option<&str>, model: Option<&str>) -> PromptRecord {
         PromptRecord {
             id: AgentId {
+                tmux_socket: None,
                 kind,
                 session_id: "sess-1".into(),
                 surface: None,

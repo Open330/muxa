@@ -206,8 +206,15 @@ Tagged union. `type` field is the discriminant.
 { "kind": "claude_code" | "codex" | "gemini_cli" | "opencode" | "unknown",
   "session_id": "string",
   "pane": "string | null",
+  "tmux_socket": "string | absent",
   "cwd": "string | null" }
 ```
+
+`tmux_socket` (additive, optional): absolute path of the tmux server
+socket `pane` belongs to — the first comma-separated field of `$TMUX` at
+hook time. Pane ids are only unique per server, so this disambiguates
+panes on non-default servers (e.g. a dedicated `tmux -L amux` server).
+Adapters that predate the field simply never send it.
 
 `level`:
 `"info" | "needs_input" | "needs_choice" | "warning" | "error"`.
@@ -231,7 +238,8 @@ Same fields as stored in the registry:
   "kind": "claude_code",
   "session_id": "sess-abc",
   "pane": "%12",
-  "tmux_session": "main",
+  "tmux_socket": "amux",
+  "tmux_session": "amux-spike",
   "cwd": "/home/user/proj",
   "state": "working" | "idle" | "waiting_input" | "waiting_choice" | "error" | "stopped" | "starting",
   "last_prompt": "string | null",
@@ -243,6 +251,13 @@ Same fields as stored in the registry:
   "last_activity_at": "2026-04-24T12:03:21Z"
 }
 ```
+
+`tmux_socket` and `tmux_session` are additive and optional. `tmux_socket`
+is the short socket name (the socket file's basename, e.g. `default` or
+`amux`) — from the adapter's `$TMUX` or backfilled by the daemon's
+reconciler. `tmux_session` is backfilled by the reconciler's multi-socket
+pane scan each tick; it is absent until the first tick after the agent's
+pane is seen.
 
 ## `HistoryEntry` schema (in `recent_prompts` responses)
 
