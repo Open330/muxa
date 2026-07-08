@@ -32,6 +32,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -47,8 +48,9 @@ const MAX_IPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound on concurrent connection handlers. Kept well under the
 /// daemon's file-descriptor budget so a burst — or a leak — of handlers can
 /// never drive `accept()` into `EMFILE` and wedge the whole listener the way
-/// a runaway of hung hook connections once did. Connections over budget are
-/// shed immediately rather than queued.
+/// a runaway of hung hook connections once did. The server reserves a permit
+/// before `accept()`, so over-budget connections wait in the OS backlog or
+/// time out client-side instead of consuming another daemon fd.
 const MAX_INFLIGHT_HANDLERS: usize = 256;
 
 /// How long a connection may sit between requests without sending a complete
@@ -57,7 +59,7 @@ const MAX_INFLIGHT_HANDLERS: usize = 256;
 /// client which connects and never sends EOF cannot pin a file descriptor
 /// indefinitely. Does not apply to the streaming pump — a `Subscribe`
 /// connection leaves the request loop entirely (see [`stream_transitions`]).
-const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(60);
+const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cadence of keepalive writes on a `Subscribe` stream. A dead watch client
 /// that has stopped reading is detected on the next keepalive write (broken
@@ -97,6 +99,12 @@ pub enum RuntimeError {
 
     #[error("ipc request timed out after {0:?}")]
     Timeout(Duration),
+}
+
+impl RuntimeError {
+    fn is_client_disconnect(&self) -> bool {
+        matches!(self, Self::Io(e) if is_client_disconnect(e))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +343,7 @@ pub struct Server {
     store: SharedStore,
     backend: SharedBackend,
     sessions: SharedSessionBackend,
+    handler_limit: usize,
 }
 
 impl Server {
@@ -344,6 +353,7 @@ impl Server {
             store,
             backend: default_backend(),
             sessions: PtySessionBackend::shared(),
+            handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
 
@@ -361,6 +371,13 @@ impl Server {
     #[must_use]
     pub fn with_sessions(mut self, sessions: SharedSessionBackend) -> Self {
         self.sessions = sessions;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_handler_limit(mut self, handler_limit: usize) -> Self {
+        self.handler_limit = handler_limit;
         self
     }
 
@@ -384,10 +401,35 @@ impl Server {
         // from handlers can never exceed `MAX_INFLIGHT_HANDLERS` — keeping
         // the process comfortably below its fd limit no matter how many
         // clients (or hung hooks) pile up.
-        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDLERS));
+        let handler_limit = self.handler_limit;
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(handler_limit));
 
         loop {
+            let permit = tokio::select! {
+                _ = shutdown.recv() => {
+                    tracing::info!("shutdown signal received; closing listener");
+                    break;
+                }
+                joined = handlers.join_next(), if !handlers.is_empty() => {
+                    if let Some(Err(e)) = joined {
+                        tracing::warn!(error = %e, "connection handler task failed");
+                    }
+                    continue;
+                }
+                permit = permits.clone().acquire_owned() => {
+                    match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                }
+            };
+
             tokio::select! {
+                _ = shutdown.recv() => {
+                    drop(permit);
+                    tracing::info!("shutdown signal received; closing listener");
+                    break;
+                }
                 accept = listener.accept() => {
                     let (stream, _) = match accept {
                         Ok(pair) => pair,
@@ -401,9 +443,10 @@ impl Server {
                             // handlers of the CPU they need to free fds.
                             tracing::error!(
                                 error = %e,
-                                inflight = MAX_INFLIGHT_HANDLERS - permits.available_permits(),
+                                inflight = handler_limit - permits.available_permits(),
                                 "accept hit fd exhaustion; backing off",
                             );
+                            drop(permit);
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         }
@@ -411,20 +454,9 @@ impl Server {
                             // Per-connection errors (client aborted mid-accept,
                             // etc.) are transient; log and keep serving.
                             tracing::warn!(error = %e, "accept error; continuing");
+                            drop(permit);
                             continue;
                         }
-                    };
-                    // Shed load past the budget instead of queuing it. Dropping
-                    // the stream closes the fd immediately; well-behaved clients
-                    // retry, and hook clients (bounded by HOOK_CALL_TIMEOUT)
-                    // treat it as a soft no-op.
-                    let Ok(permit) = permits.clone().try_acquire_owned() else {
-                        tracing::warn!(
-                            limit = MAX_INFLIGHT_HANDLERS,
-                            "handler budget exhausted; shedding connection",
-                        );
-                        drop(stream);
-                        continue;
                     };
                     let store = self.store.clone();
                     let backend = self.backend.clone();
@@ -433,16 +465,16 @@ impl Server {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
                         if let Err(e) = handle(stream, store, backend, sessions).await {
+                            if e.is_client_disconnect() {
+                                tracing::debug!(error = %e, "client disconnected");
+                                return;
+                            }
                             tracing::warn!(error = %e, "connection handler failed");
                         }
                     });
                     // Reap finished handlers opportunistically so the JoinSet
                     // doesn't grow unboundedly under steady traffic.
                     while handlers.try_join_next().is_some() {}
-                }
-                _ = shutdown.recv() => {
-                    tracing::info!("shutdown signal received; closing listener");
-                    break;
                 }
             }
         }
@@ -534,6 +566,31 @@ fn encode_line<T: Serialize>(value: &T, protocol: u32) -> Result<Vec<u8>, serde_
     };
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+fn is_client_disconnect(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+async fn write_line_or_closed(
+    writer: &mut OwnedWriteHalf,
+    bytes: &[u8],
+) -> Result<bool, RuntimeError> {
+    match writer.write_all(bytes).await {
+        Ok(()) => {}
+        Err(e) if is_client_disconnect(&e) => return Ok(false),
+        Err(e) => return Err(RuntimeError::Io(e)),
+    }
+    match writer.flush().await {
+        Ok(()) => Ok(true),
+        Err(e) if is_client_disconnect(&e) => Ok(false),
+        Err(e) => Err(RuntimeError::Io(e)),
+    }
 }
 
 async fn read_limited_line<R>(reader: &mut R, line: &mut String) -> Result<usize, RuntimeError>
@@ -661,7 +718,11 @@ async fn handle(
             tracing::debug!("idle connection timed out; closing");
             return Ok(());
         };
-        let n = read_result?;
+        let n = match read_result {
+            Ok(n) => n,
+            Err(e) if e.is_client_disconnect() => return Ok(()),
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(());
         }
@@ -889,8 +950,9 @@ async fn handle(
                     // — this connection is now owned by the streaming
                     // pump.
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    writer.write_all(&ack_bytes).await?;
-                    writer.flush().await?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
                     tracing::debug!(
                         elapsed_us =
                             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -907,8 +969,9 @@ async fn handle(
         };
 
         let bytes = encode_line(&resp, negotiated.unwrap_or(PROTOCOL_VERSION))?;
-        writer.write_all(&bytes).await?;
-        writer.flush().await?;
+        if !write_line_or_closed(&mut writer, &bytes).await? {
+            return Ok(());
+        }
 
         // Per-message timing. `debug!` so it's filtered out by default
         // (production: `info`); the field-style call defers any
@@ -952,6 +1015,14 @@ pub struct Client {
 pub struct TransitionStream {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     line: String,
+}
+
+fn decode_agents(resp: &serde_json::Value) -> Vec<Agent> {
+    resp["agents"]
+        .as_array()
+        .cloned()
+        .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
+        .unwrap_or_default()
 }
 
 impl TransitionStream {
@@ -1011,11 +1082,16 @@ impl Client {
     pub async fn snapshot(&self) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
-        Ok(resp["agents"]
-            .as_array()
-            .cloned()
-            .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
-            .unwrap_or_default())
+        Ok(decode_agents(&resp))
+    }
+
+    pub async fn snapshot_with_timeout(
+        &self,
+        deadline: Duration,
+    ) -> Result<Vec<Agent>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        Ok(decode_agents(&resp))
     }
 
     pub async fn by_pane(&self, pane: &str) -> Result<Vec<Agent>, RuntimeError> {
@@ -1025,11 +1101,21 @@ impl Client {
             "pane": pane
         });
         let resp = self.call(&req).await?;
-        Ok(resp["agents"]
-            .as_array()
-            .cloned()
-            .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
-            .unwrap_or_default())
+        Ok(decode_agents(&resp))
+    }
+
+    pub async fn by_pane_with_timeout(
+        &self,
+        pane: &str,
+        deadline: Duration,
+    ) -> Result<Vec<Agent>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "by_pane",
+            "pane": pane
+        });
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        Ok(decode_agents(&resp))
     }
 
     pub async fn by_surface(&self, surface_id: &str) -> Result<Vec<Agent>, RuntimeError> {
@@ -1613,6 +1699,88 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1, "drained handler must have applied event");
         assert_eq!(snap[0].session_id, "drain-test");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_before_response_is_clean_handler_exit() {
+        let (server_stream, mut client_stream) = tokio::net::UnixStream::pair().unwrap();
+        let store = Store::shared();
+        let handle = tokio::spawn(handle(
+            server_stream,
+            store,
+            default_backend(),
+            PtySessionBackend::shared(),
+        ));
+
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "snapshot",
+        });
+        let mut bytes = serde_json::to_vec(&req).unwrap();
+        bytes.push(b'\n');
+        client_stream.write_all(&bytes).await.unwrap();
+        client_stream.flush().await.unwrap();
+        drop(client_stream);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("handler should exit promptly")
+            .expect("handler task panicked");
+        outcome.expect("client disconnect should not be treated as a handler failure");
+    }
+
+    #[tokio::test]
+    async fn handler_budget_is_reserved_before_accepting_connections() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-budget.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store).with_handler_limit(1);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let mut holder = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        holder.write_all(b"{").await.unwrap();
+        holder.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut second = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "snapshot",
+        });
+        let mut bytes = serde_json::to_vec(&req).unwrap();
+        bytes.push(b'\n');
+        second.write_all(&bytes).await.unwrap();
+        second.flush().await.unwrap();
+        let mut reader = BufReader::new(second);
+        let mut line = String::new();
+
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reader.read_line(&mut line),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "server accepted a connection while no handler permit was available",
+        );
+
+        drop(holder);
+        line.clear();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("queued connection should be served after permit is released")
+        .expect("read response");
+        assert!(n > 0, "queued connection closed without a response");
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["ok"], true);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
     }
 
     /// Server must wait for the socket to appear before tests dial in.

@@ -41,6 +41,7 @@ const FULL_STATUS_TABLE_WIDTH: usize = 120;
 const COMPACT_STATUS_TABLE_WIDTH: usize = 76;
 const MIN_STATUS_PROMPT_WIDTH: usize = 8;
 const MAX_STATUS_PROMPT_WIDTH: usize = 60;
+const STATUS_LINE_IPC_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(name = "muxa", version, about = "muxa CLI")]
@@ -960,12 +961,23 @@ async fn cmd_status(client: &Client, cfg: &Config, theme: Option<ThemeArg>) -> R
 
 async fn cmd_status_line(client: &Client, pane: Option<String>) -> Result<()> {
     let backend = muxa::default_backend();
-    let panes_snapshot = backend.list_panes();
     let pane = pane.or_else(|| backend.current_pane());
     let agents = match &pane {
-        Some(p) => client.by_pane(p).await?,
-        None => client.snapshot().await?,
+        Some(p) => client
+            .by_pane_with_timeout(p, STATUS_LINE_IPC_TIMEOUT)
+            .await
+            .unwrap_or_default(),
+        None => client
+            .snapshot_with_timeout(STATUS_LINE_IPC_TIMEOUT)
+            .await
+            .unwrap_or_default(),
     };
+    if agents.is_empty() {
+        println!();
+        return Ok(());
+    }
+
+    let panes_snapshot = backend.list_panes();
     // tmux handles its own color markup, so we never emit ANSI here.
     let parts: Vec<String> = agents
         .iter()

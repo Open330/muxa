@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.17] - 2026-07-08
+
+### Fixed
+
+- **`muxad` could become live-but-unresponsive again under overlapping
+  status-line and hook clients.** The IPC server now reserves a handler permit
+  before `accept()`, so connections over the daemon's concurrency budget wait
+  in the OS backlog or time out client-side instead of consuming another daemon
+  file descriptor. Client disconnects such as `Broken pipe` are treated as
+  normal closures, and idle request connections are reaped faster.
+
+- **tmux `status-line` calls could amplify a degraded daemon.** The status-line
+  path now uses a tight IPC deadline and returns an empty line on timeout
+  before shelling out for pane metadata, keeping tmux refreshes fast even when
+  the daemon is slow.
+
+- **Codex panes launched through the npm `node` wrapper could be missed on
+  macOS.** Discovery now normalizes command basenames, so `/.../bin/codex`
+  descendants are classified as Codex and panes such as `iac:0.0` regain their
+  status-line icon after daemon restart or `muxa sync`.
+
 ## [0.8.16] - 2026-07-07
 
 ### Fixed

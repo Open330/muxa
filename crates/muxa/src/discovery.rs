@@ -50,12 +50,16 @@ pub struct Discovered {
 /// case-insensitive on the command name only — argv tail isn't considered
 /// because tmux only exposes the basename.
 pub fn classify_command(cmd: &str) -> Option<AgentKind> {
-    match cmd.trim().to_ascii_lowercase().as_str() {
+    match command_name(cmd).to_ascii_lowercase().as_str() {
         "claude" => Some(AgentKind::ClaudeCode),
         "codex" => Some(AgentKind::Codex),
         "gemini" | "gemini-cli" => Some(AgentKind::GeminiCli),
         _ => None,
     }
+}
+
+fn command_name(cmd: &str) -> &str {
+    cmd.trim().rsplit('/').next().unwrap_or(cmd).trim()
 }
 
 /// Foreground commands that commonly host an agent CLI as a child process
@@ -65,7 +69,7 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
 /// misses that, so callers fall through to a process-tree walk.
 fn is_wrapper_command(cmd: &str) -> bool {
     matches!(
-        cmd.trim().to_ascii_lowercase().as_str(),
+        command_name(cmd).to_ascii_lowercase().as_str(),
         "node" | "deno" | "bun" | "python" | "python3" | "ruby"
     )
 }
@@ -325,6 +329,12 @@ mod tests {
         assert_eq!(classify_command("gemini-cli"), Some(AgentKind::GeminiCli));
         // Case-insensitive — some shells uppercase argv[0].
         assert_eq!(classify_command("CLAUDE"), Some(AgentKind::ClaudeCode));
+        // macOS `ps -o comm=` can return the full executable path for a
+        // descendant binary, while tmux returns a basename.
+        assert_eq!(
+            classify_command("/opt/homebrew/lib/node_modules/@openai/codex/bin/codex"),
+            Some(AgentKind::Codex)
+        );
     }
 
     #[test]
@@ -358,6 +368,7 @@ mod tests {
     #[test]
     fn wrapper_command_covers_node_family() {
         assert!(is_wrapper_command("node"));
+        assert!(is_wrapper_command("/opt/homebrew/bin/node"));
         assert!(is_wrapper_command("python3"));
         assert!(is_wrapper_command("deno"));
         assert!(is_wrapper_command("BUN")); // case-insensitive
