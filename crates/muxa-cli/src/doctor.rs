@@ -106,12 +106,15 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 
     // Summary footer matches the cliclack box style; outro renders
     // the closing └ glyph.
+    // Point at the per-check guidance printed above rather than asserting a
+    // blanket `muxa init`/`upgrade` remedy — several warnings (e.g. "restart
+    // the agents to enable hook events") are not fixed by either command.
     let summary = if issues == 0 {
         "All clean ✓".to_string()
     } else if issues == 1 {
-        "1 issue — try `muxa init` or `muxa upgrade`".to_string()
+        "1 issue — see the ⚠/✗ line above for its specific fix".to_string()
     } else {
-        format!("{issues} issues — try `muxa init` or `muxa upgrade`")
+        format!("{issues} issues — see the ⚠/✗ lines above for their specific fixes")
     };
     let _ = cliclack::outro(summary);
     Ok(())

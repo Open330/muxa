@@ -226,14 +226,10 @@ pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Resu
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
     let data = load_data(client, cfg, &args.since, &exclusions).await?;
     let docs = [
-        build_document(
-            &data,
-            GroupBy::Day,
-            args.limit,
-            SortKey::Prompts,
-            false,
-            false,
-        ),
+        // Days read chronologically (the day-key string sorts by date), so a
+        // report shows the shape of the week in order rather than ranked by
+        // prompt count. Project/Agent/Session stay ranked by volume.
+        build_document(&data, GroupBy::Day, args.limit, SortKey::Name, false, false),
         build_document(
             &data,
             GroupBy::Project,
@@ -415,6 +411,27 @@ struct GroupAccumulator {
     work_active_secs: u64,
     attention_events: usize,
     last_prompt_at: Option<OffsetDateTime>,
+}
+
+impl GroupAccumulator {
+    /// True when this bucket carries no information at all — no prompts, no
+    /// tracked time, no attention events, no live agents. Seeders (open
+    /// sessions, live-agent state, activity ledger) can insert such empty
+    /// buckets for a day with no real activity, which surfaced as phantom
+    /// all-`-` day rows for dates outside the requested window.
+    fn is_empty(&self) -> bool {
+        self.prompts == 0
+            && self.live_agents == 0
+            && self.attention_events == 0
+            && self.working_secs == 0
+            && self.waiting_secs == 0
+            && self.error_secs == 0
+            && self.foreground_secs == 0
+            && self.human_secs == 0
+            && self.thinking_secs == 0
+            && self.active_secs == 0
+            && self.work_active_secs == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -857,6 +874,13 @@ fn build_rows(
     }
 
     let mut rows = rows.into_iter().collect::<Vec<_>>();
+    if group_by == GroupBy::Day {
+        // Drop phantom all-empty day buckets: seeding can insert a key for a
+        // day with no measured activity, which showed up as all-`-` rows for
+        // dates well outside the requested window (e.g. a "2026-05-11" row in a
+        // `--since today` view).
+        rows.retain(|(_, acc)| !acc.is_empty());
+    }
     sort_group_rows(&mut rows, sort, reverse);
     if limit > 0 {
         rows.truncate(limit);
@@ -2150,6 +2174,9 @@ fn notes(data: &StatsData) -> Vec<String> {
     notes.push(
         "WACT is the hands-on subset of ACT: the same last-touch owner is used, but seconds owned by scrollback-only windows are excluded, so each row's WACT stays within its ACT.".to_string(),
     );
+    notes.push(
+        "WORK/WAIT/ERR sum every tracked agent independently (WORK = agent busy, WAIT = agent blocked on you, ERR = agent errored), so with agents running in parallel a single day's WORK can exceed 24h of wall-clock. BLK counts attention events.".to_string(),
+    );
     notes
 }
 
@@ -2235,6 +2262,12 @@ fn print_notes(notes: &[String], verbose: bool, verbose_cmd: &str) {
             println!("note: {note}");
         }
     } else {
+        // A compact legend so the default view is legible without reading the
+        // docs. WORK/WAIT sum concurrent agents, so a day can exceed 24h — call
+        // that out here since it otherwise reads as a data error.
+        println!(
+            "legend: WACT=hands-on you · ACT=engaged you · WORK=agent busy (Σ concurrent, may exceed 24h) · WAIT=agent blocked on you · BLK=attention events · PRM=prompts",
+        );
         println!(
             "note: {n} explanatory note{plural} hidden; run `{verbose_cmd}` for methodology, or `muxa doctor` to check health.",
             n = notes.len(),
@@ -2984,8 +3017,14 @@ fn escape_markdown_cell(s: &str) -> String {
 }
 
 fn format_day(at: OffsetDateTime) -> String {
-    at.format(time::macros::format_description!("[year]-[month]-[day]"))
-        .unwrap_or_else(|_| at.date().to_string())
+    // Bucket by the viewer's local calendar day, matching the range window and
+    // the WACT graph (which both work in local time). Formatting the raw UTC
+    // timestamp mislabels every day row by up to a day for non-UTC users and
+    // splits "today" across two rows.
+    let local = at.to_offset(local_offset());
+    local
+        .format(time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap_or_else(|_| local.date().to_string())
 }
 
 fn format_rfc3339(at: OffsetDateTime) -> String {
@@ -3717,16 +3756,23 @@ mod tests {
             ),
         ));
 
+        // Day buckets follow the viewer's local calendar day, so derive the
+        // expected keys from the anchor via the same `format_day` rather than
+        // hard-coding UTC dates — this keeps the test valid in any timezone.
+        let anchor = datetime!(2026-05-29 23:58:00 UTC);
+        let tick_day = format_day(anchor);
+        let next_day = format_day(anchor + time::Duration::days(1));
+
         let rows = build_rows(&d, GroupBy::Day, 0, SortKey::Prompts, false);
-        let day29 = rows.iter().find(|r| r.key == "2026-05-29");
-        let day30 = rows.iter().find(|r| r.key == "2026-05-30");
+        let on_tick_day = rows.iter().find(|r| r.key == tick_day);
+        let on_next_day = rows.iter().find(|r| r.key == next_day);
 
         assert!(
-            day29.is_some_and(|r| r.active_secs > 0),
+            on_tick_day.is_some_and(|r| r.active_secs > 0),
             "the tick's ACTIVE window must land on its own day"
         );
         assert!(
-            day30.is_none_or(|r| r.active_secs == 0),
+            on_next_day.is_none_or(|r| r.active_secs == 0),
             "the padded window must not roll ACTIVE into the next day"
         );
     }

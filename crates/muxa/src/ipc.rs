@@ -89,7 +89,7 @@ pub enum RuntimeError {
     SocketInUse(PathBuf),
 
     #[error(
-        "daemon not reachable at {} — is `muxad` running? (start `muxad`, or set MUXA_SOCKET)",
+        "daemon not reachable at {} — is `muxad` running? (start `muxad`, run `muxa doctor`, or set MUXA_SOCKET)",
         .0.display()
     )]
     NotConnected(PathBuf),

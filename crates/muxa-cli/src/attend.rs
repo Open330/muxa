@@ -51,6 +51,20 @@ fn needs_attention(state: AgentState) -> bool {
     )
 }
 
+/// Attention severity for ordering: a fresh error outranks a choice prompt,
+/// which outranks a plain input wait. Mirrors `watch`'s `state_sort_rank` so
+/// `attend` and `watch` agree on "who's most urgent" instead of `attend`
+/// sending you to the longest-idle input wait while an error sits unattended.
+/// Non-attention states are filtered out before this is consulted.
+fn attention_rank(state: AgentState) -> u8 {
+    match state {
+        AgentState::Error => 0,
+        AgentState::WaitingChoice => 1,
+        AgentState::WaitingInput => 2,
+        _ => 3,
+    }
+}
+
 /// Spatial sort key for a pane — `(session, window_index, pane_index)` when
 /// the pane resolves against the host inventory, else the raw pane id with
 /// max indices so unresolved panes sort last but still deterministically.
@@ -99,14 +113,16 @@ fn candidates<'a>(agents: &'a [Agent], panes: &[PaneInfo]) -> Vec<Candidate<'a>>
     cands
 }
 
-/// The agent blocked longest: smallest `state_entered_at`. Ties (same
-/// instant — e.g. synthetic rows replayed at rehydrate) break by spatial
-/// key so the pick is stable across back-to-back invocations.
+/// The most urgent agent: highest attention severity first (error > choice >
+/// input), then the one blocked longest (smallest `state_entered_at`) within
+/// that severity. Ties (same instant — e.g. synthetic rows replayed at
+/// rehydrate) break by spatial key so the pick is stable across back-to-back
+/// invocations.
 fn longest_waiting<'c>(cands: &'c [Candidate<'_>]) -> Option<&'c Candidate<'c>> {
     cands.iter().min_by(|a, b| {
-        a.agent
-            .state_entered_at
-            .cmp(&b.agent.state_entered_at)
+        attention_rank(a.agent.state)
+            .cmp(&attention_rank(b.agent.state))
+            .then_with(|| a.agent.state_entered_at.cmp(&b.agent.state_entered_at))
             .then_with(|| a.key.cmp(&b.key))
     })
 }
@@ -179,14 +195,18 @@ fn print_queue(cands: &[Candidate<'_>], panes: &[PaneInfo]) {
 
     let mut ranked: Vec<&Candidate<'_>> = cands.iter().collect();
     ranked.sort_by(|a, b| {
-        a.agent
-            .state_entered_at
-            .cmp(&b.agent.state_entered_at)
+        attention_rank(a.agent.state)
+            .cmp(&attention_rank(b.agent.state))
+            .then_with(|| a.agent.state_entered_at.cmp(&b.agent.state_entered_at))
             .then_with(|| a.key.cmp(&b.key))
     });
 
     let n = ranked.len();
-    println!("{n} agent{} need you:", if n == 1 { "" } else { "s" });
+    println!(
+        "{n} agent{} need{} you:",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "s" } else { "" }
+    );
     for c in ranked {
         let icon = state_icon(c.agent.state);
         let loc = truncate_cell(&pane_display(c.agent, panes), loc_width);

@@ -19,7 +19,11 @@
 # in `muxa init`, not here. Keeps this script short, auditable, and
 # safe to pipe into `sh`.
 
-set -euo pipefail
+# POSIX-clean: `pipefail` is a bash/zsh-ism that dash (`/bin/sh` on Debian/
+# Ubuntu) rejects with "set: Illegal option -o pipefail", which would abort
+# the documented `curl … | sh` one-liner before it ran. `set -eu` is enough
+# here — there is no pipeline whose partial failure we need to catch.
+set -eu
 
 REPO_URL="${MUXA_REPO_URL:-https://github.com/Open330/muxa.git}"
 REPO_REF="${MUXA_REPO_REF:-main}"
