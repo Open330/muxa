@@ -14,12 +14,13 @@
 //! middleware. The HTML/JS/CSS payloads are non-sensitive (they hold no
 //! data — they only know how to fetch it from `/api/*`); putting them
 //! behind auth would prevent the only practical way to bootstrap the
-//! token in a browser, since `<script src="?token=...">` does not fly
-//! and `EventSource` can't set headers either. The token bootstrap path
-//! is documented in the JS: `?token=...` in the URL → localStorage →
+//! token in a browser, since `EventSource` can't set headers either. The
+//! token bootstrap path is documented in the JS: `#token=...` in the URL
+//! *fragment* (which never reaches the server) → localStorage →
 //! `Authorization: Bearer …` on every `/api/*` request thereafter. The
 //! `/api/*` routes remain auth-gated, which is the actual data
-//! boundary.
+//! boundary. They are additionally wrapped by a DNS-rebinding `Host`
+//! guard in `server.rs`.
 
 use axum::{
     extract::Path,

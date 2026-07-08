@@ -22,6 +22,31 @@ use std::time::Duration;
 /// The default port for the dashboard. Picked for low collision risk
 /// and a "muxa → 7878" mnemonic.
 pub const DEFAULT_PORT: u16 = 7878;
+
+/// Number of random bytes in an auto-generated bootstrap token. 32
+/// bytes = 256 bits, hex-encoded to 64 chars — well past the 128-bit
+/// floor and comfortable in a URL fragment.
+const TOKEN_BYTES: usize = 32;
+
+/// Generate a fresh bearer token from the platform CSPRNG (`getrandom`,
+/// which reads the OS entropy source). Hex-encoded so it is equally safe
+/// in a URL fragment and an `Authorization: Bearer` header.
+///
+/// Panics only if the OS entropy source is unavailable — a condition
+/// under which no secret can be safely minted, so refusing to start is
+/// the correct behaviour.
+#[must_use]
+pub fn generate_token() -> String {
+    use std::fmt::Write as _;
+    let mut buf = [0u8; TOKEN_BYTES];
+    getrandom::fill(&mut buf).expect("platform CSPRNG (getrandom) must be available");
+    let mut s = String::with_capacity(TOKEN_BYTES * 2);
+    for b in buf {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// The default pane scanner cache TTL.
 pub const DEFAULT_PANE_CACHE_TTL: Duration = Duration::from_secs(2);
 
@@ -108,9 +133,20 @@ impl DashboardConfig {
             .or_else(|| toml.token.clone())
             .filter(|s| !s.trim().is_empty()); // empty/whitespace treated as unset
         let token = if matches!(auth, DashboardAuthMode::None) {
+            // Explicit opt-out: run the read-only API with no auth. This is
+            // the escape hatch for a trusted single-user box.
             None
+        } else if let Some(explicit) = token {
+            Some(explicit)
+        } else if enabled {
+            // Secure by default (Jupyter model): an *enabled* dashboard with
+            // token auth but no explicitly-configured token gets a random
+            // CSPRNG-generated token. The operator is handed the access URL
+            // (with the token in the URL fragment) at startup so the flow
+            // still "just works". Only `auth = "none"` opts out.
+            Some(generate_token())
         } else {
-            token
+            None
         };
 
         let allow_public = ov.allow_public.or(toml.allow_public).unwrap_or(false);
@@ -256,6 +292,65 @@ mod tests {
             ..DashboardTomlConfig::default()
         };
         let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn enabled_default_auto_generates_token() {
+        // Secure by default: an enabled dashboard with no explicit token
+        // gets a random CSPRNG token so the API is never unauthenticated.
+        let toml = DashboardTomlConfig {
+            enabled: Some(true),
+            ..DashboardTomlConfig::default()
+        };
+        let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        let tok = cfg
+            .token
+            .clone()
+            .expect("enabled dashboard must have a token");
+        assert_eq!(tok.len(), 64, "256-bit hex token = 64 chars");
+        assert!(tok.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Two resolves must not collide — proves it's actually random.
+        let cfg2 = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        assert_ne!(cfg.token, cfg2.token);
+    }
+
+    #[test]
+    fn enabled_auth_none_opts_out_of_token() {
+        // Explicit escape hatch: auth = "none" runs with no token even
+        // when enabled.
+        let toml = DashboardTomlConfig {
+            enabled: Some(true),
+            auth: Some(DashboardAuthMode::None),
+            ..DashboardTomlConfig::default()
+        };
+        let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        assert_eq!(cfg.auth, DashboardAuthMode::None);
+        assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn enabled_explicit_token_is_not_overwritten() {
+        let toml = DashboardTomlConfig {
+            enabled: Some(true),
+            token: Some("explicit-token".into()),
+            ..DashboardTomlConfig::default()
+        };
+        let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        assert_eq!(cfg.token.as_deref(), Some("explicit-token"));
+    }
+
+    #[test]
+    fn disabled_default_stays_tokenless() {
+        // A disabled dashboard never binds, so there's nothing to guard;
+        // don't burn entropy generating a token that's never used.
+        let cfg = DashboardConfig::resolve(
+            &DashboardTomlConfig::default(),
+            &DashboardOverrides::default(),
+        )
+        .unwrap();
+        assert!(!cfg.enabled);
         assert!(cfg.token.is_none());
     }
 

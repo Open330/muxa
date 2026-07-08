@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,6 +156,7 @@ impl AppState {
 /// the oh-my-prompt sink) can `.merge()` additional routes without
 /// touching this file.
 pub fn router(state: AppState) -> Router {
+    let host_layer = middleware::from_fn_with_state(state.clone(), host_guard_middleware);
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);
     let api = Router::new()
         .route("/api/health", get(health_handler))
@@ -169,11 +171,49 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(events_handler))
         .route("/api/metrics", get(metrics_handler))
         .layer(auth_layer)
-        .with_state(state);
+        .with_state(state.clone());
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
-    // rationale (token bootstrap in the browser).
+    // rationale (token bootstrap in the browser). The DNS-rebinding host
+    // guard, by contrast, wraps *everything* (API + assets). The
+    // `TraceLayer` sits outermost so even rejected requests are traced —
+    // with a token-scrubbed URI (see `make_request_span`).
     api.merge(assets::router::<()>())
-        .layer(TraceLayer::new_for_http())
+        .layer(host_layer)
+        .layer(TraceLayer::new_for_http().make_span_with(make_request_span::<Body>))
+}
+
+/// Build the tracing span for one request with the `token` query
+/// parameter value redacted. The bootstrap token now travels in the URL
+/// *fragment* (never sent to the server), but this is defense-in-depth:
+/// a hand-typed or legacy `?token=…` URL must never be recorded verbatim
+/// in a span/log where the secret would outlive the client-side scrub.
+fn make_request_span<B>(req: &Request<B>) -> tracing::Span {
+    tracing::info_span!(
+        "http.request",
+        method = %req.method(),
+        uri = %scrub_token_from_uri(req.uri()),
+        version = ?req.version(),
+    )
+}
+
+/// Render `uri` as `path[?query]` with any `token` query-parameter value
+/// replaced by `REDACTED`. Other parameters are preserved verbatim.
+fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    match uri.query() {
+        None => path.to_string(),
+        Some(query) => {
+            let scrubbed = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((k, _)) if k.eq_ignore_ascii_case("token") => format!("{k}=REDACTED"),
+                    _ => pair.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{path}?{scrubbed}")
+        }
+    }
 }
 
 /// Bind and serve the router until `shutdown` fires or the listener
@@ -193,6 +233,7 @@ pub async fn serve(
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "dashboard listening");
+    log_access_url(&config, local);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown.recv().await;
@@ -200,10 +241,98 @@ pub async fn serve(
         .await
 }
 
-/// Auth middleware. When a token is configured on the resolved config,
-/// every request must carry a matching `Authorization: Bearer <tok>`.
-/// When no token is configured, requests pass through unchallenged
-/// (loopback default, or explicit `dashboard.auth = "none"`).
+/// DNS-rebinding guard. A page on an attacker-controlled domain can,
+/// after re-resolving that domain to `127.0.0.1`, issue requests to this
+/// loopback server from the victim's browser — but the browser still
+/// sends the attacker's domain in the `Host` header. Rejecting any
+/// non-loopback `Host` closes that hole while leaving genuine
+/// `localhost` / `127.0.0.1` access untouched.
+///
+/// Only enforced for loopback binds: an operator who deliberately binds
+/// a public address (`allow_public`) is reached via a real hostname and
+/// rebinding is moot there, so we let those requests through.
+///
+/// An *absent* `Host` header is allowed: the DNS-rebinding vector is a
+/// browser, and browsers always send `Host`. Non-browser local clients
+/// (the muxa CLI, tests) that omit it are not the threat this guards.
+async fn host_guard_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if state.config.bind.ip().is_loopback() {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok());
+        if !host_is_loopback(host, state.config.bind.ip()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+/// Is `host` (a raw `Host` header value, optionally `host:port` or
+/// `[ipv6]:port`) a loopback name/literal, or the configured loopback
+/// bind IP? Returns `true` for `None` — see [`host_guard_middleware`] for
+/// why an absent header is not an attack vector.
+fn host_is_loopback(host: Option<&str>, bind_ip: IpAddr) -> bool {
+    let Some(raw) = host else {
+        return true;
+    };
+    let host_only = strip_host_port(raw);
+    if host_only.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host_only.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip == bind_ip,
+        Err(_) => false,
+    }
+}
+
+/// Split the host component out of a `Host` header value, dropping any
+/// `:port` suffix and surrounding IPv6 brackets. `127.0.0.1:7878` →
+/// `127.0.0.1`, `[::1]:7878` → `::1`, `localhost` → `localhost`.
+fn strip_host_port(raw: &str) -> &str {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        // IPv6 literal: `[::1]` or `[::1]:port`.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // IPv4 or hostname: strip a single trailing `:port` if present.
+    match raw.rsplit_once(':') {
+        Some((h, _port)) => h,
+        None => raw,
+    }
+}
+
+/// Emit the operator-facing access URL at startup. In the default
+/// (token) mode the token rides in the URL *fragment* (`#token=…`) so it
+/// is never sent to the server in a query string or `Referer` header —
+/// the browser reads it from `location.hash` and scrubs it. Under the
+/// `auth = "none"` opt-out the bare URL is printed.
+fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
+    let host = match local.ip() {
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        IpAddr::V4(ip) => ip.to_string(),
+    };
+    let base = format!("http://{host}:{}/", local.port());
+    if let Some(token) = config.token.as_deref() {
+        tracing::info!(
+            url = %format!("{base}#token={token}"),
+            "dashboard ready — open this URL to authenticate (token is a secret; keep it private)"
+        );
+    } else {
+        tracing::info!(url = %base, "dashboard ready (auth disabled via auth = \"none\")");
+    }
+}
+
+/// Auth middleware. When a token is configured on the resolved config
+/// (the secure-by-default case — an enabled dashboard auto-generates
+/// one), every request must carry a matching `Authorization: Bearer
+/// <tok>`. Requests pass through unchallenged only when no token is
+/// configured, which now happens solely under the explicit
+/// `dashboard.auth = "none"` opt-out.
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -688,6 +817,25 @@ mod tests {
         )
     }
 
+    fn state_from(cfg: DashboardConfig) -> AppState {
+        AppState::new(
+            Store::shared(),
+            Arc::new(cfg),
+            Arc::new(PaneCache::new(Duration::from_secs(60))),
+            crate::session::PtySessionBackend::shared(),
+        )
+    }
+
+    /// Resolve a config the way the daemon does and return the `(state,
+    /// token)` pair, so tests exercise the real secure-by-default path
+    /// (auto-generated token) rather than a hand-built config.
+    fn resolved_state(toml: crate::config::DashboardTomlConfig) -> (AppState, Option<String>) {
+        let cfg = DashboardConfig::resolve(&toml, &crate::dashboard::DashboardOverrides::default())
+            .unwrap();
+        let token = cfg.token.clone();
+        (state_from(cfg), token)
+    }
+
     async fn body_json(resp: Response) -> Value {
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -848,8 +996,11 @@ mod tests {
 
     #[tokio::test]
     async fn auth_middleware_passes_through_when_no_token_configured() {
-        // Default state has no token — every request should pass.
-        let app = router(fresh_state());
+        // Only auth = "none" leaves the token unset; such a state passes.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = crate::config::DashboardAuthMode::None;
+        cfg.token = None;
+        let app = router(state_from(cfg));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -860,6 +1011,167 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Secure by default: an *enabled* dashboard with no explicit token
+    /// auto-generates one, so the API is auth-gated out of the box.
+    #[tokio::test]
+    async fn enabled_dashboard_requires_token_by_default() {
+        let (state, token) = resolved_state(crate::config::DashboardTomlConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        let token = token.expect("enabled dashboard must auto-generate a token");
+        let app = router(state);
+
+        // No credentials → rejected.
+        let unauthed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct auto-generated token → allowed.
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+    }
+
+    /// Explicit opt-out: `auth = "none"` runs the API unauthenticated
+    /// even when enabled.
+    #[tokio::test]
+    async fn enabled_dashboard_auth_none_opts_out() {
+        let (state, token) = resolved_state(crate::config::DashboardTomlConfig {
+            enabled: Some(true),
+            auth: Some(crate::config::DashboardAuthMode::None),
+            ..Default::default()
+        });
+        assert!(token.is_none(), "auth = none must leave the token unset");
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// DNS-rebinding guard: a non-loopback `Host` header is rejected with
+    /// 403 on a loopback bind, before any handler runs.
+    #[tokio::test]
+    async fn host_guard_rejects_non_loopback_host() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::HOST, "attacker.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Loopback `Host` values (with and without port, IPv4 and IPv6) are
+    /// allowed through the guard.
+    #[tokio::test]
+    async fn host_guard_allows_loopback_hosts() {
+        for host in ["127.0.0.1:7878", "localhost", "[::1]:7878", "127.0.0.1"] {
+            let app = router(fresh_state());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "host {host:?} must pass");
+        }
+    }
+
+    /// The guard is a no-op for a deliberately public bind — an operator
+    /// who set `allow_public` is reached via a real hostname.
+    #[tokio::test]
+    async fn host_guard_skipped_for_public_bind() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.bind = "0.0.0.0:7878".parse().unwrap();
+        cfg.auth = crate::config::DashboardAuthMode::None;
+        cfg.token = None;
+        let app = router(state_from(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::HOST, "dash.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn host_is_loopback_classifies_correctly() {
+        let v4 = "127.0.0.1".parse().unwrap();
+        // Absent header is allowed (non-browser clients).
+        assert!(host_is_loopback(None, v4));
+        assert!(host_is_loopback(Some("localhost"), v4));
+        assert!(host_is_loopback(Some("LocalHost:7878"), v4));
+        assert!(host_is_loopback(Some("127.0.0.1:7878"), v4));
+        assert!(host_is_loopback(Some("127.0.0.5"), v4));
+        assert!(host_is_loopback(Some("[::1]:7878"), v4));
+        assert!(!host_is_loopback(Some("attacker.example.com"), v4));
+        assert!(!host_is_loopback(Some("10.0.0.1:7878"), v4));
+        // A non-loopback bind IP is honoured as an allowed Host literal.
+        let public: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(host_is_loopback(Some("203.0.113.7:7878"), public));
+    }
+
+    #[test]
+    fn strip_host_port_variants() {
+        assert_eq!(strip_host_port("127.0.0.1:7878"), "127.0.0.1");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("[::1]:7878"), "::1");
+        assert_eq!(strip_host_port("[::1]"), "::1");
+    }
+
+    /// Defense-in-depth: the traced request URI must never carry the
+    /// token, even if a legacy `?token=` slips through.
+    #[test]
+    fn scrub_token_from_uri_redacts_token_param() {
+        let uri: axum::http::Uri = "/api/agents?token=s3cret&since=24h".parse().unwrap();
+        let scrubbed = scrub_token_from_uri(&uri);
+        assert!(!scrubbed.contains("s3cret"), "scrubbed: {scrubbed}");
+        assert!(scrubbed.contains("token=REDACTED"), "scrubbed: {scrubbed}");
+        assert!(scrubbed.contains("since=24h"), "scrubbed: {scrubbed}");
+
+        // No query → untouched path.
+        let plain: axum::http::Uri = "/api/health".parse().unwrap();
+        assert_eq!(scrub_token_from_uri(&plain), "/api/health");
     }
 
     /// Read up to `limit_bytes` of SSE body or until `dur` elapses,

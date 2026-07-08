@@ -4,9 +4,12 @@
 // <script type="module" src="/static/main.js"> from index.html.
 //
 // Runtime model:
-//   * On boot, capture ?token=... from the URL into localStorage and
-//     scrub it from the URL bar. localStorage persists across tab close
-//     and browser restart, so the user only needs to paste the token once.
+//   * On boot, capture the token from the URL #fragment (#token=...) into
+//     localStorage and scrub it from the URL bar. The fragment is never
+//     sent to the server, so the secret can't leak into request logs or a
+//     Referer header. A legacy ?token=... query param is still accepted
+//     for compatibility but is scrubbed immediately. localStorage persists
+//     across tab close and browser restart, so the user pastes it once.
 //   * Fetch /api/health to populate the version string and confirm the
 //     token is good before opening the SSE.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
@@ -38,10 +41,33 @@ const SESSION_SORTS = new Set(["priority", "latest", "name", "active", "human", 
 
 function bootstrapToken() {
   const url = new URL(window.location.href);
-  const fromUrl = url.searchParams.get("token");
-  if (fromUrl) {
-    localStorage.setItem(TOKEN_KEY, fromUrl);
+  let token = null;
+
+  // Primary path: token delivered in the URL fragment (#token=…). The
+  // fragment stays client-side, so the secret never reaches the server in
+  // a query string, request log, or Referer header.
+  if (url.hash) {
+    const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
+    const fromHash = hashParams.get("token");
+    if (fromHash) {
+      token = fromHash;
+      hashParams.delete("token");
+      const rest = hashParams.toString();
+      url.hash = rest ? `#${rest}` : "";
+    }
+  }
+
+  // Backward-compat: also honour a legacy ?token=… query param, but scrub
+  // it from the address bar right away. (It may already have hit the
+  // server via this path — rotate the token if you relied on it.)
+  const fromQuery = url.searchParams.get("token");
+  if (fromQuery) {
+    token = token || fromQuery;
     url.searchParams.delete("token");
+  }
+
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token);
     window.history.replaceState({}, "", url.toString());
   }
 }

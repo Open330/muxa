@@ -316,6 +316,16 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
     let activity_path = dir.join("activity.ndjson");
     let session_activity_path = dir.join("session-activity.json");
 
+    // With no explicit token the dashboard is now secure-by-default (it mints
+    // a random token), so tests that want the open surface must opt into the
+    // `auth = "none"` escape hatch. A `Some(token)` case is wired via
+    // `--dashboard-token` below and keeps the default token auth.
+    let dashboard_auth = if token.is_none() {
+        "\n[dashboard]\nauth = \"none\"\n"
+    } else {
+        ""
+    };
+
     // Isolate persisted state so dashboard tests don't read or write the
     // operator's real `$XDG_DATA_HOME/muxa/*` files.
     let cfg_path = dir.join("muxa-dash.toml");
@@ -334,11 +344,12 @@ path = "{}"
 
 [session_activity]
 path = "{}"
-"#,
+{}"#,
             history_path.display(),
             state_path.display(),
             activity_path.display(),
-            session_activity_path.display()
+            session_activity_path.display(),
+            dashboard_auth,
         ),
     )
     .expect("write dashboard test config");
