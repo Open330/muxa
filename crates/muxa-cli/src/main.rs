@@ -1460,6 +1460,8 @@ mod tests {
 
     fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: session_id.into(),
             surface: None,
@@ -1489,6 +1491,7 @@ mod tests {
 
     fn pane(id: &str, session: &str) -> muxa::tmux::PaneInfo {
         muxa::tmux::PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: session.into(),
             window_index: "12".into(),

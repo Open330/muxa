@@ -206,6 +206,7 @@ impl<L: LivenessSource> Reconciler<L> {
                     session_id: a.session_id,
                     surface: a.surface,
                     pane: a.pane,
+                    tmux_socket: None,
                     cwd: a.cwd,
                 },
                 cur_5h_pct: a.rate_limit_5h_pct,
@@ -484,6 +485,7 @@ mod tests {
 
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: "s".into(),
             window_index: "0".into(),
@@ -502,6 +504,7 @@ mod tests {
                 session_id: sid.into(),
                 surface: None,
                 pane: Some(pane_id.into()),
+                tmux_socket: None,
                 cwd: None,
             },
             at,
@@ -622,6 +625,8 @@ mod tests {
         let t0 = datetime!(2026-04-24 12:00:00 UTC);
 
         let mk = |sid: &str, state: AgentState| Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: sid.into(),
             surface: None,
@@ -676,6 +681,7 @@ mod tests {
                 session_id: sid.into(),
                 surface: None,
                 pane: Some(pane_id.into()),
+                tmux_socket: None,
                 cwd: None,
             },
             at,

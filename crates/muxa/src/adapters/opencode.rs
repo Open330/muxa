@@ -43,6 +43,7 @@ pub fn normalize_event(input: Value, pane: Option<String>) -> AgentEvent {
         session_id: session_id(&input).unwrap_or_else(|| "opencode-unknown".into()),
         surface: None,
         pane,
+        tmux_socket: None,
         cwd: cwd(&input),
     };
 

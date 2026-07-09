@@ -381,6 +381,7 @@ mod tests {
 
     fn pane(id: &str, session: &str, window: u32, idx: u32) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: session.into(),
             window_index: window.to_string(),
@@ -401,6 +402,8 @@ mod tests {
         entered: OffsetDateTime,
     ) -> Agent {
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::ClaudeCode,
             session_id: session.into(),
             surface: None,

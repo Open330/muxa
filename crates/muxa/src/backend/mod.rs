@@ -483,6 +483,7 @@ mod tests {
 
     fn fake_pane(id: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: id.into(),
             session: "z".into(),
             window_index: "0".into(),
@@ -530,6 +531,7 @@ mod tests {
             store
                 .apply(&AgentEvent::Started {
                     id: AgentId {
+                        tmux_socket: None,
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
                         surface: None,

@@ -71,6 +71,7 @@ impl HookAdapter for GeminiAdapter {
             session_id: input.session_id,
             surface: None,
             pane,
+            tmux_socket: None,
             cwd: input.cwd,
         };
         let at = OffsetDateTime::now_utc();

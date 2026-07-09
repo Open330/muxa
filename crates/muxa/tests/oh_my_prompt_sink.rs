@@ -33,6 +33,7 @@ fn unique_token_var() -> String {
 fn make_prompt(prompt: &str, session: &str) -> PromptRecord {
     PromptRecord {
         id: AgentId {
+            tmux_socket: None,
             kind: AgentKind::ClaudeCode,
             session_id: session.into(),
             surface: None,

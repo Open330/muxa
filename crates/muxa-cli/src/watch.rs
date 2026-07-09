@@ -5179,6 +5179,8 @@ mod tests {
     ) -> Agent {
         let now = OffsetDateTime::now_utc();
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind,
             session_id: session.into(),
             surface: None,
@@ -5276,6 +5278,7 @@ mod tests {
 
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
+            socket: None,
             pane_id: pane.into(),
             session: session.into(),
             window_index: window.to_string(),
@@ -6328,6 +6331,7 @@ sort = ["state"]
     #[test]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
+            socket: None,
             pane_id: "%42".into(),
             session: "main".into(),
             window_index: "1".into(),

@@ -98,6 +98,7 @@ impl HookAdapter for ClaudeAdapter {
             session_id: input.session_id,
             surface: None,
             pane,
+            tmux_socket: None,
             cwd: input.cwd,
         };
         let at = OffsetDateTime::now_utc();
@@ -338,6 +339,7 @@ pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> Age
             session_id: input.session_id,
             surface: None,
             pane,
+            tmux_socket: None,
             cwd: input.cwd,
         },
         model: input.model.and_then(|m| m.display_name),

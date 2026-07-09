@@ -48,6 +48,8 @@ fn make_realistic_agent() -> Agent {
     let prompt = "x".repeat(4096);
     let response = "y".repeat(4096);
     Agent {
+        tmux_socket: None,
+        tmux_session: None,
         kind: AgentKind::ClaudeCode,
         session_id: "sess-bench-0001".into(),
         surface: None,
@@ -133,6 +135,7 @@ async fn bench_one(n_subscribers: usize, iters: u64) -> (Duration, Duration, u64
     // a Started event to seed identity fields and reach Idle, then warm
     // the Working/Idle ping-pong.
     let id = AgentId {
+        tmux_socket: None,
         kind: AgentKind::ClaudeCode,
         session_id: "sess-bench-0001".into(),
         surface: None,

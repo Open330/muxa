@@ -82,6 +82,13 @@ pub struct AgentId {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
+    /// Absolute path of the tmux server socket `pane` belongs to (the first
+    /// comma-separated field of `$TMUX` at hook time). Pane ids are only
+    /// unique per server, so this disambiguates e.g. amux's dedicated
+    /// `-L amux` server from the default one. Optional and purely additive
+    /// on the wire — old adapters simply never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
     pub cwd: Option<String>,
 }
 
@@ -293,6 +300,7 @@ mod tests {
     fn round_trip_prompt_submitted() {
         let ev = AgentEvent::PromptSubmitted {
             id: AgentId {
+                tmux_socket: None,
                 kind: AgentKind::ClaudeCode,
                 session_id: "sess-1".into(),
                 surface: None,
@@ -335,6 +343,7 @@ mod tests {
     fn turn_stopped_without_response_omits_field_in_json() {
         let ev = AgentEvent::TurnStopped {
             id: AgentId {
+                tmux_socket: None,
                 kind: AgentKind::ClaudeCode,
                 session_id: "s".into(),
                 surface: None,

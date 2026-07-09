@@ -3133,6 +3133,8 @@ mod tests {
 
     fn live_agent(state: AgentState, state_entered_at: OffsetDateTime, cwd: Option<&str>) -> Agent {
         Agent {
+            tmux_socket: None,
+            tmux_session: None,
             kind: AgentKind::Codex,
             session_id: "agent-live".into(),
             surface: None,
