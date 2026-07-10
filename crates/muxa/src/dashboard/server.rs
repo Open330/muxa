@@ -306,21 +306,26 @@ fn strip_host_port(raw: &str) -> &str {
     }
 }
 
-/// Emit the operator-facing access URL at startup. In the default
-/// (token) mode the token rides in the URL *fragment* (`#token=…`) so it
-/// is never sent to the server in a query string or `Referer` header —
-/// the browser reads it from `location.hash` and scrubs it. Under the
-/// `auth = "none"` opt-out the bare URL is printed.
-fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
+/// Return the non-sensitive URL and whether authentication is enabled for the
+/// startup log. The bearer token must never enter tracing fields: launchd
+/// redirects info logs to a persistent file, turning a convenience URL into a
+/// long-lived credential leak. `muxa init` persists and prints the one-time
+/// fragment URL at setup time; daemon logs intentionally show only the base.
+fn access_log_details(config: &DashboardConfig, local: SocketAddr) -> (String, bool) {
     let host = match local.ip() {
         IpAddr::V6(ip) => format!("[{ip}]"),
         IpAddr::V4(ip) => ip.to_string(),
     };
     let base = format!("http://{host}:{}/", local.port());
-    if let Some(token) = config.token.as_deref() {
+    (base, config.token.is_some())
+}
+
+fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
+    let (base, auth_enabled) = access_log_details(config, local);
+    if auth_enabled {
         tracing::info!(
-            url = %format!("{base}#token={token}"),
-            "dashboard ready — open this URL to authenticate (token is a secret; keep it private)"
+            url = %base,
+            "dashboard ready (authentication enabled; token omitted from logs)"
         );
     } else {
         tracing::info!(url = %base, "dashboard ready (auth disabled via auth = \"none\")");
@@ -858,6 +863,21 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["protocol"], i64::from(PROTOCOL_VERSION));
         assert!(v["version"].is_string());
+    }
+
+    #[test]
+    fn dashboard_access_log_never_contains_bearer_token() {
+        let secret = "do-not-log-this-token";
+        let mut config = DashboardConfig::loopback_default();
+        config.token = Some(secret.into());
+        let local: SocketAddr = "127.0.0.1:7878".parse().unwrap();
+
+        let (url, auth_enabled) = access_log_details(&config, local);
+
+        assert!(auth_enabled);
+        assert_eq!(url, "http://127.0.0.1:7878/");
+        assert!(!url.contains(secret));
+        assert!(!url.contains("#token="));
     }
 
     #[tokio::test]

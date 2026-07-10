@@ -43,8 +43,13 @@ pub fn render_plist(muxad_path: &str) -> String {
     s.push_str("  <true/>\n");
     s.push_str("  <key>KeepAlive</key>\n");
     s.push_str("  <true/>\n");
+    // muxad serves latency-sensitive menu-bar and tmux status-line IPC over a
+    // Unix socket. launchd's Adaptive class only boosts jobs for XPC activity,
+    // so it cannot observe these requests; Background can therefore starve the
+    // daemon for seconds under CPU pressure. Interactive is appropriate here
+    // because the foreground UI's responsiveness directly depends on muxad.
     s.push_str("  <key>ProcessType</key>\n");
-    s.push_str("  <string>Background</string>\n");
+    s.push_str("  <string>Interactive</string>\n");
     // Raise the file-descriptor soft limit well above launchd's stingy
     // default (256 on macOS). The daemon caps concurrent IPC handlers below
     // this, so it's headroom, not a hard reliance — but a 256-fd ceiling is
@@ -109,36 +114,18 @@ pub fn locate_muxad() -> String {
     "muxad".into()
 }
 
-/// `launchctl bootstrap gui/<uid> <plist>` then `kickstart -k` so the
-/// agent comes up immediately. Two paths:
-///
-/// - **Fast path** — if the agent is already loaded (`launchctl print`
-///   succeeds), just `kickstart -k` to pick up any binary changes
-///   and return. This avoids the bootout→bootstrap teardown cycle on
-///   every `muxa init` re-run. Reported by a user who hit EIO from
-///   re-running the wizard against an already-installed setup.
-/// - **Standard path** — `bootout` (ignored if absent), wait for
-///   launchd to finish the teardown, then `bootstrap`. The sleep is
-///   load-bearing: under bootstrap-immediately-after-bootout
-///   launchd returns EIO ("Bootstrap failed: 5: Input/output
-///   error") because the previous agent's state hasn't been fully
-///   reaped. 1.5 s is empirically enough on Apple silicon + Intel.
+/// Reload the plist with `bootout` → `bootstrap`, then `kickstart -k` so the
+/// agent comes up immediately. A plain kickstart only reloads the executable;
+/// launchd keeps cached plist properties such as `ProcessType`, resource
+/// limits, and log paths. The sleep is load-bearing: bootstrapping immediately
+/// after bootout can return EIO while launchd is still tearing down the old
+/// job. 1.5 s is empirically enough on Apple silicon + Intel.
 pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
     let target = format!("gui/{}", super::super::util::uid_string());
     let label_target = format!("{target}/{LABEL}");
 
-    // Fast path — agent is already loaded; kick it to pick up
-    // any new binary path / config and return clean.
-    if is_loaded(&label_target) {
-        let _ = Command::new("launchctl")
-            .args(["kickstart", "-k", &label_target])
-            .status();
-        return Ok(());
-    }
-
-    // Standard path — clean bootstrap. `bootout` is best-effort:
-    // returns "No such process" (errno 3) when the agent isn't
-    // loaded, which we treat as success.
+    // `bootout` is best-effort: it returns "No such process" (errno 3) when
+    // the agent isn't loaded, which is equivalent to the desired state.
     let _ = Command::new("launchctl")
         .args(["bootout", &label_target])
         .output();
@@ -167,16 +154,6 @@ pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// True iff `launchctl print <gui/uid/label>` succeeds — i.e. the
-/// agent is currently registered with launchd. Output is suppressed
-/// since we only care about the exit status.
-fn is_loaded(label_target: &str) -> bool {
-    Command::new("launchctl")
-        .args(["print", label_target])
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 /// `launchctl bootout gui/<uid>/<label>`. Idempotent — non-zero exit
 /// when the agent isn't loaded is treated as success.
 pub fn disable_service() {
@@ -199,6 +176,9 @@ mod tests {
         assert!(body.contains("<string>/Users/jane/.cargo/bin/muxad</string>"));
         assert!(body.contains("<key>RunAtLoad</key>"));
         assert!(body.contains("<key>KeepAlive</key>"));
+        assert!(body.contains("<key>ProcessType</key>"));
+        assert!(body.contains("<string>Interactive</string>"));
+        assert!(!body.contains("<string>Background</string>"));
         // Closing tags + xml prologue
         assert!(body.starts_with("<?xml"));
         assert!(body.trim_end().ends_with("</plist>"));

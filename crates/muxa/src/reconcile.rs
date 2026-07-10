@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::adapters::codex_rollout;
 use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, RateLimitScope, RateLimitSource};
@@ -380,19 +380,37 @@ impl<L: LivenessSource> Reconciler<L> {
         // Always emit the timing line at debug (cheap, off by default)
         // even on no-op passes — operators want to see the loop is alive
         // when investigating a stuck reconciler.
-        debug!(
-            elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            list_panes_us,
-            workload_scan_us,
-            store_update_us,
-            panes = panes.len(),
-            workloads = workloads.len(),
-            stale = report.stale_panes_reaped,
-            synthetic = report.synthetic_demoted,
-            duplicates = report.duplicates_collapsed,
-            workload_changed,
-            "reconciler.tick",
-        );
+        let elapsed = started.elapsed();
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        if elapsed >= Duration::from_secs(1) {
+            warn!(
+                elapsed_us,
+                list_panes_us,
+                workload_scan_us,
+                store_update_us,
+                panes = panes.len(),
+                workloads = workloads.len(),
+                stale = report.stale_panes_reaped,
+                synthetic = report.synthetic_demoted,
+                duplicates = report.duplicates_collapsed,
+                workload_changed,
+                "slow reconciler.tick",
+            );
+        } else {
+            debug!(
+                elapsed_us,
+                list_panes_us,
+                workload_scan_us,
+                store_update_us,
+                panes = panes.len(),
+                workloads = workloads.len(),
+                stale = report.stale_panes_reaped,
+                synthetic = report.synthetic_demoted,
+                duplicates = report.duplicates_collapsed,
+                workload_changed,
+                "reconciler.tick",
+            );
+        }
         report
     }
 
