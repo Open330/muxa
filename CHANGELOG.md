@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.18] - 2026-07-10
 
 ### Added
 
@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is only considered alive while *that* server has its pane, and two agents
   on same-numbered panes of different servers are never collapsed as
   duplicates.
+- **`muxa status --json`** emits a versioned, display-oriented snapshot for
+  desktop integrations such as the bundled BarShelf menu-bar widget.
+
+### Fixed
+
+- **Codex hooks on macOS can recover their tmux pane after a paneless start.**
+  Hook ancestry now uses a lightweight process snapshot, and later real events
+  replace stale discovery placeholders instead of leaving duplicate rows.
 
 ## [0.8.17] - 2026-07-08
 
