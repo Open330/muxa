@@ -933,11 +933,21 @@ impl Store {
         };
         tracing::Span::current().record("event_type", event_type);
 
-        if matches!(ev, AgentEvent::Started { .. }) {
-            if let Some(pane) = id.pane.as_deref() {
+        if let Some(pane) = id.pane.as_deref() {
+            if matches!(ev, AgentEvent::Started { .. }) {
                 if !reconcile_pane_for_started(&mut agents, &id.session_id, pane, at) {
                     return;
                 }
+            } else if !is_synthetic(&id.session_id) {
+                // A session may have started paneless when the agent hook
+                // subprocess did not inherit TMUX_PANE. If a later prompt or
+                // tool event recovers the pane through process ancestry, that
+                // event is authoritative too: remove discovery's idle
+                // placeholder immediately instead of keeping a duplicate
+                // synthetic row until the next SessionStart.
+                agents.retain(|_, agent| {
+                    !(agent.pane.as_deref() == Some(pane) && is_synthetic(&agent.session_id))
+                });
             }
         }
 
@@ -2977,6 +2987,69 @@ mod tests {
         assert_eq!(snap[0].session_id, "real-sess");
         assert_eq!(snap[0].cwd.as_deref(), Some("/work"));
         assert_eq!(snap[0].state, AgentState::Idle);
+        assert!(store.by_session("synthetic-%7").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn later_real_event_binds_paneless_session_and_removes_synthetic() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:01:00 UTC);
+        let t2 = datetime!(2026-04-24 12:02:00 UTC);
+
+        // Discovery sees Codex in the pane, while SessionStart arrives
+        // without TMUX_PANE and creates a separate paneless real row.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "synthetic-%7".into(),
+                    surface: None,
+                    pane: Some("%7".into()),
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "real-sess".into(),
+                    surface: None,
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: Some("/work".into()),
+                },
+                at: t1,
+            })
+            .await;
+        assert_eq!(store.snapshot().await.len(), 2);
+
+        // A later hook recovers the pane through ancestry. SessionStart is
+        // not repeated, so the ordinary event must heal both identity and
+        // the stale synthetic placeholder.
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "real-sess".into(),
+                    surface: None,
+                    pane: Some("%7".into()),
+                    tmux_socket: None,
+                    cwd: Some("/work".into()),
+                },
+                tool: "Bash".into(),
+                at: t2,
+            })
+            .await;
+
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1, "late pane binding should remove synthetic");
+        assert_eq!(snap[0].session_id, "real-sess");
+        assert_eq!(snap[0].pane.as_deref(), Some("%7"));
+        assert_eq!(snap[0].state, AgentState::Working);
         assert!(store.by_session("synthetic-%7").await.is_none());
     }
 

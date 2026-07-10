@@ -82,6 +82,39 @@ impl ProcessTable {
     }
 }
 
+/// Read only PID relationships for a hook ancestry walk on macOS/BSD.
+///
+/// This deliberately avoids the full `args` column used by workload scans:
+/// hooks only need parent IDs, and may run many times during an agent turn.
+/// One small `ps` snapshot is both cheaper and avoids needlessly reading
+/// command-line arguments that can contain sensitive values.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        tracing::debug!("parent-pid snapshot unavailable: `ps -axo` did not succeed");
+        return HashMap::new();
+    };
+    parse_parent_pid_map(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parse_parent_pid_map(stdout: &str) -> HashMap<u32, u32> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let (Some(pid), Some(parent_pid)) = (parts.next(), parts.next()) else {
+                return None;
+            };
+            Some((pid.parse().ok()?, parent_pid.parse().ok()?))
+        })
+        .collect()
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn read_current_process_table() -> ProcessTable {
     let output = std::process::Command::new("ps")
@@ -186,5 +219,15 @@ mod tests {
                 (20, "/usr/local/bin/codex --resume".to_string()),
             ]
         );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn parses_parent_pid_rows_without_command_arguments() {
+        let parents = parse_parent_pid_map("  10   1\n  20  10\nmalformed\n 30 nope\n");
+
+        assert_eq!(parents.get(&10), Some(&1));
+        assert_eq!(parents.get(&20), Some(&10));
+        assert_eq!(parents.get(&30), None);
     }
 }

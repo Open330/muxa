@@ -40,13 +40,14 @@ pub trait HookAdapter {
 /// 1. `$TMUX_PANE` (tmux sets this on every shell inside a pane).
 /// 2. `$ZELLIJ_PANE_ID` (zellij's analog).
 /// 3. Walk the parent-pid chain and match against the active backend's
-///    `pane_pid_map()`. Useful when a SDK sub-process didn't inherit
-///    the host env var. Skipped when the backend's `caps().pane_pid_map`
-///    reports the lookup is structurally unsupported (zellij CLI today)
-///    rather than transiently empty — saves a fruitless walk on every
-///    sub-process hook.
+///    `pane_pid_map()`. Linux reads `/proc`; macOS/BSD take one `ps` process
+///    snapshot and walk it in memory. Useful when an agent hook subprocess
+///    didn't inherit the host env var. Skipped when the backend's
+///    `caps().pane_pid_map` reports the lookup is structurally unsupported
+///    (zellij CLI today) rather than transiently empty — saves a fruitless
+///    walk on every sub-process hook.
 ///
-/// Any failure (no host, /proc unreadable, no match) yields
+/// Any failure (no host, process table unreadable, no match) yields
 /// `pane: None`. The daemon's IPC layer accepts paneless events; agent
 /// state still flows, the watch UI just hides them by default.
 pub fn run_hook<A, R>(event_flag: &str, stdin: &mut R) -> Result<AgentEvent, AdapterError>
@@ -119,12 +120,12 @@ fn host_pane_env() -> Option<String> {
 /// backend's pane-pid map. Returns the matching `pane_id` string
 /// when an ancestor is the shell of a known pane.
 ///
-/// Skips entirely when the backend reports `caps().pane_pid_map ==
-/// false` — for zellij CLI-only the map is structurally never going
-/// to populate, so walking the chain is just `/proc` traffic for no
-/// reward. Tmux backends keep the existing behaviour.
+/// Skips entirely when the backend reports `caps().pane_pid_map == false` —
+/// for zellij CLI-only the map is structurally never going to populate, so
+/// walking the chain is wasted process-table traffic. Tmux backends keep the
+/// existing behaviour.
 fn resolve_pane_via_ancestry(backend: &dyn crate::backend::PaneBackend) -> Option<String> {
-    use crate::adapters::proc_ancestry::{ancestor_in_set, parent_pid};
+    use crate::adapters::proc_ancestry::ancestor_in_set;
     if !backend.caps().pane_pid_map {
         return None;
     }
@@ -134,7 +135,13 @@ fn resolve_pane_via_ancestry(backend: &dyn crate::backend::PaneBackend) -> Optio
     }
     let pids: std::collections::HashSet<u32> = pid_map.keys().copied().collect();
     let me = std::process::id();
-    let matched = ancestor_in_set(me, &pids, parent_pid)?;
+    #[cfg(target_os = "linux")]
+    let matched = ancestor_in_set(me, &pids, crate::adapters::proc_ancestry::parent_pid)?;
+    #[cfg(not(target_os = "linux"))]
+    let matched = {
+        let parents = crate::process_snapshot::read_parent_pid_map();
+        ancestor_in_set(me, &pids, |pid| parents.get(&pid).copied())?
+    };
     pid_map.get(&matched).cloned()
 }
 

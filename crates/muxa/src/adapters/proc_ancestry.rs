@@ -12,10 +12,9 @@
 //! Matching that PID against `tmux list-panes`' `pane_pid` recovers the
 //! correct attachment without changing how the SDK invokes itself.
 //!
-//! Linux is supported via `/proc/<pid>/status`. On other platforms
-//! [`parent_pid`] returns `None`, so the fast-path `TMUX_PANE` behaviour
-//! is preserved unchanged — there's no regression on macOS/BSD, just no
-//! new fix either.
+//! Linux reads one parent at a time via `/proc/<pid>/status`. macOS/BSD use
+//! the crate's shared one-shot `ps` process snapshot from the hook adapter,
+//! then feed its in-memory parent lookup into [`ancestor_in_set`].
 
 use std::collections::HashSet;
 use std::hash::BuildHasher;
@@ -34,15 +33,6 @@ const MAX_DEPTH: usize = 32;
 pub fn parent_pid(pid: u32) -> Option<u32> {
     let content = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     parse_ppid_from_status(&content)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn parent_pid(_pid: u32) -> Option<u32> {
-    // Other platforms not yet supported. Falling back to None keeps
-    // existing behaviour: TMUX_PANE-only resolution. macOS users still
-    // get full functionality for the common path; SDK sub-agents on
-    // macOS just don't auto-attach until we add a `libproc` lookup.
-    None
 }
 
 /// Parse the `PPid:` field out of `/proc/<pid>/status` content.

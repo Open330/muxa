@@ -60,7 +60,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     // 1. muxad responsive over IPC.
     tally(check_muxad(&socket).await, &mut issues);
 
-    // 1½. Agents seen via discovery but never confirmed by a hook.
+    // 1½. Agents seen via discovery but not yet correlated with a hook.
     //      Skipped silently when muxad is unreachable — `check_muxad`
     //      already owns and reported that condition.
     if let Some(snapshot) = fetch_snapshot(&socket).await {
@@ -189,18 +189,12 @@ async fn fetch_snapshot(socket: &Path) -> Option<Vec<Agent>> {
     }
 }
 
-/// Flag agents that exist only as discovery placeholders. A
-/// `synthetic-*` session id means muxa saw the agent's process in a
-/// pane (via `muxa sync` / startup discovery) but has never received
-/// a hook event for it — so it can't track state transitions and the
-/// row is stuck at the discovered `idle`.
-///
-/// Both common causes are fixed by restarting the agent:
-///   * it was launched before `muxa init` wrote its hook config, so
-///     the running process never loaded the hooks;
-///   * (Codex) the hooks are wired in `~/.codex/config.toml` but await
-///     approval behind codex's `/hooks` review gate, so they never
-///     execute until the user approves them.
+/// Flag agents that still exist as discovery placeholders. A `synthetic-*`
+/// session id means muxa saw an agent process in a pane but has not correlated
+/// a real hook session with that pane yet. The hook can be completely absent,
+/// or it can be arriving as a separate paneless row; the snapshot alone cannot
+/// safely distinguish those cases, so the guidance covers both without
+/// claiming that no hook events were received.
 fn check_synthetic_agents(snapshot: &[Agent]) -> CheckResult {
     let panes = synthetic_panes(
         snapshot
@@ -211,9 +205,10 @@ fn check_synthetic_agents(snapshot: &[Agent]) -> CheckResult {
         return CheckResult::Ok("Agent hooks — all tracked agents reporting".into());
     }
     CheckResult::Warn(format!(
-        "{} agent(s) discovered but sending no hook events ({}) — restart them \
-         to enable live tracking. Likely started before `muxa init`, or (Codex) \
-         their hooks await approval via `/hooks` inside codex.",
+        "{} pane agent(s) not yet correlated with hook events ({}) — trigger a \
+         new agent event. If they still remain, use `muxa watch --include-paneless` \
+         to check for pane-correlation failure; otherwise restart the agent or \
+         review `/hooks` inside Codex.",
         panes.len(),
         panes.join(", ")
     ))
