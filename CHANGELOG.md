@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.19] - 2026-07-10
+
+### Fixed
+
+- **macOS launchd no longer starves latency-sensitive IPC under heavy system
+  load.** The LaunchAgent now uses the `Interactive` process class because
+  muxa's Unix socket cannot receive launchd's XPC-only adaptive priority boost.
+  Re-running `muxa init` fully reloads the plist so process-class and resource
+  changes take effect instead of merely restarting the cached job.
+- Reconciler passes exceeding one second now emit a structured warning with
+  pane listing, workload scanning, and store update timings.
+
+### Security
+
+- Dashboard startup logs no longer include the bearer token in a URL fragment;
+  persistent daemon logs contain only the non-sensitive base URL.
+
 ## [0.8.18] - 2026-07-10
 
 ### Added
