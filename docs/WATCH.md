@@ -59,6 +59,28 @@ the current position, such as `2/3`, when more than one agent is available.
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
 ```
 
+## macOS Menu Bar with BarShelf
+
+The bundled [BarShelf](https://github.com/Open330/barshelf) `muxa Watch`
+widget provides a compact menu-bar popover view of the same agent state. It
+shows the five most recently active agents in the familiar `NAME / ST / ACT /
+LAST PROMPT` layout. The widget refreshes every five seconds while the popover
+is open and does not poll in the background.
+
+Install it from the BarShelf gallery, or directly with:
+
+```bash
+barshelf install https://github.com/Open330/barshelf/tree/master/widgets/muxa-watch
+```
+
+The widget requires Deno and a `muxa` version that supports the versioned
+snapshot command below. Set `MUXA_BIN` or the widget's custom socket setting
+when the defaults do not match your installation.
+
+```bash
+muxa status --json
+```
+
 ## Columns
 
 Columns are configured under `[watch]`:

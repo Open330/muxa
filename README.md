@@ -45,6 +45,7 @@ backend; zellij has a CLI baseline and a planned richer plugin path.
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
+| BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Dashboard | Optional loopback HTTP UI with SSE live updates and a timeline graph. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
@@ -81,7 +82,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
 | Command | Purpose |
 | --- | --- |
-| `muxa status` | Human-readable table of tracked agents. |
+| `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
 | `muxa watch [--view pane\|session]` | Live TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Session-card TUI console with live capture, prompt composer, abort/terminate actions, and ACT/WACT totals. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |

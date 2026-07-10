@@ -28,6 +28,7 @@ use muxa::{
     HumanInteractionInput, HumanInteractionKind,
 };
 use owo_colors::Style;
+use serde::Serialize;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -62,8 +63,11 @@ enum Cmd {
     /// List active agents as a human-readable table.
     Status {
         /// One-shot visual theme override.
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "json")]
         theme: Option<ThemeArg>,
+        /// Emit a stable JSON snapshot for desktop widgets and other integrations.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a one-liner status suitable for tmux `status-right`.
     StatusLine {
@@ -297,7 +301,7 @@ async fn main() -> Result<()> {
     let client = Client::new(socket.clone());
 
     match args.cmd {
-        Cmd::Status { theme } => cmd_status(&client, &cfg, theme).await,
+        Cmd::Status { theme, json } => cmd_status(&client, &cfg, theme, json).await,
         Cmd::StatusLine {
             pane,
             needs_attention,
@@ -950,8 +954,17 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(client: &Client, cfg: &Config, theme: Option<ThemeArg>) -> Result<()> {
+async fn cmd_status(
+    client: &Client,
+    cfg: &Config,
+    theme: Option<ThemeArg>,
+    json: bool,
+) -> Result<()> {
     let agents = client.snapshot().await?;
+    if json {
+        let panes = muxa::default_backend().list_panes();
+        return print_status_json(&agents, &panes, OffsetDateTime::now_utc());
+    }
     if agents.is_empty() {
         println!("no active agents");
         return Ok(());
@@ -965,6 +978,85 @@ async fn cmd_status(client: &Client, cfg: &Config, theme: Option<ThemeArg>) -> R
     let panes = backend.list_panes();
     let theme = theme::for_config(cfg, theme, use_colors());
     print_table(&agents, &panes, OffsetDateTime::now_utc(), theme);
+    Ok(())
+}
+
+/// Versioned, display-oriented status payload for local desktop integrations.
+///
+/// This deliberately exposes less than the daemon's internal `Agent` wire
+/// shape: `BarShelf` needs identity, state, timing, and the current prompt, but
+/// not assistant responses, workload process trees, or rate-limit internals.
+/// Keeping the boundary narrow also avoids coupling integrations to the IPC
+/// protocol version, which is intentionally unstable across minor releases.
+#[derive(Debug, Serialize)]
+struct StatusJson<'a> {
+    schema_version: u8,
+    #[serde(with = "time::serde::rfc3339")]
+    generated_at: OffsetDateTime,
+    agents: Vec<StatusAgentJson<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusAgentJson<'a> {
+    kind: AgentKind,
+    session_id: &'a str,
+    state: AgentState,
+    pane: Option<&'a str>,
+    location: String,
+    cwd: Option<&'a str>,
+    model: Option<&'a str>,
+    last_prompt: Option<&'a str>,
+    last_notification: Option<&'a str>,
+    context_used_pct: Option<f32>,
+    cost_usd: Option<f64>,
+    #[serde(with = "time::serde::rfc3339")]
+    started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    last_activity_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    state_entered_at: OffsetDateTime,
+}
+
+fn status_json<'a>(
+    agents: &'a [Agent],
+    panes: &[muxa::tmux::PaneInfo],
+    generated_at: OffsetDateTime,
+) -> StatusJson<'a> {
+    StatusJson {
+        schema_version: 1,
+        generated_at,
+        agents: agents
+            .iter()
+            .map(|agent| StatusAgentJson {
+                kind: agent.kind,
+                session_id: &agent.session_id,
+                state: agent.state,
+                pane: agent.pane.as_deref(),
+                location: pane_display(agent, panes),
+                cwd: agent.cwd.as_deref(),
+                model: agent.model.as_deref(),
+                last_prompt: agent.last_prompt.as_deref(),
+                last_notification: agent.last_notification.as_deref(),
+                context_used_pct: agent.context_used_pct,
+                cost_usd: agent.cost_usd,
+                started_at: agent.started_at,
+                last_activity_at: agent.last_activity_at,
+                state_entered_at: agent.state_entered_at,
+            })
+            .collect(),
+    }
+}
+
+fn print_status_json(
+    agents: &[Agent],
+    panes: &[muxa::tmux::PaneInfo],
+    generated_at: OffsetDateTime,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    serde_json::to_writer(&mut out, &status_json(agents, panes, generated_at))
+        .context("serializing status JSON")?;
+    writeln!(out)?;
     Ok(())
 }
 
@@ -1555,7 +1647,9 @@ mod tests {
             let args = Args::try_parse_from(["muxa", command, "--theme", "high-contrast"])
                 .unwrap_or_else(|err| panic!("{command} should accept --theme: {err}"));
             let theme = match args.cmd {
-                Cmd::Status { theme: Some(theme) } => theme,
+                Cmd::Status {
+                    theme: Some(theme), ..
+                } => theme,
                 Cmd::Stats(args) => args.theme().expect("expected stats theme arg"),
                 Cmd::Timeline(args) => args.theme().expect("expected timeline theme arg"),
                 Cmd::Activity(args) => args.theme().expect("expected activity theme arg"),
@@ -1563,6 +1657,53 @@ mod tests {
             };
             assert_eq!(WatchTheme::from(theme), WatchTheme::HighContrast);
         }
+    }
+
+    #[test]
+    fn status_json_cli_flag_parses_and_conflicts_with_theme() {
+        let args = Args::try_parse_from(["muxa", "status", "--json"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Status {
+                json: true,
+                theme: None
+            }
+        ));
+        assert!(Args::try_parse_from(["muxa", "status", "--json", "--theme", "minimal"]).is_err());
+    }
+
+    #[test]
+    fn status_json_is_versioned_and_display_oriented() {
+        let mut tracked = agent(
+            "session-1",
+            Some("%7"),
+            AgentState::WaitingInput,
+            "Approve the deployment?\nMore detail",
+        );
+        tracked.cwd = Some("/tmp/project".into());
+        tracked.last_response = Some("private assistant response".into());
+        tracked.last_notification = Some("Approval required".into());
+        tracked.context_used_pct = Some(42.5);
+        tracked.cost_usd = Some(1.25);
+
+        let generated_at = datetime!(2026-04-24 12:01:00 UTC);
+        let value =
+            serde_json::to_value(status_json(&[tracked], &[pane("%7", "muxa")], generated_at))
+                .unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["generated_at"], "2026-04-24T12:01:00Z");
+        assert_eq!(value["agents"][0]["kind"], "claude_code");
+        assert_eq!(value["agents"][0]["state"], "waiting_input");
+        assert_eq!(value["agents"][0]["location"], "muxa:12.3");
+        assert_eq!(
+            value["agents"][0]["last_prompt"],
+            "Approve the deployment?\nMore detail"
+        );
+        assert_eq!(value["agents"][0]["context_used_pct"], 42.5);
+        assert!(value["agents"][0].get("last_response").is_none());
+        assert!(value["agents"][0].get("workload").is_none());
+        assert!(value["agents"][0].get("rate_limit_5h_pct").is_none());
     }
 
     const ALL_STATES: [AgentState; 7] = [

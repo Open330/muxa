@@ -44,6 +44,7 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
+| BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
 | Dashboard | optional loopback HTTP UI + SSE live update + timeline graph. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
@@ -80,7 +81,7 @@ muxa watch
 
 | Command | 목적 |
 | --- | --- |
-| `muxa status` | 추적 중인 agent 테이블. |
+| `muxa status [--json]` | 추적 중인 agent 테이블 또는 desktop integration용 versioned JSON snapshot. |
 | `muxa watch [--view pane\|session]` | live TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | live capture, prompt composer, abort/terminate action, ACT/WACT total을 보여주는 session-card TUI console. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |

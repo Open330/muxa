@@ -58,6 +58,27 @@ agent pane이 여러 개 있으면 `]`로 다음 agent, `[`로 이전 agent를 �
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
 ```
 
+## macOS 메뉴바 (BarShelf)
+
+[BarShelf](https://github.com/Open330/barshelf)에 포함된 `muxa Watch` widget을
+사용하면 같은 agent 상태를 메뉴바 popover에서 compact하게 확인할 수 있습니다.
+latest activity 기준 상위 5개 agent를 `NAME / ST / ACT / LAST PROMPT` layout으로
+표시합니다. popover가 열려 있을 때 5초마다 갱신하고 background에서는 polling하지
+않습니다.
+
+BarShelf gallery에서 설치하거나 다음 명령을 사용하세요.
+
+```bash
+barshelf install https://github.com/Open330/barshelf/tree/master/widgets/muxa-watch
+```
+
+Deno와 versioned snapshot command를 지원하는 `muxa`가 필요합니다. 기본 설치
+경로/소켓이 아닌 경우 `MUXA_BIN` 또는 widget의 custom socket setting을 지정하세요.
+
+```bash
+muxa status --json
+```
+
 ## Columns
 
 `[watch]`에서 설정합니다:
