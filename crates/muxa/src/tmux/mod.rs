@@ -127,6 +127,14 @@ pub struct PaneInfo {
     pub tty: String,
     pub current_command: String,
     pub title: String,
+    /// Working directory of the pane's active process, from tmux
+    /// `#{pane_current_path}`. Empty when the backend can't supply it
+    /// (zellij CLI, older `PANE_FMT` output). Used to correlate a paneless
+    /// agent hook — a `code_mode_host` codex fires hooks from a detached
+    /// app-server with no `TMUX_PANE`, so its row carries a `cwd` but no
+    /// pane — back to the tmux pane it is actually running in.
+    #[serde(default)]
+    pub current_path: String,
     /// PID of the pane's initial process (typically the shell tmux spawned).
     /// `0` means "unknown" — backends that can't supply it (zellij CLI today,
     /// truncated lines from older tmux) leave it zeroed out, and downstream
@@ -199,7 +207,7 @@ pub struct ClientInfo {
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
 pub(crate) const CLIENT_FMT: &str =
@@ -233,6 +241,7 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             current_command: cols[5].into(),
             title: cols[6].into(),
             pane_pid,
+            current_path: cols.get(8).map(|s| (*s).to_string()).unwrap_or_default(),
             socket: socket.map(Into::into),
         });
     }

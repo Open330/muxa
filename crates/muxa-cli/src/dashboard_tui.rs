@@ -3379,6 +3379,7 @@ mod tests {
             current_command: "zsh".into(),
             title: "shell".into(),
             pane_pid: 123,
+            current_path: String::new(),
         }
     }
 

@@ -423,6 +423,7 @@ impl<L: LivenessSource> Reconciler<L> {
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
                 duplicates = report.duplicates_collapsed,
+                correlated = report.paneless_correlated,
                 workload_changed,
                 "slow reconciler.tick",
             );
@@ -437,6 +438,7 @@ impl<L: LivenessSource> Reconciler<L> {
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
                 duplicates = report.duplicates_collapsed,
+                correlated = report.paneless_correlated,
                 workload_changed,
                 "reconciler.tick",
             );
@@ -542,6 +544,7 @@ mod tests {
             current_command: "claude".into(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         }
     }
 

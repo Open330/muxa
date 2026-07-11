@@ -363,6 +363,7 @@ mod tests {
             current_command: "zsh".into(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         }
     }
 

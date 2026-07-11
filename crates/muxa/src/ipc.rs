@@ -2162,6 +2162,7 @@ mod tests {
             current_command: "claude".into(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         };
         Client::new(sock.clone())
             .push_pane_snapshot(&[pane])

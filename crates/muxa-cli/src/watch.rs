@@ -649,7 +649,7 @@ impl WatchColumn {
 /// drop-in replacement for tmux's `choose-tree -Zs`.
 pub(crate) enum WatchRow {
     Agent(Box<Agent>),
-    BarePane(PaneInfo),
+    BarePane(Box<PaneInfo>),
     Session(Box<SessionRow>),
 }
 
@@ -1552,7 +1552,7 @@ impl App {
 
         let mut rows: Vec<WatchRow> = Vec::with_capacity(agents.len() + bare.len());
         rows.extend(agents.into_iter().map(WatchRow::agent));
-        rows.extend(bare.into_iter().map(WatchRow::BarePane));
+        rows.extend(bare.into_iter().map(|p| WatchRow::BarePane(Box::new(p))));
 
         self.rows = rows;
         // Keep the *full* pane inventory (not just the bare ones) so
@@ -5287,6 +5287,7 @@ mod tests {
             current_command: cmd.into(),
             title: cmd.into(),
             pane_pid: 0,
+            current_path: String::new(),
         }
     }
 
@@ -6340,6 +6341,7 @@ sort = ["state"]
             current_command: String::new(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         }];
         assert_eq!(pane_display(Some("%42"), &panes), "main:1.0");
         // Misses fall through to the raw id without panicking.
@@ -8471,7 +8473,7 @@ sort = ["state"]
         // detail line — and the rendered content includes the dash.
         let now = OffsetDateTime::now_utc();
         let p = fake_pane("%99", "side", 0, 0, "vim");
-        let row = WatchRow::BarePane(p);
+        let row = WatchRow::BarePane(Box::new(p));
         let s = format_detail("model={model}", &row, &[], now).unwrap();
         assert_eq!(s, "model=—");
     }
@@ -8483,7 +8485,7 @@ sort = ["state"]
         // a detail line that says nothing useful.
         let now = OffsetDateTime::now_utc();
         let p = fake_pane("%99", "side", 0, 0, "vim");
-        let row = WatchRow::BarePane(p);
+        let row = WatchRow::BarePane(Box::new(p));
         assert!(format_detail("{model}", &row, &[], now).is_none());
     }
 

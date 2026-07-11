@@ -213,6 +213,7 @@ mod tests {
             current_command: String::new(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         }
     }
 

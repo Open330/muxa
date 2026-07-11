@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`code_mode_host` codex sessions now correlate to their tmux pane instead of
+  splitting into two rows.** Such a session runs its turns — and fires its
+  hooks — from a shared, detached `app-server` (parent PID 1, no `TMUX_PANE`),
+  so the real hook row landed paneless even while the session lived in a pane,
+  and discovery's synthetic placeholder on that pane never merged with it. The
+  reconciler now rejoins them: when a paneless codex hook row's `cwd` uniquely
+  matches the `pane_current_path` of a pane already carrying a synthetic codex
+  placeholder, the real row adopts that pane and the synthetic is demoted. Only
+  unambiguous 1:1 matches act — a cwd shared by several codex panes is left
+  alone. `PaneInfo` now carries `current_path` for this.
+
 ### Added
 
 - **Orphaned agent rows are now reaped instead of accumulating forever.** A row

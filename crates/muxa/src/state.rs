@@ -23,7 +23,7 @@ use crate::process_tree::WorkloadSummary;
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -1365,6 +1365,115 @@ impl Store {
         }
     }
 
+    /// Correlate paneless codex hook rows to the tmux pane they are actually
+    /// running in, by working-directory match. Returns the number adopted.
+    ///
+    /// A `features.code_mode_host` codex runs its turns — and fires its hooks —
+    /// from a shared, detached `app-server` (parent PID 1, no `TMUX_PANE`), so
+    /// the real hook row lands paneless even when the session lives in a tmux
+    /// pane. Meanwhile discovery has planted a *synthetic* codex placeholder on
+    /// that pane. The two describe one session but never merge, because the
+    /// hook never learned the pane. This bridges them: the synthetic row is the
+    /// "codex runs in this pane" evidence, and the pane's `current_path` joined
+    /// against the paneless row's `cwd` recovers the pairing. Once the real row
+    /// adopts the pane, the dedup pass demotes the synthetic.
+    ///
+    /// Deliberately conservative — a wrong pane is worse than none:
+    /// - Only unambiguous 1:1 pairings act (exactly one paneless row and one
+    ///   candidate pane share a cwd). Any many-to-one is skipped.
+    /// - A pane already owned by a *real* codex row is never stolen.
+    /// - Rows/panes without a usable cwd/path contribute nothing.
+    fn correlate_paneless_codex(
+        agents: &mut HashMap<String, Agent>,
+        panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+    ) -> usize {
+        // A pane's cwd, resolved the same way `backfill_tmux_names` picks the
+        // right candidate when a pane id repeats across tmux servers.
+        let resolve_path = |pane_id: &str, socket: Option<&str>| -> Option<String> {
+            let cands = panes_by_id.get(pane_id)?;
+            let chosen = match socket {
+                Some(sock) => cands.iter().find(|p| p.socket.as_deref() == Some(sock)),
+                None => match cands.len() {
+                    1 => cands.first(),
+                    _ => cands
+                        .iter()
+                        .find(|p| p.socket.as_deref() == Some("default"))
+                        .or(cands.first()),
+                },
+            }?;
+            let path = chosen.current_path.trim();
+            (!path.is_empty()).then(|| path.to_string())
+        };
+
+        // Panes already owned by a real codex row — off-limits.
+        let real_codex_panes: HashSet<(String, Option<String>)> = agents
+            .iter()
+            .filter(|(sid, a)| a.kind == AgentKind::Codex && !is_synthetic(sid) && a.pane.is_some())
+            .filter_map(|(_, a)| Some((a.pane.clone()?, a.tmux_socket.clone())))
+            .collect();
+
+        // cwd -> candidate codex panes (those carrying a synthetic codex row).
+        let mut panes_by_cwd: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+        for (sid, a) in agents.iter() {
+            if a.kind != AgentKind::Codex || !is_synthetic(sid) {
+                continue;
+            }
+            let Some(pane_id) = a.pane.clone() else {
+                continue;
+            };
+            if real_codex_panes.contains(&(pane_id.clone(), a.tmux_socket.clone())) {
+                continue;
+            }
+            if let Some(path) = resolve_path(&pane_id, a.tmux_socket.as_deref()) {
+                panes_by_cwd
+                    .entry(path)
+                    .or_default()
+                    .push((pane_id, a.tmux_socket.clone()));
+            }
+        }
+
+        // cwd -> paneless real codex rows.
+        let mut rows_by_cwd: HashMap<String, Vec<String>> = HashMap::new();
+        for (sid, a) in agents.iter() {
+            if a.kind != AgentKind::Codex
+                || is_synthetic(sid)
+                || a.pane.is_some()
+                || a.pid.is_some()
+            {
+                continue;
+            }
+            let Some(cwd) = a.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+                continue;
+            };
+            rows_by_cwd
+                .entry(cwd.to_string())
+                .or_default()
+                .push(sid.clone());
+        }
+
+        // Collect unambiguous adoptions first, then apply (avoids holding an
+        // immutable borrow of `agents` across the mutable `get_mut`).
+        let mut adoptions: Vec<(String, String, Option<String>)> = Vec::new();
+        for (cwd, sids) in &rows_by_cwd {
+            let Some(panes) = panes_by_cwd.get(cwd) else {
+                continue;
+            };
+            if sids.len() != 1 || panes.len() != 1 {
+                continue;
+            }
+            adoptions.push((sids[0].clone(), panes[0].0.clone(), panes[0].1.clone()));
+        }
+
+        let adopted = adoptions.len();
+        for (sid, pane_id, socket) in adoptions {
+            if let Some(a) = agents.get_mut(&sid) {
+                a.pane = Some(pane_id);
+                a.tmux_socket = socket;
+            }
+        }
+        adopted
+    }
+
     /// Converge the registry against ground truth from tmux.
     ///
     /// This is the periodic control-loop pass — analogous to a Kubernetes
@@ -1426,6 +1535,12 @@ impl Store {
             }
         });
         report.stale_panes_reaped = before - agents.len();
+
+        // Adopt panes onto paneless codex hook rows via cwd match BEFORE the
+        // dedup pass, so a newly-correlated real row and the pane's synthetic
+        // placeholder land on the same (pane, socket) key and the synthetic
+        // gets demoted in the same reconcile.
+        report.paneless_correlated = Self::correlate_paneless_codex(&mut agents, &panes_by_id);
 
         Self::backfill_tmux_names(&mut agents, &panes_by_id);
 
@@ -1516,6 +1631,8 @@ pub struct ReconcileReport {
     pub synthetic_demoted: usize,
     /// Older / duplicate real records collapsed onto the canonical row.
     pub duplicates_collapsed: usize,
+    /// Paneless codex hook rows adopted onto a tmux pane via cwd match.
+    pub paneless_correlated: usize,
 }
 
 impl ReconcileReport {
@@ -1525,9 +1642,10 @@ impl ReconcileReport {
     }
 
     /// True when this pass changed the registry — handy for log-on-change
-    /// patterns so quiet steady-state passes don't flood the log.
+    /// patterns so quiet steady-state passes don't flood the log. Correlation
+    /// mutates a row without removing one, so it counts too.
     pub fn is_noop(&self) -> bool {
-        self.total_removed() == 0
+        self.total_removed() == 0 && self.paneless_correlated == 0
     }
 }
 
@@ -1909,6 +2027,7 @@ mod tests {
             current_command: "claude".into(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         };
         store.reconcile(std::slice::from_ref(&pane)).await;
         assert!(store.by_session("agent").await.is_some());
@@ -3338,6 +3457,102 @@ mod tests {
         assert!(res.is_err(), "expected no transition, got {res:?}");
     }
 
+    /// A `code_mode_host` codex splits into a synthetic pane placeholder
+    /// (discovery) plus a paneless real hook row (the app-server fires hooks
+    /// with no `TMUX_PANE`). Reconcile must rejoin them by cwd: the real row
+    /// adopts the pane, and the synthetic is demoted in the same pass.
+    #[tokio::test]
+    async fn reconcile_correlates_paneless_codex_by_cwd() {
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let codex = |sid: &str, pane: Option<String>, cwd: Option<String>| AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane,
+                cwd,
+            },
+            at: t0,
+        };
+
+        // 1:1 pairing — the real hook row adopts the pane, synthetic collapses.
+        let store = Store::shared();
+        store
+            .apply(&codex("synthetic-%1", Some("%1".into()), None))
+            .await;
+        store
+            .apply(&codex("019f-real", None, Some("/Users/jiun/proj".into())))
+            .await;
+        let mut p = pane("%1");
+        p.current_path = "/Users/jiun/proj".into();
+        let report = store.reconcile(&[p]).await;
+        assert_eq!(report.paneless_correlated, 1, "real row should adopt %1");
+        assert_eq!(report.synthetic_demoted, 1, "synthetic collapses same pass");
+        let snap = store.snapshot().await;
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "019f-real")
+                .unwrap()
+                .pane
+                .as_deref(),
+            Some("%1"),
+        );
+        assert!(!snap.iter().any(|a| a.session_id == "synthetic-%1"));
+
+        // Ambiguous — two paneless rows share a cwd with one candidate pane,
+        // so neither is adopted (a wrong pane is worse than none).
+        let store = Store::shared();
+        store
+            .apply(&codex("synthetic-%2", Some("%2".into()), None))
+            .await;
+        store
+            .apply(&codex("real-a", None, Some("/amb".into())))
+            .await;
+        store
+            .apply(&codex("real-b", None, Some("/amb".into())))
+            .await;
+        let mut p = pane("%2");
+        p.current_path = "/amb".into();
+        let report = store.reconcile(&[p]).await;
+        assert_eq!(report.paneless_correlated, 0, "ambiguous cwd left alone");
+        let snap = store.snapshot().await;
+        assert!(snap
+            .iter()
+            .find(|a| a.session_id == "real-a")
+            .unwrap()
+            .pane
+            .is_none());
+        assert!(snap
+            .iter()
+            .find(|a| a.session_id == "real-b")
+            .unwrap()
+            .pane
+            .is_none());
+
+        // No cwd match — a paneless row whose cwd matches no codex pane stays
+        // paneless (and a pane with no current_path can't be a candidate).
+        let store = Store::shared();
+        store
+            .apply(&codex("synthetic-%3", Some("%3".into()), None))
+            .await;
+        store
+            .apply(&codex("real-c", None, Some("/elsewhere".into())))
+            .await;
+        let mut p = pane("%3");
+        p.current_path = "/different".into();
+        let report = store.reconcile(&[p]).await;
+        assert_eq!(report.paneless_correlated, 0, "no cwd match");
+        assert!(store
+            .snapshot()
+            .await
+            .iter()
+            .find(|a| a.session_id == "real-c")
+            .unwrap()
+            .pane
+            .is_none());
+    }
+
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
             socket: None,
@@ -3349,6 +3564,7 @@ mod tests {
             current_command: "claude".into(),
             title: String::new(),
             pane_pid: 0,
+            current_path: String::new(),
         }
     }
 
