@@ -1096,6 +1096,35 @@ impl Store {
         removed
     }
 
+    /// Immediately delete fully orphaned rows (no pane, surface, or pid)
+    /// whose last activity predates `cutoff`. The on-demand analogue of the
+    /// reconciler's `mark_stale_paneless_stopped` age-out — backs `muxa
+    /// prune`, so a user can clear accumulated remote/detached ghost rows
+    /// now instead of waiting for the 24h sweep plus the GC's Stopped-row
+    /// TTL. Returns the number removed.
+    ///
+    /// A pane, surface, or pid each disqualifies a row (some other liveness
+    /// path owns it), so this can never remove a live tmux pane agent, a
+    /// muxa PTY session, or a pid-tracked task — only truly ownerless rows.
+    pub async fn prune_orphans(&self, cutoff: OffsetDateTime) -> usize {
+        let removed = {
+            let mut agents = self.agents.write().await;
+            let before = agents.len();
+            agents.retain(|_, a| {
+                let orphan = a.kind != AgentKind::Task
+                    && a.pane.is_none()
+                    && a.surface.is_none()
+                    && a.pid.is_none();
+                !(orphan && a.last_activity_at < cutoff)
+            });
+            before - agents.len()
+        };
+        if removed > 0 {
+            self.dirty.notify_one();
+        }
+        removed
+    }
+
     /// Auto-downgrade agents in `from` to `Idle` if they've been
     /// sitting in that state past `threshold` since their
     /// `last_activity_at`. Returns the number of agents flipped.
@@ -1182,6 +1211,78 @@ impl Store {
             agent.last_activity_at = now;
             flipped += 1;
             // Same broadcast shape as `apply`/`mark_stuck_idle_from` so live
+            // subscribers see the row go Stopped immediately.
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: Arc::new(agent.clone()),
+            });
+        }
+        if flipped > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+        }
+        flipped
+    }
+
+    /// Flip stale paneless agents to `Stopped` so the regular GC can reap
+    /// them. Returns the number of rows flipped.
+    ///
+    /// This closes a liveness hole: an agent that is paneless **and** has no
+    /// surface **and** no pid is governed by none of the other converge
+    /// paths — `reconcile` reaps only pane-dead rows, `reap_dead_pids` reaps
+    /// only pid-tracked rows, and `gc` deletes only `Stopped` rows. A codex
+    /// session driven through a detached `app-server` / remote bridge fires
+    /// hooks with no `TMUX_PANE` and an ancestry that terminates at launchd,
+    /// so it lands paneless and never transitions to `Stopped` on its own —
+    /// the row lingers forever and `muxa watch`'s `+N paneless` count creeps
+    /// up. Flipping to `Stopped` (rather than deleting) keeps the shape
+    /// consistent with `reap_dead_pids` and lets `gc`'s TTL make the final
+    /// call.
+    ///
+    /// Conservative by construction:
+    /// - `threshold == Duration::ZERO` disables the sweep (matching
+    ///   `mark_stuck_idle_from`), so the historical "no age-based reaping"
+    ///   behaviour is one config key away.
+    /// - Only truly orphan rows qualify (`pane`, `surface`, and `pid` all
+    ///   absent). A live-but-idle remote session is spared by a generous
+    ///   default threshold; if it really is dead it stops emitting activity
+    ///   and ages out.
+    /// - `Task` rows are excluded explicitly (belt-and-suspenders on top of
+    ///   the `pid` check — a registered task may momentarily carry no pid).
+    pub async fn mark_stale_paneless_stopped(&self, threshold: Duration) -> usize {
+        if threshold.is_zero() {
+            return 0;
+        }
+        let cutoff = OffsetDateTime::now_utc() - threshold;
+        let mut agents = self.agents.write().await;
+        let mut flipped = 0_usize;
+        for agent in agents.values_mut() {
+            if agent.kind == AgentKind::Task {
+                continue;
+            }
+            // Only orphan rows: a pane, a surface, or a pid each means some
+            // other liveness path owns this row's lifecycle.
+            if agent.pane.is_some() || agent.surface.is_some() || agent.pid.is_some() {
+                continue;
+            }
+            if agent.state == AgentState::Stopped {
+                continue;
+            }
+            if agent.last_activity_at > cutoff {
+                continue;
+            }
+            let prev = agent.state;
+            let now = OffsetDateTime::now_utc();
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = now;
+            // Measure the GC's Stopped-row TTL from when we gave up on the
+            // row, not from its last real activity — otherwise a row already
+            // older than the TTL is deleted on the very next GC sweep instead
+            // of lingering as `Stopped` for the intended window.
+            agent.last_activity_at = now;
+            flipped += 1;
+            // Same broadcast shape as `apply`/`reap_dead_pids` so live
             // subscribers see the row go Stopped immediately.
             let _ = self.transitions.send(Transition {
                 from: prev,
@@ -1596,6 +1697,115 @@ mod tests {
         );
         // Idempotent: a second pass flips nothing new.
         assert_eq!(store.reap_dead_pids().await, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_stale_paneless_stopped_reaps_only_orphan_stale_rows() {
+        use crate::event::{SurfaceKind, SurfaceRef};
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC); // long before "now"
+        let fresh = OffsetDateTime::now_utc();
+
+        let started = |sid: &str, pane: Option<String>, surface: Option<SurfaceRef>, at| {
+            AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::Codex,
+                    session_id: sid.into(),
+                    surface,
+                    pane,
+                    cwd: None,
+                },
+                at,
+            }
+        };
+
+        // Orphan + stale → should flip.
+        store.apply(&started("orphan", None, None, old)).await;
+        // Orphan but fresh → spared by the age gate.
+        store
+            .apply(&started("orphan-fresh", None, None, fresh))
+            .await;
+        // Paneless but surface-tracked → not an orphan, spared.
+        store
+            .apply(&started(
+                "surface",
+                None,
+                Some(SurfaceRef {
+                    kind: SurfaceKind::Pty,
+                    id: "s1".into(),
+                }),
+                old,
+            ))
+            .await;
+        // Has a pane → governed by tmux liveness, spared.
+        store
+            .apply(&started("paned", Some("%1".into()), None, old))
+            .await;
+
+        let flipped = store
+            .mark_stale_paneless_stopped(Duration::from_secs(86_400))
+            .await;
+        assert_eq!(flipped, 1, "only the stale orphan should flip");
+        assert_eq!(
+            store.by_session("orphan").await.unwrap().state,
+            AgentState::Stopped
+        );
+        assert_ne!(
+            store.by_session("orphan-fresh").await.unwrap().state,
+            AgentState::Stopped
+        );
+        assert_ne!(
+            store.by_session("surface").await.unwrap().state,
+            AgentState::Stopped
+        );
+        assert_ne!(
+            store.by_session("paned").await.unwrap().state,
+            AgentState::Stopped
+        );
+
+        // Idempotent, and a zero threshold disables the sweep entirely.
+        assert_eq!(
+            store
+                .mark_stale_paneless_stopped(Duration::from_secs(86_400))
+                .await,
+            0
+        );
+        store.apply(&started("orphan2", None, None, old)).await;
+        assert_eq!(store.mark_stale_paneless_stopped(Duration::ZERO).await, 0);
+        assert_ne!(
+            store.by_session("orphan2").await.unwrap().state,
+            AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_orphans_deletes_only_stale_ownerless_rows() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        let fresh = OffsetDateTime::now_utc();
+        let codex = |sid: &str, pane: Option<String>, at| AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane,
+                cwd: None,
+            },
+            at,
+        };
+        store.apply(&codex("ghost", None, old)).await; // orphan + stale → gone
+        store.apply(&codex("live", None, fresh)).await; // orphan but fresh → kept
+        store.apply(&codex("paned", Some("%1".into()), old)).await; // has pane → kept
+
+        // Cutoff one hour ago: deletes the stale orphan, spares the fresh one.
+        let cutoff = OffsetDateTime::now_utc() - Duration::from_secs(3600);
+        let removed = store.prune_orphans(cutoff).await;
+        assert_eq!(removed, 1);
+        assert!(store.by_session("ghost").await.is_none());
+        assert!(store.by_session("live").await.is_some());
+        assert!(store.by_session("paned").await.is_some());
     }
 
     #[tokio::test]

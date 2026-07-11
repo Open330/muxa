@@ -115,6 +115,12 @@ pub struct Reconciler<L: LivenessSource> {
     /// Covers Codex's permission-grant case where the row gets
     /// pinned yellow with no follow-up hook to recover from.
     stuck_waiting_timeout: Duration,
+    /// If non-zero, fully orphaned rows (no pane, surface, or pid) idle for
+    /// this long are flipped to `Stopped` on every tick so the GC can reap
+    /// them. `Duration::ZERO` (default) disables the sweep. Targets paneless
+    /// codex rows from detached `app-server`/remote sessions that no other
+    /// converge path governs.
+    paneless_stale_timeout: Duration,
     /// Root of codex's session-rollout tree (`~/.codex/sessions`). When
     /// `Some`, each tick reads every live codex row's rollout file and
     /// feeds its `rate_limits` through the store — the only way muxa learns
@@ -132,6 +138,7 @@ impl<L: LivenessSource> Reconciler<L> {
             metrics: None,
             stuck_working_timeout: Duration::ZERO,
             stuck_waiting_timeout: Duration::ZERO,
+            paneless_stale_timeout: Duration::ZERO,
             codex_sessions_root: None,
         }
     }
@@ -160,6 +167,15 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_stuck_waiting_timeout(mut self, t: Duration) -> Self {
         self.stuck_waiting_timeout = t;
+        self
+    }
+
+    /// Enable age-based reaping of fully orphaned rows (no pane, surface, or
+    /// pid) — flips them to `Stopped` after `t` of inactivity so the GC
+    /// removes them. `Duration::ZERO` (the default) keeps the sweep off.
+    #[must_use]
+    pub fn with_paneless_stale_timeout(mut self, t: Duration) -> Self {
+        self.paneless_stale_timeout = t;
         self
     }
 
@@ -309,6 +325,7 @@ impl<L: LivenessSource> Reconciler<L> {
     /// a pass right after startup discovery so the user doesn't wait a full
     /// tick to see a clean view.
     #[tracing::instrument(level = "debug", skip(self))]
+    #[allow(clippy::too_many_lines)]
     pub async fn reconcile_once(&self) -> ReconcileReport {
         let started = Instant::now();
         // `list_panes` shells out to tmux and must not block the runtime.
@@ -353,6 +370,19 @@ impl<L: LivenessSource> Reconciler<L> {
                 self.stuck_waiting_timeout,
             )
             .await;
+        // Age out fully orphaned rows (no pane/surface/pid) so the GC can
+        // reap them — otherwise paneless codex rows from detached
+        // app-server/remote sessions accumulate without bound.
+        let stale_paneless = self
+            .store
+            .mark_stale_paneless_stopped(self.paneless_stale_timeout)
+            .await;
+        if stale_paneless > 0 {
+            tracing::info!(
+                stale_paneless,
+                "orphan-row sweep flipped {stale_paneless} paneless agent(s) to Stopped",
+            );
+        }
         // Poll codex rollouts for rate-limit state (no-op unless a sessions
         // root is configured). Codex has no rate-limit hook, so this is the
         // only signal — and it's the only path that catches a cap which

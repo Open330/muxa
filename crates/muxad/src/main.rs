@@ -681,6 +681,9 @@ fn spawn_reconciler_task(
     .with_stuck_waiting_timeout(std::time::Duration::from_secs(
         cfg.reconciler.stuck_waiting_timeout_secs,
     ))
+    .with_paneless_stale_timeout(std::time::Duration::from_secs(
+        cfg.reconciler.paneless_stale_timeout_secs,
+    ))
     .with_codex_sessions_root(codex_sessions_root.clone());
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(runner.run(shutdown_rx));
@@ -688,6 +691,7 @@ fn spawn_reconciler_task(
         interval_secs = cfg.reconciler.interval_secs,
         stuck_working_timeout_secs = cfg.reconciler.stuck_working_timeout_secs,
         stuck_waiting_timeout_secs = cfg.reconciler.stuck_waiting_timeout_secs,
+        paneless_stale_timeout_secs = cfg.reconciler.paneless_stale_timeout_secs,
         codex_rollout_polling = codex_sessions_root.is_some(),
         "reconciler enabled",
     );

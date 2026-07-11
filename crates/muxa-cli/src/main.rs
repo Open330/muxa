@@ -200,6 +200,23 @@ enum Cmd {
     /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
     /// socket is responsive. One command for the full update flow.
     Upgrade(upgrade::Args),
+    /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
+    /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
+    /// through a detached `app-server`). Only registry rows are removed;
+    /// tmux sessions are never touched. The daemon also ages these out on
+    /// its own after `[reconciler] paneless_stale_timeout_secs` (24h default).
+    Prune {
+        /// Only prune rows idle at least this long (e.g. `30m`, `1h`, `24h`).
+        /// Spares recently-active sessions. Ignored when `--all` is set.
+        #[arg(long, default_value = "1h")]
+        older_than: String,
+        /// Prune every orphan row regardless of age.
+        #[arg(long)]
+        all: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -355,7 +372,79 @@ async fn main() -> Result<()> {
         Cmd::Doctor => doctor::run(socket).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
+        Cmd::Prune {
+            older_than,
+            all,
+            yes,
+        } => cmd_prune(&client, &older_than, all, yes).await,
     }
+}
+
+/// Parse a short human duration (`45s`, `30m`, `1h`, `2d`, or a bare
+/// seconds count) into whole seconds. Used by `muxa prune --older-than`.
+fn parse_duration_secs(s: &str) -> Result<u64> {
+    let s = s.trim();
+    anyhow::ensure!(!s.is_empty(), "empty duration");
+    let (num, mult) = match s.chars().last() {
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some('h') => (&s[..s.len() - 1], 3_600),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('s') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    let val: u64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid duration: {s:?} (try 30m, 1h, 24h)"))?;
+    Ok(val * mult)
+}
+
+/// Delete orphan agent rows (no pane, surface, or pid) via the daemon.
+/// Previews the count from a snapshot, confirms (unless `--yes`), then asks
+/// the daemon to prune. tmux sessions are never affected — only registry rows.
+async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> Result<()> {
+    let max_age_secs = if all {
+        0
+    } else {
+        parse_duration_secs(older_than)?
+    };
+    let now = OffsetDateTime::now_utc();
+    let agents = client.snapshot().await.unwrap_or_default();
+    let is_orphan = |a: &Agent| {
+        a.kind != AgentKind::Task && a.pane.is_none() && a.surface.is_none() && a.pid.is_none()
+    };
+    let candidates = agents
+        .iter()
+        .filter(|a| {
+            is_orphan(a)
+                && (now - a.last_activity_at).whole_seconds()
+                    >= i64::try_from(max_age_secs).unwrap_or(i64::MAX)
+        })
+        .count();
+    if candidates == 0 {
+        println!("No orphan agent rows to prune.");
+        return Ok(());
+    }
+    if !yes {
+        let scope = if all {
+            "all ages".to_string()
+        } else {
+            format!("idle ≥ {older_than}")
+        };
+        let proceed = cliclack::confirm(format!(
+            "Prune {candidates} orphan agent row(s) ({scope})? tmux sessions are not affected."
+        ))
+        .initial_value(false)
+        .interact()
+        .unwrap_or(false);
+        if !proceed {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    let pruned = client.prune(Duration::from_secs(max_age_secs)).await?;
+    println!("Pruned {pruned} orphan agent row(s).");
+    Ok(())
 }
 
 async fn cmd_run(

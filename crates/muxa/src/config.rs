@@ -420,6 +420,19 @@ pub struct ReconcilerConfig {
     /// that want to skip the per-tick directory scan entirely).
     #[serde(default = "default_true")]
     pub codex_rollout_enabled: bool,
+    /// Age (seconds) after which a fully orphaned agent row — no pane, no
+    /// surface, no pid — is flipped to `Stopped` so the regular GC can reap
+    /// it. Closes the liveness hole where a codex session driven through a
+    /// detached `app-server`/remote bridge fires paneless hooks and never
+    /// transitions to `Stopped`, so the row lingers forever and `muxa
+    /// watch`'s `+N paneless` count only ever grows.
+    ///
+    /// Default `86400` (24h): a human-driven remote session idle for a full
+    /// day is effectively dead, and only the registry row is removed — the
+    /// underlying tmux session (if any) is never touched. Set `0` to disable
+    /// and preserve the historical "orphan rows persist" behaviour.
+    #[serde(default = "default_paneless_stale_secs")]
+    pub paneless_stale_timeout_secs: u64,
 }
 
 impl Default for ReconcilerConfig {
@@ -430,12 +443,18 @@ impl Default for ReconcilerConfig {
             stuck_working_timeout_secs: 0,
             stuck_waiting_timeout_secs: 0,
             codex_rollout_enabled: true,
+            paneless_stale_timeout_secs: default_paneless_stale_secs(),
         }
     }
 }
 
 fn default_reconciler_interval_secs() -> u64 {
     30
+}
+
+fn default_paneless_stale_secs() -> u64 {
+    // 24 hours — see `ReconcilerConfig::paneless_stale_timeout_secs`.
+    86_400
 }
 
 fn default_discovery_interval_secs() -> u64 {

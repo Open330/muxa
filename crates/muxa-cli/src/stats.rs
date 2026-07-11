@@ -210,7 +210,8 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
         args.reverse,
         args.graph,
     );
-    match OutputFormat::resolve(args.format, args.json, args.markdown) {
+    let format = OutputFormat::resolve(args.format, args.json, args.markdown);
+    match format {
         OutputFormat::Table => render_table(
             &doc,
             theme::for_config(cfg, args.theme, use_colors()),
@@ -219,7 +220,40 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
         OutputFormat::Markdown => print!("{}", render_markdown_stats(&doc)),
     }
+    if matches!(format, OutputFormat::Table) {
+        maybe_hint_orphans(client).await;
+    }
     Ok(())
+}
+
+/// On the interactive table path, nudge about accumulated "orphan" agent
+/// rows — paneless, surfaceless, pid-less ghosts from remote/detached
+/// sessions that `muxa prune` clears. Counts only rows idle ≥ 1h so the
+/// number matches `muxa prune`'s default and fresh live sessions don't
+/// trigger the hint. Silent unless stdout is a real terminal, so JSON/
+/// Markdown output and pipes stay clean.
+async fn maybe_hint_orphans(client: &Client) {
+    use std::io::IsTerminal as _;
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let Ok(agents) = client.snapshot().await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc();
+    let orphans = agents
+        .iter()
+        .filter(|a| {
+            a.kind != muxa::AgentKind::Task
+                && a.pane.is_none()
+                && a.surface.is_none()
+                && a.pid.is_none()
+                && (now - a.last_activity_at).whole_seconds() >= 3_600
+        })
+        .count();
+    if orphans > 0 {
+        println!("\n{orphans} stale orphan agent row(s) with no pane — run `muxa prune` to clear (tmux sessions unaffected).");
+    }
 }
 
 pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Result<()> {

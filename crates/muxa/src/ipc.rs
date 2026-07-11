@@ -211,6 +211,15 @@ enum RequestBody {
         #[serde(default)]
         command: Option<String>,
     },
+    /// Delete fully orphaned rows (no pane, surface, or pid) idle longer than
+    /// `max_age_secs`. Backs `muxa prune` — the on-demand cleanup of
+    /// remote/detached ghost rows the reconciler would otherwise only age out
+    /// after its 24h sweep. `max_age_secs = 0` (or absent) removes every
+    /// orphan regardless of age. Replies with `pruned` = rows removed.
+    Prune {
+        #[serde(default)]
+        max_age_secs: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +267,8 @@ pub struct Response {
     pub terminal: Option<TerminalSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<SessionOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pruned: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,6 +293,7 @@ impl Response {
             session: None,
             terminal: None,
             output: None,
+            pruned: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -326,6 +338,11 @@ impl Response {
     fn with_output(output: SessionOutput) -> Self {
         let mut r = Self::ok();
         r.output = Some(output);
+        r
+    }
+    fn with_pruned(pruned: usize) -> Self {
+        let mut r = Self::ok();
+        r.pruned = Some(pruned);
         r
     }
     fn hello() -> Self {
@@ -808,6 +825,14 @@ async fn handle(
                         Err(e) => Response::err(e),
                     }
                 }
+                RequestBody::Prune { max_age_secs } => {
+                    kind = "prune";
+                    let cutoff = time::OffsetDateTime::now_utc()
+                        - std::time::Duration::from_secs(max_age_secs);
+                    let pruned = store.prune_orphans(cutoff).await;
+                    tracing::debug!(pruned, max_age_secs, "prune orphans");
+                    Response::with_pruned(pruned)
+                }
                 RequestBody::Snapshot => {
                     kind = "snapshot";
                     Response::with_agents(store.snapshot().await)
@@ -1083,6 +1108,20 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
         Ok(decode_agents(&resp))
+    }
+
+    /// Ask the daemon to delete fully orphaned rows (no pane, surface, or
+    /// pid) idle longer than `max_age`. `max_age = Duration::ZERO` removes
+    /// every orphan regardless of age. Returns the number removed. Backs
+    /// `muxa prune`.
+    pub async fn prune(&self, max_age: Duration) -> Result<usize, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "prune",
+            "max_age_secs": max_age.as_secs(),
+        });
+        let resp = self.call(&req).await?;
+        Ok(usize::try_from(resp["pruned"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX))
     }
 
     pub async fn snapshot_with_timeout(

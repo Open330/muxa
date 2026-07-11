@@ -29,6 +29,11 @@
 [reconciler]
 # enabled       = true
 # interval_secs = 30                # 30s default — closed panes disappear from `muxa watch` within seconds
+# paneless_stale_timeout_secs = 86400  # 24h. Age out fully orphaned rows (no pane, surface, or pid) to
+#                                      # Stopped so the GC reaps them — e.g. codex sessions driven through a
+#                                      # detached app-server/remote bridge that fire paneless hooks and never
+#                                      # stop on their own. Only the registry row is removed; the tmux session
+#                                      # (if any) is untouched. `muxa prune` does this on demand. Set 0 to disable.
 
 # Prompt audit log: every PromptSubmitted event is appended to a bounded
 # NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`

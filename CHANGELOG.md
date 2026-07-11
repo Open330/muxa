@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Orphaned agent rows are now reaped instead of accumulating forever.** A row
+  with no pane, no surface, and no pid — the shape a codex session driven
+  through a detached `app-server`/remote bridge lands in, since its hooks carry
+  no `TMUX_PANE` and its ancestry terminates at launchd — was governed by none
+  of the converge paths (`reconcile` reaps only pane-dead rows, `reap_dead_pids`
+  only pid-tracked rows, `gc` only `Stopped` rows). Such rows lingered
+  indefinitely and inflated `muxa watch`'s `+N paneless` count. The reconciler
+  now ages them out to `Stopped` after `[reconciler] paneless_stale_timeout_secs`
+  (default `86400` = 24h; `0` disables), after which the existing GC removes
+  them. Only registry rows are affected — the underlying tmux session is never
+  touched.
+- **`muxa prune`** clears those orphan rows on demand instead of waiting for the
+  24h sweep. `--older-than <dur>` (default `1h`) spares recently-active
+  sessions, `--all` removes every orphan, `--yes` skips the confirmation.
+  `muxa stats` now nudges when stale orphan rows exist.
+
 ## [0.8.19] - 2026-07-10
 
 ### Fixed
