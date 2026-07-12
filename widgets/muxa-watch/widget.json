@@ -1,0 +1,67 @@
+{
+  "$schema": "https://barshelf.dev/schema/widget-0.1.json",
+  "schemaVersion": 1,
+  "id": "dev.barshelf.muxa-watch",
+  "name": "muxa Watch",
+  "version": "0.3.0",
+  "icon": "rectangle.3.group.bubble.left.fill",
+  "bucket": { "group": "Agents", "order": 10, "size": "L", "pinned": true },
+
+  "entry": { "kind": "script", "runtime": "deno-ts@1" },
+  "source": {
+    "kind": "script",
+    "command": ["muxa"],
+    "discover": ["$MUXA_BIN", "~/.cargo/bin/muxa", "/opt/homebrew/bin/muxa", "/usr/local/bin/muxa", "PATH"],
+    "timeoutMs": 4000,
+    "output": "viewtree"
+  },
+
+  "refresh": {
+    "onOpen": true,
+    "interval": 5,
+    "staleAfterSec": 5,
+    "runInBackground": false,
+    "triggers": ["url"]
+  },
+
+  "statusItem": { "mode": "none" },
+
+  "permissions": {
+    "exec": [
+      {
+        "command": "muxa",
+        "allowedArgs": [
+          ["status", "--json"],
+          ["--socket", "*", "status", "--json"]
+        ],
+        "maxOutputBytes": 262144,
+        "sensitiveOutput": true
+      },
+      {
+        "command": "ssh",
+        "allowedArgs": [
+          ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "--", "*", "muxa", "status", "--json"]
+        ],
+        "maxOutputBytes": 262144,
+        "sensitiveOutput": true
+      }
+    ],
+    "env": ["MUXA_BIN"],
+    "keychain": false,
+    "notifications": false
+  },
+
+  "settings": [
+    { "key": "sshHost", "title": "SSH host (empty means this Mac)", "type": "string", "default": "" },
+    { "key": "maxAgents", "title": "Maximum rows", "type": "integer", "default": 5, "min": 1, "max": 10 },
+    { "key": "showPrompts", "title": "Show last prompts", "type": "boolean", "default": true },
+    { "key": "includeStopped", "title": "Include stopped agents", "type": "boolean", "default": false },
+    { "key": "socket", "title": "Custom local muxa socket", "type": "string", "default": "" }
+  ],
+
+  "appearance": {
+    "accent": "purple",
+    "density": "compact",
+    "showHeader": true
+  }
+}
