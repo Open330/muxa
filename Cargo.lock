@@ -2289,7 +2289,6 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
- "getrandom 0.3.4",
  "http-body-util",
  "notify-rust",
  "portable-pty",

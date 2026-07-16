@@ -12,9 +12,10 @@
 //! This module bridges the gap by inspecting each pane's
 //! `current_command` field via [`PaneBackend`] and synthesizing a minimal
 //! `AgentEvent::Started` for any pane whose command matches a known
-//! agent CLI. The synthetic entry uses a `synthetic-<pane_id>` session
-//! id so re-running discovery is idempotent; when a real hook later
-//! fires for the same pane, the store replaces the synthetic entry in
+//! agent CLI. The synthetic entry uses a stable session id derived from the
+//! pane's socket and pane id so re-running discovery is idempotent without
+//! conflating same-numbered panes on different tmux servers; when a real hook
+//! later fires for the same pane, the store replaces the synthetic entry in
 //! place — see `Store::apply`.
 //!
 //! Detection prefers the cheap `current_command` field. For common wrapper
@@ -239,6 +240,40 @@ pub fn scan_panes(backend: &dyn PaneBackend) -> Vec<Discovered> {
     discover_from_panes(&backend.list_panes())
 }
 
+fn synthetic_session_id(pane: &PaneInfo) -> String {
+    match pane.socket.as_deref() {
+        // Length-prefix the socket so the identity stays unambiguous even if
+        // a custom socket name contains the separator.
+        Some(socket) => {
+            let socket = crate::tmux::socket_short_name(socket);
+            format!(
+                "{}{len}:{socket}:{}",
+                SYNTHETIC_SESSION_PREFIX,
+                pane.pane_id,
+                len = socket.len(),
+            )
+        }
+        None => format!("{}{}", SYNTHETIC_SESSION_PREFIX, pane.pane_id),
+    }
+}
+
+fn pane_identity_matches(
+    known_pane: Option<&str>,
+    known_socket: Option<&str>,
+    discovered: &PaneInfo,
+) -> bool {
+    if known_pane != Some(discovered.pane_id.as_str()) {
+        return false;
+    }
+    match (known_socket, discovered.socket.as_deref()) {
+        (Some(left), Some(right)) => {
+            crate::tmux::socket_short_name(left) == crate::tmux::socket_short_name(right)
+        }
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
 /// Build a synthetic `AgentEvent::Started` for one discovered pane.
 ///
 /// `cwd` is intentionally `None`: tmux doesn't expose the pane's working
@@ -248,7 +283,7 @@ pub fn synthesize_started(d: &Discovered, at: OffsetDateTime) -> AgentEvent {
     AgentEvent::Started {
         id: AgentId {
             kind: d.kind,
-            session_id: format!("{}{}", SYNTHETIC_SESSION_PREFIX, d.pane.pane_id),
+            session_id: synthetic_session_id(&d.pane),
             surface: None,
             pane: Some(d.pane.pane_id.clone()),
             tmux_socket: d.pane.socket.clone(),
@@ -325,7 +360,7 @@ pub async fn run_discovery(
         // keeps the summary count honest.
         let already_known = snapshot.iter().any(|a| {
             a.kind == d.kind
-                && a.pane.as_deref() == Some(d.pane.pane_id.as_str())
+                && pane_identity_matches(a.pane.as_deref(), a.tmux_socket.as_deref(), &d.pane)
                 && a.state != crate::AgentState::Stopped
         });
         if already_known {
@@ -576,6 +611,26 @@ mod tests {
             }
             other => panic!("expected Started, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn synthetic_identity_and_discovery_dedup_include_socket() {
+        let mut default = pane("%42", "claude");
+        default.socket = Some("default".into());
+        let mut amux = default.clone();
+        amux.socket = Some("amux".into());
+
+        assert_eq!(synthetic_session_id(&default), "synthetic-7:default:%42");
+        assert_eq!(synthetic_session_id(&amux), "synthetic-4:amux:%42");
+        assert_ne!(synthetic_session_id(&default), synthetic_session_id(&amux));
+
+        assert!(pane_identity_matches(
+            Some("%42"),
+            Some("/tmp/tmux-501/default"),
+            &default,
+        ));
+        assert!(!pane_identity_matches(Some("%42"), Some("amux"), &default,));
+        assert!(!pane_identity_matches(Some("%42"), None, &default));
     }
 
     #[test]

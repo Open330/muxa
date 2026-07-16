@@ -32,6 +32,7 @@ const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 /// Cadence at which the GC task scans for evictable agents.
 const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
 const PANE_SESSION_CACHE_INTERVAL_SECONDS: u64 = 5;
+const SHUTDOWN_TASK_TIMEOUT_SECONDS: u64 = 2;
 
 #[derive(Debug, Parser)]
 #[command(name = "muxad", version, about = "muxa daemon")]
@@ -44,8 +45,8 @@ struct Args {
     #[arg(long, env = "MUXA_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Enable the HTTP dashboard. Equivalent to `[dashboard] enabled =
-    /// true`.
+    /// Enable the HTTP dashboard. Requires a bearer token unless dashboard
+    /// auth is explicitly set to `none`.
     #[arg(long, conflicts_with = "no_dashboard")]
     dashboard: bool,
 
@@ -57,7 +58,7 @@ struct Args {
     #[arg(long, value_name = "ADDR", env = "MUXA_DASHBOARD_BIND")]
     dashboard_bind: Option<String>,
 
-    /// Dashboard bearer token. Required for non-loopback binds.
+    /// Dashboard bearer token. Required whenever token auth is enabled.
     #[arg(long, value_name = "TOKEN", env = "MUXA_DASHBOARD_TOKEN")]
     dashboard_token: Option<String>,
 
@@ -107,6 +108,10 @@ async fn main() -> Result<()> {
     // crashing mid-startup once we try to bind the dashboard socket.
     cfg.validate_for_daemon()
         .context("validating daemon-only config")?;
+    // Resolve CLI/env dashboard overrides before spawning any background
+    // task. Invalid auth bootstrap should fail without briefly starting
+    // writers, scanners, or notifiers that the runtime would then abort.
+    let dash_cfg = resolve_dashboard_config(&cfg, &args)?;
 
     let socket = args
         .socket
@@ -120,13 +125,19 @@ async fn main() -> Result<()> {
     // lights it up on SIGTERM/SIGINT; the IPC server treats it as the
     // authoritative drain signal.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    // Persistence consumers intentionally outlive the general task graph.
+    // The signal broadcast stops producers first; these channels are fired
+    // only after IPC and direct Store producers have drained.
+    let (activity_transition_shutdown_tx, _) = broadcast::channel::<()>(1);
+    let (writer_shutdown_tx, _) = broadcast::channel::<()>(1);
 
     install_shutdown_signal_handler(shutdown_tx.clone());
 
     // Prompt history must exist before the store: every PromptSubmitted
     // event fans out into history alongside the live agent record.
     let pane_session_cache = PaneSessionCache::default();
-    let history = build_history(&cfg, &shutdown_tx, pane_session_cache.clone()).await;
+    let (history, history_writer_handle) =
+        build_history(&cfg, &writer_shutdown_tx, pane_session_cache.clone()).await;
     let store = Store::shared_with_history(history.clone());
 
     // One backend, shared across every consumer that previously spoke
@@ -162,19 +173,22 @@ async fn main() -> Result<()> {
     // instead of `synthetic-%X` placeholders.
     enrich_from_history(&store, &history, &backend).await;
 
-    let activity_log = build_activity_log(&cfg, &shutdown_tx).await;
-    spawn_activity_transition_task(
+    let (activity_log, activity_writer_handle) =
+        build_activity_log(&cfg, &writer_shutdown_tx).await;
+    let activity_transition_handle = spawn_activity_transition_task(
         &store,
         activity_log.clone(),
         pane_session_cache.clone(),
-        &shutdown_tx,
+        &activity_transition_shutdown_tx,
     )
     .await;
-    spawn_gc_task(&store, &shutdown_tx);
-    spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
-    spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
-    spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
-    spawn_activity_compaction_task(&cfg, activity_log.clone(), &shutdown_tx);
+    let gc_handle = spawn_gc_task(&store, &shutdown_tx);
+    let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
+    let session_activity_handle =
+        spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
+    let history_compaction_handle = spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
+    let activity_compaction_handle =
+        spawn_activity_compaction_task(&cfg, activity_log.clone(), &shutdown_tx);
 
     // The snapshotter listens on its own dedicated channel rather than
     // the main shutdown broadcast: it has to be the last thing to die
@@ -197,9 +211,7 @@ async fn main() -> Result<()> {
         tracing::info!("desktop notifier enabled");
     }
 
-    // HTTP dashboard. Resolved from cfg + CLI/env overrides; non-fatal if
-    // it fails to bind (the unix-socket IPC keeps running).
-    let dash_cfg = resolve_dashboard_config(&cfg, &args)?;
+    // HTTP dashboard. A bind failure is non-fatal to unix-socket IPC.
     if dash_cfg.enabled {
         let dash_cfg = Arc::new(dash_cfg);
         let pane_cache = Arc::new(PaneCache::new(dash_cfg.pane_cache_ttl));
@@ -286,26 +298,65 @@ async fn main() -> Result<()> {
     }
 
     // Shutdown sequence (each step depends on the previous):
-    //   1. `handle.await` — IPC server drains its in-flight handlers and
-    //      returns. After this point no further `Store::apply` can land.
-    //   2. Signal `snap_shutdown_tx` so the snapshotter wakes from its
-    //      `dirty.notified()` await and runs its final flush. State on
-    //      disk now reflects every committed event up to shutdown.
-    //   3. Await the snapshotter's JoinHandle (with a small timeout) so
-    //      we don't drop the runtime mid-write.
-    handle.await??;
+    //   1. Drain IPC and await direct Store/activity producers that received
+    //      the general shutdown signal.
+    //   2. Stop and drain the activity-transition subscriber so every final
+    //      Store transition is queued to the activity writer.
+    //   3. Stop and await history/activity writers. Their biased select drains
+    //      every queued message before observing this dedicated signal.
+    //   4. Flush the final state snapshot last.
+    let server_result = handle.await;
+    // The normal signal path already sent this broadcast. Re-sending is
+    // harmless and also stops the task graph when the IPC server exits on an
+    // internal error rather than SIGTERM/SIGINT.
+    let _ = shutdown_tx.send(());
+    await_shutdown_task("gc", Some(gc_handle)).await;
+    await_shutdown_task("reconciler", reconciler_handle).await;
+    await_shutdown_task("session activity", session_activity_handle).await;
+    await_shutdown_task("history compaction", history_compaction_handle).await;
+    await_shutdown_task("activity compaction", activity_compaction_handle).await;
+
+    let _ = activity_transition_shutdown_tx.send(());
+    await_shutdown_task("activity transition", activity_transition_handle).await;
+
+    let _ = writer_shutdown_tx.send(());
+    await_shutdown_task("history writer", history_writer_handle).await;
+    await_shutdown_task("activity writer", activity_writer_handle).await;
+
     let _ = snap_shutdown_tx.send(());
-    if let Some(h) = snap_handle {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
-    }
+    await_shutdown_task("state snapshotter", snap_handle).await;
+    server_result??;
     Ok(())
+}
+
+async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(mut handle) = handle else {
+        return;
+    };
+    let timeout = std::time::Duration::from_secs(SHUTDOWN_TASK_TIMEOUT_SECONDS);
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(task = name, %error, "shutdown task failed"),
+        Err(_) => {
+            tracing::warn!(
+                task = name,
+                timeout_secs = SHUTDOWN_TASK_TIMEOUT_SECONDS,
+                "shutdown task timed out; aborting",
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 /// Spawn the GC task: evicts long-stopped agents on a periodic timer.
 ///
 /// Listens to the shutdown broadcast so a clean SIGTERM tears it down
 /// rather than relying on the runtime falling out from under it.
-fn spawn_gc_task(store: &muxa::SharedStore, shutdown_tx: &broadcast::Sender<()>) {
+fn spawn_gc_task(
+    store: &muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
     let store = store.clone();
     let ttl = time::Duration::minutes(STOPPED_AGENT_TTL_MINUTES);
     let tick = std::time::Duration::from_secs(GC_SWEEP_INTERVAL_SECONDS);
@@ -327,7 +378,7 @@ fn spawn_gc_task(store: &muxa::SharedStore, shutdown_tx: &broadcast::Sender<()>)
                 }
             }
         }
-    });
+    })
 }
 
 fn install_shutdown_signal_handler(shutdown_tx: broadcast::Sender<()>) {
@@ -354,7 +405,10 @@ async fn build_history(
     cfg: &Config,
     shutdown_tx: &broadcast::Sender<()>,
     pane_session_cache: PaneSessionCache,
-) -> std::sync::Arc<PromptHistory> {
+) -> (
+    std::sync::Arc<PromptHistory>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
     let opts_template = HistoryOptions {
         path: cfg
             .history
@@ -369,33 +423,35 @@ async fn build_history(
 
     if !cfg.history.enabled {
         tracing::info!("history disabled by config (in-memory only)");
-        return PromptHistory::in_memory_only(HistoryOptions {
-            path: None,
-            ..opts_template
-        });
+        return (
+            PromptHistory::in_memory_only(HistoryOptions {
+                path: None,
+                ..opts_template
+            }),
+            None,
+        );
     }
 
     let Some(path) = opts_template.path.clone() else {
         tracing::warn!("history enabled but no path resolvable; falling back to in-memory only");
-        return PromptHistory::in_memory_only(HistoryOptions {
-            path: None,
-            ..opts_template
-        });
+        return (
+            PromptHistory::in_memory_only(HistoryOptions {
+                path: None,
+                ..opts_template
+            }),
+            None,
+        );
     };
 
     match PromptHistory::spawn(opts_template.clone(), shutdown_tx.subscribe()).await {
-        Ok((history, _writer_handle)) => {
-            // The writer task drains itself on shutdown via its own
-            // broadcast receiver, so we don't need to await the handle
-            // here — the IPC server's await_shutdown call is the join
-            // point for the daemon as a whole.
+        Ok((history, writer_handle)) => {
             tracing::info!(
                 path = %path.display(),
                 max_per_pane = cfg.history.max_per_pane,
                 max_age_days = cfg.history.max_age_days,
                 "prompt history enabled",
             );
-            history
+            (history, Some(writer_handle))
         }
         Err(e) => {
             tracing::warn!(
@@ -403,10 +459,13 @@ async fn build_history(
                 path = %path.display(),
                 "could not open history file; falling back to in-memory only",
             );
-            PromptHistory::in_memory_only(HistoryOptions {
-                path: None,
-                ..opts_template
-            })
+            (
+                PromptHistory::in_memory_only(HistoryOptions {
+                    path: None,
+                    ..opts_template
+                }),
+                None,
+            )
         }
     }
 }
@@ -419,10 +478,13 @@ async fn build_history(
 async fn build_activity_log(
     cfg: &Config,
     shutdown_tx: &broadcast::Sender<()>,
-) -> Option<std::sync::Arc<ActivityLog>> {
+) -> (
+    Option<std::sync::Arc<ActivityLog>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
     if !cfg.activity.enabled {
         tracing::info!("activity ledger disabled by config");
-        return None;
+        return (None, None);
     }
     let Some(path) = cfg
         .activity
@@ -431,18 +493,18 @@ async fn build_activity_log(
         .or_else(paths::default_activity_file)
     else {
         tracing::warn!("activity ledger enabled but no path resolvable");
-        return None;
+        return (None, None);
     };
 
     let opts = ActivityOptions::new(path.clone());
     match ActivityLog::spawn(opts, shutdown_tx.subscribe()).await {
-        Ok((activity_log, _writer_handle)) => {
+        Ok((activity_log, writer_handle)) => {
             tracing::info!(
                 path = %path.display(),
                 max_age_days = cfg.activity.max_age_days,
                 "activity ledger enabled",
             );
-            Some(activity_log)
+            (Some(activity_log), Some(writer_handle))
         }
         Err(e) => {
             tracing::warn!(
@@ -450,7 +512,7 @@ async fn build_activity_log(
                 path = %path.display(),
                 "could not open activity ledger; duration stats will be incomplete",
             );
-            None
+            (None, None)
         }
     }
 }
@@ -493,43 +555,26 @@ async fn spawn_activity_transition_task(
     activity_log: Option<std::sync::Arc<ActivityLog>>,
     pane_session_cache: PaneSessionCache,
     shutdown_tx: &broadcast::Sender<()>,
-) {
-    let Some(activity_log) = activity_log else {
-        return;
-    };
+) -> Option<tokio::task::JoinHandle<()>> {
+    let activity_log = activity_log?;
 
     let mut states = seed_activity_state_map(store.snapshot().await);
     let mut rx = store.subscribe();
     let store = store.clone();
     let mut shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 msg = rx.recv() => {
                     match msg {
                         Ok(transition) => {
-                            let agent = transition.agent.as_ref();
-                            let at = agent.state_entered_at;
-                            let prior_entered_at = states
-                                .get(&agent.session_id)
-                                .map(|(_, entered_at)| *entered_at)
-                                .or(Some(agent.started_at));
-                            let entry = StateTransitionEntry::new(StateTransitionInput {
-                                at,
-                                kind: agent.kind,
-                                session_id: agent.session_id.clone(),
-                                pane: agent.pane.clone(),
-                                session_name: agent
-                                    .pane
-                                    .as_deref()
-                                    .and_then(|pane| pane_session_cache.get(pane)),
-                                cwd: agent.cwd.clone(),
-                                from: transition.from,
-                                to: transition.to,
-                                state_entered_at: prior_entered_at,
-                            });
-                            activity_log.append(ActivityEntry::StateTransition(entry));
-                            states.insert(agent.session_id.clone(), (transition.to, at));
+                            record_activity_transition(
+                                &activity_log,
+                                &pane_session_cache,
+                                &mut states,
+                                transition,
+                            );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -542,12 +587,51 @@ async fn spawn_activity_transition_task(
                     }
                 }
                 _ = shutdown_rx.recv() => {
+                    while let Ok(transition) = rx.try_recv() {
+                        record_activity_transition(
+                            &activity_log,
+                            &pane_session_cache,
+                            &mut states,
+                            transition,
+                        );
+                    }
                     tracing::debug!("activity transition task shutting down");
                     break;
                 }
             }
         }
     });
+    Some(handle)
+}
+
+fn record_activity_transition(
+    activity_log: &ActivityLog,
+    pane_session_cache: &PaneSessionCache,
+    states: &mut HashMap<String, (muxa::AgentState, time::OffsetDateTime)>,
+    transition: muxa::state::Transition,
+) {
+    let agent = transition.agent.as_ref();
+    let at = agent.state_entered_at;
+    let prior_entered_at = states
+        .get(&agent.session_id)
+        .map(|(_, entered_at)| *entered_at)
+        .or(Some(agent.started_at));
+    let entry = StateTransitionEntry::new(StateTransitionInput {
+        at,
+        kind: agent.kind,
+        session_id: agent.session_id.clone(),
+        pane: agent.pane.clone(),
+        session_name: agent
+            .pane
+            .as_deref()
+            .and_then(|pane| pane_session_cache.get(pane)),
+        cwd: agent.cwd.clone(),
+        from: transition.from,
+        to: transition.to,
+        state_entered_at: prior_entered_at,
+    });
+    activity_log.append(ActivityEntry::StateTransition(entry));
+    states.insert(agent.session_id.clone(), (transition.to, at));
 }
 
 fn seed_activity_state_map(
@@ -568,14 +652,14 @@ fn spawn_history_compaction_task(
     cfg: &Config,
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.history.enabled {
-        return;
+        return None;
     }
     let history = store.history().clone();
     let interval_secs = cfg.history.compact_interval_secs;
     let mut shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the immediate first tick so the loop's cadence matches
@@ -601,23 +685,22 @@ fn spawn_history_compaction_task(
             }
         }
     });
+    Some(handle)
 }
 
 fn spawn_activity_compaction_task(
     cfg: &Config,
     activity_log: Option<std::sync::Arc<ActivityLog>>,
     shutdown_tx: &broadcast::Sender<()>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.activity.enabled {
-        return;
+        return None;
     }
-    let Some(activity_log) = activity_log else {
-        return;
-    };
+    let activity_log = activity_log?;
     let interval_secs = cfg.activity.compact_interval_secs;
     let max_age = time::Duration::days(i64::from(cfg.activity.max_age_days));
     let mut shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
@@ -640,6 +723,7 @@ fn spawn_activity_compaction_task(
             }
         }
     });
+    Some(handle)
 }
 
 /// Spawn the periodic reconciler: convergent control loop that uses tmux
@@ -651,10 +735,10 @@ fn spawn_reconciler_task(
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
     backend: muxa::SharedBackend,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.reconciler.enabled {
         tracing::info!("reconciler disabled by config");
-        return;
+        return None;
     }
     // The shared backend is what the rest of the daemon uses too —
     // everyone agreeing on one host means the reconciler reaps panes
@@ -686,7 +770,7 @@ fn spawn_reconciler_task(
     ))
     .with_codex_sessions_root(codex_sessions_root.clone());
     let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(runner.run(shutdown_rx));
+    let handle = tokio::spawn(runner.run(shutdown_rx));
     tracing::info!(
         interval_secs = cfg.reconciler.interval_secs,
         stuck_working_timeout_secs = cfg.reconciler.stuck_working_timeout_secs,
@@ -695,6 +779,7 @@ fn spawn_reconciler_task(
         codex_rollout_polling = codex_sessions_root.is_some(),
         "reconciler enabled",
     );
+    Some(handle)
 }
 
 /// Track cumulative tmux session attached time for `muxa watch --view session`.
@@ -702,10 +787,10 @@ fn spawn_session_activity_task(
     cfg: &Config,
     shutdown_tx: &broadcast::Sender<()>,
     activity_log: Option<std::sync::Arc<ActivityLog>>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.session_activity.enabled {
         tracing::info!("session activity tracking disabled by config");
-        return;
+        return None;
     }
     let Some(path) = cfg
         .session_activity
@@ -714,7 +799,7 @@ fn spawn_session_activity_task(
         .or_else(paths::default_session_activity_file)
     else {
         tracing::warn!("session activity tracking enabled but no path resolvable");
-        return;
+        return None;
     };
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),
@@ -722,12 +807,13 @@ fn spawn_session_activity_task(
     )
     .with_activity_log(activity_log);
     let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(tracker.run(shutdown_rx));
+    let handle = tokio::spawn(tracker.run(shutdown_rx));
     tracing::info!(
         path = %path.display(),
         interval_secs = cfg.session_activity.interval_secs,
         "session activity tracking enabled",
     );
+    Some(handle)
 }
 
 /// Spawn the snapshotter: writes the live agent registry to disk on

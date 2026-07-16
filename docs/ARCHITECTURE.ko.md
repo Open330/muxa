@@ -52,8 +52,10 @@ file도 함께 사용합니다.
 
 ## Shutdown
 
-`SIGTERM`/`SIGINT`는 broadcast shutdown을 발생시킵니다. IPC server는 새 연결을
-받지 않고, in-flight handler를 drain한 뒤 snapshotter가 final flush를 수행합니다.
+`SIGTERM`/`SIGINT`는 먼저 IPC server와 일반 background producer를 중단합니다.
+in-flight handler와 producer가 drain된 뒤 activity transition subscriber,
+prompt/activity writer, 마지막으로 `state.json` snapshot을 순서대로 flush합니다.
+따라서 종료 전 commit된 event가 ledger와 snapshot에서 서로 어긋나지 않습니다.
 
 ## Development
 

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::backend::{HostKind, PaneBackend};
+use crate::backend::{HostKind, PaneBackend, PaneObservation};
 use crate::tmux::{self, PaneInfo};
 
 /// Production tmux backend. Stateless — every method shells out fresh
@@ -43,6 +43,10 @@ impl PaneBackend for TmuxBackend {
         // server, command exit non-zero) are exactly the ones callers
         // already treated as "host is down, retry next tick."
         tmux::list_panes().unwrap_or_default()
+    }
+
+    fn observe_panes(&self) -> PaneObservation {
+        tmux::observe_panes()
     }
 
     fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {

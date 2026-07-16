@@ -53,9 +53,11 @@ Paths are configurable; defaults live under `$XDG_DATA_HOME/muxa`.
 
 ## Shutdown
 
-`SIGTERM`/`SIGINT` trigger a broadcast shutdown. The IPC server stops
-accepting connections, drains in-flight handlers, then the snapshotter runs
-one final flush so state does not lag behind committed events.
+`SIGTERM`/`SIGINT` stop the IPC server and general background producers first.
+After in-flight handlers and producers drain, muxad drains the activity
+transition subscriber, then the prompt/activity writers, and finally flushes
+`state.json`. This ordering keeps the ledgers and snapshot aligned with every
+event committed before shutdown.
 
 ## Development
 

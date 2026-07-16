@@ -35,10 +35,12 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, warn};
 
 use crate::adapters::codex_rollout;
+use crate::backend::PaneObservation;
 use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, RateLimitScope, RateLimitSource};
 use crate::metrics::Metrics;
 use crate::process_tree;
 use crate::state::{ReconcileReport, SharedStore};
+#[cfg(test)]
 use crate::tmux::PaneInfo;
 
 /// How many days back from "now" to scan codex's date-partitioned sessions
@@ -67,8 +69,10 @@ struct CodexPollTarget {
 /// Source of truth for which panes are currently alive.
 ///
 /// Implementors return a snapshot of every pane the system considers live
-/// at the moment of the call. `Send + Sync + 'static` so the reconciler can
-/// own one inside a long-lived spawned task; `list_panes` is sync-blocking
+/// at the moment of the call, including whether that snapshot is complete
+/// enough to use as negative liveness evidence. `Send + Sync + 'static` so
+/// the reconciler can own one inside a long-lived spawned task;
+/// `observe_panes` is sync-blocking
 /// because the production impl shells out to `tmux` and the reconciler
 /// wraps the call in `spawn_blocking` itself.
 ///
@@ -79,15 +83,15 @@ struct CodexPollTarget {
 /// `LivenessSource` directly (lightweight) or implement `PaneBackend`
 /// and inherit the blanket impl (more realistic).
 pub trait LivenessSource: Send + Sync + 'static {
-    fn list_panes(&self) -> Vec<PaneInfo>;
+    fn observe_panes(&self) -> PaneObservation;
 }
 
 /// Every pane backend is a liveness source. Saves every backend impl
 /// from repeating a one-line delegation, and keeps the reconciler
 /// integration colocated with the trait whose contract it leans on.
 impl<B: crate::backend::PaneBackend> LivenessSource for B {
-    fn list_panes(&self) -> Vec<PaneInfo> {
-        crate::backend::PaneBackend::list_panes(self)
+    fn observe_panes(&self) -> PaneObservation {
+        crate::backend::PaneBackend::observe_panes(self)
     }
 }
 
@@ -328,25 +332,36 @@ impl<L: LivenessSource> Reconciler<L> {
     #[allow(clippy::too_many_lines)]
     pub async fn reconcile_once(&self) -> ReconcileReport {
         let started = Instant::now();
-        // `list_panes` shells out to tmux and must not block the runtime.
+        // Pane observation shells out to tmux and must not block the runtime.
         let src = self.source.clone();
         let list_started = Instant::now();
-        let panes = tokio::task::spawn_blocking(move || src.list_panes())
+        let observation = tokio::task::spawn_blocking(move || src.observe_panes())
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| PaneObservation::incomplete(Vec::new()));
         let list_panes_us = u64::try_from(list_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let panes_for_workload = panes.clone();
+        let pane_observation_complete = observation.is_complete();
+        let panes_for_workload = observation.panes.clone();
         let workload_started = Instant::now();
-        let workloads = tokio::task::spawn_blocking(move || {
-            process_tree::scan_pane_workloads(&panes_for_workload)
-        })
-        .await
-        .unwrap_or_default();
+        let workloads = if pane_observation_complete {
+            tokio::task::spawn_blocking(move || {
+                process_tree::scan_pane_workloads(&panes_for_workload)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            // Updating from a partial set would clear workload metadata for
+            // panes whose server failed observation.
+            std::collections::HashMap::new()
+        };
         let workload_scan_us =
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let reconcile_started = Instant::now();
-        let report = self.store.reconcile(&panes).await;
-        let workload_changed = self.store.update_workloads(&workloads).await;
+        let report = self.store.reconcile_observation(&observation).await;
+        let workload_changed = if pane_observation_complete {
+            self.store.update_workloads(&workloads).await
+        } else {
+            0
+        };
         let store_update_us =
             u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let stuck_w = self
@@ -418,7 +433,8 @@ impl<L: LivenessSource> Reconciler<L> {
                 list_panes_us,
                 workload_scan_us,
                 store_update_us,
-                panes = panes.len(),
+                panes = observation.panes.len(),
+                pane_observation_complete,
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
@@ -433,7 +449,8 @@ impl<L: LivenessSource> Reconciler<L> {
                 list_panes_us,
                 workload_scan_us,
                 store_update_us,
-                panes = panes.len(),
+                panes = observation.panes.len(),
+                pane_observation_complete,
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
@@ -501,23 +518,28 @@ mod tests {
     /// without touching tmux. Wrapped in a `Mutex` so callers can mutate
     /// the live set between reconciliation passes.
     struct FakeLiveness {
-        panes: Mutex<Vec<PaneInfo>>,
+        observation: Mutex<PaneObservation>,
     }
 
     impl FakeLiveness {
         fn new(panes: Vec<PaneInfo>) -> Self {
             Self {
-                panes: Mutex::new(panes),
+                observation: Mutex::new(PaneObservation::complete(panes)),
+            }
+        }
+        fn incomplete(panes: Vec<PaneInfo>) -> Self {
+            Self {
+                observation: Mutex::new(PaneObservation::incomplete(panes)),
             }
         }
         fn set(&self, panes: Vec<PaneInfo>) {
-            *self.panes.lock().unwrap() = panes;
+            *self.observation.lock().unwrap() = PaneObservation::complete(panes);
         }
     }
 
     impl LivenessSource for FakeLiveness {
-        fn list_panes(&self) -> Vec<PaneInfo> {
-            self.panes.lock().unwrap().clone()
+        fn observe_panes(&self) -> PaneObservation {
+            self.observation.lock().unwrap().clone()
         }
     }
 
@@ -528,8 +550,8 @@ mod tests {
     struct ArcLiveness(Arc<FakeLiveness>);
 
     impl LivenessSource for ArcLiveness {
-        fn list_panes(&self) -> Vec<PaneInfo> {
-            self.0.list_panes()
+        fn observe_panes(&self) -> PaneObservation {
+            self.0.observe_panes()
         }
     }
 
@@ -577,6 +599,119 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].session_id, "a");
+    }
+
+    #[tokio::test]
+    async fn incomplete_full_failure_preserves_pane_rows_but_runs_safe_sweeps() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("live", "%1", t0)).await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "live".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                prompt: "work".into(),
+                at: t0,
+            })
+            .await;
+
+        let source = FakeLiveness::incomplete(Vec::new());
+        let r = Reconciler::new(store.clone(), source, Duration::from_millis(10))
+            .with_stuck_working_timeout(Duration::from_secs(1));
+        let report = r.reconcile_once().await;
+
+        assert!(
+            report.is_noop(),
+            "failed observation must not remove the row"
+        );
+        let agent = store.by_session("live").await.expect("pane row preserved");
+        assert_eq!(
+            agent.state,
+            AgentState::Idle,
+            "pane-independent stuck-state maintenance should still run",
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_partial_multi_socket_observation_is_not_authoritative() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:01:00 UTC);
+
+        // Two historical rows on default exercise dedup; the amux row has
+        // the same pane id but is absent from this partial observation and
+        // therefore must not be reaped.
+        store.apply(&started("default-old", "%1", t0)).await;
+        store.apply(&started("default-new", "%1", t1)).await;
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "amux".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("/tmp/tmux-501/amux".into()),
+                    cwd: None,
+                },
+                at: t1,
+            })
+            .await;
+
+        // A synthetic codex pane plus a cwd-matching paneless real row would
+        // normally be adopted and deduplicated by a complete pass.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "synthetic-7:default:%7".into(),
+                    surface: None,
+                    pane: Some("%7".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "real-codex".into(),
+                    surface: None,
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: Some("/work".into()),
+                },
+                at: t1,
+            })
+            .await;
+
+        let mut default = pane("%1");
+        default.socket = Some("default".into());
+        let mut codex = pane("%7");
+        codex.socket = Some("default".into());
+        codex.current_path = "/work".into();
+        let source = FakeLiveness::incomplete(vec![default, codex]);
+        let r = Reconciler::new(store.clone(), source, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert!(report.is_noop());
+        assert_eq!(store.snapshot().await.len(), 5);
+        assert!(store.by_session("amux").await.is_some());
+        assert!(store.by_session("synthetic-7:default:%7").await.is_some());
+        assert!(
+            store
+                .by_session("real-codex")
+                .await
+                .is_some_and(|agent| agent.pane.is_none()),
+            "partial pane data must not drive cwd adoption",
+        );
     }
 
     #[tokio::test]

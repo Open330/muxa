@@ -178,12 +178,14 @@
 # read-only web UI + JSON/SSE API alongside its unix-socket IPC.
 #
 # Security model:
-#   - Bound to 127.0.0.1 by default; non-loopback `bind` is rejected
-#     unless `allow_public = true` AND `token` is non-empty. There is no
-#     opt-out for that pair.
+#   - Token auth is the default. When the dashboard is enabled, set an
+#     explicit `token` or explicitly opt out with `auth = "none"`.
+#   - Bound to 127.0.0.1 by default; non-loopback `bind` also requires
+#     `allow_public = true`.
 #   - Static HTML/CSS/JS load without auth so a browser can bootstrap
-#     a token via `?token=...` (which is then stored in sessionStorage
+#     a token via `#token=...` (which is then stored in localStorage
 #     and stripped from the URL bar). All `/api/*` routes are gated.
+#     Legacy `?token=...` parsing remains for compatibility only.
 #   - TLS is intentionally out of scope — front with nginx/Caddy if you
 #     expose this beyond your machine.
 #
@@ -191,11 +193,13 @@
 # CLI flags / env vars override these values per-field:
 #   --dashboard / --no-dashboard
 #   --dashboard-bind   / MUXA_DASHBOARD_BIND
+#   --dashboard-auth   / MUXA_DASHBOARD_AUTH
 #   --dashboard-token  / MUXA_DASHBOARD_TOKEN
 #   --allow-public     / MUXA_DASHBOARD_ALLOW_PUBLIC
 [dashboard]
 # enabled       = true
 # bind          = "127.0.0.1:7878"
+# auth          = "token" # or "none" to explicitly disable authentication
 # token         = "<paste 32+ random hex bytes here>"
 # allow_public  = false
 # pane_cache_ttl_ms = 2000

@@ -60,6 +60,46 @@ use std::sync::Arc;
 
 use crate::tmux::PaneInfo;
 
+/// Whether a pane observation is authoritative enough for destructive use.
+///
+/// A snapshot can still carry useful panes when it is [`Incomplete`](Self::Incomplete)
+/// (for example, one tmux server answered while another timed out). Callers
+/// may use those rows for best-effort enrichment, but absence from that
+/// snapshot is not evidence that a pane died.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationCompleteness {
+    Complete,
+    Incomplete,
+}
+
+/// Pane rows observed in one backend scan, plus whether the scan covered the
+/// backend's full pane namespace.
+#[derive(Debug, Clone)]
+pub struct PaneObservation {
+    pub panes: Vec<PaneInfo>,
+    pub completeness: ObservationCompleteness,
+}
+
+impl PaneObservation {
+    pub fn complete(panes: Vec<PaneInfo>) -> Self {
+        Self {
+            panes,
+            completeness: ObservationCompleteness::Complete,
+        }
+    }
+
+    pub fn incomplete(panes: Vec<PaneInfo>) -> Self {
+        Self {
+            panes,
+            completeness: ObservationCompleteness::Incomplete,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.completeness == ObservationCompleteness::Complete
+    }
+}
+
 /// Shared, multi-thread-safe handle to a pane backend.
 ///
 /// The daemon constructs one of these at startup based on
@@ -155,12 +195,11 @@ impl Default for BackendCaps {
 
 /// Operations the daemon and CLI perform against the pane host.
 ///
-/// All methods are best-effort: a transient failure (no tmux server, the
-/// pane just closed, the env got truncated) returns an empty result
-/// rather than an error so callers — which run on hot paths like the
-/// reconciler tick or the watch refresh loop — never have to fan
-/// non-fatal errors back up the stack. The reconciler is idempotent and
-/// will reconverge on the next tick.
+/// Operational methods are best-effort: a transient failure (no tmux server,
+/// the pane just closed, the env got truncated) returns an empty result rather
+/// than an error. [`Self::observe_panes`] is the exception needed by liveness
+/// callers: it still returns any useful rows, but also says whether absence is
+/// authoritative enough for destructive reconciliation.
 ///
 /// Implementors must be `Send + Sync + 'static` because the daemon
 /// stashes them on background tasks that own their own runtimes.
@@ -169,7 +208,21 @@ pub trait PaneBackend: Send + Sync + 'static {
     fn kind(&self) -> HostKind;
 
     /// Snapshot of every pane the host considers alive right now.
+    ///
+    /// This remains best-effort for non-destructive consumers such as
+    /// discovery and previews. Reconciliation must use [`Self::observe_panes`]
+    /// so it can distinguish an empty host from a failed observation.
     fn list_panes(&self) -> Vec<PaneInfo>;
+
+    /// Pane snapshot with an explicit completeness signal for callers that
+    /// treat missing rows as liveness evidence.
+    ///
+    /// Backends whose `list_panes` cannot be partial may use this default.
+    /// Multi-source or cache-backed implementations override it to report
+    /// transient gaps without taking best-effort rows away from other callers.
+    fn observe_panes(&self) -> PaneObservation {
+        PaneObservation::complete(self.list_panes())
+    }
 
     /// Look up a single pane by id. Returns `None` for unknown ids and
     /// for hosts that can't answer the query (rare).
@@ -238,6 +291,9 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn list_panes(&self) -> Vec<PaneInfo> {
         (**self).list_panes()
+    }
+    fn observe_panes(&self) -> PaneObservation {
+        (**self).observe_panes()
     }
     fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
         (**self).resolve_pane(pane_id)

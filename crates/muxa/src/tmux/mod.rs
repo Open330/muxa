@@ -14,6 +14,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::backend::{ObservationCompleteness, PaneObservation};
+
 /// Bound every synchronous tmux shell-out used by watch/status paths.
 ///
 /// The async dashboard scanner already has a per-socket timeout. These
@@ -218,6 +220,7 @@ pub(crate) const CLIENT_FMT: &str =
 /// caller only sees well-formed rows. The `pane_pid` column was added in
 /// 0.5.x; rows from older `PANE_FMT` outputs (or other backends that
 /// don't emit it) get `pane_pid = 0`.
+#[cfg(test)]
 pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
     parse_pane_lines_for_socket(stdout, None)
 }
@@ -246,6 +249,23 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
         });
     }
     panes
+}
+
+/// Parse pane output while retaining whether every non-empty row had the
+/// minimum shape required by [`PANE_FMT`]. The ordinary parser intentionally
+/// stays best-effort; reconciliation uses this stricter signal so a locale- or
+/// version-mangled response cannot masquerade as an authoritative empty set.
+fn observe_pane_lines_for_socket(stdout: &str, socket: Option<&str>) -> PaneObservation {
+    let complete = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .all(|line| line.split('\t').count() >= 7);
+    let panes = parse_pane_lines_for_socket(stdout, socket);
+    if complete {
+        PaneObservation::complete(panes)
+    } else {
+        PaneObservation::incomplete(panes)
+    }
 }
 
 pub(crate) fn parse_session_lines(stdout: &str) -> Vec<SessionInfo> {
@@ -284,7 +304,37 @@ pub(crate) fn parse_client_lines(stdout: &str) -> Vec<ClientInfo> {
     clients
 }
 
-pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
+struct PaneScan {
+    observation: PaneObservation,
+    last_error: Option<TmuxError>,
+}
+
+impl PaneScan {
+    fn empty() -> Self {
+        Self {
+            observation: PaneObservation::complete(Vec::new()),
+            last_error: None,
+        }
+    }
+
+    fn add_observation(&mut self, observation: PaneObservation) {
+        if !observation.is_complete() {
+            self.observation.completeness = ObservationCompleteness::Incomplete;
+        }
+        self.observation.panes.extend(observation.panes);
+    }
+
+    fn add_failure(&mut self, error: TmuxError) {
+        self.observation.completeness = ObservationCompleteness::Incomplete;
+        self.last_error = Some(error);
+    }
+}
+
+fn is_stale_socket_error(stderr: &str) -> bool {
+    stderr.starts_with("no server running on")
+}
+
+fn scan_panes() -> PaneScan {
     // Under `launchd` (gui-domain user agent) tmux's default socket
     // lookup resolves to a different temp dir than the user's
     // interactive shell, so a bare `tmux list-panes -a` finds no server
@@ -294,51 +344,110 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
     // enumerable socket exists (e.g. CI sandboxes).
     let sockets = scanner::enumerate_sockets();
     if sockets.is_empty() {
-        return list_panes_bare();
+        return scan_panes_bare();
     }
-    let mut all: Vec<PaneInfo> = Vec::new();
-    let mut last_err: Option<TmuxError> = None;
+    let mut scan = PaneScan::empty();
     for sock in &sockets {
         let Some(sock_str) = sock.to_str() else {
+            scan.add_failure(TmuxError::BadOutput("non-UTF-8 tmux socket path".into()));
             continue;
         };
         match tmux_output(&["-S", sock_str, "list-panes", "-a", "-F", PANE_FMT]) {
             Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
                 let socket = socket_short_name(sock_str);
-                all.extend(parse_pane_lines_for_socket(&stdout, Some(&socket)));
+                match String::from_utf8(o.stdout) {
+                    Ok(stdout) => {
+                        let observed = observe_pane_lines_for_socket(&stdout, Some(&socket));
+                        if !observed.is_complete() {
+                            scan.add_failure(TmuxError::BadOutput(format!(
+                                "malformed list-panes output from socket {socket}",
+                            )));
+                        }
+                        scan.add_observation(observed);
+                    }
+                    Err(error) => {
+                        scan.add_failure(TmuxError::BadOutput(error.to_string()));
+                    }
+                }
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
                 // "no server running" is the steady-state for stale socket
                 // files left behind by crashed servers; treat as empty
                 // rather than a hard error.
-                if !stderr.starts_with("no server running on") {
-                    last_err = Some(TmuxError::NonZero(stderr));
+                if !is_stale_socket_error(&stderr) {
+                    scan.add_failure(TmuxError::NonZero(stderr));
                 }
             }
             Err(e) => {
-                last_err = Some(e);
+                scan.add_failure(e);
             }
         }
     }
-    if all.is_empty() {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
-    }
-    Ok(all)
+    scan
 }
 
-fn list_panes_bare() -> Result<Vec<PaneInfo>, TmuxError> {
-    let out = tmux_output(&["list-panes", "-a", "-F", PANE_FMT])?;
-    if !out.status.success() {
-        return Err(TmuxError::NonZero(
-            String::from_utf8_lossy(&out.stderr).into(),
-        ));
+/// Observe all tmux servers with an explicit indication of whether every
+/// enumerable server was read successfully. Stale socket files reporting
+/// "no server running" count as successful empty sources; hard failures on
+/// any socket make the aggregate incomplete even when other sockets yielded
+/// useful panes.
+pub fn observe_panes() -> PaneObservation {
+    scan_panes().observation
+}
+
+/// Best-effort pane listing retained for discovery, previews, and legacy
+/// callers. Partial multi-socket scans return their successful rows. A scan
+/// with no rows and at least one hard failure retains the historical `Err`.
+pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
+    let PaneScan {
+        observation,
+        last_error,
+    } = scan_panes();
+    if observation.panes.is_empty() {
+        if let Some(error) = last_error {
+            return Err(error);
+        }
     }
-    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
-    Ok(parse_pane_lines(&stdout))
+    Ok(observation.panes)
+}
+
+fn scan_panes_bare() -> PaneScan {
+    let out = match tmux_output(&["list-panes", "-a", "-F", PANE_FMT]) {
+        Ok(out) => out,
+        Err(error) => {
+            return PaneScan {
+                observation: PaneObservation::incomplete(Vec::new()),
+                last_error: Some(error),
+            };
+        }
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if is_stale_socket_error(&stderr) {
+            return PaneScan::empty();
+        }
+        return PaneScan {
+            observation: PaneObservation::incomplete(Vec::new()),
+            last_error: Some(TmuxError::NonZero(stderr)),
+        };
+    }
+    let stdout = match String::from_utf8(out.stdout) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            return PaneScan {
+                observation: PaneObservation::incomplete(Vec::new()),
+                last_error: Some(TmuxError::BadOutput(error.to_string())),
+            };
+        }
+    };
+    let observation = observe_pane_lines_for_socket(&stdout, None);
+    let last_error = (!observation.is_complete())
+        .then(|| TmuxError::BadOutput("malformed list-panes output".into()));
+    PaneScan {
+        observation,
+        last_error,
+    }
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>, TmuxError> {
@@ -546,6 +655,49 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].pane_id, "%10");
         assert_eq!(panes[0].current_command, "claude");
+    }
+
+    #[test]
+    fn pane_observation_retains_valid_rows_but_marks_malformed_mix_incomplete() {
+        let stdout = "%10\tmain\t0\t0\t/dev/pts/0\tclaude\tclaude session\n\
+                      locale_mangled_row_without_tabs\n";
+        let observed = observe_pane_lines_for_socket(stdout, Some("default"));
+
+        assert_eq!(observed.panes.len(), 1);
+        assert_eq!(observed.panes[0].socket.as_deref(), Some("default"));
+        assert!(!observed.is_complete());
+    }
+
+    #[test]
+    fn multi_socket_scan_retains_partial_rows_and_marks_hard_failure_incomplete() {
+        let mut scan = PaneScan::empty();
+        scan.add_observation(observe_pane_lines_for_socket(
+            "%10\tmain\t0\t0\t/dev/pts/0\tclaude\tclaude session\n",
+            Some("default"),
+        ));
+        scan.add_failure(TmuxError::Timeout {
+            command: "tmux -S amux list-panes".into(),
+            timeout: Duration::from_secs(1),
+        });
+
+        assert_eq!(scan.observation.panes.len(), 1);
+        assert!(!scan.observation.is_complete());
+        assert!(scan.last_error.is_some());
+    }
+
+    #[test]
+    fn stale_socket_empty_result_keeps_scan_complete() {
+        // The production stale-socket branch deliberately adds neither an
+        // observation nor a failure. Starting from an empty aggregate thus
+        // represents its authoritative empty-success result.
+        assert!(is_stale_socket_error(
+            "no server running on /tmp/tmux-501/stale",
+        ));
+        assert!(!is_stale_socket_error("permission denied"));
+        let scan = PaneScan::empty();
+        assert!(scan.observation.panes.is_empty());
+        assert!(scan.observation.is_complete());
+        assert!(scan.last_error.is_none());
     }
 
     #[test]

@@ -20,14 +20,12 @@
 //! binary itself, and the planner/dry-run path is the same shape as
 //! `muxa init` so users get a consistent UX between the two.
 //!
-//! **Why we require running from the source repo**: the v0.5.x line
-//! is distributed as a clone-and-`cargo install` flow (no homebrew
-//! tap, no prebuilt binaries yet). Until that changes, the only
-//! upgrade path that works is the one users already use by hand —
-//! and detecting "am I in the muxa source repo" is far less ambiguous
-//! than auto-detecting "did they install via cargo / brew / aur /
-//! source". When a managed install path exists we'll add adapters
-//! here.
+//! **Why we require running from the source repo**: this command is the
+//! source-checkout updater. Release archives already exist, but muxa does
+//! not yet have a managed self-update channel that can safely identify and
+//! atomically replace every installation style. Keeping this path explicit
+//! avoids guessing whether a binary came from cargo, an archive, or a future
+//! package manager.
 
 use crate::init::util::wait_for_muxad;
 use anyhow::{anyhow, Context, Result};
@@ -107,17 +105,26 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let _ = cliclack::log::step("building muxa-cli");
     cargo_install(&repo, "crates/muxa-cli").context("cargo install muxa-cli")?;
 
-    if plan.do_restart {
+    let restart_completed = if plan.do_restart {
         let _ = cliclack::log::step("restarting daemon");
-        restart_daemon();
+        match restart_daemon() {
+            RestartOutcome::Restarted => true,
+            RestartOutcome::ManualRequired(reason) => {
+                let _ = cliclack::log::warning(format!(
+                    "{reason}; restart muxad manually to load the upgraded daemon"
+                ));
+                false
+            }
+        }
     } else {
         let _ = cliclack::log::info("daemon restart skipped (--no-restart)");
-    }
+        false
+    };
 
-    // Verification only makes sense if we actually asked the daemon
-    // to come back up. With --no-restart the user owns the lifecycle,
-    // so we'd be reporting on a stale process.
-    if plan.do_restart {
+    // Verification only makes sense after a service manager reported
+    // a successful restart. Otherwise we'd be reporting on a stale
+    // process that the user still needs to restart manually.
+    if restart_completed {
         let _ = cliclack::log::step("verifying");
         if wait_for_muxad(&socket, Duration::from_secs(3)) {
             let _ = cliclack::log::success(format!("muxad responsive on {}", socket.display()));
@@ -130,9 +137,15 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     }
 
     let head = current_head(&repo).unwrap_or_else(|| "HEAD".into());
-    let _ = cliclack::outro(format!(
-        "Upgraded to {head} — try `muxa doctor` for a health check."
-    ));
+    if plan.do_restart && !restart_completed {
+        let _ = cliclack::outro(format!(
+            "Upgraded to {head} — manual muxad restart required."
+        ));
+    } else {
+        let _ = cliclack::outro(format!(
+            "Upgraded to {head} — try `muxa doctor` for a health check."
+        ));
+    }
     Ok(())
 }
 
@@ -146,6 +159,10 @@ struct Plan {
 }
 
 fn render_plan(plan: &Plan) -> String {
+    render_plan_for_os(plan, std::env::consts::OS)
+}
+
+fn render_plan_for_os(plan: &Plan, os: &str) -> String {
     let mut lines = Vec::new();
     lines.push(format!("repo: {}", plan.repo.display()));
     if plan.do_pull {
@@ -156,11 +173,13 @@ fn render_plan(plan: &Plan) -> String {
     lines.push("cargo install --path crates/muxad --locked --force".into());
     lines.push("cargo install --path crates/muxa-cli --locked --force".into());
     if plan.do_restart {
-        let cmd = restart_command_args(std::env::consts::OS).join(" ");
+        let cmd = restart_command_args(os).join(" ");
         if cmd.is_empty() {
-            lines.push("restart muxad (no service manager — best-effort pkill+spawn)".into());
+            lines.push("restart: manual restart required (no supported service manager)".into());
         } else {
-            lines.push(format!("restart: {cmd}"));
+            lines.push(format!(
+                "restart: {cmd} (manual restart required if unavailable or unsuccessful)"
+            ));
         }
     } else {
         lines.push("restart (skipped)".into());
@@ -169,9 +188,9 @@ fn render_plan(plan: &Plan) -> String {
 }
 
 /// Walk upward from `start` until we find a `Cargo.toml` whose
-/// workspace members include `crates/muxa-cli`, or whose `[package]`
-/// name is `muxa-cli`. That's our marker for "this is the muxa
-/// source tree".
+/// workspace members include the muxa crates. That's our marker for
+/// "this is the muxa source tree". Member-crate manifests are not
+/// accepted because installs are resolved relative to the workspace.
 ///
 /// Returns the directory containing that `Cargo.toml` so the caller
 /// can pass it to `git -C` / `cargo install --path`.
@@ -179,7 +198,7 @@ pub(crate) fn find_repo_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start.to_path_buf());
     while let Some(dir) = cur {
         let manifest = dir.join("Cargo.toml");
-        if manifest.is_file() && is_muxa_manifest(&manifest) {
+        if manifest.is_file() && is_muxa_workspace_manifest(&manifest) {
             return Some(dir);
         }
         cur = dir.parent().map(Path::to_path_buf);
@@ -187,23 +206,16 @@ pub(crate) fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// True iff `manifest` looks like the muxa workspace or muxa-cli
-/// crate manifest. We deliberately *don't* parse TOML — a substring
-/// match is good enough for a shape-check, faster, and keeps us off
-/// the toml dep graph for one read.
-fn is_muxa_manifest(manifest: &Path) -> bool {
+/// True iff `manifest` looks like the muxa workspace. We deliberately
+/// *don't* parse TOML — a substring match is good enough for a
+/// shape-check, faster, and keeps us off the toml dep graph for one
+/// read.
+fn is_muxa_workspace_manifest(manifest: &Path) -> bool {
     let Ok(s) = std::fs::read_to_string(manifest) else {
         return false;
     };
     // Workspace root: `members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]`
-    if s.contains("crates/muxa-cli") && s.contains("crates/muxad") {
-        return true;
-    }
-    // Single-crate manifest: `name = "muxa-cli"` or `name = "muxa"`.
-    s.lines().any(|l| {
-        let l = l.trim();
-        l == r#"name = "muxa-cli""# || l == r#"name = "muxa""#
-    })
+    s.contains("[workspace]") && s.contains("crates/muxa-cli") && s.contains("crates/muxad")
 }
 
 /// `cargo install --path <rel> --locked --force`, streaming output
@@ -238,8 +250,8 @@ fn run_streaming(cmd: &mut Command) -> Result<()> {
 
 /// Build the per-OS daemon-restart command. Returns `Vec<String>`
 /// (not a `Command`) so tests can inspect the planned invocation
-/// without spawning anything. Empty vec means "no first-class
-/// service manager on this OS — fall back to pkill/spawn".
+/// without spawning anything. Empty vec means there is no supported
+/// service manager on this OS and a manual restart is required.
 pub(crate) fn restart_command_args(os: &str) -> Vec<String> {
     match os {
         "macos" => {
@@ -280,39 +292,31 @@ fn uid_string() -> String {
         .map_or_else(|| "501".into(), |s| s.trim().to_string())
 }
 
-/// Try, in order: the OS-native service manager, then a SIGUSR1
-/// reload, then a hard kill+respawn. We don't error out on failure
-/// here — the verify step polls the IPC socket and surfaces a
-/// warning if nothing came back up, which is more actionable than
-/// a stack of "exited with N" lines.
-fn restart_daemon() {
+enum RestartOutcome {
+    Restarted,
+    ManualRequired(String),
+}
+
+/// Restart through the OS-native service manager. If the manager is
+/// unavailable or unsuccessful, leave all muxad processes untouched
+/// and tell the caller that a manual restart is required.
+fn restart_daemon() -> RestartOutcome {
     let args = restart_command_args(std::env::consts::OS);
-    if !args.is_empty() {
-        let mut iter = args.iter();
-        let prog = iter.next().expect("non-empty args");
-        let rest: Vec<&String> = iter.collect();
-        // `launchctl` may not exist on macOS-without-launchd hosts
-        // (rare — but `cargo` on FreeBSD-emulating-macos style
-        // setups). Skip silently and let the fallback kick in.
-        if which::which(prog).is_ok() {
-            let status = Command::new(prog).args(&rest).status();
-            if matches!(status, Ok(s) if s.success()) {
-                return;
-            }
-        }
+    let Some((prog, rest)) = args.split_first() else {
+        return RestartOutcome::ManualRequired(
+            "no supported service manager for this operating system".into(),
+        );
+    };
+
+    if which::which(prog).is_err() {
+        return RestartOutcome::ManualRequired(format!("`{prog}` is not available"));
     }
 
-    // Fallback: SIGUSR1 is muxad's reload signal in some builds; if
-    // not handled, treat it as informational and fall through to the
-    // hard restart. We deliberately use `sh -c` so the `||` chain
-    // works as a single shell command.
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(
-            "pkill -USR1 muxad 2>/dev/null \
-             || (pkill muxad 2>/dev/null; nohup muxad > /tmp/muxad.log 2>&1 & disown 2>/dev/null || true)",
-        )
-        .status();
+    match Command::new(prog).args(rest).status() {
+        Ok(status) if status.success() => RestartOutcome::Restarted,
+        Ok(status) => RestartOutcome::ManualRequired(format!("`{prog}` exited with {status}")),
+        Err(error) => RestartOutcome::ManualRequired(format!("could not run `{prog}`: {error}")),
+    }
 }
 
 /// Short SHA of HEAD in `repo`. None when `git` is missing or the
@@ -369,22 +373,39 @@ members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]
     }
 
     #[test]
-    fn find_repo_root_locates_single_crate_manifest() {
+    fn find_repo_root_skips_member_crate_manifests() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::write(
             root.join("Cargo.toml"),
-            r#"[package]
-name = "muxa-cli"
-version = "0.1.0"
+            r#"[workspace]
+members = ["crates/muxa", "crates/muxa-cli", "crates/muxad"]
 "#,
         )
         .unwrap();
-        let found = find_repo_root(root).expect("should find crate root");
-        assert_eq!(
-            fs::canonicalize(&found).unwrap(),
-            fs::canonicalize(root).unwrap()
-        );
+
+        for crate_name in ["muxa-cli", "muxa"] {
+            let crate_root = root.join("crates").join(crate_name);
+            let nested = crate_root.join("src");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(
+                crate_root.join("Cargo.toml"),
+                format!(
+                    r#"[package]
+name = "{crate_name}"
+version = "0.1.0"
+"#
+                ),
+            )
+            .unwrap();
+
+            let found = find_repo_root(&nested).expect("should find workspace root");
+            assert_eq!(
+                fs::canonicalize(&found).unwrap(),
+                fs::canonicalize(root).unwrap(),
+                "started inside {crate_name}"
+            );
+        }
     }
 
     #[test]
@@ -427,7 +448,23 @@ version = "0.1.0"
         // The walk may still match a parent dir's manifest (the
         // real muxa checkout in CI). What matters is that this
         // specific manifest is rejected.
-        assert!(!is_muxa_manifest(&root.join("Cargo.toml")));
+        assert!(!is_muxa_workspace_manifest(&root.join("Cargo.toml")));
+    }
+
+    #[test]
+    fn find_repo_root_rejects_member_manifest_without_workspace() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "muxa-cli"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        assert!(!is_muxa_workspace_manifest(&manifest));
     }
 
     #[test]
@@ -455,9 +492,8 @@ version = "0.1.0"
 
     #[test]
     fn restart_command_for_unknown_os_is_empty() {
-        // Empty signals "fall back to pkill+spawn" to the live
-        // path. Tested so a future OS rename doesn't silently
-        // start emitting a wrong command.
+        // Empty signals that a manual restart is required. Tested so
+        // a future OS rename doesn't silently emit a wrong command.
         assert!(restart_command_args("plan9").is_empty());
     }
 
@@ -473,9 +509,23 @@ version = "0.1.0"
         assert!(s.contains("git pull"));
         assert!(s.contains("cargo install --path crates/muxad --locked --force"));
         assert!(s.contains("cargo install --path crates/muxa-cli --locked --force"));
-        // Restart line varies by OS — just assert *something*
-        // restart-shaped is in there.
-        assert!(s.contains("restart") || s.contains("muxad"));
+        assert!(s.contains("manual restart required"));
+        assert!(!s.contains("pkill"));
+        assert!(!s.contains("SIGUSR1"));
+    }
+
+    #[test]
+    fn dry_run_requires_manual_restart_without_service_manager() {
+        let plan = Plan {
+            repo: PathBuf::from("/tmp/fake-muxa"),
+            do_pull: true,
+            do_restart: true,
+        };
+        let s = render_plan_for_os(&plan, "plan9");
+        assert!(s.contains("manual restart required"));
+        assert!(s.contains("no supported service manager"));
+        assert!(!s.contains("pkill"));
+        assert!(!s.contains("spawn"));
     }
 
     #[test]

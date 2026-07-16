@@ -332,12 +332,11 @@ fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
     }
 }
 
-/// Auth middleware. When a token is configured on the resolved config
-/// (the secure-by-default case — an enabled dashboard auto-generates
-/// one), every request must carry a matching `Authorization: Bearer
-/// <tok>`. Requests pass through unchallenged only when no token is
-/// configured, which now happens solely under the explicit
-/// `dashboard.auth = "none"` opt-out.
+/// Auth middleware. When a token is configured on the resolved config,
+/// every request must carry a matching `Authorization: Bearer <tok>`.
+/// Requests pass through unchallenged only under the explicit
+/// `dashboard.auth = "none"` opt-out; the resolver rejects an enabled
+/// token-auth dashboard without an explicit token.
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -832,8 +831,7 @@ mod tests {
     }
 
     /// Resolve a config the way the daemon does and return the `(state,
-    /// token)` pair, so tests exercise the real secure-by-default path
-    /// (auto-generated token) rather than a hand-built config.
+    /// token)` pair so tests exercise the real config path.
     fn resolved_state(toml: crate::config::DashboardTomlConfig) -> (AppState, Option<String>) {
         let cfg = DashboardConfig::resolve(&toml, &crate::dashboard::DashboardOverrides::default())
             .unwrap();
@@ -1034,15 +1032,15 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Secure by default: an *enabled* dashboard with no explicit token
-    /// auto-generates one, so the API is auth-gated out of the box.
+    /// A persisted explicit token (the path used by `muxa init`) gates the API.
     #[tokio::test]
-    async fn enabled_dashboard_requires_token_by_default() {
+    async fn enabled_dashboard_with_explicit_token_requires_it() {
         let (state, token) = resolved_state(crate::config::DashboardTomlConfig {
             enabled: Some(true),
+            token: Some("persisted-token".into()),
             ..Default::default()
         });
-        let token = token.expect("enabled dashboard must auto-generate a token");
+        let token = token.expect("explicit token must be preserved");
         let app = router(state);
 
         // No credentials → rejected.
@@ -1058,7 +1056,7 @@ mod tests {
             .unwrap();
         assert_eq!(unauthed.status(), StatusCode::UNAUTHORIZED);
 
-        // Correct auto-generated token → allowed.
+        // Correct configured token → allowed.
         let authed = app
             .oneshot(
                 Request::builder()

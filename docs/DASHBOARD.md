@@ -6,8 +6,9 @@ tmux status line, a timeline graph of work/wait/error intervals, plus
 over Server-Sent Events.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
-Production-ready means default-secure: there is no path that exposes data
-beyond your local machine without explicit public-bind acknowledgement.
+Token authentication is the default auth mode, and an enabled dashboard must
+have an explicit token. There is no path that exposes data beyond your local
+machine without explicit public-bind acknowledgement.
 
 ## Surfaces
 
@@ -26,39 +27,55 @@ static routes do not — see "Why the HTML is public" below.
 
 ## Quick start
 
-### Loopback-only, no token (dev / single-user)
+### Recommended: generate and persist a token with `muxa init`
+
+```sh
+muxa init --component dashboard
+```
+
+The initializer enables the loopback dashboard, generates a token, persists it
+in `~/.config/muxa/config.toml`, and prints a one-time bootstrap URL such as
+`http://127.0.0.1:7878/#token=...`.
+
+### Manual loopback setup with a token
+
+For a manual setup, provide the token explicitly:
+
+```sh
+TOK=$(openssl rand -hex 32)
+muxad --dashboard --dashboard-token "$TOK"
+# then in the browser:  http://127.0.0.1:7878/#token=$TOK
+```
+
+The page captures `#token=...` into `localStorage` and rewrites the URL.
+Subsequent requests carry `Authorization: Bearer <tok>`. The token persists
+across tab close and browser restart, so you only need to paste it once per
+browser profile. To revoke, clear the `muxa.token` key (DevTools → Application
+→ Local Storage) or restart `muxad` with a different token.
+
+Legacy `?token=...` URLs are still accepted for compatibility and immediately
+scrubbed, but fragments are the supported bootstrap format because browsers do
+not send them in HTTP requests or `Referer` headers.
+
+### Loopback-only without authentication (dev / single-user)
+
+Disabling auth requires an explicit opt-out:
 
 ```toml
 # ~/.config/muxa/config.toml
 [dashboard]
 enabled = true
+auth = "none"
 # bind defaults to 127.0.0.1:7878
 ```
 
 Or via flags:
 
 ```sh
-muxad --dashboard
+muxad --dashboard --dashboard-auth none
 ```
 
 Open <http://127.0.0.1:7878/>.
-
-### Loopback with a token
-
-You don't need a token for loopback (it's already gated by the kernel). If
-you want one anyway, e.g. for a multi-user box:
-
-```sh
-TOK=$(openssl rand -hex 32)
-muxad --dashboard --dashboard-token "$TOK"
-# then in the browser:  http://127.0.0.1:7878/?token=$TOK
-```
-
-The page captures `?token=...` into `localStorage` and rewrites the URL.
-Subsequent requests carry `Authorization: Bearer <tok>`. The token persists
-across tab close and browser restart, so you only need to paste it once per
-browser profile. To revoke, clear the `muxa.token` key (DevTools → Application
-→ Local Storage) or restart `muxad` with a different token.
 
 ### Public bind with a token (LAN / VPN)
 
@@ -72,6 +89,8 @@ muxad --dashboard \
       --dashboard-token "$TOK" \
       --allow-public
 ```
+
+Open `http://<host>:7878/#token=$TOK` in the browser.
 
 If you skip `--allow-public` or `--dashboard-token`, `muxad` refuses to start
 with a clear message — same applies to TOML configs.
@@ -117,7 +136,7 @@ already enforces env-beats-flag for the fields it covers).
 | `enabled`            | bool    | `false`            | `--dashboard` / `--no-dashboard` / `MUXA_DASHBOARD_ENABLED`     |
 | `bind`               | string  | `"127.0.0.1:7878"` | `--dashboard-bind` / `MUXA_DASHBOARD_BIND`                      |
 | `auth`               | string  | `"token"`          | `--dashboard-auth` / `MUXA_DASHBOARD_AUTH` (`token` or `none`)  |
-| `token`              | string  | `""` (no auth)     | `--dashboard-token` / `MUXA_DASHBOARD_TOKEN`                    |
+| `token`              | string  | unset (required with token auth) | `--dashboard-token` / `MUXA_DASHBOARD_TOKEN`          |
 | `allow_public`       | bool    | `false`            | `--allow-public` / `MUXA_DASHBOARD_ALLOW_PUBLIC`                |
 | `pane_cache_ttl_ms`  | u64     | `2000`             | (TOML only)                                                     |
 
@@ -189,9 +208,9 @@ Three event types appear on the wire:
 The static HTML/JS/CSS routes intentionally sit *outside* the auth middleware.
 Three reasons:
 
-1. **Bootstrap.** `<script src="?token=...">` doesn't fly — browsers can't
-   inject custom headers on top-level navigation. The first GET has to
-   succeed unauthenticated for the JS to even *start* and pick the token up.
+1. **Bootstrap.** Browsers can't inject custom headers on top-level
+   navigation. The first GET has to succeed unauthenticated for the JS to
+   start, read `#token=...`, and persist it in `localStorage`.
 2. **No data.** The bundle holds no agent state. It's a thin client that
    asks `/api/*` for everything. Those endpoints stay gated.
 3. **The cost is bounded.** An unauthenticated GET to `/` returns the same
@@ -202,8 +221,9 @@ that strips the carve-out (or use mTLS).
 
 ## What it doesn't do (yet)
 
-- No persistence — daemon restart drops state. Prompt history goes to a sink
-  like [oh-my-prompt](https://github.com/jiunbae/oh-my-prompt), not muxa.
+- No dashboard-specific database. The daemon rehydrates live state from
+  `state.json`, while prompt and activity history use the configured local
+  NDJSON files.
 - No write API. Read-only dashboard. CSRF moot, but also no "stop this agent"
   button.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.

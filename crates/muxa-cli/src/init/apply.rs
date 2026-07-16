@@ -18,7 +18,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Side-effect summary returned to the orchestrator so it can paint
 /// the final outcome UI.
@@ -146,12 +149,21 @@ fn apply_edit(
         report.edited.push(path.to_path_buf());
         return Ok(());
     }
+    ensure_parent(path)?;
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading mode of {}", path.display())),
+    };
     if let Some(prev) = before {
+        let permissions = permissions
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot back up missing file {}", path.display()))?;
         let backup = backup_path(path, stamp);
-        fs::write(&backup, prev).with_context(|| format!("writing backup {}", backup.display()))?;
+        atomic_write_with_permissions(&backup, prev, Some(permissions))
+            .with_context(|| format!("writing backup {}", backup.display()))?;
         report.backups.push(backup);
     }
-    ensure_parent(path)?;
     atomic_write(path, after)?;
     report.edited.push(path.to_path_buf());
     Ok(())
@@ -229,19 +241,100 @@ fn ensure_parent(p: &Path) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}.muxa-tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
-    {
-        let mut f =
-            fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(contents.as_bytes())
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading mode of {}", path.display())),
+    };
+    atomic_write_with_permissions(path, contents, permissions.as_ref())
+}
+
+fn atomic_write_with_permissions(
+    path: &Path,
+    contents: &str,
+    permissions: Option<&fs::Permissions>,
+) -> Result<()> {
+    let (tmp, mut file) = create_temp_file(path)?;
+    let result = (|| -> Result<()> {
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all().ok();
+
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())
+                .with_context(|| format!("setting mode on {}", tmp.display()))?;
+        }
+        #[cfg(unix)]
+        if permissions.is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("setting mode on {}", tmp.display()))?;
+        }
+
+        file.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+        drop(file);
+        fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        sync_parent(path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    result
+}
+
+fn create_temp_file(path: &Path) -> Result<(PathBuf, fs::File)> {
+    loop {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(
+            ".muxa-tmp-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = path.with_file_name(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", tmp.display()));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory =
+        fs::File::open(parent).with_context(|| format!("opening {} for sync", parent.display()))?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("syncing {}", parent.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -409,10 +502,80 @@ fn diff_summary(before: &str, after: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
     #[test]
     fn backup_path_appends_stamp() {
         let p = PathBuf::from("/tmp/foo.conf");
         let b = backup_path(&p, 1_234_567_890);
         assert_eq!(b.to_string_lossy(), "/tmp/foo.conf.muxa-backup-1234567890");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_managed_file_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut report = ApplyReport::default();
+
+        apply_edit(
+            &path,
+            None,
+            "secret",
+            Outcome::Inserted,
+            false,
+            1,
+            &mut report,
+        )
+        .unwrap();
+
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write(&path, "new").unwrap();
+
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_inherits_original_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let mut report = ApplyReport::default();
+
+        apply_edit(
+            &path,
+            Some("old"),
+            "new",
+            Outcome::Replaced,
+            false,
+            42,
+            &mut report,
+        )
+        .unwrap();
+
+        let backup = backup_path(&path, 42);
+        assert_eq!(mode(&backup), 0o640);
+        assert_eq!(fs::read_to_string(backup).unwrap(), "old");
     }
 }

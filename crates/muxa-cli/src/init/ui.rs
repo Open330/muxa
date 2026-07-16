@@ -202,10 +202,27 @@ pub fn final_summary(
         body.push(l.clone());
     }
     if let Some((bind, token)) = dashboard {
-        body.push(format!("Dashboard: http://{bind}/?token={token}"));
+        body.push(format!("Dashboard: {}", dashboard_url(bind, token)));
         body.push("Token also stored in your config.toml.".into());
     }
     body.push("Try `prefix + s` for the muxa picker.".into());
     body.push("Roll back with `muxa init --uninstall`.".into());
     note(mode, "Done", &body.join("\n"));
+}
+
+fn dashboard_url(bind: &str, token: &str) -> String {
+    format!("http://{bind}/#token={token}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_bootstrap_url_uses_fragment() {
+        let url = dashboard_url("127.0.0.1:7878", "secret");
+
+        assert_eq!(url, "http://127.0.0.1:7878/#token=secret");
+        assert!(!url.contains("?token="));
+    }
 }

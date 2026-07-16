@@ -24,7 +24,6 @@ tower-http = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 rust-embed = { workspace = true }
-getrandom = "0.3"
 reqwest = { workspace = true }
 url = { workspace = true }
 notify-rust = "4"

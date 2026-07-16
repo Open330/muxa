@@ -46,7 +46,7 @@ use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::backend::{BackendCaps, HostKind, PaneBackend};
+use crate::backend::{BackendCaps, HostKind, PaneBackend, PaneObservation};
 use crate::tmux::PaneInfo;
 
 /// CLI-baseline zellij backend.
@@ -81,14 +81,18 @@ impl Default for ZellijSnapshot {
 }
 
 impl ZellijSnapshot {
-    fn fresh_panes(&self) -> Vec<PaneInfo> {
+    fn observation(&self) -> PaneObservation {
         let Some(updated_at) = self.updated_at else {
-            return Vec::new();
+            return PaneObservation::incomplete(Vec::new());
         };
         if updated_at.elapsed() > self.ttl {
-            return Vec::new();
+            return PaneObservation::incomplete(Vec::new());
         }
-        self.panes.clone()
+        PaneObservation::complete(self.panes.clone())
+    }
+
+    fn fresh_panes(&self) -> Vec<PaneInfo> {
+        self.observation().panes
     }
 }
 
@@ -124,6 +128,13 @@ impl PaneBackend for ZellijBackend {
             .read()
             .map(|s| s.fresh_panes())
             .unwrap_or_default()
+    }
+
+    fn observe_panes(&self) -> PaneObservation {
+        self.snapshot.read().map_or_else(
+            |_| PaneObservation::incomplete(Vec::new()),
+            |s| s.observation(),
+        )
     }
 
     fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
@@ -246,6 +257,10 @@ mod tests {
     fn empty_cache_yields_empty_pane_inventory() {
         let b = ZellijBackend::new();
         assert!(b.list_panes().is_empty());
+        assert!(
+            !b.observe_panes().is_complete(),
+            "no plugin snapshot is not an authoritative empty host",
+        );
         assert!(b.resolve_pane("anything").is_none());
         assert!(b.pane_pid_map().is_empty());
         assert!(b.capture_pane("anything").is_none());
@@ -263,6 +278,38 @@ mod tests {
         assert_eq!(panes.len(), 2);
         assert_eq!(b.resolve_pane("z-1").unwrap().pane_id, "z-1");
         assert!(b.resolve_pane("missing").is_none());
+        assert!(b.observe_panes().is_complete());
+    }
+
+    #[test]
+    fn stale_plugin_snapshot_is_incomplete() {
+        let b = ZellijBackend::new();
+        b.replace_snapshot(vec![fake_pane("z-1")]);
+        {
+            let mut snapshot = b.snapshot.write().unwrap();
+            snapshot.updated_at = Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(20))
+                    .expect("test instant supports subtraction"),
+            );
+            snapshot.ttl = Duration::from_secs(10);
+        }
+
+        let observed = b.observe_panes();
+        assert!(observed.panes.is_empty());
+        assert!(!observed.is_complete());
+        // Best-effort callers retain the historical empty-list behavior.
+        assert!(b.list_panes().is_empty());
+    }
+
+    #[test]
+    fn fresh_empty_plugin_snapshot_is_complete() {
+        let b = ZellijBackend::new();
+        b.replace_snapshot(Vec::new());
+
+        let observed = b.observe_panes();
+        assert!(observed.panes.is_empty());
+        assert!(observed.is_complete());
     }
 
     /// `ingest_pane_snapshot` through a `dyn PaneBackend` routes to

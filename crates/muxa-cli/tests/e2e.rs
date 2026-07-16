@@ -49,6 +49,7 @@ struct Daemon {
     /// persistence read this directly; tests that don't care about
     /// history simply ignore it.
     history: PathBuf,
+    activity: PathBuf,
 }
 
 impl Daemon {
@@ -115,6 +116,7 @@ enabled = false
             child,
             socket,
             history: history_path,
+            activity: activity_path,
         }
     }
 
@@ -122,6 +124,33 @@ enabled = false
         let mut c = Command::new(bin("muxa"));
         c.env("MUXA_SOCKET", &self.socket);
         c
+    }
+
+    #[cfg(unix)]
+    fn terminate(&mut self) {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .expect("send SIGTERM to muxad");
+        assert!(status.success(), "kill -TERM failed: {status}");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self
+                .child
+                .try_wait()
+                .expect("poll muxad shutdown")
+                .is_some()
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("muxad did not complete graceful shutdown within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -241,6 +270,46 @@ fn recap_surfaces_disk_backed_prompt_history() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn graceful_shutdown_drains_prompt_and_activity_writers() {
+    let mut daemon = Daemon::spawn();
+    let mut hook = daemon
+        .cli()
+        .args(["hook", "claude", "--event", "user_prompt_submit"])
+        .env("TMUX_PANE", "%88")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn final hook");
+    hook.stdin
+        .as_mut()
+        .expect("hook stdin")
+        .write_all(br#"{"session_id":"sess-shutdown","prompt":"persist before exit"}"#)
+        .expect("write final hook");
+    let output = hook.wait_with_output().expect("wait for final hook");
+    assert!(
+        output.status.success(),
+        "hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    daemon.terminate();
+
+    let history = std::fs::read_to_string(&daemon.history).expect("read prompt history");
+    assert!(
+        history.contains("persist before exit"),
+        "history:\n{history}"
+    );
+    let activity = std::fs::read_to_string(&daemon.activity).expect("read activity ledger");
+    assert!(activity.contains("sess-shutdown"), "activity:\n{activity}");
+    assert!(
+        activity.contains("state_transition"),
+        "activity:\n{activity}"
+    );
+}
+
 #[test]
 fn claude_statusline_forward_passes_stdin_to_command() {
     // Use `--forward cat` as a trivial passthrough: whatever we write to
@@ -316,8 +385,7 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
     let activity_path = dir.join("activity.ndjson");
     let session_activity_path = dir.join("session-activity.json");
 
-    // With no explicit token the dashboard is now secure-by-default (it mints
-    // a random token), so tests that want the open surface must opt into the
+    // Tests that want the open surface must explicitly opt into the
     // `auth = "none"` escape hatch. A `Some(token)` case is wired via
     // `--dashboard-token` below and keeps the default token auth.
     let dashboard_auth = if token.is_none() {
@@ -401,6 +469,7 @@ path = "{}"
             child,
             socket,
             history: history_path,
+            activity: activity_path,
         },
         port,
     })
@@ -437,6 +506,134 @@ fn curl_body(url: &str, header: Option<&str>) -> String {
     cmd.arg(url);
     let out = cmd.output().expect("curl");
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn manual_dashboard_without_token_fails_startup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("muxa-dash.toml");
+    let socket = dir.path().join("muxa-dash.sock");
+    std::fs::write(&cfg_path, "").expect("write empty config");
+
+    let mut child = Command::new(bin("muxad"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--dashboard")
+        .arg("--dashboard-bind")
+        .arg("127.0.0.1:0")
+        .env_remove("MUXA_DASHBOARD_TOKEN")
+        .env_remove("MUXA_DASHBOARD_AUTH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run muxad without dashboard token");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().expect("poll muxad startup").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("muxad did not reject a missing dashboard token within 2s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child
+        .wait_with_output()
+        .expect("collect muxad missing-token output");
+
+    assert!(!out.status.success(), "muxad unexpectedly started");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dashboard-token"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("dashboard.auth=\"none\""),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_dashboard_prints_fragment_url_for_persisted_token() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tools_dir = dir.path().join("tools");
+    std::fs::create_dir(&tools_dir).expect("create fake tools dir");
+    for (name, version_arg) in [("cargo", "--version"), ("tmux", "-V")] {
+        let path = tools_dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"{version_arg}\" ]; then echo '{name} test'; exit 0; fi\nexit 1\n"
+            ),
+        )
+        .expect("write fake tool");
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fake tool executable");
+    }
+
+    let config_home = dir.path().join("config");
+    let socket = dir.path().join("muxa-init.sock");
+    let out = Command::new(bin("muxa"))
+        .arg("--socket")
+        .arg(&socket)
+        .args([
+            "init",
+            "--yes",
+            "--component",
+            "dashboard",
+            "--start-daemon=false",
+        ])
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("PATH", &tools_dir)
+        .env_remove("MUXA_CONFIG")
+        .output()
+        .expect("run muxa init for dashboard");
+
+    assert!(
+        out.status.success(),
+        "muxa init failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let marker = "Dashboard: http://127.0.0.1:7878/#token=";
+    let token = stdout
+        .lines()
+        .find_map(|line| line.split_once(marker).map(|(_, token)| token.trim()))
+        .expect("init output must contain fragment bootstrap URL");
+    assert_eq!(token.len(), 64, "unexpected token in stdout:\n{stdout}");
+    assert!(!stdout.contains("/?token="), "stdout:\n{stdout}");
+
+    let config_path = if cfg!(target_os = "macos") {
+        dir.path()
+            .join("Library")
+            .join("Application Support")
+            .join("muxa")
+            .join("config.toml")
+    } else {
+        config_home.join("muxa").join("config.toml")
+    };
+    let config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        panic!(
+            "read persisted dashboard config {}: {e}",
+            config_path.display()
+        )
+    });
+    let config_mode = std::fs::metadata(&config_path)
+        .expect("dashboard config metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(config_mode, 0o600, "dashboard token config must be private");
+    assert!(
+        config.contains(&format!("token = \"{token}\"")),
+        "persisted token differs from printed URL:\n{config}"
+    );
 }
 
 #[test]

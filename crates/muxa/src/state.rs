@@ -13,6 +13,7 @@
 //! by the daemon's desktop-notifier task to wake users when an agent moves
 //! into `WaitingInput` or `Error`.
 
+use crate::backend::PaneObservation;
 use crate::event::{
     AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope, RateLimitSource,
     SurfaceRef,
@@ -31,7 +32,7 @@ use tokio::sync::{broadcast, Notify, RwLock};
 
 /// Prefix used by `muxa sync` / startup discovery for the `session_id` of a
 /// synthesized `Started` event. The store recognizes this prefix to keep
-/// dedup honest: a real hook event arriving for the same `(kind, pane)`
+/// dedup honest: a real hook event arriving for the same `(kind, pane, socket)`
 /// replaces the synthetic placeholder rather than racing it.
 ///
 /// Kept here (not in the runtime crate) so the no-I/O store layer can dedup
@@ -41,6 +42,35 @@ const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input"
 
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
+}
+
+fn same_pane_identity(agent: &Agent, pane: &str, tmux_socket: Option<&str>) -> bool {
+    if agent.pane.as_deref() != Some(pane) {
+        return false;
+    }
+    match (agent.tmux_socket.as_deref(), tmux_socket) {
+        (Some(left), Some(right)) => {
+            crate::tmux::socket_short_name(left) == crate::tmux::socket_short_name(right)
+        }
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+fn pane_is_live(agent: &Agent, panes_by_id: &HashMap<&str, Vec<&PaneInfo>>) -> bool {
+    if agent.pid.is_some() {
+        return true;
+    }
+    match agent.pane.as_deref() {
+        Some(pane_id) => match (panes_by_id.get(pane_id), agent.tmux_socket.as_deref()) {
+            (None, _) => false,
+            (Some(candidates), Some(socket)) => candidates
+                .iter()
+                .any(|pane| pane.socket.as_deref().is_none_or(|value| value == socket)),
+            (Some(_), None) => true,
+        },
+        None => true,
+    }
 }
 
 fn normalize_hydrated_agent(mut agent: Agent) -> Agent {
@@ -841,12 +871,13 @@ fn reconcile_pane_for_started(
     agents: &mut HashMap<String, Agent>,
     incoming_session: &str,
     pane: &str,
+    tmux_socket: Option<&str>,
     at: OffsetDateTime,
 ) -> bool {
     if is_synthetic(incoming_session) {
         let live_owner_exists = agents.values().any(|a| {
             a.session_id != incoming_session
-                && a.pane.as_deref() == Some(pane)
+                && same_pane_identity(a, pane, tmux_socket)
                 && a.state != AgentState::Stopped
         });
         if live_owner_exists {
@@ -857,18 +888,20 @@ fn reconcile_pane_for_started(
         // synthetic-Idle) and surface the older "stopped" timestamp in
         // `muxa status` even though the pane is alive again.
         agents.retain(|_, a| {
-            !(a.pane.as_deref() == Some(pane)
+            !(same_pane_identity(a, pane, tmux_socket)
                 && a.session_id != incoming_session
                 && a.state == AgentState::Stopped)
         });
     } else {
         // Real Started — drop synthetic placeholders for this pane outright.
-        agents.retain(|_, a| !(a.pane.as_deref() == Some(pane) && is_synthetic(&a.session_id)));
+        agents.retain(|_, a| {
+            !(same_pane_identity(a, pane, tmux_socket) && is_synthetic(&a.session_id))
+        });
     }
 
     for other in agents.values_mut() {
         if other.session_id != incoming_session
-            && other.pane.as_deref() == Some(pane)
+            && same_pane_identity(other, pane, tmux_socket)
             && other.state != AgentState::Stopped
         {
             other.state = AgentState::Stopped;
@@ -935,7 +968,13 @@ impl Store {
 
         if let Some(pane) = id.pane.as_deref() {
             if matches!(ev, AgentEvent::Started { .. }) {
-                if !reconcile_pane_for_started(&mut agents, &id.session_id, pane, at) {
+                if !reconcile_pane_for_started(
+                    &mut agents,
+                    &id.session_id,
+                    pane,
+                    id.tmux_socket.as_deref(),
+                    at,
+                ) {
                     return;
                 }
             } else if !is_synthetic(&id.session_id) {
@@ -946,7 +985,8 @@ impl Store {
                 // placeholder immediately instead of keeping a duplicate
                 // synthetic row until the next SessionStart.
                 agents.retain(|_, agent| {
-                    !(agent.pane.as_deref() == Some(pane) && is_synthetic(&agent.session_id))
+                    !(same_pane_identity(agent, pane, id.tmux_socket.as_deref())
+                        && is_synthetic(&agent.session_id))
                 });
             }
         }
@@ -1151,7 +1191,8 @@ impl Store {
         if threshold.is_zero() {
             return 0;
         }
-        let cutoff = OffsetDateTime::now_utc() - threshold;
+        let now = OffsetDateTime::now_utc();
+        let cutoff = now - threshold;
         let mut agents = self.agents.write().await;
         let mut flipped = 0_usize;
         for agent in agents.values_mut() {
@@ -1170,6 +1211,8 @@ impl Store {
             }
             let prev = agent.state;
             agent.state = AgentState::Idle;
+            agent.state_entered_at = now;
+            agent.last_activity_at = now;
             flipped += 1;
             // Broadcast for IPC subscribers and in-process sinks.
             // Identical shape to the broadcast in `apply` so consumers
@@ -1181,6 +1224,10 @@ impl Store {
                 to: agent.state,
                 agent: Arc::new(agent.clone()),
             });
+        }
+        if flipped > 0 {
+            drop(agents);
+            self.dirty.notify_one();
         }
         flipped
     }
@@ -1496,6 +1543,18 @@ impl Store {
     ///
     /// Idempotent and safe to run on a timer regardless of event traffic.
     /// Returns counts so callers can log non-trivial sweeps without spamming.
+    pub async fn reconcile_observation(&self, observation: &PaneObservation) -> ReconcileReport {
+        if !observation.is_complete() {
+            return ReconcileReport::default();
+        }
+        self.reconcile(&observation.panes).await
+    }
+
+    /// Converge against a pane set already known to be complete.
+    ///
+    /// Most runtime callers should use [`Self::reconcile_observation`]. This
+    /// slice-based entry point remains for focused store tests and callers
+    /// that obtain their complete pane inventory without a [`PaneBackend`](crate::backend::PaneBackend).
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
         let mut agents = self.agents.write().await;
         let mut report = ReconcileReport::default();
@@ -1511,28 +1570,24 @@ impl Store {
             panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
         }
 
+        let reaped_at = OffsetDateTime::now_utc();
+        let mut stale_transitions = Vec::new();
         let before = agents.len();
         agents.retain(|_, a| {
-            // pid-tracked rows (Task) are governed by process liveness in
-            // `reap_dead_pids`, never by tmux pane presence — they may be
-            // paneless or carry a pane id that isn't a tmux pane.
-            if a.pid.is_some() {
-                return true;
+            let keep = pane_is_live(a, &panes_by_id);
+            if !keep && a.state != AgentState::Stopped {
+                let mut stopped = a.clone();
+                let from = stopped.state;
+                stopped.state = AgentState::Stopped;
+                stopped.state_entered_at = reaped_at;
+                stopped.last_activity_at = reaped_at;
+                stale_transitions.push(Transition {
+                    from,
+                    to: AgentState::Stopped,
+                    agent: Arc::new(stopped),
+                });
             }
-            match a.pane.as_deref() {
-                Some(pane_id) => match (panes_by_id.get(pane_id), a.tmux_socket.as_deref()) {
-                    (None, _) => false,
-                    // Socket-aware rows must match a pane on THEIR server —
-                    // a same-numbered pane on another server is not this
-                    // agent's pane. Untagged candidates (bare-call rows)
-                    // stay acceptable to avoid reaping across tmux quirks.
-                    (Some(cands), Some(sock)) => cands
-                        .iter()
-                        .any(|p| p.socket.as_deref().is_none_or(|s| s == sock)),
-                    (Some(_), None) => true,
-                },
-                None => true, // paneless agents (rare) aren't governed by tmux
-            }
+            keep
         });
         report.stale_panes_reaped = before - agents.len();
 
@@ -1612,6 +1667,9 @@ impl Store {
         }
 
         drop(agents);
+        for transition in stale_transitions {
+            let _ = self.transitions.send(transition);
+        }
         if !report.is_noop() {
             self.dirty.notify_one();
         }
@@ -3006,6 +3064,8 @@ mod tests {
         let t = rx.try_recv().expect("transition broadcast");
         assert_eq!(t.from, AgentState::Working);
         assert_eq!(t.to, AgentState::Idle);
+        assert!(t.agent.state_entered_at > stale_at);
+        assert_eq!(t.agent.state_entered_at, t.agent.last_activity_at);
     }
 
     #[tokio::test]
@@ -3271,6 +3331,41 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].started_at, now);
+    }
+
+    #[tokio::test]
+    async fn synthetic_started_distinguishes_same_pane_id_on_different_sockets() {
+        let store = Store::shared();
+        let now = datetime!(2026-04-24 12:00:00 UTC);
+
+        for (session_id, socket) in [
+            ("synthetic-7:default:%1", "default"),
+            ("synthetic-4:amux:%1", "amux"),
+        ] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        kind: AgentKind::ClaudeCode,
+                        session_id: session_id.into(),
+                        surface: None,
+                        pane: Some("%1".into()),
+                        tmux_socket: Some(socket.into()),
+                        cwd: None,
+                    },
+                    at: now,
+                })
+                .await;
+        }
+
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().all(|agent| agent.state == AgentState::Idle));
+        assert!(snap
+            .iter()
+            .any(|agent| agent.tmux_socket.as_deref() == Some("default")));
+        assert!(snap
+            .iter()
+            .any(|agent| agent.tmux_socket.as_deref() == Some("amux")));
     }
 
     #[tokio::test]
@@ -3728,6 +3823,7 @@ mod tests {
         }
         // Only %a is still alive; %b and %c are gone.
         let live = vec![pane("%a")];
+        let mut transitions = store.subscribe();
 
         let report = store.reconcile(&live).await;
 
@@ -3737,6 +3833,19 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].session_id, "a");
+        let mut stopped = Vec::new();
+        for _ in 0..2 {
+            let transition = transitions.recv().await.expect("stale pane transition");
+            assert_eq!(transition.to, AgentState::Stopped);
+            assert_eq!(transition.agent.state, AgentState::Stopped);
+            assert_eq!(
+                transition.agent.state_entered_at,
+                transition.agent.last_activity_at,
+            );
+            stopped.push(transition.agent.session_id.clone());
+        }
+        stopped.sort();
+        assert_eq!(stopped, ["b", "c"]);
     }
 
     #[tokio::test]

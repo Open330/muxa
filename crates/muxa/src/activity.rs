@@ -12,7 +12,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
 #[cfg(unix)]
@@ -255,7 +255,11 @@ pub struct ActivityLog {
 #[derive(Debug)]
 enum WriterMsg {
     Append(ActivityEntry),
-    Rewrite(Vec<ActivityEntry>),
+    /// Load, filter, and rewrite only after earlier appends have reached disk.
+    Compact {
+        cutoff: OffsetDateTime,
+        complete: oneshot::Sender<std::io::Result<usize>>,
+    },
 }
 
 impl ActivityLog {
@@ -288,33 +292,33 @@ impl ActivityLog {
         }
     }
 
+    /// Queue compaction in the same FIFO as appends. Only this caller waits for
+    /// completion; ingest remains bounded and non-blocking via `try_send`.
     pub async fn compact(&self, max_age: time::Duration) -> CompactReport {
         let cutoff = OffsetDateTime::now_utc() - max_age;
-        let loaded = match load(&self.path).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(error = %e, path = %self.path.display(), "activity compaction load failed");
-                return CompactReport {
-                    rewrite_skipped: true,
-                    ..CompactReport::default()
-                };
-            }
-        };
-        let before = loaded.len();
-        let retained = loaded
-            .into_iter()
-            .filter(|entry| entry.at() >= cutoff)
-            .collect::<Vec<_>>();
-        let aged_out = before - retained.len();
+        let (complete, completed) = oneshot::channel();
+        if let Err(e) = self
+            .writer
+            .try_send(WriterMsg::Compact { cutoff, complete })
+        {
+            warn!(error = %e, "activity compaction queue full; skipping rewrite this cycle");
+            return CompactReport {
+                rewrite_skipped: true,
+                ..CompactReport::default()
+            };
+        }
+
         let mut report = CompactReport {
-            aged_out,
+            rewrite_dispatched: true,
             ..CompactReport::default()
         };
-        if let Err(e) = self.writer.try_send(WriterMsg::Rewrite(retained)) {
-            warn!(error = %e, "activity compaction queue full; skipping rewrite this cycle");
-            report.rewrite_skipped = true;
-        } else {
-            report.rewrite_dispatched = true;
+        match completed.await {
+            Ok(Ok(aged_out)) => report.aged_out = aged_out,
+            Ok(Err(_)) => report.rewrite_skipped = true,
+            Err(e) => {
+                warn!(error = %e, "activity writer stopped before compaction completed");
+                report.rewrite_skipped = true;
+            }
         }
         report
     }
@@ -395,10 +399,11 @@ async fn run_writer(
                             }
                         }
                     }
-                    WriterMsg::Rewrite(entries) => {
+                    WriterMsg::Compact { cutoff, complete } => {
                         drop(appender.take());
-                        if let Err(e) = atomic_rewrite(&path, &entries).await {
-                            warn!(error = %e, "activity compaction rewrite failed");
+                        let result = compact_file(&path, cutoff).await;
+                        if let Err(e) = &result {
+                            warn!(error = %e, path = %path.display(), "activity compaction failed");
                         }
                         appender = match open_appender(&path).await {
                             Ok(f) => Some(f),
@@ -407,6 +412,7 @@ async fn run_writer(
                                 None
                             }
                         };
+                        let _ = complete.send(result);
                     }
                 }
             }
@@ -462,6 +468,18 @@ async fn atomic_rewrite(path: &Path, entries: &[ActivityEntry]) -> std::io::Resu
         }
     }
     Ok(())
+}
+
+async fn compact_file(path: &Path, cutoff: OffsetDateTime) -> std::io::Result<usize> {
+    let loaded = load(path).await?;
+    let before = loaded.len();
+    let retained = loaded
+        .into_iter()
+        .filter(|entry| entry.at() >= cutoff)
+        .collect::<Vec<_>>();
+    let aged_out = before - retained.len();
+    atomic_rewrite(path, &retained).await?;
+    Ok(aged_out)
 }
 
 fn duration_secs(started_at: OffsetDateTime, ended_at: OffsetDateTime) -> u64 {
@@ -561,5 +579,49 @@ mod tests {
 
         let entries = load(&path).await.unwrap();
         assert_eq!(entries, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn compaction_runs_after_preceding_queued_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let now = OffsetDateTime::now_utc();
+        let entry = ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+            "$1",
+            "main",
+            now - time::Duration::seconds(5),
+            now,
+        ));
+        let (writer, rx) = mpsc::channel(4);
+        let log = Arc::new(ActivityLog {
+            path: path.clone(),
+            writer,
+        });
+
+        // Hold the writer offline until both commands are queued. A compactor
+        // that snapshots disk here sees an empty file and later erases `entry`.
+        log.append(entry.clone());
+        let compact = tokio::spawn({
+            let log = Arc::clone(&log);
+            async move { log.compact(time::Duration::days(1)).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while log.writer.capacity() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("append and compact commands should both be queued");
+
+        let (shutdown, _) = broadcast::channel(1);
+        let writer_task = tokio::spawn(run_writer(path.clone(), rx, shutdown.subscribe()));
+        let report = compact.await.unwrap();
+        assert!(report.rewrite_dispatched);
+        assert!(!report.rewrite_skipped);
+        assert_eq!(report.aged_out, 0);
+
+        let _ = shutdown.send(());
+        writer_task.await.unwrap();
+        assert_eq!(load(&path).await.unwrap(), vec![entry]);
     }
 }

@@ -40,13 +40,14 @@
 //!
 //! ## Concurrency model
 //!
-//! Every `apply(PromptSubmitted)` does two things:
+//! Every `apply(PromptSubmitted)` does two things under one short ordering
+//! boundary:
 //!   1. Lock the in-memory map (write), append, evict overflow — fast.
-//!   2. Send the record over an `mpsc` channel to a dedicated writer task.
+//!   2. Queue the record to a dedicated writer task before releasing the lock.
 //!
-//! Disk I/O never sits on the event-handling path. If the writer task is
-//! slow (rare — local fsync), the bounded mpsc applies backpressure
-//! before backing up the broadcast pipeline.
+//! Disk I/O never sits on the event-handling path. The bounded mpsc uses
+//! `try_send`, so a slow writer drops a disk record (with a warning) rather
+//! than backing up the broadcast pipeline.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -223,6 +224,14 @@ pub struct PromptHistory {
     /// `try_send` so the event-handler path never blocks on disk I/O.
     writer: Option<mpsc::Sender<WriterMsg>>,
     pane_sessions: Option<PaneSessionCache>,
+    #[cfg(test)]
+    before_enqueue_hook: Option<Arc<BeforeEnqueueHook>>,
+}
+
+#[cfg(test)]
+struct BeforeEnqueueHook {
+    reached: tokio::sync::Barrier,
+    resume: tokio::sync::Barrier,
 }
 
 #[derive(Debug)]
@@ -242,6 +251,8 @@ impl PromptHistory {
             pane_sessions: opts.pane_sessions.clone(),
             opts: HistoryOptions { path: None, ..opts },
             writer: None,
+            #[cfg(test)]
+            before_enqueue_hook: None,
         })
     }
 
@@ -283,6 +294,8 @@ impl PromptHistory {
                 pane_sessions: opts.pane_sessions.clone(),
                 opts,
                 writer: Some(tx),
+                #[cfg(test)]
+                before_enqueue_hook: None,
             }),
             handle,
         ))
@@ -306,11 +319,14 @@ impl PromptHistory {
                 .as_ref()
                 .and_then(|cache| cache.get(&entry.pane));
         }
-        {
-            let mut inner = self.inner.write().await;
-            push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane);
-        }
+        let mut inner = self.inner.write().await;
+        push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane);
         if let Some(tx) = &self.writer {
+            #[cfg(test)]
+            if let Some(hook) = &self.before_enqueue_hook {
+                hook.reached.wait().await;
+                hook.resume.wait().await;
+            }
             if let Err(e) = tx.try_send(WriterMsg::Append(entry)) {
                 warn!(error = %e, "history writer queue full; entry not persisted");
             }
@@ -353,24 +369,27 @@ impl PromptHistory {
         let cutoff = OffsetDateTime::now_utc() - self.opts.max_age;
         let mut report = CompactReport::default();
 
-        let snapshot: Vec<HistoryEntry> = {
-            let mut inner = self.inner.write().await;
-            for deque in inner.by_pane.values_mut() {
-                let before = deque.len();
-                deque.retain(|e| e.at >= cutoff);
-                report.aged_out += before - deque.len();
-            }
-            inner.by_pane.retain(|_, d| !d.is_empty());
-            inner
-                .by_pane
-                .values()
-                .flat_map(|d| d.iter().cloned())
-                .collect()
-        };
+        let mut inner = self.inner.write().await;
+        for deque in inner.by_pane.values_mut() {
+            let before = deque.len();
+            deque.retain(|e| e.at >= cutoff);
+            report.aged_out += before - deque.len();
+        }
+        inner.by_pane.retain(|_, d| !d.is_empty());
+        let snapshot = inner
+            .by_pane
+            .values()
+            .flat_map(|d| d.iter().cloned())
+            .collect();
 
         if let Some(tx) = &self.writer {
             // Bounded send so a stuck writer can't block compaction.
             // Compaction misfires are recoverable on the next tick.
+            #[cfg(test)]
+            if let Some(hook) = &self.before_enqueue_hook {
+                hook.reached.wait().await;
+                hook.resume.wait().await;
+            }
             if let Err(e) = tx.try_send(WriterMsg::Rewrite(snapshot)) {
                 warn!(error = %e, "history compaction queue full; skipping rewrite this cycle");
                 report.rewrite_skipped = true;
@@ -697,6 +716,63 @@ mod tests {
         assert_eq!(report.aged_out, 1);
         assert_eq!(h.len().await, 1);
         assert_eq!(h.recent_for_pane("%1", 0).await[0].prompt, "fresh");
+    }
+
+    #[tokio::test]
+    async fn memory_mutation_and_writer_enqueue_share_one_ordering_boundary() {
+        let (writer, mut queued) = mpsc::channel(4);
+        let hook = Arc::new(BeforeEnqueueHook {
+            reached: tokio::sync::Barrier::new(2),
+            resume: tokio::sync::Barrier::new(2),
+        });
+        let h = Arc::new(PromptHistory {
+            inner: RwLock::new(Inner::default()),
+            opts: HistoryOptions {
+                max_age: time::Duration::days(1),
+                ..Default::default()
+            },
+            writer: Some(writer),
+            pane_sessions: None,
+            before_enqueue_hook: Some(Arc::clone(&hook)),
+        });
+
+        let append = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move {
+                h.append(entry("%1", "kept", OffsetDateTime::now_utc()))
+                    .await;
+            }
+        });
+        hook.reached.wait().await;
+        assert!(
+            h.inner.try_write().is_err(),
+            "append must retain the write lock until its writer message is queued"
+        );
+        hook.resume.wait().await;
+        append.await.unwrap();
+        assert!(matches!(
+            queued.recv().await,
+            Some(WriterMsg::Append(entry)) if entry.prompt == "kept"
+        ));
+
+        let compact = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { h.compact().await }
+        });
+        hook.reached.wait().await;
+        assert!(
+            h.inner.try_write().is_err(),
+            "snapshot must retain the write lock until its rewrite is queued"
+        );
+        hook.resume.wait().await;
+        assert!(compact.await.unwrap().rewrite_dispatched);
+        match queued.recv().await {
+            Some(WriterMsg::Rewrite(snapshot)) => {
+                assert_eq!(snapshot.len(), 1);
+                assert_eq!(snapshot[0].prompt, "kept");
+            }
+            other => panic!("expected queued rewrite, got {other:?}"),
+        }
     }
 
     #[tokio::test]
