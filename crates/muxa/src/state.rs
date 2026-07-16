@@ -25,6 +25,7 @@ use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -104,6 +105,33 @@ const TRANSITION_CHANNEL_CAPACITY: usize = 256;
 /// from `Transition` payloads. Slow subscribers see `RecvError::Lagged`
 /// and should log + continue (same pattern as the notifier).
 const PROMPT_CHANNEL_CAPACITY: usize = 256;
+
+/// Share of pane-governed rows a single pass may reap before the sweep is
+/// treated as suspicious, as `doomed * DIVISOR >= governed` — i.e. half the
+/// registry. Half of it vanishing between two ticks is a far better match for
+/// a bad pane observation than for real user activity.
+const MASS_REAP_DIVISOR: usize = 2;
+
+/// Floor on how many rows a pass must be dropping before the ratio is even
+/// consulted. Closing the handful of panes you had open is ordinary, and
+/// making them linger an extra tick would be more surprising than the reap.
+const MASS_REAP_MIN_ROWS: usize = 5;
+
+/// Consecutive passes that must independently propose the same mass reap
+/// before it executes. Two is enough to outlast a transient observation fault
+/// while costing a legitimate mass close only one extra tick.
+const MASS_REAP_CONFIRMATIONS: u32 = 2;
+
+/// Outcome of the mass-reap guard for one reconcile pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapVerdict {
+    /// Sweep is ordinary, or a proposed mass reap has now been confirmed by
+    /// enough consecutive passes. Reap normally.
+    Allowed,
+    /// This pass alone wanted to take out most of the pane-governed registry.
+    /// Keep the rows and wait for the next pass to agree.
+    Deferred { doomed: usize, governed: usize },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -331,6 +359,11 @@ pub struct Store {
     /// bounds the blast radius (handler cap + timeouts), but this invariant is
     /// what keeps lock hold time in the microsecond range to begin with.
     agents: RwLock<HashMap<String, Agent>>,
+    /// Consecutive reconcile passes that have proposed a mass reap (see
+    /// [`Store::reap_guard_verdict`]). A single pass never executes one; the
+    /// registry only drops the rows once `MASS_REAP_CONFIRMATIONS` passes in a
+    /// row agree, and any pass that disagrees resets this to zero.
+    mass_reap_confirmations: AtomicU32,
     transitions: broadcast::Sender<Transition>,
     prompts: broadcast::Sender<PromptRecord>,
     /// Disk-backed audit log of every prompt. Lives separately from
@@ -376,6 +409,7 @@ impl Store {
         let (prompts_tx, _) = broadcast::channel(PROMPT_CHANNEL_CAPACITY);
         Self {
             agents: RwLock::default(),
+            mass_reap_confirmations: AtomicU32::new(0),
             transitions: tx,
             prompts: prompts_tx,
             history,
@@ -1550,6 +1584,54 @@ impl Store {
         self.reconcile(&observation.panes).await
     }
 
+    /// Decide whether this pass may execute its stale-pane reap.
+    ///
+    /// Ordinary sweeps are always allowed. The guard exists for the one shape
+    /// that is nearly always a bug rather than reality: a single pass claiming
+    /// that most of the pane-governed registry died at once. Completeness
+    /// checks in the backend already catch the failure modes we know about
+    /// (`observe_panes` reporting `Incomplete`); this is the backstop for the
+    /// ones we don't, and it costs a legitimate mass close only one tick.
+    ///
+    /// Deferral is deliberately *not* sticky: the counter only advances while
+    /// consecutive passes keep proposing the same wipe, so a real mass close
+    /// converges on the next tick and a transient fault resets it to zero.
+    fn reap_guard_verdict(
+        &self,
+        agents: &HashMap<String, Agent>,
+        panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+    ) -> ReapVerdict {
+        // Only rows this sweep could actually reap belong in the ratio.
+        // pid-tracked rows answer to process liveness and paneless rows to the
+        // orphan sweep; counting either would inflate the denominator and let
+        // a wipe of every real pane row slip under the threshold.
+        let governed = agents
+            .values()
+            .filter(|a| a.pid.is_none() && a.pane.is_some())
+            .count();
+        let doomed = agents
+            .values()
+            .filter(|a| !pane_is_live(a, panes_by_id))
+            .count();
+        let is_mass_reap =
+            doomed >= MASS_REAP_MIN_ROWS && doomed.saturating_mul(MASS_REAP_DIVISOR) >= governed;
+        if !is_mass_reap {
+            self.mass_reap_confirmations
+                .store(0, AtomicOrdering::Relaxed);
+            return ReapVerdict::Allowed;
+        }
+        let confirmations = self
+            .mass_reap_confirmations
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if confirmations >= MASS_REAP_CONFIRMATIONS {
+            self.mass_reap_confirmations
+                .store(0, AtomicOrdering::Relaxed);
+            return ReapVerdict::Allowed;
+        }
+        ReapVerdict::Deferred { doomed, governed }
+    }
+
     /// Converge against a pane set already known to be complete.
     ///
     /// Most runtime callers should use [`Self::reconcile_observation`]. This
@@ -1573,22 +1655,36 @@ impl Store {
         let reaped_at = OffsetDateTime::now_utc();
         let mut stale_transitions = Vec::new();
         let before = agents.len();
-        agents.retain(|_, a| {
-            let keep = pane_is_live(a, &panes_by_id);
-            if !keep && a.state != AgentState::Stopped {
-                let mut stopped = a.clone();
-                let from = stopped.state;
-                stopped.state = AgentState::Stopped;
-                stopped.state_entered_at = reaped_at;
-                stopped.last_activity_at = reaped_at;
-                stale_transitions.push(Transition {
-                    from,
-                    to: AgentState::Stopped,
-                    agent: Arc::new(stopped),
-                });
-            }
-            keep
-        });
+        // A complete observation is still only as good as the backend that
+        // produced it. Hold back a sweep that would take out most of the
+        // registry until a second pass independently agrees.
+        let verdict = self.reap_guard_verdict(&agents, &panes_by_id);
+        if let ReapVerdict::Deferred { doomed, governed } = verdict {
+            report.stale_reap_deferred = doomed;
+            tracing::warn!(
+                doomed,
+                governed,
+                "deferring mass reap of {doomed}/{governed} pane-governed agent(s) — \
+                 holding rows until another pass agrees",
+            );
+        } else {
+            agents.retain(|_, a| {
+                let keep = pane_is_live(a, &panes_by_id);
+                if !keep && a.state != AgentState::Stopped {
+                    let mut stopped = a.clone();
+                    let from = stopped.state;
+                    stopped.state = AgentState::Stopped;
+                    stopped.state_entered_at = reaped_at;
+                    stopped.last_activity_at = reaped_at;
+                    stale_transitions.push(Transition {
+                        from,
+                        to: AgentState::Stopped,
+                        agent: Arc::new(stopped),
+                    });
+                }
+                keep
+            });
+        }
         report.stale_panes_reaped = before - agents.len();
 
         // Adopt panes onto paneless codex hook rows via cwd match BEFORE the
@@ -1685,6 +1781,11 @@ impl Store {
 pub struct ReconcileReport {
     /// Records dropped because their pane is no longer in tmux.
     pub stale_panes_reaped: usize,
+    /// Records this pass wanted to drop but held back, because reaping them
+    /// would have taken out most of the pane-governed registry in one tick.
+    /// Non-zero means the guard fired — the rows survive until another pass
+    /// independently agrees. See [`Store::reap_guard_verdict`].
+    pub stale_reap_deferred: usize,
     /// Synthetic placeholders dropped because a real entry owns the same pane.
     pub synthetic_demoted: usize,
     /// Older / duplicate real records collapsed onto the canonical row.
@@ -3800,6 +3901,129 @@ mod tests {
         let report = store.reconcile(&[default_pane]).await;
         assert_eq!(report.stale_panes_reaped, 1);
         assert!(store.by_session("amux-only").await.is_none());
+    }
+
+    /// Seed `n` pane-bearing agents on panes `%0..%n`, returning their panes.
+    async fn seed_pane_agents(store: &Store, n: usize) -> Vec<PaneInfo> {
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let mut panes = Vec::new();
+        for i in 0..n {
+            let pane_id = format!("%{i}");
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        tmux_socket: None,
+                        kind: AgentKind::ClaudeCode,
+                        session_id: format!("s{i}"),
+                        surface: None,
+                        pane: Some(pane_id.clone()),
+                        cwd: None,
+                    },
+                    at: t0,
+                })
+                .await;
+            panes.push(pane(&pane_id));
+        }
+        panes
+    }
+
+    /// The incident this guard exists for: a pane observation that wrongly
+    /// reports an empty host must not empty the registry. Completeness checks
+    /// in the backend are the first line of defence — this is the backstop for
+    /// when a *new* fault sneaks an empty pane set past them as `Complete`.
+    #[tokio::test]
+    async fn transient_pane_blackout_does_not_wipe_registry() {
+        let store = Store::shared();
+        let panes = seed_pane_agents(&store, 6).await;
+
+        // The bad tick: host claims every pane is gone.
+        let report = store.reconcile(&[]).await;
+
+        assert_eq!(report.stale_panes_reaped, 0, "guard must hold the rows");
+        assert_eq!(report.stale_reap_deferred, 6);
+        assert_eq!(store.snapshot().await.len(), 6);
+
+        // Next tick sees the panes again — the wipe is never confirmed.
+        let report = store.reconcile(&panes).await;
+
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert_eq!(report.stale_reap_deferred, 0);
+        assert_eq!(store.snapshot().await.len(), 6, "registry survived intact");
+    }
+
+    /// The guard delays a real mass close by one tick, it doesn't block it:
+    /// once a second pass independently agrees, the rows go.
+    #[tokio::test]
+    async fn mass_close_reaps_once_a_second_pass_agrees() {
+        let store = Store::shared();
+        seed_pane_agents(&store, 6).await;
+
+        let first = store.reconcile(&[]).await;
+        assert_eq!(first.stale_panes_reaped, 0);
+        assert_eq!(first.stale_reap_deferred, 6);
+
+        let second = store.reconcile(&[]).await;
+        assert_eq!(second.stale_panes_reaped, 6, "confirmed wipe executes");
+        assert_eq!(second.stale_reap_deferred, 0);
+        assert!(store.snapshot().await.is_empty());
+    }
+
+    /// Closing the last couple of panes you had open is ordinary. Guarding
+    /// tiny registries would make them linger for no reason.
+    #[tokio::test]
+    async fn guard_ignores_small_registries() {
+        let store = Store::shared();
+        seed_pane_agents(&store, MASS_REAP_MIN_ROWS - 1).await;
+
+        let report = store.reconcile(&[]).await;
+
+        assert_eq!(report.stale_panes_reaped, MASS_REAP_MIN_ROWS - 1);
+        assert_eq!(report.stale_reap_deferred, 0);
+    }
+
+    /// Paneless rows aren't reapable by this sweep, so they must not pad the
+    /// denominator — otherwise a registry carrying a pile of detached codex
+    /// rows would let every real pane row be wiped in one unconfirmed pass.
+    #[tokio::test]
+    async fn paneless_rows_do_not_dilute_the_guard() {
+        let store = Store::shared();
+        seed_pane_agents(&store, 6).await;
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        for i in 0..20 {
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        tmux_socket: None,
+                        kind: AgentKind::Codex,
+                        session_id: format!("detached{i}"),
+                        surface: None,
+                        pane: None,
+                        cwd: None,
+                    },
+                    at: t0,
+                })
+                .await;
+        }
+
+        let report = store.reconcile(&[]).await;
+
+        assert_eq!(report.stale_panes_reaped, 0, "guard must still fire");
+        assert_eq!(report.stale_reap_deferred, 6);
+    }
+
+    /// A minority of rows losing their panes is the everyday case and must
+    /// still reap on the very first pass.
+    #[tokio::test]
+    async fn ordinary_minority_reap_is_not_deferred() {
+        let store = Store::shared();
+        let mut panes = seed_pane_agents(&store, 8).await;
+        panes.pop();
+
+        let report = store.reconcile(&panes).await;
+
+        assert_eq!(report.stale_panes_reaped, 1);
+        assert_eq!(report.stale_reap_deferred, 0);
+        assert_eq!(store.snapshot().await.len(), 7);
     }
 
     #[tokio::test]
