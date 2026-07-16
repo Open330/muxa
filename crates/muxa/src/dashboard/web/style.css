@@ -283,6 +283,25 @@ button, select {
   padding: 6px;
 }
 
+.session-load-more {
+  width: 100%;
+  min-height: 32px;
+  margin-top: 4px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-muted);
+  font: 10px/1.2 var(--mono);
+  cursor: pointer;
+}
+
+.session-load-more:hover,
+.session-load-more:focus-visible {
+  border-color: var(--accent);
+  color: var(--fg);
+  outline: none;
+}
+
 .session-row {
   width: 100%;
   min-height: 52px;
@@ -613,6 +632,73 @@ button, select {
   flex-direction: column;
   gap: 9px;
 }
+
+.timeline-summary-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0 2px;
+  font-family: var(--mono);
+}
+
+.timeline-summary-head strong {
+  font-size: 12px;
+}
+
+.timeline-summary-head span {
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+
+.timeline-summary-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.timeline-summary-lane {
+  display: grid;
+  grid-template-columns: 190px minmax(640px, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.timeline-summary-track {
+  height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background:
+    repeating-linear-gradient(
+      90deg,
+      transparent 0,
+      transparent calc(20% - 1px),
+      rgba(155, 152, 141, 0.16) calc(20% - 1px),
+      rgba(155, 152, 141, 0.16) 20%
+    ),
+    var(--surface-2);
+  overflow: hidden;
+}
+
+.timeline-summary-scale {
+  display: flex;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 3px;
+}
+
+.timeline-summary-fill {
+  display: block;
+  min-width: 2px;
+  height: 100%;
+}
+
+.timeline-summary-fill.state-working { background: var(--green); }
+.timeline-summary-fill.state-waiting { background: var(--yellow); }
+.timeline-summary-fill.state-error { background: var(--red); }
+.timeline-summary-fill.state-idle { background: var(--fg-dim); }
+.timeline-summary-fill.source-human { background: var(--cyan); }
+.timeline-summary-fill.source-tmux { background: var(--accent); }
 
 .timeline-group {
   display: flex;

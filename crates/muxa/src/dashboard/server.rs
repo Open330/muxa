@@ -26,13 +26,13 @@ use axum::{
 use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime, UtcOffset};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
@@ -45,7 +45,10 @@ use crate::metrics::Metrics;
 use crate::scope_filter::ScopeExclusions;
 use crate::session::{SessionBackend, SharedSessionBackend};
 use crate::state::{Agent, SharedStore, Transition};
-use crate::timeline::{self, TimelineBuildInput, TimelineFilters};
+use crate::timeline::{
+    self, TimelineBuildInput, TimelineDocument, TimelineFilters, TimelineInterval,
+    TimelineIntervalSource, TimelineLane, TimelineLaneKind, TimelineRange, TimelineTotals,
+};
 use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
@@ -65,6 +68,12 @@ const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// `O(num_states)` atomic loads and the cache + mutex go away.
 const AGENTS_BY_STATE_CACHE_TTL: Duration = Duration::from_secs(1);
 
+/// Timeline data is historical and does not need to be reparsed for every
+/// browser refresh. The live agent state still arrives over SSE, while this
+/// short cache removes repeated NDJSON parsing during bursts and reconnects.
+const ACTIVITY_LEDGER_CACHE_TTL: Duration = Duration::from_secs(10);
+const TIMELINE_SUMMARY_CACHE_TTL: Duration = Duration::from_secs(15);
+
 /// Cached `agents_by_state` histogram with the wall-clock instant it
 /// was computed. Lives inside [`AppState`] behind a `tokio::sync::Mutex`
 /// so concurrent scrapes coalesce on a single recompute when the cache
@@ -75,6 +84,16 @@ struct AgentsByStateCache {
     /// refresh in place. We don't pre-populate at construction because
     /// it would force `AppState::new` to be `async`.
     value: Option<(Instant, BTreeMap<String, u64>, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct ActivityLedgerCache {
+    value: Option<(PathBuf, Instant, Arc<Vec<crate::activity::ActivityEntry>>)>,
+}
+
+#[derive(Debug, Default)]
+struct TimelineSummaryCache {
+    value: Option<(TimelineSummaryCacheKey, Instant, TimelineSummaryResponse)>,
 }
 
 /// Application state shared by every handler. Cheap to clone (all
@@ -102,6 +121,13 @@ pub struct AppState {
     /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
     /// and the eventual plan to replace this with per-state atomics.
     agents_by_state_cache: Arc<tokio::sync::Mutex<AgentsByStateCache>>,
+    /// Short-lived parsed ledger cache shared by summary and detail timeline
+    /// requests. Entries are immutable behind an `Arc`, so handlers do not
+    /// clone the full retained activity set.
+    activity_ledger_cache: Arc<tokio::sync::Mutex<ActivityLedgerCache>>,
+    /// Compact final response cache. This protects the daemon from multiple
+    /// dashboard tabs rebuilding the same retained-history projection at once.
+    timeline_summary_cache: Arc<tokio::sync::Mutex<TimelineSummaryCache>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,6 +156,12 @@ impl AppState {
             session_activity_path: None,
             stats_config: StatsConfig::default(),
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
+            activity_ledger_cache: Arc::new(
+                tokio::sync::Mutex::new(ActivityLedgerCache::default()),
+            ),
+            timeline_summary_cache: Arc::new(tokio::sync::Mutex::new(
+                TimelineSummaryCache::default(),
+            )),
         }
     }
 
@@ -438,12 +470,144 @@ struct TimelineQuery {
     exclude_session: Option<String>,
     /// Agent kind in `snake_case`.
     agent: Option<String>,
+    /// `detail` preserves the original response. `summary` omits raw intervals
+    /// and returns compact all-session aggregates for the dashboard.
+    view: Option<TimelineView>,
+    /// Browser-local UTC offset used to group summary days. For example, Seoul
+    /// sends `540` and New York standard time sends `-300`.
+    timezone_offset_minutes: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TimelineView {
+    Detail,
+    Summary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimelineSummaryCacheKey {
+    since: String,
+    session: Option<String>,
+    exclude_pane: Option<String>,
+    exclude_session: Option<String>,
+    agent: Option<String>,
+    timezone_offset_minutes: i32,
+}
+
+impl TimelineSummaryCacheKey {
+    fn from_query(query: &TimelineQuery) -> Self {
+        Self {
+            since: query.since.clone().unwrap_or_else(|| "24h".to_string()),
+            session: query.session.clone(),
+            exclude_pane: query.exclude_pane.clone(),
+            exclude_session: query.exclude_session.clone(),
+            agent: query.agent.clone(),
+            timezone_offset_minutes: query.timezone_offset_minutes.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSummaryResponse {
+    #[serde(with = "time::serde::rfc3339")]
+    generated_at: OffsetDateTime,
+    range: TimelineRange,
+    #[serde(with = "time::serde::rfc3339")]
+    window_started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_ended_at: OffsetDateTime,
+    lanes: Vec<TimelineLane>,
+    totals: TimelineTotals,
+    active_sessions: Vec<timeline::TimelineActiveSession>,
+    notes: Vec<String>,
+    summary: TimelineSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSummary {
+    version: u8,
+    sessions: Vec<TimelineSessionSummary>,
+    days: Vec<TimelineDaySummary>,
+    sources: Vec<TimelineSourceSummary>,
+    human_presence_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSessionSummary {
+    label: String,
+    lanes: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    latest_at: Option<OffsetDateTime>,
+    totals: TimelineTotals,
+    human_presence_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineDaySummary {
+    date: String,
+    totals: TimelineTotals,
+    top_sessions: Vec<timeline::TimelineActiveSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSourceSummary {
+    kind: TimelineLaneKind,
+    lanes: usize,
+    sessions: usize,
+    totals: TimelineTotals,
+}
+
+#[derive(Debug)]
+struct TimelineSessionAccumulator {
+    lanes: usize,
+    latest_at: Option<OffsetDateTime>,
+    totals: TimelineTotals,
+    human_presence: Vec<(OffsetDateTime, OffsetDateTime)>,
+}
+
+impl TimelineSessionAccumulator {
+    fn new() -> Self {
+        Self {
+            lanes: 0,
+            latest_at: None,
+            totals: TimelineTotals::default(),
+            human_presence: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TimelineDayAccumulator {
+    totals: TimelineTotals,
+    sessions: BTreeMap<String, u64>,
+}
+
+impl TimelineDayAccumulator {
+    fn new() -> Self {
+        Self {
+            totals: TimelineTotals::default(),
+            sessions: BTreeMap::new(),
+        }
+    }
 }
 
 async fn timeline_handler(
     State(state): State<AppState>,
     Query(query): Query<TimelineQuery>,
 ) -> Response {
+    let summary_cache_key = (query.view == Some(TimelineView::Summary))
+        .then(|| TimelineSummaryCacheKey::from_query(&query));
+    if let Some(cache_key) = summary_cache_key.as_ref() {
+        if let Some(response) = cached_timeline_summary(&state, cache_key).await {
+            return Json(response).into_response();
+        }
+    }
+
     let now = OffsetDateTime::now_utc();
     let since = query.since.as_deref().unwrap_or("24h");
     let range = match timeline::parse_since(since, now, "all retained activity") {
@@ -467,19 +631,19 @@ async fn timeline_handler(
         }
     };
 
-    let mut notes = Vec::new();
-    let activity_entries = if let Some(path) = state.activity_path.as_ref() {
-        match crate::activity::load(path).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                notes.push(format!("could not load activity ledger: {e}"));
-                Vec::new()
-            }
+    let timezone_offset = match timeline_timezone_offset(query.timezone_offset_minutes) {
+        Ok(offset) => offset,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
         }
-    } else {
-        notes.push("activity ledger is not available to the dashboard".to_string());
-        Vec::new()
     };
+
+    let mut notes = Vec::new();
+    let activity_entries = load_cached_activity_entries(&state, &mut notes).await;
     let session_activities = match state.session_activity_path.as_ref() {
         Some(path) => crate::session_activity::load(path).await,
         None => Vec::new(),
@@ -493,29 +657,398 @@ async fn timeline_handler(
         .map(|pane| (pane.pane_id.clone(), pane.session.clone()))
         .collect::<HashMap<_, _>>();
 
-    Json(timeline::build_document(TimelineBuildInput {
-        now,
-        range,
-        prompt_entries: &prompt_entries,
-        activity_entries: &activity_entries,
-        agents: &agents,
-        session_activities: &session_activities,
-        pane_sessions: &pane_sessions,
-        active_lookback_secs: state.stats_config.active_lookback_secs,
-        active_timeout_secs: state.stats_config.active_timeout_secs,
-        active_tick_timeout_secs: state.stats_config.active_tick_timeout_secs,
-        count_tmux_input: state.stats_config.count_tmux_input,
-        filters: TimelineFilters {
-            session: query.session,
-            agent_kind,
-            exclusions: ScopeExclusions::new(
-                split_query_patterns(query.exclude_pane),
-                split_query_patterns(query.exclude_session),
-            ),
+    let stats_config = state.stats_config.clone();
+    let document = match tokio::task::spawn_blocking(move || {
+        timeline::build_document(TimelineBuildInput {
+            now,
+            range,
+            prompt_entries: &prompt_entries,
+            activity_entries: activity_entries.as_slice(),
+            agents: &agents,
+            session_activities: &session_activities,
+            pane_sessions: &pane_sessions,
+            active_lookback_secs: stats_config.active_lookback_secs,
+            active_timeout_secs: stats_config.active_timeout_secs,
+            active_tick_timeout_secs: stats_config.active_tick_timeout_secs,
+            count_tmux_input: stats_config.count_tmux_input,
+            filters: TimelineFilters {
+                session: query.session,
+                agent_kind,
+                exclusions: ScopeExclusions::new(
+                    split_query_patterns(query.exclude_pane),
+                    split_query_patterns(query.exclude_session),
+                ),
+            },
+            notes,
+        })
+    })
+    .await
+    {
+        Ok(document) => document,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "ok": false, "error": format!("timeline projection failed: {error}") }),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(cache_key) = summary_cache_key {
+        let response = build_timeline_summary_response(document, timezone_offset);
+        store_timeline_summary(&state, cache_key, response.clone()).await;
+        Json(response).into_response()
+    } else {
+        Json(document).into_response()
+    }
+}
+
+async fn cached_timeline_summary(
+    state: &AppState,
+    cache_key: &TimelineSummaryCacheKey,
+) -> Option<TimelineSummaryResponse> {
+    let cache = state.timeline_summary_cache.lock().await;
+    let (stored_key, cached_at, response) = cache.value.as_ref()?;
+    (stored_key == cache_key && cached_at.elapsed() < TIMELINE_SUMMARY_CACHE_TTL)
+        .then(|| response.clone())
+}
+
+async fn store_timeline_summary(
+    state: &AppState,
+    cache_key: TimelineSummaryCacheKey,
+    response: TimelineSummaryResponse,
+) {
+    state.timeline_summary_cache.lock().await.value = Some((cache_key, Instant::now(), response));
+}
+
+async fn load_cached_activity_entries(
+    state: &AppState,
+    notes: &mut Vec<String>,
+) -> Arc<Vec<crate::activity::ActivityEntry>> {
+    let Some(path) = state.activity_path.as_ref() else {
+        notes.push("activity ledger is not available to the dashboard".to_string());
+        return Arc::new(Vec::new());
+    };
+
+    let mut cache = state.activity_ledger_cache.lock().await;
+    if let Some((cached_path, cached_at, entries)) = cache.value.as_ref() {
+        if cached_path == path && cached_at.elapsed() < ACTIVITY_LEDGER_CACHE_TTL {
+            return Arc::clone(entries);
+        }
+    }
+
+    match crate::activity::load(path).await {
+        Ok(entries) => {
+            let entries = Arc::new(entries);
+            cache.value = Some((path.clone(), Instant::now(), Arc::clone(&entries)));
+            entries
+        }
+        Err(error) => {
+            notes.push(format!("could not load activity ledger: {error}"));
+            Arc::new(Vec::new())
+        }
+    }
+}
+
+fn timeline_timezone_offset(minutes: Option<i32>) -> Result<UtcOffset, String> {
+    let minutes = minutes.unwrap_or(0);
+    let seconds = minutes
+        .checked_mul(60)
+        .ok_or_else(|| format!("invalid timezone offset {minutes}"))?;
+    UtcOffset::from_whole_seconds(seconds)
+        .map_err(|_| format!("invalid timezone offset {minutes}; expected minutes from UTC"))
+}
+
+fn build_timeline_summary_response(
+    document: TimelineDocument,
+    timezone_offset: UtcOffset,
+) -> TimelineSummaryResponse {
+    let summary = build_timeline_summary(&document, timezone_offset);
+    TimelineSummaryResponse {
+        generated_at: document.generated_at,
+        range: document.range,
+        window_started_at: document.window_started_at,
+        window_ended_at: document.window_ended_at,
+        lanes: Vec::new(),
+        totals: document.totals,
+        active_sessions: document.active_sessions,
+        notes: document.notes,
+        summary,
+    }
+}
+
+fn build_timeline_summary(
+    document: &TimelineDocument,
+    timezone_offset: UtcOffset,
+) -> TimelineSummary {
+    let active_by_session = document
+        .active_sessions
+        .iter()
+        .map(|session| (session.label.as_str(), session.active_secs))
+        .collect::<HashMap<_, _>>();
+    let mut sessions = BTreeMap::<String, TimelineSessionAccumulator>::new();
+
+    for lane in &document.lanes {
+        let label = timeline_lane_session_label(lane);
+        let session = sessions
+            .entry(label)
+            .or_insert_with(TimelineSessionAccumulator::new);
+        session.lanes += 1;
+        add_timeline_totals(&mut session.totals, &lane.totals);
+        for interval in &lane.intervals {
+            session.latest_at = Some(
+                session
+                    .latest_at
+                    .map_or(interval.ended_at, |latest| latest.max(interval.ended_at)),
+            );
+            if matches!(
+                interval.source,
+                TimelineIntervalSource::HumanInteraction
+                    | TimelineIntervalSource::SessionForeground
+            ) {
+                session
+                    .human_presence
+                    .push((interval.started_at, interval.ended_at));
+            }
+        }
+    }
+
+    let sessions = sessions
+        .into_iter()
+        .map(|(label, mut session)| {
+            session.totals.active_secs =
+                active_by_session.get(label.as_str()).copied().unwrap_or(0);
+            TimelineSessionSummary {
+                label,
+                lanes: session.lanes,
+                latest_at: session.latest_at,
+                totals: session.totals,
+                human_presence_secs: merged_duration_secs(&mut session.human_presence),
+            }
+        })
+        .collect::<Vec<_>>();
+    let human_presence_secs = sessions
+        .iter()
+        .map(|session| session.human_presence_secs)
+        .sum();
+
+    TimelineSummary {
+        version: 1,
+        sessions,
+        days: build_timeline_day_summaries(document, timezone_offset),
+        sources: build_timeline_source_summaries(document),
+        human_presence_secs,
+    }
+}
+
+fn build_timeline_source_summaries(document: &TimelineDocument) -> Vec<TimelineSourceSummary> {
+    [
+        TimelineLaneKind::Agent,
+        TimelineLaneKind::Human,
+        TimelineLaneKind::Tmux,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let mut totals = TimelineTotals::default();
+        let mut lanes = 0usize;
+        let mut sessions = BTreeSet::new();
+        for lane in document.lanes.iter().filter(|lane| lane.kind == kind) {
+            lanes += 1;
+            sessions.insert(timeline_lane_session_label(lane));
+            add_timeline_totals(&mut totals, &lane.totals);
+        }
+        if kind == TimelineLaneKind::Agent {
+            totals.active_secs = document.totals.active_secs;
+        }
+        TimelineSourceSummary {
+            kind,
+            lanes,
+            sessions: sessions.len(),
+            totals,
+        }
+    })
+    .collect()
+}
+
+fn build_timeline_day_summaries(
+    document: &TimelineDocument,
+    timezone_offset: UtcOffset,
+) -> Vec<TimelineDaySummary> {
+    let mut days = BTreeMap::<Date, TimelineDayAccumulator>::new();
+    let mut date = document.window_started_at.to_offset(timezone_offset).date();
+    let final_date = (document.window_ended_at - time::Duration::nanoseconds(1))
+        .to_offset(timezone_offset)
+        .date();
+    while date <= final_date {
+        days.insert(date, TimelineDayAccumulator::new());
+        let Some(next) = date.next_day() else {
+            break;
+        };
+        date = next;
+    }
+
+    for lane in &document.lanes {
+        for interval in &lane.intervals {
+            add_interval_to_timeline_days(
+                &mut days,
+                lane,
+                interval,
+                document.window_started_at,
+                document.window_ended_at,
+                timezone_offset,
+            );
+        }
+    }
+
+    days.into_iter()
+        .map(|(date, day)| {
+            let mut top_sessions = day.sessions.into_iter().collect::<Vec<_>>();
+            top_sessions
+                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            top_sessions.truncate(3);
+            TimelineDaySummary {
+                date: date.to_string(),
+                totals: day.totals,
+                top_sessions: top_sessions
+                    .into_iter()
+                    .map(|(label, active_secs)| timeline::TimelineActiveSession {
+                        label,
+                        active_secs,
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn add_interval_to_timeline_days(
+    days: &mut BTreeMap<Date, TimelineDayAccumulator>,
+    lane: &TimelineLane,
+    interval: &TimelineInterval,
+    window_started_at: OffsetDateTime,
+    window_ended_at: OffsetDateTime,
+    timezone_offset: UtcOffset,
+) {
+    let mut cursor = interval.started_at.max(window_started_at);
+    let ended_at = interval.ended_at.min(window_ended_at);
+    while cursor < ended_at {
+        let date = cursor.to_offset(timezone_offset).date();
+        let Some(next_date) = date.next_day() else {
+            break;
+        };
+        let next_day = next_date.midnight().assume_offset(timezone_offset);
+        let segment_end = ended_at.min(next_day);
+        let duration_secs =
+            u64::try_from((segment_end - cursor).whole_seconds().max(0)).unwrap_or(0);
+        if duration_secs == 0 {
+            break;
+        }
+        if let Some(day) = days.get_mut(&date) {
+            add_interval_secs(&mut day.totals, interval, duration_secs);
+            if interval_is_active(interval) {
+                let label = interval
+                    .session_name
+                    .clone()
+                    .or_else(|| lane.session_name.clone())
+                    .or_else(|| interval.session_id.clone())
+                    .or_else(|| lane.session_id.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let total = day.sessions.entry(label).or_default();
+                *total = total.saturating_add(duration_secs);
+            }
+        }
+        cursor = segment_end;
+    }
+}
+
+fn add_interval_secs(totals: &mut TimelineTotals, interval: &TimelineInterval, secs: u64) {
+    match interval.source {
+        TimelineIntervalSource::HumanInteraction => {
+            totals.human_secs = totals.human_secs.saturating_add(secs);
+        }
+        TimelineIntervalSource::SessionForeground => {
+            totals.foreground_secs = totals.foreground_secs.saturating_add(secs);
+        }
+        TimelineIntervalSource::AgentState => match interval.state {
+            Some(AgentState::Working) => {
+                totals.working_secs = totals.working_secs.saturating_add(secs);
+            }
+            Some(AgentState::WaitingInput | AgentState::WaitingChoice) => {
+                totals.waiting_secs = totals.waiting_secs.saturating_add(secs);
+            }
+            Some(AgentState::Error) => {
+                totals.error_secs = totals.error_secs.saturating_add(secs);
+            }
+            Some(AgentState::Idle) => {
+                totals.idle_secs = totals.idle_secs.saturating_add(secs);
+            }
+            Some(AgentState::Starting) => {
+                totals.starting_secs = totals.starting_secs.saturating_add(secs);
+            }
+            Some(AgentState::Stopped) => {
+                totals.stopped_secs = totals.stopped_secs.saturating_add(secs);
+            }
+            None => {}
         },
-        notes,
-    }))
-    .into_response()
+    }
+}
+
+fn interval_is_active(interval: &TimelineInterval) -> bool {
+    match interval.source {
+        TimelineIntervalSource::HumanInteraction | TimelineIntervalSource::SessionForeground => {
+            true
+        }
+        TimelineIntervalSource::AgentState => matches!(
+            interval.state,
+            Some(
+                AgentState::Working
+                    | AgentState::WaitingInput
+                    | AgentState::WaitingChoice
+                    | AgentState::Error
+            )
+        ),
+    }
+}
+
+fn timeline_lane_session_label(lane: &TimelineLane) -> String {
+    lane.session_name
+        .clone()
+        .or_else(|| lane.session_id.clone())
+        .unwrap_or_else(|| "no session".to_string())
+}
+
+fn add_timeline_totals(total: &mut TimelineTotals, next: &TimelineTotals) {
+    total.active_secs = total.active_secs.saturating_add(next.active_secs);
+    total.working_secs = total.working_secs.saturating_add(next.working_secs);
+    total.waiting_secs = total.waiting_secs.saturating_add(next.waiting_secs);
+    total.error_secs = total.error_secs.saturating_add(next.error_secs);
+    total.idle_secs = total.idle_secs.saturating_add(next.idle_secs);
+    total.starting_secs = total.starting_secs.saturating_add(next.starting_secs);
+    total.stopped_secs = total.stopped_secs.saturating_add(next.stopped_secs);
+    total.human_secs = total.human_secs.saturating_add(next.human_secs);
+    total.foreground_secs = total.foreground_secs.saturating_add(next.foreground_secs);
+}
+
+fn merged_duration_secs(intervals: &mut [(OffsetDateTime, OffsetDateTime)]) -> u64 {
+    intervals.sort_unstable_by_key(|(started_at, ended_at)| (*started_at, *ended_at));
+    let Some(&(mut started_at, mut ended_at)) = intervals.first() else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for &(next_start, next_end) in &intervals[1..] {
+        if next_start <= ended_at {
+            ended_at = ended_at.max(next_end);
+        } else {
+            total = total.saturating_add(
+                u64::try_from((ended_at - started_at).whole_seconds().max(0)).unwrap_or(0),
+            );
+            started_at = next_start;
+            ended_at = next_end;
+        }
+    }
+    total.saturating_add(u64::try_from((ended_at - started_at).whole_seconds().max(0)).unwrap_or(0))
 }
 
 fn split_query_patterns(raw: Option<String>) -> Vec<String> {
@@ -964,6 +1497,57 @@ mod tests {
         assert!(v["active_sessions"].is_array());
         assert!(v["totals"]["active_secs"].is_number());
         assert!(v["notes"].is_array());
+    }
+
+    #[tokio::test]
+    async fn timeline_summary_endpoint_omits_raw_lanes_and_returns_aggregates() {
+        let app = router(fresh_state());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=24h&view=summary&timezone_offset_minutes=540")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["lanes"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["summary"]["version"], 1);
+        assert!(v["summary"]["sessions"].is_array());
+        assert!(v["summary"]["days"].is_array());
+        assert_eq!(v["summary"]["sources"].as_array().map(Vec::len), Some(3));
+        assert!(v["summary"]["human_presence_secs"].is_number());
+
+        let cached = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=24h&view=summary&timezone_offset_minutes=540")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::OK);
+        let cached = body_json(cached).await;
+        assert_eq!(cached["generated_at"], v["generated_at"]);
+    }
+
+    #[tokio::test]
+    async fn timeline_summary_rejects_invalid_timezone_offset() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?view=summary&timezone_offset_minutes=99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

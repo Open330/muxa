@@ -30,7 +30,10 @@ const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
 const PANES_REFETCH_INTERVAL_MS = 5000;
 const TERMINALS_REFETCH_INTERVAL_MS = 2000;
-const TIMELINE_REFETCH_INTERVAL_MS = 5000;
+const TIMELINE_REFETCH_INTERVAL_MS = 30000;
+const TIMELINE_MIN_REFRESH_INTERVAL_MS = 10000;
+const TIMELINE_EVENT_DEBOUNCE_MS = 2000;
+const SESSION_PAGE_SIZE = 40;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
@@ -79,8 +82,11 @@ function authHeaders() {
 
 // ── HTTP helpers ───────────────────────────────────────────────────
 
-async function jsonFetch(path) {
-  const resp = await fetch(path, { headers: authHeaders() });
+async function jsonFetch(path, options = {}) {
+  const resp = await fetch(path, {
+    ...options,
+    headers: { ...authHeaders(), ...(options.headers || {}) },
+  });
   if (resp.status === 401) {
     setConnectionStatus("dead", "401 — bad or missing token");
     throw new Error("unauthorized");
@@ -258,12 +264,14 @@ const store = {
   terminalSessions: [], // SessionRef[]
   paneErrors: [], // ScanError[]
   timeline: null, // TimelineDocument
+  timelineSummary: null, // compact all-session TimelineDocument
   timelineSessions: new Set(),
   ui: {
     collapsedPanels: loadSet(COLLAPSED_PANELS_KEY),
     collapsedTimelineGroups: loadSet(COLLAPSED_TIMELINE_GROUPS_KEY),
     activeTab: loadValue(DATA_TAB_KEY, "agents"),
     sessionSort: normalizeSessionSort(loadValue(SESSION_SORT_KEY, "priority")),
+    sessionLimit: SESSION_PAGE_SIZE,
     selectedSegment: null,
     selectedTimelineDay: "",
   },
@@ -325,13 +333,17 @@ function laneMatchesSelectedSession(lane) {
 }
 
 function setSelectedSession(session) {
-  store.filters.timelineSession = session || "";
+  const next = session || "";
+  if (store.filters.timelineSession === next && store.timeline) return;
+  store.filters.timelineSession = next;
   store.ui.selectedSegment = null;
   if (dom.timelineSession) dom.timelineSession.value = store.filters.timelineSession;
+  store.timeline = null;
   renderTimeline();
   renderAgents();
   renderPanes();
   renderInspector();
+  fetchTimeline({ force: true }).catch(() => {});
 }
 
 // Copy text to clipboard. Uses the async Clipboard API when available
@@ -382,7 +394,7 @@ function renderCounts() {
 }
 
 function renderOverview() {
-  const agents = [...store.agents.values()];
+  const agents = [...store.agents.values()].filter(agentMatchesSelectedSession);
   const working = agents.filter((a) => a.state === "working").length;
   const waiting = agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length;
   const errors = agents.filter((a) => a.state === "error").length;
@@ -392,19 +404,22 @@ function renderOverview() {
   dom.metricWaiting.textContent = String(waiting);
   dom.metricErrors.textContent = String(errors);
   dom.metricActive.textContent = formatDuration(totals.active_secs || 0);
-  dom.metricHuman.textContent = formatDuration(humanPresenceSecs(lanes));
+  dom.metricHuman.textContent = formatDuration(
+    store.timeline?.summary?.human_presence_secs ?? humanPresenceSecs(lanes)
+  );
   dom.metricTmux.textContent = formatDuration(totals.foreground_secs || 0);
 }
 
 function renderSessionSidebar() {
   const summaries = buildSessionSummaries();
-  dom.sessionsMeta.textContent = `${summaries.length} total`;
-  if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
-  if (summaries.length === 0) {
-    dom.sessionList.innerHTML = `<div class="empty-block">no sessions</div>`;
-    return;
-  }
+  const visible = summaries.slice(0, store.ui.sessionLimit);
   const active = selectedSession();
+  if (active && !visible.some((summary) => summary.label === active)) {
+    const selected = summaries.find((summary) => summary.label === active);
+    if (selected) visible.push(selected);
+  }
+  dom.sessionsMeta.textContent = `${Math.min(store.ui.sessionLimit, summaries.length)}/${summaries.length}`;
+  if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
   const allAgents = store.agents.size;
   const allWaiting = [...store.agents.values()].filter((a) =>
     a.state === "waiting_input" || a.state === "waiting_choice" || a.state === "error"
@@ -418,7 +433,7 @@ function renderSessionSidebar() {
     </span>
     <span class="session-score">${allWaiting}</span>
   </button>`;
-  const rows = summaries.map((s) => {
+  const rows = visible.map((s) => {
     const stateClass = s.errors > 0 ? "error" : s.waiting > 0 ? "waiting" : s.working > 0 ? "working" : "idle";
     return `<button class="session-row${s.label === active ? " active" : ""}" type="button" data-session="${esc(s.label)}">
       <span class="session-dot ${stateClass}"></span>
@@ -429,9 +444,17 @@ function renderSessionSidebar() {
       <span class="session-score">${esc(sessionScoreLabel(s, store.ui.sessionSort))}</span>
     </button>`;
   }).join("");
-  dom.sessionList.innerHTML = allRow + rows;
+  const remaining = Math.max(0, summaries.length - store.ui.sessionLimit);
+  const loadMore = remaining > 0
+    ? `<button class="session-load-more" type="button" data-load-more-sessions>show ${Math.min(SESSION_PAGE_SIZE, remaining)} more · ${remaining} hidden</button>`
+    : "";
+  dom.sessionList.innerHTML = allRow + rows + loadMore;
   dom.sessionList.querySelectorAll("[data-session]").forEach((row) => {
     row.addEventListener("click", () => setSelectedSession(row.getAttribute("data-session") || ""));
+  });
+  dom.sessionList.querySelector("[data-load-more-sessions]")?.addEventListener("click", () => {
+    store.ui.sessionLimit += SESSION_PAGE_SIZE;
+    renderSessionSidebar();
   });
 }
 
@@ -456,15 +479,25 @@ function buildSessionSummaries() {
     return map.get(key);
   };
 
-  for (const lane of store.timeline?.lanes || []) {
-    const label = lane.session_name || lane.session_id || "no session";
-    const s = ensure(label);
-    s.lanes += 1;
-    addTimelineTotals(s.totals, lane.totals || {});
-    for (const interval of lane.intervals || []) {
-      if (interval.open) continue;
-      const latest = interval.ended_at || interval.started_at || "";
-      if (latest > s.latest) s.latest = latest;
+  const compactSessions = store.timelineSummary?.summary?.sessions || [];
+  for (const summary of compactSessions) {
+    const s = ensure(summary.label);
+    s.lanes = summary.lanes || 0;
+    s.latest = summary.latest_at || "";
+    s.totals = { ...emptyTimelineTotals(), ...(summary.totals || {}) };
+    s.human_presence_secs = summary.human_presence_secs || 0;
+  }
+  if (compactSessions.length === 0) {
+    for (const lane of store.timeline?.lanes || []) {
+      const label = lane.session_name || lane.session_id || "no session";
+      const s = ensure(label);
+      s.lanes += 1;
+      addTimelineTotals(s.totals, lane.totals || {});
+      for (const interval of lane.intervals || []) {
+        if (interval.open) continue;
+        const latest = interval.ended_at || interval.started_at || "";
+        if (latest > s.latest) s.latest = latest;
+      }
     }
   }
   for (const agent of store.agents.values()) {
@@ -478,15 +511,17 @@ function buildSessionSummaries() {
   for (const pane of store.panes) {
     ensure(pane.session).panes += 1;
   }
-  for (const active of store.timeline?.active_sessions || []) {
+  for (const active of store.timelineSummary?.active_sessions || store.timeline?.active_sessions || []) {
     ensure(active.label).totals.active_secs = active.active_secs || 0;
   }
-  for (const summary of map.values()) {
-    summary.human_presence_secs = humanPresenceSecs(
-      (store.timeline?.lanes || []).filter((lane) =>
-        (lane.session_name || lane.session_id || "no session") === summary.label
-      )
-    );
+  if (compactSessions.length === 0) {
+    for (const summary of map.values()) {
+      summary.human_presence_secs = humanPresenceSecs(
+        (store.timeline?.lanes || []).filter((lane) =>
+          (lane.session_name || lane.session_id || "no session") === summary.label
+        )
+      );
+    }
   }
 
   return [...map.values()].sort(compareSessionSummaries);
@@ -581,6 +616,19 @@ function renderTimeline() {
     renderInspector();
     return;
   }
+
+  const compactSummary = !selectedSession() ? doc.summary : null;
+  if (compactSummary) {
+    dom.timelineAxis.innerHTML = "";
+    renderTimelineHeatmap(summaryDayBuckets(compactSummary.days || []));
+    renderAllSessionsTimelineSummary(compactSummary);
+    dom.timelineMeta.textContent = `${compactSummary.sessions?.length || 0} sessions · partial summary`;
+    renderOverview();
+    renderSessionSidebar();
+    renderInspector();
+    return;
+  }
+
   renderTimelineAxis(start, end);
 
   const lanes = (doc.lanes || []).filter(laneMatchesSelectedSession);
@@ -620,6 +668,84 @@ function renderTimeline() {
   renderOverview();
   renderSessionSidebar();
   renderInspector();
+}
+
+function renderAllSessionsTimelineSummary(summary) {
+  const sources = summary.sources || [];
+  const maxSecs = Math.max(1, ...sources.map((source) => sourceSummarySecs(source)));
+  dom.timelineBody.innerHTML = `
+    <div class="timeline-summary-head">
+      <strong>All sessions overview</strong>
+      <span>aggregated · select a session for exact intervals</span>
+    </div>
+    <div class="timeline-summary-lanes">
+      ${sources.map((source) => renderTimelineSummaryLane(source, maxSecs)).join("")}
+    </div>`;
+}
+
+function renderTimelineSummaryLane(source, maxSecs) {
+  const secs = sourceSummarySecs(source);
+  const width = secs > 0 ? Math.max(1, (secs / maxSecs) * 100) : 0;
+  const totals = source.totals || {};
+  const label = source.kind === "human" ? "interaction" : source.kind || "agent";
+  const segments = source.kind === "agent"
+    ? renderAgentSummarySegments(totals)
+    : `<span class="timeline-summary-fill source-${source.kind === "tmux" ? "tmux" : "human"}" style="width:100%"></span>`;
+  return `<div class="timeline-summary-lane">
+    <div class="timeline-label">
+      <span>${esc(label)}</span>
+      <small>${esc(sourceSummaryLabel(source))}</small>
+    </div>
+    <div class="timeline-summary-track">
+      <div class="timeline-summary-scale" style="width:${width}%">${segments}</div>
+    </div>
+  </div>`;
+}
+
+function renderAgentSummarySegments(totals) {
+  const parts = [
+    ["state-working", totals.working_secs || 0],
+    ["state-waiting", totals.waiting_secs || 0],
+    ["state-error", totals.error_secs || 0],
+  ];
+  const total = parts.reduce((sum, [, secs]) => sum + secs, 0);
+  if (!total) return "";
+  return parts
+    .filter(([, secs]) => secs > 0)
+    .map(([cls, secs]) => `<span class="timeline-summary-fill ${cls}" style="width:${(secs / total) * 100}%"></span>`)
+    .join("");
+}
+
+function sourceSummarySecs(source) {
+  const totals = source.totals || {};
+  if (source.kind === "human") return totals.human_secs || 0;
+  if (source.kind === "tmux") return totals.foreground_secs || 0;
+  return (totals.working_secs || 0) +
+    (totals.waiting_secs || 0) +
+    (totals.error_secs || 0);
+}
+
+function sourceSummaryLabel(source) {
+  const totals = source.totals || {};
+  const suffix = `${source.sessions || 0} sessions · ${source.lanes || 0} lanes`;
+  if (source.kind === "human") return `interact ${formatDuration(totals.human_secs || 0)} · ${suffix}`;
+  if (source.kind === "tmux") return `tmux ${formatDuration(totals.foreground_secs || 0)} · ${suffix}`;
+  return [
+    totals.active_secs ? `act ${formatDuration(totals.active_secs)}` : "",
+    totals.working_secs ? `work ${formatDuration(totals.working_secs)}` : "",
+    totals.waiting_secs ? `wait ${formatDuration(totals.waiting_secs)}` : "",
+    totals.error_secs ? `err ${formatDuration(totals.error_secs)}` : "",
+    suffix,
+  ].filter(Boolean).join(" · ");
+}
+
+function summaryDayBuckets(days) {
+  return days.map((day) => ({
+    key: day.date,
+    dateMs: new Date(`${day.date}T00:00:00`).getTime(),
+    totals: { ...emptyTimelineTotals(), ...(day.totals || {}) },
+    sessions: new Map((day.top_sessions || []).map((session) => [session.label, session.active_secs || 0])),
+  }));
 }
 
 function renderTimelineLane(lane, start, end, grouped) {
@@ -827,7 +953,7 @@ function dayTotalsLabel(totals) {
   const active = activeTimelineSecs(totals);
   if (!active) return "—";
   return [
-    ["active", active],
+    ["activity", active],
     ["work", totals.working_secs],
     ["wait", totals.waiting_secs],
     ["err", totals.error_secs],
@@ -1092,6 +1218,7 @@ function laneTotalsLabel(totals) {
 }
 
 function renderTimelineSessionOptions(doc) {
+  store.timelineSessions.clear();
   for (const p of store.panes || []) {
     if (p.session) store.timelineSessions.add(p.session);
   }
@@ -1100,6 +1227,9 @@ function renderTimelineSessionOptions(doc) {
     if (lane.session_id) store.timelineSessions.add(lane.session_id);
   }
   for (const session of doc.active_sessions || []) {
+    if (session.label) store.timelineSessions.add(session.label);
+  }
+  for (const session of store.timelineSummary?.summary?.sessions || doc.summary?.sessions || []) {
     if (session.label) store.timelineSessions.add(session.label);
   }
   const current = store.filters.timelineSession;
@@ -1404,8 +1534,11 @@ function renderStaticChips() {
 function setTimelineRange(range, selectedDay = "") {
   store.filters.timelineRange = range;
   store.ui.selectedTimelineDay = selectedDay;
+  store.timelineSummary = null;
   syncTimelineRangeChips();
-  fetchTimeline().catch(() => {});
+  store.timeline = null;
+  renderTimeline();
+  fetchTimeline({ force: true }).catch(() => {});
 }
 
 function syncTimelineRangeChips() {
@@ -1436,6 +1569,7 @@ function initSessionControls() {
   dom.showAllSessions.addEventListener("click", () => setSelectedSession(""));
   dom.sessionSort?.addEventListener("change", () => {
     store.ui.sessionSort = normalizeSessionSort(dom.sessionSort.value);
+    store.ui.sessionLimit = SESSION_PAGE_SIZE;
     saveValue(SESSION_SORT_KEY, store.ui.sessionSort);
     renderSessionSidebar();
   });
@@ -1459,6 +1593,9 @@ function initCollapseControls() {
         store.ui.collapsedPanels.delete(panelId);
       }
       saveSet(COLLAPSED_PANELS_KEY, store.ui.collapsedPanels);
+      if (panelId === "timeline-panel" && !next) {
+        fetchTimeline({ force: true }).catch(() => {});
+      }
     });
   });
 }
@@ -1493,9 +1630,11 @@ function renderInspector() {
     agents: agents.length,
     panes: panes.length,
     totals: store.timeline?.totals || emptyTimelineTotals(),
-    human_presence_secs: humanPresenceSecs(store.timeline?.lanes || []),
+    human_presence_secs: store.timeline?.summary?.human_presence_secs ?? humanPresenceSecs(store.timeline?.lanes || []),
   };
-  const humanSecs = activeSummary.human_presence_secs ?? humanPresenceSecs(store.timeline?.lanes || []);
+  const humanSecs = activeSummary.human_presence_secs ??
+    store.timeline?.summary?.human_presence_secs ??
+    humanPresenceSecs(store.timeline?.lanes || []);
 
   dom.inspectorBody.innerHTML = `
     <div class="inspector-title">
@@ -1636,10 +1775,58 @@ async function fetchTerminalSessions() {
   renderTerminals();
 }
 
-async function fetchTimeline() {
-  const params = new URLSearchParams({ since: store.filters.timelineRange });
-  store.timeline = await jsonFetch(`/api/timeline?${params.toString()}`);
-  renderTimeline();
+let timelineRequest = null;
+let timelineRequestKey = "";
+let timelineRequestController = null;
+let lastTimelineFetchAt = 0;
+
+function timelineCanRefresh() {
+  return !document.hidden && !store.ui.collapsedPanels.has("timeline-panel");
+}
+
+function currentTimelineRequestKey() {
+  return `${store.filters.timelineRange}\u0000${selectedSession()}`;
+}
+
+async function fetchTimeline({ force = false } = {}) {
+  if (!force && !timelineCanRefresh()) return;
+  const session = selectedSession();
+  const requestKey = currentTimelineRequestKey();
+  if (timelineRequest && timelineRequestKey === requestKey) return timelineRequest;
+  if (timelineRequestController) timelineRequestController.abort();
+
+  const params = new URLSearchParams({
+    since: store.filters.timelineRange,
+    timezone_offset_minutes: String(-new Date().getTimezoneOffset()),
+  });
+  if (session) {
+    params.set("session", session);
+  } else {
+    params.set("view", "summary");
+  }
+
+  const controller = new AbortController();
+  timelineRequestController = controller;
+  timelineRequestKey = requestKey;
+  timelineRequest = (async () => {
+    try {
+      const data = await jsonFetch(`/api/timeline?${params.toString()}`, { signal: controller.signal });
+      if (currentTimelineRequestKey() !== requestKey) return;
+      store.timeline = data;
+      if (!session) store.timelineSummary = data;
+      lastTimelineFetchAt = Date.now();
+      renderTimeline();
+    } catch (error) {
+      if (error?.name !== "AbortError") throw error;
+    } finally {
+      if (timelineRequestController === controller) {
+        timelineRequest = null;
+        timelineRequestKey = "";
+        timelineRequestController = null;
+      }
+    }
+  })();
+  return timelineRequest;
 }
 
 async function fetchHealth() {
@@ -1672,11 +1859,12 @@ function applyTransition(t) {
 
 let timelineRefreshTimer = null;
 function scheduleTimelineRefresh() {
-  if (timelineRefreshTimer) return;
+  if (!selectedSession() || timelineRefreshTimer || !timelineCanRefresh()) return;
+  const cooldown = Math.max(0, TIMELINE_MIN_REFRESH_INTERVAL_MS - (Date.now() - lastTimelineFetchAt));
   timelineRefreshTimer = setTimeout(() => {
     timelineRefreshTimer = null;
     fetchTimeline().catch(() => {});
-  }, 500);
+  }, Math.max(TIMELINE_EVENT_DEBOUNCE_MS, cooldown));
 }
 
 // ── Boot ──────────────────────────────────────────────────────────
@@ -1699,7 +1887,7 @@ async function main() {
     fetchAgentsSnapshot(),
     fetchPanes(),
     fetchTerminalSessions(),
-    fetchTimeline(),
+    fetchTimeline({ force: true }),
   ]);
 
   // Periodically refetch panes — they are pull-only on the server.
@@ -1716,6 +1904,12 @@ async function main() {
   setInterval(() => {
     fetchTimeline().catch(() => {});
   }, TIMELINE_REFETCH_INTERVAL_MS);
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && Date.now() - lastTimelineFetchAt >= TIMELINE_MIN_REFRESH_INTERVAL_MS) {
+      fetchTimeline().catch(() => {});
+    }
+  });
 
   // Subscribe to live events.
   streamEvents(
