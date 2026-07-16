@@ -7,11 +7,14 @@
 
 use crate::event::{AgentKind, AgentState};
 use serde::{Deserialize, Serialize};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(not(unix))]
+use std::time::SystemTime;
 use time::OffsetDateTime;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -362,6 +365,125 @@ pub async fn load(path: &Path) -> std::io::Result<Vec<ActivityEntry>> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created_at: Option<SystemTime>,
+}
+
+impl ActivityFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                created_at: metadata.created().ok(),
+            }
+        }
+    }
+}
+
+/// Append-aware parsed activity ledger snapshot.
+///
+/// Normal appends seek directly to the previously observed byte offset. Atomic
+/// compaction replacement and truncation trigger a full reload. Bytes after the
+/// final newline are retained until the writer completes that NDJSON record.
+#[derive(Debug, Default)]
+pub(crate) struct ActivityCache {
+    path: Option<PathBuf>,
+    identity: Option<ActivityFileIdentity>,
+    read_len: u64,
+    pending: Vec<u8>,
+    entries: Arc<Vec<ActivityEntry>>,
+}
+
+impl ActivityCache {
+    pub(crate) async fn refresh(
+        &mut self,
+        path: &Path,
+    ) -> std::io::Result<Arc<Vec<ActivityEntry>>> {
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.reset(path.to_path_buf(), None);
+                return Ok(Arc::clone(&self.entries));
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata().await?;
+        let identity = ActivityFileIdentity::from_metadata(&metadata);
+        let append_only = self.path.as_deref() == Some(path)
+            && self.identity.as_ref() == Some(&identity)
+            && metadata.len() >= self.read_len;
+        if append_only && metadata.len() == self.read_len {
+            return Ok(Arc::clone(&self.entries));
+        }
+
+        let read_from = if append_only { self.read_len } else { 0 };
+        file.seek(SeekFrom::Start(read_from)).await?;
+        let mut appended = Vec::new();
+        file.read_to_end(&mut appended).await?;
+        if !append_only {
+            self.reset(path.to_path_buf(), Some(identity.clone()));
+        }
+        self.read_len = read_from.saturating_add(u64::try_from(appended.len()).unwrap_or(u64::MAX));
+        self.identity = Some(identity);
+        self.parse_appended(path, appended);
+        Ok(Arc::clone(&self.entries))
+    }
+
+    pub(crate) fn snapshot(&self) -> Arc<Vec<ActivityEntry>> {
+        Arc::clone(&self.entries)
+    }
+
+    fn reset(&mut self, path: PathBuf, identity: Option<ActivityFileIdentity>) {
+        self.path = Some(path);
+        self.identity = identity;
+        self.read_len = 0;
+        self.pending.clear();
+        self.entries = Arc::new(Vec::new());
+    }
+
+    fn parse_appended(&mut self, path: &Path, appended: Vec<u8>) {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(&appended);
+        let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+            self.pending = bytes;
+            return;
+        };
+        self.pending.extend_from_slice(&bytes[last_newline + 1..]);
+
+        let entries = Arc::make_mut(&mut self.entries);
+        let mut skipped = 0usize;
+        for line in bytes[..=last_newline].split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<ActivityEntry>(line) {
+                Ok(entry) if entry.schema_version() == ACTIVITY_SCHEMA_VERSION => {
+                    entries.push(entry);
+                }
+                Ok(_) | Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            debug!(skipped, path = %path.display(), "skipped unreadable activity lines");
+        }
+    }
+}
+
 pub async fn append_entry(path: &Path, entry: &ActivityEntry) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -579,6 +701,134 @@ mod tests {
 
         let entries = load(&path).await.unwrap();
         assert_eq!(entries, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn activity_cache_reads_only_appended_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let first = foreground_entry("$1", "first", 0, 5);
+        let second = foreground_entry("$2", "second", 5, 10);
+        append_entry(&path, &first).await.unwrap();
+
+        let mut cache = ActivityCache::default();
+        let initial = cache.refresh(&path).await.unwrap();
+        assert_eq!(initial.as_slice(), std::slice::from_ref(&first));
+        let initial_len = cache.read_len;
+
+        append_entry(&path, &second).await.unwrap();
+        let refreshed = cache.refresh(&path).await.unwrap();
+        assert!(cache.read_len > initial_len);
+        assert_eq!(refreshed.as_slice(), &[first, second]);
+    }
+
+    #[tokio::test]
+    async fn activity_cache_waits_for_complete_final_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let entry = foreground_entry("$1", "main", 0, 5);
+        let encoded = serde_json::to_vec(&entry).unwrap();
+        let split_at = encoded.len() / 2;
+        tokio::fs::write(&path, &encoded[..split_at]).await.unwrap();
+
+        let mut cache = ActivityCache::default();
+        assert!(cache.refresh(&path).await.unwrap().is_empty());
+
+        let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+        file.write_all(&encoded[split_at..]).await.unwrap();
+        file.write_all(b"\n").await.unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(cache.refresh(&path).await.unwrap().as_slice(), &[entry]);
+    }
+
+    #[tokio::test]
+    async fn activity_cache_reloads_after_atomic_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let first = foreground_entry("$1", "first", 0, 5);
+        let replacement = foreground_entry("$2", "replacement", 5, 10);
+        append_entry(&path, &first).await.unwrap();
+
+        let mut cache = ActivityCache::default();
+        assert_eq!(cache.refresh(&path).await.unwrap().as_slice(), &[first]);
+
+        atomic_rewrite(&path, std::slice::from_ref(&replacement))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.refresh(&path).await.unwrap().as_slice(),
+            &[replacement]
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_cache_reloads_after_in_place_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let first = foreground_entry("$1", "first-session-with-long-name", 0, 5);
+        let second = foreground_entry("$2", "second-session-with-long-name", 5, 10);
+        append_entry(&path, &first).await.unwrap();
+        append_entry(&path, &second).await.unwrap();
+
+        let mut cache = ActivityCache::default();
+        assert_eq!(cache.refresh(&path).await.unwrap().len(), 2);
+
+        let replacement = foreground_entry("$3", "short", 10, 15);
+        let mut encoded = serde_json::to_vec(&replacement).unwrap();
+        encoded.push(b'\n');
+        tokio::fs::write(&path, encoded).await.unwrap();
+        assert_eq!(
+            cache.refresh(&path).await.unwrap().as_slice(),
+            &[replacement]
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_cache_preserves_snapshot_when_replacement_read_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let backup = tmp.path().join("activity.backup");
+        let entry = foreground_entry("$1", "main", 0, 5);
+        append_entry(&path, &entry).await.unwrap();
+
+        let mut cache = ActivityCache::default();
+        assert_eq!(
+            cache.refresh(&path).await.unwrap().as_slice(),
+            std::slice::from_ref(&entry)
+        );
+        tokio::fs::rename(&path, &backup).await.unwrap();
+        tokio::fs::create_dir(&path).await.unwrap();
+
+        assert!(cache.refresh(&path).await.is_err());
+        assert_eq!(cache.snapshot().as_slice(), &[entry]);
+    }
+
+    #[tokio::test]
+    async fn activity_cache_clears_snapshot_when_file_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("activity.ndjson");
+        let entry = foreground_entry("$1", "main", 0, 5);
+        append_entry(&path, &entry).await.unwrap();
+
+        let mut cache = ActivityCache::default();
+        assert_eq!(cache.refresh(&path).await.unwrap().as_slice(), &[entry]);
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(cache.refresh(&path).await.unwrap().is_empty());
+    }
+
+    fn foreground_entry(
+        session_id: &str,
+        session_name: &str,
+        started_second: u8,
+        ended_second: u8,
+    ) -> ActivityEntry {
+        let base = datetime!(2026-05-31 00:00:00 UTC);
+        ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+            session_id,
+            session_name,
+            base + time::Duration::seconds(i64::from(started_second)),
+            base + time::Duration::seconds(i64::from(ended_second)),
+        ))
     }
 
     #[tokio::test]

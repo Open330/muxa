@@ -114,7 +114,7 @@ pub enum TimelineIntervalSource {
     SessionForeground,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct TimelineTotals {
     pub active_secs: u64,
     pub working_secs: u64,
@@ -158,6 +158,45 @@ pub struct TimelineBuildInput<'a> {
     pub count_tmux_input: bool,
     pub filters: TimelineFilters,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineSummaryProjection {
+    pub generated_at: OffsetDateTime,
+    pub range: TimelineRange,
+    pub window_started_at: OffsetDateTime,
+    pub window_ended_at: OffsetDateTime,
+    pub totals: TimelineTotals,
+    pub active_sessions: Vec<TimelineActiveSession>,
+    pub notes: Vec<String>,
+    pub sessions: Vec<TimelineSessionProjection>,
+    pub days: Vec<TimelineDayProjection>,
+    pub sources: Vec<TimelineSourceProjection>,
+    pub human_presence_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineSessionProjection {
+    pub label: String,
+    pub lanes: usize,
+    pub latest_at: Option<OffsetDateTime>,
+    pub totals: TimelineTotals,
+    pub human_presence_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineDayProjection {
+    pub date: String,
+    pub totals: TimelineTotals,
+    pub top_sessions: Vec<TimelineActiveSession>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineSourceProjection {
+    pub kind: TimelineLaneKind,
+    pub lanes: usize,
+    pub sessions: usize,
+    pub totals: TimelineTotals,
 }
 
 #[must_use]
@@ -477,6 +516,242 @@ pub fn build_document(input: TimelineBuildInput<'_>) -> TimelineDocument {
     }
 }
 
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn build_summary(
+    input: TimelineBuildInput<'_>,
+    timezone_offset: UtcOffset,
+) -> TimelineSummaryProjection {
+    let mut lanes = BTreeMap::<String, SummaryLaneAccumulator<'_>>::new();
+
+    for entry in input.activity_entries {
+        match entry {
+            ActivityEntry::StateTransition(entry) => {
+                let session_name = entry.session_name.as_deref().or_else(|| {
+                    entry
+                        .pane
+                        .as_ref()
+                        .and_then(|pane| input.pane_sessions.get(pane))
+                        .map(String::as_str)
+                });
+                if !matches_session_filter(
+                    &input.filters,
+                    Some(&entry.session_id),
+                    session_name,
+                    entry.pane.as_deref(),
+                ) || !matches_agent_filter(&input.filters, Some(entry.kind))
+                {
+                    continue;
+                }
+                let started_at = entry.state_entered_at.unwrap_or_else(|| {
+                    entry.at
+                        - time::Duration::seconds(
+                            i64::try_from(entry.duration_secs).unwrap_or(i64::MAX),
+                        )
+                });
+                let Some((started_at, ended_at)) =
+                    clip_interval(&input.range, input.now, started_at, entry.at)
+                else {
+                    continue;
+                };
+                push_summary_span(
+                    &mut lanes,
+                    agent_lane_id(entry.kind, &entry.session_id),
+                    TimelineLaneKind::Agent,
+                    session_name.unwrap_or(&entry.session_id),
+                    session_name.unwrap_or(&entry.session_id),
+                    SummarySpan {
+                        source: TimelineIntervalSource::AgentState,
+                        state: Some(entry.from),
+                        human_kind: None,
+                        started_at,
+                        ended_at,
+                        open: false,
+                        pane: entry.pane.as_deref(),
+                        session_id: Some(&entry.session_id),
+                        session_name,
+                        cwd: entry.cwd.as_deref(),
+                    },
+                );
+            }
+            ActivityEntry::SessionForeground(entry) => {
+                if !matches_session_filter(
+                    &input.filters,
+                    Some(&entry.session_id),
+                    Some(&entry.session_name),
+                    None,
+                ) {
+                    continue;
+                }
+                let Some((started_at, ended_at)) =
+                    clip_interval(&input.range, input.now, entry.started_at, entry.ended_at)
+                else {
+                    continue;
+                };
+                push_summary_span(
+                    &mut lanes,
+                    tmux_lane_id(&entry.session_id, &entry.session_name),
+                    TimelineLaneKind::Tmux,
+                    &entry.session_name,
+                    &entry.session_name,
+                    SummarySpan {
+                        source: TimelineIntervalSource::SessionForeground,
+                        state: None,
+                        human_kind: None,
+                        started_at,
+                        ended_at,
+                        open: false,
+                        pane: None,
+                        session_id: Some(&entry.session_id),
+                        session_name: Some(&entry.session_name),
+                        cwd: None,
+                    },
+                );
+            }
+            ActivityEntry::HumanInteraction(entry) => {
+                if !matches_session_filter(
+                    &input.filters,
+                    entry.session_id.as_deref(),
+                    entry.session_name.as_deref(),
+                    entry.pane.as_deref(),
+                ) {
+                    continue;
+                }
+                let Some((started_at, ended_at)) =
+                    clip_interval(&input.range, input.now, entry.started_at, entry.ended_at)
+                else {
+                    continue;
+                };
+                let lane_label = human_lane_label(
+                    entry.session_id.as_deref(),
+                    entry.session_name.as_deref(),
+                    entry.pane.as_deref(),
+                );
+                push_summary_span(
+                    &mut lanes,
+                    human_lane_id(
+                        entry.session_id.as_deref(),
+                        entry.session_name.as_deref(),
+                        entry.pane.as_deref(),
+                    ),
+                    TimelineLaneKind::Human,
+                    entry
+                        .session_name
+                        .as_deref()
+                        .or(entry.session_id.as_deref())
+                        .unwrap_or("no session"),
+                    entry
+                        .session_name
+                        .as_deref()
+                        .or(entry.session_id.as_deref())
+                        .unwrap_or(&lane_label),
+                    SummarySpan {
+                        source: TimelineIntervalSource::HumanInteraction,
+                        state: None,
+                        human_kind: Some(entry.kind),
+                        started_at,
+                        ended_at,
+                        open: false,
+                        pane: entry.pane.as_deref(),
+                        session_id: entry.session_id.as_deref(),
+                        session_name: entry.session_name.as_deref(),
+                        cwd: None,
+                    },
+                );
+            }
+        }
+    }
+
+    for agent in input.agents {
+        if agent.state == AgentState::Stopped || !live_agent_has_range_activity(agent, &input.range)
+        {
+            continue;
+        }
+        let session_name = agent
+            .pane
+            .as_ref()
+            .and_then(|pane| input.pane_sessions.get(pane))
+            .map(String::as_str);
+        if !matches_session_filter(
+            &input.filters,
+            Some(&agent.session_id),
+            session_name,
+            agent.pane.as_deref(),
+        ) || !matches_agent_filter(&input.filters, Some(agent.kind))
+        {
+            continue;
+        }
+        let Some((started_at, ended_at)) =
+            clip_interval(&input.range, input.now, agent.state_entered_at, input.now)
+        else {
+            continue;
+        };
+        push_summary_span(
+            &mut lanes,
+            agent_lane_id(agent.kind, &agent.session_id),
+            TimelineLaneKind::Agent,
+            session_name.unwrap_or(&agent.session_id),
+            session_name.unwrap_or(&agent.session_id),
+            SummarySpan {
+                source: TimelineIntervalSource::AgentState,
+                state: Some(agent.state),
+                human_kind: None,
+                started_at,
+                ended_at,
+                open: true,
+                pane: agent.pane.as_deref(),
+                session_id: Some(&agent.session_id),
+                session_name,
+                cwd: agent.cwd.as_deref(),
+            },
+        );
+    }
+
+    for activity in input.session_activities {
+        let Some(attached_since) = activity.attached_since else {
+            continue;
+        };
+        if !matches_session_filter(
+            &input.filters,
+            Some(&activity.session_id),
+            Some(&activity.name),
+            None,
+        ) {
+            continue;
+        }
+        let Some((started_at, ended_at)) =
+            clip_interval(&input.range, input.now, attached_since, input.now)
+        else {
+            continue;
+        };
+        push_summary_span(
+            &mut lanes,
+            tmux_lane_id(&activity.session_id, &activity.name),
+            TimelineLaneKind::Tmux,
+            &activity.name,
+            &activity.name,
+            SummarySpan {
+                source: TimelineIntervalSource::SessionForeground,
+                state: None,
+                human_kind: None,
+                started_at,
+                ended_at,
+                open: true,
+                pane: None,
+                session_id: Some(&activity.session_id),
+                session_name: Some(&activity.name),
+                cwd: None,
+            },
+        );
+    }
+
+    let lanes = lanes
+        .into_values()
+        .map(SummaryLaneAccumulator::finish)
+        .collect::<Vec<_>>();
+    finish_summary_projection(input, timezone_offset, lanes)
+}
+
 pub fn parse_since(
     raw: &str,
     now: OffsetDateTime,
@@ -710,6 +985,446 @@ impl LaneAccumulator {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SummarySpan<'a> {
+    source: TimelineIntervalSource,
+    state: Option<AgentState>,
+    human_kind: Option<HumanInteractionKind>,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    open: bool,
+    pane: Option<&'a str>,
+    session_id: Option<&'a str>,
+    session_name: Option<&'a str>,
+    cwd: Option<&'a str>,
+}
+
+#[derive(Debug)]
+struct SummaryLaneAccumulator<'a> {
+    kind: TimelineLaneKind,
+    session_label: String,
+    day_session_label: String,
+    spans: Vec<SummarySpan<'a>>,
+}
+
+impl<'a> SummaryLaneAccumulator<'a> {
+    fn finish(mut self) -> SummaryLane<'a> {
+        self.spans
+            .sort_unstable_by_key(|span| (span.started_at, span.ended_at));
+        let mut merged = Vec::with_capacity(self.spans.len());
+        for span in self.spans {
+            if let Some(previous) = merged.last_mut() {
+                if summary_spans_mergeable(previous, &span) {
+                    previous.ended_at = previous.ended_at.max(span.ended_at);
+                    continue;
+                }
+            }
+            merged.push(span);
+        }
+        let mut totals = TimelineTotals::default();
+        for span in &merged {
+            add_summary_span_secs(
+                &mut totals,
+                span,
+                duration_secs(span.started_at, span.ended_at),
+            );
+        }
+        SummaryLane {
+            kind: self.kind,
+            session_label: self.session_label,
+            day_session_label: self.day_session_label,
+            totals,
+            spans: merged,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SummaryLane<'a> {
+    kind: TimelineLaneKind,
+    session_label: String,
+    day_session_label: String,
+    totals: TimelineTotals,
+    spans: Vec<SummarySpan<'a>>,
+}
+
+#[derive(Debug)]
+struct SummarySessionAccumulator {
+    lanes: usize,
+    latest_at: Option<OffsetDateTime>,
+    totals: TimelineTotals,
+    human_presence: Vec<(OffsetDateTime, OffsetDateTime)>,
+}
+
+impl SummarySessionAccumulator {
+    fn new() -> Self {
+        Self {
+            lanes: 0,
+            latest_at: None,
+            totals: TimelineTotals::default(),
+            human_presence: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SummaryDayAccumulator {
+    totals: TimelineTotals,
+    sessions: BTreeMap<String, u64>,
+}
+
+impl SummaryDayAccumulator {
+    fn new() -> Self {
+        Self {
+            totals: TimelineTotals::default(),
+            sessions: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SummarySourceAccumulator {
+    lanes: usize,
+    sessions: BTreeSet<String>,
+    totals: TimelineTotals,
+}
+
+struct SummaryAggregation {
+    totals: TimelineTotals,
+    sessions: BTreeMap<String, SummarySessionAccumulator>,
+    sources: [SummarySourceAccumulator; 3],
+    days: BTreeMap<Date, SummaryDayAccumulator>,
+}
+
+impl SummarySourceAccumulator {
+    fn new() -> Self {
+        Self {
+            lanes: 0,
+            sessions: BTreeSet::new(),
+            totals: TimelineTotals::default(),
+        }
+    }
+}
+
+fn push_summary_span<'a>(
+    lanes: &mut BTreeMap<String, SummaryLaneAccumulator<'a>>,
+    lane_id: String,
+    kind: TimelineLaneKind,
+    session_label: &str,
+    day_session_label: &str,
+    span: SummarySpan<'a>,
+) {
+    lanes
+        .entry(lane_id)
+        .or_insert_with(|| SummaryLaneAccumulator {
+            kind,
+            session_label: session_label.to_string(),
+            day_session_label: day_session_label.to_string(),
+            spans: Vec::new(),
+        })
+        .spans
+        .push(span);
+}
+
+fn summary_spans_mergeable(previous: &SummarySpan<'_>, next: &SummarySpan<'_>) -> bool {
+    previous.source == next.source
+        && previous.state == next.state
+        && previous.human_kind == next.human_kind
+        && previous.open == next.open
+        && previous.pane == next.pane
+        && previous.session_id == next.session_id
+        && previous.session_name == next.session_name
+        && previous.cwd == next.cwd
+        && previous.ended_at >= next.started_at
+}
+
+fn finish_summary_projection(
+    input: TimelineBuildInput<'_>,
+    timezone_offset: UtcOffset,
+    lanes: Vec<SummaryLane<'_>>,
+) -> TimelineSummaryProjection {
+    let earliest_span = lanes
+        .iter()
+        .flat_map(|lane| lane.spans.iter().map(|span| span.started_at))
+        .min();
+    let window_ended_at = input.range.effective_end(input.now);
+    let mut window_started_at = input
+        .range
+        .since_at
+        .or(earliest_span)
+        .unwrap_or(input.now - time::Duration::hours(1));
+    if window_ended_at <= window_started_at {
+        window_started_at = window_ended_at - time::Duration::seconds(1);
+    }
+
+    let active_sessions = active_sessions_for_input(&input);
+    let active_by_session = active_sessions
+        .iter()
+        .map(|session| (session.label.as_str(), session.active_secs))
+        .collect::<HashMap<_, _>>();
+    let SummaryAggregation {
+        mut totals,
+        sessions,
+        mut sources,
+        days,
+    } = aggregate_summary_lanes(&lanes, window_started_at, window_ended_at, timezone_offset);
+
+    totals.active_secs = active_sessions
+        .iter()
+        .map(|session| session.active_secs)
+        .sum();
+    sources[0].totals.active_secs = totals.active_secs;
+    let sessions = sessions
+        .into_iter()
+        .map(|(label, mut session)| {
+            session.totals.active_secs =
+                active_by_session.get(label.as_str()).copied().unwrap_or(0);
+            TimelineSessionProjection {
+                label,
+                lanes: session.lanes,
+                latest_at: session.latest_at,
+                totals: session.totals,
+                human_presence_secs: merged_summary_duration_secs(&mut session.human_presence),
+            }
+        })
+        .collect::<Vec<_>>();
+    let human_presence_secs = sessions
+        .iter()
+        .map(|session| session.human_presence_secs)
+        .sum();
+    let sources = [
+        TimelineLaneKind::Agent,
+        TimelineLaneKind::Human,
+        TimelineLaneKind::Tmux,
+    ]
+    .into_iter()
+    .zip(sources)
+    .map(|(kind, source)| TimelineSourceProjection {
+        kind,
+        lanes: source.lanes,
+        sessions: source.sessions.len(),
+        totals: source.totals,
+    })
+    .collect();
+    let days = finish_summary_days(days);
+    let mut notes = input.notes;
+    if lanes.is_empty() {
+        notes.push("no timeline intervals in this view".to_string());
+    }
+
+    TimelineSummaryProjection {
+        generated_at: input.now,
+        range: input.range,
+        window_started_at,
+        window_ended_at,
+        totals,
+        active_sessions,
+        notes,
+        sessions,
+        days,
+        sources,
+        human_presence_secs,
+    }
+}
+
+fn aggregate_summary_lanes(
+    lanes: &[SummaryLane<'_>],
+    window_started_at: OffsetDateTime,
+    window_ended_at: OffsetDateTime,
+    timezone_offset: UtcOffset,
+) -> SummaryAggregation {
+    let mut aggregation = SummaryAggregation {
+        totals: TimelineTotals::default(),
+        sessions: BTreeMap::new(),
+        sources: [
+            SummarySourceAccumulator::new(),
+            SummarySourceAccumulator::new(),
+            SummarySourceAccumulator::new(),
+        ],
+        days: summary_days(window_started_at, window_ended_at, timezone_offset),
+    };
+    for lane in lanes {
+        aggregation.totals.add_totals(&lane.totals);
+        let source = &mut aggregation.sources[usize::from(lane_rank(lane.kind))];
+        source.lanes += 1;
+        source.sessions.insert(lane.session_label.clone());
+        source.totals.add_totals(&lane.totals);
+
+        let session = aggregation
+            .sessions
+            .entry(lane.session_label.clone())
+            .or_insert_with(SummarySessionAccumulator::new);
+        session.lanes += 1;
+        session.totals.add_totals(&lane.totals);
+        for span in &lane.spans {
+            session.latest_at = Some(
+                session
+                    .latest_at
+                    .map_or(span.ended_at, |latest| latest.max(span.ended_at)),
+            );
+            if matches!(
+                span.source,
+                TimelineIntervalSource::HumanInteraction
+                    | TimelineIntervalSource::SessionForeground
+            ) {
+                session
+                    .human_presence
+                    .push((span.started_at, span.ended_at));
+            }
+            let day_session_label = span
+                .session_name
+                .or(span.session_id)
+                .unwrap_or(&lane.day_session_label);
+            add_summary_span_to_days(
+                &mut aggregation.days,
+                day_session_label,
+                span,
+                window_started_at,
+                window_ended_at,
+                timezone_offset,
+            );
+        }
+    }
+    aggregation
+}
+
+fn summary_days(
+    window_started_at: OffsetDateTime,
+    window_ended_at: OffsetDateTime,
+    timezone_offset: UtcOffset,
+) -> BTreeMap<Date, SummaryDayAccumulator> {
+    let mut days = BTreeMap::new();
+    let mut date = window_started_at.to_offset(timezone_offset).date();
+    let final_date = (window_ended_at - time::Duration::nanoseconds(1))
+        .to_offset(timezone_offset)
+        .date();
+    while date <= final_date {
+        days.insert(date, SummaryDayAccumulator::new());
+        let Some(next) = date.next_day() else {
+            break;
+        };
+        date = next;
+    }
+    days
+}
+
+fn add_summary_span_to_days(
+    days: &mut BTreeMap<Date, SummaryDayAccumulator>,
+    session_label: &str,
+    span: &SummarySpan<'_>,
+    window_started_at: OffsetDateTime,
+    window_ended_at: OffsetDateTime,
+    timezone_offset: UtcOffset,
+) {
+    let mut cursor = span.started_at.max(window_started_at);
+    let ended_at = span.ended_at.min(window_ended_at);
+    while cursor < ended_at {
+        let date = cursor.to_offset(timezone_offset).date();
+        let Some(next_date) = date.next_day() else {
+            break;
+        };
+        let segment_end = ended_at.min(next_date.midnight().assume_offset(timezone_offset));
+        let secs = duration_secs(cursor, segment_end);
+        if secs == 0 {
+            break;
+        }
+        if let Some(day) = days.get_mut(&date) {
+            add_summary_span_secs(&mut day.totals, span, secs);
+            if summary_span_is_active(span) {
+                let total = day.sessions.entry(session_label.to_string()).or_default();
+                *total = total.saturating_add(secs);
+            }
+        }
+        cursor = segment_end;
+    }
+}
+
+fn finish_summary_days(days: BTreeMap<Date, SummaryDayAccumulator>) -> Vec<TimelineDayProjection> {
+    days.into_iter()
+        .map(|(date, day)| {
+            let mut top_sessions = day.sessions.into_iter().collect::<Vec<_>>();
+            top_sessions
+                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            top_sessions.truncate(3);
+            TimelineDayProjection {
+                date: date.to_string(),
+                totals: day.totals,
+                top_sessions: top_sessions
+                    .into_iter()
+                    .map(|(label, active_secs)| TimelineActiveSession { label, active_secs })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn add_summary_span_secs(totals: &mut TimelineTotals, span: &SummarySpan<'_>, secs: u64) {
+    match span.source {
+        TimelineIntervalSource::HumanInteraction => {
+            totals.human_secs = totals.human_secs.saturating_add(secs);
+        }
+        TimelineIntervalSource::SessionForeground => {
+            totals.foreground_secs = totals.foreground_secs.saturating_add(secs);
+        }
+        TimelineIntervalSource::AgentState => match span.state {
+            Some(AgentState::Working) => {
+                totals.working_secs = totals.working_secs.saturating_add(secs);
+            }
+            Some(AgentState::WaitingInput | AgentState::WaitingChoice) => {
+                totals.waiting_secs = totals.waiting_secs.saturating_add(secs);
+            }
+            Some(AgentState::Error) => {
+                totals.error_secs = totals.error_secs.saturating_add(secs);
+            }
+            Some(AgentState::Idle) => {
+                totals.idle_secs = totals.idle_secs.saturating_add(secs);
+            }
+            Some(AgentState::Starting) => {
+                totals.starting_secs = totals.starting_secs.saturating_add(secs);
+            }
+            Some(AgentState::Stopped) => {
+                totals.stopped_secs = totals.stopped_secs.saturating_add(secs);
+            }
+            None => {}
+        },
+    }
+}
+
+fn summary_span_is_active(span: &SummarySpan<'_>) -> bool {
+    match span.source {
+        TimelineIntervalSource::HumanInteraction | TimelineIntervalSource::SessionForeground => {
+            true
+        }
+        TimelineIntervalSource::AgentState => matches!(
+            span.state,
+            Some(
+                AgentState::Working
+                    | AgentState::WaitingInput
+                    | AgentState::WaitingChoice
+                    | AgentState::Error
+            )
+        ),
+    }
+}
+
+fn merged_summary_duration_secs(intervals: &mut [(OffsetDateTime, OffsetDateTime)]) -> u64 {
+    intervals.sort_unstable_by_key(|(started_at, ended_at)| (*started_at, *ended_at));
+    let Some(&(mut started_at, mut ended_at)) = intervals.first() else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for &(next_start, next_end) in &intervals[1..] {
+        if next_start <= ended_at {
+            ended_at = ended_at.max(next_end);
+        } else {
+            total = total.saturating_add(duration_secs(started_at, ended_at));
+            started_at = next_start;
+            ended_at = next_end;
+        }
+    }
+    total.saturating_add(duration_secs(started_at, ended_at))
+}
+
 impl TimelineTotals {
     fn add_interval(&mut self, interval: &TimelineInterval) {
         match interval.source {
@@ -808,6 +1523,7 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
     let active_timeout = secs_to_duration(input.active_timeout_secs);
     let active_tick_timeout = secs_to_duration(input.active_tick_timeout_secs);
     let active_presences = active_human_presence_intervals(input, ActivePresenceMode::Active);
+    let active_presence_index = ActivePresenceIndex::new(&active_presences);
 
     for prompt in input.prompt_entries {
         if !input.range.includes_end(prompt.at) {
@@ -837,7 +1553,7 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
             session_name,
             &prompt.session_id,
         ) {
-            for segment in overlapping_active_presence_segments(&interval, &active_presences) {
+            for segment in overlapping_active_presence_segments(&interval, &active_presence_index) {
                 intervals.push(ActiveAnchor {
                     interval: segment,
                     group_key: group_key.clone(),
@@ -880,7 +1596,7 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
             entry.session_id.as_deref().unwrap_or("human_interaction"),
         ) {
             let group_key = active_human_group_key(&interval);
-            for segment in overlapping_active_presence_segments(&interval, &active_presences) {
+            for segment in overlapping_active_presence_segments(&interval, &active_presence_index) {
                 intervals.push(ActiveAnchor {
                     interval: segment,
                     group_key: group_key.clone(),
@@ -891,8 +1607,9 @@ fn active_anchor_intervals(input: &TimelineBuildInput<'_>) -> Vec<ActiveAnchor> 
     }
 
     let presences = active_human_presence_intervals(input, ActivePresenceMode::Thinking);
+    let presence_index = ActivePresenceIndex::new(&presences);
     for attention in active_attention_intervals(input) {
-        for segment in overlapping_active_presence_segments(&attention.interval, &presences) {
+        for segment in overlapping_active_presence_segments(&attention.interval, &presence_index) {
             let anchor = segment.started_at;
             intervals.push(ActiveAnchor {
                 interval: segment,
@@ -1158,29 +1875,55 @@ fn is_attention_state(state: AgentState) -> bool {
     )
 }
 
-fn active_intervals_relate(a: &ActiveScopedInterval, b: &ActiveScopedInterval) -> bool {
-    if let (Some(a_pane), Some(b_pane)) = (a.pane.as_deref(), b.pane.as_deref()) {
-        if a_pane == b_pane {
-            return true;
+struct ActivePresenceIndex<'a> {
+    intervals: &'a [ActiveScopedInterval],
+    by_pane: HashMap<&'a str, Vec<usize>>,
+    by_session: HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'a> ActivePresenceIndex<'a> {
+    fn new(intervals: &'a [ActiveScopedInterval]) -> Self {
+        let mut index = Self {
+            intervals,
+            by_pane: HashMap::new(),
+            by_session: HashMap::new(),
+        };
+        for (position, interval) in intervals.iter().enumerate() {
+            if let Some(pane) = interval.pane.as_deref() {
+                index.by_pane.entry(pane).or_default().push(position);
+            }
+            if let Some(session) = interval.session_name.as_deref() {
+                index.by_session.entry(session).or_default().push(position);
+            }
         }
+        index
     }
-    if let (Some(a_session), Some(b_session)) =
-        (a.session_name.as_deref(), b.session_name.as_deref())
-    {
-        return a_session == b_session;
+
+    fn candidates(&self, attention: &ActiveScopedInterval) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        if let Some(pane) = attention.pane.as_deref() {
+            if let Some(positions) = self.by_pane.get(pane) {
+                candidates.extend_from_slice(positions);
+            }
+        }
+        if let Some(session) = attention.session_name.as_deref() {
+            if let Some(positions) = self.by_session.get(session) {
+                candidates.extend_from_slice(positions);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
     }
-    false
 }
 
 fn overlapping_active_presence_segments(
     attention: &ActiveScopedInterval,
-    presences: &[ActiveScopedInterval],
+    presences: &ActivePresenceIndex<'_>,
 ) -> Vec<ActiveScopedInterval> {
     let mut segments = Vec::new();
-    for presence in presences {
-        if !active_intervals_relate(attention, presence) {
-            continue;
-        }
+    for position in presences.candidates(attention) {
+        let presence = &presences.intervals[position];
         let started_at = attention.started_at.max(presence.started_at);
         let ended_at = attention.ended_at.min(presence.ended_at);
         if ended_at <= started_at {
@@ -1619,6 +2362,245 @@ mod tests {
             .iter()
             .all(|lane| lane.kind == TimelineLaneKind::Human));
         assert_eq!(doc.totals.human_secs, 240);
+    }
+
+    struct SummaryFixture {
+        now: OffsetDateTime,
+        range: TimelineRange,
+        entries: [ActivityEntry; 4],
+        prompts: [HistoryEntry; 1],
+        pane_sessions: HashMap<String, String>,
+    }
+
+    fn summary_fixture() -> SummaryFixture {
+        let now = datetime!(2026-06-05 01:00:00 UTC);
+        let range = TimelineRange {
+            label: "cross-midnight".into(),
+            since_at: Some(datetime!(2026-06-04 23:55:00 UTC)),
+            until_at: None,
+        };
+        let entries = [
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 00:10:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: Some("/repo".into()),
+                from: AgentState::Working,
+                to: AgentState::Idle,
+                state_entered_at: Some(datetime!(2026-06-04 23:50:00 UTC)),
+            })),
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 00:20:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: Some("/repo".into()),
+                from: AgentState::Working,
+                to: AgentState::WaitingInput,
+                state_entered_at: Some(datetime!(2026-06-05 00:05:00 UTC)),
+            })),
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "main",
+                datetime!(2026-06-04 23:58:00 UTC),
+                datetime!(2026-06-05 00:08:00 UTC),
+            )),
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaPromptInput,
+                pane: Some("%1".into()),
+                session_id: Some("agent-main".into()),
+                session_name: Some("main".into()),
+                started_at: datetime!(2026-06-05 00:00:00 UTC),
+                ended_at: datetime!(2026-06-05 00:05:00 UTC),
+            })),
+        ];
+        let prompts = [HistoryEntry::new(
+            AgentKind::Codex,
+            "agent-main",
+            "%1",
+            "prompt",
+            datetime!(2026-06-05 00:01:00 UTC),
+            None,
+        )];
+        let pane_sessions = HashMap::from([("%1".to_string(), "main".to_string())]);
+        SummaryFixture {
+            now,
+            range,
+            entries,
+            prompts,
+            pane_sessions,
+        }
+    }
+
+    #[test]
+    fn direct_summary_matches_detail_projection_and_day_buckets() {
+        let SummaryFixture {
+            now,
+            range,
+            entries,
+            prompts,
+            pane_sessions,
+        } = summary_fixture();
+        let detail = build_document(TimelineBuildInput {
+            now,
+            range: range.clone(),
+            prompt_entries: &prompts,
+            activity_entries: &entries,
+            agents: &[],
+            session_activities: &[],
+            pane_sessions: &pane_sessions,
+            active_lookback_secs: 60,
+            active_timeout_secs: 300,
+            active_tick_timeout_secs: 300,
+            count_tmux_input: true,
+            filters: TimelineFilters::default(),
+            notes: Vec::new(),
+        });
+        let summary = build_summary(
+            TimelineBuildInput {
+                now,
+                range,
+                prompt_entries: &prompts,
+                activity_entries: &entries,
+                agents: &[],
+                session_activities: &[],
+                pane_sessions: &pane_sessions,
+                active_lookback_secs: 60,
+                active_timeout_secs: 300,
+                active_tick_timeout_secs: 300,
+                count_tmux_input: true,
+                filters: TimelineFilters::default(),
+                notes: Vec::new(),
+            },
+            UtcOffset::UTC,
+        );
+
+        assert_eq!(summary.totals, detail.totals);
+        assert_eq!(summary.active_sessions, detail.active_sessions);
+        assert_eq!(summary.window_started_at, detail.window_started_at);
+        assert_eq!(summary.window_ended_at, detail.window_ended_at);
+        assert_eq!(summary.sessions.len(), 1);
+        assert_eq!(summary.sessions[0].label, "main");
+        assert_eq!(summary.sessions[0].lanes, 3);
+        assert_eq!(summary.sessions[0].totals, detail.totals);
+        assert_eq!(summary.sessions[0].human_presence_secs, 600);
+        assert_eq!(
+            summary.sessions[0].latest_at,
+            Some(datetime!(2026-06-05 00:20:00 UTC))
+        );
+        assert_eq!(summary.days.len(), 2);
+        assert_eq!(summary.days[0].date, "2026-06-04");
+        assert_eq!(summary.days[0].totals.working_secs, 300);
+        assert_eq!(summary.days[0].totals.foreground_secs, 120);
+        assert_eq!(summary.days[1].date, "2026-06-05");
+        assert_eq!(summary.days[1].totals.working_secs, 1_200);
+        assert_eq!(summary.days[1].totals.human_secs, 300);
+        assert_eq!(summary.days[1].totals.foreground_secs, 480);
+        assert_eq!(summary.sources[0].kind, TimelineLaneKind::Agent);
+        assert_eq!(summary.sources[0].lanes, 1);
+        assert_eq!(summary.sources[0].totals.working_secs, 1_500);
+        assert_eq!(summary.sources[1].kind, TimelineLaneKind::Human);
+        assert_eq!(summary.sources[2].kind, TimelineLaneKind::Tmux);
+    }
+
+    #[test]
+    fn direct_summary_preserves_pane_only_day_attribution_label() {
+        let now = datetime!(2026-06-05 01:00:00 UTC);
+        let entries = [ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+            HumanInteractionInput {
+                kind: HumanInteractionKind::MuxaWatch,
+                pane: Some("%9".into()),
+                session_id: None,
+                session_name: None,
+                started_at: datetime!(2026-06-05 00:00:00 UTC),
+                ended_at: datetime!(2026-06-05 00:01:00 UTC),
+            },
+        ))];
+        let summary = build_summary(
+            TimelineBuildInput {
+                now,
+                range: TimelineRange {
+                    label: "hour".into(),
+                    since_at: Some(datetime!(2026-06-05 00:00:00 UTC)),
+                    until_at: None,
+                },
+                prompt_entries: &[],
+                activity_entries: &entries,
+                agents: &[],
+                session_activities: &[],
+                pane_sessions: &HashMap::new(),
+                active_lookback_secs: 60,
+                active_timeout_secs: 300,
+                active_tick_timeout_secs: 300,
+                count_tmux_input: true,
+                filters: TimelineFilters::default(),
+                notes: Vec::new(),
+            },
+            UtcOffset::UTC,
+        );
+
+        assert_eq!(summary.sessions[0].label, "no session");
+        assert_eq!(summary.days[0].top_sessions[0].label, "human/%9");
+    }
+
+    #[test]
+    fn direct_summary_attributes_renamed_sessions_per_span() {
+        let now = datetime!(2026-06-05 01:00:00 UTC);
+        let entries = [
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 00:01:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("before-rename".into()),
+                cwd: Some("/repo".into()),
+                from: AgentState::Working,
+                to: AgentState::Idle,
+                state_entered_at: Some(datetime!(2026-06-05 00:00:00 UTC)),
+            })),
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: datetime!(2026-06-05 00:03:00 UTC),
+                kind: AgentKind::Codex,
+                session_id: "agent-main".into(),
+                pane: Some("%1".into()),
+                session_name: Some("after-rename".into()),
+                cwd: Some("/repo".into()),
+                from: AgentState::Working,
+                to: AgentState::Idle,
+                state_entered_at: Some(datetime!(2026-06-05 00:01:00 UTC)),
+            })),
+        ];
+        let summary = build_summary(
+            TimelineBuildInput {
+                now,
+                range: TimelineRange {
+                    label: "hour".into(),
+                    since_at: Some(datetime!(2026-06-05 00:00:00 UTC)),
+                    until_at: None,
+                },
+                prompt_entries: &[],
+                activity_entries: &entries,
+                agents: &[],
+                session_activities: &[],
+                pane_sessions: &HashMap::new(),
+                active_lookback_secs: 60,
+                active_timeout_secs: 300,
+                active_tick_timeout_secs: 300,
+                count_tmux_input: true,
+                filters: TimelineFilters::default(),
+                notes: Vec::new(),
+            },
+            UtcOffset::UTC,
+        );
+
+        assert_eq!(summary.days[0].top_sessions.len(), 2);
+        assert_eq!(summary.days[0].top_sessions[0].label, "after-rename");
+        assert_eq!(summary.days[0].top_sessions[0].active_secs, 120);
+        assert_eq!(summary.days[0].top_sessions[1].label, "before-rename");
+        assert_eq!(summary.days[0].top_sessions[1].active_secs, 60);
     }
 
     #[test]

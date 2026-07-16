@@ -794,6 +794,8 @@ button, select {
   grid-template-columns: 190px minmax(640px, 1fr);
   align-items: center;
   gap: 12px;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 27px;
 }
 
 .timeline-lane.grouped .timeline-label span,

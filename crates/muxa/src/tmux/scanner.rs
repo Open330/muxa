@@ -28,10 +28,11 @@ use crate::tmux::{PaneInfo, PANE_FMT};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 /// Per-socket `tmux list-panes` timeout. Picked to stay imperceptible on
@@ -310,34 +311,25 @@ impl PaneCache {
     }
 
     /// Return the cached result if fresh; otherwise call `refresh` and
-    /// store its output. Concurrent callers may both end up refreshing —
-    /// the last to write wins. Acceptable: scans are idempotent and
-    /// short.
+    /// store its output. The async mutex is held across refresh so concurrent
+    /// dashboard requests coalesce onto one tmux scan.
     pub async fn get_or_refresh<F, Fut>(&self, refresh: F) -> ScanResult
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ScanResult>,
     {
-        if let Some(fresh) = self.fresh_cached() {
-            return fresh;
+        let mut guard = self.inner.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.refreshed_at.elapsed() < self.ttl {
+                return cached.result.clone();
+            }
         }
         let result = refresh().await;
-        let mut guard = self.inner.lock().expect("PaneCache mutex poisoned");
         *guard = Some(Cached {
             result: result.clone(),
             refreshed_at: Instant::now(),
         });
         result
-    }
-
-    fn fresh_cached(&self) -> Option<ScanResult> {
-        let guard = self.inner.lock().expect("PaneCache mutex poisoned");
-        let cached = guard.as_ref()?;
-        if cached.refreshed_at.elapsed() < self.ttl {
-            Some(cached.result.clone())
-        } else {
-            None
-        }
     }
 }
 
@@ -524,6 +516,34 @@ mod tests {
             "second hit should not refresh"
         );
         assert_eq!(r1.fetched_at, r2.fetched_at);
+    }
+
+    #[tokio::test]
+    async fn cache_coalesces_concurrent_refreshes() {
+        let cache = Arc::new(PaneCache::new(Duration::from_secs(60)));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let counter = Arc::clone(&counter);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache
+                    .get_or_refresh(|| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        empty_scan()
+                    })
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
