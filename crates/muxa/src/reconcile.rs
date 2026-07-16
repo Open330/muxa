@@ -357,7 +357,12 @@ impl<L: LivenessSource> Reconciler<L> {
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let reconcile_started = Instant::now();
         let report = self.store.reconcile_observation(&observation).await;
-        let workload_changed = if pane_observation_complete {
+        // A deferred mass reap means the store distrusted this pane set even
+        // though the backend called it complete. The rows survived; feeding
+        // the same set to `update_workloads` would blank the workload of
+        // every row the guard just rescued.
+        let observation_trusted = pane_observation_complete && report.stale_reap_deferred == 0;
+        let workload_changed = if observation_trusted {
             self.store.update_workloads(&workloads).await
         } else {
             0
@@ -437,6 +442,7 @@ impl<L: LivenessSource> Reconciler<L> {
                 pane_observation_complete,
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
+                stale_deferred = report.stale_reap_deferred,
                 synthetic = report.synthetic_demoted,
                 duplicates = report.duplicates_collapsed,
                 correlated = report.paneless_correlated,
@@ -453,6 +459,7 @@ impl<L: LivenessSource> Reconciler<L> {
                 pane_observation_complete,
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
+                stale_deferred = report.stale_reap_deferred,
                 synthetic = report.synthetic_demoted,
                 duplicates = report.duplicates_collapsed,
                 correlated = report.paneless_correlated,
@@ -510,7 +517,9 @@ mod tests {
     //!   (defense-in-depth, planted via the public `Store::hydrate` seam).
     use super::*;
     use crate::event::{AgentEvent, AgentId, AgentKind};
+    use crate::process_tree::WorkloadSummary;
     use crate::state::Store;
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use time::macros::datetime;
 
@@ -635,6 +644,42 @@ mod tests {
             agent.state,
             AgentState::Idle,
             "pane-independent stuck-state maintenance should still run",
+        );
+    }
+
+    /// Rescuing a row from a distrusted observation is pointless if the same
+    /// observation is still allowed to blank what the row carried. A deferred
+    /// mass reap means "this pane set is not to be believed" — that has to
+    /// govern the workload update too, not just the reap.
+    #[tokio::test]
+    async fn deferred_mass_reap_does_not_blank_rescued_workloads() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let mut seeded = HashMap::new();
+        for i in 0..6 {
+            let pane = format!("%{i}");
+            store.apply(&started(&format!("s{i}"), &pane, t0)).await;
+            seeded.insert(
+                pane,
+                WorkloadSummary {
+                    process_count: 3,
+                    ..WorkloadSummary::default()
+                },
+            );
+        }
+        store.update_workloads(&seeded).await;
+
+        // A believable-looking but empty reading: every pane appears gone.
+        let source = FakeLiveness::new(Vec::new());
+        let r = Reconciler::new(store.clone(), source, Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(report.stale_reap_deferred, 6, "guard should hold the rows");
+        assert_eq!(report.stale_panes_reaped, 0);
+        let agent = store.by_session("s0").await.expect("row rescued");
+        assert_eq!(
+            agent.workload.process_count, 3,
+            "the rescued row must keep the workload the good tick gave it",
         );
     }
 

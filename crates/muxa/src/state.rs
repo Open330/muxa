@@ -24,9 +24,10 @@ use crate::process_tree::WorkloadSummary;
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, Notify, RwLock};
@@ -117,19 +118,31 @@ const MASS_REAP_DIVISOR: usize = 2;
 /// making them linger an extra tick would be more surprising than the reap.
 const MASS_REAP_MIN_ROWS: usize = 5;
 
-/// Consecutive passes that must independently propose the same mass reap
-/// before it executes. Two is enough to outlast a transient observation fault
-/// while costing a legitimate mass close only one extra tick.
+/// Consecutive passes that must propose the *same* mass reap before it
+/// executes. Two is enough to outlast a single bad observation while costing a
+/// legitimate mass close only one extra tick.
 const MASS_REAP_CONFIRMATIONS: u32 = 2;
+
+/// A mass reap that was proposed and held back, waiting to see whether the
+/// next pass says the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MassReapWatch {
+    /// Identity of the doomed set, so that "the next pass agreed" means it
+    /// named the same rows — not merely that it also wanted a mass reap.
+    fingerprint: u64,
+    /// How many consecutive passes have now proposed exactly this set.
+    confirmations: u32,
+}
 
 /// Outcome of the mass-reap guard for one reconcile pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReapVerdict {
-    /// Sweep is ordinary, or a proposed mass reap has now been confirmed by
+    /// Sweep is ordinary, or this exact mass reap has now been proposed by
     /// enough consecutive passes. Reap normally.
     Allowed,
-    /// This pass alone wanted to take out most of the pane-governed registry.
-    /// Keep the rows and wait for the next pass to agree.
+    /// This pass wanted to take out most of the pane-governed registry and no
+    /// earlier pass had named the same rows. Keep them and see what the next
+    /// pass says.
     Deferred { doomed: usize, governed: usize },
 }
 
@@ -359,11 +372,12 @@ pub struct Store {
     /// bounds the blast radius (handler cap + timeouts), but this invariant is
     /// what keeps lock hold time in the microsecond range to begin with.
     agents: RwLock<HashMap<String, Agent>>,
-    /// Consecutive reconcile passes that have proposed a mass reap (see
-    /// [`Store::reap_guard_verdict`]). A single pass never executes one; the
-    /// registry only drops the rows once `MASS_REAP_CONFIRMATIONS` passes in a
-    /// row agree, and any pass that disagrees resets this to zero.
-    mass_reap_confirmations: AtomicU32,
+    /// The mass reap currently being held back, if any (see
+    /// [`Store::reap_guard_verdict`]). A plain mutex, not an atomic: every
+    /// access already happens under the `agents` write lock, so it is never
+    /// contended, and pretending otherwise would imply a lock-free protocol
+    /// this doesn't have.
+    mass_reap_watch: Mutex<Option<MassReapWatch>>,
     transitions: broadcast::Sender<Transition>,
     prompts: broadcast::Sender<PromptRecord>,
     /// Disk-backed audit log of every prompt. Lives separately from
@@ -409,7 +423,7 @@ impl Store {
         let (prompts_tx, _) = broadcast::channel(PROMPT_CHANNEL_CAPACITY);
         Self {
             agents: RwLock::default(),
-            mass_reap_confirmations: AtomicU32::new(0),
+            mass_reap_watch: Mutex::new(None),
             transitions: tx,
             prompts: prompts_tx,
             history,
@@ -1563,7 +1577,11 @@ impl Store {
     ///
     /// 1. **Reap stale**: any agent whose pane no longer exists in the
     ///    snapshot is dropped. Without this the registry accumulates
-    ///    forever as users close panes.
+    ///    forever as users close panes. One exception: a pass that would
+    ///    take out most of the pane-governed registry at once is held back
+    ///    until a second pass names the same rows, so this step is not
+    ///    guaranteed to have converged after any *single* call — see
+    ///    [`Self::reap_guard_verdict`].
     /// 2. **Demote synthetic**: synthetic placeholders for panes that also
     ///    have a real session are dropped — the real entry is always the
     ///    authoritative one.
@@ -1579,9 +1597,27 @@ impl Store {
     /// Returns counts so callers can log non-trivial sweeps without spamming.
     pub async fn reconcile_observation(&self, observation: &PaneObservation) -> ReconcileReport {
         if !observation.is_complete() {
+            // Not a pass, as far as the mass-reap guard is concerned: an
+            // observation we already distrust can neither confirm nor break
+            // a deferral.
+            self.clear_mass_reap_watch();
             return ReconcileReport::default();
         }
         self.reconcile(&observation.panes).await
+    }
+
+    /// Forget any held-back mass reap.
+    ///
+    /// Called when a pass can't be counted as evidence either way — today,
+    /// when the observation came back `Incomplete`. A reading we already
+    /// distrust is not agreement, and it isn't disagreement either; letting
+    /// the watch survive it would let two faults minutes apart confirm each
+    /// other as if they were consecutive.
+    fn clear_mass_reap_watch(&self) {
+        *self
+            .mass_reap_watch
+            .lock()
+            .expect("mass reap watch poisoned") = None;
     }
 
     /// Decide whether this pass may execute its stale-pane reap.
@@ -1589,13 +1625,25 @@ impl Store {
     /// Ordinary sweeps are always allowed. The guard exists for the one shape
     /// that is nearly always a bug rather than reality: a single pass claiming
     /// that most of the pane-governed registry died at once. Completeness
-    /// checks in the backend already catch the failure modes we know about
-    /// (`observe_panes` reporting `Incomplete`); this is the backstop for the
-    /// ones we don't, and it costs a legitimate mass close only one tick.
+    /// checks in the backend already catch the observation faults we know
+    /// about (`observe_panes` reporting `Incomplete`); this is the backstop
+    /// for a fault that slips past them as an empty-yet-`Complete` reading.
     ///
-    /// Deferral is deliberately *not* sticky: the counter only advances while
-    /// consecutive passes keep proposing the same wipe, so a real mass close
-    /// converges on the next tick and a transient fault resets it to zero.
+    /// Agreement is by *identity*, not by count: the watch remembers which
+    /// rows were doomed, so a pass proposing a different wipe starts its own
+    /// deferral rather than confirming someone else's. Without that, a fault
+    /// rolling across tmux servers — server A blacking out, then B — would
+    /// have each pass confirm the previous one's unrelated proposal and reap
+    /// live rows that were only ever named once.
+    ///
+    /// **This buys protection against a transient fault, not a persistent
+    /// one.** A user closing every pane and a backend wrongly reporting every
+    /// pane closed are indistinguishable here — tmux's own "no server running"
+    /// is a legitimate empty reading — so a fault that keeps naming the same
+    /// rows still gets its wipe, one tick late. Telling those two apart needs
+    /// a signal this layer doesn't have (is the socket still connectable? are
+    /// the agent processes still alive?) and belongs in the backend, next to
+    /// the completeness check. What this rules out is the single bad tick.
     fn reap_guard_verdict(
         &self,
         agents: &HashMap<String, Agent>,
@@ -1609,26 +1657,43 @@ impl Store {
             .values()
             .filter(|a| a.pid.is_none() && a.pane.is_some())
             .count();
-        let doomed = agents
-            .values()
-            .filter(|a| !pane_is_live(a, panes_by_id))
-            .count();
+        let mut doomed_ids: Vec<&str> = agents
+            .iter()
+            .filter(|(_, a)| !pane_is_live(a, panes_by_id))
+            .map(|(sid, _)| sid.as_str())
+            .collect();
+        let doomed = doomed_ids.len();
         let is_mass_reap =
             doomed >= MASS_REAP_MIN_ROWS && doomed.saturating_mul(MASS_REAP_DIVISOR) >= governed;
+        let mut watch = self
+            .mass_reap_watch
+            .lock()
+            .expect("mass reap watch poisoned");
         if !is_mass_reap {
-            self.mass_reap_confirmations
-                .store(0, AtomicOrdering::Relaxed);
+            *watch = None;
             return ReapVerdict::Allowed;
         }
-        let confirmations = self
-            .mass_reap_confirmations
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            + 1;
+
+        // `agents` is a HashMap, so iteration order is not stable across
+        // passes — sort before hashing or the same set fingerprints
+        // differently every tick and nothing ever confirms.
+        doomed_ids.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        doomed_ids.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+
+        let confirmations = match *watch {
+            Some(prev) if prev.fingerprint == fingerprint => prev.confirmations + 1,
+            _ => 1,
+        };
         if confirmations >= MASS_REAP_CONFIRMATIONS {
-            self.mass_reap_confirmations
-                .store(0, AtomicOrdering::Relaxed);
+            *watch = None;
             return ReapVerdict::Allowed;
         }
+        *watch = Some(MassReapWatch {
+            fingerprint,
+            confirmations,
+        });
         ReapVerdict::Deferred { doomed, governed }
     }
 
@@ -3979,6 +4044,115 @@ mod tests {
 
         assert_eq!(report.stale_panes_reaped, MASS_REAP_MIN_ROWS - 1);
         assert_eq!(report.stale_reap_deferred, 0);
+    }
+
+    /// A fault rolling across tmux servers must not let each pass confirm the
+    /// previous one's unrelated proposal. Rows named by exactly one pass are
+    /// live rows as far as the guard knows, and must survive it.
+    #[tokio::test]
+    async fn disjoint_doomed_sets_do_not_confirm_each_other() {
+        let store = Store::shared();
+        let panes = seed_pane_agents(&store, 12).await;
+
+        // Tick 1: server A blacks out — %0..%5 doomed (6 of 12 governed).
+        let first = store.reconcile(&panes[6..]).await;
+        assert_eq!(first.stale_reap_deferred, 6);
+        assert_eq!(first.stale_panes_reaped, 0);
+
+        // Tick 2: A is back, but B blacks out — a completely different set is
+        // doomed. This is that set's first and only proposal.
+        let second = store.reconcile(&panes[..6]).await;
+
+        assert_eq!(
+            second.stale_panes_reaped, 0,
+            "a set proposed once must not ride the previous set's deferral",
+        );
+        assert_eq!(second.stale_reap_deferred, 6);
+        assert_eq!(store.snapshot().await.len(), 12, "all rows still live");
+    }
+
+    /// An `Incomplete` observation is not evidence: it can neither confirm a
+    /// held-back wipe nor count as the disagreement that clears one. Letting
+    /// the watch survive it would let two faults, arbitrarily far apart, act
+    /// as if they were consecutive passes.
+    #[tokio::test]
+    async fn incomplete_observation_clears_a_pending_deferral() {
+        let store = Store::shared();
+        seed_pane_agents(&store, 6).await;
+
+        let armed = store
+            .reconcile_observation(&PaneObservation::complete(Vec::new()))
+            .await;
+        assert_eq!(armed.stale_reap_deferred, 6, "first fault arms the watch");
+
+        // The backend goes explicitly unreliable for a tick.
+        store
+            .reconcile_observation(&PaneObservation::incomplete(Vec::new()))
+            .await;
+
+        // A later, unrelated fault must start over, not inherit confirmation.
+        let later = store
+            .reconcile_observation(&PaneObservation::complete(Vec::new()))
+            .await;
+
+        assert_eq!(
+            later.stale_panes_reaped, 0,
+            "a fault after an unusable reading must re-earn its confirmation",
+        );
+        assert_eq!(later.stale_reap_deferred, 6);
+        assert_eq!(store.snapshot().await.len(), 6);
+    }
+
+    /// Pins the reset-on-disagree half of the lifecycle: an ordinary pass
+    /// between two faults must disarm the watch, so the second fault is a
+    /// first proposal rather than a confirmation.
+    #[tokio::test]
+    async fn ordinary_pass_between_faults_disarms_the_watch() {
+        let store = Store::shared();
+        let panes = seed_pane_agents(&store, 6).await;
+
+        let first = store.reconcile(&[]).await;
+        assert_eq!(first.stale_reap_deferred, 6);
+
+        // Everything is visible again — this pass disagrees.
+        store.reconcile(&panes).await;
+
+        let second = store.reconcile(&[]).await;
+
+        assert_eq!(
+            second.stale_panes_reaped, 0,
+            "the good pass must have reset the counter",
+        );
+        assert_eq!(second.stale_reap_deferred, 6);
+        assert_eq!(store.snapshot().await.len(), 6);
+    }
+
+    /// Pins the ratio itself, which the total-wipe cases can't: at 5 doomed of
+    /// 10 governed the sweep is exactly half and must defer...
+    #[tokio::test]
+    async fn reap_at_the_ratio_boundary_is_deferred() {
+        let store = Store::shared();
+        let panes = seed_pane_agents(&store, 10).await;
+
+        let report = store.reconcile(&panes[5..]).await;
+
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert_eq!(report.stale_reap_deferred, 5);
+    }
+
+    /// ...while the same 5 rows out of 11 are a minority and reap immediately.
+    /// Together these two fix `MASS_REAP_DIVISOR`; without them the ratio term
+    /// could be deleted outright and the suite would stay green.
+    #[tokio::test]
+    async fn reap_just_under_the_ratio_is_not_deferred() {
+        let store = Store::shared();
+        let panes = seed_pane_agents(&store, 11).await;
+
+        let report = store.reconcile(&panes[5..]).await;
+
+        assert_eq!(report.stale_panes_reaped, 5);
+        assert_eq!(report.stale_reap_deferred, 0);
+        assert_eq!(store.snapshot().await.len(), 6);
     }
 
     /// Paneless rows aren't reapable by this sweep, so they must not pad the
