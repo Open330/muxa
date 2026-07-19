@@ -103,6 +103,8 @@
 # theme = "classic"   # optional watch-only override for [ui].theme
 # view = "session"    # one row per tmux session; panes merge by latest activity (default)
 # view = "pane"       # one row per agent/pane
+# view = "swarm"      # k9s-style console: session clusters, animated dot spinners
+#                     # for working/starting agents, and an expandable subagent tree
 # columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because picker actions

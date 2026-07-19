@@ -259,6 +259,7 @@ enum HookCmd {
 enum WatchViewArg {
     Pane,
     Session,
+    Swarm,
 }
 
 impl From<WatchViewArg> for muxa::config::WatchView {
@@ -266,6 +267,7 @@ impl From<WatchViewArg> for muxa::config::WatchView {
         match value {
             WatchViewArg::Pane => Self::Pane,
             WatchViewArg::Session => Self::Session,
+            WatchViewArg::Swarm => Self::Swarm,
         }
     }
 }

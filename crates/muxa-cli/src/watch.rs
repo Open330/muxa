@@ -80,6 +80,9 @@ const INPUT_POLL: Duration = Duration::from_millis(16);
 /// `relative_time` at second granularity — without the old behaviour of one
 /// full render per `INPUT_POLL` tick (~62 fps) even on a completely idle UI.
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
+/// Faster idle repaint cadence for the swarm view so its dot spinners
+/// animate smoothly (~8 fps) even with no input.
+const SWARM_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
 
 /// How long a transient action hint stays visible in the footer before
 /// the renderer falls back to the default keybinding strip. 2 s is the
@@ -1258,6 +1261,9 @@ impl FooterHint {
 pub(crate) struct App {
     pub rows: Vec<WatchRow>,
     pub table_state: TableState,
+    /// Monotonic frame counter advanced once per paint. Drives the swarm
+    /// view's dot-spinner animation; unused by the table views.
+    pub anim_frame: usize,
     pub last_error: Option<DaemonError>,
     pub last_refresh: OffsetDateTime,
     /// Watch config — held by value so the rendering path doesn't need to
@@ -1437,6 +1443,7 @@ impl App {
         Self {
             rows: Vec::new(),
             table_state: TableState::default(),
+            anim_frame: 0,
             last_error: None,
             last_refresh: OffsetDateTime::now_utc(),
             watch_cfg: cfg,
@@ -1503,7 +1510,7 @@ impl App {
             self.paneless_hidden = before - agents.len();
         }
 
-        if self.watch_cfg.view == WatchView::Session {
+        if self.watch_cfg.view != WatchView::Pane {
             self.rows = build_session_rows(
                 agents,
                 &panes,
@@ -2875,7 +2882,12 @@ pub async fn run(
     let mut last_render = std::time::Instant::now();
 
     loop {
-        if needs_render || last_render.elapsed() >= IDLE_REDRAW_INTERVAL {
+        let redraw_interval = if app.watch_cfg.view == WatchView::Swarm {
+            SWARM_REDRAW_INTERVAL
+        } else {
+            IDLE_REDRAW_INTERVAL
+        };
+        if needs_render || last_render.elapsed() >= redraw_interval {
             guard
                 .terminal_mut()
                 .draw(|f| render(f, &mut app))
@@ -3670,6 +3682,9 @@ pub(crate) fn quick_copy_action(app: &App) -> Action {
 // ---- rendering ------------------------------------------------------------
 
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
+    // Advance the animation clock once per paint so the swarm view's dot
+    // spinners cycle. Harmless for the table views (which ignore it).
+    app.anim_frame = app.anim_frame.wrapping_add(1);
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3690,13 +3705,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             // "where am I in the list" — then `Clear` the popup area
             // (wipes the cells under it so the popup paints clean) and
             // render the preview on top.
-            render_table(f, chunks[1], app);
+            render_body(f, chunks[1], app);
             let popup_area = centered_rect(80, 70, chunks[1]);
             f.render_widget(Clear, popup_area);
             render_preview(f, popup_area, app);
         }
         None => {
-            render_table(f, chunks[1], app);
+            render_body(f, chunks[1], app);
         }
     }
     // Overlays land on top of either the preview or the table —
@@ -4276,6 +4291,236 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             .border_type(theme.border_type),
     );
     f.render_widget(header, area);
+}
+
+/// Dispatch the main body: the k9s-style swarm console for
+/// [`WatchView::Swarm`], otherwise the classic table.
+fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.watch_cfg.view == WatchView::Swarm {
+        render_swarm(f, area, app);
+    } else {
+        render_table(f, area, app);
+    }
+}
+
+// cli-spinners frames: `dots` for parent agents, `dots2` (denser) for
+// subagents, and a half-circle set for starting.
+const SWARM_DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SWARM_DOTS2: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+const SWARM_START: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+fn swarm_glyph(state: AgentState, frame: usize) -> &'static str {
+    match state {
+        AgentState::Working => SWARM_DOTS[frame % SWARM_DOTS.len()],
+        AgentState::Starting => SWARM_START[frame % SWARM_START.len()],
+        other => crate::state_icon(other),
+    }
+}
+
+fn subagent_glyph(frame: usize, phase: usize) -> &'static str {
+    SWARM_DOTS2[frame.wrapping_add(phase) % SWARM_DOTS2.len()]
+}
+
+fn swarm_kind_short(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::ClaudeCode => "claude",
+        AgentKind::Codex => "codex",
+        AgentKind::GeminiCli => "gemini",
+        AgentKind::Opencode => "opencode",
+        AgentKind::Task => "task",
+        AgentKind::Unknown => "agent",
+    }
+}
+
+fn swarm_state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "working",
+        AgentState::Idle => "idle",
+        AgentState::Starting => "starting",
+        AgentState::WaitingInput => "waiting·in",
+        AgentState::WaitingChoice => "waiting·y/n",
+        AgentState::Error => "error",
+        AgentState::Stopped => "stopped",
+    }
+}
+
+/// `◇subagents ▸shells +other` load badge. Prefers the hook-tracked named
+/// subagent count over the process-tree scan.
+fn swarm_load(agent: &Agent) -> String {
+    if !agent.subagents.is_empty() {
+        return format!("◇{}", agent.subagents.len());
+    }
+    let w = &agent.workload;
+    let mut parts = Vec::new();
+    if w.subagent_count > 0 {
+        parts.push(format!("◇{}", w.subagent_count));
+    }
+    if w.shell_count > 0 {
+        parts.push(format!("▸{}", w.shell_count));
+    }
+    let other = w
+        .process_count
+        .saturating_sub(w.subagent_count)
+        .saturating_sub(w.shell_count);
+    if other > 0 {
+        parts.push(format!("+{other}"));
+    }
+    parts.join(" ")
+}
+
+/// One cluster header line: `▐ session [n]  <state spinners>  n⬆ n⊂`.
+fn swarm_cluster_header(
+    sr: &SessionRow,
+    theme: WatchThemeSpec,
+    frame: usize,
+    is_sel: bool,
+) -> Line<'static> {
+    let working = sr
+        .agents
+        .iter()
+        .filter(|a| a.state == AgentState::Working)
+        .count();
+    let subs: usize = sr.agents.iter().map(|a| a.subagents.len()).sum();
+    let mut hdr = vec![
+        Span::styled(
+            if is_sel { "▐ " } else { "  " },
+            Style::default().fg(theme.accent),
+        ),
+        Span::styled(
+            sr.session.clone(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  [{}]  ", sr.agents.len().max(sr.pane_count)),
+            theme.dim_style(),
+        ),
+    ];
+    for a in &sr.agents {
+        hdr.push(Span::styled(
+            format!("{} ", swarm_glyph(a.state, frame)),
+            theme.state_style(a.state),
+        ));
+    }
+    if working > 0 || subs > 0 {
+        hdr.push(Span::styled(
+            format!(" {working}⬆ {subs}⊂"),
+            theme.dim_style(),
+        ));
+    }
+    Line::from(hdr)
+}
+
+/// One agent row plus its indented subagent tree (`├─ / └─` with a dot
+/// spinner per in-flight Task child).
+fn swarm_agent_lines(agent: &Agent, theme: WatchThemeSpec, frame: usize) -> Vec<Line<'static>> {
+    let mut spans = vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{} ", swarm_glyph(agent.state, frame)),
+            theme.state_style(agent.state),
+        ),
+        Span::styled(
+            format!("{:<9}", swarm_kind_short(agent.kind)),
+            Style::default(),
+        ),
+        Span::styled(
+            format!("{:<12}", swarm_state_label(agent.state)),
+            theme.state_style(agent.state),
+        ),
+    ];
+    let load = swarm_load(agent);
+    if !load.is_empty() {
+        spans.push(Span::styled(
+            format!("{load:<7}"),
+            Style::default().fg(theme.state_working),
+        ));
+    }
+    if let Some(p) = agent.last_prompt.as_deref() {
+        let snippet = p.replace('\n', " ");
+        spans.push(Span::styled(
+            truncate_chars(&snippet, 42),
+            theme.dim_style(),
+        ));
+    }
+    let mut out = vec![Line::from(spans)];
+
+    let n = agent.subagents.len();
+    for (j, s) in agent.subagents.iter().enumerate() {
+        let conn = if j + 1 == n { "└─" } else { "├─" };
+        let mut ss = vec![
+            Span::raw("       "),
+            Span::styled(format!("{conn} "), theme.dim_style()),
+            Span::styled(
+                format!("{} ", subagent_glyph(frame, j)),
+                Style::default().fg(theme.state_working),
+            ),
+            Span::styled(
+                format!("{:<16}", truncate_chars(&s.kind, 16)),
+                Style::default(),
+            ),
+        ];
+        if let Some(d) = s.description.as_deref() {
+            ss.push(Span::styled(truncate_chars(d, 32), theme.dim_style()));
+        }
+        out.push(Line::from(ss));
+    }
+    out
+}
+
+/// The swarm console: one cluster per tmux session, animated dot spinners
+/// for working/starting agents, and an indented subagent tree under each
+/// agent. Selection (j/k) highlights the session cluster.
+fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let frame = app.anim_frame;
+    let selected = app.table_state.selected();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_line: Option<usize> = None;
+
+    for (i, row) in app.rows.iter().enumerate() {
+        let WatchRow::Session(sr) = row else {
+            continue;
+        };
+        let is_sel = selected == Some(i);
+        if is_sel {
+            sel_line = Some(lines.len());
+        }
+        lines.push(swarm_cluster_header(sr, theme, frame, is_sel));
+        for a in &sr.agents {
+            lines.extend(swarm_agent_lines(a, theme, frame));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no agents — waiting for a hook or discovery scan",
+            theme.dim_style(),
+        )));
+    }
+
+    // Keep the selected cluster on screen without a full scrollbar widget.
+    let inner_h = usize::from(area.height.saturating_sub(2));
+    let total = lines.len();
+    let scroll_lines = if total <= inner_h {
+        0
+    } else {
+        sel_line
+            .unwrap_or(0)
+            .saturating_sub(inner_h / 3)
+            .min(total - inner_h)
+    };
+    let scroll = u16::try_from(scroll_lines).unwrap_or(u16::MAX);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(" Swarm ", theme.table_header_style()));
+    let para = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    f.render_widget(para, area);
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
@@ -5714,6 +5959,53 @@ mod tests {
             screen.contains("▶ ● ○"),
             "state summary should remain visible before a clipped long session name:\n{screen}"
         );
+    }
+
+    #[test]
+    fn swarm_view_renders_cluster_spinner_and_subagent_tree() {
+        let cfg = WatchConfig {
+            view: WatchView::Swarm,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let mut agent = fake_agent(
+            "worker",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("refactor the reconciler"),
+            Some("Opus"),
+            Some(17.0),
+            Some(1.0),
+        );
+        agent.subagents = vec![muxa::state::Subagent {
+            kind: "Explore".into(),
+            description: Some("map the codebase".into()),
+            started_at: OffsetDateTime::now_utc(),
+        }];
+        app.set_data_with_sessions(
+            vec![agent],
+            vec![fake_pane("%1", "worker", 0, 0, "claude")],
+            vec![fake_session("$1", "worker", 1)],
+            vec![],
+        );
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Swarm"), "swarm title:\n{screen}");
+        assert!(
+            screen.contains("worker"),
+            "session cluster header:\n{screen}"
+        );
+        assert!(screen.contains("Explore"), "subagent tree row:\n{screen}");
+        assert!(screen.contains("◇1"), "subagent load badge:\n{screen}");
     }
 
     #[test]

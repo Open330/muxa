@@ -937,6 +937,9 @@ pub enum WatchView {
     Pane,
     #[default]
     Session,
+    /// k9s-style swarm console: session clusters, animated dot spinners for
+    /// working/starting agents, and an expandable subagent tree.
+    Swarm,
 }
 
 /// Visual preset for muxa's human-facing terminal UIs.
