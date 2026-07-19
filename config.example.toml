@@ -113,6 +113,13 @@
 # for one invocation without flipping this flag.
 # hide_paneless = true
 
+# Animate the state glyph in the `muxa watch` TUI: a spinning braille dot for
+# `working` and a rotating half-circle for `starting`. Purely a watch-TUI
+# affordance — `muxa status` and the tmux status-line always render the static
+# `[ui] icons` glyph. Default true; set false for calm static icons (or a
+# terminal without braille support).
+# spinner = true
+
 # Preview overlay (`p` key) — first-paint shape. Geometry (`f`, popup ↔
 # fullscreen) and content (`c`, prompt/response ↔ live pane) remain
 # toggleable at runtime regardless of the default.

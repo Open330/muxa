@@ -460,6 +460,7 @@ impl WatchColumn {
         now: OffsetDateTime,
         panes: &'a [PaneInfo],
         theme: WatchThemeSpec,
+        spin: Spinner,
     ) -> Text<'a> {
         match self {
             Self::Pane => {
@@ -482,7 +483,7 @@ impl WatchColumn {
             }
             Self::Kind => a.kind.to_string().into(),
             Self::State => {
-                let (symbol, style) = state_marker(a.state, theme);
+                let (symbol, style) = state_marker(a.state, theme, spin);
                 Text::from(Span::styled(symbol, style))
             }
             Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
@@ -555,11 +556,12 @@ impl WatchColumn {
         now: OffsetDateTime,
         panes: &'a [PaneInfo],
         theme: WatchThemeSpec,
+        spin: Spinner,
     ) -> Text<'a> {
         let dim = theme.dim_style().add_modifier(Modifier::DIM);
         let Some(agent) = s.latest_agent.as_ref() else {
             return match self {
-                Self::Pane => session_label(s, theme),
+                Self::Pane => session_label(s, theme, spin),
                 Self::Prompt => Text::from(Span::styled(
                     s.bare_summary.clone().unwrap_or_else(|| {
                         format!("{} pane{}", s.pane_count, plural(s.pane_count))
@@ -576,7 +578,7 @@ impl WatchColumn {
         };
 
         match self {
-            Self::Pane => session_label(s, theme),
+            Self::Pane => session_label(s, theme, spin),
             Self::Kind
             | Self::State
             | Self::Model
@@ -584,7 +586,7 @@ impl WatchColumn {
             | Self::Cost
             | Self::Limits
             | Self::Prompt
-            | Self::Activity => self.agent_text(agent, now, panes, theme),
+            | Self::Activity => self.agent_text(agent, now, panes, theme, spin),
             Self::Workload => session_workload_text(s),
             Self::SessionTime => session_time_text(s, now),
         }
@@ -2073,8 +2075,9 @@ struct StateSummaryPart {
 fn state_summary_spans(
     states: impl IntoIterator<Item = AgentState>,
     theme: WatchThemeSpec,
+    spin: Spinner,
 ) -> Vec<Span<'static>> {
-    state_summary_parts(states, theme)
+    state_summary_parts(states, theme, spin)
         .into_iter()
         .enumerate()
         .flat_map(|(i, part)| {
@@ -2091,6 +2094,7 @@ fn state_summary_spans(
 fn state_summary_parts(
     states: impl IntoIterator<Item = AgentState>,
     theme: WatchThemeSpec,
+    spin: Spinner,
 ) -> Vec<StateSummaryPart> {
     let states: Vec<AgentState> = states.into_iter().collect();
     let mut parts = Vec::new();
@@ -2100,7 +2104,7 @@ fn state_summary_parts(
         if count == 0 {
             continue;
         }
-        let (symbol, style) = state_marker(state, theme);
+        let (symbol, style) = state_marker(state, theme, spin);
         let label = if count == 1 {
             symbol.to_string()
         } else {
@@ -2137,8 +2141,9 @@ fn overflow_label(count: usize, max_width: usize) -> String {
 fn state_summary_gutter_spans(
     states: impl IntoIterator<Item = AgentState>,
     theme: WatchThemeSpec,
+    spin: Spinner,
 ) -> Vec<Span<'static>> {
-    let parts = state_summary_parts(states, theme);
+    let parts = state_summary_parts(states, theme, spin);
     let fitted = if state_summary_parts_width(&parts) <= SESSION_STATE_GUTTER_CONTENT_WIDTH {
         parts
     } else {
@@ -2203,17 +2208,63 @@ fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'stati
         .collect()
 }
 
-fn session_label(s: &SessionRow, theme: WatchThemeSpec) -> Text<'static> {
-    let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme);
+fn session_label(s: &SessionRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static> {
+    let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme, spin);
     spans.push(Span::raw(s.session.clone()));
 
     Text::from(Line::from(spans))
 }
 
-fn state_marker(state: AgentState, theme: WatchThemeSpec) -> (&'static str, Style) {
-    // Share the one glyph source of truth with `muxa status`/`status-line`
-    // so the `[ui] icons` toggle (unicode|ascii) applies everywhere.
-    (crate::state_icon(state), theme.state_style(state))
+/// Per-frame animated state glyph for the `muxa watch` TUI. `enabled` mirrors
+/// the `[watch] spinner` toggle; when off (and on every non-watch surface) the
+/// static `state_icon` is used. Only `Working`/`Starting` animate.
+#[derive(Clone, Copy)]
+struct Spinner {
+    frame: usize,
+    enabled: bool,
+}
+
+impl Spinner {
+    #[cfg(test)]
+    const OFF: Spinner = Spinner {
+        frame: 0,
+        enabled: false,
+    };
+
+    fn glyph(self, state: AgentState) -> Option<&'static str> {
+        if !self.enabled {
+            return None;
+        }
+        match state {
+            AgentState::Working => Some(SWARM_DOTS[self.frame % SWARM_DOTS.len()]),
+            AgentState::Starting => Some(SWARM_START[self.frame % SWARM_START.len()]),
+            _ => None,
+        }
+    }
+}
+
+fn state_marker(state: AgentState, theme: WatchThemeSpec, spin: Spinner) -> (&'static str, Style) {
+    // The static glyph is the shared source of truth with `muxa
+    // status`/`status-line` (honoring the `[ui] icons` toggle); the spinner
+    // only overrides `working`/`starting` inside the watch TUI.
+    let icon = spin
+        .glyph(state)
+        .unwrap_or_else(|| crate::state_icon(state));
+    (icon, theme.state_style(state))
+}
+
+/// True when any row holds a `working`/`starting` agent — i.e. something the
+/// spinner would animate. Gates the fast repaint cadence so an all-idle fleet
+/// keeps the calm 1 s idle repaint.
+fn rows_have_active_spinner(rows: &[WatchRow]) -> bool {
+    fn is_spinner_state(state: AgentState) -> bool {
+        matches!(state, AgentState::Working | AgentState::Starting)
+    }
+    rows.iter().any(|r| match r {
+        WatchRow::Agent(a) => is_spinner_state(a.state),
+        WatchRow::Session(s) => s.agents.iter().any(|a| is_spinner_state(a.state)),
+        WatchRow::BarePane(_) => false,
+    })
 }
 
 fn session_time_text(s: &SessionRow, now: OffsetDateTime) -> Text<'static> {
@@ -2882,7 +2933,14 @@ pub async fn run(
     let mut last_render = std::time::Instant::now();
 
     loop {
-        let redraw_interval = if app.watch_cfg.view == WatchView::Swarm {
+        // Animate on a fast cadence only while there's something to spin:
+        // the swarm view always, or the table views when `[watch] spinner`
+        // is on and at least one agent is working/starting. An all-idle
+        // fleet falls back to the calm 1 s idle repaint.
+        let animating = (app.watch_cfg.view == WatchView::Swarm || app.watch_cfg.spinner)
+            && icons_unicode()
+            && rows_have_active_spinner(&app.rows);
+        let redraw_interval = if animating {
             SWARM_REDRAW_INTERVAL
         } else {
             IDLE_REDRAW_INTERVAL
@@ -4161,11 +4219,12 @@ fn app_agent_states(app: &App) -> Vec<AgentState> {
 fn header_state_summary_spans(
     states: Vec<AgentState>,
     theme: WatchThemeSpec,
+    spin: Spinner,
 ) -> Vec<Span<'static>> {
     if states.len() <= 1 {
         Vec::new()
     } else {
-        state_summary_spans(states, theme)
+        state_summary_spans(states, theme, spin)
     }
 }
 
@@ -4191,7 +4250,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
     let agent_states = app_agent_states(app);
     let agent_total = agent_states.len();
-    let state_summary = header_state_summary_spans(agent_states, theme);
+    let spin = Spinner {
+        frame: app.anim_frame,
+        enabled: app.watch_cfg.spinner && icons_unicode(),
+    };
+    let state_summary = header_state_summary_spans(agent_states, theme, spin);
 
     let mut spans = vec![
         Span::styled(theme.title, theme.accent_badge()),
@@ -4309,7 +4372,18 @@ const SWARM_DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦",
 const SWARM_DOTS2: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const SWARM_START: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
+/// Whether the active `[ui] icons` set can render the braille/half-circle
+/// spinner. Under `icons = "ascii"` the spinner is suppressed so a terminal
+/// that can't draw unicode doesn't get mojibake — it falls back to the static
+/// ascii `state_icon`.
+fn icons_unicode() -> bool {
+    matches!(crate::icon_set(), IconSet::Unicode)
+}
+
 fn swarm_glyph(state: AgentState, frame: usize) -> &'static str {
+    if !icons_unicode() {
+        return crate::state_icon(state);
+    }
     match state {
         AgentState::Working => SWARM_DOTS[frame % SWARM_DOTS.len()],
         AgentState::Starting => SWARM_START[frame % SWARM_START.len()],
@@ -4318,6 +4392,9 @@ fn swarm_glyph(state: AgentState, frame: usize) -> &'static str {
 }
 
 fn subagent_glyph(frame: usize, phase: usize) -> &'static str {
+    if !icons_unicode() {
+        return crate::state_icon(AgentState::Working);
+    }
     SWARM_DOTS2[frame.wrapping_add(phase) % SWARM_DOTS2.len()]
 }
 
@@ -4549,6 +4626,10 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let selected = app.table_state.selected();
     let detail_host = detail_host_column(&app.columns);
     let status_host = status_host_column(&app.columns);
+    let spin = Spinner {
+        frame: app.anim_frame,
+        enabled: app.watch_cfg.spinner && icons_unicode(),
+    };
     let rows: Vec<Row> = app
         .rows
         .iter()
@@ -4558,13 +4639,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 WatchRow::Agent(a) => app
                     .columns
                     .iter()
-                    .map(|c| c.agent_text(a, now, &app.panes, theme))
+                    .map(|c| c.agent_text(a, now, &app.panes, theme, spin))
                     .collect(),
                 WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
                 WatchRow::Session(s) => app
                     .columns
                     .iter()
-                    .map(|c| c.session_text(s, now, &app.panes, theme))
+                    .map(|c| c.session_text(s, now, &app.panes, theme, spin))
                     .collect(),
             };
 
@@ -5406,9 +5487,57 @@ mod tests {
             AgentState::Starting,
             AgentState::Stopped,
         ] {
-            let (marker, _) = state_marker(state, theme);
+            let (marker, _) = state_marker(state, theme, Spinner::OFF);
             assert_eq!(unicode_width::UnicodeWidthStr::width(marker), 1);
         }
+    }
+
+    #[test]
+    fn spinner_animates_only_working_and_starting() {
+        let theme = watch_theme(WatchTheme::Classic);
+        let on = Spinner {
+            frame: 0,
+            enabled: true,
+        };
+        // Working / starting animate to dot / half-circle frames.
+        assert!(SWARM_DOTS.contains(&state_marker(AgentState::Working, theme, on).0));
+        assert!(SWARM_START.contains(&state_marker(AgentState::Starting, theme, on).0));
+        // Every other state keeps the shared static icon (also used by
+        // `muxa status` / status-line).
+        for state in [
+            AgentState::Idle,
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+            AgentState::Stopped,
+        ] {
+            assert_eq!(state_marker(state, theme, on).0, crate::state_icon(state));
+        }
+        // Advancing the frame advances the dot.
+        let f0 = state_marker(
+            AgentState::Working,
+            theme,
+            Spinner {
+                frame: 0,
+                enabled: true,
+            },
+        )
+        .0;
+        let f1 = state_marker(
+            AgentState::Working,
+            theme,
+            Spinner {
+                frame: 1,
+                enabled: true,
+            },
+        )
+        .0;
+        assert_ne!(f0, f1);
+        // Disabled falls back to the static icon everywhere.
+        assert_eq!(
+            state_marker(AgentState::Working, theme, Spinner::OFF).0,
+            crate::state_icon(AgentState::Working)
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5914,8 +6043,13 @@ mod tests {
         let WatchRow::Session(row) = &app.rows[0] else {
             panic!("expected session row");
         };
-        let text =
-            WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
+        let text = WatchColumn::Pane.session_text(
+            row,
+            now,
+            &app.panes,
+            watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
+        );
         assert_eq!(plain_text(&text), "■ +4  main");
     }
 
@@ -5925,6 +6059,8 @@ mod tests {
         let cfg = WatchConfig {
             view: WatchView::Session,
             sort: vec![WatchSortKey::Session],
+            // Assert the static gutter layout, not an animation frame.
+            spinner: false,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -6038,6 +6174,7 @@ mod tests {
             now + time::Duration::seconds(1),
             &app.panes,
             watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
         );
         assert_eq!(plain_text(&text), "▶     main");
     }
@@ -6082,6 +6219,7 @@ mod tests {
                         now,
                         &app.panes,
                         watch_theme(WatchTheme::Classic),
+                        Spinner::OFF,
                     );
                     Some((row.session.as_str(), plain_text(&text)))
                 }
@@ -6150,8 +6288,13 @@ mod tests {
         let WatchRow::Session(row) = &app.rows[0] else {
             panic!("expected session row");
         };
-        let text =
-            WatchColumn::Pane.session_text(row, now, &app.panes, watch_theme(WatchTheme::Classic));
+        let text = WatchColumn::Pane.session_text(
+            row,
+            now,
+            &app.panes,
+            watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
+        );
         let label = plain_text(&text);
         assert_eq!(
             display_col_of(&label, "crowded"),
@@ -6189,6 +6332,7 @@ mod tests {
             now,
             &app.panes,
             watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
         );
         let cell = text
             .lines
@@ -6958,14 +7102,20 @@ sort = ["state"]
             WatchColumn::Activity,
             WatchColumn::SessionTime,
         ] {
-            let _ = col.agent_text(&a, now, &[], watch_theme(WatchTheme::Classic));
+            let _ = col.agent_text(&a, now, &[], watch_theme(WatchTheme::Classic), Spinner::OFF);
         }
     }
 
     /// Helper: pull the rendered LIMITS cell down to a single concatenated
     /// string so tests can assert on substrings without juggling spans.
     fn limits_cell_string(a: &Agent, now: OffsetDateTime) -> String {
-        let text = WatchColumn::Limits.agent_text(a, now, &[], watch_theme(WatchTheme::Classic));
+        let text = WatchColumn::Limits.agent_text(
+            a,
+            now,
+            &[],
+            watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
+        );
         text.lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -6976,7 +7126,7 @@ sort = ["state"]
     /// for the cell tests since LIMITS only ever emits a single span.
     fn limits_cell_fg(a: &Agent, now: OffsetDateTime) -> Option<Color> {
         WatchColumn::Limits
-            .agent_text(a, now, &[], watch_theme(WatchTheme::Classic))
+            .agent_text(a, now, &[], watch_theme(WatchTheme::Classic), Spinner::OFF)
             .lines
             .first()
             .and_then(|l| l.spans.first())
@@ -10447,6 +10597,9 @@ sort = ["state"]
             view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],
             hide_paneless: false,
+            // Static glyphs so the golden snapshots pin layout, not an
+            // animation frame. The spinner has its own dedicated test.
+            spinner: false,
             ..WatchConfig::default()
         };
         App::with_config(cfg)
