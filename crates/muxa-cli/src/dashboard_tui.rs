@@ -3348,6 +3348,7 @@ mod tests {
             cwd: Some("/tmp/project".into()),
             pid: None,
             workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
             state,
             last_prompt: prompt.map(str::to_string),
             last_response: None,

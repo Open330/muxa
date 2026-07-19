@@ -19,6 +19,7 @@ use super::hook::{truncate, AdapterError, HookAdapter};
 use super::transcript;
 use crate::event::{
     AgentEvent, AgentId, AgentKind, NotificationLevel, RateLimitScope, RateLimitSource,
+    SubagentSpec,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -59,6 +60,21 @@ pub struct Input {
     /// read here and avoids racing the JSONL flush.
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    /// `PreToolUse` only: the tool's input object. We read only the `Task`
+    /// fields (`subagent_type`, `description`) to surface subagents; every
+    /// other tool's input is ignored.
+    #[serde(default)]
+    pub tool_input: Option<ToolInput>,
+}
+
+/// Narrow view of a tool's input — just the `Task` fields muxa needs to
+/// identify a spawned subagent. Deserialization ignores all other keys.
+#[derive(Debug, Deserialize)]
+pub struct ToolInput {
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,7 +126,7 @@ impl HookAdapter for ClaudeAdapter {
                 prompt: truncate(input.prompt.unwrap_or_default(), 4_000),
                 at,
             },
-            Event::PreToolUse => pre_tool_event(id, input.tool_name, at),
+            Event::PreToolUse => pre_tool_event(id, input.tool_name, input.tool_input, at),
             Event::PostToolUse => AgentEvent::ToolCompleted {
                 id,
                 tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
@@ -217,7 +233,12 @@ impl HookAdapter for ClaudeAdapter {
 /// distinct from a free-text `Notification` prompt. The matching
 /// `PostToolUse` → `ToolCompleted` recovers the row back to Working
 /// via `state::mutate_for_event`.
-fn pre_tool_event(id: AgentId, tool_name: Option<String>, at: OffsetDateTime) -> AgentEvent {
+fn pre_tool_event(
+    id: AgentId,
+    tool_name: Option<String>,
+    tool_input: Option<ToolInput>,
+    at: OffsetDateTime,
+) -> AgentEvent {
     let tool_name = tool_name.unwrap_or_else(|| "unknown".into());
     if is_user_blocking_tool(&tool_name) {
         AgentEvent::NotificationFired {
@@ -227,9 +248,21 @@ fn pre_tool_event(id: AgentId, tool_name: Option<String>, at: OffsetDateTime) ->
             at,
         }
     } else {
+        // Claude's `Task` tool spawns a subagent; carry its identity so the
+        // store can track it as an in-flight subagent (retired on the
+        // matching `PostToolUse`). Every other tool carries `None`.
+        let subagent = (tool_name == "Task").then(|| {
+            let (kind, description) =
+                tool_input.map_or((None, None), |ti| (ti.subagent_type, ti.description));
+            SubagentSpec {
+                kind: kind.unwrap_or_else(|| "subagent".into()),
+                description,
+            }
+        });
         AgentEvent::ToolStarted {
             id,
             tool: tool_name,
+            subagent,
             at,
         }
     }
@@ -371,6 +404,7 @@ mod tests {
             error: None,
             error_details: None,
             last_assistant_message: None,
+            tool_input: None,
         }
     }
 
@@ -408,7 +442,45 @@ mod tests {
         // read as WaitingInput.
         let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("Bash"), None);
         match ev {
-            AgentEvent::ToolStarted { tool, .. } => assert_eq!(tool, "Bash"),
+            AgentEvent::ToolStarted { tool, subagent, .. } => {
+                assert_eq!(tool, "Bash");
+                assert!(subagent.is_none(), "non-Task tools carry no subagent");
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_task_carries_subagent_identity() {
+        // The `Task` tool spawns a subagent; the adapter lifts its
+        // `subagent_type` + `description` onto ToolStarted so the store can
+        // track it as an in-flight subagent.
+        let mut input = pretool_input("Task");
+        input.tool_input = Some(ToolInput {
+            subagent_type: Some("Explore".into()),
+            description: Some("map the codebase".into()),
+        });
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, input, None);
+        match ev {
+            AgentEvent::ToolStarted { tool, subagent, .. } => {
+                assert_eq!(tool, "Task");
+                let s = subagent.expect("Task must carry a subagent spec");
+                assert_eq!(s.kind, "Explore");
+                assert_eq!(s.description.as_deref(), Some("map the codebase"));
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_task_without_subagent_type_defaults() {
+        // A `Task` call whose input we couldn't parse still registers a
+        // subagent, just with a generic kind.
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("Task"), None);
+        match ev {
+            AgentEvent::ToolStarted { subagent, .. } => {
+                assert_eq!(subagent.expect("Task carries a subagent").kind, "subagent");
+            }
             other => panic!("expected ToolStarted, got {other:?}"),
         }
     }
@@ -425,6 +497,7 @@ mod tests {
             error: None,
             error_details: None,
             last_assistant_message: None,
+            tool_input: None,
         }
     }
 
@@ -470,6 +543,7 @@ mod tests {
             error: None,
             error_details: None,
             last_assistant_message: None,
+            tool_input: None,
         }
     }
 
@@ -485,6 +559,7 @@ mod tests {
             error: Some(error.into()),
             error_details: Some(format!("{error} details")),
             last_assistant_message: last_assistant_message.map(Into::into),
+            tool_input: None,
         }
     }
 

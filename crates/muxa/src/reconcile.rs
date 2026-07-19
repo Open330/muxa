@@ -820,6 +820,7 @@ mod tests {
             cwd: None,
             pid: None,
             workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
             state,
             last_prompt: None,
             last_response: None,

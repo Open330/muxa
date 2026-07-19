@@ -105,6 +105,25 @@ const TRANSITION_CHANNEL_CAPACITY: usize = 256;
 /// and should log + continue (same pattern as the notifier).
 const PROMPT_CHANNEL_CAPACITY: usize = 256;
 
+/// Upper bound on tracked in-flight subagents per agent. A safety cap so a
+/// missed `ToolCompleted` (crash, dropped hook) can't grow the list without
+/// bound; real fan-out is far below this.
+const MAX_SUBAGENTS: usize = 32;
+
+/// A subagent (Claude `Task` child) currently running under an agent.
+/// Presence means "in flight": entries are pushed on the Task `ToolStarted`
+/// and removed on its matching `ToolCompleted`, so the list only ever holds
+/// subagents that are still working.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subagent {
+    /// Task `subagent_type`, e.g. `"Explore"`, `"general-purpose"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub kind: AgentKind,
@@ -137,6 +156,12 @@ pub struct Agent {
     /// Empty on hosts/backends that cannot expose pane PIDs.
     #[serde(default, skip_serializing_if = "WorkloadSummary::is_empty")]
     pub workload: WorkloadSummary,
+    /// Subagents (Claude `Task` children) currently in flight under this
+    /// agent, newest last. Pushed on the Task `ToolStarted` and cleared on
+    /// its `ToolCompleted` / at turn end. Empty for agents with none.
+    /// Additive on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<Subagent>,
     pub state: AgentState,
     pub last_prompt: Option<String>,
     /// Last assistant response captured for this agent. Populated by the
@@ -254,6 +279,7 @@ impl Agent {
             cwd,
             pid: None,
             workload: WorkloadSummary::default(),
+            subagents: Vec::new(),
             state: AgentState::Starting,
             last_prompt: None,
             last_response: None,
@@ -271,6 +297,19 @@ impl Agent {
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
+        }
+    }
+
+    /// Record a newly-spawned subagent (Claude `Task` child), capped at
+    /// [`MAX_SUBAGENTS`] so a missed completion can't grow the list without
+    /// bound. Cloned from the wire spec since the event is borrowed.
+    fn record_subagent(&mut self, spec: &crate::event::SubagentSpec, at: OffsetDateTime) {
+        if self.subagents.len() < MAX_SUBAGENTS {
+            self.subagents.push(Subagent {
+                kind: spec.kind.clone(),
+                description: spec.description.clone(),
+                started_at: at,
+            });
         }
     }
 }
@@ -552,6 +591,7 @@ fn mutate_for_event(
     match ev {
         AgentEvent::Started { .. } => {
             agent.state = AgentState::Idle;
+            agent.subagents.clear();
             // A fresh session means whatever wall the previous turn ran
             // into has been cleared (or the user is starting over) —
             // drop the active-cap marker so the watch row stops glowing
@@ -586,7 +626,7 @@ fn mutate_for_event(
                 ));
             }
         }
-        AgentEvent::ToolStarted { .. } => {
+        AgentEvent::ToolStarted { subagent, .. } => {
             // ToolStarted always means "agent is actively doing work" —
             // covers the Idle → Working transition AND the
             // WaitingInput → Working recovery (e.g. Codex resuming
@@ -596,8 +636,13 @@ fn mutate_for_event(
             if agent.state != AgentState::Error {
                 agent.state = AgentState::Working;
             }
+            // A Claude `Task` call carries a subagent spec — record it as an
+            // in-flight subagent; the matching `ToolCompleted` retires it.
+            if let Some(spec) = subagent {
+                agent.record_subagent(spec, at);
+            }
         }
-        AgentEvent::ToolCompleted { .. } => {
+        AgentEvent::ToolCompleted { tool, .. } => {
             // Tool activity proves the agent isn't waiting on the user
             // any more. Specifically targets these cases:
             //   - Codex grants permission, runs the tool, the
@@ -616,6 +661,13 @@ fn mutate_for_event(
                 AgentState::WaitingInput | AgentState::WaitingChoice
             ) {
                 agent.state = AgentState::Working;
+            }
+            // A completed `Task` retires the oldest in-flight subagent. We
+            // match FIFO rather than by id — the hook stream carries no
+            // per-call id, and parallel same-type subagents finish close
+            // enough in practice.
+            if tool == "Task" && !agent.subagents.is_empty() {
+                agent.subagents.remove(0);
             }
         }
         AgentEvent::NotificationFired { level, message, .. } => {
@@ -656,9 +708,14 @@ fn mutate_for_event(
             } else if agent.state != AgentState::Error {
                 agent.state = AgentState::Idle;
             }
+            // Turn boundary: subagents have finished (their own
+            // `ToolCompleted` fired first); clear defensively so a missed
+            // completion can't leave phantom subagents on an idle row.
+            agent.subagents.clear();
         }
         AgentEvent::SessionEnded { .. } => {
             agent.state = AgentState::Stopped;
+            agent.subagents.clear();
         }
         AgentEvent::Heartbeat { .. } => apply_heartbeat(agent, ev),
         AgentEvent::RateLimited { .. } => apply_rate_limited(agent, ev),
@@ -1745,6 +1802,7 @@ mod tests {
             surface: None,
             pid: None,
             workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
             pane: Some("%1".into()),
             cwd: None,
             state,
@@ -2179,6 +2237,7 @@ mod tests {
             .apply(&AgentEvent::ToolStarted {
                 id: id("c"),
                 tool: "Bash".into(),
+                subagent: None,
                 at: now,
             })
             .await;
@@ -2187,6 +2246,69 @@ mod tests {
             AgentState::Working,
             "ToolStarted should recover WaitingInput → Working"
         );
+    }
+
+    #[tokio::test]
+    async fn task_tool_tracks_subagents_as_first_class_rows() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("c"),
+                at: now,
+            })
+            .await;
+
+        let spawn = |kind: &str| AgentEvent::ToolStarted {
+            id: id("c"),
+            tool: "Task".into(),
+            subagent: Some(crate::event::SubagentSpec {
+                kind: kind.into(),
+                description: None,
+            }),
+            at: now,
+        };
+        store.apply(&spawn("Explore")).await;
+        store.apply(&spawn("general-purpose")).await;
+
+        let a = store.by_session("c").await.unwrap();
+        assert_eq!(a.subagents.len(), 2, "both Task children are tracked");
+        assert_eq!(a.subagents[0].kind, "Explore");
+        assert_eq!(a.subagents[1].kind, "general-purpose");
+
+        // A completed Task retires the oldest in-flight subagent (FIFO).
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("c"),
+                tool: "Task".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        let a = store.by_session("c").await.unwrap();
+        assert_eq!(a.subagents.len(), 1);
+        assert_eq!(a.subagents[0].kind, "general-purpose");
+
+        // A non-Task completion leaves the subagent list untouched.
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("c"),
+                tool: "Bash".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(store.by_session("c").await.unwrap().subagents.len(), 1);
+
+        // Turn end clears any stragglers so an idle row never shows phantoms.
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("c"),
+                response: Some("done".into()),
+                at: now,
+            })
+            .await;
+        assert!(store.by_session("c").await.unwrap().subagents.is_empty());
     }
 
     #[tokio::test]
@@ -2337,6 +2459,7 @@ mod tests {
             .apply(&AgentEvent::ToolStarted {
                 id: id("e"),
                 tool: "Read".into(),
+                subagent: None,
                 at: now,
             })
             .await;
@@ -2530,6 +2653,7 @@ mod tests {
             .apply(&AgentEvent::ToolStarted {
                 id: id("s"),
                 tool: "Bash".into(),
+                subagent: None,
                 at: now,
             })
             .await;
@@ -3465,6 +3589,7 @@ mod tests {
                     cwd: Some("/work".into()),
                 },
                 tool: "Bash".into(),
+                subagent: None,
                 at: t2,
             })
             .await;
@@ -3916,6 +4041,7 @@ mod tests {
                     surface: None,
                     pid: None,
                     workload: crate::WorkloadSummary::default(),
+                    subagents: Vec::new(),
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Stopped,
@@ -3947,6 +4073,7 @@ mod tests {
                     surface: None,
                     pid: None,
                     workload: crate::WorkloadSummary::default(),
+                    subagents: Vec::new(),
                     pane: Some("%1".into()),
                     cwd: None,
                     state: AgentState::Working,
@@ -4007,6 +4134,7 @@ mod tests {
                         surface: None,
                         pid: None,
                         workload: crate::WorkloadSummary::default(),
+                        subagents: Vec::new(),
                         pane: Some("%1".into()),
                         cwd: None,
                         state: AgentState::Working,
@@ -4072,6 +4200,7 @@ mod tests {
             surface: None,
             pid: None,
             workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
             pane: Some(pane.into()),
             cwd: None,
             state: AgentState::Idle,

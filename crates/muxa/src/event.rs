@@ -143,6 +143,18 @@ pub enum RateLimitSource {
     CodexRollout,
 }
 
+/// Identifies a subagent spawned via Claude's `Task` tool, carried on
+/// `ToolStarted`. `kind` is the Task `subagent_type` (e.g. `"Explore"`,
+/// `"general-purpose"`); `description` is the short label the parent gave
+/// the task, when present. Additive/optional so non-Task tools, other
+/// adapters, and older wire peers stay compatible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSpec {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -160,6 +172,11 @@ pub enum AgentEvent {
     ToolStarted {
         id: AgentId,
         tool: String,
+        /// Present only for Claude `Task` tool calls: the subagent being
+        /// spawned. `#[serde(default)]` keeps the field additive on the
+        /// wire for every other tool/adapter and for older peers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentSpec>,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },

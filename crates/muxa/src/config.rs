@@ -894,6 +894,13 @@ pub struct WatchConfig {
     /// Set `false` here to flip the default the other way.
     #[serde(default = "default_true")]
     pub hide_paneless: bool,
+    /// Animate the state glyph in the `muxa watch` TUI — a spinning braille
+    /// dot for `working`, a rotating half-circle for `starting`. Purely a
+    /// watch-TUI affordance: `muxa status` and the tmux status-line always
+    /// render the static `[ui] icons` glyph. Set `false` for calm static
+    /// icons (or a terminal without braille).
+    #[serde(default = "default_true")]
+    pub spinner: bool,
     /// Behaviour of the `p` preview overlay. See [`PreviewConfig`].
     pub preview: PreviewConfig,
 }
@@ -937,6 +944,9 @@ pub enum WatchView {
     Pane,
     #[default]
     Session,
+    /// k9s-style swarm console: session clusters, animated dot spinners for
+    /// working/starting agents, and an expandable subagent tree.
+    Swarm,
 }
 
 /// Visual preset for muxa's human-facing terminal UIs.
@@ -1051,6 +1061,7 @@ impl Default for WatchConfig {
                 WatchSortKey::Activity,
             ],
             hide_paneless: true,
+            spinner: true,
             preview: PreviewConfig::default(),
         }
     }

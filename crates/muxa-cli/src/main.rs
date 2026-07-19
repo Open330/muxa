@@ -259,6 +259,7 @@ enum HookCmd {
 enum WatchViewArg {
     Pane,
     Session,
+    Swarm,
 }
 
 impl From<WatchViewArg> for muxa::config::WatchView {
@@ -266,6 +267,7 @@ impl From<WatchViewArg> for muxa::config::WatchView {
         match value {
             WatchViewArg::Pane => Self::Pane,
             WatchViewArg::Session => Self::Session,
+            WatchViewArg::Swarm => Self::Swarm,
         }
     }
 }
@@ -1098,6 +1100,14 @@ struct StatusAgentJson<'a> {
     last_notification: Option<&'a str>,
     context_used_pct: Option<f32>,
     cost_usd: Option<f64>,
+    /// Slim child-process rollup for the swarm view. Omitted when the agent
+    /// has no tracked descendants, so quiet fleets stay noise-free.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workload: Option<WorkloadJson>,
+    /// Named subagents (Claude `Task` children) currently in flight, newest
+    /// last. Omitted when none are running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subagents: Vec<SubagentJson<'a>>,
     #[serde(with = "time::serde::rfc3339")]
     started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -1106,13 +1116,37 @@ struct StatusAgentJson<'a> {
     state_entered_at: OffsetDateTime,
 }
 
+/// Counts-only workload projection. Deliberately drops the internal
+/// process-tree preview (pids, argv) — integrations want "how many children of
+/// each kind", not the raw tree the daemon keeps for reconciliation. The
+/// `subagents` count here is process-fork subagents seen by the tree scan;
+/// the named, hook-tracked `Task` subagents live in the sibling `subagents`
+/// array on the agent.
+#[derive(Debug, Serialize)]
+struct WorkloadJson {
+    subagents: u16,
+    shells: u16,
+    processes: u16,
+}
+
+/// One in-flight subagent for the swarm view: its type, optional label, and
+/// when it started. Sourced from the agent's hook-tracked `Task` children.
+#[derive(Debug, Serialize)]
+struct SubagentJson<'a> {
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(with = "time::serde::rfc3339")]
+    started_at: OffsetDateTime,
+}
+
 fn status_json<'a>(
     agents: &'a [Agent],
     panes: &[muxa::tmux::PaneInfo],
     generated_at: OffsetDateTime,
 ) -> StatusJson<'a> {
     StatusJson {
-        schema_version: 1,
+        schema_version: 2,
         generated_at,
         agents: agents
             .iter()
@@ -1128,6 +1162,20 @@ fn status_json<'a>(
                 last_notification: agent.last_notification.as_deref(),
                 context_used_pct: agent.context_used_pct,
                 cost_usd: agent.cost_usd,
+                workload: (!agent.workload.is_empty()).then_some(WorkloadJson {
+                    subagents: agent.workload.subagent_count,
+                    shells: agent.workload.shell_count,
+                    processes: agent.workload.process_count,
+                }),
+                subagents: agent
+                    .subagents
+                    .iter()
+                    .map(|s| SubagentJson {
+                        kind: &s.kind,
+                        description: s.description.as_deref(),
+                        started_at: s.started_at,
+                    })
+                    .collect(),
                 started_at: agent.started_at,
                 last_activity_at: agent.last_activity_at,
                 state_entered_at: agent.state_entered_at,
@@ -1649,6 +1697,7 @@ mod tests {
             pane: pane.map(str::to_string),
             pid: None,
             workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
             cwd: None,
             state,
             last_prompt: Some(prompt.into()),
@@ -1781,7 +1830,7 @@ mod tests {
             serde_json::to_value(status_json(&[tracked], &[pane("%7", "muxa")], generated_at))
                 .unwrap();
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["generated_at"], "2026-04-24T12:01:00Z");
         assert_eq!(value["agents"][0]["kind"], "claude_code");
         assert_eq!(value["agents"][0]["state"], "waiting_input");
@@ -1792,8 +1841,60 @@ mod tests {
         );
         assert_eq!(value["agents"][0]["context_used_pct"], 42.5);
         assert!(value["agents"][0].get("last_response").is_none());
+        // Workload is omitted when the agent has no tracked descendants.
         assert!(value["agents"][0].get("workload").is_none());
         assert!(value["agents"][0].get("rate_limit_5h_pct").is_none());
+    }
+
+    #[test]
+    fn status_json_exposes_workload_counts_when_present() {
+        let generated_at = datetime!(2026-04-24 12:01:00 UTC);
+        let mut tracked = agent(
+            "session-1",
+            Some("%9"),
+            AgentState::Working,
+            "build the tree",
+        );
+        tracked.workload = muxa::process_tree::WorkloadSummary {
+            primary_pid: Some(4321),
+            process_count: 4,
+            shell_count: 1,
+            subagent_count: 2,
+            helper_count: 1,
+            preview: Vec::new(),
+        };
+        tracked.subagents = vec![
+            muxa::state::Subagent {
+                kind: "Explore".into(),
+                description: Some("map the codebase".into()),
+                started_at: generated_at,
+            },
+            muxa::state::Subagent {
+                kind: "general-purpose".into(),
+                description: None,
+                started_at: generated_at,
+            },
+        ];
+
+        let value =
+            serde_json::to_value(status_json(&[tracked], &[pane("%9", "muxa")], generated_at))
+                .unwrap();
+
+        let wl = &value["agents"][0]["workload"];
+        assert_eq!(wl["subagents"], 2);
+        assert_eq!(wl["shells"], 1);
+        assert_eq!(wl["processes"], 4);
+        // The internal process-tree preview / helper counts stay out of the projection.
+        assert!(wl.get("preview").is_none());
+        assert!(wl.get("helpers").is_none());
+
+        // Named, hook-tracked Task subagents ride in a sibling array.
+        let subs = &value["agents"][0]["subagents"];
+        assert_eq!(subs[0]["kind"], "Explore");
+        assert_eq!(subs[0]["description"], "map the codebase");
+        assert_eq!(subs[0]["started_at"], "2026-04-24T12:01:00Z");
+        assert_eq!(subs[1]["kind"], "general-purpose");
+        assert!(subs[1].get("description").is_none());
     }
 
     const ALL_STATES: [AgentState; 7] = [

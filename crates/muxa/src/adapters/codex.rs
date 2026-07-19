@@ -82,6 +82,7 @@ impl HookAdapter for CodexAdapter {
             Event::PreToolUse => AgentEvent::ToolStarted {
                 id,
                 tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
+                subagent: None,
                 at,
             },
             Event::PostToolUse => AgentEvent::ToolCompleted {

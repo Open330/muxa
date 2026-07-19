@@ -103,6 +103,8 @@
 # theme = "classic"   # optional watch-only override for [ui].theme
 # view = "session"    # one row per tmux session; panes merge by latest activity (default)
 # view = "pane"       # one row per agent/pane
+# view = "swarm"      # k9s-style console: session clusters, animated dot spinners
+#                     # for working/starting agents, and an expandable subagent tree
 # columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because picker actions
@@ -110,6 +112,13 @@
 # they remain discoverable. `muxa watch --include-paneless` reveals them
 # for one invocation without flipping this flag.
 # hide_paneless = true
+
+# Animate the state glyph in the `muxa watch` TUI: a spinning braille dot for
+# `working` and a rotating half-circle for `starting`. Purely a watch-TUI
+# affordance — `muxa status` and the tmux status-line always render the static
+# `[ui] icons` glyph. Default true; set false for calm static icons (or a
+# terminal without braille support).
+# spinner = true
 
 # Preview overlay (`p` key) — first-paint shape. Geometry (`f`, popup ↔
 # fullscreen) and content (`c`, prompt/response ↔ live pane) remain

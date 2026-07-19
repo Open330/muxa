@@ -933,6 +933,7 @@ async fn enrich_from_history(
             cwd: entry.cwd,
             pid: None,
             workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
             state: muxa::AgentState::Idle,
             last_prompt: Some(entry.prompt),
             last_response: None,

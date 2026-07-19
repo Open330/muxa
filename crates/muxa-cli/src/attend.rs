@@ -411,6 +411,7 @@ mod tests {
             pane: pane.map(Into::into),
             pid: None,
             workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
             cwd: None,
             state,
             last_prompt: None,
