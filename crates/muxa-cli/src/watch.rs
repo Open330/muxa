@@ -1266,6 +1266,14 @@ pub(crate) struct App {
     /// Monotonic frame counter advanced once per paint. Drives the swarm
     /// view's dot-spinner animation; unused by the table views.
     pub anim_frame: usize,
+    /// Last-seen state per agent, diffed on each update to detect transitions
+    /// that should flash a [`Pulse`]. Keyed by `(kind, session_id)` — the
+    /// codebase's compound agent identity — so two agents that happen to share
+    /// a `session_id` string across kinds don't clobber each other.
+    prev_agent_states: HashMap<(AgentKind, String), AgentState>,
+    /// Active transition pulses, same `(kind, session_id)` key. Pruned as they
+    /// expire past [`PULSE_WINDOW`].
+    pulses: HashMap<(AgentKind, String), Pulse>,
     pub last_error: Option<DaemonError>,
     pub last_refresh: OffsetDateTime,
     /// Watch config — held by value so the rendering path doesn't need to
@@ -1446,6 +1454,8 @@ impl App {
             rows: Vec::new(),
             table_state: TableState::default(),
             anim_frame: 0,
+            prev_agent_states: HashMap::new(),
+            pulses: HashMap::new(),
             last_error: None,
             last_refresh: OffsetDateTime::now_utc(),
             watch_cfg: cfg,
@@ -1479,6 +1489,71 @@ impl App {
     #[cfg(test)]
     pub(crate) fn set_data(&mut self, agents: Vec<Agent>, panes: Vec<PaneInfo>) {
         self.set_data_with_sessions(agents, panes, Vec::new(), Vec::new());
+    }
+
+    /// Iterate `((kind, session_id), state)` for every agent currently in
+    /// `rows`.
+    fn current_agent_states(&self) -> Vec<((AgentKind, String), AgentState)> {
+        self.rows
+            .iter()
+            .flat_map(|r| match r {
+                WatchRow::Agent(a) => vec![((a.kind, a.session_id.clone()), a.state)],
+                WatchRow::Session(s) => s
+                    .agents
+                    .iter()
+                    .map(|a| ((a.kind, a.session_id.clone()), a.state))
+                    .collect(),
+                WatchRow::BarePane(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Diff the current agent states against the previous snapshot and record a
+    /// [`Pulse`] for any transition worth flashing (done / error). No-op — and
+    /// clears any state — when `[watch] spinner` is off. Called after every
+    /// live update in `apply_outcome`.
+    fn detect_pulses(&mut self) {
+        if !self.watch_cfg.spinner {
+            self.prev_agent_states.clear();
+            self.pulses.clear();
+            return;
+        }
+        let now = std::time::Instant::now();
+        let current = self.current_agent_states();
+        for (key, state) in &current {
+            if let Some(pk) = pulse_kind(self.prev_agent_states.get(key).copied(), *state) {
+                self.pulses.insert(
+                    key.clone(),
+                    Pulse {
+                        kind: pk,
+                        started: now,
+                    },
+                );
+            }
+        }
+        self.prev_agent_states = current.into_iter().collect();
+        self.pulses
+            .retain(|_, p| now.duration_since(p.started) < PULSE_WINDOW);
+    }
+
+    /// The active pulse for `(kind, session_id)`, if one is still within its
+    /// window.
+    fn active_pulse(
+        &self,
+        kind: AgentKind,
+        session_id: &str,
+        now: std::time::Instant,
+    ) -> Option<PulseKind> {
+        self.pulses
+            .get(&(kind, session_id.to_string()))
+            .and_then(|p| (now.duration_since(p.started) < PULSE_WINDOW).then_some(p.kind))
+    }
+
+    /// Whether any pulse is still lit (gates the fast repaint cadence).
+    fn has_active_pulse(&self, now: std::time::Instant) -> bool {
+        self.pulses
+            .values()
+            .any(|p| now.duration_since(p.started) < PULSE_WINDOW)
     }
 
     pub(crate) fn set_data_with_sessions(
@@ -2253,6 +2328,83 @@ fn state_marker(state: AgentState, theme: WatchThemeSpec, spin: Spinner) -> (&'s
     (icon, theme.state_style(state))
 }
 
+/// A one-shot state-transition flash on an agent's State cell — a green `✓`
+/// when a turn finishes (`working → idle`), a red flash when it errors. Unlike
+/// the spinner (continuous, active states), a pulse marks a discrete *event*
+/// and then decays to the static glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PulseKind {
+    Done,
+    Error,
+}
+
+#[derive(Clone, Copy)]
+struct Pulse {
+    kind: PulseKind,
+    started: std::time::Instant,
+}
+
+/// How long a transition pulse stays lit before decaying to the static glyph.
+const PULSE_WINDOW: Duration = Duration::from_millis(1300);
+
+/// Classify a state transition into a pulse, if any. `prev == None` (first
+/// sight, e.g. initial load) never pulses so the fleet doesn't flash on open.
+fn pulse_kind(prev: Option<AgentState>, cur: AgentState) -> Option<PulseKind> {
+    let prev = prev?;
+    match cur {
+        AgentState::Error if prev != AgentState::Error => Some(PulseKind::Error),
+        AgentState::Idle if prev == AgentState::Working => Some(PulseKind::Done),
+        _ => None,
+    }
+}
+
+/// Glyph + style for an active pulse. Flashes via reverse-video on a ~2-frame
+/// cadence, then the pulse expires and the cell reverts to its static glyph.
+/// Honors `[ui] icons = ascii` for the `✓`.
+fn pulse_glyph_style(kind: PulseKind, theme: WatchThemeSpec, frame: usize) -> (String, Style) {
+    let (glyph, color) = match kind {
+        PulseKind::Done => {
+            let g = if icons_unicode() { "✓" } else { "+" };
+            (g.to_string(), theme.state_working)
+        }
+        PulseKind::Error => (
+            crate::state_icon(AgentState::Error).to_string(),
+            theme.state_error,
+        ),
+    };
+    let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    if (frame / 2).is_multiple_of(2) {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    (glyph, style)
+}
+
+fn pulse_cell(kind: PulseKind, theme: WatchThemeSpec, frame: usize) -> Text<'static> {
+    let (glyph, style) = pulse_glyph_style(kind, theme, frame);
+    Text::from(Span::styled(glyph, style))
+}
+
+/// Active pulse per row (by index), resolved outside the render closure so it
+/// borrows `app` immutably before the stateful table render takes
+/// `&mut app.table_state`.
+fn resolve_row_pulses(app: &App) -> Vec<Option<PulseKind>> {
+    let now = std::time::Instant::now();
+    app.rows
+        .iter()
+        .map(|r| {
+            let who = match r {
+                WatchRow::Agent(a) => Some((a.kind, a.session_id.as_str())),
+                WatchRow::Session(s) => s
+                    .latest_agent
+                    .as_ref()
+                    .map(|a| (a.kind, a.session_id.as_str())),
+                WatchRow::BarePane(_) => None,
+            };
+            who.and_then(|(kind, sid)| app.active_pulse(kind, sid, now))
+        })
+        .collect()
+}
+
 /// True when any row holds a `working`/`starting` agent — i.e. something the
 /// spinner would animate. Gates the fast repaint cadence so an all-idle fleet
 /// keeps the calm 1 s idle repaint.
@@ -2434,6 +2586,13 @@ pub(crate) struct FullRefresh {
 /// `set_data` re-sorts). Gone rows simply don't appear in the new
 /// snapshot and so drop.
 pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
+    apply_outcome_inner(app, outcome);
+    // Diff the freshly-applied states against the prior snapshot to arm any
+    // done/error transition pulses.
+    app.detect_pulses();
+}
+
+fn apply_outcome_inner(app: &mut App, outcome: RefreshOutcome) {
     match outcome {
         RefreshOutcome::Full(full) => apply_full(app, full),
         RefreshOutcome::SingleAgent(agent) => {
@@ -2933,13 +3092,15 @@ pub async fn run(
     let mut last_render = std::time::Instant::now();
 
     loop {
-        // Animate on a fast cadence only while there's something to spin:
+        // Animate on a fast cadence only while there's something to move:
         // the swarm view always, or the table views when `[watch] spinner`
-        // is on and at least one agent is working/starting. An all-idle
-        // fleet falls back to the calm 1 s idle repaint.
-        let animating = (app.watch_cfg.view == WatchView::Swarm || app.watch_cfg.spinner)
+        // is on and at least one agent is working/starting — or while a
+        // transition pulse is still lit. An otherwise-idle fleet falls back to
+        // the calm 1 s idle repaint.
+        let spinning = (app.watch_cfg.view == WatchView::Swarm || app.watch_cfg.spinner)
             && icons_unicode()
             && rows_have_active_spinner(&app.rows);
+        let animating = spinning || app.has_active_pulse(std::time::Instant::now());
         let redraw_interval = if animating {
             SWARM_REDRAW_INTERVAL
         } else {
@@ -4491,13 +4652,24 @@ fn swarm_cluster_header(
 
 /// One agent row plus its indented subagent tree (`├─ / └─` with a dot
 /// spinner per in-flight Task child).
-fn swarm_agent_lines(agent: &Agent, theme: WatchThemeSpec, frame: usize) -> Vec<Line<'static>> {
-    let mut spans = vec![
-        Span::raw("    "),
-        Span::styled(
-            format!("{} ", swarm_glyph(agent.state, frame)),
+fn swarm_agent_lines(
+    agent: &Agent,
+    theme: WatchThemeSpec,
+    frame: usize,
+    pulse: Option<PulseKind>,
+) -> Vec<Line<'static>> {
+    // A live transition pulse takes over the leading glyph; otherwise the
+    // spinner/static state glyph.
+    let (glyph, gstyle) = match pulse {
+        Some(kind) => pulse_glyph_style(kind, theme, frame),
+        None => (
+            swarm_glyph(agent.state, frame).to_string(),
             theme.state_style(agent.state),
         ),
+    };
+    let mut spans = vec![
+        Span::raw("    "),
+        Span::styled(format!("{glyph} "), gstyle),
         Span::styled(
             format!("{:<9}", swarm_kind_short(agent.kind)),
             Style::default(),
@@ -4553,6 +4725,7 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let frame = app.anim_frame;
     let selected = app.table_state.selected();
+    let now_pulse = std::time::Instant::now();
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line: Option<usize> = None;
 
@@ -4566,7 +4739,8 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
         }
         lines.push(swarm_cluster_header(sr, theme, frame, is_sel));
         for a in &sr.agents {
-            lines.extend(swarm_agent_lines(a, theme, frame));
+            let pulse = app.active_pulse(a.kind, &a.session_id, now_pulse);
+            lines.extend(swarm_agent_lines(a, theme, frame, pulse));
         }
         lines.push(Line::from(""));
     }
@@ -4630,6 +4804,16 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         frame: app.anim_frame,
         enabled: app.watch_cfg.spinner && icons_unicode(),
     };
+    // A one-shot done/error flash overrides the State cell for its window.
+    // Resolve per-row pulses up front so the row closure only touches app
+    // *fields* — calling an `&self` method inside it would capture all of
+    // `app` and clash with the `&mut app.table_state` render below.
+    let anim_frame = app.anim_frame;
+    let state_col = app
+        .columns
+        .iter()
+        .position(|c| matches!(c, WatchColumn::State));
+    let row_pulses = resolve_row_pulses(app);
     let rows: Vec<Row> = app
         .rows
         .iter()
@@ -4648,6 +4832,11 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                     .map(|c| c.session_text(s, now, &app.panes, theme, spin))
                     .collect(),
             };
+
+            // Overlay a transition pulse on the State cell.
+            if let (Some(sc), Some(kind)) = (state_col, row_pulses[i]) {
+                texts[sc] = pulse_cell(kind, theme, anim_frame);
+            }
 
             let mut expanded = false;
             if Some(i) == selected && app.watch_cfg.detail.enabled {
@@ -5537,6 +5726,74 @@ mod tests {
         assert_eq!(
             state_marker(AgentState::Working, theme, Spinner::OFF).0,
             crate::state_icon(AgentState::Working)
+        );
+    }
+
+    #[test]
+    fn pulse_kind_classifies_transitions() {
+        // Turn finished.
+        assert_eq!(
+            pulse_kind(Some(AgentState::Working), AgentState::Idle),
+            Some(PulseKind::Done)
+        );
+        // Entered error from anywhere but error.
+        assert_eq!(
+            pulse_kind(Some(AgentState::WaitingInput), AgentState::Error),
+            Some(PulseKind::Error)
+        );
+        // No flash: already error, first sight, spin-up settling, or non-idle.
+        assert_eq!(pulse_kind(Some(AgentState::Error), AgentState::Error), None);
+        assert_eq!(pulse_kind(None, AgentState::Error), None);
+        assert_eq!(
+            pulse_kind(Some(AgentState::Starting), AgentState::Idle),
+            None
+        );
+        assert_eq!(
+            pulse_kind(Some(AgentState::Working), AgentState::WaitingInput),
+            None
+        );
+    }
+
+    #[test]
+    fn done_pulse_flashes_state_cell_on_work_to_idle() {
+        let cfg = WatchConfig {
+            view: WatchView::Pane,
+            sort: vec![WatchSortKey::PaneId],
+            hide_paneless: false,
+            spinner: true,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let working = fake_agent(
+            "s1",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("refactor"),
+            None,
+            None,
+            None,
+        );
+        let panes = vec![fake_pane("%1", "a", 0, 0, "claude")];
+        // Prime prev-state = Working (first sight never flashes).
+        app.set_data(vec![working.clone()], panes.clone());
+        app.detect_pulses();
+        // Working → Idle arms a Done pulse.
+        let mut idle = working;
+        idle.state = AgentState::Idle;
+        app.set_data(vec![idle], panes);
+        app.detect_pulses();
+
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains('✓'),
+            "done pulse ✓ should overlay the State cell:\n{screen}"
         );
     }
 
