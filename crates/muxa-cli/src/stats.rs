@@ -3175,6 +3175,7 @@ mod tests {
             pane: Some("%1".into()),
             pid: None,
             workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
             cwd: cwd.map(str::to_string),
             state,
             last_prompt: None,

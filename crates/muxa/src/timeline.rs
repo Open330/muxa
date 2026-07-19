@@ -3224,6 +3224,7 @@ mod tests {
             pane: Some("%1".into()),
             pid: None,
             workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
             cwd: None,
             state,
             last_prompt: None,

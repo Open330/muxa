@@ -491,6 +491,7 @@ mod tests {
             pane: pane.map(str::to_string),
             pid: None,
             workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
             cwd: None,
             state: AgentState::WaitingInput,
             last_prompt: prompt.map(str::to_string),

@@ -81,6 +81,7 @@ pub fn normalize_event(input: Value, pane: Option<String>) -> AgentEvent {
         "tool.execute.before" => AgentEvent::ToolStarted {
             id,
             tool: tool_name(&input),
+            subagent: None,
             at,
         },
         "tool.execute.after" => AgentEvent::ToolCompleted {
