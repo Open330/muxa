@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Real hook events stay authoritative — a hooked agent owns its pane and
   bridge state never clobbers it. Verified live against herdr 0.7.4. See
   `docs/HERDR.md`.
+- **herdr reverse path (`pane.report_agent`).** On herdr hosts the daemon
+  now pushes muxa's authoritative hook-derived state for REAL
+  (non-synthetic) `herdr:` rows into herdr's own UI: a transition
+  subscriber maps `Working`→`working`, `WaitingInput`/`WaitingChoice`/`Error`
+  →`blocked` (carrying the notification/error text), `Idle`→`idle`, and
+  `Stopped`→`pane.release_agent` (handing authority back to herdr's
+  detection). Reports carry `source = "muxa"`, a herdr-aligned agent slug,
+  the real session id, and a monotonic `seq`. Synthetic bridge rows are
+  never reported back, so the two directions can't feedback-loop. Failures
+  are best-effort and non-fatal. Verified live against herdr 0.7.4. See
+  `docs/HERDR.md`.
 
 ### Fixed
 

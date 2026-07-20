@@ -39,8 +39,8 @@ no hooks for.
   kinds are `pane.agent_status_changed`, `pane.output_matched`, and
   `pane.scroll_changed` — pane create/close are *not* subscribable, so
   pane liveness stays with the reconciler's `observe_panes` polling.
-  Optional later: `pane.report_agent` (reverse path: muxa's hook-derived
-  state shown in herdr's UI).
+  Phase 2 reverse path (implemented): `pane.report_agent` /
+  `pane.release_agent` push muxa's hook-derived state into herdr's UI.
 - `PaneInfo` (herdr): `pane_id`, `tab_id`, `workspace_id`, `terminal_id`,
   `cwd`, `focused`, `title`, `terminal_title`, `agent`, `agent_status`
   (`idle|working|blocked|done|unknown`), …
@@ -154,8 +154,61 @@ background producers. The bridge applies directly to the in-process
 producers.
 
 Pane liveness stays with the reconciler (pane close is not a subscribable
-herdr event kind). Optional reverse path — push muxa's hook-derived state
-into herdr's UI via `pane.report_agent` — remains future work.
+herdr event kind).
+
+### Reverse path — muxa's hook state into herdr (`pane.report_agent`)
+
+**Implemented** (`muxad::herdr_bridge`, `report_decision` + a second
+transition-subscriber task, both herdr-host only). herdr treats an installed
+integration's report as authoritative over its *own* screen detection, so when
+muxa has real hook truth for a pane, it hands that truth to herdr's sidebar
+instead of letting herdr guess from scrollback. The task subscribes to the same
+`Store::subscribe()` transition stream the desktop notifier and activity ledger
+use; on every state change it decides via the pure `report_decision` fn and, for
+a reportable row, fires `pane.report_agent` (`source = "muxa"`) at the herdr
+socket. Failures are non-fatal (bounded request timeout, debug-logged, dropped)
+and never hold the transition channel back.
+
+**Only REAL rows on `herdr:` panes are reported.** `report_decision` returns
+nothing unless the row is *both* on a `herdr:` pane (the prefix is stripped for
+the wire `pane_id`) *and* non-synthetic. Mapping:
+
+| muxa `AgentState`              | herdr call / state                       |
+|--------------------------------|------------------------------------------|
+| `Working`                      | `pane.report_agent` `working`            |
+| `WaitingInput`/`WaitingChoice` | `pane.report_agent` `blocked` (+message) |
+| `Error`                        | `pane.report_agent` `blocked` (+message) |
+| `Idle`                         | `pane.report_agent` `idle`               |
+| `Stopped`                      | `pane.release_agent`                     |
+| `Starting`                     | — (transient; nothing reported)          |
+
+`agent` is a herdr-aligned slug (`ClaudeCode`→`claude`, `Codex`→`codex`,
+`GeminiCli`→`gemini`, `Opencode`→`opencode`, else the kind name), matching the
+forward bridge's `classify_agent` so the same pane carries the same label in
+both directions. `agent_session_id` is muxa's real session id, and a
+process-global monotonic `seq` lets herdr discard out-of-order reports. `blocked`
+rows carry `last_notification` as the `message` so herdr shows *what* the agent
+is waiting on / erroring about.
+
+**No feedback loop — the load-bearing invariant.** Synthetic rows (the ones the
+forward bridge *mints* from herdr's own detection) are NEVER reported back:
+echoing them would form a cycle — report → herdr adopts muxa as authority →
+herdr stops emitting `pane.agent_status_changed` → the forward bridge starves →
+the synthetic row goes stale. The two directions stay disjoint by pane
+ownership. A `herdr:` pane with a real hook row is reported here, and the forward
+bridge's `apply_update` already *drops* herdr's screen-detection updates for that
+same pane — so herdr's flapping is silenced from both ends and muxa is the single
+source of truth. A `herdr:` pane with only a synthetic bridge row is never
+reported; herdr keeps detecting and the forward bridge keeps mirroring it.
+
+**Release.** `Stopped` is muxa's terminal state — reached on a `SessionEnded`
+hook and on reconciler/GC reaping (the reaper flips the row to `Stopped`, which
+emits a transition) — and triggers `pane.release_agent`, returning authority to
+herdr's own detection. A row GC-evicted *after* it already went `Stopped` emits
+no further transition, and there is no distinct "row removed" transition to
+observe, so releasing on the `…→Stopped` edge is both necessary and sufficient.
+One consequence of being change-driven: a hook row rehydrated from `state.json`
+at startup isn't reported to herdr until its *next* transition.
 
 ## Risks
 

@@ -192,6 +192,12 @@ async fn main() -> Result<()> {
     // server takes ownership of `store` so it shares the same registry.
     let herdr_bridge_handle =
         herdr_bridge::spawn_herdr_bridge_task(&backend, store.clone(), &shutdown_tx);
+    // herdr reverse path: push muxa's authoritative hook-derived state for REAL
+    // (non-synthetic) `herdr:` rows back into herdr's UI via `pane.report_agent`,
+    // releasing authority when the row stops. Subscribes to the same store
+    // transition stream the notifier/activity tasks use. Herdr-host only.
+    let herdr_report_handle =
+        herdr_bridge::spawn_herdr_report_task(&backend, store.clone(), &shutdown_tx);
     let session_activity_handle =
         spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
     let history_compaction_handle = spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
@@ -321,6 +327,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("gc", Some(gc_handle)).await;
     await_shutdown_task("reconciler", reconciler_handle).await;
     await_shutdown_task("herdr bridge", herdr_bridge_handle).await;
+    await_shutdown_task("herdr report", herdr_report_handle).await;
     await_shutdown_task("session activity", session_activity_handle).await;
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;

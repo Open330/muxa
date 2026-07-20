@@ -40,12 +40,13 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muxa::backend::herdr::{default_socket_path, PANE_ID_PREFIX};
 use muxa::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
-use muxa::state::SYNTHETIC_SESSION_PREFIX;
-use muxa::{HostKind, SharedBackend, SharedStore};
+use muxa::state::{Agent, SYNTHETIC_SESSION_PREFIX};
+use muxa::{AgentState, HostKind, SharedBackend, SharedStore};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -525,6 +526,263 @@ pub fn spawn_herdr_bridge_task(
     Some(tokio::spawn(run(store, socket_path, shutdown_tx)))
 }
 
+// ============================================================================
+// Reverse path: pane.report_agent — push muxa's hook-derived state INTO herdr.
+// ============================================================================
+//
+// ## What and why
+//
+// The forward bridge above turns herdr's *own* screen detection into synthetic
+// muxa rows. This reverse path does the opposite for the rows muxa is
+// authoritative about: whenever a REAL (hook-driven, non-synthetic) agent on a
+// `herdr:` pane changes state, muxa reports that state to herdr via
+// `pane.report_agent` (source `"muxa"`). herdr treats an installed
+// integration's report as authoritative over its own screen detection, so its
+// sidebar/UI shows muxa's exact hook-derived state instead of guessing from the
+// pane's scrollback — and stops its screen-detection state flapping for that
+// pane while muxa owns it.
+//
+// ## No feedback loop (the load-bearing invariant)
+//
+// We report ONLY non-synthetic rows. Synthetic rows (`synthetic-…` session ids)
+// are the ones the forward bridge MINTS from herdr's detection — echoing them
+// back would form a loop: report → herdr adopts muxa as authority → herdr stops
+// emitting `pane.agent_status_changed` → the forward bridge sees no more deltas
+// → muxa's synthetic row goes stale. The two directions stay disjoint by pane
+// ownership:
+//
+//   * A `herdr:` pane with a real hook row → reported here; the forward bridge's
+//     `apply_update` already DROPS herdr's screen-detection updates for that
+//     same pane (hook-authoritative), so herdr's flapping is silenced from both
+//     ends and muxa is the single source of truth.
+//   * A `herdr:` pane with only a synthetic bridge row → never reported; herdr
+//     keeps its own detection and the forward bridge keeps mirroring it.
+//
+// ## Release
+//
+// When a reported row transitions to `Stopped` we send `pane.release_agent`,
+// handing authority back to herdr's own detection. `Stopped` is muxa's terminal
+// state — reached on a `SessionEnded` hook and on reconciler/GC reaping (the
+// reaper flips the row to `Stopped`, which emits a `Transition`). NOTE: a row
+// that is GC-evicted from the registry *after* it already went `Stopped` emits
+// no further transition, and there is no distinct "row removed" transition on
+// the stream to observe. Releasing on the `…→Stopped` edge is therefore both
+// necessary and sufficient — that single release is the last thing herdr hears
+// from muxa for the pane, after which its own detection resumes.
+
+/// The `source` every reverse-path call carries, so herdr attributes the
+/// authority to this integration (and its `pane.release_agent` matches).
+const REPORT_SOURCE: &str = "muxa";
+
+/// Process-global monotonic sequence for `pane.report_agent` /
+/// `pane.release_agent`. herdr uses `seq` to discard out-of-order reports, so a
+/// single ever-increasing counter across every pane keeps a late-delivered
+/// report from resurrecting stale state.
+static REPORT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_seq() -> u64 {
+    REPORT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// herdr's canonical agent slug for a muxa [`AgentKind`]. Chosen to line up
+/// with herdr's own agent names (its `IntegrationTarget` uses `claude`,
+/// `codex`, …) and with the forward bridge's [`classify_agent`], so a pane muxa
+/// reports and a pane herdr detects carry the same agent label.
+fn agent_slug(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::ClaudeCode => "claude",
+        AgentKind::Codex => "codex",
+        AgentKind::GeminiCli => "gemini",
+        AgentKind::Opencode => "opencode",
+        AgentKind::Task => "task",
+        AgentKind::Unknown => "unknown",
+    }
+}
+
+/// A wire-ready decision for one muxa [`Transition`]: report a state to herdr,
+/// or release muxa's authority so herdr's own detection resumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrReport {
+    /// `pane.report_agent` — muxa is authoritative for this pane's state.
+    Report {
+        /// Bare herdr pane id (the `herdr:` prefix stripped for the wire).
+        pane_id: String,
+        /// herdr agent slug (see [`agent_slug`]).
+        agent: String,
+        /// One of herdr's `PaneAgentState`: `idle` | `working` | `blocked`.
+        state: &'static str,
+        /// Optional human message — blocked/error rows carry the notification.
+        message: Option<String>,
+        /// muxa's real session id, forwarded as herdr's `agent_session_id`.
+        agent_session_id: String,
+    },
+    /// `pane.release_agent` — hand authority back to herdr.
+    Release {
+        /// Bare herdr pane id (the `herdr:` prefix stripped for the wire).
+        pane_id: String,
+        /// herdr agent slug (see [`agent_slug`]).
+        agent: String,
+    },
+}
+
+impl HerdrReport {
+    /// The herdr JSON-RPC method and params for this decision, stamped with
+    /// `seq`. `source` is always [`REPORT_SOURCE`].
+    fn request(&self, seq: u64) -> (&'static str, Value) {
+        match self {
+            HerdrReport::Report {
+                pane_id,
+                agent,
+                state,
+                message,
+                agent_session_id,
+            } => (
+                "pane.report_agent",
+                json!({
+                    "pane_id": pane_id,
+                    "source": REPORT_SOURCE,
+                    "agent": agent,
+                    "state": state,
+                    "message": message,
+                    "agent_session_id": agent_session_id,
+                    "seq": seq,
+                }),
+            ),
+            HerdrReport::Release { pane_id, agent } => (
+                "pane.release_agent",
+                json!({
+                    "pane_id": pane_id,
+                    "source": REPORT_SOURCE,
+                    "agent": agent,
+                    "seq": seq,
+                }),
+            ),
+        }
+    }
+}
+
+/// Decide what (if anything) to report to herdr for a post-transition agent
+/// snapshot. Pure and total, so the full mapping is unit-testable.
+///
+/// Returns `None` — report nothing — unless the row is BOTH on a `herdr:` pane
+/// AND non-synthetic (a real hook row). See the module-level no-loop note.
+///
+/// State mapping:
+///
+/// | muxa `AgentState`              | herdr call / state      |
+/// |--------------------------------|-------------------------|
+/// | `Working`                      | report `working`        |
+/// | `WaitingInput`/`WaitingChoice` | report `blocked` (+msg) |
+/// | `Error`                        | report `blocked` (+msg) |
+/// | `Idle`                         | report `idle`           |
+/// | `Stopped`                      | release                 |
+/// | `Starting`                     | — (nothing; transient)  |
+pub fn report_decision(agent: &Agent) -> Option<HerdrReport> {
+    let pane = agent.pane.as_deref()?;
+    // Only herdr-namespaced panes; the bare id is what crosses the wire.
+    let bare = pane.strip_prefix(PANE_ID_PREFIX)?;
+    // NEVER report synthetic rows — those are minted FROM herdr's own detection
+    // and echoing them back would loop (see the module-level no-loop note).
+    if agent.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) {
+        return None;
+    }
+    let pane_id = bare.to_owned();
+    let agent_name = agent_slug(agent.kind).to_owned();
+
+    let (state, message): (&'static str, Option<String>) = match agent.state {
+        AgentState::Working => ("working", None),
+        // Both "needs input" and "needs a choice" are `blocked` to herdr; carry
+        // the notification text so the sidebar shows *what* it's blocked on.
+        AgentState::WaitingInput | AgentState::WaitingChoice => {
+            ("blocked", agent.last_notification.clone())
+        }
+        // Error has no herdr equivalent; surface it as `blocked` with the error
+        // message (NotificationFired at Error level populates last_notification).
+        AgentState::Error => ("blocked", agent.last_notification.clone()),
+        AgentState::Idle => ("idle", None),
+        AgentState::Stopped => {
+            return Some(HerdrReport::Release {
+                pane_id,
+                agent: agent_name,
+            });
+        }
+        // A freshly-`Started` row is `Starting` only briefly before its first
+        // prompt/tool/turn event moves it on; reporting a transient state herdr
+        // has no equivalent for adds churn without value.
+        AgentState::Starting => return None,
+    };
+    Some(HerdrReport::Report {
+        pane_id,
+        agent: agent_name,
+        state,
+        message,
+        agent_session_id: agent.session_id.clone(),
+    })
+}
+
+/// Fire one reverse-path call at herdr. Best-effort: a failure just means herdr
+/// keeps its own detection for a beat. Bounded by [`REQUEST_TIMEOUT`] inside
+/// [`herdr_request`] so a wedged server can't stall the transition stream.
+async fn send_report(socket_path: &Path, report: &HerdrReport, seq: u64) {
+    let (method, params) = report.request(seq);
+    if herdr_request(socket_path, method, params).await.is_none() {
+        // No `result` came back (transport error, timeout, or an error
+        // response) — non-fatal, just note it and move on.
+        tracing::debug!(method, seq, "herdr report: no result (dropped)");
+    }
+}
+
+/// Subscribe to the store's transition stream and push every REAL row's state
+/// change on a `herdr:` pane into herdr. Runs until shutdown or the store's
+/// broadcast channel closes.
+async fn run_report(store: SharedStore, socket_path: PathBuf, shutdown_tx: broadcast::Sender<()>) {
+    let mut rx = store.subscribe();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::debug!("herdr report path shutting down");
+                return;
+            }
+            msg = rx.recv() => match msg {
+                Ok(transition) => {
+                    if let Some(report) = report_decision(transition.agent.as_ref()) {
+                        send_report(&socket_path, &report, next_seq()).await;
+                    }
+                }
+                // A slow send while herdr was wedged let transitions pile up.
+                // Reporting is best-effort and each transition carries the full
+                // post-state, so skipping the gap is harmless — the next
+                // transition re-reports current truth.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "herdr report path lagged behind transitions");
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+        }
+    }
+}
+
+/// Spawn the herdr reverse-path (report) task, but only when the active backend
+/// is herdr. Returns the join handle so the daemon can drain it on shutdown;
+/// `None` on every other host.
+pub fn spawn_herdr_report_task(
+    backend: &SharedBackend,
+    store: SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if backend.kind() != HostKind::Herdr {
+        return None;
+    }
+    let socket_path = default_socket_path();
+    let shutdown_tx = shutdown_tx.clone();
+    tracing::info!(
+        socket = %socket_path.display(),
+        "herdr report path enabled (pushing hook-derived state via pane.report_agent)",
+    );
+    Some(tokio::spawn(run_report(store, socket_path, shutdown_tx)))
+}
+
 #[cfg(test)]
 mod tests {
     use muxa::event::AgentEvent;
@@ -733,5 +991,217 @@ mod tests {
         assert_eq!(rows[0].session_id, "real-session");
         assert_eq!(rows[0].kind, AgentKind::ClaudeCode);
         assert_eq!(rows[0].state, AgentState::Idle, "unchanged by the bridge");
+    }
+
+    // --- Reverse path: report_decision --------------------------------------
+
+    /// Build an `Agent` for the reverse-path mapping tests. Only the fields
+    /// `report_decision` reads (`kind`, `session_id`, `pane`, `state`,
+    /// `last_notification`) carry meaning; the rest are inert.
+    fn agent(kind: AgentKind, session_id: &str, pane: &str, state: AgentState) -> Agent {
+        Agent {
+            kind,
+            session_id: session_id.to_owned(),
+            surface: None,
+            pane: Some(pane.to_owned()),
+            tmux_socket: None,
+            tmux_session: None,
+            cwd: None,
+            pid: None,
+            workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
+            state,
+            last_prompt: None,
+            last_response: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: AT,
+            last_activity_at: AT,
+            state_entered_at: AT,
+        }
+    }
+
+    #[test]
+    fn working_row_reports_working_with_stripped_pane() {
+        let a = agent(
+            AgentKind::ClaudeCode,
+            "sess-1",
+            "herdr:w1:p1",
+            AgentState::Working,
+        );
+        match report_decision(&a).expect("herdr working row reports") {
+            HerdrReport::Report {
+                pane_id,
+                agent,
+                state,
+                message,
+                agent_session_id,
+            } => {
+                assert_eq!(pane_id, "w1:p1", "herdr: prefix stripped for the wire");
+                assert_eq!(agent, "claude", "ClaudeCode -> herdr slug");
+                assert_eq!(state, "working");
+                assert_eq!(message, None);
+                assert_eq!(agent_session_id, "sess-1");
+            }
+            report @ HerdrReport::Release { .. } => panic!("expected Report, got {report:?}"),
+        }
+    }
+
+    #[test]
+    fn waiting_states_report_blocked_with_notification() {
+        for state in [AgentState::WaitingInput, AgentState::WaitingChoice] {
+            let mut a = agent(AgentKind::ClaudeCode, "s", "herdr:w1:p1", state);
+            a.last_notification = Some("Approve running `rm`?".into());
+            match report_decision(&a).unwrap() {
+                HerdrReport::Report { state, message, .. } => {
+                    assert_eq!(state, "blocked", "{state:?} -> blocked");
+                    assert_eq!(message.as_deref(), Some("Approve running `rm`?"));
+                }
+                report @ HerdrReport::Release { .. } => panic!("expected Report, got {report:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn error_reports_blocked_with_error_message() {
+        let mut a = agent(AgentKind::Codex, "s", "herdr:w1:p1", AgentState::Error);
+        a.last_notification = Some("StopFailure: auth".into());
+        match report_decision(&a).unwrap() {
+            HerdrReport::Report {
+                agent,
+                state,
+                message,
+                ..
+            } => {
+                assert_eq!(agent, "codex");
+                assert_eq!(state, "blocked");
+                assert_eq!(message.as_deref(), Some("StopFailure: auth"));
+            }
+            report @ HerdrReport::Release { .. } => panic!("expected Report, got {report:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_reports_idle() {
+        let a = agent(AgentKind::ClaudeCode, "s", "herdr:w1:p1", AgentState::Idle);
+        match report_decision(&a).unwrap() {
+            HerdrReport::Report { state, .. } => assert_eq!(state, "idle"),
+            report @ HerdrReport::Release { .. } => panic!("expected Report, got {report:?}"),
+        }
+    }
+
+    #[test]
+    fn stopped_releases_authority() {
+        let a = agent(
+            AgentKind::ClaudeCode,
+            "s",
+            "herdr:w1:p1",
+            AgentState::Stopped,
+        );
+        match report_decision(&a).expect("stopped releases") {
+            HerdrReport::Release { pane_id, agent } => {
+                assert_eq!(pane_id, "w1:p1");
+                assert_eq!(agent, "claude");
+            }
+            report @ HerdrReport::Report { .. } => panic!("expected Release, got {report:?}"),
+        }
+    }
+
+    #[test]
+    fn starting_reports_nothing() {
+        let a = agent(
+            AgentKind::ClaudeCode,
+            "s",
+            "herdr:w1:p1",
+            AgentState::Starting,
+        );
+        assert_eq!(
+            report_decision(&a),
+            None,
+            "transient Starting is not reported"
+        );
+    }
+
+    #[test]
+    fn synthetic_row_is_never_reported_no_loop() {
+        // A synthetic (bridge-owned) row on a herdr pane must NEVER be reported
+        // back to herdr — that would close the detection loop.
+        let a = agent(
+            AgentKind::Unknown,
+            "synthetic-herdr:w1:p1",
+            "herdr:w1:p1",
+            AgentState::Working,
+        );
+        assert_eq!(
+            report_decision(&a),
+            None,
+            "synthetic rows are not echoed back"
+        );
+    }
+
+    #[test]
+    fn non_herdr_pane_is_not_reported() {
+        // A real hook row on a tmux pane is none of herdr's business.
+        let a = agent(AgentKind::ClaudeCode, "s", "%7", AgentState::Working);
+        assert_eq!(report_decision(&a), None);
+        // …and a row with no pane at all.
+        let mut paneless = agent(AgentKind::ClaudeCode, "s", "%7", AgentState::Working);
+        paneless.pane = None;
+        assert_eq!(report_decision(&paneless), None);
+    }
+
+    #[test]
+    fn agent_slug_covers_every_kind() {
+        assert_eq!(agent_slug(AgentKind::ClaudeCode), "claude");
+        assert_eq!(agent_slug(AgentKind::Codex), "codex");
+        assert_eq!(agent_slug(AgentKind::GeminiCli), "gemini");
+        assert_eq!(agent_slug(AgentKind::Opencode), "opencode");
+        assert_eq!(agent_slug(AgentKind::Task), "task");
+        assert_eq!(agent_slug(AgentKind::Unknown), "unknown");
+    }
+
+    #[test]
+    fn report_request_shape_is_wire_correct() {
+        let a = agent(
+            AgentKind::ClaudeCode,
+            "sess-1",
+            "herdr:w1:p1",
+            AgentState::Working,
+        );
+        let report = report_decision(&a).unwrap();
+        let (method, params) = report.request(42);
+        assert_eq!(method, "pane.report_agent");
+        assert_eq!(params["pane_id"], json!("w1:p1"));
+        assert_eq!(params["source"], json!("muxa"));
+        assert_eq!(params["agent"], json!("claude"));
+        assert_eq!(params["state"], json!("working"));
+        assert_eq!(params["agent_session_id"], json!("sess-1"));
+        assert_eq!(params["seq"], json!(42));
+    }
+
+    #[test]
+    fn release_request_shape_is_wire_correct() {
+        let a = agent(
+            AgentKind::ClaudeCode,
+            "s",
+            "herdr:w1:p1",
+            AgentState::Stopped,
+        );
+        let report = report_decision(&a).unwrap();
+        let (method, params) = report.request(7);
+        assert_eq!(method, "pane.release_agent");
+        assert_eq!(params["pane_id"], json!("w1:p1"));
+        assert_eq!(params["source"], json!("muxa"));
+        assert_eq!(params["agent"], json!("claude"));
+        assert_eq!(params["seq"], json!(7));
     }
 }
