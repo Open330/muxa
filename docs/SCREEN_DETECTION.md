@@ -155,12 +155,15 @@ an unmatched screen just keeps the row's previous state.
 | Pattern class | Confidence | Notes |
 |---------------|-----------|-------|
 | Braille spinner glyphs (`⠋⠙…`, `⣾⣽…`) as `working` | **Medium-high** | Near-universal across modern TUI CLIs; low false-positive risk in normal prose. |
+| `thinking` / `generating` (and cursor's `reasoning`) as `working` | **Medium** | Canonical spinner labels; uncommon in ordinary code/git output. |
 | `esc to interrupt` / interrupt hints as `working` | **Medium** | Common idiom (Claude/others show it); not verified per-CLI. |
 | `[y/n]` / `(y/n)` as `blocked` | **Medium-high** | Strong, specific approval affordance. |
 | aider `(Y)es/(N)o` as `blocked` | **Medium-high** | Aider's documented confirm format is distinctive. |
+| copilot `❯ Yes` selection widget as `blocked` | **Low-medium** | The highlighted-row arrow is specific to an actual menu, not prose. |
 | Generic "do you want to allow/proceed/run", "approve this command", "permission to run" as `blocked` | **Low-medium** | Plausible phrasings; specific enough to avoid most prose, but not verified against each CLI's exact copy. |
-| goose "would like to call" as `blocked` | **Low** | Speculative wording. |
+| goose "would like to call" / literal `Allow?` as `blocked` | **Low** | Speculative wording; `Allow?` requires the `?` affordance, not the bare word. |
 | bare `^> $` as `idle` | **Medium** | Common prompt shape; may miss CLIs with a richer prompt (model name, token count). |
+| **Excluded:** bare single English words (`working`, a lone `allow`) and loose `yes … no … ?` prose as a state marker | **Rejected** | Too common in ordinary output ("working tree clean", "these settings allow …", any sentence with yes/no/?); they falsely froze rows as busy or blocked. Removed in favor of spinner glyphs + unambiguous affordances above. `no match > wrong match`. |
 
 Operators who run these CLIs should refine the patterns against the real UI via
 a user override — that is the intended path to high-confidence detection.

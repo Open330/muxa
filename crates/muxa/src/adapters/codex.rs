@@ -105,6 +105,10 @@ impl HookAdapter for CodexAdapter {
                 response: None,
                 recap: None,
                 ai_title: None,
+                // Real hook: never a synthetic idle observation. A response-less
+                // Codex `Stop` can fire while a permission prompt is still on
+                // screen, so it must NOT clear a waiting row (see state.rs).
+                idle_confirmed: false,
                 at,
             },
         }

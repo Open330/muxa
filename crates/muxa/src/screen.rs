@@ -211,13 +211,12 @@ pub fn parse_manifest(toml_str: &str) -> Result<AgentManifest, ManifestError> {
 }
 
 /// Lowercase command basename: `/usr/local/bin/Cursor-Agent` → `cursor-agent`.
+/// Delegates the basename extraction to [`crate::discovery::command_name`] (the
+/// same rule `discovery::classify_command` uses) and only adds the lowercasing
+/// the manifest matcher wants, so the screen matcher and `classify_command`
+/// agree on "the command" by construction.
 fn command_basename(cmd: &str) -> String {
-    cmd.trim()
-        .rsplit('/')
-        .next()
-        .unwrap_or(cmd)
-        .trim()
-        .to_ascii_lowercase()
+    crate::discovery::command_name(cmd).to_ascii_lowercase()
 }
 
 /// The bundled manifest sources, shipped in the binary via `include_str!`.
@@ -486,7 +485,14 @@ idle = ['^> $']
     fn amp_fixtures() {
         let m = parse_manifest(include_str!("screen/agents/amp.toml")).unwrap();
         assert!(m.matches_command("amp"));
-        assert_eq!(m.classify("⠸ Working"), Some(ScreenState::Working));
+        // A spinner glyph is busy; the bare word "working" alone is NOT (it
+        // shows up in ordinary output like "working tree clean").
+        assert_eq!(m.classify("⠸ generating"), Some(ScreenState::Working));
+        assert_eq!(
+            m.classify("nothing to commit, working tree clean"),
+            None,
+            "the word `working` in prose must not read as busy",
+        );
         assert_eq!(
             m.classify("Allow this command? (y/n)"),
             Some(ScreenState::Blocked)
@@ -500,8 +506,26 @@ idle = ['^> $']
         assert!(m.matches_command("copilot"));
         assert_eq!(m.classify("⠴ generating"), Some(ScreenState::Working));
         assert_eq!(
+            m.classify("working tree clean"),
+            None,
+            "the word `working` in prose must not read as busy",
+        );
+        assert_eq!(
             m.classify("Do you want to run this? [y/n]"),
             Some(ScreenState::Blocked)
+        );
+        // A real yes/no selection widget (highlighted `❯ Yes` row) reads as
+        // blocked...
+        assert_eq!(
+            m.classify("  Run this command?\n❯ Yes\n  No"),
+            Some(ScreenState::Blocked),
+        );
+        // ...but an ordinary sentence containing yes / no / ? does NOT (the old
+        // `\byes\b.*\bno\b.*\?` pattern wrongly matched this).
+        assert_eq!(
+            m.classify("Yes, we can do that, but no rush — right?"),
+            None,
+            "prose with yes/no/? must not read as an approval prompt",
         );
     }
 
@@ -523,8 +547,22 @@ idle = ['^> $']
         assert!(m.matches_command("goose"));
         assert_eq!(m.classify("⠧ thinking"), Some(ScreenState::Working));
         assert_eq!(
+            m.classify("working tree clean"),
+            None,
+            "the word `working` in prose must not read as busy",
+        );
+        assert_eq!(
             m.classify("Goose would like to call the shell tool. Allow? [y/n]"),
             Some(ScreenState::Blocked)
+        );
+        // The literal `Allow?` affordance on its own reads as blocked...
+        assert_eq!(m.classify("Allow?"), Some(ScreenState::Blocked));
+        // ...but the bare word "allow" in prose does NOT (the old pattern made
+        // every token after "allow" optional, matching a lone "allow ").
+        assert_eq!(
+            m.classify("These settings allow faster incremental rebuilds."),
+            None,
+            "the word `allow` in prose must not read as an approval prompt",
         );
     }
 

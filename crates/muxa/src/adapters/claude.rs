@@ -188,6 +188,7 @@ impl HookAdapter for ClaudeAdapter {
                         response: Some(truncate(text, 4_000)),
                         recap,
                         ai_title,
+                        idle_confirmed: false,
                         at,
                     },
                     None => AgentEvent::TurnStopped {
@@ -195,6 +196,7 @@ impl HookAdapter for ClaudeAdapter {
                         response: None,
                         recap,
                         ai_title,
+                        idle_confirmed: false,
                         at,
                     },
                 }

@@ -194,6 +194,7 @@ async fn bench_one(n_subscribers: usize, iters: u64) -> (Duration, Duration, u64
         response: Some("r".repeat(4096)),
         recap: None,
         ai_title: None,
+        idle_confirmed: false,
         at: now,
     };
 

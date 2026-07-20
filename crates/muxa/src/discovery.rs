@@ -60,7 +60,12 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
     }
 }
 
-fn command_name(cmd: &str) -> &str {
+/// The bare command basename: `/usr/local/bin/Cursor-Agent` → `Cursor-Agent`
+/// (case preserved). The single source of the basename rule — `classify_command`
+/// lowercases the result, and `screen`'s manifest matcher reuses this so the two
+/// agree on what "the command" is by construction.
+#[must_use]
+pub fn command_name(cmd: &str) -> &str {
     cmd.trim().rsplit('/').next().unwrap_or(cmd).trim()
 }
 

@@ -215,6 +215,21 @@ pub enum AgentEvent {
         /// recap, so it's the practical steady-state summary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ai_title: Option<String>,
+        /// Marker set ONLY by the SYNTHETIC detection producers (screen
+        /// inference / the herdr bridge) when they have OBSERVED the pane go
+        /// idle — the approval prompt / spinner is gone from the screen. A real
+        /// hook's turn-boundary `Stop` always leaves this `false`.
+        ///
+        /// It exists to distinguish "a stop that is positive evidence the agent
+        /// is now idle" (set it) from "a bare response-less stop that proves
+        /// nothing about a pending wait" (leave it). The latter is the Codex
+        /// quirk — Codex fires a response-less `Stop` while a permission prompt
+        /// is still on screen — so a *markerless* response-less stop keeps a
+        /// `WaitingInput`/`WaitingChoice` row waiting, while a marked one clears
+        /// it to `Idle`. See `mutate_for_event`'s `TurnStopped` arm.
+        /// `#[serde(default)]` keeps the field additive for older wire peers.
+        #[serde(default)]
+        idle_confirmed: bool,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
@@ -382,6 +397,7 @@ mod tests {
             response: None,
             recap: None,
             ai_title: None,
+            idle_confirmed: false,
             at: datetime!(2026-04-24 12:00:00 UTC),
         };
         let json = serde_json::to_string(&ev).unwrap();

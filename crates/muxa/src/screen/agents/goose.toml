@@ -13,13 +13,17 @@ blocked = [
     '(?i)\[y/n\]',
     '(?i)\(y/n\)',
     '(?i)would like to call',
-    '(?i)allow (this|the)? ?(tool|command)?\s*(call|execution)?\??',
+    # Only an actual approval prompt — the literal "Allow?" affordance
+    # ("… Allow? [y/n]"), NOT the bare word "allow" in prose. The previous
+    # pattern made every token after "allow" optional, so it matched a lone
+    # "allow ".
+    '(?i)\ballow\?',
     '(?i)do you want to (allow|proceed|run|continue)',
     '(?i)approve (this|the) (command|tool|action)',
 ]
 working = [
     '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
-    '(?i)\b(thinking|generating|working)\b',
+    '(?i)\b(thinking|generating)\b',
     '(?i)esc to interrupt',
 ]
 idle = [

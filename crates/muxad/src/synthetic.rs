@@ -136,6 +136,12 @@ pub fn state_events(
             response: None,
             recap: None,
             ai_title: None,
+            // Positive idle evidence: the producer OBSERVED the pane go idle
+            // (the approval prompt / spinner is gone). This marker lets a
+            // synthetic `WaitingInput` row clear to `Idle` on this response-less
+            // stop, without reopening the Codex response-less-stop quirk (which
+            // is markerless). See `state::mutate_for_event`'s `TurnStopped` arm.
+            idle_confirmed: true,
             at,
         },
     };
@@ -214,9 +220,25 @@ mod tests {
     }
 
     #[test]
-    fn idle_builds_turn_stopped() {
+    fn idle_builds_idle_confirmed_turn_stopped() {
+        // The synthetic idle event MUST carry `idle_confirmed = true` — that
+        // marker is what lets it clear a WaitingInput row without reopening the
+        // Codex markerless-stop quirk (see state::mutate_for_event).
         let events = state_events(id("%1"), SyntheticState::Idle, "cursor", None, AT);
-        assert!(matches!(events[0], AgentEvent::TurnStopped { .. }));
+        match &events[0] {
+            AgentEvent::TurnStopped {
+                idle_confirmed,
+                response,
+                ..
+            } => {
+                assert!(
+                    *idle_confirmed,
+                    "synthetic idle is an explicit idle observation"
+                );
+                assert_eq!(*response, None);
+            }
+            other => panic!("expected TurnStopped, got {other:?}"),
+        }
     }
 
     #[tokio::test]

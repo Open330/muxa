@@ -19,7 +19,7 @@ blocked = [
 ]
 working = [
     '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
-    '(?i)\b(thinking|generating|working)\b',
+    '(?i)\b(thinking|generating)\b',
     '(?i)esc to interrupt',
 ]
 idle = [

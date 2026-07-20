@@ -54,6 +54,7 @@ pub fn normalize_event(input: Value, pane: Option<String>) -> AgentEvent {
             response: response_text(&input),
             recap: None,
             ai_title: None,
+            idle_confirmed: false,
             at,
         },
         "session.error" => AgentEvent::NotificationFired {

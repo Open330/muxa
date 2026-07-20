@@ -34,7 +34,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use muxa::screen::{ManifestSet, ScreenState};
+use muxa::screen::{AgentManifest, ManifestSet, ScreenState};
 use muxa::tmux::PaneInfo;
 use muxa::{AgentId, AgentKind, Config, HostKind, PaneBackend, SharedBackend, SharedStore};
 use time::OffsetDateTime;
@@ -128,7 +128,10 @@ impl ScreenDetector {
     /// hook doesn't own.
     async fn run_tick(&mut self) -> usize {
         let candidates = self.gather_candidates().await;
-        let current: HashSet<String> = candidates.iter().map(|(_, p)| p.pane_id.clone()).collect();
+        let current: HashSet<String> = candidates
+            .iter()
+            .map(|(_, p, _)| p.pane_id.clone())
+            .collect();
 
         // Panes we tracked that are no longer candidates: the agent's foreground
         // command changed (it exited, or a different program took over). Stop the
@@ -146,8 +149,8 @@ impl ScreenDetector {
         }
 
         let mut changes = 0;
-        for (backend_idx, pane) in candidates {
-            if self.process_candidate(backend_idx, &pane).await {
+        for (backend_idx, pane, manifest) in candidates {
+            if self.process_candidate(backend_idx, &pane, &manifest).await {
                 changes += 1;
             }
         }
@@ -155,10 +158,13 @@ impl ScreenDetector {
     }
 
     /// List panes across every detectable backend and keep the ones whose
-    /// foreground command matches a manifest. Returns `(backend_index, pane)`
-    /// so the capture step can target the right backend. The `list_panes` calls
-    /// (blocking tmux shell-outs) run inside one `spawn_blocking`.
-    async fn gather_candidates(&self) -> Vec<(usize, PaneInfo)> {
+    /// foreground command matches a manifest. Returns
+    /// `(backend_index, pane, manifest)` — the manifest that selected the pane
+    /// is carried forward (cloned; its `RegexSet`s are `Arc`-backed, so the
+    /// clone is cheap) so [`process_candidate`](Self::process_candidate) need
+    /// not re-resolve it. The `list_panes` calls (blocking tmux shell-outs) run
+    /// inside one `spawn_blocking`.
+    async fn gather_candidates(&self) -> Vec<(usize, PaneInfo, AgentManifest)> {
         let backends = self.backends.clone();
         let panes: Vec<(usize, PaneInfo)> = spawn_blocking(move || {
             let mut out = Vec::new();
@@ -174,10 +180,10 @@ impl ScreenDetector {
 
         panes
             .into_iter()
-            .filter(|(_, p)| {
+            .filter_map(|(i, p)| {
                 self.manifests
                     .manifest_for_command(&p.current_command)
-                    .is_some()
+                    .map(|m| (i, p, m.clone()))
             })
             .collect()
     }
@@ -185,7 +191,14 @@ impl ScreenDetector {
     /// Capture, classify, and (on a state change) ingest one candidate pane.
     /// Returns `true` iff a state change was ingested. Skips panes a live hook
     /// owns (no capture) and classifications that don't move the state.
-    async fn process_candidate(&mut self, backend_idx: usize, pane: &PaneInfo) -> bool {
+    /// `manifest` is the one `gather_candidates` already resolved for this
+    /// pane's command, carried forward so there is no second lookup.
+    async fn process_candidate(
+        &mut self,
+        backend_idx: usize,
+        pane: &PaneInfo,
+        manifest: &AgentManifest,
+    ) -> bool {
         let pane_id = pane.pane_id.clone();
 
         // Hook-authoritative: a live real row owns the pane — don't even capture.
@@ -202,12 +215,8 @@ impl ScreenDetector {
         };
         let prepared = muxa::screen::prepare_capture(&raw, CAPTURE_TAIL_LINES);
 
-        // Classify (borrow of `manifests` scoped so the mutations below are free
-        // of it). `None` = unknown screen → keep previous state, no change.
-        let Some((state, name)) = ({
-            let manifest = self.manifests.manifest_for_command(&pane.current_command);
-            manifest.and_then(|m| m.classify(&prepared).map(|s| (s, m.name.clone())))
-        }) else {
+        // `None` = unknown screen → keep previous state, no change.
+        let Some(state) = manifest.classify(&prepared) else {
             return false;
         };
 
@@ -219,7 +228,7 @@ impl ScreenDetector {
         let events = synthetic::state_events(
             id,
             to_synthetic(state),
-            &name,
+            &manifest.name,
             None,
             OffsetDateTime::now_utc(),
         );
