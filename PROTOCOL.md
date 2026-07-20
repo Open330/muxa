@@ -186,6 +186,104 @@ unchanged).
 
 ---
 
+## Control methods
+
+These methods let a client **drive** agents rather than only observe them.
+They back muxa's control plane — the `muxa mcp` MCP server exposes each as a
+tool so a coding agent can orchestrate the others (see `docs/MCP.md`).
+
+**Safety.** `send_prompt` injects keystrokes into another agent's pane — a
+control action, not a read. The IPC socket is already owner-only (`0600`,
+chmod'd after bind — see [Transport](#transport)), so only the daemon's own
+user can invoke it; there is no network exposure and no additional
+authentication layer. Treat socket access as equivalent to shell access for
+that user.
+
+**Pre-1.0 evolution.** These methods are additive (they do not bump
+`PROTOCOL_VERSION`). Like the rest of the pre-1.0 surface they may change
+shape between minor releases; pin a muxa version if you build on them.
+
+#### `send_prompt`
+
+Inject `text` into `pane` as literal keystrokes. The daemon resolves the
+backend from the pane-id namespace (`%…` → tmux, `herdr:…` → herdr, …),
+falling back to the primary backend for unclassifiable ids. When `submit`
+is true a trailing carriage return is sent as a second injection so the
+agent's current line is committed (byte-identical to tmux `send-keys Enter`
+and to writing a CR to a herdr pane's pty).
+
+```json
+{ "protocol": 3, "kind": "send_prompt", "pane": "%12", "text": "run the tests", "submit": true }
+```
+
+Response: `{ "ok": true, "protocol": 3 }`.
+
+Refused with a **structured error** (never a panic) when the resolving
+backend lacks the `send_text` capability — e.g. zellij, whose CLI
+`write-chars` only reaches the focused pane and so can't safely target an
+arbitrary pane id:
+
+```json
+{ "ok": false, "protocol": 3, "error": "backend zellij does not support send_text (pane zellij:3)" }
+```
+
+`text` is sent literally (`send-keys -l` on tmux), so it is never
+reinterpreted as a key name. Text that *begins* with `-` can be misparsed by
+tmux's option scanner; muxa never generates such prompts.
+
+#### `capture`
+
+Capture the visible contents of `pane` via the namespace-resolved backend.
+
+```json
+{ "protocol": 3, "kind": "capture", "pane": "%12" }
+```
+
+Response: `{ "ok": true, "protocol": 3, "capture": "<visible pane text>" }`.
+`capture` is `null` when the pane is gone or the backend can't capture
+(best-effort — never an error).
+
+#### `subscribe`
+
+Long-lived push stream. The server replies with a one-shot `ok` ack, then
+writes one JSON-encoded [`Transition`](#transition-schema-in-subscribe-stream)
+per state change (newline-delimited) until the client closes the socket. The
+stream is the same broadcast the daemon's notifier and activity ledger
+consume, so subscribers see every committed transition.
+
+```json
+{ "protocol": 3, "kind": "subscribe" }
+```
+
+Two non-`Transition` control frames are interleaved on the stream and MUST be
+tolerated by readers:
+
+- **Keepalive** — a bare empty line the daemon writes on an idle stream to
+  detect a dead client (broken pipe). Skip it.
+- **Lagged marker** — `{"event":"lagged","dropped":N}` when the client
+  consumed too slowly and the broadcast buffer overflowed, dropping `N`
+  transitions. The stream continues; the client should reconcile the gap
+  with a fresh `snapshot`. muxa's own `TransitionStream` reader skips this
+  frame automatically.
+
+Used by `muxa watch` (to replace 500 ms polling with push updates) and by
+`muxa mcp`'s `muxa_wait_for_change` tool.
+
+##### `Transition` schema (in `subscribe` stream)
+
+```json
+{
+  "from": "idle",
+  "to": "working",
+  "agent": { <Agent>, ... }
+}
+```
+
+`from`/`to` are `AgentState` values; `agent` is the post-transition
+[`Agent`](#agent-schema-in-responses) row.
+
+---
+
 ## `AgentEvent` schema
 
 Tagged union. `type` field is the discriminant.

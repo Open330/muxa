@@ -78,9 +78,17 @@ impl PaneBackend for TmuxBackend {
             .is_ok_and(|s| s.success())
     }
 
+    fn send_text(&self, pane_id: &str, text: &str) -> bool {
+        // `send-keys -l` (literal) so prompt text can't be reinterpreted as
+        // a tmux key. Scoped to `MUXA_TMUX_SOCKET` when set so the injection
+        // reaches the right server. Best-effort: a non-zero exit (pane gone)
+        // collapses to `false`, which the daemon surfaces as a send failure.
+        crate::tmux::send_text(pane_id, text)
+    }
+
     // `caps()` uses the default impl from the trait — tmux supports
-    // every method the trait exposes, so spelling out the table here
-    // would just be noise.
+    // every method the trait exposes (including `send_text`), so spelling
+    // out the table here would just be noise.
 }
 
 #[cfg(test)]

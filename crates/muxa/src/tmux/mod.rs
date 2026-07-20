@@ -120,6 +120,57 @@ fn tmux_output(args: &[&str]) -> Result<Output, TmuxError> {
     )
 }
 
+/// Build a tmux `Command` scoped to `MUXA_TMUX_SOCKET` when that env var
+/// names a specific server socket.
+///
+/// The other single-socket helpers target whatever the default socket /
+/// `$TMUX_TMPDIR` resolves to. Control actions ([`send_text`]) instead have
+/// to reach the *particular* server the target pane lives on. When the daemon
+/// is scoped to one server (`MUXA_TMUX_SOCKET`, as in an isolated or test
+/// context) we pass `-S <socket>` so `send-keys` lands on that server rather
+/// than the default one. Unset ⇒ no `-S`, byte-identical to `tmux_command()`.
+fn tmux_command_scoped() -> Command {
+    let mut cmd = tmux_command();
+    if let Ok(sock) = std::env::var("MUXA_TMUX_SOCKET") {
+        let trimmed = sock.trim();
+        if !trimmed.is_empty() {
+            cmd.arg("-S").arg(trimmed);
+        }
+    }
+    cmd
+}
+
+/// The `send-keys` argv (after any server-scope flags) for a literal text
+/// injection. Split out from [`send_text`] so the argument construction is
+/// unit-testable without a running tmux server.
+///
+/// `-l` sends the text literally — no key-name lookup — so arbitrary prompt
+/// text can't be misread as a tmux key (`Enter`, `C-c`, …). A bare `"\r"`
+/// submits the pane's current line (byte-identical to `send-keys Enter`).
+fn send_keys_argv<'a>(pane_id: &'a str, text: &'a str) -> [&'a str; 5] {
+    ["send-keys", "-t", pane_id, "-l", text]
+}
+
+/// Inject `text` into `pane_id` as literal keystrokes. Backs the tmux
+/// [`crate::backend::PaneBackend::send_text`] capability and, through it, the
+/// daemon's `send_prompt` IPC. Returns `true` on a zero exit; `false` when
+/// the pane is gone, tmux errors, or the shell-out times out (best-effort,
+/// matching the rest of this module).
+///
+/// Known limitation: text that *starts* with `-` can be misparsed by tmux's
+/// `send-keys` option scanner; muxa never generates such prompts and callers
+/// should avoid leading dashes.
+pub fn send_text(pane_id: &str, text: &str) -> bool {
+    let mut cmd = tmux_command_scoped();
+    cmd.args(send_keys_argv(pane_id, text));
+    command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux send-keys -t {pane_id}"),
+    )
+    .is_ok_and(|o| o.status.success())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
@@ -490,7 +541,17 @@ pub fn inside_tmux() -> bool {
 /// status is non-zero, the stderr is short — so callers should treat
 /// `NonZero` as "ephemeral, retry next tick" rather than fatal.
 pub fn capture_pane(pane_id: &str) -> Result<String, TmuxError> {
-    let out = tmux_output(&["capture-pane", "-ep", "-t", pane_id])?;
+    // Scope to `MUXA_TMUX_SOCKET` (via `-S`) when set so a capture reaches the
+    // specific server the pane lives on — the same targeting `send_text` uses,
+    // which is what makes the control-plane `capture` IPC work in an isolated
+    // single-server context. Unset ⇒ default socket, unchanged.
+    let mut cmd = tmux_command_scoped();
+    cmd.args(["capture-pane", "-ep", "-t", pane_id]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux capture-pane -t {pane_id}"),
+    )?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
             String::from_utf8_lossy(&out.stderr).into(),
@@ -594,6 +655,22 @@ pub(crate) fn parse_pane_pid_map(stdout: &str) -> std::collections::HashMap<u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locks the `send-keys` argv shape: literal (`-l`) injection targeting
+    /// the pane id, with the text passed verbatim as the final arg. `-l`
+    /// keeps prompt text from being reinterpreted as a tmux key name.
+    #[test]
+    fn send_keys_argv_is_literal_and_targeted() {
+        assert_eq!(
+            send_keys_argv("%12", "fix the bug"),
+            ["send-keys", "-t", "%12", "-l", "fix the bug"],
+        );
+        // A bare carriage return is the submit form (send-keys Enter equiv).
+        assert_eq!(
+            send_keys_argv("%3", "\r"),
+            ["send-keys", "-t", "%3", "-l", "\r"],
+        );
+    }
 
     #[test]
     fn bounded_command_returns_fast_output() {

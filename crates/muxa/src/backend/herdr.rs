@@ -289,9 +289,21 @@ impl PaneBackend for HerdrBackend {
             .is_ok()
     }
 
+    fn send_text(&self, pane_id: &str, text: &str) -> bool {
+        let raw = strip_prefix(pane_id);
+        // `pane.send_text` writes the text into the pane's pty. The daemon
+        // sends a bare `"\r"` as a follow-up call to submit — a CR through
+        // the pty is Enter for both cooked-mode shells (ICRNL → NL) and
+        // raw-mode TUIs (crossterm reads CR as Enter), so no separate
+        // key-name call is needed. Any non-error reply means it landed.
+        self.request("pane.send_text", json!({ "pane_id": raw, "text": text }))
+            .is_ok()
+    }
+
     fn caps(&self) -> BackendCaps {
-        // The socket API covers every capability directly; nothing is
-        // plugin-gated the way zellij is.
+        // The socket API covers every capability directly (including
+        // `send_text` via `pane.send_text`); nothing is plugin-gated the
+        // way zellij is.
         BackendCaps::default()
     }
 }
@@ -964,6 +976,24 @@ mod tests {
         assert!(backend.capture_pane("herdr:p1").is_none());
         assert!(backend.pane_pid_map().is_empty());
         assert!(!backend.focus_pane("herdr:p1"));
+        assert!(!backend.send_text("herdr:p1", "hi"));
+    }
+
+    #[test]
+    fn send_text_true_on_ok_reply() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            "pane.send_text" => Reply::Result(json!({ "type": "ok" })),
+            _ => Reply::Error,
+        });
+        assert!(backend_at(&socket).send_text("herdr:p1", "echo hi"));
+        // The submit form (bare CR) uses the same call.
+        assert!(backend_at(&socket).send_text("herdr:p1", "\r"));
+    }
+
+    #[test]
+    fn send_text_false_on_error_reply() {
+        let (socket, _dir) = spawn_server(|_| Reply::Error);
+        assert!(!backend_at(&socket).send_text("herdr:p1", "echo hi"));
     }
 
     /// A herdr `workspace_list` result: `w1` focused, `w2` not.
