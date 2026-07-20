@@ -41,11 +41,17 @@ The herdr work landed the key enablers:
 
 ### Backend set, not backend
 
-- `active_backends() -> Vec<SharedBackend>`: tmux if a server is
-  reachable (or unconditionally — its methods degrade to empty), herdr
-  if its socket exists, zellij per current detection. Config override:
-  `MUXA_HOSTS=tmux,herdr` (env) / `hosts = ["tmux", "herdr"]` (config);
-  `MUXA_HOST=<one>` keeps meaning "exactly this one" for compatibility.
+- `active_backends() -> Vec<SharedBackend>`: tmux unconditionally (its
+  methods degrade to empty), herdr if its server actually **answers** on
+  the socket (a live `connect`, not a stale socket file — a crashed
+  server's leftover socket must not ghost a dead backend into the set),
+  zellij per current detection. The **env-preferred host** (whatever the
+  current shell resolves to via `detect_host_env`) leads the auto-detected
+  set, so `backends[0]` is that host — consumers treat the first backend as
+  primary (dashboard, watch initial cursor). Config override:
+  `MUXA_HOSTS=tmux,herdr` (env, verbatim order) / `hosts = ["tmux", "herdr"]`
+  (config); `MUXA_HOST=<one>` keeps meaning "exactly this one" for
+  compatibility.
 - The daemon threads the set. Single-backend consumers changed shape
   (all **implemented** in `crates/muxad/src/main.rs` unless noted):
   - **Reconciler**: one `Reconciler` over the whole set
@@ -53,13 +59,29 @@ The herdr work landed the key enablers:
     **concurrently** (`spawn_blocking` fan-out, joined) and reconciles
     each observation under its own `HostKind` via
     `reconcile_observation(obs, kind)` — completeness stays per-host so
-    a herdr timeout can't trigger tmux reaping or vice versa. The
-    workload scan runs **once** over the union of complete observations
-    and is gated on *every* observation being complete (so an
-    incompletely-observed host's rows aren't reset). The cross-host
-    age-out (`mark_stale_cross_host_stopped`) receives **all** observed
-    kinds, so a row on a host in the set is governed by that host's
-    reconcile pass while a row on a host *not* in the set ages out.
+    a herdr timeout can't trigger tmux reaping or vice versa. Everything
+    that spans hosts keys off the **complete-this-tick** kind set (the
+    hosts that actually answered), never "every observation is complete",
+    so one chronically-incomplete host can't freeze the others:
+    - The **workload scan** runs once over the union of *complete*
+      observations, and `update_workloads` governs (resets/updates) only
+      rows whose pane-id namespace belongs to a complete host — an
+      incompletely-observed host's rows keep their previous workload
+      rather than being reset to the default. When no host answers, the
+      scan+update is skipped entirely (the single-host "incomplete → skip"
+      rule).
+    - **Paneless-codex correlation** (`correlate_paneless_codex_union`)
+      runs once over the union of complete panes, *before* the per-host
+      passes, so the many-to-one cwd ambiguity guard sees candidate panes
+      on every host at once (a per-host pass could otherwise adopt a row
+      whose codex actually lives in the other host's pane at the same cwd)
+      while this tick's dedup still demotes the redundant synthetic.
+    - The cross-host age-out (`mark_stale_cross_host_stopped`) receives the
+      **complete-this-tick** kinds, so a row on a host that answered is
+      governed by that host's reconcile pass, while a row on a host *not*
+      in the set — or one that can't answer past the (24h-default)
+      inactivity window — ages out. A single incomplete tick is harmless
+      because the threshold is a last-activity window, not one tick.
   - **Discovery**: startup + periodic passes iterate the set and concat
     pane scans (`run_discovery` per backend, reports summed).
   - **Session activity**: a **single** tracker samples one source per

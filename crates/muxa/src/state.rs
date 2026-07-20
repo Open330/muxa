@@ -1469,11 +1469,18 @@ impl Store {
     /// [`Self::mark_stale_paneless_stopped`] lets a genuinely-live remote row
     /// keep itself alive by emitting activity, while a truly dead one ages out.
     ///
-    /// `observing_kinds` is the set of hosts that *do* have a live observation
-    /// this pass (today always exactly one — the daemon's single active
-    /// backend — but taking a slice lets a future multi-host daemon pass
-    /// several without changing the shape). A row is foreign, and therefore a
-    /// candidate, only when its pane id classifies to a known host
+    /// `observing_kinds` is the set of hosts whose observation was *complete*
+    /// this pass — the hosts that actually answered, not merely the ones in the
+    /// backend set. A host that answers governs its own rows via reaping, so it
+    /// must be spared here; a host that *can't* answer for longer than the
+    /// inactivity window is, for our purposes, indistinguishable from a host
+    /// outside the set — its rows are never reaped by any observation, so they
+    /// must age out here or they ghost forever. Passing the complete-this-tick
+    /// set (rather than every kind in the backend set) is what closes that gap:
+    /// a chronically-incomplete host's stale rows age out, while a transiently
+    /// incomplete tick is harmless because the threshold is the (24h-default)
+    /// paneless window on `last_activity_at`, not a single tick. A row is a
+    /// candidate only when its pane id classifies to a known host
     /// ([`crate::backend::pane_id_host_kind`]) that is *not* in this set.
     /// Same-host rows (governed by `reconcile`) and unclassifiable/paneless
     /// rows (governed by the normal reap / `mark_stale_paneless_stopped`
@@ -1544,12 +1551,35 @@ impl Store {
     /// touch `last_activity_at`, `state_entered_at`, or emit transitions,
     /// because a shell child appearing below an agent is not itself an
     /// agent lifecycle transition.
-    pub async fn update_workloads(&self, by_pane: &HashMap<String, WorkloadSummary>) -> usize {
+    ///
+    /// `complete_kinds` is the set of hosts whose pane observation was
+    /// *complete* this tick. Because the process-tree scan is store-global —
+    /// it clears the workload of any pane absent from its map — a row is only
+    /// governed (reset/updated) when its pane-id namespace classifies to a host
+    /// in that set. A row on a host observed *incompletely* (or not at all)
+    /// keeps its previous workload metadata rather than being wrongly reset to
+    /// the default from a scan that never covered its host. Rows whose pane id
+    /// doesn't classify to a known host (paneless / legacy) are governed as
+    /// before — they never carry a scan workload anyway, so the outcome matches
+    /// the pre-multi-host single-observation behavior byte-for-byte.
+    pub async fn update_workloads(
+        &self,
+        by_pane: &HashMap<String, WorkloadSummary>,
+        complete_kinds: &[HostKind],
+    ) -> usize {
         let mut agents = self.agents.write().await;
         let mut changed = 0_usize;
         for agent in agents.values_mut() {
             if agent.pid.is_some() {
                 continue;
+            }
+            // Skip rows namespaced to a host whose scan didn't run this tick.
+            if let Some(pane_id) = agent.pane.as_deref() {
+                if let Some(host) = crate::backend::pane_id_host_kind(pane_id) {
+                    if !complete_kinds.contains(&host) {
+                        continue;
+                    }
+                }
             }
             let next = agent
                 .pane
@@ -1761,8 +1791,45 @@ impl Store {
     /// every such caller today observes tmux, so it defaults to
     /// [`HostKind::Tmux`]. Tests exercising cross-host behavior call
     /// [`Self::reconcile_hosted`] directly.
+    ///
+    /// Composes the two halves the multi-host reconciler now runs separately —
+    /// the paneless-codex correlation ([`Self::correlate_paneless_codex_union`])
+    /// then the tmux reap/dedup pass — so a single-host caller (and every store
+    /// test) sees the exact same adopt-then-demote-in-one-pass behavior as
+    /// before the correlation was lifted out of [`Self::reconcile_hosted`].
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
-        self.reconcile_hosted(live_panes, HostKind::Tmux).await
+        let paneless_correlated = self.correlate_paneless_codex_union(live_panes).await;
+        let mut report = self.reconcile_hosted(live_panes, HostKind::Tmux).await;
+        report.paneless_correlated = paneless_correlated;
+        report
+    }
+
+    /// Adopt paneless codex hook rows onto the tmux/herdr pane they actually
+    /// run in, by working-directory match, across the **union** of live panes
+    /// from every complete observation this tick. Returns the number adopted.
+    ///
+    /// This is the multi-host-safe home of [`Self::correlate_paneless_codex`]:
+    /// a `code_mode_host` codex fires its hooks from a shared, detached
+    /// `app-server` (no `TMUX_PANE`), so its real row lands paneless while
+    /// discovery plants a synthetic placeholder on its pane. Correlating over
+    /// the union — rather than per host inside [`Self::reconcile_hosted`] — lets
+    /// the many-to-one cwd ambiguity guard see candidate panes on *both* hosts,
+    /// so it won't mis-adopt a row whose codex lives in a herdr pane sharing a
+    /// cwd with a tmux pane. The reconciler calls this before its per-host
+    /// reap/dedup passes so those passes still demote the redundant synthetic
+    /// in the same tick.
+    pub async fn correlate_paneless_codex_union(&self, live_panes: &[PaneInfo]) -> usize {
+        let mut agents = self.agents.write().await;
+        let mut panes_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for p in live_panes {
+            panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
+        }
+        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id);
+        if adopted > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+        }
+        adopted
     }
 
     /// Converge against a complete pane set observed by `observing_kind`.
@@ -1811,12 +1878,18 @@ impl Store {
         });
         report.stale_panes_reaped = before - agents.len();
 
-        // Adopt panes onto paneless codex hook rows via cwd match BEFORE the
-        // dedup pass, so a newly-correlated real row and the pane's synthetic
-        // placeholder land on the same (pane, socket) key and the synthetic
-        // gets demoted in the same reconcile.
-        report.paneless_correlated = Self::correlate_paneless_codex(&mut agents, &panes_by_id);
-
+        // NOTE: paneless-codex correlation is NOT done here. In a multi-host
+        // daemon each backend's observation reconciles separately, and a
+        // per-host correlation would only see one host's panes — its
+        // many-to-one cwd ambiguity guard couldn't tell that a cwd is also
+        // claimed by a pane on the *other* host, so the tmux pass could adopt a
+        // row whose codex actually lives in a herdr pane at the same cwd. The
+        // correlation runs ONCE per tick over the union of complete
+        // observations via [`Self::correlate_paneless_codex_union`], which the
+        // reconciler invokes *before* the per-host passes so this reconcile's
+        // dedup still demotes the now-redundant synthetic in the same tick.
+        // The single-host [`Self::reconcile`] entry point composes the two so
+        // its behavior is unchanged.
         Self::backfill_tmux_names(&mut agents, &panes_by_id);
 
         // Sweeps 2 & 3: per-pane dedup. Group surviving agents by pane id
@@ -2350,15 +2423,80 @@ mod tests {
             },
         );
 
-        assert_eq!(store.update_workloads(&by_pane).await, 1);
+        assert_eq!(store.update_workloads(&by_pane, &[HostKind::Tmux]).await, 1);
         let snap = store.snapshot().await;
         assert_eq!(snap[0].workload.shell_count, 1);
         assert_eq!(snap[0].workload.process_count, 2);
         assert_eq!(snap[0].last_activity_at, at);
 
-        assert_eq!(store.update_workloads(&by_pane).await, 0);
-        assert_eq!(store.update_workloads(&HashMap::new()).await, 1);
+        assert_eq!(store.update_workloads(&by_pane, &[HostKind::Tmux]).await, 0);
+        assert_eq!(
+            store
+                .update_workloads(&HashMap::new(), &[HostKind::Tmux])
+                .await,
+            1
+        );
         assert!(store.snapshot().await[0].workload.is_empty());
+    }
+
+    /// Fix 3: when only some hosts are observed complete this tick, the
+    /// workload update must govern only the complete hosts' rows. A tmux row
+    /// (complete) updates from the scan; a herdr row (incomplete this tick, so
+    /// `Herdr` absent from `complete_kinds`) keeps its previous workload
+    /// instead of being reset to the default by a scan that never covered herdr.
+    #[tokio::test]
+    async fn update_workloads_governs_only_complete_hosts() {
+        let store = Store::shared();
+        let at = datetime!(2026-05-10 12:00:00 UTC);
+        let started = |sid: &str, pane: &str| AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                cwd: None,
+            },
+            at,
+        };
+        store.apply(&started("tmux-row", "%1")).await;
+        store.apply(&started("herdr-row", "herdr:p1")).await;
+
+        let wl = |n: u16| WorkloadSummary {
+            primary_pid: Some(20),
+            process_count: n,
+            shell_count: 1,
+            subagent_count: 0,
+            helper_count: 0,
+            preview: Vec::new(),
+        };
+
+        // Seed both rows with a non-default workload (as a prior complete tick
+        // would have), so a wrongful reset is observable.
+        let mut seed = HashMap::new();
+        seed.insert("%1".to_string(), wl(2));
+        seed.insert("herdr:p1".to_string(), wl(3));
+        assert_eq!(
+            store
+                .update_workloads(&seed, &[HostKind::Tmux, HostKind::Herdr])
+                .await,
+            2
+        );
+
+        // Now only tmux is complete; the scan map covers only tmux panes.
+        let mut tmux_scan = HashMap::new();
+        tmux_scan.insert("%1".to_string(), wl(5));
+        let changed = store.update_workloads(&tmux_scan, &[HostKind::Tmux]).await;
+
+        assert_eq!(changed, 1, "only the tmux row's workload changes");
+        let snap = store.snapshot().await;
+        let tmux = snap.iter().find(|a| a.session_id == "tmux-row").unwrap();
+        let herdr = snap.iter().find(|a| a.session_id == "herdr-row").unwrap();
+        assert_eq!(tmux.workload.process_count, 5, "tmux row updated");
+        assert_eq!(
+            herdr.workload.process_count, 3,
+            "herdr row (incomplete this tick) keeps its previous workload",
+        );
     }
 
     #[tokio::test]

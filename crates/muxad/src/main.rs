@@ -153,6 +153,11 @@ async fn main() -> Result<()> {
     let backends: Vec<muxa::SharedBackend> = muxa::active_backends();
     // Never empty (see `active_backends`); `primary` is the conventional
     // single-backend handle for consumers a namespace can't disambiguate.
+    // `active_backends` orders the set by env preference, so `backends[0]` is
+    // the env-preferred host (e.g. herdr when running herdr-inside-herdr) — the
+    // same host the old single-backend daemon detected. Consumers that must
+    // match that legacy single-host behavior (the web dashboard scanner) take
+    // `primary`.
     let primary: muxa::SharedBackend = backends[0].clone();
     let sessions = muxa::PtySessionBackend::shared();
     let observing_kinds: Vec<muxa::HostKind> = backends.iter().map(|b| b.kind()).collect();
@@ -261,12 +266,16 @@ async fn main() -> Result<()> {
             })
             .flatten();
         let sessions_for_dash = sessions.clone();
-        // The web dashboard's pane scanner stays single-backend (the `primary`)
-        // this pass — merging it with the backend set is an explicit non-goal in
+        // The web dashboard's pane scanner stays single-backend this pass —
+        // merging it with the backend set is an explicit non-goal in
         // `docs/MULTI_HOST.md` (the scanner is dashboard-only plumbing, tracked
-        // as a follow-up). On a single-host daemon `primary` is that host, so
-        // behavior is unchanged; on a multi-host daemon the dashboard shows the
-        // primary host only until that follow-up lands.
+        // as a follow-up). It must observe the *env-preferred* host — exactly
+        // what the old single-backend daemon detected from env. `active_backends`
+        // is ordered by env preference (`backends[0]` = the env-preferred host,
+        // e.g. herdr-inside-herdr), so `primary` IS that backend and the
+        // dashboard behaves identically to the pre-multi-host daemon. On a
+        // multi-host daemon the dashboard shows the env-preferred host only
+        // until the scanner-set merge follow-up lands.
         let backend_for_dash = primary.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
             activity_path: dashboard_activity_path,
@@ -1301,24 +1310,51 @@ fn spawn_startup_discovery(
 
 /// Run one discovery pass over every observed backend and sum the reports.
 /// Pane namespaces are disjoint per host, so each backend's scan contributes
-/// independently; a whole-pass failure for one backend is logged and the others
-/// still run (best-effort, matching the rest of the daemon's surface).
+/// independently.
+///
+/// The passes fan out **concurrently** — each does its own blocking pane scan
+/// (`block_in_place` inside `run_discovery`) plus async IPC, so we drive each
+/// on its own task and join. A slow or unreachable host can't serialize behind
+/// (or block) the others, and a failed pass (discovery error *or* join error)
+/// contributes nothing while the rest still land — best-effort, matching the
+/// rest of the daemon's surface, and mirroring `watch::compute_refresh`'s
+/// concurrent inventory fan-out. `run_discovery` is async (does IPC), so we
+/// use `tokio::spawn` rather than `spawn_blocking`; both the daemon and CLI run
+/// on the multi-threaded runtime `block_in_place` requires.
 async fn run_discovery_all(
     client: &Client,
     backends: &[muxa::SharedBackend],
 ) -> discovery::DiscoveryReport {
+    let handles: Vec<_> = backends
+        .iter()
+        .map(|backend| {
+            let client = client.clone();
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                let kind = backend.kind();
+                (
+                    kind,
+                    discovery::run_discovery(&client, backend.as_ref()).await,
+                )
+            })
+        })
+        .collect();
+
     let mut total = discovery::DiscoveryReport::default();
-    for backend in backends {
-        match discovery::run_discovery(client, backend.as_ref()).await {
-            Ok(report) => {
+    for handle in handles {
+        match handle.await {
+            Ok((_, Ok(report))) => {
                 total.claude_code += report.claude_code;
                 total.codex += report.codex;
                 total.gemini_cli += report.gemini_cli;
                 total.skipped_known += report.skipped_known;
                 total.failed += report.failed;
             }
+            Ok((kind, Err(e))) => {
+                tracing::warn!(error = %e, host = %kind, "discovery pass failed");
+            }
             Err(e) => {
-                tracing::warn!(error = %e, host = %backend.kind(), "discovery pass failed");
+                tracing::debug!(error = %e, "discovery task join failed");
             }
         }
     }

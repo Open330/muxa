@@ -661,7 +661,7 @@ async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
     // Enumerate panes across every active host so a herdr agent that needs
     // a human is jumpable from a tmux-primary shell (and vice versa). The
     // jump itself dispatches per-row in `jump_to_pane`.
-    let panes = all_panes();
+    let panes = all_panes().await;
     if let Some(pane) = attend::run(client, panes, args).await? {
         jump_to_pane(&pane);
     }
@@ -934,11 +934,25 @@ pub(crate) fn backend_for_pane(pane_id: &str) -> muxa::SharedBackend {
 /// enumeration used by `muxa panes`, `stats`, `timeline`, and `attend`.
 /// Rows already carry their host namespace in `pane_id`, so a plain concat
 /// keeps them distinct.
-pub(crate) fn all_panes() -> Vec<muxa::tmux::PaneInfo> {
-    muxa::active_backends()
-        .iter()
-        .flat_map(|backend| backend.list_panes())
-        .collect()
+///
+/// Each backend's `list_panes` blocks (tmux shells out; herdr hits a socket),
+/// so we fan the calls out onto the blocking pool up front and join them —
+/// the tick budget is one host's latency, not the sum, and a slow/failing
+/// host can't stall the runtime or the others (a join error contributes an
+/// empty list). Mirrors the concurrent fan-out `watch::compute_refresh` uses.
+pub(crate) async fn all_panes() -> Vec<muxa::tmux::PaneInfo> {
+    let tasks: Vec<_> = muxa::active_backends()
+        .into_iter()
+        .map(|backend| tokio::task::spawn_blocking(move || backend.list_panes()))
+        .collect();
+    let mut panes = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(list) => panes.extend(list),
+            Err(e) => tracing::debug!(error = %e, "pane enumeration task failed"),
+        }
+    }
+    panes
 }
 
 fn jump_to_pane_tmux(pane_id: &str) {

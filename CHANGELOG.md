@@ -14,10 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of a single env-detected backend. One reconciler runs over the
   whole set — each tick observes every backend concurrently and reconciles
   each observation under its own `HostKind`, so a herdr timeout can't reap
-  tmux rows (completeness stays per-host); the workload scan runs once over
-  the union of complete observations, and the cross-host age-out sweep
-  receives all observed kinds so a row on an unobserved host ages out while
-  observed hosts stay governed by their own pass. Discovery, the
+  tmux rows (completeness stays per-host); the workload scan, paneless-codex
+  correlation, and cross-host age-out all key off the *complete-this-tick*
+  host set, so a row on an unobserved (or chronically-unanswerable) host ages
+  out while every host that answered stays governed by its own pass and keeps
+  its metadata. Discovery, the
   pane-session cache, and history enrichment enumerate the set and union
   their scans; session-activity sampling runs one tracker that polls every
   host's foreground source (tmux clients + herdr focused workspace) into a
@@ -133,6 +134,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan with the herdr pane list instead of replacing it, so tmux panes no
   longer vanish from `/api/panes`/timeline during mixed-host migration. See
   `docs/HERDR.md`.
+
+- **multi-host CLI/daemon wiring (review follow-ups).** Correctness fixes to the
+  cross-multiplexer console: (1) `muxa watch` session rows are now grouped by a
+  host-namespaced key, so a tmux session and a herdr workspace that share a raw
+  id (both named `w1`) stay two distinct rows with correct per-host pane counts
+  instead of merging into one corrupted row — display names, the activity ledger
+  lookup, and DUR still key off the raw id (host id-spaces are disjoint), only
+  grouping/identity/sort-tiebreak use the composite; (2) `watch`'s initial "where
+  am I" cursor resolves `current_pane()` across the backend set in env-preference
+  order (first `Some` wins) so a herdr pane launched from tmux lands on the
+  env-preferred host; (3) daemon discovery passes and the CLI's cross-host pane
+  enumeration (`muxa panes`/`stats`/`timeline`/`attend`) now fan out
+  concurrently — a slow or unreachable host no longer serializes behind (or
+  blocks the runtime on) the others, and a failed host contributes an empty
+  result; (4) the web dashboard's single-backend scanner is documented to bind to
+  the env-preferred host (`backends[0]`), matching the pre-multi-host daemon. See
+  `docs/MULTI_HOST.md`.
+
+- **multi-host core hardening (review follow-ups).** Correctness fixes to the
+  backend set and reconciler so one permanently-unreachable or chronically-slow
+  host can't poison the others: (1) herdr auto-detect now *connects* to the
+  socket instead of `try_exists()`ing the file, so a stale socket left by a
+  crashed server no longer ghosts a dead herdr backend into a tmux-only daemon's
+  set forever; (2) the env-preferred host now leads the auto-detected set, so
+  `backends[0]` (the "primary" the dashboard and watch cursor use) is the host
+  the shell actually lives in (`MUXA_HOSTS` keeps its verbatim order); (3) the
+  workload scan/update runs over the union of *complete* observations and only
+  governs rows whose host was observed complete this tick — a chronically-
+  incomplete host's rows keep their workload metadata instead of being frozen or
+  reset for every host; (4) the cross-host ghost age-out is keyed on the
+  complete-this-tick kinds, so a host that can't answer past the inactivity
+  window ages out its rows like a host outside the set (transient incompleteness
+  is safe — the threshold is the 24h paneless window, not one tick); (5) paneless-
+  codex cwd correlation runs once per tick over the union of panes from all
+  complete hosts, so its many-to-one ambiguity guard sees candidates on every
+  host and won't mis-adopt a row whose codex lives in the other host's pane at
+  the same cwd; (6) the merged session-activity sampler now applies each source
+  independently — a failing source (e.g. tmux on a herdr-only machine with no
+  `tmux` binary) contributes nothing and no longer closes the other host's open
+  foreground intervals, only its own keyspace is left untouched. Single-host
+  behavior is unchanged throughout. See `docs/MULTI_HOST.md`.
 
 - **`code_mode_host` codex sessions now correlate to their tmux pane instead of
   splitting into two rows.** Such a session runs its turns — and fires its

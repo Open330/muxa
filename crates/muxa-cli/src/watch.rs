@@ -668,9 +668,17 @@ pub(crate) enum RowIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRow {
-    /// Stable group key — `PaneInfo.session` (tmux session name / herdr
-    /// `workspace_id`). Used for grouping, sorting, and the activity bridge.
+    /// Raw session id — `PaneInfo.session` (tmux session name / herdr
+    /// `workspace_id`). This is the ledger/display key: activity lookups and
+    /// `display_name` resolution key off it (host id-spaces are disjoint, so a
+    /// raw id is unambiguous for those lookups). NOT the grouping key — a tmux
+    /// session and a herdr workspace can share a raw id (both "w1"), so
+    /// grouping/identity use `group_key` instead.
     pub session: String,
+    /// Host-namespaced grouping/identity key (`"{host}:{session}"`, e.g.
+    /// `"tmux:w1"` vs `"herdr:w1"`). Keeps a tmux session and a herdr workspace
+    /// with the same raw id in distinct rows. Internal only — never displayed.
+    pub group_key: String,
     /// Human-facing name shown in the session view. Equals `session` on tmux;
     /// resolves to the workspace label on herdr.
     pub display_name: String,
@@ -790,7 +798,7 @@ impl WatchRow {
         match self {
             Self::Agent(a) => RowIdentity::Agent(a.kind, a.session_id.clone()),
             Self::BarePane(p) => RowIdentity::BarePane(p.pane_id.clone()),
-            Self::Session(s) => RowIdentity::Session(s.session.clone()),
+            Self::Session(s) => RowIdentity::Session(s.group_key.clone()),
         }
     }
 
@@ -2008,6 +2016,48 @@ fn sort_agents(
     a.pane.as_deref().cmp(&b.pane.as_deref())
 }
 
+/// Host-namespaced grouping/identity key for a session row.
+///
+/// A tmux session and a herdr workspace can share a raw session id (both
+/// named "w1"); grouping by the raw id alone merges them into one corrupted
+/// row (wrong pane counts, mixed agents). Prefixing with the host keeps them
+/// distinct. Ledger/display lookups still use the *raw* id (`session`), which
+/// is unambiguous because each host's id-space is disjoint — this composite is
+/// grouping/identity only. A row with no classifiable host (paneless agent,
+/// `(no session)`, a background task) keys on the raw id, matching the
+/// pre-multi-host grouping exactly.
+fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
+    match host {
+        Some(muxa::HostKind::Tmux) => format!("tmux:{session}"),
+        Some(muxa::HostKind::Herdr) => format!("herdr:{session}"),
+        Some(muxa::HostKind::Zellij) => format!("zellij:{session}"),
+        None => session.to_string(),
+    }
+}
+
+/// Resolve an agent's session group: the raw session id (display/ledger key)
+/// plus the pane's host namespace (grouping key input). Resolved from the
+/// agent's pane when it's in the inventory; a paneless / stale agent has no
+/// host, so it falls back to a raw synthetic session and `None`.
+fn agent_session_group(
+    agent: &Agent,
+    pane_lookup: impl Fn(&str) -> Option<(String, Option<muxa::HostKind>)>,
+) -> (String, Option<muxa::HostKind>) {
+    agent
+        .pane
+        .as_deref()
+        .and_then(&pane_lookup)
+        .unwrap_or_else(|| {
+            let session = match agent.pane.as_deref() {
+                Some(p) => format!("(stale {p})"),
+                // Paneless background tasks group under their own name.
+                None if agent.kind == AgentKind::Task => agent.session_id.clone(),
+                None => "(no session)".to_string(),
+            };
+            (session, None)
+        })
+}
+
 fn build_session_rows(
     agents: Vec<Agent>,
     panes: &[PaneInfo],
@@ -2017,7 +2067,10 @@ fn build_session_rows(
 ) -> Vec<WatchRow> {
     #[derive(Default)]
     struct Builder {
+        /// Raw session id (display/ledger key).
         session: String,
+        /// Host-namespaced grouping/identity key.
+        group_key: String,
         panes: Vec<PaneInfo>,
         agents: Vec<Agent>,
         activity: Option<SessionActivity>,
@@ -2026,30 +2079,33 @@ fn build_session_rows(
     let sort_context =
         SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
+    // Keyed by the host-namespaced `group_key`, not the raw session, so a tmux
+    // session "w1" and a herdr workspace "w1" build two rows.
     let mut builders: HashMap<String, Builder> = HashMap::new();
     for p in panes {
-        let entry = builders
-            .entry(p.session.clone())
-            .or_insert_with(|| Builder {
-                session: p.session.clone(),
-                ..Builder::default()
-            });
+        let host = muxa::backend::pane_id_host_kind(&p.pane_id);
+        let key = session_group_key(host, &p.session);
+        let entry = builders.entry(key.clone()).or_insert_with(|| Builder {
+            session: p.session.clone(),
+            group_key: key,
+            ..Builder::default()
+        });
         entry.panes.push(p.clone());
     }
 
     for agent in agents {
-        let session = agent
-            .pane
-            .as_deref()
-            .and_then(|id| sort_context.pane(id).map(|p| p.session.clone()))
-            .unwrap_or_else(|| match agent.pane.as_deref() {
-                Some(p) => format!("(stale {p})"),
-                // Paneless background tasks group under their own name.
-                None if agent.kind == AgentKind::Task => agent.session_id.clone(),
-                None => "(no session)".to_string(),
-            });
-        let entry = builders.entry(session.clone()).or_insert_with(|| Builder {
+        let (session, host) = agent_session_group(&agent, |id| {
+            sort_context.pane(id).map(|p| {
+                (
+                    p.session.clone(),
+                    muxa::backend::pane_id_host_kind(&p.pane_id),
+                )
+            })
+        });
+        let key = session_group_key(host, &session);
+        let entry = builders.entry(key.clone()).or_insert_with(|| Builder {
             session,
+            group_key: key,
             ..Builder::default()
         });
         entry.agents.push(agent);
@@ -2098,6 +2154,7 @@ fn build_session_rows(
                 .collect();
             SessionRow {
                 display_name: sort_context.display_name(&b.session),
+                group_key: b.group_key,
                 session: b.session,
                 pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
                 representative_pane,
@@ -2239,7 +2296,9 @@ fn sort_sessions(
             return cmp;
         }
     }
-    a.session.cmp(&b.session)
+    // Final tiebreak on the host-namespaced key so two rows sharing a raw
+    // session id (tmux "w1" + herdr "w1") get a stable, deterministic order.
+    a.group_key.cmp(&b.group_key)
 }
 
 /// Render a `pane_id` as `session:window.pane` when we can resolve it
@@ -2844,26 +2903,34 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
 }
 
 fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
-    let session = agent
+    // Resolve the agent's raw session (display/ledger) and its pane host, then
+    // match rows on the host-namespaced group key — the same keying
+    // `build_session_rows` uses — so a herdr "w1" agent never merges into a
+    // tmux "w1" row.
+    let (session, host) = agent
         .pane
         .as_deref()
         .and_then(|id| {
-            app.panes
-                .iter()
-                .find(|p| p.pane_id == id)
-                .map(|p| p.session.clone())
+            app.panes.iter().find(|p| p.pane_id == id).map(|p| {
+                (
+                    p.session.clone(),
+                    muxa::backend::pane_id_host_kind(&p.pane_id),
+                )
+            })
         })
         .unwrap_or_else(|| {
-            agent
+            let session = agent
                 .pane
                 .as_deref()
-                .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"))
+                .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"));
+            (session, None)
         });
+    let group_key = session_group_key(host, &session);
     for row in &mut app.rows {
         let WatchRow::Session(s) = row else {
             continue;
         };
-        if s.session != session {
+        if s.group_key != group_key {
             continue;
         }
         let key = (agent.kind, agent.session_id.clone());
@@ -2911,6 +2978,7 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
         .map_or_else(|| session.clone(), |s| s.name.clone());
     app.rows.push(WatchRow::Session(Box::new(SessionRow {
         display_name,
+        group_key,
         session,
         pane_ids: agent.pane.clone().into_iter().collect(),
         representative_pane: agent.pane.clone(),
@@ -3210,10 +3278,14 @@ pub async fn run(
     // capture path resolves a backend per pane-id namespace instead.
     let backends: Vec<muxa::SharedBackend> = muxa::active_backends();
 
-    // "Where am I" is inherently single-host (env-based) — land the
-    // cursor on the user's current pane on first load via the
-    // env-preferred backend (first entry of the set; never empty).
-    let initial_pane = backends[0].current_pane();
+    // "Where am I" is inherently single-host (env-based) — land the cursor on
+    // the user's current pane on first load. `current_pane` is env-based: the
+    // env-preferred backend answers inside its own pane, but inside e.g. a
+    // herdr pane launched from tmux BOTH backends could answer. `active_backends`
+    // is ordered by env preference (`backends[0]` = the env-preferred host), so
+    // we resolve in set order and take the first `Some` — env preference breaks
+    // the tie. Single-host: identical (the one backend answers or doesn't).
+    let initial_pane = backends.iter().find_map(|b| b.current_pane());
     app.set_initial_pane(initial_pane.clone());
     let watch_started_at = OffsetDateTime::now_utc();
     let mut prompt_started_at: Option<(OffsetDateTime, String)> = None;
@@ -7093,6 +7165,61 @@ mod tests {
             panic!("expected session row");
         };
         assert_eq!(row.display_name, "w1", "display name falls back to the id");
+    }
+
+    #[test]
+    fn same_named_tmux_session_and_herdr_workspace_stay_distinct_rows() {
+        // A tmux session named "w1" and a herdr workspace whose id is "w1"
+        // share a raw session string. Grouped by the raw id alone they'd merge
+        // into one corrupted row (panes from both hosts, wrong count); the
+        // host-namespaced group key keeps them apart.
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![
+                // tmux "w1": two panes.
+                fake_pane("%1", "w1", 0, 0, "zsh"),
+                fake_pane("%2", "w1", 0, 1, "nvim"),
+                // herdr workspace "w1": one pane.
+                fake_pane("herdr:p1", "w1", 0, 0, "zsh"),
+            ],
+            vec![fake_session("$1", "w1", 1)],
+            vec![],
+        );
+
+        let session_rows: Vec<&SessionRow> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Session(s) => Some(s.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            session_rows.len(),
+            2,
+            "tmux w1 and herdr w1 must be two distinct rows"
+        );
+
+        let tmux_row = session_rows
+            .iter()
+            .find(|s| s.group_key == "tmux:w1")
+            .expect("tmux:w1 row present");
+        let herdr_row = session_rows
+            .iter()
+            .find(|s| s.group_key == "herdr:w1")
+            .expect("herdr:w1 row present");
+
+        // Raw session id stays "w1" on both (display/ledger key), only the
+        // group key is namespaced.
+        assert_eq!(tmux_row.session, "w1");
+        assert_eq!(herdr_row.session, "w1");
+        assert_eq!(tmux_row.pane_count, 2, "tmux row keeps its two panes");
+        assert_eq!(herdr_row.pane_count, 1, "herdr row keeps its one pane");
     }
 
     // ---- multi-host aggregation + badges ---------------------------------
