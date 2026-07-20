@@ -719,6 +719,7 @@ fn mutate_for_event(
             response,
             recap,
             ai_title,
+            idle_confirmed,
             ..
         } => {
             if let Some(text) = response {
@@ -751,12 +752,22 @@ fn mutate_for_event(
             } else if matches!(
                 agent.state,
                 AgentState::WaitingInput | AgentState::WaitingChoice
-            ) {
+            ) && !*idle_confirmed
+            {
                 // Codex can emit `Stop` while a permission request is still
                 // sitting in the terminal. A response-less stop is not proof
                 // that the user-facing wait cleared; keep the row waiting
                 // until a tool event, response, or explicit later state
                 // transition says otherwise.
+                //
+                // EXCEPTION — `idle_confirmed`. A SYNTHETIC detection producer
+                // (screen inference / the herdr bridge) sets this flag when it
+                // has OBSERVED the pane go idle (the approval prompt is gone
+                // from the current screen). That IS proof the wait cleared, so a
+                // marked stop falls through to `Idle`. This keys on positive
+                // idle evidence, NOT on `is_synthetic`: a markerless
+                // response-less stop — a real Codex permission-gap stop, or any
+                // other bare synthetic stop — still freezes the waiting row.
             } else if agent.state != AgentState::Error {
                 agent.state = AgentState::Idle;
             }
@@ -2701,6 +2712,7 @@ mod tests {
                 response: Some("done".into()),
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
@@ -2817,6 +2829,7 @@ mod tests {
                 response: None,
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
@@ -3041,6 +3054,7 @@ mod tests {
                 response: None,
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
@@ -3063,6 +3077,7 @@ mod tests {
                 response: None,
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
@@ -3445,6 +3460,7 @@ mod tests {
                 response: Some("recovered".into()),
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: t1,
             })
             .await;
@@ -3487,6 +3503,7 @@ mod tests {
                 response: None,
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: t0,
             })
             .await;
@@ -3516,6 +3533,7 @@ mod tests {
                 response: Some("the assistant said hi".into()),
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
@@ -3545,6 +3563,7 @@ mod tests {
                 response: Some("first answer".into()),
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
@@ -3557,11 +3576,131 @@ mod tests {
                 response: None,
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at: now,
             })
             .await;
         let agent = store.by_session("s").await.unwrap();
         assert_eq!(agent.last_response.as_deref(), Some("first answer"));
+    }
+
+    #[tokio::test]
+    async fn responseless_stop_keeps_real_waiting_row_waiting() {
+        // A REAL (hook) row waiting on a permission prompt must stay waiting on
+        // a response-less TurnStopped — the Codex Stop-during-permission guard.
+        let store = Store::shared();
+        let now = datetime!(2026-07-20 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("real"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("real"),
+                level: NotificationLevel::NeedsInput,
+                message: "approve?".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("real").await.unwrap().state,
+            AgentState::WaitingInput
+        );
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("real"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                // A bare (markerless) response-less stop — exactly the Codex
+                // permission-gap quirk.
+                idle_confirmed: false,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("real").await.unwrap().state,
+            AgentState::WaitingInput,
+            "a real waiting row stays waiting on a markerless response-less stop",
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_confirmed_stop_clears_waiting_row_to_idle() {
+        // A SYNTHETIC detection producer (screen inference / herdr bridge) that
+        // was WaitingInput and now OBSERVES the pane go idle emits a response-
+        // less TurnStopped with `idle_confirmed = true`. That marker is positive
+        // proof the wait cleared, so the row must fall through to Idle — this is
+        // what lets a screen `blocked -> idle` transition land.
+        let store = Store::shared();
+        let now = datetime!(2026-07-20 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("synthetic-%1"),
+                level: NotificationLevel::NeedsInput,
+                message: "approve?".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("synthetic-%1").await.unwrap().state,
+            AgentState::WaitingInput,
+        );
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("synthetic-%1"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("synthetic-%1").await.unwrap().state,
+            AgentState::Idle,
+            "an idle-confirmed stop clears a waiting row to Idle",
+        );
+    }
+
+    #[tokio::test]
+    async fn markerless_stop_keeps_synthetic_waiting_row_waiting() {
+        // The invariant guarding against transient/jitter idle: a SYNTHETIC row
+        // that is genuinely blocked must NOT be cleared by a bare, markerless
+        // response-less stop. Only an `idle_confirmed` stop (the producer
+        // actually observed the prompt disappear) may clear it. The distinction
+        // keys on the marker, NOT on the session being synthetic.
+        let store = Store::shared();
+        let now = datetime!(2026-07-20 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("synthetic-%1"),
+                level: NotificationLevel::NeedsInput,
+                message: "approve?".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("synthetic-%1").await.unwrap().state,
+            AgentState::WaitingInput,
+        );
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("synthetic-%1"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: false,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("synthetic-%1").await.unwrap().state,
+            AgentState::WaitingInput,
+            "a synthetic waiting row stays waiting on a markerless stop",
+        );
     }
 
     #[tokio::test]

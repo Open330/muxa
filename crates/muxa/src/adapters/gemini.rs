@@ -113,6 +113,7 @@ impl HookAdapter for GeminiAdapter {
                 response: None,
                 recap: None,
                 ai_title: None,
+                idle_confirmed: false,
                 at,
             },
             Event::SessionEnd => AgentEvent::SessionEnded { id, at },

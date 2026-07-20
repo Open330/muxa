@@ -50,6 +50,7 @@ mod process_snapshot;
 pub mod process_tree;
 pub mod reconcile;
 pub mod scope_filter;
+pub mod screen;
 pub mod session;
 pub mod session_activity;
 pub mod sinks;
@@ -100,7 +101,7 @@ pub use activity::{
     ACTIVITY_SCHEMA_VERSION,
 };
 #[doc(hidden)]
-pub use discovery::{run_discovery, scan_panes, Discovered, DiscoveryReport};
+pub use discovery::{run_discovery, scan_panes, synthetic_session_id, Discovered, DiscoveryReport};
 #[doc(hidden)]
 pub use error::{CoreError, Result};
 #[doc(hidden)]
@@ -111,6 +112,8 @@ pub use metrics::{Metrics, MetricsSnapshot};
 pub use reconcile::{LivenessSource, Reconciler};
 #[doc(hidden)]
 pub use scope_filter::ScopeExclusions;
+#[doc(hidden)]
+pub use screen::{load_manifests, AgentManifest, ManifestSet, ScreenState};
 #[doc(hidden)]
 pub use session::{
     PtySessionBackend, SessionBackend, SessionBackendCaps, SessionBackendKind, SessionError,

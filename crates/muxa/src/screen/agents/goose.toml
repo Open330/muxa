@@ -1,0 +1,32 @@
+# Bundled screen-detection manifest — Goose CLI (`goose`, Block).
+#
+# BEST-EFFORT / CONSERVATIVE. Written WITHOUT running goose. See the notes in
+# cursor.toml and docs/SCREEN_DETECTION.md. Override at
+# $XDG_CONFIG_HOME/muxa/agents/goose.toml.
+
+[agent]
+name = "goose"
+command = ["goose"]
+
+[rules]
+blocked = [
+    '(?i)\[y/n\]',
+    '(?i)\(y/n\)',
+    '(?i)would like to call',
+    # Only an actual approval prompt — the literal "Allow?" affordance
+    # ("… Allow? [y/n]"), NOT the bare word "allow" in prose. The previous
+    # pattern made every token after "allow" optional, so it matched a lone
+    # "allow ".
+    '(?i)\ballow\?',
+    '(?i)do you want to (allow|proceed|run|continue)',
+    '(?i)approve (this|the) (command|tool|action)',
+]
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)\b(thinking|generating)\b',
+    '(?i)esc to interrupt',
+]
+idle = [
+    '(?m)^\s*>\s*$',
+    '(?i)\bgoose\b\s*>\s*$',
+]

@@ -44,9 +44,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muxa::backend::herdr::{default_socket_path, PANE_ID_PREFIX};
-use muxa::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
+use muxa::event::{AgentEvent, AgentId, AgentKind};
 use muxa::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use muxa::{AgentState, HostKind, SharedBackend, SharedStore};
+
+use crate::synthetic::{self, SyntheticState};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -132,14 +134,6 @@ fn classify_agent(agent: &str) -> AgentKind {
     }
 }
 
-/// A short, human-facing label for the `working` [`AgentEvent::ToolStarted`].
-/// The tool string isn't persisted on the row (no `current_tool` field), so it
-/// only ever surfaces in the activity ledger — the herdr agent name is the
-/// most informative thing to record there.
-fn tool_label(name: &str) -> String {
-    name.to_owned()
-}
-
 /// The `last_notification` text for a `blocked` row. Prefers the herdr pane
 /// title (often "waiting for approval" style copy), else a generic line naming
 /// the agent.
@@ -213,78 +207,32 @@ pub fn translate(envelope: &Value, at: OffsetDateTime) -> Result<BridgeUpdate, D
         cwd: None,
     };
 
-    let status_event = match status {
-        "working" => AgentEvent::ToolStarted {
-            id: id.clone(),
-            tool: tool_label(name),
-            subagent: None,
-            at,
-        },
-        "blocked" => AgentEvent::NotificationFired {
-            id: id.clone(),
-            level: NotificationLevel::NeedsInput,
-            message: blocked_message(data, name),
-            at,
-        },
-        "idle" | "done" => AgentEvent::TurnStopped {
-            id: id.clone(),
-            response: None,
-            recap: None,
-            ai_title: None,
-            at,
-        },
+    // Map herdr's status onto the shared synthetic-state vocabulary, then let
+    // the shared builder produce the status event + name-bearing heartbeat (the
+    // exact same shape screen detection emits). `blocked` carries the herdr pane
+    // title as its message; `working`/`idle` need none.
+    let (state, message) = match status {
+        "working" => (SyntheticState::Working, None),
+        "blocked" => (SyntheticState::Blocked, Some(blocked_message(data, name))),
+        "idle" | "done" => (SyntheticState::Idle, None),
         "unknown" => return Err(DropReason::StatusUnknown),
         _ => return Err(DropReason::Malformed),
     };
 
-    // Carry the herdr agent name into `model` so an Unknown-kind row (cursor,
-    // amp, …) still tells the operator *which* agent it is. Harmless for a row
-    // that later gets real hooks — the bridge row is evicted first.
-    let heartbeat = AgentEvent::Heartbeat {
-        id,
-        model: Some(name.to_owned()),
-        context_used_pct: None,
-        cost_usd: None,
-        rate_limit_5h_pct: None,
-        rate_limit_5h_resets_at: None,
-        rate_limit_7d_pct: None,
-        rate_limit_7d_resets_at: None,
-        at,
-    };
+    // Carry the herdr agent name into `model` (via the heartbeat the builder
+    // appends) so an Unknown-kind row (cursor, amp, …) still tells the operator
+    // *which* agent it is. Harmless for a row that later gets real hooks — the
+    // bridge row is evicted first.
+    let events = synthetic::state_events(id, state, name, message, at);
 
-    Ok(BridgeUpdate {
-        pane_id,
-        events: vec![status_event, heartbeat],
-    })
+    Ok(BridgeUpdate { pane_id, events })
 }
 
-/// True when a bridge row already owning `pane` (a real, hook-driven,
-/// non-synthetic occupant) must be treated as owning it authoritatively.
-///
-/// A `Stopped` occupant does NOT own the pane: GC keeps a `Stopped` row around
-/// for up to an hour, and a fresh (hook-less) agent launched in that same pane
-/// during that window would otherwise be invisible to the bridge the whole
-/// time. So only NON-`Stopped` non-synthetic occupants block a bridge update.
-fn occupant_is_authoritative(agent: &Agent) -> bool {
-    !agent.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) && agent.state != AgentState::Stopped
-}
-
-/// Apply a translated update, enforcing the hook-authoritative rule: if a
-/// *live* non-synthetic (real hook) row already owns the pane, drop the bridge
-/// update wholesale. A `Stopped` real row is a stale tombstone, not an owner —
-/// see [`occupant_is_authoritative`].
+/// Apply a translated update, enforcing the hook-authoritative rule via the
+/// shared [`synthetic::apply_if_unowned`]: if a *live* non-synthetic (real
+/// hook) row already owns the pane, drop the bridge update wholesale.
 async fn apply_update(store: &SharedStore, update: BridgeUpdate) {
-    let occupants = store.by_pane(&update.pane_id).await;
-    if occupants.iter().any(occupant_is_authoritative) {
-        tracing::debug!(
-            pane = %update.pane_id,
-            "herdr bridge: pane owned by a live hooked agent, dropping bridge update",
-        );
-        return;
-    }
-    for ev in &update.events {
-        store.apply(ev).await;
-    }
+    synthetic::apply_if_unowned(store, &update.pane_id, &update.events).await;
 }
 
 /// The muxa-namespaced pane id of an agent-less `pane.agent_status_changed`
@@ -299,50 +247,17 @@ fn agentless_pane_id(envelope: &Value) -> Option<String> {
     Some(format!("{PANE_ID_PREFIX}{raw}"))
 }
 
-/// Herdr says this pane has no agent. If a *synthetic* bridge row is still
-/// mirroring an agent there, stop it — otherwise its last state (`Working` /
-/// `WaitingInput`) would freeze forever: the pane's shell is alive (so the
-/// reconciler won't reap it) and the row isn't `Stopped` (so GC won't evict
-/// it). Emitting `SessionEnded` drives the synthetic row to `Stopped`, after
-/// which GC can reclaim it. A pane with no synthetic row is left untouched (no
-/// row is invented), and a real hook row is never disturbed by this path.
-async fn stop_agentless_synthetic(store: &SharedStore, pane_id: &str) {
-    let occupants = store.by_pane(pane_id).await;
-    for occ in occupants {
-        if !occ.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) || occ.state == AgentState::Stopped
-        {
-            // Real hook rows are not ours to stop; already-`Stopped` synthetic
-            // rows need no further event.
-            continue;
-        }
-        let id = AgentId {
-            kind: occ.kind,
-            session_id: occ.session_id.clone(),
-            surface: occ.surface.clone(),
-            pane: occ.pane.clone(),
-            tmux_socket: None,
-            cwd: occ.cwd.clone(),
-        };
-        store
-            .apply(&AgentEvent::SessionEnded {
-                id,
-                at: OffsetDateTime::now_utc(),
-            })
-            .await;
-        tracing::debug!(pane = %pane_id, "herdr bridge: agent gone, stopped synthetic row");
-    }
-}
-
 /// Translate a wire/seed envelope and, when it yields an update, apply it.
 async fn ingest_envelope(store: &SharedStore, envelope: &Value) {
     match translate(envelope, OffsetDateTime::now_utc()) {
         Ok(update) => apply_update(store, update).await,
         // Agent gone: herdr no longer attributes an agent to this pane. If a
         // synthetic bridge row is still mirroring one there, stop it so it
-        // doesn't freeze; otherwise it's a plain shell and a no-op.
+        // doesn't freeze; otherwise it's a plain shell and a no-op. Shared with
+        // screen detection via [`synthetic::stop_synthetic_row`].
         Err(DropReason::NoAgent) => {
             if let Some(pane) = agentless_pane_id(envelope) {
-                stop_agentless_synthetic(store, &pane).await;
+                synthetic::stop_synthetic_row(store, &pane).await;
             }
         }
         // Unknown status is routine — keep it off the debug stream so the log
@@ -1016,7 +931,7 @@ pub fn spawn_herdr_report_task(
 
 #[cfg(test)]
 mod tests {
-    use muxa::event::AgentEvent;
+    use muxa::event::{AgentEvent, NotificationLevel};
     use muxa::state::Store;
     use muxa::AgentState;
     use serde_json::json;

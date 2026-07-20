@@ -60,7 +60,12 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
     }
 }
 
-fn command_name(cmd: &str) -> &str {
+/// The bare command basename: `/usr/local/bin/Cursor-Agent` → `Cursor-Agent`
+/// (case preserved). The single source of the basename rule — `classify_command`
+/// lowercases the result, and `screen`'s manifest matcher reuses this so the two
+/// agree on what "the command" is by construction.
+#[must_use]
+pub fn command_name(cmd: &str) -> &str {
     cmd.trim().rsplit('/').next().unwrap_or(cmd).trim()
 }
 
@@ -240,7 +245,14 @@ pub fn scan_panes(backend: &dyn PaneBackend) -> Vec<Discovered> {
     discover_from_panes(&backend.list_panes())
 }
 
-fn synthetic_session_id(pane: &PaneInfo) -> String {
+/// The synthetic session id muxa mints for a pane that has no real hook-derived
+/// session yet — `synthetic-<pane_id>` for a socket-less pane, or
+/// `synthetic-<len>:<socket>:<pane_id>` when the pane carries a tmux socket
+/// identity. Exposed so other synthetic-row producers (the herdr bridge, screen
+/// detection) mint the SAME key, letting a discovery placeholder and a
+/// synthetic row collapse onto one registry entry and share the same
+/// hook-eviction precedence.
+pub fn synthetic_session_id(pane: &PaneInfo) -> String {
     match pane.socket.as_deref() {
         // Length-prefix the socket so the identity stays unambiguous even if
         // a custom socket name contains the separator.

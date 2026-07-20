@@ -28,6 +28,8 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
 mod herdr_bridge;
+mod screen_detect;
+mod synthetic;
 
 /// Inactivity window before a stopped agent is evicted from the in-memory store.
 const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
@@ -210,6 +212,13 @@ async fn main() -> Result<()> {
     // transition stream the notifier/activity tasks use. Spawned when herdr ∈ set.
     let herdr_report_handle =
         herdr_bridge::spawn_herdr_report_task(&backends, store.clone(), &shutdown_tx);
+    // Screen-manifest fallback detection: for agent CLIs muxa has no hooks for
+    // (cursor-agent, amp, copilot, …), capture matching panes and classify their
+    // screen into synthetic rows. Skips herdr hosts (the herdr bridge covers
+    // them) and any pane a live hook owns. Spawned before the IPC server takes
+    // ownership of `store` so it shares the same registry.
+    let screen_detect_handle =
+        screen_detect::spawn_screen_detect_task(&cfg, &backends, store.clone(), &shutdown_tx);
     let session_activity_handle =
         spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone(), &backends);
     let history_compaction_handle = spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
@@ -364,6 +373,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("reconciler", reconciler_handle).await;
     await_shutdown_task("herdr bridge", herdr_bridge_handle).await;
     await_shutdown_task("herdr report", herdr_report_handle).await;
+    await_shutdown_task("screen detection", screen_detect_handle).await;
     await_shutdown_task("session activity", session_activity_handle).await;
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;
