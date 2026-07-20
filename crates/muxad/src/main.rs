@@ -27,6 +27,8 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
+mod herdr_bridge;
+
 /// Inactivity window before a stopped agent is evicted from the in-memory store.
 const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 /// Cadence at which the GC task scans for evictable agents.
@@ -184,8 +186,20 @@ async fn main() -> Result<()> {
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
     let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
+    // herdr event bridge (Phase 2): only on herdr hosts. Translates herdr's
+    // own agent-state detection into synthetic muxa rows so agents muxa has no
+    // hooks for still appear in status/watch/stats. Spawned before the IPC
+    // server takes ownership of `store` so it shares the same registry.
+    let herdr_bridge_handle =
+        herdr_bridge::spawn_herdr_bridge_task(&backend, store.clone(), &shutdown_tx);
+    // herdr reverse path: push muxa's authoritative hook-derived state for REAL
+    // (non-synthetic) `herdr:` rows back into herdr's UI via `pane.report_agent`,
+    // releasing authority when the row stops. Subscribes to the same store
+    // transition stream the notifier/activity tasks use. Herdr-host only.
+    let herdr_report_handle =
+        herdr_bridge::spawn_herdr_report_task(&backend, store.clone(), &shutdown_tx);
     let session_activity_handle =
-        spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
+        spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone(), &backend);
     let history_compaction_handle = spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
     let activity_compaction_handle =
         spawn_activity_compaction_task(&cfg, activity_log.clone(), &shutdown_tx);
@@ -240,6 +254,7 @@ async fn main() -> Result<()> {
             })
             .flatten();
         let sessions_for_dash = sessions.clone();
+        let backend_for_dash = backend.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
@@ -251,6 +266,7 @@ async fn main() -> Result<()> {
                 store_for_dash,
                 pane_cache,
                 sessions_for_dash,
+                backend_for_dash,
                 dashboard_runtime,
                 shutdown_rx,
             )
@@ -312,6 +328,8 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(());
     await_shutdown_task("gc", Some(gc_handle)).await;
     await_shutdown_task("reconciler", reconciler_handle).await;
+    await_shutdown_task("herdr bridge", herdr_bridge_handle).await;
+    await_shutdown_task("herdr report", herdr_report_handle).await;
     await_shutdown_task("session activity", session_activity_handle).await;
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;
@@ -782,11 +800,15 @@ fn spawn_reconciler_task(
     Some(handle)
 }
 
-/// Track cumulative tmux session attached time for `muxa watch --view session`.
+/// Track cumulative session foreground time for `muxa watch --view session`.
+/// The sampling source follows the active pane backend: tmux (and the zellij
+/// fallback) shells out to `list-clients`; herdr queries the focused
+/// workspace over its socket. All downstream accounting is shared.
 fn spawn_session_activity_task(
     cfg: &Config,
     shutdown_tx: &broadcast::Sender<()>,
     activity_log: Option<std::sync::Arc<ActivityLog>>,
+    backend: &muxa::SharedBackend,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.session_activity.enabled {
         tracing::info!("session activity tracking disabled by config");
@@ -801,16 +823,27 @@ fn spawn_session_activity_task(
         tracing::warn!("session activity tracking enabled but no path resolvable");
         return None;
     };
+    // On herdr, foreground time is credited to the focused workspace over the
+    // herdr socket (resolved the same way the query backend and event bridge
+    // do). Every other host uses the tmux sampler.
+    let source = match backend.kind() {
+        muxa::HostKind::Herdr => muxa::SessionActivitySource::Herdr {
+            socket_path: muxa::backend::herdr::default_socket_path(),
+        },
+        _ => muxa::SessionActivitySource::Tmux,
+    };
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),
         std::time::Duration::from_secs(cfg.session_activity.interval_secs),
     )
-    .with_activity_log(activity_log);
+    .with_activity_log(activity_log)
+    .with_source(source);
     let shutdown_rx = shutdown_tx.subscribe();
     let handle = tokio::spawn(tracker.run(shutdown_rx));
     tracing::info!(
         path = %path.display(),
         interval_secs = cfg.session_activity.interval_secs,
+        host = %backend.kind(),
         "session activity tracking enabled",
     );
     Some(handle)

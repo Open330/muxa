@@ -866,6 +866,7 @@ fn jump_to_pane(pane_id: &str) {
     match backend.kind() {
         muxa::HostKind::Tmux => jump_to_pane_tmux(pane_id),
         muxa::HostKind::Zellij => jump_to_pane_zellij(backend.as_ref(), pane_id),
+        muxa::HostKind::Herdr => jump_to_pane_herdr(backend.as_ref(), pane_id),
     }
 }
 
@@ -911,6 +912,17 @@ fn jump_to_pane_tmux(pane_id: &str) {
 fn jump_to_pane_zellij(backend: &dyn muxa::PaneBackend, pane_id: &str) {
     if !backend.focus_pane(pane_id) {
         eprintln!("muxa: zellij focus-pane-with-id {pane_id} failed — pane may have closed");
+    }
+}
+
+/// Jump on herdr: `pane.focus` over the herdr socket is the whole story,
+/// same single-call shape as zellij. Focus moves the herdr UI wherever a
+/// client is attached; there is no bare-shell attach handover analog.
+fn jump_to_pane_herdr(backend: &dyn muxa::PaneBackend, pane_id: &str) {
+    if !backend.focus_pane(pane_id) {
+        eprintln!(
+            "muxa: herdr pane.focus {pane_id} failed — pane may have closed or the herdr server is down"
+        );
     }
 }
 
@@ -1340,6 +1352,9 @@ fn cmd_panes() {
                 "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
             ),
             muxa::HostKind::Zellij => println!("(no zellij panes)"),
+            muxa::HostKind::Herdr => {
+                println!("(no herdr panes — server may be down or socket unreachable)");
+            }
         }
         return;
     }

@@ -52,6 +52,7 @@
 //! when zellij CLI cannot populate `pane_pid_map`), call sites consult
 //! [`BackendCaps`] returned by [`PaneBackend::caps`] before degrading.
 
+pub mod herdr;
 pub mod tmux;
 pub mod zellij;
 
@@ -127,6 +128,7 @@ pub type SharedBackend = Arc<dyn PaneBackend>;
 pub fn default_backend() -> SharedBackend {
     match detect_host_env() {
         Some(HostKind::Zellij) => Arc::new(zellij::ZellijBackend::new()),
+        Some(HostKind::Herdr) => Arc::new(herdr::HerdrBackend::new()),
         _ => Arc::new(tmux::TmuxBackend::new()),
     }
 }
@@ -139,6 +141,7 @@ pub fn default_backend() -> SharedBackend {
 pub enum HostKind {
     Tmux,
     Zellij,
+    Herdr,
 }
 
 /// Static capability descriptor. Callers that *need to know* whether a
@@ -322,22 +325,25 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
 ///
 /// Resolution order:
 ///
-/// 1. **`MUXA_HOST`** — if set to `"tmux"` or `"zellij"` (case-insensitive),
-///    that wins regardless of what `TMUX` / `ZELLIJ` look like. Provides
-///    an unambiguous override for nested-multiplexer setups (e.g. zellij
-///    inside tmux, or `tmux new-session` from inside zellij) where
-///    auto-detect can't tell which host the current shell really lives in.
-///    Other values are ignored (treated as unset) so a typo doesn't pin
-///    the daemon to the wrong host silently.
+/// 1. **`MUXA_HOST`** — if set to `"tmux"`, `"zellij"`, or `"herdr"`
+///    (case-insensitive), that wins regardless of what `TMUX` / `ZELLIJ` /
+///    `HERDR_*` look like. Provides an unambiguous override for
+///    nested-multiplexer setups (zellij inside tmux, `tmux new-session` from
+///    inside a herdr pane, …) where auto-detect can't tell which host the
+///    current shell really lives in. Other values are ignored (treated as
+///    unset) so a typo doesn't pin the daemon to the wrong host silently.
 /// 2. **`ZELLIJ`** set → [`HostKind::Zellij`].
-/// 3. **`TMUX`** set → [`HostKind::Tmux`].
+/// 3. **`HERDR_PANE_ID` / `HERDR_ENV`** set → [`HostKind::Herdr`].
+/// 4. **`TMUX`** set → [`HostKind::Tmux`].
 ///
-/// When both `TMUX` and `ZELLIJ` are present, zellij wins by default.
-/// The env doesn't carry "which one was set last" ordering, so this is
-/// a pragmatic pick rather than a principled one — `MUXA_HOST` is the
-/// escape hatch for the case where the auto-detect picks wrong.
+/// The tie-break for nested hosts (all ancestors' vars are inherited) is
+/// **newer host wins**: zellij, then herdr, then tmux. Launching herdr *from*
+/// a tmux shell is the common migration path, so herdr beats tmux on a
+/// presence tie — matching the hook adapter's `host_pane_env` so the pane a
+/// hook is stamped onto and the backend that observes it always agree. The
+/// rarer nesting (tmux inside a herdr pane) is served by `MUXA_HOST=tmux`.
 ///
-/// Returns `None` outside both hosts; callers fall through to a no-op
+/// Returns `None` outside all hosts; callers fall through to a no-op
 /// backend in that case.
 pub fn detect_host_env() -> Option<HostKind> {
     detect_from(|name| std::env::var(name).ok())
@@ -355,6 +361,7 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "tmux" => return Some(HostKind::Tmux),
             "zellij" => return Some(HostKind::Zellij),
+            "herdr" => return Some(HostKind::Herdr),
             // Empty / unknown / typo → fall through to auto-detect.
             // Logging the bad value here would be noisy at startup;
             // the daemon traces the resolved host kind on the first
@@ -363,14 +370,52 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
         }
     }
 
-    // 2. & 3. Auto-detect from host-set env vars.
+    // 2.–4. Auto-detect from host-set env vars. Ordering is a tie-break
+    // for nested hosts (all ancestors' vars are inherited): newer hosts
+    // are checked before tmux because launching herdr/zellij *from* a tmux
+    // shell is the common migration path — and the inner shell inherits the
+    // outer `$TMUX`, so it can't be disambiguated by presence alone. The
+    // rarer nesting (tmux inside a herdr pane) uses the `MUXA_HOST` override.
+    // `host_pane_env` in the hook adapter mirrors this exact order.
     if read("ZELLIJ").is_some() {
         return Some(HostKind::Zellij);
+    }
+    if read("HERDR_PANE_ID").is_some() || read("HERDR_ENV").is_some() {
+        return Some(HostKind::Herdr);
     }
     if read("TMUX").is_some() {
         return Some(HostKind::Tmux);
     }
     None
+}
+
+/// Classify a namespaced pane id back to the host that governs it.
+///
+/// muxa namespaces every non-tmux pane id — `zellij:<id>` for zellij,
+/// `herdr:<id>` (see [`herdr::PANE_ID_PREFIX`]) for herdr — and leaves
+/// tmux's native `%N` ids as-is. The reconciler's cross-host reaping guard
+/// uses this to tell whether a registry row belongs to the *observing*
+/// backend: a `%`-id is tmux's, a `herdr:`-id is herdr's, a `zellij:`-id is
+/// zellij's. When it does not, that row's pane can't appear in this
+/// backend's observation, so its absence is not liveness evidence.
+///
+/// Returns `None` for shapes muxa doesn't recognize (legacy rows, paneless
+/// synthetic ids, a future host's ids) — those stay governed by whatever
+/// backend is active today, preserving pre-guard behavior.
+#[must_use]
+pub fn pane_id_host_kind(pane_id: &str) -> Option<HostKind> {
+    if pane_id.starts_with('%') {
+        Some(HostKind::Tmux)
+    } else if pane_id.starts_with("zellij:") {
+        // No shared const for zellij's prefix yet (its ids are minted by the
+        // WASM plugin as `zellij:<terminal-id>`); the literal is the single
+        // source of truth until one is introduced.
+        Some(HostKind::Zellij)
+    } else if pane_id.starts_with(herdr::PANE_ID_PREFIX) {
+        Some(HostKind::Herdr)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +466,37 @@ mod tests {
         assert_eq!(
             detect_from(env_reader(&[("TMUX", "1"), ("ZELLIJ", "1")])),
             Some(HostKind::Zellij),
+        );
+    }
+
+    /// herdr beats tmux on a presence tie (herdr launched from a tmux shell,
+    /// the common migration path). Locks the policy that `host_pane_env`
+    /// mirrors so hook stamping and backend observation agree.
+    #[test]
+    fn detect_prefers_herdr_over_tmux() {
+        assert_eq!(
+            detect_from(env_reader(&[("HERDR_PANE_ID", "9"), ("TMUX", "1")])),
+            Some(HostKind::Herdr),
+        );
+        // `HERDR_ENV` alone (no pane id) still identifies herdr.
+        assert_eq!(
+            detect_from(env_reader(&[("HERDR_ENV", "1"), ("TMUX", "1")])),
+            Some(HostKind::Herdr),
+        );
+    }
+
+    /// `MUXA_HOST=tmux` forces tmux even against a present herdr env — the
+    /// escape hatch for tmux running inside a herdr pane.
+    #[test]
+    fn detect_muxa_host_tmux_overrides_herdr() {
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("MUXA_HOST", "tmux"),
+                ("HERDR_PANE_ID", "9"),
+                ("TMUX", "1"),
+            ])),
+            Some(HostKind::Tmux),
+            "MUXA_HOST=tmux must beat a present HERDR env var",
         );
     }
 
@@ -482,6 +558,33 @@ mod tests {
     fn host_kind_display_is_lowercase_stable() {
         assert_eq!(HostKind::Tmux.to_string(), "tmux");
         assert_eq!(HostKind::Zellij.to_string(), "zellij");
+    }
+
+    /// The cross-host reaping guard's classifier maps each host's pane-id
+    /// namespace back to its `HostKind`: tmux `%N`, `zellij:<id>`,
+    /// `herdr:<id>`. Unknown shapes return `None` so they stay governed by
+    /// the active backend (pre-guard behavior). Locks the exact prefixes the
+    /// reconciler relies on to avoid reaping another host's live rows.
+    #[test]
+    fn pane_id_host_kind_classifies_each_namespace() {
+        assert_eq!(pane_id_host_kind("%3"), Some(HostKind::Tmux));
+        assert_eq!(pane_id_host_kind("%0"), Some(HostKind::Tmux));
+        assert_eq!(pane_id_host_kind("zellij:7"), Some(HostKind::Zellij));
+        assert_eq!(
+            pane_id_host_kind("zellij:terminal:7"),
+            Some(HostKind::Zellij),
+        );
+        // Reference the const the herdr backend actually stamps, so a rename
+        // there fails this test rather than silently desyncing the guard.
+        assert_eq!(
+            pane_id_host_kind(&format!("{}42", herdr::PANE_ID_PREFIX)),
+            Some(HostKind::Herdr),
+        );
+        // Unknown / legacy / paneless-synthetic shapes: governed by whoever
+        // is the active backend, exactly as before the guard existed.
+        assert_eq!(pane_id_host_kind("synthetic-%1"), None);
+        assert_eq!(pane_id_host_kind("weird-id"), None);
+        assert_eq!(pane_id_host_kind(""), None);
     }
 
     /// A minimal fake the rest of the test module reuses — keeps
@@ -584,6 +687,11 @@ mod tests {
 
         let store = Store::shared();
         let t0 = datetime!(2026-04-28 12:00:00 UTC);
+        // `FakeBackend::kind()` is `Zellij`, so use zellij-namespaced pane ids
+        // here: the cross-host reaping guard only lets an observation reap
+        // rows whose pane id belongs to the observing host. Tmux `%N` rows
+        // under a zellij observation are (correctly) exempt, so this test
+        // must speak the observing host's namespace to exercise reaping.
         for sid in ["alive", "ghost"] {
             store
                 .apply(&AgentEvent::Started {
@@ -592,15 +700,15 @@ mod tests {
                         kind: AgentKind::ClaudeCode,
                         session_id: sid.into(),
                         surface: None,
-                        pane: Some(format!("%{sid}")),
+                        pane: Some(format!("zellij:{sid}")),
                         cwd: None,
                     },
                     at: t0,
                 })
                 .await;
         }
-        // Backend reports only %alive as live; %ghost should be reaped.
-        let backend = FakeBackend::with_panes(vec![fake_pane("%alive")]);
+        // Backend reports only zellij:alive as live; zellij:ghost is reaped.
+        let backend = FakeBackend::with_panes(vec![fake_pane("zellij:alive")]);
         let r = Reconciler::new(store.clone(), backend, Duration::from_millis(10));
         let report = r.reconcile_once().await;
         assert_eq!(report.stale_panes_reaped, 1);

@@ -10,6 +10,7 @@ use crate::activity::{
     ActivityEntry, ActivityLog, HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind,
     SessionForegroundEntry,
 };
+use crate::backend::herdr;
 use crate::tmux::{self, SessionInfo, TmuxError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -240,10 +241,31 @@ fn add_elapsed(record: &mut SessionActivity, since: OffsetDateTime, now: OffsetD
     record.total_attached_secs = record.total_attached_secs.saturating_add(secs);
 }
 
+/// Where a poll samples foreground state from. Only the *sampling* source
+/// differs between hosts — everything downstream (`apply_sample_report`,
+/// the ledger intervals, `session-activity.json`, input ticks) is shared.
+///
+/// - `Tmux`: interactive `tmux list-clients` rows grouped by session (also
+///   the fallback for zellij, which has no client-attach signal and so
+///   degrades to an empty sample, unchanged).
+/// - `Herdr`: the focused herdr *workspace* over the herdr socket. herdr
+///   has no client-attach or per-client input signal, so it produces the
+///   "workspace X is foregrounded" observation only — see
+///   [`sample_herdr_activity`] for the accrual limitation this implies.
+#[derive(Default)]
+pub enum SessionActivitySource {
+    #[default]
+    Tmux,
+    Herdr {
+        socket_path: PathBuf,
+    },
+}
+
 pub struct SessionActivityTracker {
     path: PathBuf,
     interval: Duration,
     activity_log: Option<Arc<ActivityLog>>,
+    source: SessionActivitySource,
 }
 
 impl SessionActivityTracker {
@@ -252,13 +274,41 @@ impl SessionActivityTracker {
             path,
             interval,
             activity_log: None,
+            source: SessionActivitySource::default(),
         }
+    }
+
+    /// Select the foreground-sampling source. Defaults to
+    /// [`SessionActivitySource::Tmux`]; the daemon sets
+    /// [`SessionActivitySource::Herdr`] on herdr hosts.
+    #[must_use]
+    pub fn with_source(mut self, source: SessionActivitySource) -> Self {
+        self.source = source;
+        self
     }
 
     #[must_use]
     pub fn with_activity_log(mut self, activity_log: Option<Arc<ActivityLog>>) -> Self {
         self.activity_log = activity_log;
         self
+    }
+
+    /// Take one foreground sample from the configured source, off the async
+    /// runtime (both the tmux shell-out and the herdr socket round-trip
+    /// block). The two sources produce the same [`ActivitySample`] shape, so
+    /// the caller's accounting is source-agnostic.
+    async fn sample(&self) -> Result<ActivitySample, String> {
+        match &self.source {
+            SessionActivitySource::Tmux => tokio::task::spawn_blocking(sample_activity)
+                .await
+                .unwrap_or_else(|e| Err(format!("join error: {e}"))),
+            SessionActivitySource::Herdr { socket_path } => {
+                let socket_path = socket_path.clone();
+                tokio::task::spawn_blocking(move || sample_herdr_activity(&socket_path))
+                    .await
+                    .map_err(|e| format!("join error: {e}"))
+            }
+        }
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -300,9 +350,7 @@ impl SessionActivityTracker {
         records: &mut HashMap<String, SessionActivity>,
         seen_clients: &mut HashMap<String, (i64, i64)>,
     ) {
-        let sample = tokio::task::spawn_blocking(sample_activity)
-            .await
-            .unwrap_or_else(|e| Err(format!("join error: {e}")));
+        let sample = self.sample().await;
         let sample = match sample {
             Ok(sample) => sample,
             Err(e) => {
@@ -402,6 +450,38 @@ fn sample_activity() -> Result<ActivitySample, String> {
         sessions,
         client_inputs,
     })
+}
+
+/// herdr foreground sample: the currently focused herdr *workspace*, mapped
+/// to a single [`SessionInfo`] with one "attached client" so
+/// [`apply_sample_report`] credits foreground time to it exactly as it would
+/// an attached tmux session. The `session_id` is the raw `workspace_id`
+/// (`w1`), matching `HerdrBackend::list_panes`'s `PaneInfo.session` so the
+/// ledger keys line up with the pane rows. No focused workspace (or an
+/// unreachable/absent server) yields an empty sample — the tmux "no server
+/// running" analog, which closes any open foreground interval.
+///
+/// LIMITATION (documented, mitigation out of scope): herdr's socket API
+/// exposes no client-attach state — there is no `client.list` analog. So,
+/// unlike the tmux path (which credits time only while an interactive client
+/// is attached), herdr focus time accrues even when the server sits detached
+/// with no client attached. This inflates ACT for always-on detached herdr
+/// servers. herdr also has no per-client input/scroll signal, so
+/// `client_inputs` is always empty and no `HumanInteraction` (`TmuxInput` /
+/// `TmuxScroll`) ticks are ever emitted on herdr hosts.
+fn sample_herdr_activity(socket_path: &Path) -> ActivitySample {
+    let sessions = match herdr::herdr_focused_workspace(socket_path) {
+        Some(ws) => vec![SessionInfo {
+            session_id: ws.id,
+            name: ws.label,
+            attached_clients: 1,
+        }],
+        None => Vec::new(),
+    };
+    ActivitySample {
+        sessions,
+        client_inputs: Vec::new(),
+    }
 }
 
 /// Build the per-client input readings for this poll: one entry per interactive

@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **herdr web dashboard panes view.** The dashboard's `/api/panes` route
+  (and the timeline's pane→session map) now populate on herdr hosts. The
+  daemon threads its active pane backend into the dashboard; when the host
+  is herdr the pane-cache refresh sources rows from `HerdrBackend::list_panes()`
+  over the socket and folds them into the scanner's result shape instead of
+  the tmux multi-socket scanner (which sees nothing on herdr). Panes carry
+  their herdr-native fields (`herdr:<id>`, workspace as session, tab as
+  window) plus a synthetic `"herdr"` socket identity for the UI's
+  socket-filter chip. `MUXA_TMUX_SOCKET` scopes tmux sockets only and is not
+  applied to herdr panes; the tmux path is unchanged. See `docs/HERDR.md`.
+- **herdr watch session view.** `muxa watch --view session` (the default
+  view) now populates on herdr hosts: sessions are derived from herdr
+  workspaces over the socket (`workspace.list`) instead of `tmux
+  list-sessions`, so each workspace shows as a session row keyed by its raw
+  `workspace_id` with the workspace **label** as its display name (falling
+  back to the id). The DUR column lights up from the existing
+  session-activity ledger (keyed by the same `workspace_id`), and Enter-twice
+  attach is host-dispatched to herdr's `pane.focus`, never a tmux-only
+  action. See `docs/HERDR.md`.
+- **herdr session foreground time.** The foreground-time ledger now works on
+  herdr hosts: instead of `tmux list-clients` (which finds no server on
+  herdr), the sampler queries the focused herdr **workspace** over the herdr
+  socket (`workspace.list`) and credits foreground time to it, keyed by the
+  raw `workspace_id` so `muxa stats`/`report` ACT numbers and
+  `muxa watch --view session` populate exactly as on tmux. Only the sampling
+  source branches; all downstream accounting is shared. Known limitation:
+  herdr exposes no client-attach state, so focus time accrues even when the
+  server is detached with no client attached (inflates ACT for always-on
+  detached servers; mitigation out of scope). See `docs/HERDR.md`.
+- **herdr backend (Phase 1).** muxa now observes agents inside
+  [herdr](https://herdr.dev) panes: a full `PaneBackend` over herdr's local
+  socket API (`pane.list`/`pane.read`/`pane.process_info`/`pane.focus`, so
+  pane inventory, live captures, pid maps, and watch-attach all work with
+  no plugin), hook correlation via `$HERDR_PANE_ID` (rows are namespaced
+  `herdr:<pane_id>`), host auto-detection inside herdr panes plus a
+  `MUXA_HOST=herdr` override for the daemon, and a cross-host reaping
+  guard so a tmux-backend daemon never reaps live `herdr:`/`zellij:` rows
+  (and vice versa) while both hosts are in use. Verified end-to-end
+  against herdr 0.7.4 (protocol 16). See `docs/HERDR.md`.
+- **herdr event bridge (Phase 2).** On herdr hosts the daemon now
+  subscribes to herdr's `pane.agent_status_changed` stream and translates
+  it into synthetic muxa rows, so agents muxa has no hooks for (cursor,
+  amp, copilot, …) still appear in `muxa status`/`watch`/stats:
+  `working`→working, `blocked`→waiting, `idle`/`done`→turn-stop; unknown
+  agents map to `AgentKind::Unknown` carrying the herdr agent name.
+  Real hook events stay authoritative — a hooked agent owns its pane and
+  bridge state never clobbers it. Verified live against herdr 0.7.4. See
+  `docs/HERDR.md`.
+- **herdr reverse path (`pane.report_agent`).** On herdr hosts the daemon
+  now pushes muxa's authoritative hook-derived state for REAL
+  (non-synthetic) `herdr:` rows into herdr's own UI: a transition
+  subscriber maps `Working`→`working`, `WaitingInput`/`WaitingChoice`/`Error`
+  →`blocked` (carrying the notification/error text), `Idle`→`idle`, and
+  `Stopped`→`pane.release_agent` (handing authority back to herdr's
+  detection). Reports carry `source = "muxa"`, a herdr-aligned agent slug,
+  the real session id, and a monotonic `seq`. Synthetic bridge rows are
+  never reported back, so the two directions can't feedback-loop. Failures
+  are best-effort and non-fatal. Verified live against herdr 0.7.4. See
+  `docs/HERDR.md`.
+
 ### Fixed
 
 - **The `muxa Watch` BarShelf widget no longer goes blank after a muxa
@@ -21,6 +83,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   card names the fix ("Update muxa Watch") rather than showing a generic
   offline state — and an actionable fault is never hidden behind the
   last-good-render fallback the way a dropped SSH connection is.
+- **herdr backend hardening (review follow-ups).** Several correctness fixes to
+  the herdr support: (1) foreign-host rows the daemon can't observe (e.g. a
+  `herdr:` row left after switching the daemon back to tmux) now age out to
+  `Stopped` after the paneless-orphan timeout instead of ghosting forever;
+  (2) nested-host policy is now consistent — **herdr wins presence ties over
+  tmux** in *both* host detection and hook pane-stamping (herdr launched from
+  a tmux shell is the common case; its shells inherit the outer `$TMUX_PANE`),
+  with `MUXA_HOST=tmux` as the escape hatch for the rarer tmux-inside-herdr
+  nesting; (3) socket presence uses `try_exists()` so a stat error
+  (EACCES/EIO/stalled automount) degrades to a transient error instead of an
+  authoritative "no panes" that mass-reaps; (4) the socket request loop now has
+  an aggregate read deadline (a chatty server streaming unrelated lines can no
+  longer wedge reconcile/watch) and per-`pane.list` process-info enrichment is
+  time-budgeted; (5) the web dashboard on a herdr host now merges the tmux
+  scan with the herdr pane list instead of replacing it, so tmux panes no
+  longer vanish from `/api/panes`/timeline during mixed-host migration. See
+  `docs/HERDR.md`.
 
 - **`code_mode_host` codex sessions now correlate to their tmux pane instead of
   splitting into two rows.** Such a session runs its turns — and fires its

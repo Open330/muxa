@@ -24,7 +24,9 @@ and Google Gemini CLI through their existing hook/event systems, then
 correlates those events with tmux panes and sessions.
 
 It does not fork tmux or modify agent binaries. tmux is the default full
-backend; zellij has a CLI baseline and a planned richer plugin path.
+backend; [herdr](https://herdr.dev) is supported through its socket API
+(see [docs/HERDR.md](docs/HERDR.md)); zellij has a CLI baseline and a
+planned richer plugin path.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa demo" width="900" />

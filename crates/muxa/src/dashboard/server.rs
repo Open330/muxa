@@ -38,6 +38,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
+use crate::backend::{HostKind, SharedBackend};
 use crate::config::StatsConfig;
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
@@ -97,6 +98,12 @@ pub struct AppState {
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
+    /// Active pane backend, threaded in so the `/api/panes` refresh can
+    /// source panes from the herdr socket when the host is herdr (the tmux
+    /// multi-socket [`scanner::scan`] sees nothing there). `None` keeps the
+    /// historical tmux-scanner path — the default for tests and any caller
+    /// that doesn't supply one (behaviour is byte-identical to before).
+    pub backend: Option<SharedBackend>,
     /// Lock-free runtime counters surfaced via `/api/metrics`. Cloned
     /// from the [`Store`](crate::state::Store)'s metrics so SSE
     /// connect/disconnect bumps live alongside event-apply bumps.
@@ -143,6 +150,7 @@ impl AppState {
             config,
             pane_cache,
             sessions,
+            backend: None,
             metrics,
             activity_path: None,
             session_activity_path: None,
@@ -173,6 +181,61 @@ impl AppState {
         self.stats_config = stats_config;
         self
     }
+
+    #[must_use]
+    pub fn with_backend(mut self, backend: SharedBackend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// Refresh the pane inventory through the pane cache, sourcing from the
+    /// herdr socket when the active backend is herdr and from the tmux
+    /// multi-socket scanner otherwise. Both `/api/panes` and the timeline's
+    /// pane→session map go through here so they agree on a herdr host.
+    async fn refresh_pane_scan(&self) -> scanner::ScanResult {
+        let backend = self.backend.clone();
+        self.pane_cache
+            .get_or_refresh(|| refresh_pane_scan(backend))
+            .await
+    }
+}
+
+/// Pull one pane inventory for the pane cache. On a herdr host we run BOTH
+/// the tmux multi-socket [`scanner::scan`] *and* the daemon's [`HerdrBackend`]
+/// `pane.list` (a blocking socket round-trip, hence `spawn_blocking`), then
+/// concat the two into one [`ScanResult`]. Running only the herdr side would
+/// drop live tmux panes during a mixed-host migration (tmux panes vanish from
+/// `/api/panes` and the timeline); merging keeps both. tmux per-socket
+/// failures keep flowing through `errors` as before. Every other backend — and
+/// the `None`/no-backend test path — runs the unchanged tmux scanner alone.
+async fn refresh_pane_scan(backend: Option<SharedBackend>) -> scanner::ScanResult {
+    match backend {
+        Some(backend) if backend.kind() == HostKind::Herdr => {
+            let herdr_panes = tokio::task::spawn_blocking(move || backend.list_panes())
+                .await
+                .unwrap_or_default();
+            merge_pane_scans(
+                scanner::scan().await,
+                scanner::herdr_scan_result(herdr_panes),
+            )
+        }
+        _ => scanner::scan().await,
+    }
+}
+
+/// Concat a herdr pane inventory onto a tmux scan result. herdr panes are
+/// appended after the tmux panes; the tmux side's `errors` (per-socket partial
+/// failures) are preserved and any herdr-side errors folded in too (there are
+/// none today — a single in-process backend call has no per-socket failures).
+/// The `fetched_at` of the tmux scan is kept as the result timestamp (both are
+/// captured within the same refresh, so the difference is immaterial).
+fn merge_pane_scans(
+    mut tmux: scanner::ScanResult,
+    herdr: scanner::ScanResult,
+) -> scanner::ScanResult {
+    tmux.panes.extend(herdr.panes);
+    tmux.errors.extend(herdr.errors);
+    tmux
 }
 
 /// Build the dashboard router. Public so `muxad`'s integration tests
@@ -247,10 +310,12 @@ pub async fn serve(
     store: SharedStore,
     pane_cache: Arc<PaneCache>,
     sessions: SharedSessionBackend,
+    backend: SharedBackend,
     runtime: DashboardRuntimeConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
     let state = AppState::new(store, config.clone(), pane_cache, sessions)
+        .with_backend(backend)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
         .with_stats_config(runtime.stats_config);
     let app = router(state);
@@ -415,7 +480,7 @@ struct PanesResponse {
 }
 
 async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let result = state.pane_cache.get_or_refresh(scanner::scan).await;
+    let result = state.refresh_pane_scan().await;
     Json(PanesResponse {
         panes: result.panes,
         errors: result.errors,
@@ -628,7 +693,7 @@ async fn timeline_handler(
     };
     let agents = state.store.snapshot().await;
     let prompt_entries = state.store.recent_prompts(None, 0).await;
-    let pane_scan = state.pane_cache.get_or_refresh(scanner::scan).await;
+    let pane_scan = state.refresh_pane_scan().await;
     let pane_sessions = pane_scan
         .panes
         .iter()
@@ -1253,6 +1318,139 @@ mod tests {
         assert!(v["panes"].is_array());
         assert!(v["errors"].is_array());
         assert!(v["fetched_at"].is_string());
+    }
+
+    /// On a herdr host `/api/panes` must source rows from the herdr backend,
+    /// not the (empty-on-herdr) tmux scanner. We stand up a minimal herdr
+    /// mock socket, point a real `HerdrBackend` at it, and assert the pane
+    /// surfaces with the herdr synthetic socket identity.
+    #[tokio::test]
+    async fn panes_endpoint_sources_from_herdr_backend_when_host_is_herdr() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        // Answer pane.list (+ per-pane pane.process_info) on a detached
+        // accept loop; the same newline-JSON shape herdr.rs tests use.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+                let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                let result = match method {
+                    "pane.list" => json!({
+                        "type": "pane_list",
+                        "panes": [{
+                            "pane_id": "p1", "terminal_id": "t1",
+                            "workspace_id": "ws1", "tab_id": "tab1",
+                            "focused": true, "agent_status": "idle", "revision": 1,
+                            "cwd": "/home/u/proj", "title": "editor",
+                            "terminal_title": "raw",
+                        }],
+                    }),
+                    "pane.process_info" => json!({
+                        "type": "pane_process_info",
+                        "process_info": {
+                            "pane_id": "p1", "shell_pid": 4242, "tty": "/dev/pts/3",
+                            "foreground_processes": [
+                                { "pid": 4242, "name": "zsh" },
+                                { "pid": 5001, "name": "vim" },
+                            ],
+                        },
+                    }),
+                    _ => json!({ "type": "ok" }),
+                };
+                let mut out =
+                    serde_json::to_string(&json!({ "id": id, "result": result })).unwrap();
+                out.push('\n');
+                let _ = stream.write_all(out.as_bytes());
+            }
+        });
+
+        let backend: SharedBackend = Arc::new(
+            crate::backend::herdr::HerdrBackend::with_socket_path(socket_path),
+        );
+        let state = fresh_state().with_backend(backend);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/panes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let panes = v["panes"].as_array().expect("panes array");
+        // The herdr branch now merges the tmux scan too, so any stray tmux
+        // server on the test host may add panes — find the herdr pane rather
+        // than asserting an exact count.
+        let herdr = panes
+            .iter()
+            .find(|p| p["pane_id"] == "herdr:p1")
+            .unwrap_or_else(|| panic!("herdr pane must surface: {v:?}"));
+        assert_eq!(herdr["session"], "ws1");
+        assert_eq!(herdr["window_index"], "tab1");
+        assert_eq!(herdr["socket"], "herdr");
+        assert_eq!(herdr["current_command"], "vim");
+    }
+
+    /// The herdr pane-scan path merges rather than replaces: a herdr backend's
+    /// panes are appended onto whatever the tmux scan returned, and the tmux
+    /// side's per-socket errors survive. Exercised on the pure merge helper so
+    /// the tmux side can be fabricated (a real tmux server isn't needed).
+    #[test]
+    fn merge_pane_scans_appends_herdr_onto_tmux_and_keeps_errors() {
+        use crate::tmux::scanner::{PaneSummary, ScanError, ScanResult};
+        use std::path::PathBuf;
+
+        let tmux_pane = PaneSummary {
+            pane_id: "%1".into(),
+            session: "main".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "zsh".into(),
+            title: String::new(),
+            socket: PathBuf::from("default"),
+            attach_command: "tmux attach".into(),
+        };
+        let tmux = ScanResult {
+            panes: vec![tmux_pane],
+            errors: vec![ScanError {
+                socket: PathBuf::from("wedged"),
+                message: "timed out".into(),
+            }],
+            fetched_at: OffsetDateTime::now_utc(),
+        };
+        let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
+            socket: None,
+            pane_id: "herdr:p1".into(),
+            session: "ws1".into(),
+            window_index: "tab1".into(),
+            pane_index: "p1".into(),
+            tty: String::new(),
+            current_command: "vim".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: String::new(),
+        }]);
+
+        let merged = merge_pane_scans(tmux, herdr);
+        let ids: Vec<&str> = merged.panes.iter().map(|p| p.pane_id.as_str()).collect();
+        assert_eq!(ids, ["%1", "herdr:p1"], "tmux first, herdr appended");
+        assert_eq!(merged.errors.len(), 1, "tmux scan errors preserved");
+        assert_eq!(merged.errors[0].socket, PathBuf::from("wedged"));
     }
 
     #[tokio::test]

@@ -668,7 +668,12 @@ pub(crate) enum RowIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRow {
+    /// Stable group key — `PaneInfo.session` (tmux session name / herdr
+    /// `workspace_id`). Used for grouping, sorting, and the activity bridge.
     pub session: String,
+    /// Human-facing name shown in the session view. Equals `session` on tmux;
+    /// resolves to the workspace label on herdr.
+    pub display_name: String,
     pub pane_ids: Vec<String>,
     pub representative_pane: Option<String>,
     pub latest_agent: Option<Agent>,
@@ -1841,6 +1846,13 @@ impl App {
 struct SortContext<'a> {
     pane_by_id: HashMap<&'a str, &'a PaneInfo>,
     session_id_by_name: HashMap<&'a str, &'a str>,
+    /// Display name for a group key. A group is keyed by `PaneInfo.session`:
+    /// the session name on tmux, the `workspace_id` on herdr. Mapped from
+    /// both `SessionInfo.name` and `SessionInfo.session_id` so a key resolves
+    /// however the pane spells it — on tmux both entries point at the same
+    /// name (identity display); on herdr the `workspace_id` entry surfaces
+    /// the human label.
+    display_by_key: HashMap<&'a str, &'a str>,
     activity_by_id: HashMap<&'a str, &'a SessionActivity>,
     now: OffsetDateTime,
 }
@@ -1852,12 +1864,18 @@ impl<'a> SortContext<'a> {
         session_activity: &'a [SessionActivity],
         now: OffsetDateTime,
     ) -> Self {
+        let mut display_by_key = HashMap::new();
+        for s in sessions {
+            display_by_key.insert(s.name.as_str(), s.name.as_str());
+            display_by_key.insert(s.session_id.as_str(), s.name.as_str());
+        }
         Self {
             pane_by_id: panes.iter().map(|p| (p.pane_id.as_str(), p)).collect(),
             session_id_by_name: sessions
                 .iter()
                 .map(|s| (s.name.as_str(), s.session_id.as_str()))
                 .collect(),
+            display_by_key,
             activity_by_id: session_activity
                 .iter()
                 .map(|a| (a.session_id.as_str(), a))
@@ -1870,10 +1888,27 @@ impl<'a> SortContext<'a> {
         self.pane_by_id.get(pane_id).copied()
     }
 
+    /// The human-facing display name for a group key, falling back to the key
+    /// itself when no session metadata matches (e.g. a stale pane).
+    fn display_name(&self, session: &str) -> String {
+        self.display_by_key
+            .get(session)
+            .copied()
+            .unwrap_or(session)
+            .to_string()
+    }
+
     fn activity_for_session_name(&self, session: &str) -> Option<&'a SessionActivity> {
+        // tmux keys panes by the mutable session *name* but the ledger by the
+        // stable session *id*, so bridge name → id → activity. On herdr the
+        // pane's session is already the stable `workspace_id` (= the ledger
+        // key), so the name lookup misses and we fall back to keying the
+        // ledger directly. The fallback is a no-op on tmux (session names
+        // never collide with `$N` session ids) and only fires after a miss.
         self.session_id_by_name
             .get(session)
             .and_then(|id| self.activity_by_id.get(*id).copied())
+            .or_else(|| self.activity_by_id.get(session).copied())
     }
 
     fn session_duration_secs(&self, session: &str) -> u64 {
@@ -2062,6 +2097,7 @@ fn build_session_rows(
                 .map(|agent| ((agent.kind, agent.session_id.clone()), agent.state))
                 .collect();
             SessionRow {
+                display_name: sort_context.display_name(&b.session),
                 session: b.session,
                 pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
                 representative_pane,
@@ -2333,7 +2369,7 @@ fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'stati
 
 fn session_label(s: &SessionRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static> {
     let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme, spin);
-    spans.push(Span::raw(s.session.clone()));
+    spans.push(Span::raw(s.display_name.clone()));
 
     Text::from(Line::from(spans))
 }
@@ -2809,7 +2845,16 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
 
     let mut agent_states = HashMap::new();
     agent_states.insert((agent.kind, agent.session_id.clone()), agent.state);
+    // Resolve the workspace label from the last full refresh's session list
+    // (herdr); on tmux and for an unknown key this is the key itself. The next
+    // `Full` tick rebuilds the row via `build_session_rows` regardless.
+    let display_name = app
+        .sessions
+        .iter()
+        .find(|s| s.session_id == session || s.name == session)
+        .map_or_else(|| session.clone(), |s| s.name.clone());
     app.rows.push(WatchRow::Session(Box::new(SessionRow {
+        display_name,
         session,
         pane_ids: agent.pane.clone().into_iter().collect(),
         representative_pane: agent.pane.clone(),
@@ -2879,13 +2924,31 @@ async fn compute_refresh(
     let backend_for_blocking = backend.clone();
     let panes_task = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes());
 
-    let is_tmux = backend.kind() == muxa::HostKind::Tmux;
-    let sessions_task = tokio::task::spawn_blocking(move || {
-        if is_tmux {
-            muxa::tmux::list_sessions().unwrap_or_default()
-        } else {
-            Vec::new()
+    // Source the "sessions" list per host. tmux shells `list-sessions`;
+    // herdr derives sessions from its workspaces over the socket (session
+    // id = raw `workspace_id`, matching `PaneInfo.session` and the
+    // session-activity ledger key so the DUR column resolves; display name =
+    // workspace label, falling back to the id). zellij has no session
+    // concept here, so it stays empty. Any host: this may shell out or hit a
+    // socket, so it MUST NOT run on a tokio worker.
+    let host = backend.kind();
+    let sessions_task = tokio::task::spawn_blocking(move || match host {
+        muxa::HostKind::Tmux => muxa::tmux::list_sessions().unwrap_or_default(),
+        muxa::HostKind::Herdr => {
+            let socket = muxa::backend::herdr::default_socket_path();
+            muxa::backend::herdr::herdr_list_workspaces(&socket)
+                .into_iter()
+                .map(|ws| SessionInfo {
+                    session_id: ws.id,
+                    name: ws.label,
+                    // herdr's socket API exposes no client-attach state
+                    // (see docs/HERDR.md); watch never reads this field for
+                    // display, and foreground time comes from the ledger.
+                    attached_clients: 0,
+                })
+                .collect()
         }
+        muxa::HostKind::Zellij => Vec::new(),
     });
 
     let session_activity_task = async move {
@@ -6847,6 +6910,85 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<String>();
         assert_eq!(cell, "1h05m");
+    }
+
+    #[test]
+    fn herdr_session_row_shows_label_and_resolves_duration_by_workspace_id() {
+        // herdr shape: the pane's session and the ledger key are both the
+        // stable `workspace_id` (`w1`); the SessionInfo carries the human
+        // label as its name (session_id == the workspace id). The row must
+        // display the label, and the DUR column must resolve via the
+        // session-id fallback even though no session *name* matches `w1`.
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![fake_pane("herdr:p1", "w1", 0, 0, "zsh")],
+            vec![fake_session("w1", "muxa", 0)],
+            vec![fake_session_activity(
+                "w1",
+                "muxa",
+                3_600,
+                Some(now - time::Duration::minutes(5)),
+            )],
+        );
+
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        assert_eq!(row.session, "w1", "group key stays the workspace id");
+        assert_eq!(row.display_name, "muxa", "display name is the label");
+
+        let label = plain_text(&session_label(
+            row,
+            watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
+        ));
+        assert!(
+            label.contains("muxa"),
+            "label renders the workspace label: {label}"
+        );
+
+        let text = WatchColumn::SessionTime.session_text(
+            row,
+            now,
+            &app.panes,
+            watch_theme(WatchTheme::Classic),
+            Spinner::OFF,
+            app.watch_cfg.summary,
+        );
+        let cell = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
+        assert_eq!(cell, "1h05m", "DUR resolves by workspace id");
+    }
+
+    #[test]
+    fn herdr_session_row_falls_back_to_workspace_id_without_label() {
+        // No SessionInfo for the pane's workspace (e.g. the workspace list
+        // was unreachable this refresh): the display name degrades to the id.
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![fake_pane("herdr:p1", "w1", 0, 0, "zsh")],
+            vec![],
+            vec![],
+        );
+
+        let WatchRow::Session(row) = &app.rows[0] else {
+            panic!("expected session row");
+        };
+        assert_eq!(row.display_name, "w1", "display name falls back to the id");
     }
 
     #[test]

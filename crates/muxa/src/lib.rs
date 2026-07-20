@@ -118,7 +118,7 @@ pub use session::{
 };
 #[doc(hidden)]
 pub use session_activity::{
-    SessionActivity, SessionActivityTracker, SESSION_ACTIVITY_SCHEMA_VERSION,
+    SessionActivity, SessionActivitySource, SessionActivityTracker, SESSION_ACTIVITY_SCHEMA_VERSION,
 };
 #[doc(hidden)]
 pub use snapshot::{Snapshotter, SnapshotterOptions};
