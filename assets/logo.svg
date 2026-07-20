@@ -1,36 +1,37 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 160" role="img" aria-label="muxa">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 200" role="img" aria-label="muxa">
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#7aa2f7"/>
-      <stop offset="100%" stop-color="#bb9af7"/>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a674ff"/>
+      <stop offset="100%" stop-color="#7c46e6"/>
     </linearGradient>
+    <linearGradient id="wm" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#a674ff"/>
+      <stop offset="100%" stop-color="#7c46e6"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
     <style>
-      .wordmark {
+      .wm {
         font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-        font-weight: 700;
-        font-size: 96px;
-        letter-spacing: -4px;
-        fill: url(#g);
+        font-weight: 800;
+        font-size: 104px;
+        letter-spacing: -2px;
       }
-      .glyph { fill: #7aa2f7; }
-      .glyph-dim { fill: #7aa2f7; opacity: 0.45; }
-      .glyph-hot { fill: #e0af68; }
     </style>
   </defs>
 
-  <!-- Pane-grid icon: three rectangles with state glyphs -->
-  <g transform="translate(32 32)">
-    <rect class="glyph" x="0"  y="0"  width="36" height="44" rx="4"/>
-    <rect class="glyph-dim" x="44" y="0"  width="36" height="20" rx="4"/>
-    <rect class="glyph-hot" x="44" y="24" width="36" height="20" rx="4"/>
-    <rect class="glyph-dim" x="0"  y="52" width="80" height="44" rx="4"/>
-    <!-- Working gear dot -->
-    <circle cx="18"  cy="22" r="6" fill="#1a1b26"/>
-    <!-- Waiting-input bang -->
-    <rect x="60" y="28" width="4" height="10" rx="1" fill="#1a1b26"/>
-    <rect x="60" y="40" width="4" height="4"  rx="1" fill="#1a1b26"/>
+  <!-- Icon — glowing shell-prompt tile -->
+  <g transform="translate(36 36)">
+    <rect x="6" y="12" width="116" height="116" rx="28" fill="#8b5cf6" filter="url(#glow)" opacity="0.5"/>
+    <rect x="0" y="0" width="128" height="128" rx="30" fill="url(#tile)"/>
+    <rect x="14" y="11" width="100" height="10" rx="5" fill="#ffffff" opacity="0.18"/>
+    <path d="M40 42 L72 64 L40 86" fill="none" stroke="#ffffff" stroke-width="14"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="82" y="74" width="24" height="32" rx="6" fill="#ffffff"/>
   </g>
 
   <!-- Wordmark -->
-  <text class="wordmark" x="150" y="108">muxa</text>
+  <text class="wm" x="210" y="136" fill="url(#wm)">muxa</text>
+  <rect x="470" y="64" width="40" height="72" rx="8" fill="url(#wm)" opacity="0.9"/>
 </svg>

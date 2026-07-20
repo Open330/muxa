@@ -90,7 +90,7 @@ button, select {
   white-space: nowrap;
 }
 
-.logo { color: var(--accent); font-size: 18px; }
+.logo { width: 22px; height: 22px; border-radius: 6px; display: block; }
 .title { font-family: var(--mono); font-weight: 700; font-size: 16px; }
 .version { color: var(--fg-muted); font-family: var(--mono); font-size: 11px; }
 
