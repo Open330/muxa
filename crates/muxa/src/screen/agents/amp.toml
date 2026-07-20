@@ -1,0 +1,27 @@
+# Bundled screen-detection manifest — Amp CLI (`amp`, Sourcegraph).
+#
+# BEST-EFFORT / CONSERVATIVE. Written WITHOUT running amp. See the notes in
+# cursor.toml and docs/SCREEN_DETECTION.md. Override at
+# $XDG_CONFIG_HOME/muxa/agents/amp.toml.
+
+[agent]
+name = "amp"
+command = ["amp"]
+
+[rules]
+blocked = [
+    '(?i)\[y/n\]',
+    '(?i)\(y/n\)',
+    '(?i)do you want to (allow|proceed|run|continue)',
+    '(?i)allow (this|the) (command|tool|edit)\??',
+    '(?i)permission (to run|required|request)',
+    '(?i)approve (this|the) (command|edit|change|tool)',
+]
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)\b(thinking|generating|working)\b',
+    '(?i)esc to interrupt',
+]
+idle = [
+    '(?m)^\s*>\s*$',
+]

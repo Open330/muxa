@@ -1,0 +1,34 @@
+# Bundled screen-detection manifest — Cursor CLI (`cursor-agent`).
+#
+# BEST-EFFORT / CONSERVATIVE. Written WITHOUT running cursor-agent (muxa's CI
+# can't drive these CLIs). Patterns lean on braille spinner glyphs and generic
+# approval phrasing; when unsure they match NOTHING so an unrecognized screen
+# keeps the row's previous state rather than mislabeling it. See
+# docs/SCREEN_DETECTION.md. Override at $XDG_CONFIG_HOME/muxa/agents/cursor.toml.
+
+[agent]
+name = "cursor"
+command = ["cursor-agent"]
+
+[rules]
+# STRICT — only unambiguous approval / permission UI. An over-broad blocked
+# pattern is the worst failure (a working agent shown as "needs input"), so
+# these require a clear yes/no affordance or explicit permission wording.
+blocked = [
+    '(?i)\[y/n\]',
+    '(?i)\(y/n\)',
+    '(?i)do you want to (allow|proceed|run|continue|apply)',
+    '(?i)permission (to run|required|request)',
+    '(?i)approve (this|the) (command|edit|change|tool)',
+    '(?i)press\s+y\s+to\s+(confirm|approve|continue|run)',
+]
+# Active generation: spinner glyphs or an explicit interrupt hint.
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)\b(thinking|generating|reasoning)\b',
+    '(?i)esc to interrupt',
+]
+# Idle: a bare prompt line waiting for the next instruction.
+idle = [
+    '(?m)^\s*>\s*$',
+]

@@ -1,0 +1,28 @@
+# Bundled screen-detection manifest — Goose CLI (`goose`, Block).
+#
+# BEST-EFFORT / CONSERVATIVE. Written WITHOUT running goose. See the notes in
+# cursor.toml and docs/SCREEN_DETECTION.md. Override at
+# $XDG_CONFIG_HOME/muxa/agents/goose.toml.
+
+[agent]
+name = "goose"
+command = ["goose"]
+
+[rules]
+blocked = [
+    '(?i)\[y/n\]',
+    '(?i)\(y/n\)',
+    '(?i)would like to call',
+    '(?i)allow (this|the)? ?(tool|command)?\s*(call|execution)?\??',
+    '(?i)do you want to (allow|proceed|run|continue)',
+    '(?i)approve (this|the) (command|tool|action)',
+]
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)\b(thinking|generating|working)\b',
+    '(?i)esc to interrupt',
+]
+idle = [
+    '(?m)^\s*>\s*$',
+    '(?i)\bgoose\b\s*>\s*$',
+]

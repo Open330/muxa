@@ -107,6 +107,7 @@ pub struct Config {
     pub dashboard: DashboardTomlConfig,
     pub discovery: DiscoveryConfig,
     pub reconciler: ReconcilerConfig,
+    pub screen_detect: ScreenDetectConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
@@ -450,6 +451,45 @@ impl Default for ReconcilerConfig {
 
 fn default_reconciler_interval_secs() -> u64 {
     30
+}
+
+/// `[screen_detect]` config — the screen-manifest fallback detector.
+///
+/// For agent CLIs muxa has **no hooks** for (cursor-agent, amp, copilot, aider,
+/// goose, plus any user-declared agent), the daemon periodically captures the
+/// pane and matches TOML manifest rules against the visible tail to infer
+/// `Working` / `WaitingInput` / `Idle`. This is the *last-resort* fallback:
+/// hooks stay authoritative when present, herdr hosts are covered by herdr's
+/// own detection + bridge (and are skipped here), and the synthetic rows this
+/// task mints are evicted the instant a real hook claims the pane. See
+/// `docs/SCREEN_DETECTION.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScreenDetectConfig {
+    /// Master switch. Default `true` — the detector only does real work when a
+    /// pane's foreground command matches a manifest AND no authoritative row
+    /// owns the pane, so its idle cost is ~one pane list per tick.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cadence of the capture/classify pass, in seconds. Default 3 — brisk
+    /// enough to feel live, slow enough that the per-candidate `capture-pane`
+    /// shell-outs (each bounded by tmux's 1s timeout) stay negligible. A tick is
+    /// skipped if the previous one is still running.
+    #[serde(default = "default_screen_detect_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for ScreenDetectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_screen_detect_interval_secs(),
+        }
+    }
+}
+
+fn default_screen_detect_interval_secs() -> u64 {
+    3
 }
 
 fn default_paneless_stale_secs() -> u64 {
@@ -1231,6 +1271,25 @@ mod tests {
     fn discovery_can_be_disabled() {
         let cfg: Config = toml::from_str("[discovery]\nenabled = false\n").unwrap();
         assert!(!cfg.discovery.enabled);
+    }
+
+    #[test]
+    fn screen_detect_defaults_on_at_3s() {
+        let cfg = Config::default();
+        assert!(cfg.screen_detect.enabled);
+        assert_eq!(cfg.screen_detect.interval_secs, 3);
+        // Parsed from an empty document, the defaults still apply.
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(empty.screen_detect.enabled);
+        assert_eq!(empty.screen_detect.interval_secs, 3);
+    }
+
+    #[test]
+    fn screen_detect_can_be_configured() {
+        let cfg: Config =
+            toml::from_str("[screen_detect]\nenabled = false\ninterval_secs = 10\n").unwrap();
+        assert!(!cfg.screen_detect.enabled);
+        assert_eq!(cfg.screen_detect.interval_secs, 10);
     }
 
     #[test]

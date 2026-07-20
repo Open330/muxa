@@ -1,0 +1,37 @@
+# Bundled screen-detection manifest — Aider (`aider`).
+#
+# BEST-EFFORT / CONSERVATIVE. Written WITHOUT running aider. Aider's confirm
+# prompts use a distinctive `(Y)es/(N)o` affordance, which is a stronger signal
+# than the generic phrasing the other manifests fall back on. Still: when unsure,
+# match nothing. See docs/SCREEN_DETECTION.md. Override at
+# $XDG_CONFIG_HOME/muxa/agents/aider.toml.
+#
+# NOTE: aider often runs as a `python` process, so its tmux foreground command
+# may be `python`/`python3` rather than `aider`. muxa's screen detection matches
+# the foreground command name only (no process-tree walk), so panes where aider
+# is not the direct foreground command won't be picked up. Add `python` to
+# `command` in a user override ONLY if you accept that every python pane becomes
+# a candidate.
+
+[agent]
+name = "aider"
+command = ["aider"]
+
+[rules]
+blocked = [
+    '(?i)\(y\)es/\(n\)o',
+    '(?i)\[y/n\]',
+    '(?i)\(y/n\)',
+    '(?i)add .* to the chat\?',
+    '(?i)run shell command\?',
+    '(?i)do you want to (allow|proceed|run|continue)',
+    '(?i)allow (edits|command)\??',
+]
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)\b(thinking|generating)\b',
+]
+idle = [
+    '(?m)^\s*>\s*$',
+    '(?m)^\s*(architect|ask|code)?\s*>\s*$',
+]

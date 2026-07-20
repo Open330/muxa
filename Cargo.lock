@@ -2292,6 +2292,7 @@ dependencies = [
  "http-body-util",
  "notify-rust",
  "portable-pty",
+ "regex",
  "reqwest",
  "rust-embed",
  "serde",

@@ -45,6 +45,21 @@
 #                                      # stop on their own. Only the registry row is removed; the tmux session
 #                                      # (if any) is untouched. `muxa prune` does this on demand. Set 0 to disable.
 
+# Screen-manifest fallback detection: for agent CLIs muxa has NO hooks for
+# (cursor-agent, amp, copilot, aider, goose, and any you declare), the daemon
+# periodically captures the pane and matches TOML manifest rules against the
+# visible tail to infer Working / WaitingInput / Idle. Last-resort only: hooks
+# stay authoritative, herdr hosts are covered by herdr's own detection, and the
+# synthetic rows are evicted the instant a real hook claims the pane. Bundled
+# manifests ship in the binary; drop overrides at
+# $XDG_CONFIG_HOME/muxa/agents/<name>.toml (same name replaces a bundled one).
+# See docs/SCREEN_DETECTION.md.
+[screen_detect]
+# enabled       = true
+# interval_secs = 3                 # 3s default — capture/classify cadence; a tick is skipped
+#                                   # if the previous is still running, and no captures run when
+#                                   # no pane matches a manifest (idle cost ≈ one pane list).
+
 # Prompt audit log: every PromptSubmitted event is appended to a bounded
 # NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`
 # even after the live agent record has been reaped (daemon restart, pane

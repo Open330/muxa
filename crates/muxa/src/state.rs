@@ -751,12 +751,19 @@ fn mutate_for_event(
             } else if matches!(
                 agent.state,
                 AgentState::WaitingInput | AgentState::WaitingChoice
-            ) {
+            ) && !is_synthetic(&agent.session_id)
+            {
                 // Codex can emit `Stop` while a permission request is still
                 // sitting in the terminal. A response-less stop is not proof
                 // that the user-facing wait cleared; keep the row waiting
                 // until a tool event, response, or explicit later state
                 // transition says otherwise.
+                //
+                // REAL rows only. A SYNTHETIC detection row (screen inference /
+                // the herdr bridge) that reports `idle`/`done` is reading the
+                // pane's *current* screen — if the approval prompt is gone, the
+                // wait genuinely cleared, so a synthetic response-less stop must
+                // fall through to `Idle` rather than freezing on `WaitingInput`.
             } else if agent.state != AgentState::Error {
                 agent.state = AgentState::Idle;
             }
@@ -3562,6 +3569,83 @@ mod tests {
             .await;
         let agent = store.by_session("s").await.unwrap();
         assert_eq!(agent.last_response.as_deref(), Some("first answer"));
+    }
+
+    #[tokio::test]
+    async fn responseless_stop_keeps_real_waiting_row_waiting() {
+        // A REAL (hook) row waiting on a permission prompt must stay waiting on
+        // a response-less TurnStopped — the Codex Stop-during-permission guard.
+        let store = Store::shared();
+        let now = datetime!(2026-07-20 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("real"),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("real"),
+                level: NotificationLevel::NeedsInput,
+                message: "approve?".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("real").await.unwrap().state,
+            AgentState::WaitingInput
+        );
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("real"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("real").await.unwrap().state,
+            AgentState::WaitingInput,
+            "a real waiting row stays waiting on a response-less stop",
+        );
+    }
+
+    #[tokio::test]
+    async fn responseless_stop_clears_synthetic_waiting_row_to_idle() {
+        // A SYNTHETIC detection row (screen inference / herdr bridge) that was
+        // WaitingInput and now reports idle (a response-less TurnStopped) must
+        // fall through to Idle — the screen no longer shows the prompt, so the
+        // wait genuinely cleared. This is what lets a screen `blocked -> idle`
+        // transition land.
+        let store = Store::shared();
+        let now = datetime!(2026-07-20 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("synthetic-%1"),
+                level: NotificationLevel::NeedsInput,
+                message: "approve?".into(),
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("synthetic-%1").await.unwrap().state,
+            AgentState::WaitingInput,
+        );
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: id("synthetic-%1"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("synthetic-%1").await.unwrap().state,
+            AgentState::Idle,
+            "a synthetic waiting row clears to Idle on a response-less stop",
+        );
     }
 
     #[tokio::test]

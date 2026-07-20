@@ -240,7 +240,14 @@ pub fn scan_panes(backend: &dyn PaneBackend) -> Vec<Discovered> {
     discover_from_panes(&backend.list_panes())
 }
 
-fn synthetic_session_id(pane: &PaneInfo) -> String {
+/// The synthetic session id muxa mints for a pane that has no real hook-derived
+/// session yet — `synthetic-<pane_id>` for a socket-less pane, or
+/// `synthetic-<len>:<socket>:<pane_id>` when the pane carries a tmux socket
+/// identity. Exposed so other synthetic-row producers (the herdr bridge, screen
+/// detection) mint the SAME key, letting a discovery placeholder and a
+/// synthetic row collapse onto one registry entry and share the same
+/// hook-eviction precedence.
+pub fn synthetic_session_id(pane: &PaneInfo) -> String {
     match pane.socket.as_deref() {
         // Length-prefix the socket so the identity stays unambiguous even if
         // a custom socket name contains the separator.

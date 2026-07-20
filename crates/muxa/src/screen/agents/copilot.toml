@@ -1,0 +1,28 @@
+# Bundled screen-detection manifest — GitHub Copilot CLI (`copilot`).
+#
+# BEST-EFFORT / CONSERVATIVE. Written WITHOUT running the Copilot CLI. See the
+# notes in cursor.toml and docs/SCREEN_DETECTION.md. Override at
+# $XDG_CONFIG_HOME/muxa/agents/copilot.toml.
+
+[agent]
+name = "copilot"
+command = ["copilot"]
+
+[rules]
+blocked = [
+    '(?i)\[y/n\]',
+    '(?i)\(y/n\)',
+    '(?i)allow (command|tool|this)\??',
+    '(?i)do you want to (allow|proceed|run|continue)',
+    '(?i)permission (to run|required|request)',
+    '(?i)approve (this|the) (command|edit|change|tool)',
+    '(?i)\byes\b.*\bno\b.*\?',
+]
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)\b(thinking|generating|working)\b',
+    '(?i)esc to interrupt',
+]
+idle = [
+    '(?m)^\s*>\s*$',
+]
