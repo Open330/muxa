@@ -37,6 +37,25 @@ muxa init
 `cargo install` writes to `~/.cargo/bin`; make sure that directory is on
 your `PATH`.
 
+## Homebrew
+
+```bash
+brew install open330/tap/muxa
+muxa init
+```
+
+Installs pre-built `muxa` and `muxad` binaries from
+[Open330/homebrew-tap](https://github.com/Open330/homebrew-tap)
+(macOS arm64/x86_64 and Linux arm64/x86_64). The formula ships a
+`brew services`-compatible service for `muxad`:
+
+```bash
+brew services start muxa   # or run `muxad` yourself / via muxa init
+```
+
+The formula tracks the latest release automatically (the `tap-bump`
+workflow rewrites it whenever a release is published).
+
 ## Pre-Built Binaries
 
 Download an archive from the
