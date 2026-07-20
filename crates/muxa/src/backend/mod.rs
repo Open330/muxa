@@ -133,6 +133,116 @@ pub fn default_backend() -> SharedBackend {
     }
 }
 
+/// Build one backend of the given kind.
+fn backend_of(kind: HostKind) -> SharedBackend {
+    match kind {
+        HostKind::Tmux => Arc::new(tmux::TmuxBackend::new()),
+        HostKind::Zellij => Arc::new(zellij::ZellijBackend::new()),
+        HostKind::Herdr => Arc::new(herdr::HerdrBackend::new()),
+    }
+}
+
+/// Build every backend the daemon should observe simultaneously — the
+/// multi-host analog of [`default_backend`] (see `docs/MULTI_HOST.md`).
+///
+/// Resolution:
+/// 1. `MUXA_HOSTS` — comma-separated explicit set (`"tmux,herdr"`),
+///    unknown names ignored, order preserved, duplicates dropped.
+/// 2. `MUXA_HOST` — the existing single-host override still means
+///    "exactly this one"; it wins over auto-detect but loses to the
+///    explicit set, which exists precisely to widen it.
+/// 3. Auto-detect: tmux always (its methods degrade to empty when no
+///    server is running, and it remains muxa's default market); herdr
+///    when its socket resolves to an existing path (env override or
+///    the default-session path); zellij only via env presence — the
+///    CLI baseline can't enumerate without a plugin, so a speculative
+///    zellij backend would only add an incomplete-observation source.
+///
+/// Never returns an empty set — the [`default_backend`] fallback rules
+/// keep a lone tmux backend when nothing is detectable. Multiple
+/// observers converging one registry is safe: each observation only
+/// governs rows in its own pane-id namespace (see
+/// [`pane_id_host_kind`] and the cross-host reaping guard).
+pub fn active_backends() -> Vec<SharedBackend> {
+    active_backends_from(
+        |name| std::env::var(name).ok(),
+        |kind| match kind {
+            HostKind::Herdr => herdr::default_socket_path().try_exists().unwrap_or(false),
+            // tmux/zellij reachability is not probed here; see the
+            // resolution rules above.
+            HostKind::Tmux | HostKind::Zellij => false,
+        },
+    )
+}
+
+/// Decoupled-from-process-env variant of [`active_backends`] for tests.
+/// `probe(kind)` answers "is this host's server reachable" for hosts
+/// whose presence can't be read from env alone (currently herdr).
+fn active_backends_from(
+    read: impl Fn(&str) -> Option<String>,
+    probe: impl Fn(HostKind) -> bool,
+) -> Vec<SharedBackend> {
+    let kinds = active_kinds_from(&read, &probe);
+    kinds.into_iter().map(backend_of).collect()
+}
+
+fn active_kinds_from(
+    read: &impl Fn(&str) -> Option<String>,
+    probe: &impl Fn(HostKind) -> bool,
+) -> Vec<HostKind> {
+    // 1. Explicit set.
+    if let Some(raw) = read("MUXA_HOSTS") {
+        let mut kinds = Vec::new();
+        for name in raw.split(',') {
+            let kind = match name.trim().to_ascii_lowercase().as_str() {
+                "tmux" => Some(HostKind::Tmux),
+                "zellij" => Some(HostKind::Zellij),
+                "herdr" => Some(HostKind::Herdr),
+                _ => None,
+            };
+            if let Some(k) = kind {
+                if !kinds.contains(&k) {
+                    kinds.push(k);
+                }
+            }
+        }
+        if !kinds.is_empty() {
+            return kinds;
+        }
+        // Entirely-unparsable value falls through to the narrower rules
+        // rather than silently observing nothing.
+    }
+
+    // 2. Single-host override keeps its exact meaning.
+    if let Some(k) = detect_from_override(read) {
+        return vec![k];
+    }
+
+    // 3. Auto-detect. tmux unconditionally; herdr on a live socket or
+    // pane env; zellij on pane env only.
+    let mut kinds = vec![HostKind::Tmux];
+    if read("ZELLIJ").is_some() {
+        kinds.push(HostKind::Zellij);
+    }
+    if read("HERDR_PANE_ID").is_some() || read("HERDR_ENV").is_some() || probe(HostKind::Herdr) {
+        kinds.push(HostKind::Herdr);
+    }
+    kinds
+}
+
+/// Just the `MUXA_HOST` step of [`detect_from`], shared with
+/// [`active_kinds_from`] so the override means the same thing to both
+/// resolution paths.
+fn detect_from_override(read: &impl Fn(&str) -> Option<String>) -> Option<HostKind> {
+    let raw = read("MUXA_HOST")?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tmux" => Some(HostKind::Tmux),
+        "zellij" => Some(HostKind::Zellij),
+        "herdr" => Some(HostKind::Herdr),
+        _ => None,
+    }
+}
+
 /// Identity of the pane host. Surfaced through telemetry and log lines so
 /// operators running both backends can tell which one a given event went
 /// through.
@@ -728,5 +838,53 @@ mod tests {
         assert!(caps.pane_pid_map);
         assert!(caps.capture_pane);
         assert!(caps.focus_pane);
+    }
+
+    /// `MUXA_HOSTS` is an explicit ordered set: names normalize, unknown
+    /// entries and duplicates drop, and a fully-unparsable value falls
+    /// through to auto-detect instead of observing nothing.
+    #[test]
+    fn active_kinds_explicit_set() {
+        let kinds = active_kinds_from(
+            &env_reader(&[("MUXA_HOSTS", " Herdr, tmux ,herdr,bogus")]),
+            &|_| false,
+        );
+        assert_eq!(kinds, vec![HostKind::Herdr, HostKind::Tmux]);
+
+        let fallthrough = active_kinds_from(&env_reader(&[("MUXA_HOSTS", "bogus,")]), &|_| false);
+        assert_eq!(fallthrough, vec![HostKind::Tmux]);
+    }
+
+    /// `MUXA_HOST` (singular) keeps meaning "exactly this one" even in
+    /// the set-valued resolution, and loses only to `MUXA_HOSTS`.
+    #[test]
+    fn active_kinds_single_override_stays_exact() {
+        let kinds = active_kinds_from(
+            &env_reader(&[("MUXA_HOST", "herdr"), ("TMUX", "/tmp/t,1,0")]),
+            // Even a reachable herdr socket must not widen an explicit
+            // single-host override.
+            &|_| true,
+        );
+        assert_eq!(kinds, vec![HostKind::Herdr]);
+    }
+
+    /// Auto-detect: tmux is unconditional; herdr joins on env presence
+    /// or a live socket probe; zellij joins on env presence only.
+    #[test]
+    fn active_kinds_auto_detect() {
+        assert_eq!(
+            active_kinds_from(&env_reader(&[]), &|_| false),
+            vec![HostKind::Tmux],
+        );
+        assert_eq!(
+            active_kinds_from(&env_reader(&[]), &|k| k == HostKind::Herdr),
+            vec![HostKind::Tmux, HostKind::Herdr],
+        );
+        assert_eq!(
+            active_kinds_from(&env_reader(&[("HERDR_ENV", "1"), ("ZELLIJ", "1")]), &|_| {
+                false
+            },),
+            vec![HostKind::Tmux, HostKind::Zellij, HostKind::Herdr],
+        );
     }
 }
