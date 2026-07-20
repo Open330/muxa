@@ -103,6 +103,8 @@ impl HookAdapter for CodexAdapter {
             Event::Stop => AgentEvent::TurnStopped {
                 id,
                 response: None,
+                recap: None,
+                ai_title: None,
                 at,
             },
         }

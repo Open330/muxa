@@ -3352,6 +3352,8 @@ mod tests {
             state,
             last_prompt: prompt.map(str::to_string),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: Some("gpt-test".into()),
             context_used_pct: Some(42.0),

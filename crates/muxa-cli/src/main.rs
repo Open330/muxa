@@ -1702,6 +1702,8 @@ mod tests {
             state,
             last_prompt: Some(prompt.into()),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: Some("claude-sonnet-very-long-model-name".into()),
             context_used_pct: None,

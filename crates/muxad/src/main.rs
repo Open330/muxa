@@ -937,6 +937,8 @@ async fn enrich_from_history(
             state: muxa::AgentState::Idle,
             last_prompt: Some(entry.prompt),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: entry.model,
             context_used_pct: None,

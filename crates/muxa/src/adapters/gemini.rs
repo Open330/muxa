@@ -111,6 +111,8 @@ impl HookAdapter for GeminiAdapter {
             Event::AfterAgent => AgentEvent::TurnStopped {
                 id,
                 response: None,
+                recap: None,
+                ai_title: None,
                 at,
             },
             Event::SessionEnd => AgentEvent::SessionEnded { id, at },

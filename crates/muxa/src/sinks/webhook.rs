@@ -496,6 +496,8 @@ mod tests {
             state: AgentState::WaitingInput,
             last_prompt: prompt.map(str::to_string),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: None,
             context_used_pct: None,

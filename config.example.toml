@@ -116,6 +116,19 @@
 # view = "swarm"      # k9s-style console: session clusters, animated dot spinners
 #                     # for working/starting agents, and an expandable subagent tree
 # columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
+
+# What the summary ("prompt") column leads with. Each value names the highest
+# tier it will show and then degrades, so the column is never blank when a
+# last prompt exists.
+#   summary = "recap"   # recap → session title → last prompt (default)
+#   summary = "title"   # session title → last prompt; skips the sparse recap
+#   summary = "prompt"  # last prompt only (pre-recap behavior)
+# "recap" is Claude Code's own `※ recap: …` line, read from the session
+# transcript — it is not exposed via any hook, and Claude only writes one when
+# you return after being away, so the title tier keeps the column useful in
+# between. Codex/Gemini have no recap or title source and fall straight
+# through to the last prompt. The header reads SUMMARY unless set to "prompt".
+# summary = "recap"
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because picker actions
 # can't target them anyway; the footer surfaces a `+N paneless` count so

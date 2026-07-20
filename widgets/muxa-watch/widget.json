@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "dev.barshelf.muxa-watch",
   "name": "muxa Watch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "icon": "rectangle.3.group.bubble.left.fill",
   "bucket": { "group": "Agents", "order": 10, "size": "L", "pinned": true },
 
@@ -55,6 +55,7 @@
     { "key": "sshHost", "title": "SSH host (empty means this Mac)", "type": "string", "default": "" },
     { "key": "maxAgents", "title": "Maximum rows", "type": "integer", "default": 5, "min": 1, "max": 10 },
     { "key": "showPrompts", "title": "Show last prompts", "type": "boolean", "default": true },
+    { "key": "showSubagents", "title": "Show subagents in flight", "type": "boolean", "default": true },
     { "key": "includeStopped", "title": "Include stopped agents", "type": "boolean", "default": false },
     { "key": "socket", "title": "Custom local muxa socket", "type": "string", "default": "" }
   ],

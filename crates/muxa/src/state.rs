@@ -170,6 +170,20 @@ pub struct Agent {
     /// text (e.g., Codex/Gemini today). Optional so the field is purely
     /// additive on the wire and in the UI.
     pub last_response: Option<String>,
+    /// Claude Code's session "recap" (`※ recap: …`), scraped from the
+    /// transcript at turn end. The richest "what is this agent actually
+    /// doing" signal muxa can get, but sparse — Claude only writes one
+    /// when the user returns after being away — so it is never cleared by
+    /// a turn that didn't produce one, and the UI falls back to
+    /// [`Self::ai_title`] then [`Self::last_prompt`]. `None` for agents
+    /// with no recap source (Codex/Gemini have no equivalent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recap: Option<String>,
+    /// Claude Code's rolling short session title — the same string it puts
+    /// in the tmux pane title. Rewritten far more often than a recap, so
+    /// it's the practical steady-state summary. Additive on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_title: Option<String>,
     pub last_notification: Option<String>,
     pub model: Option<String>,
     pub context_used_pct: Option<f32>,
@@ -283,6 +297,8 @@ impl Agent {
             state: AgentState::Starting,
             last_prompt: None,
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: None,
             context_used_pct: None,
@@ -577,6 +593,7 @@ fn event_touches_activity(agent: &Agent, ev: &AgentEvent) -> bool {
 /// [`apply_rate_limited`]) to keep the dispatch table scannable —
 /// adding a new variant means adding one match arm here plus an
 /// optional helper.
+#[allow(clippy::too_many_lines)] // dispatch table — see the doc comment above
 fn mutate_for_event(
     agent: &mut Agent,
     ev: &AgentEvent,
@@ -679,9 +696,25 @@ fn mutate_for_event(
                 NotificationLevel::Info | NotificationLevel::Warning => {}
             }
         }
-        AgentEvent::TurnStopped { response, .. } => {
+        AgentEvent::TurnStopped {
+            response,
+            recap,
+            ai_title,
+            ..
+        } => {
             if let Some(text) = response {
                 agent.last_response = Some(text.clone());
+            }
+            // Session-summary signals ride along on turn end. Only
+            // overwrite on `Some`: a recap is sparse (Claude writes one
+            // only when the user returns after being away, and an old one
+            // falls out of the transcript tail window), so a turn that
+            // surfaced none must not erase the last good recap.
+            if let Some(text) = recap {
+                agent.recap = Some(text.clone());
+            }
+            if let Some(text) = ai_title {
+                agent.ai_title = Some(text.clone());
             }
             // A successful turn (response captured) is empirical proof
             // that the cap isn't blocking right now — clear any active
@@ -1808,6 +1841,8 @@ mod tests {
             state,
             last_prompt: None,
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: last_notification.map(Into::into),
             model: None,
             context_used_pct: None,
@@ -2305,6 +2340,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("c"),
                 response: Some("done".into()),
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -2419,6 +2456,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("codex"),
                 response: None,
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -2641,6 +2680,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: None,
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -2661,6 +2702,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: None,
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -3041,6 +3084,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: Some("recovered".into()),
+                recap: None,
+                ai_title: None,
                 at: t1,
             })
             .await;
@@ -3081,6 +3126,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: None,
+                recap: None,
+                ai_title: None,
                 at: t0,
             })
             .await;
@@ -3108,6 +3155,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: Some("the assistant said hi".into()),
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -3135,6 +3184,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: Some("first answer".into()),
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -3145,6 +3196,8 @@ mod tests {
             .apply(&AgentEvent::TurnStopped {
                 id: id("s"),
                 response: None,
+                recap: None,
+                ai_title: None,
                 at: now,
             })
             .await;
@@ -4002,6 +4055,7 @@ mod tests {
     /// rest. Demoted synthetics and collapsed real duplicates are reported
     /// separately so operators can tell the two pathologies apart.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // scenario setup: several planted rows, one assertion pass
     async fn reconcile_collapses_duplicates_with_correct_priority() {
         let store = Store::shared();
         let old = datetime!(2026-04-24 12:00:00 UTC);
@@ -4047,6 +4101,8 @@ mod tests {
                     state: AgentState::Stopped,
                     last_prompt: None,
                     last_response: None,
+                    recap: None,
+                    ai_title: None,
                     last_notification: None,
                     model: None,
                     context_used_pct: None,
@@ -4079,6 +4135,8 @@ mod tests {
                     state: AgentState::Working,
                     last_prompt: None,
                     last_response: None,
+                    recap: None,
+                    ai_title: None,
                     last_notification: None,
                     model: None,
                     context_used_pct: None,
@@ -4140,6 +4198,8 @@ mod tests {
                         state: AgentState::Working,
                         last_prompt: None,
                         last_response: None,
+                        recap: None,
+                        ai_title: None,
                         last_notification: None,
                         model: None,
                         context_used_pct: None,
@@ -4206,6 +4266,8 @@ mod tests {
             state: AgentState::Idle,
             last_prompt: Some(prompt.into()),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: None,
             context_used_pct: None,

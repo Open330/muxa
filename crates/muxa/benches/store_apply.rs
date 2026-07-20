@@ -61,6 +61,8 @@ fn make_realistic_agent() -> Agent {
         state: muxa::AgentState::Idle,
         last_prompt: Some(prompt),
         last_response: Some(response),
+        recap: None,
+        ai_title: None,
         last_notification: Some("permission needed for tool: Bash(rm -rf /tmp/cache)".into()),
         model: Some("claude-opus-4-7".into()),
         context_used_pct: Some(48.5),
@@ -190,6 +192,8 @@ async fn bench_one(n_subscribers: usize, iters: u64) -> (Duration, Duration, u64
     let stop = AgentEvent::TurnStopped {
         id: id.clone(),
         response: Some("r".repeat(4096)),
+        recap: None,
+        ai_title: None,
         at: now,
     };
 

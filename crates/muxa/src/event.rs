@@ -203,6 +203,18 @@ pub enum AgentEvent {
         /// stay wire-compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response: Option<String>,
+        /// Claude Code's session "recap" (`※ recap: …`), scraped from the
+        /// transcript on the same pass that reads `response`. It is not in
+        /// any hook payload — the transcript is the only stable read path.
+        /// Sparse by nature (only written when the user returns after being
+        /// away), so consumers fall back to `ai_title`/`last_prompt`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recap: Option<String>,
+        /// Claude Code's rolling short session title (the string it also
+        /// puts in the tmux pane title). Rewritten far more often than a
+        /// recap, so it's the practical steady-state summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ai_title: Option<String>,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
@@ -368,6 +380,8 @@ mod tests {
                 cwd: None,
             },
             response: None,
+            recap: None,
+            ai_title: None,
             at: datetime!(2026-04-24 12:00:00 UTC),
         };
         let json = serde_json::to_string(&ev).unwrap();

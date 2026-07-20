@@ -34,7 +34,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme, WatchView, WidthSpec};
+use muxa::config::{
+    IconSet, WatchConfig, WatchSortKey, WatchSummary, WatchTheme, WatchView, WidthSpec,
+};
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
 use muxa::process_tree::WorkloadProcessKind;
@@ -461,6 +463,7 @@ impl WatchColumn {
         panes: &'a [PaneInfo],
         theme: WatchThemeSpec,
         spin: Spinner,
+        summary: WatchSummary,
     ) -> Text<'a> {
         match self {
             Self::Pane => {
@@ -497,17 +500,7 @@ impl WatchColumn {
                 .into(),
             Self::Limits => limits_text(a, now),
             Self::Workload => workload_text(a),
-            Self::Prompt => a
-                .last_prompt
-                .as_deref()
-                .unwrap_or("-")
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(80)
-                .collect::<String>()
-                .into(),
+            Self::Prompt => summary_line(a, summary).into(),
             Self::Activity => relative_time(a.last_activity_at, now).into(),
             Self::SessionTime => Text::from(Span::styled(
                 "-",
@@ -557,6 +550,7 @@ impl WatchColumn {
         panes: &'a [PaneInfo],
         theme: WatchThemeSpec,
         spin: Spinner,
+        summary: WatchSummary,
     ) -> Text<'a> {
         let dim = theme.dim_style().add_modifier(Modifier::DIM);
         let Some(agent) = s.latest_agent.as_ref() else {
@@ -586,7 +580,7 @@ impl WatchColumn {
             | Self::Cost
             | Self::Limits
             | Self::Prompt
-            | Self::Activity => self.agent_text(agent, now, panes, theme, spin),
+            | Self::Activity => self.agent_text(agent, now, panes, theme, spin, summary),
             Self::Workload => session_workload_text(s),
             Self::SessionTime => session_time_text(s, now),
         }
@@ -4789,6 +4783,12 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header_cells = app.columns.iter().map(|c| {
         let header = if app.watch_cfg.view == WatchView::Session && matches!(c, WatchColumn::Pane) {
             "SESSION"
+        } else if matches!(c, WatchColumn::Prompt) && app.watch_cfg.summary != WatchSummary::Prompt
+        {
+            // The column still falls back to the last prompt, but its
+            // headline content is the agent's own recap/title — label it
+            // for what it usually shows rather than its last resort.
+            "SUMMARY"
         } else {
             c.header()
         };
@@ -4823,13 +4823,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 WatchRow::Agent(a) => app
                     .columns
                     .iter()
-                    .map(|c| c.agent_text(a, now, &app.panes, theme, spin))
+                    .map(|c| c.agent_text(a, now, &app.panes, theme, spin, app.watch_cfg.summary))
                     .collect(),
                 WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
                 WatchRow::Session(s) => app
                     .columns
                     .iter()
-                    .map(|c| c.session_text(s, now, &app.panes, theme, spin))
+                    .map(|c| c.session_text(s, now, &app.panes, theme, spin, app.watch_cfg.summary))
                     .collect(),
             };
 
@@ -5208,6 +5208,34 @@ fn resolve_var_chain(
     } else {
         None
     }
+}
+
+/// Text for the summary column under `mode`, collapsed to one line and
+/// clipped to the column's practical width.
+///
+/// Each mode names the highest tier it will show and then *degrades*: the
+/// default `Recap` falls through recap → session title → last prompt. That
+/// matters because a recap is sparse (Claude Code writes one only when you
+/// return after being away) and agents with no recap source at all — Codex,
+/// Gemini — would otherwise render an empty column.
+fn summary_line(a: &Agent, mode: WatchSummary) -> String {
+    let picked = match mode {
+        WatchSummary::Recap => a
+            .recap
+            .as_deref()
+            .or(a.ai_title.as_deref())
+            .or(a.last_prompt.as_deref()),
+        WatchSummary::Title => a.ai_title.as_deref().or(a.last_prompt.as_deref()),
+        WatchSummary::Prompt => a.last_prompt.as_deref(),
+    };
+    picked
+        .unwrap_or("-")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn workload_text(a: &Agent) -> Text<'static> {
@@ -5823,6 +5851,8 @@ mod tests {
             state,
             last_prompt: prompt.map(Into::into),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: model.map(Into::into),
             context_used_pct: ctx,
@@ -6142,6 +6172,38 @@ mod tests {
     }
 
     #[test]
+    fn summary_line_falls_through_recap_then_title_then_prompt() {
+        let mut a = fake_agent_at("s", "%1", OffsetDateTime::now_utc());
+        a.last_prompt = Some("do the thing".into());
+
+        // Only a prompt: every mode shows it — the column never blanks.
+        assert_eq!(summary_line(&a, WatchSummary::Recap), "do the thing");
+        assert_eq!(summary_line(&a, WatchSummary::Title), "do the thing");
+        assert_eq!(summary_line(&a, WatchSummary::Prompt), "do the thing");
+
+        // A session title outranks the prompt, except in prompt-only mode.
+        a.ai_title = Some("infra cleanup".into());
+        assert_eq!(summary_line(&a, WatchSummary::Recap), "infra cleanup");
+        assert_eq!(summary_line(&a, WatchSummary::Title), "infra cleanup");
+        assert_eq!(summary_line(&a, WatchSummary::Prompt), "do the thing");
+
+        // A recap outranks both, and collapses to its first line.
+        a.recap = Some("Redis restored; MinIO left.\ndropped".into());
+        assert_eq!(
+            summary_line(&a, WatchSummary::Recap),
+            "Redis restored; MinIO left."
+        );
+        assert_eq!(summary_line(&a, WatchSummary::Title), "infra cleanup");
+
+        // Codex/Gemini shape: no recap or title source, and nothing typed
+        // yet — renders the placeholder rather than an empty cell.
+        a.recap = None;
+        a.ai_title = None;
+        a.last_prompt = None;
+        assert_eq!(summary_line(&a, WatchSummary::Recap), "-");
+    }
+
+    #[test]
     fn default_sort_keeps_session_grouping_and_floats_latest_activity_in_each_group() {
         // Default config = [Session, Activity]. Two sessions with two
         // agents each at staggered timestamps. Expect:
@@ -6306,6 +6368,7 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
+            app.watch_cfg.summary,
         );
         assert_eq!(plain_text(&text), "■ +4  main");
     }
@@ -6432,6 +6495,7 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
+            app.watch_cfg.summary,
         );
         assert_eq!(plain_text(&text), "▶     main");
     }
@@ -6477,6 +6541,7 @@ mod tests {
                         &app.panes,
                         watch_theme(WatchTheme::Classic),
                         Spinner::OFF,
+                        app.watch_cfg.summary,
                     );
                     Some((row.session.as_str(), plain_text(&text)))
                 }
@@ -6551,6 +6616,7 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
+            app.watch_cfg.summary,
         );
         let label = plain_text(&text);
         assert_eq!(
@@ -6590,6 +6656,7 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
+            app.watch_cfg.summary,
         );
         let cell = text
             .lines
@@ -7359,7 +7426,14 @@ sort = ["state"]
             WatchColumn::Activity,
             WatchColumn::SessionTime,
         ] {
-            let _ = col.agent_text(&a, now, &[], watch_theme(WatchTheme::Classic), Spinner::OFF);
+            let _ = col.agent_text(
+                &a,
+                now,
+                &[],
+                watch_theme(WatchTheme::Classic),
+                Spinner::OFF,
+                WatchSummary::default(),
+            );
         }
     }
 
@@ -7372,6 +7446,7 @@ sort = ["state"]
             &[],
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
+            WatchSummary::default(),
         );
         text.lines
             .iter()
@@ -7383,7 +7458,14 @@ sort = ["state"]
     /// for the cell tests since LIMITS only ever emits a single span.
     fn limits_cell_fg(a: &Agent, now: OffsetDateTime) -> Option<Color> {
         WatchColumn::Limits
-            .agent_text(a, now, &[], watch_theme(WatchTheme::Classic), Spinner::OFF)
+            .agent_text(
+                a,
+                now,
+                &[],
+                watch_theme(WatchTheme::Classic),
+                Spinner::OFF,
+                WatchSummary::default(),
+            )
             .lines
             .first()
             .and_then(|l| l.spans.first())

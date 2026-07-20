@@ -239,6 +239,8 @@ mod tests {
             state,
             last_prompt: Some("refactor the ipc module to use tokio io_uring".into()),
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: None,
             context_used_pct: None,

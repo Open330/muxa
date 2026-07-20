@@ -202,6 +202,100 @@ fn classify_transcript_line(line: &str) -> Option<TurnOutcome> {
     None
 }
 
+/// Session-level summary signals captured from the transcript tail.
+///
+/// Claude Code writes two summary-ish records that a dashboard can show as
+/// "what is this agent actually doing":
+///
+/// ```json
+/// {"type":"system","subtype":"away_summary","content":"… (disable recaps in /config)"}
+/// {"type":"ai-title","aiTitle":"맥북 상태 및 로컬 문제점 파악","sessionId":"…"}
+/// ```
+///
+/// Neither is exposed through a hook payload or the statusline JSON — the
+/// transcript is the only stable read path, which is why this lives here.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// The user-facing "recap" (`※ recap: …`). Rich, but *sparse*: Claude
+    /// Code only generates one when the user comes back after being away,
+    /// so a long unbroken working stretch pushes the last one out of the
+    /// tail window. That's deliberate here — a recap old enough to fall
+    /// outside the window is stale, and callers are expected to fall back
+    /// to the fresher [`Self::ai_title`].
+    pub recap: Option<String>,
+    /// Claude Code's rolling short session title — the same string it puts
+    /// in the tmux pane title. Rewritten far more often than a recap
+    /// (hundreds of records per session vs. a handful), so it's the
+    /// practical steady-state summary.
+    pub ai_title: Option<String>,
+}
+
+impl SessionSummary {
+    /// True when neither signal was found — lets callers skip attaching an
+    /// all-`None` summary to an event.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.recap.is_none() && self.ai_title.is_none()
+    }
+}
+
+/// UI chrome Claude Code appends to every recap. Carrying it into a
+/// dashboard column would waste width and read as noise.
+const RECAP_SUFFIX: &str = "(disable recaps in /config)";
+
+/// Scan the transcript tail once and return the most recent recap and
+/// session title found there.
+///
+/// Same silent-failure contract as [`last_assistant_text`]: any IO or parse
+/// problem yields an empty [`SessionSummary`] rather than an error, because
+/// this runs inside the agent's hook process.
+pub fn last_session_summary(path: &Path) -> SessionSummary {
+    let mut out = SessionSummary::default();
+    let Ok(mut f) = File::open(path) else {
+        return out;
+    };
+    let Ok(meta) = f.metadata() else {
+        return out;
+    };
+    let start = meta.len().saturating_sub(TAIL_BYTES);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return out;
+    }
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        match extract_summary(&line) {
+            Some(Summary::Recap(t)) => out.recap = Some(t),
+            Some(Summary::AiTitle(t)) => out.ai_title = Some(t),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Which summary signal a transcript line carried, if any.
+enum Summary {
+    Recap(String),
+    AiTitle(String),
+}
+
+/// Classify one transcript line as a recap or a session title.
+fn extract_summary(line: &str) -> Option<Summary> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    match v.get("type")?.as_str()? {
+        "system"
+            if v.get("subtype").and_then(serde_json::Value::as_str) == Some("away_summary") =>
+        {
+            let content = v.get("content")?.as_str()?.trim();
+            let cleaned = content.strip_suffix(RECAP_SUFFIX).unwrap_or(content).trim();
+            (!cleaned.is_empty()).then(|| Summary::Recap(cleaned.to_string()))
+        }
+        "ai-title" => {
+            let title = v.get("aiTitle")?.as_str()?.trim();
+            (!title.is_empty()).then(|| Summary::AiTitle(title.to_string()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +449,45 @@ mod tests {
             r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"recent"}}]}}}}"#
         ).unwrap();
         assert_eq!(last_assistant_text(f.path()).as_deref(), Some("recent"));
+    }
+
+    // --- session summary (recap / ai-title) -----------------------------
+
+    #[test]
+    fn summary_is_empty_for_missing_file_and_plain_transcript() {
+        assert!(last_session_summary(Path::new("/definitely/not/here")).is_empty());
+        let f = write(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+        ]);
+        assert!(last_session_summary(f.path()).is_empty());
+    }
+
+    #[test]
+    fn picks_latest_recap_and_title_and_strips_recap_chrome() {
+        let f = write(&[
+            r#"{"type":"ai-title","aiTitle":"old title","sessionId":"s"}"#,
+            r#"{"type":"system","subtype":"away_summary","content":"first recap (disable recaps in /config)"}"#,
+            r#"{"type":"system","subtype":"turn_duration","content":"not a recap"}"#,
+            r#"{"type":"ai-title","aiTitle":"맥북 상태 및 로컬 문제점 파악","sessionId":"s"}"#,
+            r#"{"type":"system","subtype":"away_summary","content":"latest recap (disable recaps in /config)"}"#,
+        ]);
+        let s = last_session_summary(f.path());
+        assert_eq!(s.recap.as_deref(), Some("latest recap"));
+        assert_eq!(s.ai_title.as_deref(), Some("맥북 상태 및 로컬 문제점 파악"));
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn summary_tolerates_missing_chrome_blank_values_and_junk() {
+        let f = write(&[
+            "not json at all",
+            r#"{"type":"ai-title","aiTitle":"   ","sessionId":"s"}"#,
+            r#"{"type":"system","subtype":"away_summary","content":"   "}"#,
+            // A recap without the trailing chrome must survive verbatim.
+            r#"{"type":"system","subtype":"away_summary","content":"bare recap"}"#,
+        ]);
+        let s = last_session_summary(f.path());
+        assert_eq!(s.recap.as_deref(), Some("bare recap"));
+        assert_eq!(s.ai_title, None, "blank titles must not be captured");
     }
 }

@@ -108,6 +108,7 @@ impl HookAdapter for ClaudeAdapter {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // per-hook-event dispatch; splitting the match only scatters it
     fn normalize(event: Event, input: Input, pane: Option<String>) -> AgentEvent {
         let id = AgentId {
             kind: AgentKind::ClaudeCode,
@@ -152,6 +153,18 @@ impl HookAdapter for ClaudeAdapter {
                 // as a rate-limit signal (fallback for installs that
                 // don't have the StopFailure hook wired). Otherwise
                 // emit a normal `TurnStopped` with the assistant text.
+                // The same transcript also carries the session recap
+                // (`※ recap: …`, a `system`/`away_summary` record) and the
+                // rolling `ai-title`. Neither is in any hook payload or the
+                // statusline JSON, so this scan is the only stable read
+                // path — do it once here and ride along on `TurnStopped`.
+                let summary = input
+                    .transcript_path
+                    .as_deref()
+                    .map(transcript::last_session_summary)
+                    .unwrap_or_default();
+                let recap = summary.recap.map(|r| truncate(r, 2_000));
+                let ai_title = summary.ai_title.map(|t| truncate(t, 200));
                 match input
                     .transcript_path
                     .as_deref()
@@ -173,11 +186,15 @@ impl HookAdapter for ClaudeAdapter {
                     Some(transcript::TurnOutcome::Response(text)) => AgentEvent::TurnStopped {
                         id,
                         response: Some(truncate(text, 4_000)),
+                        recap,
+                        ai_title,
                         at,
                     },
                     None => AgentEvent::TurnStopped {
                         id,
                         response: None,
+                        recap,
+                        ai_title,
                         at,
                     },
                 }

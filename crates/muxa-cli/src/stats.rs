@@ -3180,6 +3180,8 @@ mod tests {
             state,
             last_prompt: None,
             last_response: None,
+            recap: None,
+            ai_title: None,
             last_notification: None,
             model: None,
             context_used_pct: None,

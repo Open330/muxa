@@ -883,6 +883,16 @@ pub struct WatchConfig {
     /// the most-recently-active agent inside each group. `t` (sort by state)
     /// and any user-configured order still take over verbatim.
     pub sort: Vec<WatchSortKey>,
+    /// What the summary column shows, and in what priority order.
+    ///
+    /// Default `recap`: the agent's own session recap when it has one,
+    /// else its rolling session title, else the last prompt. Claude Code
+    /// writes a recap only when you come back after being away — rich but
+    /// sparse — so the title tier keeps the column meaningful in between.
+    /// Agents with no recap source (Codex, Gemini) fall straight through
+    /// to the last prompt.
+    #[serde(default)]
+    pub summary: WatchSummary,
     /// Hide agents that aren't bound to a tmux pane.
     ///
     /// Paneless agents (Claude SDK sub-processes whose env didn't carry
@@ -947,6 +957,24 @@ pub enum WatchView {
     /// k9s-style swarm console: session clusters, animated dot spinners for
     /// working/starting agents, and an expandable subagent tree.
     Swarm,
+}
+
+/// Priority chain for the `muxa watch` summary column.
+///
+/// Each variant names the *highest* tier it will show; lower tiers stay as
+/// fallbacks, so the column is never empty when a last prompt exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchSummary {
+    /// recap → session title → last prompt. The default: prefer the agent's
+    /// own summary of what it's doing, and degrade gracefully.
+    #[default]
+    Recap,
+    /// session title → last prompt. Skips the sparse recap for operators who
+    /// want a stable one-liner that changes only when the topic does.
+    Title,
+    /// last prompt only — the historical pre-recap behavior.
+    Prompt,
 }
 
 /// Visual preset for muxa's human-facing terminal UIs.
@@ -1046,6 +1074,7 @@ impl Default for WatchConfig {
             columns,
             widths,
             view: WatchView::Session,
+            summary: WatchSummary::default(),
             detail: DetailConfig::default(),
             // Lead with State so needs-attention rows (error / input /
             // choice) float to the top and a blocked agent is never buried
