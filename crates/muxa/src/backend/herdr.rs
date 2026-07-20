@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -289,6 +289,47 @@ pub fn default_socket_path() -> PathBuf {
     }
     let rel = ".config/herdr/herdr.sock";
     dirs::home_dir().map_or_else(|| PathBuf::from(rel), |home| home.join(rel))
+}
+
+/// The focused herdr workspace, mapped to muxa's foreground-tracking keys:
+/// the stable `workspace_id` becomes the session id (matching
+/// [`to_pane_info`]'s `session` mapping so ledger keys line up) and the
+/// mutable `label` becomes the display name (tmux session-name analog).
+pub(crate) struct FocusedWorkspace {
+    /// herdr `workspace_id` (e.g. `w1`). Same value `list_panes` puts in
+    /// [`PaneInfo::session`].
+    pub id: String,
+    /// herdr workspace `label` — the human-facing name. Falls back to the
+    /// id when absent.
+    pub label: String,
+}
+
+/// Query the herdr socket for the currently focused workspace, for
+/// `session_activity`'s herdr foreground-time analog. Uses `workspace.list`
+/// (the cheapest call that reports each workspace's `focused` flag —
+/// lighter than `session.snapshot`, which also serializes every tab, pane,
+/// and agent) and returns the one workspace herdr marks `focused`.
+///
+/// Returns `None` when the server is unreachable/absent, no workspace is
+/// focused, or the reply is malformed — the sampler treats all of these as
+/// "no focused workspace this tick" (see `session_activity`).
+pub(crate) fn herdr_focused_workspace(socket_path: &Path) -> Option<FocusedWorkspace> {
+    let backend = HerdrBackend::with_socket_path(socket_path.to_path_buf());
+    let result = backend.request("workspace.list", json!({})).ok()?;
+    let workspaces = result.get("workspaces")?.as_array()?;
+    workspaces
+        .iter()
+        .find(|ws| ws.get("focused").and_then(Value::as_bool) == Some(true))
+        .and_then(|ws| {
+            let id = ws.get("workspace_id").and_then(Value::as_str)?.to_string();
+            let label = ws
+                .get("label")
+                .and_then(Value::as_str)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            Some(FocusedWorkspace { id, label })
+        })
 }
 
 /// Strip the `herdr:` namespace before an id crosses the socket. Lenient:
@@ -743,6 +784,103 @@ mod tests {
         assert!(backend.capture_pane("herdr:p1").is_none());
         assert!(backend.pane_pid_map().is_empty());
         assert!(!backend.focus_pane("herdr:p1"));
+    }
+
+    /// A herdr `workspace_list` result: `w1` focused, `w2` not.
+    fn workspace_list_result() -> Value {
+        json!({
+            "type": "workspace_list",
+            "workspaces": [
+                {
+                    "workspace_id": "w1",
+                    "number": 1,
+                    "label": "main",
+                    "focused": true,
+                    "pane_count": 2,
+                    "tab_count": 1,
+                    "active_tab_id": "tab1",
+                    "agent_status": "working",
+                },
+                {
+                    "workspace_id": "w2",
+                    "number": 2,
+                    "label": "scratch",
+                    "focused": false,
+                    "pane_count": 1,
+                    "tab_count": 1,
+                    "active_tab_id": "tab2",
+                    "agent_status": "idle",
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn focused_workspace_returns_the_focused_one() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            "workspace.list" => Reply::Result(workspace_list_result()),
+            _ => Reply::Error,
+        });
+        let ws = herdr_focused_workspace(&socket).expect("a workspace is focused");
+        assert_eq!(ws.id, "w1", "session id ← focused workspace_id");
+        assert_eq!(ws.label, "main", "display name ← workspace label");
+    }
+
+    #[test]
+    fn focused_workspace_none_when_no_workspace_focused() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            // Same list but nothing focused (e.g. a fully detached server).
+            "workspace.list" => Reply::Result(json!({
+                "type": "workspace_list",
+                "workspaces": [{
+                    "workspace_id": "w1",
+                    "number": 1,
+                    "label": "main",
+                    "focused": false,
+                    "pane_count": 1,
+                    "tab_count": 1,
+                    "active_tab_id": "tab1",
+                    "agent_status": "idle",
+                }],
+            })),
+            _ => Reply::Error,
+        });
+        assert!(herdr_focused_workspace(&socket).is_none());
+    }
+
+    #[test]
+    fn focused_workspace_none_when_server_down() {
+        // No socket file ⇒ server absent ⇒ no sample (tmux "no server" analog).
+        let missing = PathBuf::from("/definitely/missing/herdr-activity.sock");
+        assert!(herdr_focused_workspace(&missing).is_none());
+    }
+
+    #[test]
+    fn focused_workspace_none_on_error_reply() {
+        let (socket, _dir) = spawn_server(|_| Reply::Error);
+        assert!(herdr_focused_workspace(&socket).is_none());
+    }
+
+    #[test]
+    fn focused_workspace_label_falls_back_to_id() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            "workspace.list" => Reply::Result(json!({
+                "type": "workspace_list",
+                "workspaces": [{
+                    "workspace_id": "w7",
+                    "number": 1,
+                    "label": "",
+                    "focused": true,
+                    "pane_count": 1,
+                    "tab_count": 1,
+                    "active_tab_id": "tab1",
+                    "agent_status": "idle",
+                }],
+            })),
+            _ => Reply::Error,
+        });
+        let ws = herdr_focused_workspace(&socket).unwrap();
+        assert_eq!(ws.label, "w7", "empty label falls back to the id");
     }
 
     #[test]

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **herdr session foreground time.** The foreground-time ledger now works on
+  herdr hosts: instead of `tmux list-clients` (which finds no server on
+  herdr), the sampler queries the focused herdr **workspace** over the herdr
+  socket (`workspace.list`) and credits foreground time to it, keyed by the
+  raw `workspace_id` so `muxa stats`/`report` ACT numbers and
+  `muxa watch --view session` populate exactly as on tmux. Only the sampling
+  source branches; all downstream accounting is shared. Known limitation:
+  herdr exposes no client-attach state, so focus time accrues even when the
+  server is detached with no client attached (inflates ACT for always-on
+  detached servers; mitigation out of scope). See `docs/HERDR.md`.
 - **herdr backend (Phase 1).** muxa now observes agents inside
   [herdr](https://herdr.dev) panes: a full `PaneBackend` over herdr's local
   socket API (`pane.list`/`pane.read`/`pane.process_info`/`pane.focus`, so

@@ -97,10 +97,34 @@ can tell which host governs a row (see reaping guard below).
 5. **CLI attach** (`main.rs jump_to_pane`, done): `HostKind::Herdr` arm →
    `focus_pane`, zellij-shape.
 
-Out of scope for Phase 1: `session_activity` (tmux foreground time —
-returns empty on herdr hosts; a herdr workspace-focus analog can come
-later), the web dashboard's tmux scanner panes view, `muxa status-line`
-(a tmux status-right concept; herdr has its own sidebar).
+6. **Session foreground time** (`session_activity.rs`, done): the tmux
+   foreground-time ledger has a herdr analog. On herdr hosts the sampler
+   branches (`SessionActivitySource::Herdr`) and, each poll, queries the
+   focused herdr **workspace** via `workspace.list` (the cheapest call
+   reporting each workspace's `focused` flag; `backend::herdr::herdr_focused_workspace`)
+   instead of `tmux list-clients`. The focused workspace becomes a single
+   `SessionInfo` with one "attached client", so the *same*
+   `apply_sample_report` accounting credits foreground time to it and emits
+   the same ledger intervals + `session-activity.json`. The muxa session key
+   is the raw `workspace_id` (`w1`), matching `PaneInfo.session` from
+   `HerdrBackend::list_panes` so ledger keys line up with pane rows. No
+   focused workspace, or an unreachable/absent server, yields an empty
+   sample — the tmux "no server running" analog, which closes any open
+   interval. Only the *sampling source* branches; downstream accounting is
+   shared with tmux.
+
+   **Known limitation (mitigation out of scope for now):** herdr's socket
+   API exposes no client-attach state — there is no `client.list` analog.
+   So, unlike tmux (which credits time only while an interactive client is
+   attached), herdr focus time accrues even when the server sits detached
+   with no client attached. This **inflates ACT for always-on detached
+   herdr servers**. herdr also has no per-client input/scroll signal, so no
+   `HumanInteraction` (keypress/scroll) ticks are emitted on herdr hosts —
+   only the workspace-foreground observation.
+
+Out of scope for Phase 1: the web dashboard's tmux scanner panes view,
+`muxa status-line` (a tmux status-right concept; herdr has its own
+sidebar).
 
 ## Phase 2 — herdr-native agent state (event bridge)
 
