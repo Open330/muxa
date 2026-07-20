@@ -534,7 +534,7 @@ async fn load_data(
         .await
         .context("querying daemon agent snapshot")?;
     let activities = load_session_activities(cfg).await;
-    let panes = muxa::default_backend().list_panes();
+    let panes = crate::all_panes();
 
     let pane_sessions = panes
         .iter()

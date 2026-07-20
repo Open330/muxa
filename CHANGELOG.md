@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **multi-host observation (daemon).** `muxad` now observes every backend
+  in `muxa::active_backends()` at once (tmux + herdr during a migration)
+  instead of a single env-detected backend. One reconciler runs over the
+  whole set — each tick observes every backend concurrently and reconciles
+  each observation under its own `HostKind`, so a herdr timeout can't reap
+  tmux rows (completeness stays per-host); the workload scan runs once over
+  the union of complete observations, and the cross-host age-out sweep
+  receives all observed kinds so a row on an unobserved host ages out while
+  observed hosts stay governed by their own pass. Discovery, the
+  pane-session cache, and history enrichment enumerate the set and union
+  their scans; session-activity sampling runs one tracker that polls every
+  host's foreground source (tmux clients + herdr focused workspace) into a
+  single race-free ledger; the herdr bridge/report tasks spawn whenever
+  herdr is in the set, not only when it's the sole backend. See
+  `docs/MULTI_HOST.md`.
+- **cross-multiplexer unified console (CLI).** `muxa watch` and the
+  pane-listing surfaces now aggregate across *every* active host at once
+  instead of the single env-detected backend — during a tmux→herdr
+  migration both sides show in one view. `watch`'s refresh fans
+  `list_panes()` and the per-host session sources (tmux `list-sessions`,
+  herdr `workspace.list`) across the backend set concurrently and concats
+  the rows (namespaces keep them distinct: tmux `%N` / herdr `herdr:…`).
+  When the row set spans more than one host, each row gets a subtle dim
+  host tag (`tmux`/`herdr`) on its SESSION/PANE cell; single-host users see
+  no change. Attach (Enter in `watch`, `muxa attend`) dispatches per row on
+  the pane id's namespace, so a `herdr:` row focuses via herdr even when the
+  shell is tmux-primary (and vice versa); unrecognized ids fall back to the
+  process-global backend. `muxa panes`, `stats`, and `timeline` enumerate
+  panes across the set too, and `muxa panes` prints a per-host empty hint
+  for any host in the set that contributed zero. Live pane captures
+  (`watch` preview, `dashboard`) resolve the capturing backend by namespace.
+  `current_pane`/status-line ("where am I") stay single-host by design. See
+  `docs/MULTI_HOST.md`.
 - **herdr web dashboard panes view.** The dashboard's `/api/panes` route
   (and the timeline's pane→session map) now populate on herdr hosts. The
   daemon threads its active pane backend into the dashboard; when the host

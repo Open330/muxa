@@ -265,7 +265,15 @@ pub struct SessionActivityTracker {
     path: PathBuf,
     interval: Duration,
     activity_log: Option<Arc<ActivityLog>>,
-    source: SessionActivitySource,
+    /// One sampling source per host the daemon observes that *has* a foreground
+    /// signal (tmux and/or herdr; zellij has none). A single tracker owns one
+    /// `records` map and one `session-activity.json` writer, so polling every
+    /// source from this one task is race-free by construction — two independent
+    /// trackers writing the same file would clobber each other (each `save()`
+    /// rewrites the whole file). Merging is safe because the ledger keys are
+    /// disjoint across hosts (tmux `$N` vs herdr workspace ids), so one map
+    /// holds both hosts' sessions without collision.
+    sources: Vec<SessionActivitySource>,
 }
 
 impl SessionActivityTracker {
@@ -274,16 +282,28 @@ impl SessionActivityTracker {
             path,
             interval,
             activity_log: None,
-            source: SessionActivitySource::default(),
+            sources: vec![SessionActivitySource::default()],
         }
     }
 
-    /// Select the foreground-sampling source. Defaults to
-    /// [`SessionActivitySource::Tmux`]; the daemon sets
-    /// [`SessionActivitySource::Herdr`] on herdr hosts.
+    /// Select a single foreground-sampling source, replacing any already set.
+    /// Defaults to [`SessionActivitySource::Tmux`]; the daemon uses
+    /// [`Self::with_sources`] to sample several hosts at once.
     #[must_use]
     pub fn with_source(mut self, source: SessionActivitySource) -> Self {
-        self.source = source;
+        self.sources = vec![source];
+        self
+    }
+
+    /// Sample foreground state from several hosts each poll, merged into one
+    /// ledger. Used by the multi-host daemon (tmux + herdr during a migration).
+    /// An empty slice is treated as "no source" and leaves the default tmux
+    /// sampler in place so the tracker never silently stops sampling.
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<SessionActivitySource>) -> Self {
+        if !sources.is_empty() {
+            self.sources = sources;
+        }
         self
     }
 
@@ -293,22 +313,42 @@ impl SessionActivityTracker {
         self
     }
 
-    /// Take one foreground sample from the configured source, off the async
-    /// runtime (both the tmux shell-out and the herdr socket round-trip
-    /// block). The two sources produce the same [`ActivitySample`] shape, so
-    /// the caller's accounting is source-agnostic.
+    /// Take one foreground sample from every configured source, off the async
+    /// runtime (both the tmux shell-out and the herdr socket round-trip block),
+    /// and merge them into a single [`ActivitySample`]. Sources sample
+    /// concurrently. All sources produce the same shape, and their session ids
+    /// don't collide across hosts, so the caller's accounting stays
+    /// source-agnostic over the merged result.
+    ///
+    /// If ANY source errors (only the tmux sampler can — the herdr sampler is
+    /// infallible, yielding an empty sample when no workspace is focused) the
+    /// whole poll is skipped rather than sampling a partial live set: passing a
+    /// host's sessions to `apply_sample_report` without the other host's would
+    /// wrongly close the missing host's foreground intervals. This matches the
+    /// single-host contract, where a failed sample skips the poll entirely.
     async fn sample(&self) -> Result<ActivitySample, String> {
-        match &self.source {
-            SessionActivitySource::Tmux => tokio::task::spawn_blocking(sample_activity)
-                .await
-                .unwrap_or_else(|e| Err(format!("join error: {e}"))),
-            SessionActivitySource::Herdr { socket_path } => {
-                let socket_path = socket_path.clone();
-                tokio::task::spawn_blocking(move || sample_herdr_activity(&socket_path))
-                    .await
-                    .map_err(|e| format!("join error: {e}"))
-            }
+        let handles: Vec<tokio::task::JoinHandle<Result<ActivitySample, String>>> = self
+            .sources
+            .iter()
+            .map(|source| match source {
+                SessionActivitySource::Tmux => tokio::task::spawn_blocking(sample_activity),
+                SessionActivitySource::Herdr { socket_path } => {
+                    let socket_path = socket_path.clone();
+                    tokio::task::spawn_blocking(move || Ok(sample_herdr_activity(&socket_path)))
+                }
+            })
+            .collect();
+
+        let mut merged = ActivitySample {
+            sessions: Vec::new(),
+            client_inputs: Vec::new(),
+        };
+        for handle in handles {
+            let sample = handle.await.map_err(|e| format!("join error: {e}"))??;
+            merged.sessions.extend(sample.sessions);
+            merged.client_inputs.extend(sample.client_inputs);
         }
+        Ok(merged)
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -632,6 +672,30 @@ mod tests {
         let record = records.get("$1").unwrap();
         assert_eq!(record.attached_since, None);
         assert_eq!(record.total_attached_secs, 15);
+    }
+
+    /// A single tracker samples several hosts into one records map. The merged
+    /// live set carries both a tmux `$N` and a herdr workspace id at once;
+    /// because the keyspaces are disjoint, both accrue foreground time and
+    /// neither host's presence closes the other's interval. This is the
+    /// invariant that lets one tracker (one writer) poll both sources safely.
+    #[test]
+    fn merged_multi_host_sample_credits_both_keyspaces() {
+        let mut records = HashMap::new();
+        let t0 = datetime!(2026-05-29 00:00:00 UTC);
+        let t1 = datetime!(2026-05-29 00:00:10 UTC);
+
+        // Poll 1: a merged sample from tmux (`$1`) + herdr (`w1`).
+        let merged = [session("$1", "main", 1), session("w1", "work", 1)];
+        assert!(apply_sample(&mut records, &merged, t0));
+        assert!(records.get("$1").unwrap().is_attached());
+        assert!(records.get("w1").unwrap().is_attached());
+
+        // Poll 2: same merged set — both keep accruing, neither is closed by the
+        // other host being present in the same sample.
+        assert!(!apply_sample(&mut records, &merged, t1));
+        assert_eq!(records.get("$1").unwrap().effective_total_secs(t1), 10);
+        assert_eq!(records.get("w1").unwrap().effective_total_secs(t1), 10);
     }
 
     #[test]

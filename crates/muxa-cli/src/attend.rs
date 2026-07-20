@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 use muxa::ipc::Client;
 use muxa::state::Agent;
 use muxa::tmux::PaneInfo;
-use muxa::{AgentState, PaneBackend};
+use muxa::AgentState;
 
 use crate::{pane_display, state_icon, state_style, terminal_width, truncate_cell, use_colors};
 
@@ -150,11 +150,11 @@ fn next_after<'c>(
 /// Choose a pane to attend to, or print the queue / a "nothing to do"
 /// line. Returns the pane id the caller should jump to, or `None` when
 /// there's nothing to jump to (`--list`, or no agent needs attention).
-pub async fn run(client: &Client, backend: &dyn PaneBackend, args: Args) -> Result<Option<String>> {
+pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Option<String>> {
     let agents = client.snapshot().await?;
-    // Resolve panes once: spatial ordering + `pane_display` both read it,
-    // and it's empty (harmless) on backends without pane metadata.
-    let panes = backend.list_panes();
+    // Panes are enumerated by the caller across every active host (spatial
+    // ordering + `pane_display` both read them); empty is harmless on
+    // backends without pane metadata.
     let cands = candidates(&agents, &panes);
     // Agents that need a human but have no pane to focus. `candidates`
     // drops these (there's nothing to jump to), which used to make a
@@ -188,7 +188,11 @@ pub async fn run(client: &Client, backend: &dyn PaneBackend, args: Args) -> Resu
     }
 
     let chosen = if args.cycle {
-        let current = backend.current_pane().map(|p| spatial_key(&p, &panes));
+        // "Where am I" is inherently single-host — resolve the cursor's
+        // current pane via the env-preferred backend.
+        let current = muxa::default_backend()
+            .current_pane()
+            .map(|p| spatial_key(&p, &panes));
         next_after(&cands, current.as_ref())
     } else {
         longest_waiting(&cands)

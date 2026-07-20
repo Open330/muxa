@@ -117,7 +117,13 @@ impl<B: crate::backend::PaneBackend> LivenessSource for B {
 /// knob, not a correctness requirement.
 pub struct Reconciler<L: LivenessSource> {
     store: SharedStore,
-    source: Arc<L>,
+    /// One source per backend the daemon observes. Single-host daemons (and
+    /// every test) carry exactly one; a multi-host daemon (tmux + herdr during
+    /// a migration) carries several. Each tick observes all of them
+    /// concurrently and reconciles each observation against the store under its
+    /// own [`HostKind`], so a herdr timeout can't trigger tmux reaping or vice
+    /// versa (`reconcile_observation` is completeness-gated per host).
+    sources: Vec<Arc<L>>,
     interval: Duration,
     /// Optional metrics handle. Daemon wires one in via
     /// [`Self::with_metrics`]; tests can leave it `None` to avoid
@@ -148,9 +154,23 @@ pub struct Reconciler<L: LivenessSource> {
 
 impl<L: LivenessSource> Reconciler<L> {
     pub fn new(store: SharedStore, source: L, interval: Duration) -> Self {
+        Self::with_sources(store, vec![source], interval)
+    }
+
+    /// Build a reconciler that observes several backends per tick — the
+    /// multi-host analog of [`Self::new`]. Every source is observed
+    /// concurrently and reconciled under its own [`HostKind`]; the ghost
+    /// age-out sweep ([`Store::mark_stale_cross_host_stopped`](crate::state::Store::mark_stale_cross_host_stopped))
+    /// naturally receives all active kinds, so a row on a host in the set is
+    /// governed by that host's reconcile pass while a row on a host NOT in the
+    /// set ages out. An empty `sources` degrades to a store-maintenance-only
+    /// loop (no observation, but the stuck/paneless/codex sweeps still run);
+    /// the daemon never constructs one that way — `active_backends()` is never
+    /// empty.
+    pub fn with_sources(store: SharedStore, sources: Vec<L>, interval: Duration) -> Self {
         Self {
             store,
-            source: Arc::new(source),
+            sources: sources.into_iter().map(Arc::new).collect(),
             interval,
             metrics: None,
             stuck_working_timeout: Duration::ZERO,
@@ -345,38 +365,82 @@ impl<L: LivenessSource> Reconciler<L> {
     #[allow(clippy::too_many_lines)]
     pub async fn reconcile_once(&self) -> ReconcileReport {
         let started = Instant::now();
-        // Pane observation shells out to tmux and must not block the runtime.
-        // Capture the observing host up front so the store's reaping guard can
-        // exempt rows namespaced to a *different* host (cross-host migration).
-        let observing_kind = self.source.kind();
-        let src = self.source.clone();
+        // Every backend is observed each tick. Capture each observing host so
+        // the store's reaping guard can exempt rows namespaced to a host that
+        // is *also* in the set (cross-host migration) while reaping the ones
+        // that aren't.
+        let observing_kinds: Vec<HostKind> = self.sources.iter().map(|s| s.kind()).collect();
+        // Pane observation shells out to tmux / round-trips the herdr socket and
+        // must not block the runtime. Spawn every source's blocking observation
+        // up front so they run CONCURRENTLY, then collect — a herdr timeout
+        // must not serialize behind the tmux scan (and vice versa), keeping the
+        // tick budget flat as backends are added.
         let list_started = Instant::now();
-        let observation = tokio::task::spawn_blocking(move || src.observe_panes())
-            .await
-            .unwrap_or_else(|_| PaneObservation::incomplete(Vec::new()));
+        let handles: Vec<(HostKind, tokio::task::JoinHandle<PaneObservation>)> = self
+            .sources
+            .iter()
+            .map(|src| {
+                let src = src.clone();
+                let kind = src.kind();
+                (
+                    kind,
+                    tokio::task::spawn_blocking(move || src.observe_panes()),
+                )
+            })
+            .collect();
+        let mut observations: Vec<(HostKind, PaneObservation)> = Vec::with_capacity(handles.len());
+        for (kind, handle) in handles {
+            let obs = handle
+                .await
+                .unwrap_or_else(|_| PaneObservation::incomplete(Vec::new()));
+            observations.push((kind, obs));
+        }
         let list_panes_us = u64::try_from(list_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let pane_observation_complete = observation.is_complete();
-        let panes_for_workload = observation.panes.clone();
+        // Workload scan runs once per tick over the UNION of complete
+        // observations — process-tree scanning is store-global (it clears the
+        // workload of any pane absent from its map), so a per-backend scan would
+        // clobber the other host's rows. Gate the whole scan+update on *all*
+        // observations being complete: `update_workloads` would otherwise reset
+        // an incompletely-observed host's rows to the default workload. This
+        // generalizes the single-host rule (run only when the one observation is
+        // complete) without regressing it.
+        let all_complete = observations.iter().all(|(_, o)| o.is_complete());
+        let total_panes: usize = observations.iter().map(|(_, o)| o.panes.len()).sum();
+        let panes_for_workload: Vec<crate::tmux::PaneInfo> = if all_complete {
+            observations
+                .iter()
+                .flat_map(|(_, o)| o.panes.iter().cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let workload_started = Instant::now();
-        let workloads = if pane_observation_complete {
+        let workloads = if all_complete {
             tokio::task::spawn_blocking(move || {
                 process_tree::scan_pane_workloads(&panes_for_workload)
             })
             .await
             .unwrap_or_default()
         } else {
-            // Updating from a partial set would clear workload metadata for
-            // panes whose server failed observation.
             std::collections::HashMap::new()
         };
         let workload_scan_us =
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let reconcile_started = Instant::now();
-        let report = self
-            .store
-            .reconcile_observation(&observation, observing_kind)
-            .await;
-        let workload_changed = if pane_observation_complete {
+        // Reconcile each observation against the store sequentially, under its
+        // own host kind. Completeness is enforced per host inside
+        // `reconcile_observation`, so an incomplete herdr scan is a no-op that
+        // leaves tmux reaping untouched. Accumulate the per-host reports so the
+        // timing line and callers (tests) see the whole tick's effect.
+        let mut report = ReconcileReport::default();
+        for (kind, observation) in &observations {
+            let r = self.store.reconcile_observation(observation, *kind).await;
+            report.stale_panes_reaped += r.stale_panes_reaped;
+            report.synthetic_demoted += r.synthetic_demoted;
+            report.duplicates_collapsed += r.duplicates_collapsed;
+            report.paneless_correlated += r.paneless_correlated;
+        }
+        let workload_changed = if all_complete {
             self.store.update_workloads(&workloads).await
         } else {
             0
@@ -418,20 +482,22 @@ impl<L: LivenessSource> Reconciler<L> {
             );
         }
         // Age out rows whose pane belongs to a host this daemon isn't
-        // observing (e.g. a `herdr:` row left behind after switching the
-        // daemon back to tmux). The cross-host guard exempts them from
-        // *immediate* reaping, but a single-backend daemon never sees them,
-        // so without this they'd ghost forever. Same inactivity window as the
-        // paneless sweep. Today the observing set is exactly the one active
-        // backend; a future multi-host daemon would pass all its live kinds.
+        // observing (e.g. a `zellij:` row while the set is tmux + herdr, or a
+        // `herdr:` row left behind after narrowing the set back to tmux). The
+        // cross-host guard exempts them from *immediate* reaping, and no
+        // observation in the set can ever see them, so without this they'd
+        // ghost forever. Passing ALL observing kinds means a row on a host
+        // that IS in the set (even one that's down / observed incomplete this
+        // tick) is spared here and stays governed by its own reconcile pass.
+        // Same inactivity window as the paneless sweep.
         let stale_cross_host = self
             .store
-            .mark_stale_cross_host_stopped(&[observing_kind], self.paneless_stale_timeout)
+            .mark_stale_cross_host_stopped(&observing_kinds, self.paneless_stale_timeout)
             .await;
         if stale_cross_host > 0 {
             tracing::info!(
                 stale_cross_host,
-                observing = %observing_kind,
+                observing = ?observing_kinds,
                 "cross-host sweep flipped {stale_cross_host} foreign-host agent(s) to Stopped",
             );
         }
@@ -470,8 +536,9 @@ impl<L: LivenessSource> Reconciler<L> {
                 list_panes_us,
                 workload_scan_us,
                 store_update_us,
-                panes = observation.panes.len(),
-                pane_observation_complete,
+                panes = total_panes,
+                pane_observation_complete = all_complete,
+                backends = observing_kinds.len(),
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
@@ -486,8 +553,9 @@ impl<L: LivenessSource> Reconciler<L> {
                 list_panes_us,
                 workload_scan_us,
                 store_update_us,
-                panes = observation.panes.len(),
-                pane_observation_complete,
+                panes = total_panes,
+                pane_observation_complete = all_complete,
+                backends = observing_kinds.len(),
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
@@ -556,18 +624,27 @@ mod tests {
     /// the live set between reconciliation passes.
     struct FakeLiveness {
         observation: Mutex<PaneObservation>,
+        kind: HostKind,
     }
 
     impl FakeLiveness {
         fn new(panes: Vec<PaneInfo>) -> Self {
             Self {
                 observation: Mutex::new(PaneObservation::complete(panes)),
+                kind: HostKind::Tmux,
             }
         }
         fn incomplete(panes: Vec<PaneInfo>) -> Self {
             Self {
                 observation: Mutex::new(PaneObservation::incomplete(panes)),
+                kind: HostKind::Tmux,
             }
+        }
+        /// Tag this source with a specific observing host — used by the
+        /// multi-source tests to exercise the cross-host reaping guard.
+        fn with_kind(mut self, kind: HostKind) -> Self {
+            self.kind = kind;
+            self
         }
         fn set(&self, panes: Vec<PaneInfo>) {
             *self.observation.lock().unwrap() = PaneObservation::complete(panes);
@@ -577,6 +654,9 @@ mod tests {
     impl LivenessSource for FakeLiveness {
         fn observe_panes(&self) -> PaneObservation {
             self.observation.lock().unwrap().clone()
+        }
+        fn kind(&self) -> HostKind {
+            self.kind
         }
     }
 
@@ -636,6 +716,106 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].session_id, "a");
+    }
+
+    fn herdr_pane(id: &str) -> PaneInfo {
+        let mut p = pane(id);
+        p.session = "w1".into();
+        p
+    }
+
+    /// Multi-source reconcile: each backend governs only its own pane-id
+    /// namespace. A tmux source reaps a dead tmux `%N` row and a herdr source
+    /// reaps a dead `herdr:` row in the SAME tick, while each host's live row
+    /// is preserved and neither host's observation touches the other's rows.
+    #[tokio::test]
+    async fn reconcile_once_reaps_per_host_across_a_backend_set() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-alive", "%1", t0)).await;
+        store.apply(&started("tmux-ghost", "%2", t0)).await;
+        store.apply(&started("herdr-alive", "herdr:p1", t0)).await;
+        store.apply(&started("herdr-ghost", "herdr:p2", t0)).await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::new(vec![herdr_pane("herdr:p1")]).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        // One stale reap per host, both in the one tick.
+        assert_eq!(report.stale_panes_reaped, 2);
+        let snap = store.snapshot().await;
+        let live: std::collections::HashSet<&str> =
+            snap.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains("tmux-alive"));
+        assert!(live.contains("herdr-alive"));
+    }
+
+    /// The cross-host age-out sweep spares rows whose host IS in the observed
+    /// set (governed by that host's own reconcile pass) and ages out rows whose
+    /// host is NOT — even when the set spans several hosts. A stale `zellij:`
+    /// row is foreign to a tmux+herdr set and must flip to `Stopped`; a stale
+    /// `herdr:` row is spared because herdr is observed (its own reconcile
+    /// governs it — here its pane is still live, so it survives).
+    #[tokio::test]
+    async fn cross_host_sweep_uses_the_whole_observed_set() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("herdr-live", "herdr:p1", old)).await;
+        store
+            .apply(&started("zellij-foreign", "zellij:9", old))
+            .await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::new(vec![herdr_pane("herdr:p1")]).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10))
+                // Non-zero threshold enables the cross-host sweep; the rows are far
+                // older than the cutoff so an unobserved host's row ages out now.
+                .with_paneless_stale_timeout(Duration::from_secs(1));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        // herdr is observed (and its pane live) → spared.
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "herdr-live")
+                .map(|a| a.state),
+            Some(AgentState::Idle),
+        );
+        // zellij is NOT observed → aged out to Stopped.
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "zellij-foreign")
+                .map(|a| a.state),
+            Some(AgentState::Stopped),
+        );
+    }
+
+    /// An incomplete observation from ONE backend must not clear the workload
+    /// metadata of another backend's rows: the workload scan+update is gated on
+    /// EVERY observation being complete, mirroring the single-host rule.
+    #[tokio::test]
+    async fn incomplete_one_backend_does_not_reap_or_reset_another() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-alive", "%1", t0)).await;
+        store.apply(&started("herdr-alive", "herdr:p1", t0)).await;
+
+        // tmux observed complete; herdr times out (incomplete, empty).
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::incomplete(Vec::new()).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        // The incomplete herdr scan reaps nothing; the tmux scan reaps nothing
+        // (its one row is live). Both rows survive.
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert!(store.by_session("tmux-alive").await.is_some());
+        assert!(store.by_session("herdr-alive").await.is_some());
     }
 
     #[tokio::test]

@@ -1832,10 +1832,15 @@ async fn refresh_capture(client: &Client, app: &mut DashboardApp) {
 
     let text = match target.clone() {
         CaptureTarget::Pane(pane_id) => {
-            tokio::task::spawn_blocking(move || muxa::default_backend().capture_pane(&pane_id))
-                .await
-                .ok()
-                .flatten()
+            // Resolve the backend by the pane id's namespace (like the jump
+            // path) so a herdr pane captures via herdr even when the
+            // process-global host is tmux, and vice versa.
+            tokio::task::spawn_blocking(move || {
+                crate::backend_for_pane(&pane_id).capture_pane(&pane_id)
+            })
+            .await
+            .ok()
+            .flatten()
         }
         CaptureTarget::PtySession(session_id) => client
             .capture_session(&session_id)

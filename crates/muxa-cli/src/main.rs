@@ -658,8 +658,11 @@ fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
 /// the actual focus through `jump_to_pane`, the identical machinery the
 /// `muxa watch` Enter action uses, so a jump lands the same way from both.
 async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
-    let backend = muxa::default_backend();
-    if let Some(pane) = attend::run(client, backend.as_ref(), args).await? {
+    // Enumerate panes across every active host so a herdr agent that needs
+    // a human is jumpable from a tmux-primary shell (and vice versa). The
+    // jump itself dispatches per-row in `jump_to_pane`.
+    let panes = all_panes();
+    if let Some(pane) = attend::run(client, panes, args).await? {
         jump_to_pane(&pane);
     }
     Ok(())
@@ -862,12 +865,80 @@ fn tmux_interaction_target(pane_id: &str) -> Option<(Option<String>, Option<Stri
 /// switching — `select-window`/`select-pane` are plain control messages to
 /// the tmux server and don't need an attached client.
 fn jump_to_pane(pane_id: &str) {
-    let backend = muxa::default_backend();
-    match backend.kind() {
+    // Dispatch on the pane id's namespace FIRST: a `herdr:` row must jump
+    // via a herdr backend even when the process-global detected host is
+    // tmux (and vice versa) — the multi-host unified console lists rows
+    // from every host, so the row's own id is the source of truth. Only
+    // when the namespace is unrecognized (legacy/synthetic ids) do we fall
+    // back to the process-global backend's kind.
+    let fallback = muxa::default_backend();
+    let kind = dispatch_kind(pane_id, fallback.kind());
+    match kind {
+        // tmux jumps go straight through `tmux::` helpers and need no backend.
         muxa::HostKind::Tmux => jump_to_pane_tmux(pane_id),
-        muxa::HostKind::Zellij => jump_to_pane_zellij(backend.as_ref(), pane_id),
-        muxa::HostKind::Herdr => jump_to_pane_herdr(backend.as_ref(), pane_id),
+        muxa::HostKind::Zellij => {
+            let backend = backend_for_dispatch(kind, &fallback);
+            jump_to_pane_zellij(backend.as_ref(), pane_id);
+        }
+        muxa::HostKind::Herdr => {
+            let backend = backend_for_dispatch(kind, &fallback);
+            jump_to_pane_herdr(backend.as_ref(), pane_id);
+        }
     }
+}
+
+/// Effective host for a per-row action: the pane id's namespace when
+/// recognized, else the process-global `fallback`. Pure so the dispatch
+/// table is unit-testable without constructing backends.
+fn dispatch_kind(pane_id: &str, fallback: muxa::HostKind) -> muxa::HostKind {
+    muxa::backend::pane_id_host_kind(pane_id).unwrap_or(fallback)
+}
+
+/// Reuse the already-built `fallback` backend when its kind matches, else
+/// construct a fresh one for `kind` (cheap — the constructors are a unit
+/// struct for tmux/zellij and a socket path for herdr).
+fn backend_for_dispatch(
+    kind: muxa::HostKind,
+    fallback: &muxa::SharedBackend,
+) -> muxa::SharedBackend {
+    if fallback.kind() == kind {
+        fallback.clone()
+    } else {
+        backend_for_kind(kind)
+    }
+}
+
+/// Build one backend of the given kind. The CLI-side analog of the
+/// (private) `muxa::backend::backend_of`, used for per-row host dispatch
+/// where the row's host differs from the process-global one.
+pub(crate) fn backend_for_kind(kind: muxa::HostKind) -> muxa::SharedBackend {
+    match kind {
+        muxa::HostKind::Tmux => std::sync::Arc::new(muxa::TmuxBackend::new()),
+        muxa::HostKind::Zellij => std::sync::Arc::new(muxa::ZellijBackend::new()),
+        muxa::HostKind::Herdr => std::sync::Arc::new(muxa::backend::herdr::HerdrBackend::new()),
+    }
+}
+
+/// Resolve the backend that owns `pane_id` by its namespace, falling back
+/// to the process-global backend for unrecognized ids. Used by the live
+/// pane-capture paths (`watch` preview, `dashboard` capture) so a capture
+/// hits the host the pane actually lives on.
+pub(crate) fn backend_for_pane(pane_id: &str) -> muxa::SharedBackend {
+    match muxa::backend::pane_id_host_kind(pane_id) {
+        Some(kind) => backend_for_kind(kind),
+        None => muxa::default_backend(),
+    }
+}
+
+/// Aggregate pane inventories across every active backend — the multi-host
+/// enumeration used by `muxa panes`, `stats`, `timeline`, and `attend`.
+/// Rows already carry their host namespace in `pane_id`, so a plain concat
+/// keeps them distinct.
+pub(crate) fn all_panes() -> Vec<muxa::tmux::PaneInfo> {
+    muxa::active_backends()
+        .iter()
+        .flat_map(|backend| backend.list_panes())
+        .collect()
 }
 
 fn jump_to_pane_tmux(pane_id: &str) {
@@ -1339,34 +1410,57 @@ async fn cmd_recap(client: &Client, pane: Option<String>, limit: usize, all: boo
 }
 
 fn cmd_panes() {
-    let backend = muxa::default_backend();
-    let panes = backend.list_panes();
-    if panes.is_empty() {
-        // Two ways to get here: the host (tmux/zellij) has no panes,
-        // or the backend's `caps()` says metadata is plugin-only and
-        // not pushed yet. The hint differentiates so users diagnosing
-        // a misconfigured zellij plugin see something useful.
-        match backend.kind() {
-            muxa::HostKind::Tmux => println!("(no tmux panes — server may be down)"),
-            muxa::HostKind::Zellij if !backend.caps().current_command => println!(
-                "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
-            ),
-            muxa::HostKind::Zellij => println!("(no zellij panes)"),
-            muxa::HostKind::Herdr => {
-                println!("(no herdr panes — server may be down or socket unreachable)");
-            }
+    // Aggregate across every active host — the cross-multiplexer pane
+    // inventory. Rows carry their namespace in `pane_id`, so a concat keeps
+    // tmux `%N` and herdr `herdr:…` rows distinct. Per-host hints still fire
+    // for any host in the set that contributed zero panes, so a single-host
+    // user sees the same diagnostic as before while a multi-host user learns
+    // which side is empty.
+    let backends = muxa::active_backends();
+    let mut all: Vec<muxa::tmux::PaneInfo> = Vec::new();
+    let mut empty_hosts: Vec<&muxa::SharedBackend> = Vec::new();
+    for backend in &backends {
+        let panes = backend.list_panes();
+        if panes.is_empty() {
+            empty_hosts.push(backend);
         }
-        return;
+        all.extend(panes);
     }
+
     let terminal_width = terminal_width();
     let mut out = std::io::stdout().lock();
-    for p in panes {
+    for p in &all {
         let line = format!(
             "{:<8} {}:{}.{}  tty={}  cmd={}  title={}",
             p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title
         );
         if writeln!(out, "{}", truncate_cell(&line, terminal_width)).is_err() {
             return;
+        }
+    }
+
+    // A host contributed zero: print its diagnostic. When the set is a
+    // single host and it's empty this reproduces the pre-multi-host hint;
+    // when other hosts have panes it tells the user which side came up dry.
+    for backend in empty_hosts {
+        let hint = empty_pane_hint(backend.as_ref());
+        let _ = writeln!(out, "{hint}");
+    }
+}
+
+/// The empty-state diagnostic for a host that reported no panes. Two ways
+/// to get here: the host really has no panes, or the backend's `caps()`
+/// says metadata is plugin-only and not pushed yet — the zellij branch
+/// differentiates so a misconfigured plugin is diagnosable.
+fn empty_pane_hint(backend: &dyn muxa::PaneBackend) -> &'static str {
+    match backend.kind() {
+        muxa::HostKind::Tmux => "(no tmux panes — server may be down)",
+        muxa::HostKind::Zellij if !backend.caps().current_command => {
+            "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
+        }
+        muxa::HostKind::Zellij => "(no zellij panes)",
+        muxa::HostKind::Herdr => {
+            "(no herdr panes — server may be down or socket unreachable)"
         }
     }
 }
@@ -1701,6 +1795,20 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn dispatch_kind_prefers_pane_namespace_over_fallback() {
+        use muxa::HostKind;
+        // Namespaced ids dispatch to their own host regardless of the
+        // process-global fallback — a herdr row jumps via herdr even when
+        // the shell is tmux-primary, and vice versa.
+        assert_eq!(dispatch_kind("%3", HostKind::Herdr), HostKind::Tmux);
+        assert_eq!(dispatch_kind("herdr:abc", HostKind::Tmux), HostKind::Herdr);
+        assert_eq!(dispatch_kind("zellij:7", HostKind::Tmux), HostKind::Zellij);
+        // Unrecognized ids fall back to the process-global host.
+        assert_eq!(dispatch_kind("legacy-id", HostKind::Tmux), HostKind::Tmux);
+        assert_eq!(dispatch_kind("legacy-id", HostKind::Herdr), HostKind::Herdr);
+    }
 
     fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {
         Agent {
