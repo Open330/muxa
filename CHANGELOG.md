@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa Watch` (widget 0.4.1) keeps the state dot on the agent's name.** A
+  row that carries a subagent tree is taller than a plain one, and the default
+  center alignment slid its dot down beside the caption while every other
+  row's sat on the name. The row now aligns on the first text baseline.
+
 - **`muxa Watch` (widget 0.4.0) now shows the swarm.** Agents with parallel
   work carry a load badge (`◇` subagents, `▸` shells, `+` other children) and
   expand into one line per named Task subagent in flight — the same glyphs as

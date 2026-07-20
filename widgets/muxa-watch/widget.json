@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "dev.barshelf.muxa-watch",
   "name": "muxa Watch",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "icon": "rectangle.3.group.bubble.left.fill",
   "bucket": { "group": "Agents", "order": 10, "size": "L", "pinned": true },
 

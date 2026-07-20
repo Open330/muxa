@@ -456,7 +456,10 @@ function agentRow(
       }),
       ...(options.showSubagents ? subagentRows(agent, rowID) : []),
     ], { spacing: 1, widthFill: true }),
-  ], { id: rowID, spacing: 8 });
+    // Baseline, not the default center: a row grows taller when it carries a
+    // subagent tree, and centering would slide its state dot down beside the
+    // caption while every other row's dot sits on the name.
+  ], { id: rowID, spacing: 8, alignment: "baseline" });
 }
 
 function sortedAgents(agents: MuxaAgent[]): MuxaAgent[] {
