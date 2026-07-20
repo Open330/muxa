@@ -59,23 +59,47 @@ can tell which host governs a row (see reaping guard below).
 
 1. **Host detection** (`backend/mod.rs`, done): `MUXA_HOST=herdr`
    override; auto-detect `HERDR_PANE_ID`/`HERDR_ENV`, ordered
-   `ZELLIJ` → `HERDR` → `TMUX` (newer hosts win nested-env ties; the
-   override is the escape hatch). The daemon usually runs outside any
+   `ZELLIJ` → `HERDR` → `TMUX`. The daemon usually runs outside any
    host env — set `MUXA_HOST=herdr` in its environment (launchd/systemd
    or shell) to observe herdr.
+
+   **Nested-host tie-break — one policy, both places.** Env presence
+   alone can't tell an inner host from an outer one: a herdr pane launched
+   from a tmux shell *inherits* the outer `$TMUX`/`$TMUX_PANE` (empirically
+   verified), and tmux launched inside a herdr pane inherits `$HERDR_*`. muxa
+   resolves the ambiguity **herdr-wins** — launching herdr from a tmux shell
+   is the common migration path, so on a `HERDR_* + TMUX` tie both the host
+   detector (`detect_from`) *and* the hook pane-stamper
+   (`adapters/hook.rs::host_pane_env`) pick herdr. Keeping the two in lockstep
+   is what makes the pane a hook is stamped onto and the backend that observes
+   it agree. **Caveat:** the rarer nesting — tmux running *inside* a herdr
+   pane — is misdetected by this default; set **`MUXA_HOST=tmux`** to force it
+   (the override is honored by both `detect_from` and `host_pane_env`;
+   `MUXA_HOST=herdr`/`zellij` force those hosts analogously).
 2. **`HerdrBackend`** (`backend/herdr.rs`): direct-query `PaneBackend`
    over the socket, tmux-shape (stateless; callers already wrap calls in
-   `spawn_blocking`). Per-call connect with ~1s timeout, matching the
-   tmux command timeout.
+   `spawn_blocking`). Per-call connect with ~1s per-read timeout, matching the
+   tmux command timeout, plus an aggregate ~2× read deadline over the whole
+   reply loop so a server that *streams* unrelated lines faster than the
+   per-read timeout can't loop forever and wedge a reconcile/watch refresh
+   (the per-read timeout resets on every line; only the aggregate deadline
+   bounds the total).
    - `list_panes` → `pane.list` + per-pane `pane.process_info` to fill
      `current_command`/`pane_pid`/`tty`. Mapping into muxa `PaneInfo`:
      `session` = herdr `workspace_id`, `window_index` = `tab_id`,
      `pane_index` = raw herdr pane id, `current_path` = `cwd`,
      `socket` = `None` (never reuse the tmux-socket identity channel).
+     Per-pane enrichment is bounded by a total time budget: once spent, the
+     remaining panes return with empty process fields rather than let a slow
+     server turn one `pane.list` into an N×1s stall.
    - `observe_panes` → `complete` on a successful query; `complete(empty)`
-     when the socket file is absent (server truly down ⇒ its panes are
-     gone, tmux semantics); `incomplete` on connect/protocol errors or
-     timeout (transient ⇒ must not reap).
+     **only** when the socket file is authoritatively absent
+     (`try_exists() == Ok(false)` ⇒ server truly down ⇒ its panes are gone,
+     tmux semantics); `incomplete` on connect/protocol errors, timeout, *or a
+     stat that errors* (`try_exists() == Err` — EACCES/EIO/stalled automount;
+     transient ⇒ must not reap). Using `try_exists` rather than `exists` is
+     what keeps a stat error from being swallowed as an authoritative empty
+     and triggering a mass reap.
    - `capture_pane` → `pane.read` (`visible`), `focus_pane` → `pane.focus`,
      `pane_pid_map` → shell pids from `pane.process_info`,
      `current_pane` → `$HERDR_PANE_ID` (prefixed).
@@ -94,6 +118,23 @@ can tell which host governs a row (see reaping guard below).
    (today's behavior). Without this, a tmux-backend daemon reaps live
    herdr rows every reconcile tick (and vice versa) whenever both hosts
    are in use during migration.
+
+   **Foreign-host age-out** (`Store::mark_stale_cross_host_stopped`): the
+   guard exempts a foreign-host row from *immediate* reaping, but a
+   single-backend daemon never observes those panes at all and the GC only
+   evicts `Stopped` rows — so a `herdr:` row left in `state.json` after the
+   operator switches the daemon back to tmux would ghost forever. Each
+   reconcile tick the reconciler flips foreign-host rows (pane id classifies
+   to a host *not* in the active observing set) to `Stopped` after the same
+   inactivity window the paneless orphan sweep uses
+   (`[reconciler] paneless_stale_timeout_secs`, default 86400), after which
+   the existing GC removes them. A genuinely-live remote row keeps itself
+   alive by emitting activity; a dead one ages out. The check takes a *set*
+   of observing kinds (today always the one active backend) so a future
+   multi-host daemon can pass several without changing shape. Note
+   `muxa prune` targets *paneless* orphans only — a foreign-host row still
+   carries its `herdr:`/`zellij:` pane id, so this age-out (not `prune`) is
+   what clears it.
 5. **CLI attach** (`main.rs jump_to_pane`, done): `HostKind::Herdr` arm →
    `focus_pane`, zellij-shape.
 
@@ -144,10 +185,15 @@ can tell which host governs a row (see reaping guard below).
    (`tmux::scanner::scan`), which sees nothing on a herdr host. The daemon
    now threads its active `SharedBackend` into the dashboard `AppState`;
    the pane-cache refresh closure branches on `backend.kind() ==
-   HostKind::Herdr` and folds `HerdrBackend::list_panes()` (a blocking
-   socket call, so `spawn_blocking`) into the scanner's `ScanResult` shape
-   via `tmux::scanner::herdr_scan_result`. Both `/api/panes` and the
-   timeline handler's pane→session map go through the same refresh, so
+   HostKind::Herdr` and runs **both** the tmux `scanner::scan` *and*
+   `HerdrBackend::list_panes()` (a blocking socket call, so `spawn_blocking`,
+   folded into the scanner's `ScanResult` shape via
+   `tmux::scanner::herdr_scan_result`), then concatenates them
+   (`merge_pane_scans`) — herdr panes appended onto the tmux scan, tmux
+   per-socket errors preserved in `errors`. Running only the herdr side would
+   drop live tmux panes during a mixed-host migration (they'd vanish from
+   `/api/panes` and the timeline); merging keeps both. Both `/api/panes` and
+   the timeline handler's pane→session map go through the same refresh, so
    they agree on herdr. Field mapping reuses the muxa `PaneInfo` the
    backend already returns (`pane_id` `herdr:<id>`, `session` =
    `workspace_id`, `window_index` = `tab_id`, `pane_index` = raw id,

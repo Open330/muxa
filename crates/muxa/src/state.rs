@@ -1453,6 +1453,92 @@ impl Store {
         flipped
     }
 
+    /// Age out rows whose pane belongs to a host **no active observation
+    /// governs**, flipping them to `Stopped` after `threshold` of inactivity
+    /// so the regular GC can reap them. Returns the number flipped.
+    ///
+    /// This closes the flip side of the cross-host reaping guard. That guard
+    /// (see [`pane_is_live`]) deliberately exempts a foreign-host row from
+    /// *immediate* reaping — a tmux-backend daemon physically cannot see a
+    /// `herdr:`/`zellij:` pane, so its absence from a tmux scan is not death.
+    /// But a single-backend daemon never observes those panes at all, and the
+    /// GC only evicts `Stopped` rows — so without an age-out a foreign-host
+    /// row (e.g. a `herdr:` row left in `state.json` after the operator
+    /// switched the daemon back to tmux) would ghost forever. Flipping to
+    /// `Stopped` after the same inactivity window as
+    /// [`Self::mark_stale_paneless_stopped`] lets a genuinely-live remote row
+    /// keep itself alive by emitting activity, while a truly dead one ages out.
+    ///
+    /// `observing_kinds` is the set of hosts that *do* have a live observation
+    /// this pass (today always exactly one — the daemon's single active
+    /// backend — but taking a slice lets a future multi-host daemon pass
+    /// several without changing the shape). A row is foreign, and therefore a
+    /// candidate, only when its pane id classifies to a known host
+    /// ([`crate::backend::pane_id_host_kind`]) that is *not* in this set.
+    /// Same-host rows (governed by `reconcile`) and unclassifiable/paneless
+    /// rows (governed by the normal reap / `mark_stale_paneless_stopped`
+    /// paths) are left untouched.
+    ///
+    /// Conservative by construction, mirroring [`Self::mark_stale_paneless_stopped`]:
+    /// `threshold == Duration::ZERO` disables the sweep; `Task` and
+    /// pid-tracked rows are excluded (process liveness owns them); already
+    /// `Stopped` rows are skipped.
+    pub async fn mark_stale_cross_host_stopped(
+        &self,
+        observing_kinds: &[HostKind],
+        threshold: Duration,
+    ) -> usize {
+        if threshold.is_zero() {
+            return 0;
+        }
+        let cutoff = OffsetDateTime::now_utc() - threshold;
+        let mut agents = self.agents.write().await;
+        let mut flipped = 0_usize;
+        for agent in agents.values_mut() {
+            if agent.kind == AgentKind::Task || agent.pid.is_some() {
+                continue;
+            }
+            if agent.state == AgentState::Stopped {
+                continue;
+            }
+            // Only rows whose pane classifies to a host NOT currently
+            // observed — those are the ones no live observation can reap.
+            let Some(pane_id) = agent.pane.as_deref() else {
+                continue;
+            };
+            let Some(host) = crate::backend::pane_id_host_kind(pane_id) else {
+                continue;
+            };
+            if observing_kinds.contains(&host) {
+                continue;
+            }
+            if agent.last_activity_at > cutoff {
+                continue;
+            }
+            let prev = agent.state;
+            let now = OffsetDateTime::now_utc();
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = now;
+            // Measure the GC's Stopped-row TTL from when we gave up on the
+            // row, not from its last real activity — same rationale as
+            // `mark_stale_paneless_stopped`.
+            agent.last_activity_at = now;
+            flipped += 1;
+            // Same broadcast shape as `apply`/`mark_stale_paneless_stopped`
+            // so live subscribers see the row go Stopped immediately.
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: Arc::new(agent.clone()),
+            });
+        }
+        if flipped > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+        }
+        flipped
+    }
+
     /// Refresh pane-backed workload summaries from the latest OS
     /// process-tree scan. This is metadata enrichment only: it must not
     /// touch `last_activity_at`, `state_entered_at`, or emit transitions,
@@ -2089,6 +2175,97 @@ mod tests {
         assert_ne!(
             store.by_session("orphan2").await.unwrap().state,
             AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_stale_cross_host_ages_out_only_foreign_host_stale_rows() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC); // long before "now"
+        let fresh = OffsetDateTime::now_utc();
+
+        let started = |sid: &str, pane: &str, at| AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                cwd: None,
+            },
+            at,
+        };
+
+        // A tmux daemon observing tmux. A stale `herdr:` row is foreign and
+        // unobservable ⇒ must age out. A fresh `herdr:` row is spared by the
+        // age gate. A stale tmux `%N` row is same-host (governed by reconcile)
+        // ⇒ untouched here.
+        store.apply(&started("herdr-stale", "herdr:p1", old)).await;
+        store
+            .apply(&started("herdr-fresh", "herdr:p2", fresh))
+            .await;
+        store.apply(&started("tmux-stale", "%1", old)).await;
+
+        let flipped = store
+            .mark_stale_cross_host_stopped(&[HostKind::Tmux], Duration::from_secs(86_400))
+            .await;
+        assert_eq!(flipped, 1, "only the stale foreign-host row should flip");
+        assert_eq!(
+            store.by_session("herdr-stale").await.unwrap().state,
+            AgentState::Stopped,
+        );
+        assert_ne!(
+            store.by_session("herdr-fresh").await.unwrap().state,
+            AgentState::Stopped,
+            "a fresh foreign-host row keeps itself alive via activity",
+        );
+        assert_ne!(
+            store.by_session("tmux-stale").await.unwrap().state,
+            AgentState::Stopped,
+            "same-host reaping is unchanged — reconcile governs it, not this sweep",
+        );
+
+        // Idempotent, and a zero threshold disables the sweep.
+        assert_eq!(
+            store
+                .mark_stale_cross_host_stopped(&[HostKind::Tmux], Duration::from_secs(86_400))
+                .await,
+            0,
+        );
+        assert_eq!(
+            store
+                .mark_stale_cross_host_stopped(&[HostKind::Tmux], Duration::ZERO)
+                .await,
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_stale_cross_host_spares_rows_of_an_observed_host() {
+        // A herdr daemon observing herdr must NOT age out its own `herdr:`
+        // rows even when stale — reconcile governs same-host liveness.
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "herdr-own".into(),
+                    surface: None,
+                    pane: Some("herdr:p9".into()),
+                    cwd: None,
+                },
+                at: old,
+            })
+            .await;
+        let flipped = store
+            .mark_stale_cross_host_stopped(&[HostKind::Herdr], Duration::from_secs(86_400))
+            .await;
+        assert_eq!(flipped, 0);
+        assert_ne!(
+            store.by_session("herdr-own").await.unwrap().state,
+            AgentState::Stopped,
         );
     }
 

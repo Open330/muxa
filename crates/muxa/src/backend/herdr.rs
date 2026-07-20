@@ -22,8 +22,10 @@
 //! `{"id":"muxa-<n>","method":…,"params":{…}}` and read response lines
 //! until one echoes our `id`, skipping anything else (a concurrent
 //! subscription event, a stale reply). Read/write are bounded by a ~1s
-//! timeout matching [`crate::tmux`]'s `TMUX_COMMAND_TIMEOUT`, so a wedged
-//! server can't hold a watch refresh open. A success carries a
+//! per-read timeout matching [`crate::tmux`]'s `TMUX_COMMAND_TIMEOUT`, plus
+//! an aggregate ~2× read deadline over the whole reply loop so a server that
+//! *streams* unrelated lines sub-timeout can't wedge a watch refresh open. A
+//! success carries a
 //! `type`-tagged `result`; an `error` object (or a malformed line, or a
 //! timeout) degrades the call the way a host-down backend would — empty
 //! vec / `None` / `false`, never a panic.
@@ -35,7 +37,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -100,11 +102,12 @@ impl HerdrBackend {
     /// (must not drive destructive reaping) — see [`Self::observe_panes`].
     fn request(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
         // A missing socket file means no server is listening — distinct
-        // from a connect/timeout error because it is authoritative:
-        // there are no herdr panes to observe.
-        if !self.socket_path.exists() {
-            return Err(HerdrError::SocketMissing);
-        }
+        // from a connect/timeout error because it is authoritative: there
+        // are no herdr panes to observe. `try_exists()` (not `exists()`)
+        // so a stat that *errors* — EACCES, EIO, a stalled automount — maps
+        // to a transient `Io` error rather than being swallowed as an
+        // authoritative "socket absent" and triggering a mass reap.
+        classify_socket_presence(self.socket_path.try_exists())?;
 
         let mut stream = UnixStream::connect(&self.socket_path).map_err(map_io)?;
         stream
@@ -127,8 +130,19 @@ impl HerdrBackend {
         // Read lines until one echoes our id. Skip non-matching lines
         // (subscription events carry no `id`; stale/foreign replies carry
         // a different one) and unparsable noise.
+        //
+        // The per-read socket timeout resets on every line, so a chatty
+        // server that streams unrelated lines *faster* than that timeout
+        // would loop here forever and wedge the reconciler / watch refresh.
+        // Bound the whole read with an aggregate wall-clock deadline
+        // (~2× the per-read timeout — enough for a healthy server's reply
+        // to arrive after at most one skipped line, but not unbounded).
+        let deadline = Instant::now() + self.timeout.saturating_mul(2);
         let reader = BufReader::new(&stream);
         for line in reader.lines() {
+            if Instant::now() >= deadline {
+                return Err(HerdrError::Timeout);
+            }
             let line = line.map_err(map_io)?;
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -178,10 +192,21 @@ impl HerdrBackend {
             .cloned()
             .and_then(|p| serde_json::from_value(p).ok())
             .ok_or(HerdrError::Protocol("pane.list missing panes"))?;
+        // Per-pane `pane.process_info` enrichment is a full socket round-trip
+        // each, so N panes cost N× serial worst-case against a slow server.
+        // Cap the *total* enrichment time per list so one wedged server can't
+        // turn a single `pane.list` into an N-second stall: once the budget
+        // is spent we return the remaining panes with empty process fields
+        // (degraded `current_command`/`pane_pid`/`tty`) rather than block.
+        let enrich_deadline = Instant::now() + self.timeout.saturating_mul(2);
         Ok(panes
             .iter()
             .map(|pane| {
-                let process = self.process_info(&pane.pane_id);
+                let process = if Instant::now() < enrich_deadline {
+                    self.process_info(&pane.pane_id)
+                } else {
+                    None
+                };
                 to_pane_info(pane, process.as_ref())
             })
             .collect())
@@ -383,6 +408,21 @@ fn strip_prefix(pane_id: &str) -> &str {
     pane_id.strip_prefix(PANE_ID_PREFIX).unwrap_or(pane_id)
 }
 
+/// Classify a `try_exists()` result on the socket path. `Ok(false)` is the
+/// authoritative "no server listening" signal (`SocketMissing` — reaping may
+/// proceed); `Ok(true)` clears the check; an `Err` (EACCES, EIO, a stalled
+/// automount) is transient — mapped to `Io` so `observe_panes` yields
+/// `incomplete` and destructive reaping is withheld. Split out from
+/// [`HerdrBackend::request`] so the three-way mapping is unit-testable without
+/// having to provoke a real stat error.
+fn classify_socket_presence(exists: std::io::Result<bool>) -> Result<(), HerdrError> {
+    match exists {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(HerdrError::SocketMissing),
+        Err(_) => Err(HerdrError::Io),
+    }
+}
+
 /// Map an I/O failure to the classification `observe_panes` needs: a read
 /// that hit the socket timeout surfaces as `WouldBlock`/`TimedOut`, which
 /// we tag distinctly from other transport errors for clearer logs (both
@@ -529,6 +569,11 @@ mod tests {
         ForeignIdThen(Value),
         /// Accept the connection but never answer — drives the timeout.
         Hang,
+        /// Stream unrelated (foreign-id) lines faster than the per-read
+        /// timeout and never send the matching reply — drives the aggregate
+        /// read deadline (a per-read timeout alone would reset on every line
+        /// and loop forever).
+        Chatter,
     }
 
     /// Spin a `UnixListener` on a temp path, answering each connection via
@@ -582,6 +627,18 @@ mod tests {
                     Reply::Hang => {
                         // Hold the connection open with no reply.
                         thread::sleep(Duration::from_secs(30));
+                    }
+                    Reply::Chatter => {
+                        // Flood foreign-id lines sub-timeout, forever. The
+                        // client must bail at its aggregate read deadline
+                        // rather than loop on the resetting per-read timeout.
+                        loop {
+                            write_line(
+                                &mut stream,
+                                &json!({ "id": "muxa-foreign", "result": { "type": "ok" } }),
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
                     }
                 }
             }
@@ -712,6 +769,46 @@ mod tests {
             "a timeout is transient — must not authorize reaping",
         );
         assert!(observation.panes.is_empty());
+    }
+
+    #[test]
+    fn classify_socket_presence_maps_each_variant() {
+        // Present ⇒ proceed.
+        assert!(classify_socket_presence(Ok(true)).is_ok());
+        // Authoritatively absent ⇒ SocketMissing (reap-safe).
+        assert!(matches!(
+            classify_socket_presence(Ok(false)),
+            Err(HerdrError::SocketMissing),
+        ));
+        // Stat *errored* (EACCES/EIO/stalled automount) ⇒ transient Io, NOT
+        // an authoritative empty — this is the whole point of `try_exists`.
+        assert!(matches!(
+            classify_socket_presence(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            Err(HerdrError::Io),
+        ));
+    }
+
+    #[test]
+    fn observe_panes_incomplete_on_chatty_server() {
+        // The server streams unrelated (foreign-id) lines forever, faster
+        // than the per-read timeout — so only the aggregate read deadline can
+        // end the call. Without it the client loops on the resetting per-read
+        // timeout indefinitely and wedges the reconciler.
+        let (socket, _dir) = spawn_server(|_| Reply::Chatter);
+        let backend = backend_at(&socket).with_timeout(Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let observation = backend.observe_panes();
+        assert!(
+            !observation.is_complete(),
+            "an aggregate-deadline timeout is transient — must not authorize reaping",
+        );
+        assert!(observation.panes.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "call must bail at the ~2× aggregate deadline, not loop on chatter",
+        );
     }
 
     #[test]

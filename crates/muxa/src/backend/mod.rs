@@ -325,22 +325,25 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
 ///
 /// Resolution order:
 ///
-/// 1. **`MUXA_HOST`** — if set to `"tmux"` or `"zellij"` (case-insensitive),
-///    that wins regardless of what `TMUX` / `ZELLIJ` look like. Provides
-///    an unambiguous override for nested-multiplexer setups (e.g. zellij
-///    inside tmux, or `tmux new-session` from inside zellij) where
-///    auto-detect can't tell which host the current shell really lives in.
-///    Other values are ignored (treated as unset) so a typo doesn't pin
-///    the daemon to the wrong host silently.
+/// 1. **`MUXA_HOST`** — if set to `"tmux"`, `"zellij"`, or `"herdr"`
+///    (case-insensitive), that wins regardless of what `TMUX` / `ZELLIJ` /
+///    `HERDR_*` look like. Provides an unambiguous override for
+///    nested-multiplexer setups (zellij inside tmux, `tmux new-session` from
+///    inside a herdr pane, …) where auto-detect can't tell which host the
+///    current shell really lives in. Other values are ignored (treated as
+///    unset) so a typo doesn't pin the daemon to the wrong host silently.
 /// 2. **`ZELLIJ`** set → [`HostKind::Zellij`].
-/// 3. **`TMUX`** set → [`HostKind::Tmux`].
+/// 3. **`HERDR_PANE_ID` / `HERDR_ENV`** set → [`HostKind::Herdr`].
+/// 4. **`TMUX`** set → [`HostKind::Tmux`].
 ///
-/// When both `TMUX` and `ZELLIJ` are present, zellij wins by default.
-/// The env doesn't carry "which one was set last" ordering, so this is
-/// a pragmatic pick rather than a principled one — `MUXA_HOST` is the
-/// escape hatch for the case where the auto-detect picks wrong.
+/// The tie-break for nested hosts (all ancestors' vars are inherited) is
+/// **newer host wins**: zellij, then herdr, then tmux. Launching herdr *from*
+/// a tmux shell is the common migration path, so herdr beats tmux on a
+/// presence tie — matching the hook adapter's `host_pane_env` so the pane a
+/// hook is stamped onto and the backend that observes it always agree. The
+/// rarer nesting (tmux inside a herdr pane) is served by `MUXA_HOST=tmux`.
 ///
-/// Returns `None` outside both hosts; callers fall through to a no-op
+/// Returns `None` outside all hosts; callers fall through to a no-op
 /// backend in that case.
 pub fn detect_host_env() -> Option<HostKind> {
     detect_from(|name| std::env::var(name).ok())
@@ -369,9 +372,11 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
 
     // 2.–4. Auto-detect from host-set env vars. Ordering is a tie-break
     // for nested hosts (all ancestors' vars are inherited): newer hosts
-    // are checked before tmux on the assumption that running tmux *inside*
-    // herdr/zellij is rarer than the reverse migration path. Nested users
-    // for whom this guesses wrong have the `MUXA_HOST` override.
+    // are checked before tmux because launching herdr/zellij *from* a tmux
+    // shell is the common migration path — and the inner shell inherits the
+    // outer `$TMUX`, so it can't be disambiguated by presence alone. The
+    // rarer nesting (tmux inside a herdr pane) uses the `MUXA_HOST` override.
+    // `host_pane_env` in the hook adapter mirrors this exact order.
     if read("ZELLIJ").is_some() {
         return Some(HostKind::Zellij);
     }
@@ -461,6 +466,37 @@ mod tests {
         assert_eq!(
             detect_from(env_reader(&[("TMUX", "1"), ("ZELLIJ", "1")])),
             Some(HostKind::Zellij),
+        );
+    }
+
+    /// herdr beats tmux on a presence tie (herdr launched from a tmux shell,
+    /// the common migration path). Locks the policy that `host_pane_env`
+    /// mirrors so hook stamping and backend observation agree.
+    #[test]
+    fn detect_prefers_herdr_over_tmux() {
+        assert_eq!(
+            detect_from(env_reader(&[("HERDR_PANE_ID", "9"), ("TMUX", "1")])),
+            Some(HostKind::Herdr),
+        );
+        // `HERDR_ENV` alone (no pane id) still identifies herdr.
+        assert_eq!(
+            detect_from(env_reader(&[("HERDR_ENV", "1"), ("TMUX", "1")])),
+            Some(HostKind::Herdr),
+        );
+    }
+
+    /// `MUXA_HOST=tmux` forces tmux even against a present herdr env — the
+    /// escape hatch for tmux running inside a herdr pane.
+    #[test]
+    fn detect_muxa_host_tmux_overrides_herdr() {
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("MUXA_HOST", "tmux"),
+                ("HERDR_PANE_ID", "9"),
+                ("TMUX", "1"),
+            ])),
+            Some(HostKind::Tmux),
+            "MUXA_HOST=tmux must beat a present HERDR env var",
         );
     }
 

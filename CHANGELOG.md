@@ -83,6 +83,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   card names the fix ("Update muxa Watch") rather than showing a generic
   offline state — and an actionable fault is never hidden behind the
   last-good-render fallback the way a dropped SSH connection is.
+- **herdr backend hardening (review follow-ups).** Several correctness fixes to
+  the herdr support: (1) foreign-host rows the daemon can't observe (e.g. a
+  `herdr:` row left after switching the daemon back to tmux) now age out to
+  `Stopped` after the paneless-orphan timeout instead of ghosting forever;
+  (2) nested-host policy is now consistent — **herdr wins presence ties over
+  tmux** in *both* host detection and hook pane-stamping (herdr launched from
+  a tmux shell is the common case; its shells inherit the outer `$TMUX_PANE`),
+  with `MUXA_HOST=tmux` as the escape hatch for the rarer tmux-inside-herdr
+  nesting; (3) socket presence uses `try_exists()` so a stat error
+  (EACCES/EIO/stalled automount) degrades to a transient error instead of an
+  authoritative "no panes" that mass-reaps; (4) the socket request loop now has
+  an aggregate read deadline (a chatty server streaming unrelated lines can no
+  longer wedge reconcile/watch) and per-`pane.list` process-info enrichment is
+  time-budgeted; (5) the web dashboard on a herdr host now merges the tmux
+  scan with the herdr pane list instead of replacing it, so tmux panes no
+  longer vanish from `/api/panes`/timeline during mixed-host migration. See
+  `docs/HERDR.md`.
 
 - **`code_mode_host` codex sessions now correlate to their tmux pane instead of
   splitting into two rows.** Such a session runs its turns — and fires its

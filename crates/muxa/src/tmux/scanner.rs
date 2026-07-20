@@ -15,16 +15,17 @@
 //! ## Herdr hosts
 //!
 //! Herdr is a single-server-per-user model too, but — unlike zellij — it
-//! ships a socket API that enumerates every pane out of the box, so the
-//! dashboard's `/api/panes` route does *not* go through [`scan`] on a
-//! herdr host. Instead the daemon's active [`HerdrBackend`] answers
-//! `pane.list` directly and the result is folded into the same
-//! [`ScanResult`] shape by [`herdr_scan_result`]. The branch lives in the
-//! dashboard's pane-cache refresh closure (see
-//! `crate::dashboard::server`); the tmux path here is untouched. The
-//! `MUXA_TMUX_SOCKET` scope is a *tmux-socket* concept and never applies
-//! to herdr panes (consistent with the ingest scope gate treating a
-//! socket-less herdr event as in-scope).
+//! ships a socket API that enumerates every pane out of the box. On a herdr
+//! host the dashboard's `/api/panes` refresh runs [`scan`] **and** asks the
+//! daemon's active [`HerdrBackend`] for `pane.list`, then concatenates the
+//! two: the herdr panes (folded into this [`ScanResult`] shape by
+//! [`herdr_scan_result`]) are appended onto the tmux scan. Running only the
+//! herdr side would drop live tmux panes during a mixed-host migration, so
+//! the merge keeps both. That branch lives in the dashboard's pane-cache
+//! refresh closure (see `crate::dashboard::server`); the tmux path here is
+//! untouched. The `MUXA_TMUX_SOCKET` scope is a *tmux-socket* concept and
+//! never applies to herdr panes (consistent with the ingest scope gate
+//! treating a socket-less herdr event as in-scope).
 //!
 //! [`HerdrBackend`]: crate::backend::herdr::HerdrBackend
 //!

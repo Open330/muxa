@@ -38,7 +38,7 @@
 //!
 //! A dropped connection is retried with capped exponential backoff.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -173,15 +173,15 @@ pub fn translate(envelope: &Value, at: OffsetDateTime) -> Result<BridgeUpdate, D
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or(DropReason::MissingPaneId)?;
-    let status = data
-        .get("agent_status")
-        .and_then(Value::as_str)
-        .ok_or(DropReason::Malformed)?;
 
     // `agent` is herdr's canonical slug; `display_agent` is its pretty label.
     // The name (for the visible `model` metadata) prefers the pretty label;
     // the kind is classified from whichever is present. A pane with neither is
-    // a plain shell — nothing to synthesize.
+    // agent-less — herdr sees a plain shell (or the agent just exited). We
+    // resolve the name BEFORE the status so an agent-less envelope is reported
+    // as `NoAgent` even when it carries no `agent_status`; the caller
+    // ([`ingest_envelope`]) turns that into a "stop the synthetic row if the
+    // pane still has one" action rather than a silent drop.
     let canonical = data
         .get("agent")
         .and_then(Value::as_str)
@@ -192,6 +192,11 @@ pub fn translate(envelope: &Value, at: OffsetDateTime) -> Result<BridgeUpdate, D
         .filter(|s| !s.is_empty());
     let name = display.or(canonical).ok_or(DropReason::NoAgent)?;
     let kind = classify_agent(canonical.unwrap_or(name));
+
+    let status = data
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .ok_or(DropReason::Malformed)?;
 
     let pane_id = format!("{PANE_ID_PREFIX}{raw_pane}");
     // herdr panes carry no tmux socket, so the synthetic session id is the
@@ -251,18 +256,27 @@ pub fn translate(envelope: &Value, at: OffsetDateTime) -> Result<BridgeUpdate, D
     })
 }
 
+/// True when a bridge row already owning `pane` (a real, hook-driven,
+/// non-synthetic occupant) must be treated as owning it authoritatively.
+///
+/// A `Stopped` occupant does NOT own the pane: GC keeps a `Stopped` row around
+/// for up to an hour, and a fresh (hook-less) agent launched in that same pane
+/// during that window would otherwise be invisible to the bridge the whole
+/// time. So only NON-`Stopped` non-synthetic occupants block a bridge update.
+fn occupant_is_authoritative(agent: &Agent) -> bool {
+    !agent.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) && agent.state != AgentState::Stopped
+}
+
 /// Apply a translated update, enforcing the hook-authoritative rule: if a
-/// non-synthetic (real hook) row already owns the pane, drop the bridge update
-/// wholesale.
+/// *live* non-synthetic (real hook) row already owns the pane, drop the bridge
+/// update wholesale. A `Stopped` real row is a stale tombstone, not an owner —
+/// see [`occupant_is_authoritative`].
 async fn apply_update(store: &SharedStore, update: BridgeUpdate) {
     let occupants = store.by_pane(&update.pane_id).await;
-    if occupants
-        .iter()
-        .any(|a| !a.session_id.starts_with(SYNTHETIC_SESSION_PREFIX))
-    {
+    if occupants.iter().any(occupant_is_authoritative) {
         tracing::debug!(
             pane = %update.pane_id,
-            "herdr bridge: pane owned by a hooked agent, dropping bridge update",
+            "herdr bridge: pane owned by a live hooked agent, dropping bridge update",
         );
         return;
     }
@@ -271,15 +285,110 @@ async fn apply_update(store: &SharedStore, update: BridgeUpdate) {
     }
 }
 
+/// The muxa-namespaced pane id of an agent-less `pane.agent_status_changed`
+/// envelope (herdr reports `agent = null` when an agent exits but the pane's
+/// shell stays open). `None` if the envelope carries no usable `pane_id`.
+fn agentless_pane_id(envelope: &Value) -> Option<String> {
+    let raw = envelope
+        .get("data")
+        .and_then(|d| d.get("pane_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    Some(format!("{PANE_ID_PREFIX}{raw}"))
+}
+
+/// Herdr says this pane has no agent. If a *synthetic* bridge row is still
+/// mirroring an agent there, stop it — otherwise its last state (`Working` /
+/// `WaitingInput`) would freeze forever: the pane's shell is alive (so the
+/// reconciler won't reap it) and the row isn't `Stopped` (so GC won't evict
+/// it). Emitting `SessionEnded` drives the synthetic row to `Stopped`, after
+/// which GC can reclaim it. A pane with no synthetic row is left untouched (no
+/// row is invented), and a real hook row is never disturbed by this path.
+async fn stop_agentless_synthetic(store: &SharedStore, pane_id: &str) {
+    let occupants = store.by_pane(pane_id).await;
+    for occ in occupants {
+        if !occ.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) || occ.state == AgentState::Stopped
+        {
+            // Real hook rows are not ours to stop; already-`Stopped` synthetic
+            // rows need no further event.
+            continue;
+        }
+        let id = AgentId {
+            kind: occ.kind,
+            session_id: occ.session_id.clone(),
+            surface: occ.surface.clone(),
+            pane: occ.pane.clone(),
+            tmux_socket: None,
+            cwd: occ.cwd.clone(),
+        };
+        store
+            .apply(&AgentEvent::SessionEnded {
+                id,
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        tracing::debug!(pane = %pane_id, "herdr bridge: agent gone, stopped synthetic row");
+    }
+}
+
 /// Translate a wire/seed envelope and, when it yields an update, apply it.
 async fn ingest_envelope(store: &SharedStore, envelope: &Value) {
     match translate(envelope, OffsetDateTime::now_utc()) {
         Ok(update) => apply_update(store, update).await,
-        // Unknown status / plain shells are routine — keep them off the debug
-        // stream so the log isn't swamped on a busy session.
-        Err(DropReason::StatusUnknown | DropReason::NoAgent) => {}
+        // Agent gone: herdr no longer attributes an agent to this pane. If a
+        // synthetic bridge row is still mirroring one there, stop it so it
+        // doesn't freeze; otherwise it's a plain shell and a no-op.
+        Err(DropReason::NoAgent) => {
+            if let Some(pane) = agentless_pane_id(envelope) {
+                stop_agentless_synthetic(store, &pane).await;
+            }
+        }
+        // Unknown status is routine — keep it off the debug stream so the log
+        // isn't swamped on a busy session.
+        Err(DropReason::StatusUnknown) => {}
         Err(reason) => tracing::debug!(?reason, "herdr bridge: dropped event"),
     }
+}
+
+/// A compact, comparable fingerprint of a pane's herdr-reported agent state
+/// (`agent` + `display_agent` + `agent_status`). The rescan loop keeps the
+/// last-observed signature per pane so it re-ingests a pane ONLY when its
+/// status actually drifted — re-ingesting an unchanged pane would needlessly
+/// bump the synthetic row's activity timestamp every rescan tick. The `\u{1}`
+/// separator can't appear in an agent name or status, so distinct field tuples
+/// never collide.
+fn status_signature(agent: Option<&str>, display: Option<&str>, status: &str) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}",
+        agent.unwrap_or(""),
+        display.unwrap_or(""),
+        status
+    )
+}
+
+/// The `(raw_pane_id, signature)` of a live `pane.agent_status_changed`
+/// envelope, so the rescan loop's `seen` map can be kept current from streamed
+/// deltas too (not just from `pane.list`). `None` for non-status events or an
+/// envelope with no `pane_id`.
+fn envelope_signature(envelope: &Value) -> Option<(String, String)> {
+    if envelope.get("event").and_then(Value::as_str) != Some(AGENT_STATUS_EVENT) {
+        return None;
+    }
+    let data = envelope.get("data")?;
+    let raw = data
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let status = data
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let sig = status_signature(
+        data.get("agent").and_then(Value::as_str),
+        data.get("display_agent").and_then(Value::as_str),
+        status,
+    );
+    Some((raw.to_owned(), sig))
 }
 
 /// One herdr pane's current agent state, as read from `pane.list`.
@@ -303,6 +412,15 @@ impl HerdrPane {
                 "agent_status": self.agent_status,
             },
         })
+    }
+
+    /// This pane's current status fingerprint (see [`status_signature`]).
+    fn signature(&self) -> String {
+        status_signature(
+            self.agent.as_deref(),
+            self.display_agent.as_deref(),
+            &self.agent_status,
+        )
     }
 }
 
@@ -430,9 +548,21 @@ async fn connect_and_stream(
         "herdr event bridge subscribed to {AGENT_STATUS_EVENT}",
     );
 
-    // Seed current state — subscribing streams only *future* changes.
+    // Seed current state — subscribing streams only *future* changes. Record
+    // each pane's signature so the rescan below can tell real drift from noise.
+    //
+    // Seed/subscribe race: the `pane.list` snapshot above was taken on a
+    // *separate* connection a moment before this subscription went live, so a
+    // status change landing in that gap is in neither the seed nor the stream.
+    // The status-aware rescan (below) is the backstop: within one
+    // `RESCAN_INTERVAL` it re-lists, notices any pane whose signature no longer
+    // matches `seen`, and re-ingests it — healing both the seed/subscribe gap
+    // *and* any single delta the stream might drop. (This is why the rescan
+    // compares per-pane status, not just the pane *set*.)
+    let mut seen: HashMap<String, String> = HashMap::new();
     for pane in &panes {
         ingest_envelope(store, &pane.as_envelope()).await;
+        seen.insert(pane.pane_id.clone(), pane.signature());
     }
 
     let known: HashSet<String> = pane_ids.into_iter().collect();
@@ -449,6 +579,11 @@ async fn connect_and_stream(
                         // Events carry `event`; the subscribe ack carries `id`.
                         if value.get("event").is_some() {
                             ingest_envelope(store, &value).await;
+                            // Keep `seen` current from the stream so the next
+                            // rescan doesn't redundantly re-ingest this pane.
+                            if let Some((pane, sig)) = envelope_signature(&value) {
+                                seen.insert(pane, sig);
+                            }
                         }
                     }
                 }
@@ -460,10 +595,24 @@ async fn connect_and_stream(
             },
             _ = rescan.tick() => {
                 if let Some(current) = list_panes(socket_path).await {
-                    let current: HashSet<String> =
-                        current.into_iter().map(|p| p.pane_id).collect();
-                    if current != known {
+                    let current_ids: HashSet<String> =
+                        current.iter().map(|p| p.pane_id.clone()).collect();
+                    if current_ids != known {
+                        // Pane set changed — reconnect so new panes get
+                        // subscribed (herdr has no wildcard subscription) and
+                        // closed panes get dropped from the seen map on the
+                        // fresh connect.
                         return ConnOutcome::StreamEnded("pane set changed");
+                    }
+                    // Same pane set: heal any status drift (a lost delta or the
+                    // seed/subscribe race) by re-ingesting only panes whose
+                    // signature changed since we last observed them.
+                    for pane in &current {
+                        let sig = pane.signature();
+                        if seen.get(&pane.pane_id) != Some(&sig) {
+                            ingest_envelope(store, &pane.as_envelope()).await;
+                            seen.insert(pane.pane_id.clone(), sig);
+                        }
                     }
                 }
             }
@@ -732,12 +881,80 @@ async fn send_report(socket_path: &Path, report: &HerdrReport, seq: u64) {
     }
 }
 
+/// Fold one just-sent decision into the running "panes muxa has reported as
+/// authoritative" set that [`resync_reports`] diffs against on a lag. A
+/// `Report` records the pane→slug; a `Release` forgets it.
+fn track_report(reported: &mut HashMap<String, String>, report: &HerdrReport) {
+    match report {
+        HerdrReport::Report { pane_id, agent, .. } => {
+            reported.insert(pane_id.clone(), agent.clone());
+        }
+        HerdrReport::Release { pane_id, .. } => {
+            reported.remove(pane_id);
+        }
+    }
+}
+
+/// Recompute the full set of reverse-path calls needed to re-assert muxa's
+/// authority after the transition stream *lagged* (a burst overran the
+/// broadcast buffer and dropped transitions). Because we don't know which
+/// edges were dropped — possibly the only `…→Stopped` edge that would have
+/// released a pane — we rebuild from a store snapshot:
+///
+/// * report every currently-reportable REAL `herdr:` row (idempotent for herdr:
+///   the monotonic `seq` and `source` make a re-report harmless), and
+/// * release any pane we *previously* reported that has no reportable row in
+///   the snapshot anymore — its agent stopped or its row was GC-evicted during
+///   the gap, so herdr is still holding muxa's last state for a pane muxa no
+///   longer tracks.
+///
+/// Pure and total over its inputs, so the decision logic is unit-testable.
+/// `previously_reported` maps a bare herdr pane id to the agent slug last
+/// reported for it. Returns `(calls to send in order, the new reported set)`.
+fn resync_reports(
+    agents: &[Agent],
+    previously_reported: &HashMap<String, String>,
+) -> (Vec<HerdrReport>, HashMap<String, String>) {
+    let mut calls = Vec::new();
+    let mut now_reported: HashMap<String, String> = HashMap::new();
+    for agent in agents {
+        let Some(report) = report_decision(agent) else {
+            continue;
+        };
+        if let HerdrReport::Report { pane_id, agent, .. } = &report {
+            now_reported.insert(pane_id.clone(), agent.clone());
+        }
+        calls.push(report);
+    }
+    // Release panes we had reported that produced no call this pass — their row
+    // is gone entirely (a Stopped row GC-evicted, or reaped mid-gap), so herdr
+    // would otherwise keep muxa-authoritative state for a dead pane forever.
+    for (pane, slug) in previously_reported {
+        let handled = now_reported.contains_key(pane)
+            || calls
+                .iter()
+                .any(|c| matches!(c, HerdrReport::Release { pane_id, .. } if pane_id == pane));
+        if !handled {
+            calls.push(HerdrReport::Release {
+                pane_id: pane.clone(),
+                agent: slug.clone(),
+            });
+        }
+    }
+    (calls, now_reported)
+}
+
 /// Subscribe to the store's transition stream and push every REAL row's state
 /// change on a `herdr:` pane into herdr. Runs until shutdown or the store's
 /// broadcast channel closes.
 async fn run_report(store: SharedStore, socket_path: PathBuf, shutdown_tx: broadcast::Sender<()>) {
     let mut rx = store.subscribe();
     let mut shutdown_rx = shutdown_tx.subscribe();
+    // Panes muxa has reported as authoritative to herdr (bare pane id -> agent
+    // slug), kept current on every send so a lag-driven resync knows which
+    // panes to release when their `…→Stopped` edge was among the dropped
+    // transitions.
+    let mut reported: HashMap<String, String> = HashMap::new();
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -747,15 +964,26 @@ async fn run_report(store: SharedStore, socket_path: PathBuf, shutdown_tx: broad
             msg = rx.recv() => match msg {
                 Ok(transition) => {
                     if let Some(report) = report_decision(transition.agent.as_ref()) {
+                        track_report(&mut reported, &report);
                         send_report(&socket_path, &report, next_seq()).await;
                     }
                 }
-                // A slow send while herdr was wedged let transitions pile up.
-                // Reporting is best-effort and each transition carries the full
-                // post-state, so skipping the gap is harmless — the next
-                // transition re-reports current truth.
+                // A slow send while herdr was wedged let transitions overrun the
+                // broadcast buffer. We can't skip the gap: a dropped `…→Stopped`
+                // edge would leave herdr muxa-authoritative for a dead agent
+                // forever (a Stopped row emits no further transition). Resync the
+                // whole reverse path from a store snapshot instead.
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "herdr report path lagged behind transitions");
+                    tracing::warn!(
+                        dropped = n,
+                        "herdr report path lagged; resyncing reverse path from store snapshot",
+                    );
+                    let snapshot = store.snapshot().await;
+                    let (calls, new_reported) = resync_reports(&snapshot, &reported);
+                    reported = new_reported;
+                    for report in &calls {
+                        send_report(&socket_path, report, next_seq()).await;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
@@ -993,6 +1221,116 @@ mod tests {
         assert_eq!(rows[0].state, AgentState::Idle, "unchanged by the bridge");
     }
 
+    #[tokio::test]
+    async fn stopped_real_row_does_not_block_bridge() {
+        // A real hook row that has gone `Stopped` is a stale tombstone GC keeps
+        // for up to an hour — it must NOT suppress a fresh (hook-less) agent
+        // the bridge detects in the same pane.
+        let store = Store::shared();
+        let id = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "real".into(),
+            surface: None,
+            pane: Some("herdr:w1:p1".into()),
+            tmux_socket: None,
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: AT,
+            })
+            .await;
+        store.apply(&AgentEvent::SessionEnded { id, at: AT }).await;
+
+        let working = translate(&status_event("cursor", "Cursor", "working", "w1:p1"), AT).unwrap();
+        apply_update(&store, working).await;
+
+        let rows = store.by_pane("herdr:w1:p1").await;
+        assert!(
+            rows.iter()
+                .any(|r| r.session_id == "real" && r.state == AgentState::Stopped),
+            "the stale Stopped real row is left in place",
+        );
+        let synth = rows
+            .iter()
+            .find(|r| r.session_id.starts_with(SYNTHETIC_SESSION_PREFIX))
+            .expect("bridge synthetic row applied over the Stopped tombstone");
+        assert_eq!(synth.state, AgentState::Working);
+    }
+
+    #[tokio::test]
+    async fn agent_gone_stops_synthetic_row() {
+        // herdr detects an agent, then it exits while the shell stays open
+        // (agent = null). The synthetic row must be driven to Stopped, not left
+        // frozen at Working forever.
+        let store = Store::shared();
+        let working = translate(&status_event("cursor", "Cursor", "working", "w1:p1"), AT).unwrap();
+        apply_update(&store, working).await;
+        assert_eq!(
+            store.by_pane("herdr:w1:p1").await[0].state,
+            AgentState::Working
+        );
+
+        let gone = json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": "w1:p1", "agent": null, "agent_status": "idle" },
+        });
+        ingest_envelope(&store, &gone).await;
+
+        let rows = store.by_pane("herdr:w1:p1").await;
+        assert_eq!(rows.len(), 1, "same row, now stopped");
+        assert_eq!(rows[0].state, AgentState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn agent_gone_on_empty_pane_is_noop() {
+        // An agent-less update for a pane muxa has no row for must not invent
+        // one (a plain shell is not an agent).
+        let store = Store::shared();
+        let gone = json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": "w9:p9", "agent_status": "idle" },
+        });
+        ingest_envelope(&store, &gone).await;
+        assert!(
+            store.by_pane("herdr:w9:p9").await.is_empty(),
+            "no row invented for an agent-less shell pane",
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_gone_leaves_real_hook_row_untouched() {
+        // A real hook row on the pane is not the bridge's to stop.
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "real".into(),
+                    surface: None,
+                    pane: Some("herdr:w1:p1".into()),
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: AT,
+            })
+            .await;
+        let gone = json!({
+            "event": "pane.agent_status_changed",
+            "data": { "pane_id": "w1:p1", "agent": null, "agent_status": "idle" },
+        });
+        ingest_envelope(&store, &gone).await;
+        let rows = store.by_pane("herdr:w1:p1").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "real");
+        assert_eq!(
+            rows[0].state,
+            AgentState::Idle,
+            "real hook row untouched by the agent-gone signal",
+        );
+    }
+
     // --- Reverse path: report_decision --------------------------------------
 
     /// Build an `Agent` for the reverse-path mapping tests. Only the fields
@@ -1203,5 +1541,107 @@ mod tests {
         assert_eq!(params["source"], json!("muxa"));
         assert_eq!(params["agent"], json!("claude"));
         assert_eq!(params["seq"], json!(7));
+    }
+
+    // --- Reverse path: resync_reports (lag recovery) ------------------------
+
+    fn reported(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(p, a)| ((*p).to_owned(), (*a).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn resync_reasserts_live_rows_and_releases_vanished() {
+        // p1 still has a live Working real row; p2 was reported before but has
+        // vanished from the snapshot entirely (its row was GC-evicted after a
+        // dropped `…→Stopped` edge). p1 must be re-reported, p2 released.
+        let prev = reported(&[("w1:p1", "claude"), ("w1:p2", "codex")]);
+        let live = agent(
+            AgentKind::ClaudeCode,
+            "s1",
+            "herdr:w1:p1",
+            AgentState::Working,
+        );
+        let (calls, now) = resync_reports(&[live], &prev);
+
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                HerdrReport::Report { pane_id, state, .. } if pane_id == "w1:p1" && *state == "working"
+            )),
+            "live pane re-reported",
+        );
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                HerdrReport::Release { pane_id, agent } if pane_id == "w1:p2" && agent == "codex"
+            )),
+            "vanished pane released with its last-known slug",
+        );
+        assert_eq!(now.get("w1:p1").map(String::as_str), Some("claude"));
+        assert!(
+            !now.contains_key("w1:p2"),
+            "vanished pane dropped from the reported set",
+        );
+    }
+
+    #[test]
+    fn resync_releases_a_stopped_row_once() {
+        // The row is still present but Stopped — report_decision already yields
+        // a Release, so the vanished-pane sweep must not add a duplicate.
+        let prev = reported(&[("w1:p1", "claude")]);
+        let stopped = agent(
+            AgentKind::ClaudeCode,
+            "s1",
+            "herdr:w1:p1",
+            AgentState::Stopped,
+        );
+        let (calls, now) = resync_reports(&[stopped], &prev);
+        assert_eq!(calls.len(), 1, "exactly one release, no duplicate");
+        assert!(matches!(
+            &calls[0],
+            HerdrReport::Release { pane_id, .. } if pane_id == "w1:p1"
+        ));
+        assert!(now.is_empty(), "released pane is not in the reported set");
+    }
+
+    #[test]
+    fn resync_ignores_synthetic_and_non_herdr_rows() {
+        let synthetic = agent(
+            AgentKind::Unknown,
+            "synthetic-herdr:w1:p1",
+            "herdr:w1:p1",
+            AgentState::Working,
+        );
+        let tmux = agent(AgentKind::ClaudeCode, "s2", "%3", AgentState::Working);
+        let (calls, now) = resync_reports(&[synthetic, tmux], &HashMap::new());
+        assert!(calls.is_empty(), "neither row is reportable");
+        assert!(now.is_empty());
+    }
+
+    #[test]
+    fn track_report_records_and_forgets() {
+        let mut set = HashMap::new();
+        track_report(
+            &mut set,
+            &HerdrReport::Report {
+                pane_id: "w1:p1".into(),
+                agent: "claude".into(),
+                state: "working",
+                message: None,
+                agent_session_id: "s1".into(),
+            },
+        );
+        assert_eq!(set.get("w1:p1").map(String::as_str), Some("claude"));
+        track_report(
+            &mut set,
+            &HerdrReport::Release {
+                pane_id: "w1:p1".into(),
+                agent: "claude".into(),
+            },
+        );
+        assert!(set.is_empty(), "release forgets the pane");
     }
 }

@@ -417,6 +417,24 @@ impl<L: LivenessSource> Reconciler<L> {
                 "orphan-row sweep flipped {stale_paneless} paneless agent(s) to Stopped",
             );
         }
+        // Age out rows whose pane belongs to a host this daemon isn't
+        // observing (e.g. a `herdr:` row left behind after switching the
+        // daemon back to tmux). The cross-host guard exempts them from
+        // *immediate* reaping, but a single-backend daemon never sees them,
+        // so without this they'd ghost forever. Same inactivity window as the
+        // paneless sweep. Today the observing set is exactly the one active
+        // backend; a future multi-host daemon would pass all its live kinds.
+        let stale_cross_host = self
+            .store
+            .mark_stale_cross_host_stopped(&[observing_kind], self.paneless_stale_timeout)
+            .await;
+        if stale_cross_host > 0 {
+            tracing::info!(
+                stale_cross_host,
+                observing = %observing_kind,
+                "cross-host sweep flipped {stale_cross_host} foreign-host agent(s) to Stopped",
+            );
+        }
         // Poll codex rollouts for rate-limit state (no-op unless a sessions
         // root is configured). Codex has no rate-limit hook, so this is the
         // only signal — and it's the only path that catches a cap which

@@ -200,22 +200,42 @@ impl AppState {
     }
 }
 
-/// Pull one pane inventory for the pane cache. On a herdr host the tmux
-/// scanner sees nothing, so we ask the daemon's [`HerdrBackend`] for
-/// `pane.list` (a blocking socket round-trip, hence `spawn_blocking`) and
-/// reshape it into the scanner's [`ScanResult`]. Every other backend — and
-/// the `None`/no-backend test path — runs the unchanged tmux
-/// [`scanner::scan`].
+/// Pull one pane inventory for the pane cache. On a herdr host we run BOTH
+/// the tmux multi-socket [`scanner::scan`] *and* the daemon's [`HerdrBackend`]
+/// `pane.list` (a blocking socket round-trip, hence `spawn_blocking`), then
+/// concat the two into one [`ScanResult`]. Running only the herdr side would
+/// drop live tmux panes during a mixed-host migration (tmux panes vanish from
+/// `/api/panes` and the timeline); merging keeps both. tmux per-socket
+/// failures keep flowing through `errors` as before. Every other backend — and
+/// the `None`/no-backend test path — runs the unchanged tmux scanner alone.
 async fn refresh_pane_scan(backend: Option<SharedBackend>) -> scanner::ScanResult {
     match backend {
         Some(backend) if backend.kind() == HostKind::Herdr => {
-            let panes = tokio::task::spawn_blocking(move || backend.list_panes())
+            let herdr_panes = tokio::task::spawn_blocking(move || backend.list_panes())
                 .await
                 .unwrap_or_default();
-            scanner::herdr_scan_result(panes)
+            merge_pane_scans(
+                scanner::scan().await,
+                scanner::herdr_scan_result(herdr_panes),
+            )
         }
         _ => scanner::scan().await,
     }
+}
+
+/// Concat a herdr pane inventory onto a tmux scan result. herdr panes are
+/// appended after the tmux panes; the tmux side's `errors` (per-socket partial
+/// failures) are preserved and any herdr-side errors folded in too (there are
+/// none today — a single in-process backend call has no per-socket failures).
+/// The `fetched_at` of the tmux scan is kept as the result timestamp (both are
+/// captured within the same refresh, so the difference is immaterial).
+fn merge_pane_scans(
+    mut tmux: scanner::ScanResult,
+    herdr: scanner::ScanResult,
+) -> scanner::ScanResult {
+    tmux.panes.extend(herdr.panes);
+    tmux.errors.extend(herdr.errors);
+    tmux
 }
 
 /// Build the dashboard router. Public so `muxad`'s integration tests
@@ -1372,12 +1392,65 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         let panes = v["panes"].as_array().expect("panes array");
-        assert_eq!(panes.len(), 1, "herdr pane must surface: {v:?}");
-        assert_eq!(panes[0]["pane_id"], "herdr:p1");
-        assert_eq!(panes[0]["session"], "ws1");
-        assert_eq!(panes[0]["window_index"], "tab1");
-        assert_eq!(panes[0]["socket"], "herdr");
-        assert_eq!(panes[0]["current_command"], "vim");
+        // The herdr branch now merges the tmux scan too, so any stray tmux
+        // server on the test host may add panes — find the herdr pane rather
+        // than asserting an exact count.
+        let herdr = panes
+            .iter()
+            .find(|p| p["pane_id"] == "herdr:p1")
+            .unwrap_or_else(|| panic!("herdr pane must surface: {v:?}"));
+        assert_eq!(herdr["session"], "ws1");
+        assert_eq!(herdr["window_index"], "tab1");
+        assert_eq!(herdr["socket"], "herdr");
+        assert_eq!(herdr["current_command"], "vim");
+    }
+
+    /// The herdr pane-scan path merges rather than replaces: a herdr backend's
+    /// panes are appended onto whatever the tmux scan returned, and the tmux
+    /// side's per-socket errors survive. Exercised on the pure merge helper so
+    /// the tmux side can be fabricated (a real tmux server isn't needed).
+    #[test]
+    fn merge_pane_scans_appends_herdr_onto_tmux_and_keeps_errors() {
+        use crate::tmux::scanner::{PaneSummary, ScanError, ScanResult};
+        use std::path::PathBuf;
+
+        let tmux_pane = PaneSummary {
+            pane_id: "%1".into(),
+            session: "main".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "zsh".into(),
+            title: String::new(),
+            socket: PathBuf::from("default"),
+            attach_command: "tmux attach".into(),
+        };
+        let tmux = ScanResult {
+            panes: vec![tmux_pane],
+            errors: vec![ScanError {
+                socket: PathBuf::from("wedged"),
+                message: "timed out".into(),
+            }],
+            fetched_at: OffsetDateTime::now_utc(),
+        };
+        let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
+            socket: None,
+            pane_id: "herdr:p1".into(),
+            session: "ws1".into(),
+            window_index: "tab1".into(),
+            pane_index: "p1".into(),
+            tty: String::new(),
+            current_command: "vim".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: String::new(),
+        }]);
+
+        let merged = merge_pane_scans(tmux, herdr);
+        let ids: Vec<&str> = merged.panes.iter().map(|p| p.pane_id.as_str()).collect();
+        assert_eq!(ids, ["%1", "herdr:p1"], "tmux first, herdr appended");
+        assert_eq!(merged.errors.len(), 1, "tmux scan errors preserved");
+        assert_eq!(merged.errors[0].socket, PathBuf::from("wedged"));
     }
 
     #[tokio::test]
