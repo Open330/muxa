@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **herdr watch session view.** `muxa watch --view session` (the default
+  view) now populates on herdr hosts: sessions are derived from herdr
+  workspaces over the socket (`workspace.list`) instead of `tmux
+  list-sessions`, so each workspace shows as a session row keyed by its raw
+  `workspace_id` with the workspace **label** as its display name (falling
+  back to the id). The DUR column lights up from the existing
+  session-activity ledger (keyed by the same `workspace_id`), and Enter-twice
+  attach is host-dispatched to herdr's `pane.focus`, never a tmux-only
+  action. See `docs/HERDR.md`.
 - **herdr session foreground time.** The foreground-time ledger now works on
   herdr hosts: instead of `tmux list-clients` (which finds no server on
   herdr), the sampler queries the focused herdr **workspace** over the herdr

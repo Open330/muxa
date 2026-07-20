@@ -332,6 +332,51 @@ pub(crate) fn herdr_focused_workspace(socket_path: &Path) -> Option<FocusedWorks
         })
 }
 
+/// A herdr workspace as the watch/session view needs it: the stable
+/// `workspace_id` (session id, matching [`to_pane_info`]'s `session` mapping
+/// and the `session_activity` ledger key) plus the mutable human-facing
+/// `label` (display name, falling back to the id when herdr reports none).
+pub struct WorkspaceSummary {
+    /// herdr `workspace_id` (e.g. `w1`). Same value `list_panes` puts in
+    /// [`PaneInfo::session`] and the ledger keys foreground time under.
+    pub id: String,
+    /// herdr workspace `label` — the display name. Falls back to the id.
+    pub label: String,
+}
+
+/// List every herdr workspace as a [`WorkspaceSummary`], so the watch
+/// session view can source "sessions" on herdr hosts (the tmux
+/// `list_sessions` analog). Uses `workspace.list` — the same cheap call
+/// [`herdr_focused_workspace`] uses, but returns *all* workspaces rather
+/// than only the focused one.
+///
+/// Returns an empty `Vec` when the server is unreachable/absent, reports no
+/// workspaces, or the reply is malformed — every failure degrades to "no
+/// sessions this refresh", mirroring `list_sessions().unwrap_or_default()`
+/// on tmux (a downed tmux server likewise yields no session rows).
+pub fn herdr_list_workspaces(socket_path: &Path) -> Vec<WorkspaceSummary> {
+    let backend = HerdrBackend::with_socket_path(socket_path.to_path_buf());
+    let Ok(result) = backend.request("workspace.list", json!({})) else {
+        return Vec::new();
+    };
+    let Some(workspaces) = result.get("workspaces").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    workspaces
+        .iter()
+        .filter_map(|ws| {
+            let id = ws.get("workspace_id").and_then(Value::as_str)?.to_string();
+            let label = ws
+                .get("label")
+                .and_then(Value::as_str)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            Some(WorkspaceSummary { id, label })
+        })
+        .collect()
+}
+
 /// Strip the `herdr:` namespace before an id crosses the socket. Lenient:
 /// an already-bare id (or a foreign shape) passes through unchanged.
 fn strip_prefix(pane_id: &str) -> &str {
@@ -881,6 +926,68 @@ mod tests {
         });
         let ws = herdr_focused_workspace(&socket).unwrap();
         assert_eq!(ws.label, "w7", "empty label falls back to the id");
+    }
+
+    #[test]
+    fn list_workspaces_returns_all_with_label_or_id() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            "workspace.list" => Reply::Result(workspace_list_result()),
+            _ => Reply::Error,
+        });
+        let ws = herdr_list_workspaces(&socket);
+        assert_eq!(ws.len(), 2, "every workspace becomes a session row");
+        assert_eq!(ws[0].id, "w1");
+        assert_eq!(ws[0].label, "main");
+        assert_eq!(ws[1].id, "w2");
+        assert_eq!(ws[1].label, "scratch");
+    }
+
+    #[test]
+    fn list_workspaces_label_falls_back_to_id() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            "workspace.list" => Reply::Result(json!({
+                "type": "workspace_list",
+                "workspaces": [{
+                    "workspace_id": "w9",
+                    "number": 1,
+                    "label": "",
+                    "focused": false,
+                    "pane_count": 1,
+                    "tab_count": 1,
+                    "active_tab_id": "tab1",
+                    "agent_status": "idle",
+                }],
+            })),
+            _ => Reply::Error,
+        });
+        let ws = herdr_list_workspaces(&socket);
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].label, "w9", "empty label falls back to the id");
+    }
+
+    #[test]
+    fn list_workspaces_empty_when_no_workspaces() {
+        let (socket, _dir) = spawn_server(|method| match method {
+            "workspace.list" => Reply::Result(json!({
+                "type": "workspace_list",
+                "workspaces": [],
+            })),
+            _ => Reply::Error,
+        });
+        assert!(herdr_list_workspaces(&socket).is_empty());
+    }
+
+    #[test]
+    fn list_workspaces_empty_when_server_down() {
+        // No socket file ⇒ server absent ⇒ no session rows (list_sessions analog).
+        let missing = PathBuf::from("/definitely/missing/herdr-workspaces.sock");
+        assert!(herdr_list_workspaces(&missing).is_empty());
+    }
+
+    #[test]
+    fn list_workspaces_empty_on_error_reply() {
+        let (socket, _dir) = spawn_server(|_| Reply::Error);
+        assert!(herdr_list_workspaces(&socket).is_empty());
     }
 
     #[test]
