@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `muxa Watch` BarShelf widget no longer goes blank after a muxa
+  upgrade.** The widget pinned `schema_version === 1`, so the schema 1→2 bump
+  that shipped subagents and workload made every payload fail to parse: the
+  card fell back to "Unavailable"/"SSH source offline" on every host at once,
+  with `unsupported muxa status payload` in the widget log. `status --json` is
+  additive by contract, so the widget now parses forward across schema
+  versions and only reports an unsupported payload when the fields it actually
+  reads are gone. That case, and a missing/outdated CLI, are now classified at
+  the failure site (`SourceFault`) instead of re-matched from prose, so the
+  card names the fix ("Update muxa Watch") rather than showing a generic
+  offline state — and an actionable fault is never hidden behind the
+  last-good-render fallback the way a dropped SSH connection is.
+
 - **`code_mode_host` codex sessions now correlate to their tmux pane instead of
   splitting into two rows.** Such a session runs its turns — and fires its
   hooks — from a shared, detached `app-server` (parent PID 1, no `TMUX_PANE`),
@@ -21,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone. `PaneInfo` now carries `current_path` for this.
 
 ### Added
+
+- **`muxa Watch` (widget 0.4.0) now shows the swarm.** Agents with parallel
+  work carry a load badge (`◇` subagents, `▸` shells, `+` other children) and
+  expand into one line per named Task subagent in flight — the same glyphs as
+  `muxa watch --view swarm`. A new **Show subagents in flight** setting turns
+  the tree off; the locked-screen cache keeps the counts and subagent kinds but
+  drops their descriptions, which are prompt text.
 
 - **Orphaned agent rows are now reaped instead of accumulating forever.** A row
   with no pane, no surface, and no pid — the shape a codex session driven
