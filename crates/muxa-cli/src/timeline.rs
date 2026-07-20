@@ -247,8 +247,8 @@ async fn load_document(client: &Client, cfg: &Config, args: &Args) -> Result<Tim
         .await
         .context("querying daemon prompt history")?;
     let session_activities = load_session_activities(cfg).await;
-    let pane_sessions = muxa::default_backend()
-        .list_panes()
+    let pane_sessions = crate::all_panes()
+        .await
         .into_iter()
         .map(|pane| (pane.pane_id, pane.session))
         .collect::<HashMap<_, _>>();

@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **multi-host observation (daemon).** `muxad` now observes every backend
+  in `muxa::active_backends()` at once (tmux + herdr during a migration)
+  instead of a single env-detected backend. One reconciler runs over the
+  whole set — each tick observes every backend concurrently and reconciles
+  each observation under its own `HostKind`, so a herdr timeout can't reap
+  tmux rows (completeness stays per-host); the workload scan, paneless-codex
+  correlation, and cross-host age-out all key off the *complete-this-tick*
+  host set, so a row on an unobserved (or chronically-unanswerable) host ages
+  out while every host that answered stays governed by its own pass and keeps
+  its metadata. Discovery, the
+  pane-session cache, and history enrichment enumerate the set and union
+  their scans; session-activity sampling runs one tracker that polls every
+  host's foreground source (tmux clients + herdr focused workspace) into a
+  single race-free ledger; the herdr bridge/report tasks spawn whenever
+  herdr is in the set, not only when it's the sole backend. See
+  `docs/MULTI_HOST.md`.
+- **cross-multiplexer unified console (CLI).** `muxa watch` and the
+  pane-listing surfaces now aggregate across *every* active host at once
+  instead of the single env-detected backend — during a tmux→herdr
+  migration both sides show in one view. `watch`'s refresh fans
+  `list_panes()` and the per-host session sources (tmux `list-sessions`,
+  herdr `workspace.list`) across the backend set concurrently and concats
+  the rows (namespaces keep them distinct: tmux `%N` / herdr `herdr:…`).
+  When the row set spans more than one host, each row gets a subtle dim
+  host tag (`tmux`/`herdr`) on its SESSION/PANE cell; single-host users see
+  no change. Attach (Enter in `watch`, `muxa attend`) dispatches per row on
+  the pane id's namespace, so a `herdr:` row focuses via herdr even when the
+  shell is tmux-primary (and vice versa); unrecognized ids fall back to the
+  process-global backend. `muxa panes`, `stats`, and `timeline` enumerate
+  panes across the set too, and `muxa panes` prints a per-host empty hint
+  for any host in the set that contributed zero. Live pane captures
+  (`watch` preview, `dashboard`) resolve the capturing backend by namespace.
+  `current_pane`/status-line ("where am I") stay single-host by design. See
+  `docs/MULTI_HOST.md`.
 - **herdr web dashboard panes view.** The dashboard's `/api/panes` route
   (and the timeline's pane→session map) now populate on herdr hosts. The
   daemon threads its active pane backend into the dashboard; when the host
@@ -100,6 +134,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan with the herdr pane list instead of replacing it, so tmux panes no
   longer vanish from `/api/panes`/timeline during mixed-host migration. See
   `docs/HERDR.md`.
+
+- **multi-host CLI/daemon wiring (review follow-ups).** Correctness fixes to the
+  cross-multiplexer console: (1) `muxa watch` session rows are now grouped by a
+  host-namespaced key, so a tmux session and a herdr workspace that share a raw
+  id (both named `w1`) stay two distinct rows with correct per-host pane counts
+  instead of merging into one corrupted row — display names, the activity ledger
+  lookup, and DUR still key off the raw id (host id-spaces are disjoint), only
+  grouping/identity/sort-tiebreak use the composite; (2) `watch`'s initial "where
+  am I" cursor resolves `current_pane()` across the backend set in env-preference
+  order (first `Some` wins) so a herdr pane launched from tmux lands on the
+  env-preferred host; (3) daemon discovery passes and the CLI's cross-host pane
+  enumeration (`muxa panes`/`stats`/`timeline`/`attend`) now fan out
+  concurrently — a slow or unreachable host no longer serializes behind (or
+  blocks the runtime on) the others, and a failed host contributes an empty
+  result; (4) the web dashboard's single-backend scanner is documented to bind to
+  the env-preferred host (`backends[0]`), matching the pre-multi-host daemon. See
+  `docs/MULTI_HOST.md`.
+
+- **multi-host core hardening (review follow-ups).** Correctness fixes to the
+  backend set and reconciler so one permanently-unreachable or chronically-slow
+  host can't poison the others: (1) herdr auto-detect now *connects* to the
+  socket instead of `try_exists()`ing the file, so a stale socket left by a
+  crashed server no longer ghosts a dead herdr backend into a tmux-only daemon's
+  set forever; (2) the env-preferred host now leads the auto-detected set, so
+  `backends[0]` (the "primary" the dashboard and watch cursor use) is the host
+  the shell actually lives in (`MUXA_HOSTS` keeps its verbatim order); (3) the
+  workload scan/update runs over the union of *complete* observations and only
+  governs rows whose host was observed complete this tick — a chronically-
+  incomplete host's rows keep their workload metadata instead of being frozen or
+  reset for every host; (4) the cross-host ghost age-out is keyed on the
+  complete-this-tick kinds, so a host that can't answer past the inactivity
+  window ages out its rows like a host outside the set (transient incompleteness
+  is safe — the threshold is the 24h paneless window, not one tick); (5) paneless-
+  codex cwd correlation runs once per tick over the union of panes from all
+  complete hosts, so its many-to-one ambiguity guard sees candidates on every
+  host and won't mis-adopt a row whose codex lives in the other host's pane at
+  the same cwd; (6) the merged session-activity sampler now applies each source
+  independently — a failing source (e.g. tmux on a herdr-only machine with no
+  `tmux` binary) contributes nothing and no longer closes the other host's open
+  foreground intervals, only its own keyspace is left untouched. Single-host
+  behavior is unchanged throughout. See `docs/MULTI_HOST.md`.
 
 - **`code_mode_host` codex sessions now correlate to their tmux pane instead of
   splitting into two rows.** Such a session runs its turns — and fires its

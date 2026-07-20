@@ -657,15 +657,16 @@ async fn run(store: SharedStore, socket_path: PathBuf, shutdown_tx: broadcast::S
     }
 }
 
-/// Spawn the herdr bridge task, but only when the active backend is herdr.
-/// Returns the join handle so the daemon can drain it on shutdown; `None` on
-/// every other host.
+/// Spawn the herdr bridge task, but only when herdr is in the observed backend
+/// set (a multi-host daemon observes tmux + herdr at once during a migration).
+/// Returns the join handle so the daemon can drain it on shutdown; `None` when
+/// herdr isn't observed.
 pub fn spawn_herdr_bridge_task(
-    backend: &SharedBackend,
+    backends: &[SharedBackend],
     store: SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if backend.kind() != HostKind::Herdr {
+    if !backends.iter().any(|b| b.kind() == HostKind::Herdr) {
         return None;
     }
     let socket_path = default_socket_path();
@@ -993,15 +994,15 @@ async fn run_report(store: SharedStore, socket_path: PathBuf, shutdown_tx: broad
     }
 }
 
-/// Spawn the herdr reverse-path (report) task, but only when the active backend
-/// is herdr. Returns the join handle so the daemon can drain it on shutdown;
-/// `None` on every other host.
+/// Spawn the herdr reverse-path (report) task, but only when herdr is in the
+/// observed backend set. Returns the join handle so the daemon can drain it on
+/// shutdown; `None` when herdr isn't observed.
 pub fn spawn_herdr_report_task(
-    backend: &SharedBackend,
+    backends: &[SharedBackend],
     store: SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if backend.kind() != HostKind::Herdr {
+    if !backends.iter().any(|b| b.kind() == HostKind::Herdr) {
         return None;
     }
     let socket_path = default_socket_path();
@@ -1647,5 +1648,46 @@ mod tests {
             },
         );
         assert!(set.is_empty(), "release forgets the pane");
+    }
+
+    // --- Spawn conditions over a backend set --------------------------------
+
+    fn tmux_backend() -> SharedBackend {
+        std::sync::Arc::new(muxa::backend::tmux::TmuxBackend::new())
+    }
+
+    fn herdr_backend() -> SharedBackend {
+        std::sync::Arc::new(muxa::backend::herdr::HerdrBackend::new())
+    }
+
+    /// Neither herdr task spawns when herdr is absent from the observed set.
+    #[tokio::test]
+    async fn herdr_tasks_skip_when_herdr_not_in_set() {
+        let store = Store::shared();
+        let (tx, _) = broadcast::channel::<()>(1);
+        let backends = vec![tmux_backend()];
+        assert!(spawn_herdr_bridge_task(&backends, store.clone(), &tx).is_none());
+        assert!(spawn_herdr_report_task(&backends, store, &tx).is_none());
+    }
+
+    /// Both herdr tasks spawn when herdr is present in a multi-host set
+    /// (tmux + herdr during a migration), not only when it's the sole backend.
+    #[tokio::test]
+    async fn herdr_tasks_spawn_when_herdr_in_multi_host_set() {
+        let store = Store::shared();
+        let (tx, _) = broadcast::channel::<()>(1);
+        let backends = vec![tmux_backend(), herdr_backend()];
+        let bridge = spawn_herdr_bridge_task(&backends, store.clone(), &tx);
+        let report = spawn_herdr_report_task(&backends, store, &tx);
+        assert!(bridge.is_some(), "bridge spawns when herdr ∈ set");
+        assert!(report.is_some(), "report spawns when herdr ∈ set");
+        // Drain the spawned tasks so they don't linger past the test runtime.
+        let _ = tx.send(());
+        if let Some(h) = bridge {
+            let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
+        }
+        if let Some(h) = report {
+            let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
+        }
     }
 }

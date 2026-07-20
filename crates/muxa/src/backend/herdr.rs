@@ -316,6 +316,44 @@ pub fn default_socket_path() -> PathBuf {
     dirs::home_dir().map_or_else(|| PathBuf::from(rel), |home| home.join(rel))
 }
 
+/// Bound on the auto-detect reachability probe. A herdr server accepts a
+/// connection instantly; a stale socket file (crashed server) refuses one
+/// instantly (`ECONNREFUSED`) and an absent path fails instantly
+/// (`ENOENT`). The only way `connect()` can linger is a wedged listener
+/// whose backlog never drains — vanishingly rare — so this timeout is a
+/// belt-and-suspenders bound that keeps daemon startup from stalling on a
+/// pathological socket. A probe that can't answer within it is treated as
+/// unreachable (conservative: better to exclude a barely-alive host than
+/// drag it into the set).
+const REACHABLE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Liveness probe for [`crate::backend::active_backends`] auto-detect: does a
+/// herdr server actually **answer** on `socket_path` right now?
+///
+/// A bare `try_exists()` on the socket file is not enough. A crashed herdr
+/// server leaves its socket file behind, and that stale file would otherwise
+/// drag a permanently-dead herdr backend into a tmux-only daemon's active set
+/// forever — every reconcile tick observing it incomplete (never reaping its
+/// ghost rows), every read fanning out a doomed connect. An actual
+/// `connect()` distinguishes the two: it refuses immediately on a stale
+/// socket and succeeds only when a server is listening, so the ghost is
+/// excluded. Env presence (`HERDR_PANE_ID`/`HERDR_ENV`) remains a separate
+/// inclusion signal at the call site — inside a herdr pane the server is alive
+/// by construction, so no probe is needed there.
+///
+/// The connect runs on a throwaway thread so a wedged listener can't block
+/// startup past [`REACHABLE_PROBE_TIMEOUT`]; the thread finishes on its own
+/// once `connect()` returns (its send just no-ops after we've stopped
+/// waiting).
+pub(crate) fn server_reachable(socket_path: &Path) -> bool {
+    let path = socket_path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(&path).is_ok());
+    });
+    rx.recv_timeout(REACHABLE_PROBE_TIMEOUT).unwrap_or(false)
+}
+
 /// The focused herdr workspace, mapped to muxa's foreground-tracking keys:
 /// the stable `workspace_id` becomes the session id (matching
 /// [`to_pane_info`]'s `session` mapping so ledger keys line up) and the

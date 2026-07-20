@@ -117,7 +117,13 @@ impl<B: crate::backend::PaneBackend> LivenessSource for B {
 /// knob, not a correctness requirement.
 pub struct Reconciler<L: LivenessSource> {
     store: SharedStore,
-    source: Arc<L>,
+    /// One source per backend the daemon observes. Single-host daemons (and
+    /// every test) carry exactly one; a multi-host daemon (tmux + herdr during
+    /// a migration) carries several. Each tick observes all of them
+    /// concurrently and reconciles each observation against the store under its
+    /// own [`HostKind`], so a herdr timeout can't trigger tmux reaping or vice
+    /// versa (`reconcile_observation` is completeness-gated per host).
+    sources: Vec<Arc<L>>,
     interval: Duration,
     /// Optional metrics handle. Daemon wires one in via
     /// [`Self::with_metrics`]; tests can leave it `None` to avoid
@@ -148,9 +154,24 @@ pub struct Reconciler<L: LivenessSource> {
 
 impl<L: LivenessSource> Reconciler<L> {
     pub fn new(store: SharedStore, source: L, interval: Duration) -> Self {
+        Self::with_sources(store, vec![source], interval)
+    }
+
+    /// Build a reconciler that observes several backends per tick — the
+    /// multi-host analog of [`Self::new`]. Every source is observed
+    /// concurrently and reconciled under its own [`HostKind`]; the ghost
+    /// age-out sweep ([`Store::mark_stale_cross_host_stopped`](crate::state::Store::mark_stale_cross_host_stopped))
+    /// receives the kinds whose observation was *complete* this tick, so a row
+    /// on a host that answered is governed by that host's reconcile pass while a
+    /// row on a host NOT in the set — or one that can't answer past the
+    /// inactivity window — ages out. An empty `sources` degrades to a store-maintenance-only
+    /// loop (no observation, but the stuck/paneless/codex sweeps still run);
+    /// the daemon never constructs one that way — `active_backends()` is never
+    /// empty.
+    pub fn with_sources(store: SharedStore, sources: Vec<L>, interval: Duration) -> Self {
         Self {
             store,
-            source: Arc::new(source),
+            sources: sources.into_iter().map(Arc::new).collect(),
             interval,
             metrics: None,
             stuck_working_timeout: Duration::ZERO,
@@ -345,41 +366,106 @@ impl<L: LivenessSource> Reconciler<L> {
     #[allow(clippy::too_many_lines)]
     pub async fn reconcile_once(&self) -> ReconcileReport {
         let started = Instant::now();
-        // Pane observation shells out to tmux and must not block the runtime.
-        // Capture the observing host up front so the store's reaping guard can
-        // exempt rows namespaced to a *different* host (cross-host migration).
-        let observing_kind = self.source.kind();
-        let src = self.source.clone();
+        // Every backend is observed each tick. Capture each observing host so
+        // the store's reaping guard can exempt rows namespaced to a host that
+        // is *also* in the set (cross-host migration) while reaping the ones
+        // that aren't.
+        let observing_kinds: Vec<HostKind> = self.sources.iter().map(|s| s.kind()).collect();
+        // Pane observation shells out to tmux / round-trips the herdr socket and
+        // must not block the runtime. Spawn every source's blocking observation
+        // up front so they run CONCURRENTLY, then collect — a herdr timeout
+        // must not serialize behind the tmux scan (and vice versa), keeping the
+        // tick budget flat as backends are added.
         let list_started = Instant::now();
-        let observation = tokio::task::spawn_blocking(move || src.observe_panes())
-            .await
-            .unwrap_or_else(|_| PaneObservation::incomplete(Vec::new()));
-        let list_panes_us = u64::try_from(list_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let pane_observation_complete = observation.is_complete();
-        let panes_for_workload = observation.panes.clone();
-        let workload_started = Instant::now();
-        let workloads = if pane_observation_complete {
-            tokio::task::spawn_blocking(move || {
-                process_tree::scan_pane_workloads(&panes_for_workload)
+        let handles: Vec<(HostKind, tokio::task::JoinHandle<PaneObservation>)> = self
+            .sources
+            .iter()
+            .map(|src| {
+                let src = src.clone();
+                let kind = src.kind();
+                (
+                    kind,
+                    tokio::task::spawn_blocking(move || src.observe_panes()),
+                )
             })
-            .await
-            .unwrap_or_default()
-        } else {
-            // Updating from a partial set would clear workload metadata for
-            // panes whose server failed observation.
+            .collect();
+        let mut observations: Vec<(HostKind, PaneObservation)> = Vec::with_capacity(handles.len());
+        for (kind, handle) in handles {
+            let obs = handle
+                .await
+                .unwrap_or_else(|_| PaneObservation::incomplete(Vec::new()));
+            observations.push((kind, obs));
+        }
+        let list_panes_us = u64::try_from(list_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // The kinds whose observation was COMPLETE this tick — the hosts that
+        // actually answered. Fixes 3/4/5 all key off this set rather than "every
+        // observation is complete": one chronically-incomplete host must not
+        // freeze the others.
+        let all_complete = observations.iter().all(|(_, o)| o.is_complete());
+        let complete_kinds: Vec<HostKind> = observations
+            .iter()
+            .filter(|(_, o)| o.is_complete())
+            .map(|(k, _)| *k)
+            .collect();
+        let total_panes: usize = observations.iter().map(|(_, o)| o.panes.len()).sum();
+        // Fix 3/5: the union of panes from COMPLETE observations only. An
+        // incompletely-observed host contributes no panes, so its rows are
+        // neither workload-reset nor used as codex-correlation candidates this
+        // tick. Empty when no host answered (a single-host daemon whose one scan
+        // failed) — then the workload scan+update is skipped entirely, keeping
+        // that host's rows untouched (the old single-host-incomplete rule).
+        let union_panes: Vec<crate::tmux::PaneInfo> = observations
+            .iter()
+            .filter(|(_, o)| o.is_complete())
+            .flat_map(|(_, o)| o.panes.iter().cloned())
+            .collect();
+        // Workload scan runs once per tick over that union — process-tree
+        // scanning is store-global (it clears the workload of any pane absent
+        // from its map), so it must see every complete host's panes at once, and
+        // `update_workloads` then governs only rows on a complete host (see
+        // `Store::update_workloads`), leaving an incomplete host's rows as-is.
+        let workload_started = Instant::now();
+        let workloads = if complete_kinds.is_empty() {
             std::collections::HashMap::new()
+        } else {
+            let panes = union_panes.clone();
+            tokio::task::spawn_blocking(move || process_tree::scan_pane_workloads(&panes))
+                .await
+                .unwrap_or_default()
         };
         let workload_scan_us =
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let reconcile_started = Instant::now();
-        let report = self
-            .store
-            .reconcile_observation(&observation, observing_kind)
-            .await;
-        let workload_changed = if pane_observation_complete {
-            self.store.update_workloads(&workloads).await
-        } else {
+        let mut report = ReconcileReport::default();
+        // Fix 5: correlate paneless codex ONCE over the union of complete panes,
+        // BEFORE the per-host reap/dedup passes. Running it per host would only
+        // show the ambiguity guard one host's panes, so a tmux pass could adopt a
+        // row whose codex actually lives in a herdr pane at the same cwd. Doing
+        // it here — ahead of the per-host passes — still lets this tick's dedup
+        // demote the now-redundant synthetic. Skip when nothing answered.
+        if !union_panes.is_empty() {
+            report.paneless_correlated = self
+                .store
+                .correlate_paneless_codex_union(&union_panes)
+                .await;
+        }
+        // Reconcile each observation against the store sequentially, under its
+        // own host kind. Completeness is enforced per host inside
+        // `reconcile_observation`, so an incomplete herdr scan is a no-op that
+        // leaves tmux reaping untouched. Accumulate the per-host reports so the
+        // timing line and callers (tests) see the whole tick's effect.
+        for (kind, observation) in &observations {
+            let r = self.store.reconcile_observation(observation, *kind).await;
+            report.stale_panes_reaped += r.stale_panes_reaped;
+            report.synthetic_demoted += r.synthetic_demoted;
+            report.duplicates_collapsed += r.duplicates_collapsed;
+        }
+        let workload_changed = if complete_kinds.is_empty() {
             0
+        } else {
+            self.store
+                .update_workloads(&workloads, &complete_kinds)
+                .await
         };
         let store_update_us =
             u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -417,21 +503,26 @@ impl<L: LivenessSource> Reconciler<L> {
                 "orphan-row sweep flipped {stale_paneless} paneless agent(s) to Stopped",
             );
         }
-        // Age out rows whose pane belongs to a host this daemon isn't
-        // observing (e.g. a `herdr:` row left behind after switching the
-        // daemon back to tmux). The cross-host guard exempts them from
-        // *immediate* reaping, but a single-backend daemon never sees them,
-        // so without this they'd ghost forever. Same inactivity window as the
-        // paneless sweep. Today the observing set is exactly the one active
-        // backend; a future multi-host daemon would pass all its live kinds.
+        // Age out rows whose pane belongs to a host that did NOT answer with a
+        // complete observation this tick (e.g. a `zellij:` row while the set is
+        // tmux + herdr, a `herdr:` row left behind after narrowing the set back
+        // to tmux, or a host in the set that is chronically unable to answer).
+        // The cross-host guard exempts foreign rows from *immediate* reaping,
+        // and no observation reaps them, so without this they'd ghost forever.
+        // Fix 4: pass the COMPLETE-this-tick kinds, not every kind in the set —
+        // a host that answers governs its rows via reaping and is spared here,
+        // while a host that can't answer past the inactivity window ages out
+        // exactly like a host outside the set. Transient incompleteness is safe:
+        // the threshold is the (24h-default) paneless window on last-activity,
+        // not a single tick. Same inactivity window as the paneless sweep.
         let stale_cross_host = self
             .store
-            .mark_stale_cross_host_stopped(&[observing_kind], self.paneless_stale_timeout)
+            .mark_stale_cross_host_stopped(&complete_kinds, self.paneless_stale_timeout)
             .await;
         if stale_cross_host > 0 {
             tracing::info!(
                 stale_cross_host,
-                observing = %observing_kind,
+                complete = ?complete_kinds,
                 "cross-host sweep flipped {stale_cross_host} foreign-host agent(s) to Stopped",
             );
         }
@@ -470,8 +561,9 @@ impl<L: LivenessSource> Reconciler<L> {
                 list_panes_us,
                 workload_scan_us,
                 store_update_us,
-                panes = observation.panes.len(),
-                pane_observation_complete,
+                panes = total_panes,
+                pane_observation_complete = all_complete,
+                backends = observing_kinds.len(),
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
@@ -486,8 +578,9 @@ impl<L: LivenessSource> Reconciler<L> {
                 list_panes_us,
                 workload_scan_us,
                 store_update_us,
-                panes = observation.panes.len(),
-                pane_observation_complete,
+                panes = total_panes,
+                pane_observation_complete = all_complete,
+                backends = observing_kinds.len(),
                 workloads = workloads.len(),
                 stale = report.stale_panes_reaped,
                 synthetic = report.synthetic_demoted,
@@ -556,18 +649,27 @@ mod tests {
     /// the live set between reconciliation passes.
     struct FakeLiveness {
         observation: Mutex<PaneObservation>,
+        kind: HostKind,
     }
 
     impl FakeLiveness {
         fn new(panes: Vec<PaneInfo>) -> Self {
             Self {
                 observation: Mutex::new(PaneObservation::complete(panes)),
+                kind: HostKind::Tmux,
             }
         }
         fn incomplete(panes: Vec<PaneInfo>) -> Self {
             Self {
                 observation: Mutex::new(PaneObservation::incomplete(panes)),
+                kind: HostKind::Tmux,
             }
+        }
+        /// Tag this source with a specific observing host — used by the
+        /// multi-source tests to exercise the cross-host reaping guard.
+        fn with_kind(mut self, kind: HostKind) -> Self {
+            self.kind = kind;
+            self
         }
         fn set(&self, panes: Vec<PaneInfo>) {
             *self.observation.lock().unwrap() = PaneObservation::complete(panes);
@@ -577,6 +679,9 @@ mod tests {
     impl LivenessSource for FakeLiveness {
         fn observe_panes(&self) -> PaneObservation {
             self.observation.lock().unwrap().clone()
+        }
+        fn kind(&self) -> HostKind {
+            self.kind
         }
     }
 
@@ -636,6 +741,242 @@ mod tests {
         let snap = store.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].session_id, "a");
+    }
+
+    fn herdr_pane(id: &str) -> PaneInfo {
+        let mut p = pane(id);
+        p.session = "w1".into();
+        p
+    }
+
+    /// Multi-source reconcile: each backend governs only its own pane-id
+    /// namespace. A tmux source reaps a dead tmux `%N` row and a herdr source
+    /// reaps a dead `herdr:` row in the SAME tick, while each host's live row
+    /// is preserved and neither host's observation touches the other's rows.
+    #[tokio::test]
+    async fn reconcile_once_reaps_per_host_across_a_backend_set() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-alive", "%1", t0)).await;
+        store.apply(&started("tmux-ghost", "%2", t0)).await;
+        store.apply(&started("herdr-alive", "herdr:p1", t0)).await;
+        store.apply(&started("herdr-ghost", "herdr:p2", t0)).await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::new(vec![herdr_pane("herdr:p1")]).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        // One stale reap per host, both in the one tick.
+        assert_eq!(report.stale_panes_reaped, 2);
+        let snap = store.snapshot().await;
+        let live: std::collections::HashSet<&str> =
+            snap.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains("tmux-alive"));
+        assert!(live.contains("herdr-alive"));
+    }
+
+    /// The cross-host age-out sweep spares rows whose host IS in the observed
+    /// set (governed by that host's own reconcile pass) and ages out rows whose
+    /// host is NOT — even when the set spans several hosts. A stale `zellij:`
+    /// row is foreign to a tmux+herdr set and must flip to `Stopped`; a stale
+    /// `herdr:` row is spared because herdr is observed (its own reconcile
+    /// governs it — here its pane is still live, so it survives).
+    #[tokio::test]
+    async fn cross_host_sweep_uses_the_whole_observed_set() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("herdr-live", "herdr:p1", old)).await;
+        store
+            .apply(&started("zellij-foreign", "zellij:9", old))
+            .await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::new(vec![herdr_pane("herdr:p1")]).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10))
+                // Non-zero threshold enables the cross-host sweep; the rows are far
+                // older than the cutoff so an unobserved host's row ages out now.
+                .with_paneless_stale_timeout(Duration::from_secs(1));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        // herdr is observed (and its pane live) → spared.
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "herdr-live")
+                .map(|a| a.state),
+            Some(AgentState::Idle),
+        );
+        // zellij is NOT observed → aged out to Stopped.
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "zellij-foreign")
+                .map(|a| a.state),
+            Some(AgentState::Stopped),
+        );
+    }
+
+    /// An incomplete observation from ONE backend must not reap or reset
+    /// another backend's rows. The complete tmux scan governs its own rows; the
+    /// incomplete herdr scan is a no-op, so `update_workloads` only touches
+    /// tmux-namespaced rows and the herdr row keeps its metadata (see the
+    /// dedicated store test `update_workloads_governs_only_complete_hosts`).
+    #[tokio::test]
+    async fn incomplete_one_backend_does_not_reap_or_reset_another() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-alive", "%1", t0)).await;
+        store.apply(&started("herdr-alive", "herdr:p1", t0)).await;
+
+        // tmux observed complete; herdr times out (incomplete, empty).
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::incomplete(Vec::new()).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        // The incomplete herdr scan reaps nothing; the tmux scan reaps nothing
+        // (its one row is live). Both rows survive.
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert!(store.by_session("tmux-alive").await.is_some());
+        assert!(store.by_session("herdr-alive").await.is_some());
+    }
+
+    /// Fix 4: the cross-host age-out keys off the COMPLETE-this-tick kinds, so a
+    /// chronically-incomplete host's stale rows age out (nothing else ever
+    /// reaps them) while a freshly-active row on the same host survives. tmux
+    /// answers complete; herdr times out (incomplete) every tick, so `Herdr` is
+    /// absent from `complete_kinds` and its rows are treated like a host outside
+    /// the set. A herdr row idle past the window flips to `Stopped`; a herdr row
+    /// with recent activity is spared by the last-activity threshold.
+    #[tokio::test]
+    async fn cross_host_ages_out_chronically_incomplete_host() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        let fresh = time::OffsetDateTime::now_utc();
+        store.apply(&started("herdr-stale", "herdr:p1", old)).await;
+        store
+            .apply(&started("herdr-fresh", "herdr:p2", fresh))
+            .await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        // herdr never answers — incomplete, empty, every tick.
+        let herdr = FakeLiveness::incomplete(Vec::new()).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10))
+                .with_paneless_stale_timeout(Duration::from_secs(1));
+        r.reconcile_once().await;
+
+        let snap = store.snapshot().await;
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "herdr-stale")
+                .map(|a| a.state),
+            Some(AgentState::Stopped),
+            "a chronically-incomplete host's stale row ages out",
+        );
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "herdr-fresh")
+                .map(|a| a.state),
+            Some(AgentState::Idle),
+            "a freshly-active row on the same host survives",
+        );
+    }
+
+    fn codex_paneless(sid: &str, cwd: &str, at: time::OffsetDateTime) -> AgentEvent {
+        AgentEvent::Started {
+            id: AgentId {
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: None,
+                tmux_socket: None,
+                cwd: Some(cwd.into()),
+            },
+            at,
+        }
+    }
+
+    fn codex_synthetic(sid: &str, pane_id: &str, at: time::OffsetDateTime) -> AgentEvent {
+        AgentEvent::Started {
+            id: AgentId {
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane_id.into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at,
+        }
+    }
+
+    /// Fix 5: paneless-codex correlation runs ONCE over the union of complete
+    /// observations, so its many-to-one cwd ambiguity guard sees candidate panes
+    /// on *both* hosts. A paneless codex row whose cwd is shared by a tmux pane
+    /// AND a herdr pane is ambiguous → NOT adopted (a per-host pass would have
+    /// seen only one candidate and mis-adopted). A paneless row whose cwd is
+    /// unique to a single host's pane still adopts as before.
+    #[tokio::test]
+    async fn codex_correlation_over_union_guards_cross_host_cwd_ambiguity() {
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+
+        // Ambiguous: same cwd on a tmux pane and a herdr pane.
+        let store = Store::shared();
+        store
+            .apply(&codex_synthetic("synthetic-%7", "%7", t0))
+            .await;
+        store
+            .apply(&codex_synthetic("synthetic-herdr:p9", "herdr:p9", t0))
+            .await;
+        store.apply(&codex_paneless("real-amb", "/work", t0)).await;
+
+        let mut tp = pane("%7");
+        tp.current_path = "/work".into();
+        let mut hp = herdr_pane("herdr:p9");
+        hp.current_path = "/work".into();
+        let tmux = FakeLiveness::new(vec![tp]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::new(vec![hp]).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(
+            report.paneless_correlated, 0,
+            "a cwd shared across hosts is ambiguous — no adoption",
+        );
+        assert!(
+            store
+                .by_session("real-amb")
+                .await
+                .is_some_and(|a| a.pane.is_none()),
+            "the paneless row stays paneless",
+        );
+
+        // Unique: the cwd resolves to exactly one host's pane → adopt.
+        let store = Store::shared();
+        store
+            .apply(&codex_synthetic("synthetic-%8", "%8", t0))
+            .await;
+        store.apply(&codex_paneless("real-solo", "/solo", t0)).await;
+
+        let mut up = pane("%8");
+        up.current_path = "/solo".into();
+        let tmux = FakeLiveness::new(vec![up]).with_kind(HostKind::Tmux);
+        let herdr = FakeLiveness::new(Vec::new()).with_kind(HostKind::Herdr);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10));
+        let report = r.reconcile_once().await;
+
+        assert_eq!(report.paneless_correlated, 1, "unique cwd adopts as before");
+        assert_eq!(
+            store.by_session("real-solo").await.and_then(|a| a.pane),
+            Some("%8".into()),
+        );
     }
 
     #[tokio::test]

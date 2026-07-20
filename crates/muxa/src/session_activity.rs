@@ -167,6 +167,30 @@ pub fn apply_sample_report<S: BuildHasher>(
     sessions: &[SessionInfo],
     now: OffsetDateTime,
 ) -> ApplySampleReport {
+    // A whole-ledger sample (single-source, or a pre-merged set): every record
+    // is in scope for the absence-close.
+    apply_scoped_sample_report(records, sessions, now, |_| true)
+}
+
+/// [`apply_sample_report`] scoped to one source's keyspace. The upsert of
+/// sampled sessions is unchanged (it only ever touches sessions this source
+/// reported), but the absence-close — which credits and closes an open
+/// foreground interval for a record that has *disappeared* from the live set —
+/// only fires for records this source `owns`.
+///
+/// This is what keeps multi-host sampling independent: when the tmux source
+/// fails (or is simply skipped) its sessions are absent from this poll, but a
+/// herdr apply must not read that absence as "the tmux sessions detached" and
+/// close their intervals — those records belong to the tmux keyspace, so the
+/// herdr `owns` predicate returns false for them and they're left untouched.
+/// With `owns = |_| true` this is byte-identical to the pre-partition
+/// whole-ledger behavior, so single-source callers are unaffected.
+fn apply_scoped_sample_report<S: BuildHasher>(
+    records: &mut HashMap<String, SessionActivity, S>,
+    sessions: &[SessionInfo],
+    now: OffsetDateTime,
+    owns: impl Fn(&str) -> bool,
+) -> ApplySampleReport {
     let mut changed = false;
     let mut intervals = Vec::new();
     let live_ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
@@ -218,6 +242,12 @@ pub fn apply_sample_report<S: BuildHasher>(
         if live_ids.contains(record.session_id.as_str()) {
             continue;
         }
+        // Only close intervals for records in this source's keyspace — a record
+        // absent because a *different* source produced this sample is not
+        // evidence that it detached.
+        if !owns(record.session_id.as_str()) {
+            continue;
+        }
         if let Some(since) = record.attached_since {
             intervals.push(SessionForegroundEntry::new(
                 record.session_id.clone(),
@@ -261,11 +291,43 @@ pub enum SessionActivitySource {
     },
 }
 
+impl SessionActivitySource {
+    /// Does `session_id` belong to this source's keyspace? Used to partition the
+    /// absence-close (see [`apply_scoped_sample_report`]) so one source's
+    /// failure or absence can't close another host's open foreground intervals.
+    ///
+    /// The keyspaces are disjoint by construction: tmux session ids are always
+    /// `$N`, herdr workspace ids are anything else. zellij degrades to the tmux
+    /// source with an empty sample, so it never mints ids of its own here.
+    fn owns(&self, session_id: &str) -> bool {
+        match self {
+            SessionActivitySource::Tmux => session_id.starts_with('$'),
+            SessionActivitySource::Herdr { .. } => !session_id.starts_with('$'),
+        }
+    }
+
+    /// Whether this source is the (only) producer of per-client input readings.
+    /// Reading detection prunes its `seen` set to the live clients, so it must
+    /// run only when the tmux source actually sampled — a failed tmux poll must
+    /// leave that state untouched, exactly as the single-source path did.
+    fn produces_client_inputs(&self) -> bool {
+        matches!(self, SessionActivitySource::Tmux)
+    }
+}
+
 pub struct SessionActivityTracker {
     path: PathBuf,
     interval: Duration,
     activity_log: Option<Arc<ActivityLog>>,
-    source: SessionActivitySource,
+    /// One sampling source per host the daemon observes that *has* a foreground
+    /// signal (tmux and/or herdr; zellij has none). A single tracker owns one
+    /// `records` map and one `session-activity.json` writer, so polling every
+    /// source from this one task is race-free by construction — two independent
+    /// trackers writing the same file would clobber each other (each `save()`
+    /// rewrites the whole file). Merging is safe because the ledger keys are
+    /// disjoint across hosts (tmux `$N` vs herdr workspace ids), so one map
+    /// holds both hosts' sessions without collision.
+    sources: Vec<SessionActivitySource>,
 }
 
 impl SessionActivityTracker {
@@ -274,16 +336,28 @@ impl SessionActivityTracker {
             path,
             interval,
             activity_log: None,
-            source: SessionActivitySource::default(),
+            sources: vec![SessionActivitySource::default()],
         }
     }
 
-    /// Select the foreground-sampling source. Defaults to
-    /// [`SessionActivitySource::Tmux`]; the daemon sets
-    /// [`SessionActivitySource::Herdr`] on herdr hosts.
+    /// Select a single foreground-sampling source, replacing any already set.
+    /// Defaults to [`SessionActivitySource::Tmux`]; the daemon uses
+    /// [`Self::with_sources`] to sample several hosts at once.
     #[must_use]
     pub fn with_source(mut self, source: SessionActivitySource) -> Self {
-        self.source = source;
+        self.sources = vec![source];
+        self
+    }
+
+    /// Sample foreground state from several hosts each poll, merged into one
+    /// ledger. Used by the multi-host daemon (tmux + herdr during a migration).
+    /// An empty slice is treated as "no source" and leaves the default tmux
+    /// sampler in place so the tracker never silently stops sampling.
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<SessionActivitySource>) -> Self {
+        if !sources.is_empty() {
+            self.sources = sources;
+        }
         self
     }
 
@@ -293,22 +367,39 @@ impl SessionActivityTracker {
         self
     }
 
-    /// Take one foreground sample from the configured source, off the async
-    /// runtime (both the tmux shell-out and the herdr socket round-trip
-    /// block). The two sources produce the same [`ActivitySample`] shape, so
-    /// the caller's accounting is source-agnostic.
-    async fn sample(&self) -> Result<ActivitySample, String> {
-        match &self.source {
-            SessionActivitySource::Tmux => tokio::task::spawn_blocking(sample_activity)
-                .await
-                .unwrap_or_else(|e| Err(format!("join error: {e}"))),
-            SessionActivitySource::Herdr { socket_path } => {
-                let socket_path = socket_path.clone();
-                tokio::task::spawn_blocking(move || sample_herdr_activity(&socket_path))
-                    .await
-                    .map_err(|e| format!("join error: {e}"))
-            }
+    /// Take one foreground sample from every configured source, off the async
+    /// runtime (both the tmux shell-out and the herdr socket round-trip block),
+    /// concurrently. Returns one result per source, positionally aligned with
+    /// `self.sources`, so the caller can apply each *independently*.
+    ///
+    /// Failures are per-source, not per-poll: only the tmux sampler can error
+    /// (the herdr sampler is infallible, yielding an empty sample when no
+    /// workspace is focused). A failed source contributes nothing and — because
+    /// [`Self::poll_once`] applies each surviving source scoped to its own
+    /// keyspace — leaves the other hosts' intervals open. A herdr-only machine
+    /// with no `tmux` binary therefore keeps accruing herdr foreground time even
+    /// though its tmux sampler errors every poll.
+    async fn sample(&self) -> Vec<Result<ActivitySample, String>> {
+        let handles: Vec<tokio::task::JoinHandle<Result<ActivitySample, String>>> = self
+            .sources
+            .iter()
+            .map(|source| match source {
+                SessionActivitySource::Tmux => tokio::task::spawn_blocking(sample_activity),
+                SessionActivitySource::Herdr { socket_path } => {
+                    let socket_path = socket_path.clone();
+                    tokio::task::spawn_blocking(move || Ok(sample_herdr_activity(&socket_path)))
+                }
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            results.push(match handle.await {
+                Ok(sample) => sample,
+                Err(e) => Err(format!("join error: {e}")),
+            });
         }
+        results
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -350,36 +441,59 @@ impl SessionActivityTracker {
         records: &mut HashMap<String, SessionActivity>,
         seen_clients: &mut HashMap<String, (i64, i64)>,
     ) {
-        let sample = self.sample().await;
-        let sample = match sample {
-            Ok(sample) => sample,
-            Err(e) => {
-                debug!(error = %e, "session activity poll skipped");
-                return;
-            }
-        };
-
+        let results = self.sample().await;
         let now = OffsetDateTime::now_utc();
-        let report = apply_sample_report(records, &sample.sessions, now);
-        for interval in report.intervals {
-            if let Some(activity_log) = &self.activity_log {
-                activity_log.append(ActivityEntry::SessionForeground(interval));
+
+        // Apply each source independently, scoped to its own keyspace. A failed
+        // source contributes nothing this poll and — because the absence-close is
+        // scoped by `owns` — does not close any other host's open intervals; only
+        // its own keyspace is left untouched. Single-source behavior is
+        // unchanged: the one source's `owns` covers the whole ledger, and a
+        // failure means no source applies (a full no-op poll, exactly as before).
+        let mut changed = false;
+        let mut client_inputs: Vec<ClientInput> = Vec::new();
+        // Reading detection prunes `seen_clients` to the live client set, so it
+        // must only run when the input-producing source (tmux) actually sampled.
+        // A failed tmux poll leaves that state untouched.
+        let mut run_input_detection = false;
+        for (source, result) in self.sources.iter().zip(results) {
+            let sample = match result {
+                Ok(sample) => sample,
+                Err(e) => {
+                    debug!(error = %e, "session activity source sample failed; its keyspace left untouched");
+                    continue;
+                }
+            };
+            let report =
+                apply_scoped_sample_report(records, &sample.sessions, now, |id| source.owns(id));
+            for interval in report.intervals {
+                if let Some(activity_log) = &self.activity_log {
+                    activity_log.append(ActivityEntry::SessionForeground(interval));
+                }
+            }
+            changed |= report.changed;
+            if source.produces_client_inputs() {
+                run_input_detection = true;
+                client_inputs.extend(sample.client_inputs);
             }
         }
 
         // Reading detection: a TmuxInput tick per session whose *already-seen*
         // client advanced its `client_activity` (a keypress or scroll). A fresh
         // client (reattach / extra client) is unseen and only seeds, so an idle
-        // attach never fabricates input.
-        for entry in detect_input_ticks(seen_clients, &sample.client_inputs) {
-            if let Some(activity_log) = &self.activity_log {
-                activity_log.append(ActivityEntry::HumanInteraction(entry));
+        // attach never fabricates input. Skipped entirely when the tmux source
+        // didn't sample, so `seen_clients` isn't pruned on a failed tmux poll.
+        if run_input_detection {
+            for entry in detect_input_ticks(seen_clients, &client_inputs) {
+                if let Some(activity_log) = &self.activity_log {
+                    activity_log.append(ActivityEntry::HumanInteraction(entry));
+                }
             }
         }
 
         // `seen_clients` is in-memory only, so input detection never forces a
         // disk write; persist only when the session foreground state changed.
-        if report.changed {
+        if changed {
             let mut sessions = records.values().cloned().collect::<Vec<_>>();
             sessions.sort_by(|a, b| {
                 a.name
@@ -634,6 +748,30 @@ mod tests {
         assert_eq!(record.total_attached_secs, 15);
     }
 
+    /// A single tracker samples several hosts into one records map. The merged
+    /// live set carries both a tmux `$N` and a herdr workspace id at once;
+    /// because the keyspaces are disjoint, both accrue foreground time and
+    /// neither host's presence closes the other's interval. This is the
+    /// invariant that lets one tracker (one writer) poll both sources safely.
+    #[test]
+    fn merged_multi_host_sample_credits_both_keyspaces() {
+        let mut records = HashMap::new();
+        let t0 = datetime!(2026-05-29 00:00:00 UTC);
+        let t1 = datetime!(2026-05-29 00:00:10 UTC);
+
+        // Poll 1: a merged sample from tmux (`$1`) + herdr (`w1`).
+        let merged = [session("$1", "main", 1), session("w1", "work", 1)];
+        assert!(apply_sample(&mut records, &merged, t0));
+        assert!(records.get("$1").unwrap().is_attached());
+        assert!(records.get("w1").unwrap().is_attached());
+
+        // Poll 2: same merged set — both keep accruing, neither is closed by the
+        // other host being present in the same sample.
+        assert!(!apply_sample(&mut records, &merged, t1));
+        assert_eq!(records.get("$1").unwrap().effective_total_secs(t1), 10);
+        assert_eq!(records.get("w1").unwrap().effective_total_secs(t1), 10);
+    }
+
     #[test]
     fn apply_sample_report_emits_detach_interval() {
         let mut records = HashMap::new();
@@ -665,6 +803,58 @@ mod tests {
         assert_eq!(record.attached_since, None);
         assert_eq!(record.total_attached_secs, 20);
         assert_eq!(record.attached_clients, 0);
+    }
+
+    /// Fix 6: sources apply independently, each scoped to its own keyspace, so a
+    /// failed source can't close another host's open intervals. Here the tmux
+    /// sampler "fails" (contributes nothing this poll) while the herdr sample is
+    /// applied scoped to the herdr keyspace: the tmux `$1` foreground interval
+    /// stays OPEN (not closed by tmux's absence) and herdr keeps accruing. The
+    /// herdr-scoped apply still closes its OWN interval when the workspace
+    /// detaches — the scope includes its keyspace, just not the tmux one.
+    #[test]
+    fn scoped_apply_leaves_foreign_keyspace_untouched() {
+        let tmux_owns = |id: &str| id.starts_with('$');
+        let herdr_owns = |id: &str| !id.starts_with('$');
+
+        let mut records = HashMap::new();
+        let t0 = datetime!(2026-05-29 00:00:00 UTC);
+        let t1 = datetime!(2026-05-29 00:00:10 UTC);
+        let t2 = datetime!(2026-05-29 00:00:25 UTC);
+
+        // Healthy poll: both sources attached, each applied scoped.
+        apply_scoped_sample_report(&mut records, &[session("$1", "main", 1)], t0, tmux_owns);
+        apply_scoped_sample_report(&mut records, &[session("w1", "work", 1)], t0, herdr_owns);
+        assert!(records.get("$1").unwrap().is_attached());
+        assert!(records.get("w1").unwrap().is_attached());
+
+        // Next poll: the tmux sampler errored, so only the herdr sample is
+        // applied (scoped to herdr). tmux `$1` is absent from it but must NOT be
+        // closed — it belongs to the untouched tmux keyspace.
+        let report =
+            apply_scoped_sample_report(&mut records, &[session("w1", "work", 1)], t1, herdr_owns);
+        assert!(
+            report.intervals.is_empty(),
+            "a herdr-only apply must not close the tmux interval",
+        );
+        assert!(
+            records.get("$1").unwrap().is_attached(),
+            "tmux interval stays open across a failed tmux poll",
+        );
+        assert_eq!(records.get("$1").unwrap().effective_total_secs(t1), 10);
+        assert!(records.get("w1").unwrap().is_attached());
+
+        // The herdr workspace itself detaches: the herdr-scoped apply DOES close
+        // its own interval (its keyspace is in scope), while tmux is still left
+        // untouched.
+        let report = apply_scoped_sample_report(&mut records, &[], t2, herdr_owns);
+        assert_eq!(report.intervals.len(), 1);
+        assert_eq!(report.intervals[0].session_id, "w1");
+        assert_eq!(records.get("w1").unwrap().attached_since, None);
+        assert!(
+            records.get("$1").unwrap().is_attached(),
+            "tmux keyspace remains untouched by the herdr detach",
+        );
     }
 
     // Fixed attach time for helpers whose tests don't vary it (same attach).

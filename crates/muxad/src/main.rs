@@ -142,17 +142,28 @@ async fn main() -> Result<()> {
         build_history(&cfg, &writer_shutdown_tx, pane_session_cache.clone()).await;
     let store = Store::shared_with_history(history.clone());
 
-    // One backend, shared across every consumer that previously spoke
-    // to tmux directly. Resolution honors `MUXA_HOST` then auto-detects
-    // from `ZELLIJ` / `TMUX`, falling back to `TmuxBackend` when no host
-    // is detectable. Cheap to clone — the underlying `Arc` lets the
-    // reconciler, discovery, enrichment, and snapshotter each hold a
-    // handle without contention.
-    let backend: muxa::SharedBackend = muxa::default_backend();
+    // The set of backends this daemon observes simultaneously — tmux + herdr
+    // during a migration (see `docs/MULTI_HOST.md`). Resolution honors
+    // `MUXA_HOSTS` > `MUXA_HOST` > auto-detect and is never empty. Each element
+    // is a cheap-to-clone `Arc`, so enumeration-shaped consumers (reconciler,
+    // discovery, pane-session cache, history enrichment) iterate the whole set,
+    // while the few consumers that genuinely need a single handle take the
+    // `primary` (first) backend — or, for a host-specific consumer, the
+    // matching backend from the set.
+    let backends: Vec<muxa::SharedBackend> = muxa::active_backends();
+    // Never empty (see `active_backends`); `primary` is the conventional
+    // single-backend handle for consumers a namespace can't disambiguate.
+    // `active_backends` orders the set by env preference, so `backends[0]` is
+    // the env-preferred host (e.g. herdr when running herdr-inside-herdr) — the
+    // same host the old single-backend daemon detected. Consumers that must
+    // match that legacy single-host behavior (the web dashboard scanner) take
+    // `primary`.
+    let primary: muxa::SharedBackend = backends[0].clone();
     let sessions = muxa::PtySessionBackend::shared();
-    tracing::info!(host = %backend.kind(), "pane backend selected");
-    refresh_pane_session_cache(&pane_session_cache, backend.clone()).await;
-    spawn_pane_session_cache_task(pane_session_cache.clone(), backend.clone(), &shutdown_tx);
+    let observing_kinds: Vec<muxa::HostKind> = backends.iter().map(|b| b.kind()).collect();
+    tracing::info!(hosts = ?observing_kinds, "pane backends selected");
+    refresh_pane_session_cache(&pane_session_cache, &backends).await;
+    spawn_pane_session_cache_task(pane_session_cache.clone(), backends.clone(), &shutdown_tx);
 
     // Rehydrate the agent registry from the previous run's snapshot, if
     // any. Done before the IPC server starts accepting events so no
@@ -173,7 +184,7 @@ async fn main() -> Result<()> {
     // real `session_id` + `last_prompt` from prompts.ndjson, so the
     // operator sees rich rows for those panes immediately on restart
     // instead of `synthetic-%X` placeholders.
-    enrich_from_history(&store, &history, &backend).await;
+    enrich_from_history(&store, &history, &backends).await;
 
     let (activity_log, activity_writer_handle) =
         build_activity_log(&cfg, &writer_shutdown_tx).await;
@@ -185,21 +196,22 @@ async fn main() -> Result<()> {
     )
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
-    let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
-    // herdr event bridge (Phase 2): only on herdr hosts. Translates herdr's
-    // own agent-state detection into synthetic muxa rows so agents muxa has no
-    // hooks for still appear in status/watch/stats. Spawned before the IPC
-    // server takes ownership of `store` so it shares the same registry.
+    let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backends.clone());
+    // herdr event bridge (Phase 2): spawned when herdr ∈ the observed set.
+    // Translates herdr's own agent-state detection into synthetic muxa rows so
+    // agents muxa has no hooks for still appear in status/watch/stats. Spawned
+    // before the IPC server takes ownership of `store` so it shares the same
+    // registry.
     let herdr_bridge_handle =
-        herdr_bridge::spawn_herdr_bridge_task(&backend, store.clone(), &shutdown_tx);
+        herdr_bridge::spawn_herdr_bridge_task(&backends, store.clone(), &shutdown_tx);
     // herdr reverse path: push muxa's authoritative hook-derived state for REAL
     // (non-synthetic) `herdr:` rows back into herdr's UI via `pane.report_agent`,
     // releasing authority when the row stops. Subscribes to the same store
-    // transition stream the notifier/activity tasks use. Herdr-host only.
+    // transition stream the notifier/activity tasks use. Spawned when herdr ∈ set.
     let herdr_report_handle =
-        herdr_bridge::spawn_herdr_report_task(&backend, store.clone(), &shutdown_tx);
+        herdr_bridge::spawn_herdr_report_task(&backends, store.clone(), &shutdown_tx);
     let session_activity_handle =
-        spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone(), &backend);
+        spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone(), &backends);
     let history_compaction_handle = spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
     let activity_compaction_handle =
         spawn_activity_compaction_task(&cfg, activity_log.clone(), &shutdown_tx);
@@ -254,7 +266,17 @@ async fn main() -> Result<()> {
             })
             .flatten();
         let sessions_for_dash = sessions.clone();
-        let backend_for_dash = backend.clone();
+        // The web dashboard's pane scanner stays single-backend this pass —
+        // merging it with the backend set is an explicit non-goal in
+        // `docs/MULTI_HOST.md` (the scanner is dashboard-only plumbing, tracked
+        // as a follow-up). It must observe the *env-preferred* host — exactly
+        // what the old single-backend daemon detected from env. `active_backends`
+        // is ordered by env preference (`backends[0]` = the env-preferred host,
+        // e.g. herdr-inside-herdr), so `primary` IS that backend and the
+        // dashboard behaves identically to the pre-multi-host daemon. On a
+        // multi-host daemon the dashboard shows the env-preferred host only
+        // until the scanner-set merge follow-up lands.
+        let backend_for_dash = primary.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
@@ -281,8 +303,20 @@ async fn main() -> Result<()> {
     spawn_oh_my_prompt_sink(&cfg, &store, &shutdown_tx)?;
     spawn_webhook_sink(&cfg, &store, &shutdown_tx)?;
 
+    // The IPC server's backend is consumed for exactly one thing: routing an
+    // inbound `BackendPaneSnapshot` push into `PaneBackend::ingest_pane_snapshot`
+    // — a no-op on every backend except zellij (whose WASM plugin is the only
+    // external snapshot source). Route those pushes to the zellij backend in the
+    // set so they land in the same instance discovery/reconciler read from;
+    // fall back to `primary` when zellij isn't observed (the ingest is then an
+    // inert no-op anyway).
+    let ipc_backend = backends
+        .iter()
+        .find(|b| b.kind() == muxa::HostKind::Zellij)
+        .cloned()
+        .unwrap_or_else(|| primary.clone());
     let server = Server::new(socket.clone(), store)
-        .with_backend(backend.clone())
+        .with_backend(ipc_backend)
         .with_sessions(sessions);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -309,8 +343,8 @@ async fn main() -> Result<()> {
     // `muxa init` after every daemon or tmux server restart.
     if listener_ready {
         maybe_heal_tmux_socket_env(&socket, cfg.socket.as_deref());
-        spawn_startup_discovery(&cfg, socket.clone(), backend.clone(), &shutdown_tx);
-        spawn_periodic_discovery(&cfg, socket.clone(), backend.clone(), &shutdown_tx);
+        spawn_startup_discovery(&cfg, socket.clone(), backends.clone(), &shutdown_tx);
+        spawn_periodic_discovery(&cfg, socket.clone(), backends.clone(), &shutdown_tx);
     }
 
     // Shutdown sequence (each step depends on the previous):
@@ -535,16 +569,29 @@ async fn build_activity_log(
     }
 }
 
-async fn refresh_pane_session_cache(cache: &PaneSessionCache, backend: muxa::SharedBackend) {
-    let panes = tokio::task::spawn_blocking(move || backend.list_panes())
-        .await
-        .unwrap_or_default();
-    cache.replace(panes.into_iter().map(|pane| (pane.pane_id, pane.session)));
+/// Refresh the pane→session cache from the UNION of every observed backend's
+/// pane list. Pane-id namespaces are disjoint across hosts (`%N` vs `herdr:…`
+/// vs `zellij:…`), so concatenating the per-backend lists into one map can't
+/// collide. Backends are enumerated concurrently off the runtime.
+async fn refresh_pane_session_cache(cache: &PaneSessionCache, backends: &[muxa::SharedBackend]) {
+    let handles: Vec<_> = backends
+        .iter()
+        .map(|backend| {
+            let backend = backend.clone();
+            tokio::task::spawn_blocking(move || backend.list_panes())
+        })
+        .collect();
+    let mut entries = Vec::new();
+    for handle in handles {
+        let panes = handle.await.unwrap_or_default();
+        entries.extend(panes.into_iter().map(|pane| (pane.pane_id, pane.session)));
+    }
+    cache.replace(entries);
 }
 
 fn spawn_pane_session_cache_task(
     cache: PaneSessionCache,
-    backend: muxa::SharedBackend,
+    backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
 ) {
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -557,7 +604,7 @@ fn spawn_pane_session_cache_task(
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    refresh_pane_session_cache(&cache, backend.clone()).await;
+                    refresh_pane_session_cache(&cache, &backends).await;
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::debug!("pane session cache task shutting down");
@@ -752,17 +799,19 @@ fn spawn_reconciler_task(
     cfg: &Config,
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
-    backend: muxa::SharedBackend,
+    backends: Vec<muxa::SharedBackend>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.reconciler.enabled {
         tracing::info!("reconciler disabled by config");
         return None;
     }
-    // The shared backend is what the rest of the daemon uses too —
-    // everyone agreeing on one host means the reconciler reaps panes
-    // by the same definition the watch loop, hook ancestry, and
-    // discovery do. `LivenessSource` reaches the reconciler via the
-    // blanket impl on `PaneBackend`.
+    // One reconciler over the whole observed set: each tick observes every
+    // backend concurrently and reconciles each observation under its own host
+    // kind, so a herdr timeout can't reap tmux rows (completeness is gated
+    // per host). The ghost age-out sweep receives all these kinds, so a row on
+    // a host NOT in the set ages out while rows on observed hosts stay governed
+    // by their own reconcile pass. `LivenessSource` reaches the reconciler via
+    // the blanket impl on `PaneBackend`.
     // Codex has no rate-limit hook; the reconciler learns codex usage caps
     // by polling the on-disk session rollouts. Resolve the tree once here so
     // the per-tick poll just reads files.
@@ -771,9 +820,9 @@ fn spawn_reconciler_task(
     } else {
         None
     };
-    let runner = Reconciler::new(
+    let runner = Reconciler::with_sources(
         store.clone(),
-        backend,
+        backends,
         std::time::Duration::from_secs(cfg.reconciler.interval_secs),
     )
     .with_metrics(store.metrics())
@@ -808,7 +857,7 @@ fn spawn_session_activity_task(
     cfg: &Config,
     shutdown_tx: &broadcast::Sender<()>,
     activity_log: Option<std::sync::Arc<ActivityLog>>,
-    backend: &muxa::SharedBackend,
+    backends: &[muxa::SharedBackend],
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.session_activity.enabled {
         tracing::info!("session activity tracking disabled by config");
@@ -823,27 +872,41 @@ fn spawn_session_activity_task(
         tracing::warn!("session activity tracking enabled but no path resolvable");
         return None;
     };
-    // On herdr, foreground time is credited to the focused workspace over the
-    // herdr socket (resolved the same way the query backend and event bridge
-    // do). Every other host uses the tmux sampler.
-    let source = match backend.kind() {
-        muxa::HostKind::Herdr => muxa::SessionActivitySource::Herdr {
-            socket_path: muxa::backend::herdr::default_socket_path(),
-        },
-        _ => muxa::SessionActivitySource::Tmux,
-    };
+    // One sampling source per host in the set that HAS a foreground signal:
+    // tmux (`list-clients`) and herdr (focused workspace over its socket).
+    // zellij has no client-attach signal, so it contributes no source. A single
+    // tracker polls them all into one ledger — two independent trackers writing
+    // `session-activity.json` would clobber each other (each `save()` rewrites
+    // the whole file); merging is safe because the session-id keyspaces are
+    // disjoint across hosts. Fall back to the default tmux sampler if the set
+    // somehow yields no source (e.g. zellij-only), preserving prior behavior.
+    let mut sources = Vec::new();
+    for backend in backends {
+        match backend.kind() {
+            muxa::HostKind::Tmux => sources.push(muxa::SessionActivitySource::Tmux),
+            muxa::HostKind::Herdr => sources.push(muxa::SessionActivitySource::Herdr {
+                socket_path: muxa::backend::herdr::default_socket_path(),
+            }),
+            muxa::HostKind::Zellij => {}
+        }
+    }
+    let source_kinds: Vec<muxa::HostKind> = backends
+        .iter()
+        .map(|b| b.kind())
+        .filter(|k| *k != muxa::HostKind::Zellij)
+        .collect();
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),
         std::time::Duration::from_secs(cfg.session_activity.interval_secs),
     )
     .with_activity_log(activity_log)
-    .with_source(source);
+    .with_sources(sources);
     let shutdown_rx = shutdown_tx.subscribe();
     let handle = tokio::spawn(tracker.run(shutdown_rx));
     tracing::info!(
         path = %path.display(),
         interval_secs = cfg.session_activity.interval_secs,
-        host = %backend.kind(),
+        hosts = ?source_kinds,
         "session activity tracking enabled",
     );
     Some(handle)
@@ -916,20 +979,30 @@ async fn hydrate_state(cfg: &Config, store: &muxa::SharedStore) {
 async fn enrich_from_history(
     store: &muxa::SharedStore,
     history: &Arc<PromptHistory>,
-    backend: &muxa::SharedBackend,
+    backends: &[muxa::SharedBackend],
 ) {
     if history.is_empty().await {
         return;
     }
-    // Wrap the (potentially blocking) backend call so the runtime
-    // doesn't stall while tmux shells out. Cloning the `Arc` is the
-    // cheapest way to give `spawn_blocking`'s closure the `'static`
-    // handle it needs.
-    let backend_for_blocking = backend.clone();
-    let Ok(panes) = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes()).await
-    else {
-        return;
-    };
+    // Wrap each (potentially blocking) backend call so the runtime doesn't
+    // stall while tmux shells out / the herdr socket round-trips; enumerate the
+    // whole set concurrently and union the results. Cloning the `Arc`s is the
+    // cheapest way to give each `spawn_blocking` closure the `'static` handle it
+    // needs. Pane namespaces are disjoint across hosts, so the union can't
+    // conflate panes from different backends.
+    let handles: Vec<_> = backends
+        .iter()
+        .map(|backend| {
+            let backend = backend.clone();
+            tokio::task::spawn_blocking(move || backend.list_panes())
+        })
+        .collect();
+    let mut panes = Vec::new();
+    for handle in handles {
+        if let Ok(list) = handle.await {
+            panes.extend(list);
+        }
+    }
     if panes.is_empty() {
         return;
     }
@@ -1190,7 +1263,7 @@ fn should_heal_tmux_socket_env(
 fn spawn_startup_discovery(
     cfg: &Config,
     socket: PathBuf,
-    backend: muxa::SharedBackend,
+    backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> bool {
     if !cfg.discovery.enabled {
@@ -1220,22 +1293,72 @@ fn spawn_startup_discovery(
             _ = shutdown_rx.recv() => {
                 tracing::debug!("startup discovery cancelled mid-pass (shutdown)");
             }
-            result = discovery::run_discovery(&client, backend.as_ref()) => match result {
-                Ok(report) => {
-                    tracing::info!(
-                        claude_code = report.claude_code,
-                        codex = report.codex,
-                        gemini_cli = report.gemini_cli,
-                        skipped_known = report.skipped_known,
-                        failed = report.failed,
-                        "startup discovery complete",
-                    );
-                }
-                Err(e) => tracing::warn!(error = %e, "startup discovery failed"),
-            },
+            report = run_discovery_all(&client, &backends) => {
+                tracing::info!(
+                    claude_code = report.claude_code,
+                    codex = report.codex,
+                    gemini_cli = report.gemini_cli,
+                    skipped_known = report.skipped_known,
+                    failed = report.failed,
+                    "startup discovery complete",
+                );
+            }
         }
     });
     true
+}
+
+/// Run one discovery pass over every observed backend and sum the reports.
+/// Pane namespaces are disjoint per host, so each backend's scan contributes
+/// independently.
+///
+/// The passes fan out **concurrently** — each does its own blocking pane scan
+/// (`block_in_place` inside `run_discovery`) plus async IPC, so we drive each
+/// on its own task and join. A slow or unreachable host can't serialize behind
+/// (or block) the others, and a failed pass (discovery error *or* join error)
+/// contributes nothing while the rest still land — best-effort, matching the
+/// rest of the daemon's surface, and mirroring `watch::compute_refresh`'s
+/// concurrent inventory fan-out. `run_discovery` is async (does IPC), so we
+/// use `tokio::spawn` rather than `spawn_blocking`; both the daemon and CLI run
+/// on the multi-threaded runtime `block_in_place` requires.
+async fn run_discovery_all(
+    client: &Client,
+    backends: &[muxa::SharedBackend],
+) -> discovery::DiscoveryReport {
+    let handles: Vec<_> = backends
+        .iter()
+        .map(|backend| {
+            let client = client.clone();
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                let kind = backend.kind();
+                (
+                    kind,
+                    discovery::run_discovery(&client, backend.as_ref()).await,
+                )
+            })
+        })
+        .collect();
+
+    let mut total = discovery::DiscoveryReport::default();
+    for handle in handles {
+        match handle.await {
+            Ok((_, Ok(report))) => {
+                total.claude_code += report.claude_code;
+                total.codex += report.codex;
+                total.gemini_cli += report.gemini_cli;
+                total.skipped_known += report.skipped_known;
+                total.failed += report.failed;
+            }
+            Ok((kind, Err(e))) => {
+                tracing::warn!(error = %e, host = %kind, "discovery pass failed");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "discovery task join failed");
+            }
+        }
+    }
+    total
 }
 
 /// Spawn the periodic discovery rescan. Startup discovery covers t=0; this
@@ -1247,7 +1370,7 @@ fn spawn_startup_discovery(
 fn spawn_periodic_discovery(
     cfg: &Config,
     socket: PathBuf,
-    backend: muxa::SharedBackend,
+    backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
 ) {
     if !cfg.discovery.enabled || cfg.discovery.interval_secs == 0 {
@@ -1264,16 +1387,14 @@ fn spawn_periodic_discovery(
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    match discovery::run_discovery(&client, backend.as_ref()).await {
-                        Ok(report) => tracing::debug!(
-                            claude_code = report.claude_code,
-                            codex = report.codex,
-                            gemini_cli = report.gemini_cli,
-                            skipped_known = report.skipped_known,
-                            "periodic discovery pass",
-                        ),
-                        Err(e) => tracing::warn!(error = %e, "periodic discovery failed"),
-                    }
+                    let report = run_discovery_all(&client, &backends).await;
+                    tracing::debug!(
+                        claude_code = report.claude_code,
+                        codex = report.codex,
+                        gemini_cli = report.gemini_cli,
+                        skipped_known = report.skipped_known,
+                        "periodic discovery pass",
+                    );
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::debug!("periodic discovery shutting down");
@@ -1334,7 +1455,7 @@ mod tests {
         let spawned = spawn_startup_discovery(
             &cfg,
             PathBuf::from("/tmp/never-bound.sock"),
-            muxa::default_backend(),
+            muxa::active_backends(),
             &shutdown_tx,
         );
         assert!(spawned, "discovery should spawn when enabled");
@@ -1353,7 +1474,7 @@ mod tests {
         let spawned = spawn_startup_discovery(
             &cfg,
             PathBuf::from("/tmp/never-bound.sock"),
-            muxa::default_backend(),
+            muxa::active_backends(),
             &shutdown_tx,
         );
         assert!(!spawned, "discovery must not spawn when disabled");

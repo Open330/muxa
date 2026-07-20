@@ -668,9 +668,17 @@ pub(crate) enum RowIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRow {
-    /// Stable group key — `PaneInfo.session` (tmux session name / herdr
-    /// `workspace_id`). Used for grouping, sorting, and the activity bridge.
+    /// Raw session id — `PaneInfo.session` (tmux session name / herdr
+    /// `workspace_id`). This is the ledger/display key: activity lookups and
+    /// `display_name` resolution key off it (host id-spaces are disjoint, so a
+    /// raw id is unambiguous for those lookups). NOT the grouping key — a tmux
+    /// session and a herdr workspace can share a raw id (both "w1"), so
+    /// grouping/identity use `group_key` instead.
     pub session: String,
+    /// Host-namespaced grouping/identity key (`"{host}:{session}"`, e.g.
+    /// `"tmux:w1"` vs `"herdr:w1"`). Keeps a tmux session and a herdr workspace
+    /// with the same raw id in distinct rows. Internal only — never displayed.
+    pub group_key: String,
     /// Human-facing name shown in the session view. Equals `session` on tmux;
     /// resolves to the workspace label on herdr.
     pub display_name: String,
@@ -790,7 +798,7 @@ impl WatchRow {
         match self {
             Self::Agent(a) => RowIdentity::Agent(a.kind, a.session_id.clone()),
             Self::BarePane(p) => RowIdentity::BarePane(p.pane_id.clone()),
-            Self::Session(s) => RowIdentity::Session(s.session.clone()),
+            Self::Session(s) => RowIdentity::Session(s.group_key.clone()),
         }
     }
 
@@ -2008,6 +2016,48 @@ fn sort_agents(
     a.pane.as_deref().cmp(&b.pane.as_deref())
 }
 
+/// Host-namespaced grouping/identity key for a session row.
+///
+/// A tmux session and a herdr workspace can share a raw session id (both
+/// named "w1"); grouping by the raw id alone merges them into one corrupted
+/// row (wrong pane counts, mixed agents). Prefixing with the host keeps them
+/// distinct. Ledger/display lookups still use the *raw* id (`session`), which
+/// is unambiguous because each host's id-space is disjoint — this composite is
+/// grouping/identity only. A row with no classifiable host (paneless agent,
+/// `(no session)`, a background task) keys on the raw id, matching the
+/// pre-multi-host grouping exactly.
+fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
+    match host {
+        Some(muxa::HostKind::Tmux) => format!("tmux:{session}"),
+        Some(muxa::HostKind::Herdr) => format!("herdr:{session}"),
+        Some(muxa::HostKind::Zellij) => format!("zellij:{session}"),
+        None => session.to_string(),
+    }
+}
+
+/// Resolve an agent's session group: the raw session id (display/ledger key)
+/// plus the pane's host namespace (grouping key input). Resolved from the
+/// agent's pane when it's in the inventory; a paneless / stale agent has no
+/// host, so it falls back to a raw synthetic session and `None`.
+fn agent_session_group(
+    agent: &Agent,
+    pane_lookup: impl Fn(&str) -> Option<(String, Option<muxa::HostKind>)>,
+) -> (String, Option<muxa::HostKind>) {
+    agent
+        .pane
+        .as_deref()
+        .and_then(&pane_lookup)
+        .unwrap_or_else(|| {
+            let session = match agent.pane.as_deref() {
+                Some(p) => format!("(stale {p})"),
+                // Paneless background tasks group under their own name.
+                None if agent.kind == AgentKind::Task => agent.session_id.clone(),
+                None => "(no session)".to_string(),
+            };
+            (session, None)
+        })
+}
+
 fn build_session_rows(
     agents: Vec<Agent>,
     panes: &[PaneInfo],
@@ -2017,7 +2067,10 @@ fn build_session_rows(
 ) -> Vec<WatchRow> {
     #[derive(Default)]
     struct Builder {
+        /// Raw session id (display/ledger key).
         session: String,
+        /// Host-namespaced grouping/identity key.
+        group_key: String,
         panes: Vec<PaneInfo>,
         agents: Vec<Agent>,
         activity: Option<SessionActivity>,
@@ -2026,30 +2079,33 @@ fn build_session_rows(
     let sort_context =
         SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
+    // Keyed by the host-namespaced `group_key`, not the raw session, so a tmux
+    // session "w1" and a herdr workspace "w1" build two rows.
     let mut builders: HashMap<String, Builder> = HashMap::new();
     for p in panes {
-        let entry = builders
-            .entry(p.session.clone())
-            .or_insert_with(|| Builder {
-                session: p.session.clone(),
-                ..Builder::default()
-            });
+        let host = muxa::backend::pane_id_host_kind(&p.pane_id);
+        let key = session_group_key(host, &p.session);
+        let entry = builders.entry(key.clone()).or_insert_with(|| Builder {
+            session: p.session.clone(),
+            group_key: key,
+            ..Builder::default()
+        });
         entry.panes.push(p.clone());
     }
 
     for agent in agents {
-        let session = agent
-            .pane
-            .as_deref()
-            .and_then(|id| sort_context.pane(id).map(|p| p.session.clone()))
-            .unwrap_or_else(|| match agent.pane.as_deref() {
-                Some(p) => format!("(stale {p})"),
-                // Paneless background tasks group under their own name.
-                None if agent.kind == AgentKind::Task => agent.session_id.clone(),
-                None => "(no session)".to_string(),
-            });
-        let entry = builders.entry(session.clone()).or_insert_with(|| Builder {
+        let (session, host) = agent_session_group(&agent, |id| {
+            sort_context.pane(id).map(|p| {
+                (
+                    p.session.clone(),
+                    muxa::backend::pane_id_host_kind(&p.pane_id),
+                )
+            })
+        });
+        let key = session_group_key(host, &session);
+        let entry = builders.entry(key.clone()).or_insert_with(|| Builder {
             session,
+            group_key: key,
             ..Builder::default()
         });
         entry.agents.push(agent);
@@ -2098,6 +2154,7 @@ fn build_session_rows(
                 .collect();
             SessionRow {
                 display_name: sort_context.display_name(&b.session),
+                group_key: b.group_key,
                 session: b.session,
                 pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
                 representative_pane,
@@ -2115,6 +2172,62 @@ fn build_session_rows(
     rows.into_iter()
         .map(|row| WatchRow::Session(Box::new(row)))
         .collect()
+}
+
+/// The host a row belongs to, classified by its pane id's namespace
+/// (`%…`→tmux, `herdr:…`→herdr, `zellij:…`→zellij). `None` when the row
+/// carries no classifiable pane id (a paneless agent, a legacy/synthetic
+/// id) — such rows get no host badge.
+fn row_host(row: &WatchRow) -> Option<muxa::HostKind> {
+    let pane_id = match row {
+        WatchRow::Agent(a) => a.pane.as_deref(),
+        WatchRow::BarePane(p) => Some(p.pane_id.as_str()),
+        WatchRow::Session(s) => s
+            .representative_pane
+            .as_deref()
+            .or_else(|| s.pane_ids.first().map(String::as_str)),
+    }?;
+    muxa::backend::pane_id_host_kind(pane_id)
+}
+
+/// Whether the visible row set spans more than one host — the trigger for
+/// showing per-row host badges. Single-host users (the common case) see no
+/// badge, so nothing changes for them. Rows with no classifiable host don't
+/// count toward the distinct-host tally.
+fn rows_multi_host(rows: &[WatchRow]) -> bool {
+    let mut seen: Option<muxa::HostKind> = None;
+    for row in rows {
+        if let Some(host) = row_host(row) {
+            match seen {
+                Some(prev) if prev != host => return true,
+                None => seen = Some(host),
+                Some(_) => {}
+            }
+        }
+    }
+    false
+}
+
+/// The subtle dim host tag shown before a multi-host row's SESSION/PANE
+/// cell. Mirrors the dashboard TUI's `CardHost` naming.
+fn host_badge_label(host: muxa::HostKind) -> &'static str {
+    match host {
+        muxa::HostKind::Tmux => "tmux",
+        muxa::HostKind::Zellij => "zellij",
+        muxa::HostKind::Herdr => "herdr",
+    }
+}
+
+/// Prepend the dim host tag to a cell's first line. Only called when the
+/// row set spans multiple hosts, so the badge disambiguates rather than
+/// adding noise.
+fn prepend_host_badge(text: &mut Text<'_>, host: muxa::HostKind) {
+    let style = Style::default().add_modifier(Modifier::DIM);
+    let badge = Span::styled(format!("{} ", host_badge_label(host)), style);
+    match text.lines.first_mut() {
+        Some(line) => line.spans.insert(0, badge),
+        None => text.lines.push(Line::from(badge)),
+    }
 }
 
 fn sort_panes(a: &PaneInfo, b: &PaneInfo) -> std::cmp::Ordering {
@@ -2183,7 +2296,9 @@ fn sort_sessions(
             return cmp;
         }
     }
-    a.session.cmp(&b.session)
+    // Final tiebreak on the host-namespaced key so two rows sharing a raw
+    // session id (tmux "w1" + herdr "w1") get a stable, deterministic order.
+    a.group_key.cmp(&b.group_key)
 }
 
 /// Render a `pane_id` as `session:window.pane` when we can resolve it
@@ -2788,26 +2903,34 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
 }
 
 fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
-    let session = agent
+    // Resolve the agent's raw session (display/ledger) and its pane host, then
+    // match rows on the host-namespaced group key — the same keying
+    // `build_session_rows` uses — so a herdr "w1" agent never merges into a
+    // tmux "w1" row.
+    let (session, host) = agent
         .pane
         .as_deref()
         .and_then(|id| {
-            app.panes
-                .iter()
-                .find(|p| p.pane_id == id)
-                .map(|p| p.session.clone())
+            app.panes.iter().find(|p| p.pane_id == id).map(|p| {
+                (
+                    p.session.clone(),
+                    muxa::backend::pane_id_host_kind(&p.pane_id),
+                )
+            })
         })
         .unwrap_or_else(|| {
-            agent
+            let session = agent
                 .pane
                 .as_deref()
-                .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"))
+                .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"));
+            (session, None)
         });
+    let group_key = session_group_key(host, &session);
     for row in &mut app.rows {
         let WatchRow::Session(s) = row else {
             continue;
         };
-        if s.session != session {
+        if s.group_key != group_key {
             continue;
         }
         let key = (agent.kind, agent.session_id.clone());
@@ -2855,6 +2978,7 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
         .map_or_else(|| session.clone(), |s| s.name.clone());
     app.rows.push(WatchRow::Session(Box::new(SessionRow {
         display_name,
+        group_key,
         session,
         pane_ids: agent.pane.clone().into_iter().collect(),
         representative_pane: agent.pane.clone(),
@@ -2908,31 +3032,15 @@ fn apply_full(app: &mut App, full: FullRefresh) {
     app.set_data_with_sessions(new_agents, panes, sessions, session_activity);
 }
 
-/// Compute one refresh outcome: pane inventory from the active backend
-/// (off-runtime via `spawn_blocking` so any shell-out doesn't block the
-/// runtime) plus a daemon snapshot. Kept independent of `App` so the
-/// work can run on a worker thread without holding any UI state.
-async fn compute_refresh(
-    client: &Client,
-    backend: &muxa::SharedBackend,
-    session_activity_path: Option<PathBuf>,
-) -> RefreshOutcome {
-    // Pane inventory is independent of the daemon — fetch it even when
-    // muxad is down so `muxa watch` stays useful as a session picker.
-    // The backend's `list_panes` may shell out (tmux) or hit a cache
-    // (zellij + plugin); either way it MUST NOT run on a tokio worker.
-    let backend_for_blocking = backend.clone();
-    let panes_task = tokio::task::spawn_blocking(move || backend_for_blocking.list_panes());
-
-    // Source the "sessions" list per host. tmux shells `list-sessions`;
-    // herdr derives sessions from its workspaces over the socket (session
-    // id = raw `workspace_id`, matching `PaneInfo.session` and the
-    // session-activity ledger key so the DUR column resolves; display name =
-    // workspace label, falling back to the id). zellij has no session
-    // concept here, so it stays empty. Any host: this may shell out or hit a
-    // socket, so it MUST NOT run on a tokio worker.
-    let host = backend.kind();
-    let sessions_task = tokio::task::spawn_blocking(move || match host {
+/// The "sessions" list for one host. tmux shells `list-sessions`; herdr
+/// derives sessions from its workspaces over the socket (session id = raw
+/// `workspace_id`, matching `PaneInfo.session` and the session-activity
+/// ledger key so the DUR column resolves; display name = workspace label,
+/// falling back to the id). zellij has no session concept here, so it stays
+/// empty. May shell out or hit a socket — callers MUST run it off the tokio
+/// runtime.
+fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
+    match host {
         muxa::HostKind::Tmux => muxa::tmux::list_sessions().unwrap_or_default(),
         muxa::HostKind::Herdr => {
             let socket = muxa::backend::herdr::default_socket_path();
@@ -2949,7 +3057,45 @@ async fn compute_refresh(
                 .collect()
         }
         muxa::HostKind::Zellij => Vec::new(),
-    });
+    }
+}
+
+/// Compute one refresh outcome: pane inventory aggregated across every
+/// active backend (off-runtime via `spawn_blocking` so any shell-out
+/// doesn't block the runtime) plus a daemon snapshot. Kept independent of
+/// `App` so the work can run on a worker thread without holding any UI
+/// state.
+async fn compute_refresh(
+    client: &Client,
+    backends: &[muxa::SharedBackend],
+    session_activity_path: Option<PathBuf>,
+) -> RefreshOutcome {
+    // Pane inventory is independent of the daemon — fetch it even when
+    // muxad is down so `muxa watch` stays useful as a session picker. This
+    // is the cross-multiplexer unified console: aggregate `list_panes` and
+    // the per-host session sources across EVERY active backend so tmux and
+    // herdr rows show side by side. Rows carry their host namespace in the
+    // pane id, so a concat keeps them distinct.
+    //
+    // Each backend's `list_panes` / session source may shell out (tmux) or
+    // hit a socket (herdr); neither may run on a tokio worker, so every one
+    // goes through `spawn_blocking`. Spawning them up front runs the whole
+    // fan-out concurrently — the tick budget is one host's latency, not the
+    // sum (see docs/MULTI_HOST.md "Startup cost").
+    let pane_tasks: Vec<_> = backends
+        .iter()
+        .map(|backend| {
+            let backend = backend.clone();
+            tokio::task::spawn_blocking(move || backend.list_panes())
+        })
+        .collect();
+    let session_tasks: Vec<_> = backends
+        .iter()
+        .map(|backend| {
+            let host = backend.kind();
+            tokio::task::spawn_blocking(move || sessions_for_host(host))
+        })
+        .collect();
 
     let session_activity_task = async move {
         match session_activity_path {
@@ -2958,14 +3104,18 @@ async fn compute_refresh(
         }
     };
 
-    let (panes, sessions, session_activity, snapshot) = tokio::join!(
-        panes_task,
-        sessions_task,
-        session_activity_task,
-        client.snapshot()
-    );
-    let panes = panes.unwrap_or_default();
-    let sessions = sessions.unwrap_or_default();
+    // The blocking tasks already run concurrently on the blocking pool;
+    // await the daemon snapshot + ledger load alongside them, then collect.
+    let (session_activity, snapshot) = tokio::join!(session_activity_task, client.snapshot());
+
+    let mut panes: Vec<PaneInfo> = Vec::new();
+    for task in pane_tasks {
+        panes.extend(task.await.unwrap_or_default());
+    }
+    let mut sessions: Vec<SessionInfo> = Vec::new();
+    for task in session_tasks {
+        sessions.extend(task.await.unwrap_or_default());
+    }
 
     let full = match snapshot {
         Ok(agents) => FullRefresh {
@@ -3123,14 +3273,19 @@ pub async fn run(
     let mut guard = TerminalGuard::new(terminal);
 
     let mut app = App::with_config(watch_cfg);
-    // Resolve the host once at startup — same Arc threads through the
-    // priming refresh, the background task, and the live capture path.
-    let backend: muxa::SharedBackend = muxa::default_backend();
+    // The unified console observes every active host. The set threads
+    // through the priming refresh and the background task; the live
+    // capture path resolves a backend per pane-id namespace instead.
+    let backends: Vec<muxa::SharedBackend> = muxa::active_backends();
 
-    // When invoked from inside a host (tmux / zellij), land the cursor
-    // on the user's current pane on first load instead of always
-    // row 0.
-    let initial_pane = backend.current_pane();
+    // "Where am I" is inherently single-host (env-based) — land the cursor on
+    // the user's current pane on first load. `current_pane` is env-based: the
+    // env-preferred backend answers inside its own pane, but inside e.g. a
+    // herdr pane launched from tmux BOTH backends could answer. `active_backends`
+    // is ordered by env preference (`backends[0]` = the env-preferred host), so
+    // we resolve in set order and take the first `Some` — env preference breaks
+    // the tie. Single-host: identical (the one backend answers or doesn't).
+    let initial_pane = backends.iter().find_map(|b| b.current_pane());
     app.set_initial_pane(initial_pane.clone());
     let watch_started_at = OffsetDateTime::now_utc();
     let mut prompt_started_at: Option<(OffsetDateTime, String)> = None;
@@ -3156,7 +3311,7 @@ pub async fn run(
     // wrapper for what is effectively immutable data. The backend is
     // already an `Arc<dyn …>` so cloning it is just a refcount bump.
     let bg_client = client.clone();
-    let bg_backend = backend.clone();
+    let bg_backends = backends.clone();
     let bg_session_activity_path = session_activity_path.clone();
     let sub_client = client.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
@@ -3178,9 +3333,9 @@ pub async fn run(
     let bg = tokio::spawn(refresh_task(
         move || {
             let client = bg_client.clone();
-            let backend = bg_backend.clone();
+            let backends = bg_backends.clone();
             let session_activity_path = bg_session_activity_path.clone();
-            async move { compute_refresh(&client, &backend, session_activity_path).await }
+            async move { compute_refresh(&client, &backends, session_activity_path).await }
         },
         wake_rx,
         outcome_tx,
@@ -3464,19 +3619,22 @@ pub async fn run(
         // (zellij CLI today) skip the call and the renderer shows a
         // "(not supported)" placeholder.
         if let Some(p) = &app.preview {
-            if p.content == PreviewContent::LivePane && backend.caps().capture_pane {
+            // Resolve the capturing backend by the pane id's namespace so a
+            // herdr row captures via herdr even when tmux is the primary
+            // host (and vice versa). Cheap to build per capture (bounded to
+            // ~2 Hz by the TTL below).
+            let cap_backend = crate::backend_for_pane(&p.pane_id);
+            if p.content == PreviewContent::LivePane && cap_backend.caps().capture_pane {
                 let stale = app.pane_capture.as_ref().is_none_or(|c| {
                     c.pane_id != p.pane_id || c.fetched_at.elapsed() >= Duration::from_millis(500)
                 });
                 if stale {
                     let pane_id = p.pane_id.clone();
-                    let backend_for_blocking = backend.clone();
-                    let captured = tokio::task::spawn_blocking(move || {
-                        backend_for_blocking.capture_pane(&pane_id)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                    let captured =
+                        tokio::task::spawn_blocking(move || cap_backend.capture_pane(&pane_id))
+                            .await
+                            .ok()
+                            .flatten();
                     app.pane_capture = Some(CapturedPane {
                         pane_id: p.pane_id.clone(),
                         text: captured.unwrap_or_default(),
@@ -4885,6 +5043,8 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
+#[allow(clippy::too_many_lines)] // column resolution + per-row cell/badge/pulse
+                                 // assembly reads better inline than split across helpers
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
 
@@ -4930,6 +5090,15 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .columns
         .iter()
         .position(|c| matches!(c, WatchColumn::State));
+    // Host badges: only when the row set spans >1 host (the cross-
+    // multiplexer console) do we tag each row's SESSION/PANE cell, so a
+    // single-host user sees no change. The Pane column is the natural
+    // host-identifying slot in both the session and pane views.
+    let pane_col = app
+        .columns
+        .iter()
+        .position(|c| matches!(c, WatchColumn::Pane));
+    let multi_host = rows_multi_host(&app.rows);
     let row_pulses = resolve_row_pulses(app);
     let rows: Vec<Row> = app
         .rows
@@ -4953,6 +5122,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             // Overlay a transition pulse on the State cell.
             if let (Some(sc), Some(kind)) = (state_col, row_pulses[i]) {
                 texts[sc] = pulse_cell(kind, theme, anim_frame);
+            }
+
+            // Tag the row with its host when the console spans multiple.
+            if multi_host {
+                if let (Some(pc), Some(host)) = (pane_col, row_host(r)) {
+                    prepend_host_badge(&mut texts[pc], host);
+                }
             }
 
             let mut expanded = false;
@@ -6989,6 +7165,188 @@ mod tests {
             panic!("expected session row");
         };
         assert_eq!(row.display_name, "w1", "display name falls back to the id");
+    }
+
+    #[test]
+    fn same_named_tmux_session_and_herdr_workspace_stay_distinct_rows() {
+        // A tmux session named "w1" and a herdr workspace whose id is "w1"
+        // share a raw session string. Grouped by the raw id alone they'd merge
+        // into one corrupted row (panes from both hosts, wrong count); the
+        // host-namespaced group key keeps them apart.
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![
+                // tmux "w1": two panes.
+                fake_pane("%1", "w1", 0, 0, "zsh"),
+                fake_pane("%2", "w1", 0, 1, "nvim"),
+                // herdr workspace "w1": one pane.
+                fake_pane("herdr:p1", "w1", 0, 0, "zsh"),
+            ],
+            vec![fake_session("$1", "w1", 1)],
+            vec![],
+        );
+
+        let session_rows: Vec<&SessionRow> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                WatchRow::Session(s) => Some(s.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            session_rows.len(),
+            2,
+            "tmux w1 and herdr w1 must be two distinct rows"
+        );
+
+        let tmux_row = session_rows
+            .iter()
+            .find(|s| s.group_key == "tmux:w1")
+            .expect("tmux:w1 row present");
+        let herdr_row = session_rows
+            .iter()
+            .find(|s| s.group_key == "herdr:w1")
+            .expect("herdr:w1 row present");
+
+        // Raw session id stays "w1" on both (display/ledger key), only the
+        // group key is namespaced.
+        assert_eq!(tmux_row.session, "w1");
+        assert_eq!(herdr_row.session, "w1");
+        assert_eq!(tmux_row.pane_count, 2, "tmux row keeps its two panes");
+        assert_eq!(herdr_row.pane_count, 1, "herdr row keeps its one pane");
+    }
+
+    // ---- multi-host aggregation + badges ---------------------------------
+
+    #[test]
+    fn row_host_classifies_by_pane_namespace() {
+        let tmux = WatchRow::BarePane(Box::new(fake_pane("%1", "main", 0, 0, "zsh")));
+        let herdr = WatchRow::BarePane(Box::new(fake_pane("herdr:p1", "w1", 0, 0, "zsh")));
+        let zellij = WatchRow::BarePane(Box::new(fake_pane("zellij:7", "z", 0, 0, "zsh")));
+        let legacy = WatchRow::BarePane(Box::new(fake_pane("weird-id", "x", 0, 0, "zsh")));
+        assert_eq!(row_host(&tmux), Some(muxa::HostKind::Tmux));
+        assert_eq!(row_host(&herdr), Some(muxa::HostKind::Herdr));
+        assert_eq!(row_host(&zellij), Some(muxa::HostKind::Zellij));
+        assert_eq!(row_host(&legacy), None, "unrecognized ids get no badge");
+    }
+
+    #[test]
+    fn rows_multi_host_only_when_hosts_differ() {
+        let tmux_a = WatchRow::BarePane(Box::new(fake_pane("%1", "main", 0, 0, "zsh")));
+        let tmux_b = WatchRow::BarePane(Box::new(fake_pane("%2", "main", 0, 1, "zsh")));
+        let herdr = WatchRow::BarePane(Box::new(fake_pane("herdr:p1", "w1", 0, 0, "zsh")));
+        let legacy = WatchRow::BarePane(Box::new(fake_pane("weird", "x", 0, 0, "zsh")));
+
+        assert!(
+            !rows_multi_host(std::slice::from_ref(&tmux_a)),
+            "single tmux host → no badges"
+        );
+        assert!(
+            !rows_multi_host(&[
+                WatchRow::BarePane(Box::new(fake_pane("%1", "main", 0, 0, "zsh"))),
+                WatchRow::BarePane(Box::new(fake_pane("%2", "main", 0, 1, "zsh"))),
+            ]),
+            "two tmux rows are still one host"
+        );
+        assert!(
+            rows_multi_host(&[
+                WatchRow::BarePane(Box::new(fake_pane("%1", "main", 0, 0, "zsh"))),
+                WatchRow::BarePane(Box::new(fake_pane("herdr:p1", "w1", 0, 0, "zsh"))),
+            ]),
+            "tmux + herdr → badges on"
+        );
+        // Unclassifiable rows never flip the decision on their own.
+        assert!(!rows_multi_host(&[legacy]));
+        drop((tmux_a, tmux_b, herdr));
+    }
+
+    #[test]
+    fn mixed_host_panes_build_distinct_session_rows() {
+        // A tmux session and a herdr workspace with colliding-looking keys
+        // ("main" vs "w1") stay separate rows, each classified to its host.
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data_with_sessions(
+            vec![],
+            vec![
+                fake_pane("%1", "main", 0, 0, "vim"),
+                fake_pane("herdr:p1", "w1", 0, 0, "zsh"),
+            ],
+            vec![fake_session("w1", "muxa", 0)],
+            vec![],
+        );
+        assert_eq!(app.rows.len(), 2, "one row per host session");
+        let hosts: std::collections::HashSet<_> = app.rows.iter().filter_map(row_host).collect();
+        assert!(hosts.contains(&muxa::HostKind::Tmux));
+        assert!(hosts.contains(&muxa::HostKind::Herdr));
+        assert!(rows_multi_host(&app.rows));
+    }
+
+    #[test]
+    fn host_badges_render_only_in_multi_host() {
+        fn render_to_string(app: &mut App) -> String {
+            let backend = TestBackend::new(120, 12);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(f, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        }
+
+        // Multi-host: the SESSION cells carry dim "tmux"/"herdr" tags. The
+        // session names ("main"/"w1") don't contain those words, so a match
+        // can only come from the badge.
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            ..WatchConfig::default()
+        };
+        let mut multi = App::with_config(cfg.clone());
+        multi.set_data_with_sessions(
+            vec![],
+            vec![
+                fake_pane("%1", "main", 0, 0, "vim"),
+                fake_pane("herdr:p1", "w1", 0, 0, "zsh"),
+            ],
+            vec![],
+            vec![],
+        );
+        let text = render_to_string(&mut multi);
+        assert!(
+            text.contains("tmux"),
+            "multi-host shows tmux badge: {text:?}"
+        );
+        assert!(
+            text.contains("herdr"),
+            "multi-host shows herdr badge: {text:?}"
+        );
+
+        // Single-host: no badge — a lone tmux session must not gain a
+        // "herdr" (or any) host tag.
+        let mut single = App::with_config(cfg);
+        single.set_data_with_sessions(
+            vec![],
+            vec![fake_pane("%1", "main", 0, 0, "vim")],
+            vec![],
+            vec![],
+        );
+        let text = render_to_string(&mut single);
+        assert!(
+            !text.contains("herdr"),
+            "single-host adds no host badge: {text:?}"
+        );
     }
 
     #[test]

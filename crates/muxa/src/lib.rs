@@ -63,8 +63,8 @@ pub mod tmux;
 // ---------------------------------------------------------------------------
 
 pub use backend::{
-    default_backend, tmux::TmuxBackend, zellij::ZellijBackend, BackendCaps, HostKind, PaneBackend,
-    SharedBackend,
+    active_backends, default_backend, tmux::TmuxBackend, zellij::ZellijBackend, BackendCaps,
+    HostKind, PaneBackend, SharedBackend,
 };
 pub use config::Config;
 pub use error::CoreError as Error;
