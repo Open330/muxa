@@ -13,7 +13,7 @@
 //! by the daemon's desktop-notifier task to wake users when an agent moves
 //! into `WaitingInput` or `Error`.
 
-use crate::backend::PaneObservation;
+use crate::backend::{HostKind, PaneObservation};
 use crate::event::{
     AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, RateLimitScope, RateLimitSource,
     SurfaceRef,
@@ -57,9 +57,28 @@ fn same_pane_identity(agent: &Agent, pane: &str, tmux_socket: Option<&str>) -> b
     }
 }
 
-fn pane_is_live(agent: &Agent, panes_by_id: &HashMap<&str, Vec<&PaneInfo>>) -> bool {
+fn pane_is_live(
+    agent: &Agent,
+    panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+    observing_kind: HostKind,
+) -> bool {
     if agent.pid.is_some() {
         return true;
+    }
+    // Cross-host reaping guard: an observation from one backend only governs
+    // rows whose pane id belongs to that backend's host. A tmux-backend daemon
+    // physically cannot see herdr/zellij panes (and vice versa), so a namespaced
+    // id for *another* host missing from this snapshot is not death — it's just
+    // out of view. Treat such rows as live so a tmux→herdr migration (both hosts
+    // active) doesn't reap the other host's live rows every reconcile tick.
+    // Unknown-shape ids (`None`) fall through to the active backend's normal
+    // governance, exactly as before this guard existed.
+    if let Some(pane_id) = agent.pane.as_deref() {
+        if let Some(host) = crate::backend::pane_id_host_kind(pane_id) {
+            if host != observing_kind {
+                return true;
+            }
+        }
     }
     match agent.pane.as_deref() {
         Some(pane_id) => match (panes_by_id.get(pane_id), agent.tmux_socket.as_deref()) {
@@ -1633,19 +1652,44 @@ impl Store {
     ///
     /// Idempotent and safe to run on a timer regardless of event traffic.
     /// Returns counts so callers can log non-trivial sweeps without spamming.
-    pub async fn reconcile_observation(&self, observation: &PaneObservation) -> ReconcileReport {
+    pub async fn reconcile_observation(
+        &self,
+        observation: &PaneObservation,
+        observing_kind: HostKind,
+    ) -> ReconcileReport {
         if !observation.is_complete() {
             return ReconcileReport::default();
         }
-        self.reconcile(&observation.panes).await
+        self.reconcile_hosted(&observation.panes, observing_kind)
+            .await
     }
 
-    /// Converge against a pane set already known to be complete.
+    /// Converge against a pane set already known to be complete, assuming the
+    /// panes were observed by the **tmux** backend.
     ///
-    /// Most runtime callers should use [`Self::reconcile_observation`]. This
-    /// slice-based entry point remains for focused store tests and callers
-    /// that obtain their complete pane inventory without a [`PaneBackend`](crate::backend::PaneBackend).
+    /// Most runtime callers should use [`Self::reconcile_observation`], which
+    /// threads the real observing [`HostKind`] through so the cross-host
+    /// reaping guard can exempt other hosts' rows. This slice-based entry point
+    /// remains for focused store tests and callers that obtain their complete
+    /// pane inventory without a [`PaneBackend`](crate::backend::PaneBackend);
+    /// every such caller today observes tmux, so it defaults to
+    /// [`HostKind::Tmux`]. Tests exercising cross-host behavior call
+    /// [`Self::reconcile_hosted`] directly.
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
+        self.reconcile_hosted(live_panes, HostKind::Tmux).await
+    }
+
+    /// Converge against a complete pane set observed by `observing_kind`.
+    ///
+    /// The `observing_kind` is the host that produced `live_panes`. It gates
+    /// the stale-pane reap so an observation only governs rows whose pane id
+    /// belongs to that host (see [`pane_is_live`] and
+    /// [`crate::backend::pane_id_host_kind`]).
+    pub async fn reconcile_hosted(
+        &self,
+        live_panes: &[PaneInfo],
+        observing_kind: HostKind,
+    ) -> ReconcileReport {
         let mut agents = self.agents.write().await;
         let mut report = ReconcileReport::default();
 
@@ -1664,7 +1708,7 @@ impl Store {
         let mut stale_transitions = Vec::new();
         let before = agents.len();
         agents.retain(|_, a| {
-            let keep = pane_is_live(a, &panes_by_id);
+            let keep = pane_is_live(a, &panes_by_id, observing_kind);
             if !keep && a.state != AgentState::Stopped {
                 let mut stopped = a.clone();
                 let from = stopped.state;
@@ -3839,6 +3883,100 @@ mod tests {
             pane_pid: 0,
             current_path: String::new(),
         }
+    }
+
+    /// Start an agent on an arbitrary pane id (any host namespace) so the
+    /// cross-host reaping-guard tests can plant `herdr:…` / `zellij:…` / `%N`
+    /// rows without the `%1`-defaulting `id()` helper.
+    fn started_on(sid: &str, pane_id: &str) -> AgentEvent {
+        AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane_id.into()),
+                cwd: None,
+            },
+            at: datetime!(2026-04-24 12:00:00 UTC),
+        }
+    }
+
+    /// Cross-host reaping guard: a `herdr:`-namespaced row must survive a
+    /// **tmux** observation that doesn't contain it. A tmux-backend daemon
+    /// physically can't see herdr panes, so their absence from its scan is not
+    /// death — reaping them would be fatal during a tmux→herdr migration where
+    /// both hosts run at once. The same-host tmux ghost is still reaped.
+    #[tokio::test]
+    async fn herdr_row_survives_tmux_observation() {
+        let store = Store::shared();
+        store.apply(&started_on("herdr-live", "herdr:7")).await;
+        store.apply(&started_on("tmux-live", "%1")).await;
+        store.apply(&started_on("tmux-ghost", "%2")).await;
+
+        // Tmux backend observed only %1. It never enumerates herdr panes.
+        let report = store.reconcile_hosted(&[pane("%1")], HostKind::Tmux).await;
+
+        assert_eq!(report.stale_panes_reaped, 1, "only the tmux ghost reaps");
+        let ids: Vec<String> = store
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|a| a.session_id)
+            .collect();
+        assert!(ids.contains(&"herdr-live".to_string()), "herdr row exempt");
+        assert!(ids.contains(&"tmux-live".to_string()));
+        assert!(
+            !ids.contains(&"tmux-ghost".to_string()),
+            "tmux ghost reaped"
+        );
+    }
+
+    /// Mirror of the above from the other side: a tmux `%N` row survives a
+    /// **herdr** observation. A herdr-backend daemon can't see tmux panes, so
+    /// their absence isn't evidence of death. The same-host herdr ghost reaps.
+    #[tokio::test]
+    async fn tmux_row_survives_herdr_observation() {
+        let store = Store::shared();
+        store.apply(&started_on("tmux-live", "%9")).await;
+        store.apply(&started_on("herdr-live", "herdr:1")).await;
+        store.apply(&started_on("herdr-ghost", "herdr:2")).await;
+
+        // Herdr backend observed only herdr:1.
+        let report = store
+            .reconcile_hosted(&[pane("herdr:1")], HostKind::Herdr)
+            .await;
+
+        assert_eq!(report.stale_panes_reaped, 1, "only the herdr ghost reaps");
+        let ids: Vec<String> = store
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|a| a.session_id)
+            .collect();
+        assert!(ids.contains(&"tmux-live".to_string()), "tmux row exempt");
+        assert!(ids.contains(&"herdr-live".to_string()));
+        assert!(
+            !ids.contains(&"herdr-ghost".to_string()),
+            "herdr ghost reaped"
+        );
+    }
+
+    /// An unknown-shape pane id (no `%` / `zellij:` / `herdr:` namespace) has
+    /// no host classification, so it stays governed by the active backend —
+    /// exactly as before the guard existed. Here a tmux observation without it
+    /// reaps it. Guards against the exemption silently swallowing legacy rows.
+    #[tokio::test]
+    async fn unknown_shape_pane_governed_by_active_backend() {
+        let store = Store::shared();
+        store.apply(&started_on("legacy", "weird-id")).await;
+
+        // Tmux observation contains no matching pane → legacy row reaped,
+        // because `pane_id_host_kind("weird-id")` is `None` (not exempt).
+        let report = store.reconcile_hosted(&[], HostKind::Tmux).await;
+
+        assert_eq!(report.stale_panes_reaped, 1, "unknown-shape row reaped");
+        assert!(store.snapshot().await.is_empty());
     }
 
     /// Synthetic must lose to a real session even when the real session is

@@ -39,7 +39,9 @@ pub trait HookAdapter {
 /// `pane` resolution, in order:
 /// 1. `$TMUX_PANE` (tmux sets this on every shell inside a pane).
 /// 2. `$ZELLIJ_PANE_ID` (zellij's analog).
-/// 3. Walk the parent-pid chain and match against the active backend's
+/// 3. `$HERDR_PANE_ID` (herdr's analog), namespaced to `herdr:<id>` — see
+///    [`host_pane_env`].
+/// 4. Walk the parent-pid chain and match against the active backend's
 ///    `pane_pid_map()`. Linux reads `/proc`; macOS/BSD take one `ps` process
 ///    snapshot and walk it in memory. Useful when an agent hook subprocess
 ///    didn't inherit the host env var. Skipped when the backend's
@@ -102,18 +104,43 @@ fn muxa_session_env() -> Option<SurfaceRef> {
 }
 
 /// Read whichever host-set "this pane" env var is present, in
-/// `TMUX_PANE` then `ZELLIJ_PANE_ID` order. Empty string is treated as
-/// unset; see also `crate::backend::detect_host_env` for the host-
-/// selection precedence.
+/// `TMUX_PANE` → `ZELLIJ_PANE_ID` → `HERDR_PANE_ID` order. Empty string is
+/// treated as unset; see also `crate::backend::detect_host_env` for the
+/// host-selection precedence.
+///
+/// tmux/zellij ids are returned verbatim (`%N`, `zellij:<id>` — the latter
+/// already carries its namespace). herdr's raw pane id is *not* namespaced
+/// by herdr, so we stamp `crate::backend::herdr::PANE_ID_PREFIX` (`herdr:`)
+/// here to match the `herdr:<id>` shape muxa uses everywhere internally
+/// (registry rows, `by_pane`, and the cross-host reaping guard's
+/// `pane_id_host_kind`); the prefix is stripped again before the id goes
+/// back over the herdr socket.
+///
+/// tmux wins the precedence over herdr deliberately: when both env vars are
+/// present the process is a tmux pane running *inside* a herdr terminal, and
+/// `$TMUX_PANE` is the id that muxa's tmux backend can actually observe and
+/// reap — `$HERDR_PANE_ID` there names herdr's outer container, not a pane
+/// muxa tracks. (Nested the other way — herdr inside tmux — doesn't set
+/// `$TMUX_PANE` for the herdr pane, so this order is safe.)
 fn host_pane_env() -> Option<String> {
+    host_pane_env_from(|name| std::env::var(name).ok())
+}
+
+/// Decoupled-from-process-env variant of [`host_pane_env`] for tests, mirroring
+/// `crate::backend::detect_from`. `read("VAR")` yields the env var's value if
+/// set, else `None`; tests pass a closure so we never mutate `std::env`
+/// (forbidden by the workspace's `forbid(unsafe_code)` posture, and racy under
+/// parallel test threads).
+fn host_pane_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
     for name in ["TMUX_PANE", "ZELLIJ_PANE_ID"] {
-        if let Ok(v) = std::env::var(name) {
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Some(v) = read(name).filter(|v| !v.is_empty()) {
+            return Some(v);
         }
     }
-    None
+    // herdr last, and prefixed — the raw `$HERDR_PANE_ID` is un-namespaced.
+    read("HERDR_PANE_ID")
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("{}{v}", crate::backend::herdr::PANE_ID_PREFIX))
 }
 
 /// Walk our parent PID chain and look each ancestor up in the
@@ -158,4 +185,88 @@ pub(crate) fn truncate(mut s: String, max: usize) -> String {
         s.push('…');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `read` closure from a static lookup table, matching the
+    /// `backend::tests::env_reader` shape. Missing keys read as `None`.
+    fn env_reader(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// tmux and zellij pane ids pass through verbatim: `$TMUX_PANE` is
+    /// already `%N` and `$ZELLIJ_PANE_ID` already carries its `zellij:`
+    /// namespace, so muxa must not re-wrap either.
+    #[test]
+    fn host_pane_env_returns_tmux_and_zellij_verbatim() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("TMUX_PANE", "%7")])),
+            Some("%7".to_string()),
+        );
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("ZELLIJ_PANE_ID", "zellij:3")])),
+            Some("zellij:3".to_string()),
+        );
+    }
+
+    /// herdr's raw `$HERDR_PANE_ID` is un-namespaced, so the adapter stamps
+    /// the `herdr:` prefix — matching the `herdr:<id>` shape muxa uses in the
+    /// registry and the reaping guard's `pane_id_host_kind`.
+    #[test]
+    fn host_pane_env_prefixes_herdr_pane_id() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("HERDR_PANE_ID", "42")])),
+            Some(format!("{}42", crate::backend::herdr::PANE_ID_PREFIX)),
+        );
+    }
+
+    /// When both `$TMUX_PANE` and `$HERDR_PANE_ID` are set — a tmux pane
+    /// running inside a herdr terminal — tmux wins: `$TMUX_PANE` names the
+    /// pane muxa's tmux backend can actually observe and reap, whereas
+    /// `$HERDR_PANE_ID` there names herdr's outer container. The precedence
+    /// order keeps herdr last for exactly this reason.
+    #[test]
+    fn host_pane_env_tmux_takes_precedence_over_herdr() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("TMUX_PANE", "%1"), ("HERDR_PANE_ID", "9")])),
+            Some("%1".to_string()),
+            "tmux pane id must win when nested inside a herdr terminal",
+        );
+    }
+
+    /// An empty `$HERDR_PANE_ID` is treated as unset (never returned as a
+    /// bare `herdr:` prefix), matching the empty-string handling for the
+    /// tmux/zellij vars.
+    #[test]
+    fn host_pane_env_ignores_empty_herdr_pane_id() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("HERDR_PANE_ID", "")])),
+            None
+        );
+        // Empty herdr but a real zellij id → the zellij id, not a stray prefix.
+        assert_eq!(
+            host_pane_env_from(env_reader(&[
+                ("HERDR_PANE_ID", ""),
+                ("ZELLIJ_PANE_ID", "zellij:5"),
+            ])),
+            Some("zellij:5".to_string()),
+        );
+    }
+
+    /// No host env at all → `None`; the caller then falls back to the
+    /// parent-pid ancestry walk.
+    #[test]
+    fn host_pane_env_none_when_unset() {
+        assert_eq!(host_pane_env_from(env_reader(&[])), None);
+    }
 }

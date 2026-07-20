@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **herdr backend (Phase 1).** muxa now observes agents inside
+  [herdr](https://herdr.dev) panes: a full `PaneBackend` over herdr's local
+  socket API (`pane.list`/`pane.read`/`pane.process_info`/`pane.focus`, so
+  pane inventory, live captures, pid maps, and watch-attach all work with
+  no plugin), hook correlation via `$HERDR_PANE_ID` (rows are namespaced
+  `herdr:<pane_id>`), host auto-detection inside herdr panes plus a
+  `MUXA_HOST=herdr` override for the daemon, and a cross-host reaping
+  guard so a tmux-backend daemon never reaps live `herdr:`/`zellij:` rows
+  (and vice versa) while both hosts are in use. Verified end-to-end
+  against herdr 0.7.4 (protocol 16). See `docs/HERDR.md`.
+- **herdr event bridge (Phase 2).** On herdr hosts the daemon now
+  subscribes to herdr's `pane.agent_status_changed` stream and translates
+  it into synthetic muxa rows, so agents muxa has no hooks for (cursor,
+  amp, copilot, …) still appear in `muxa status`/`watch`/stats:
+  `working`→working, `blocked`→waiting, `idle`/`done`→turn-stop; unknown
+  agents map to `AgentKind::Unknown` carrying the herdr agent name.
+  Real hook events stay authoritative — a hooked agent owns its pane and
+  bridge state never clobbers it. Verified live against herdr 0.7.4. See
+  `docs/HERDR.md`.
+
 ### Fixed
 
 - **The `muxa Watch` BarShelf widget no longer goes blank after a muxa

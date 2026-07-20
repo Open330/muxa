@@ -35,7 +35,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, warn};
 
 use crate::adapters::codex_rollout;
-use crate::backend::PaneObservation;
+use crate::backend::{HostKind, PaneObservation};
 use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, RateLimitScope, RateLimitSource};
 use crate::metrics::Metrics;
 use crate::process_tree;
@@ -84,6 +84,16 @@ struct CodexPollTarget {
 /// and inherit the blanket impl (more realistic).
 pub trait LivenessSource: Send + Sync + 'static {
     fn observe_panes(&self) -> PaneObservation;
+
+    /// Which host produced this source's observations. The reconciler threads
+    /// it into [`Store::reconcile_observation`](crate::state::Store::reconcile_observation)
+    /// so the cross-host reaping guard only reaps rows whose pane id belongs to
+    /// the observing host — a tmux daemon must not reap live `herdr:`/`zellij:`
+    /// rows, and vice versa. Defaults to [`HostKind::Tmux`] for the hand-rolled
+    /// test fakes that predate the guard and only ever carry `%N` panes.
+    fn kind(&self) -> HostKind {
+        HostKind::Tmux
+    }
 }
 
 /// Every pane backend is a liveness source. Saves every backend impl
@@ -92,6 +102,9 @@ pub trait LivenessSource: Send + Sync + 'static {
 impl<B: crate::backend::PaneBackend> LivenessSource for B {
     fn observe_panes(&self) -> PaneObservation {
         crate::backend::PaneBackend::observe_panes(self)
+    }
+    fn kind(&self) -> HostKind {
+        crate::backend::PaneBackend::kind(self)
     }
 }
 
@@ -333,6 +346,9 @@ impl<L: LivenessSource> Reconciler<L> {
     pub async fn reconcile_once(&self) -> ReconcileReport {
         let started = Instant::now();
         // Pane observation shells out to tmux and must not block the runtime.
+        // Capture the observing host up front so the store's reaping guard can
+        // exempt rows namespaced to a *different* host (cross-host migration).
+        let observing_kind = self.source.kind();
         let src = self.source.clone();
         let list_started = Instant::now();
         let observation = tokio::task::spawn_blocking(move || src.observe_panes())
@@ -356,7 +372,10 @@ impl<L: LivenessSource> Reconciler<L> {
         let workload_scan_us =
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let reconcile_started = Instant::now();
-        let report = self.store.reconcile_observation(&observation).await;
+        let report = self
+            .store
+            .reconcile_observation(&observation, observing_kind)
+            .await;
         let workload_changed = if pane_observation_complete {
             self.store.update_workloads(&workloads).await
         } else {

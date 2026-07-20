@@ -27,6 +27,8 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
+mod herdr_bridge;
+
 /// Inactivity window before a stopped agent is evicted from the in-memory store.
 const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 /// Cadence at which the GC task scans for evictable agents.
@@ -184,6 +186,12 @@ async fn main() -> Result<()> {
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
     let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backend.clone());
+    // herdr event bridge (Phase 2): only on herdr hosts. Translates herdr's
+    // own agent-state detection into synthetic muxa rows so agents muxa has no
+    // hooks for still appear in status/watch/stats. Spawned before the IPC
+    // server takes ownership of `store` so it shares the same registry.
+    let herdr_bridge_handle =
+        herdr_bridge::spawn_herdr_bridge_task(&backend, store.clone(), &shutdown_tx);
     let session_activity_handle =
         spawn_session_activity_task(&cfg, &shutdown_tx, activity_log.clone());
     let history_compaction_handle = spawn_history_compaction_task(&cfg, &store, &shutdown_tx);
@@ -312,6 +320,7 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(());
     await_shutdown_task("gc", Some(gc_handle)).await;
     await_shutdown_task("reconciler", reconciler_handle).await;
+    await_shutdown_task("herdr bridge", herdr_bridge_handle).await;
     await_shutdown_task("session activity", session_activity_handle).await;
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;

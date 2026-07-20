@@ -455,6 +455,7 @@ fn push_action_target(targets: &mut Vec<ActionTarget>, target: ActionTarget) {
 enum CardHost {
     Tmux,
     Zellij,
+    Herdr,
     Pty,
     Pane,
     Agent,
@@ -465,6 +466,7 @@ impl CardHost {
         match self {
             Self::Tmux => "tmux",
             Self::Zellij => "zellij",
+            Self::Herdr => "herdr",
             Self::Pty => "pty",
             Self::Pane => "pane",
             Self::Agent => "agent",
@@ -1142,6 +1144,7 @@ fn build_dashboard_data(
         let card_host = match host {
             HostKind::Tmux => CardHost::Tmux,
             HostKind::Zellij => CardHost::Zellij,
+            HostKind::Herdr => CardHost::Herdr,
         };
         let key = format!("{}:{}", card_host.label(), pane.session);
         let builder = builders
@@ -1288,6 +1291,7 @@ fn card_identity(
             let card_host = match host {
                 HostKind::Tmux => CardHost::Tmux,
                 HostKind::Zellij => CardHost::Zellij,
+                HostKind::Herdr => CardHost::Herdr,
             };
             return CardIdentity {
                 key: format!("{}:{}", card_host.label(), info.session),
@@ -2148,7 +2152,7 @@ fn compact_card_lines(
 
 fn card_title(card: &SessionCard) -> String {
     let prefix = match card.host {
-        CardHost::Tmux | CardHost::Zellij => "",
+        CardHost::Tmux | CardHost::Zellij | CardHost::Herdr => "",
         CardHost::Pty => "pty:",
         CardHost::Pane => "pane:",
         CardHost::Agent => "agent:",
