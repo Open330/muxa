@@ -434,6 +434,30 @@ pub trait PaneBackend: Send + Sync + 'static {
         false
     }
 
+    /// Like [`Self::send_text`] but targeting the pane on a specific host
+    /// *server* named by `socket`. This is the control-plane entry point: a
+    /// tmux pane id like `%5` exists on every running tmux server, so the
+    /// daemon threads the agent row's recorded `tmux_socket` here to inject
+    /// into the RIGHT server rather than whichever one answers first.
+    ///
+    /// `socket` is the pane row's recorded short socket name (`default` /
+    /// `amux`), or `None` when the row has no recorded socket. The default
+    /// impl ignores `socket` and delegates to [`Self::send_text`] — correct
+    /// for hosts without a per-server socket concept (herdr, zellij); tmux
+    /// overrides it to pin the server.
+    fn send_text_on(&self, _socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        self.send_text(pane_id, text)
+    }
+
+    /// Like [`Self::capture_pane`] but targeting the pane on the specific host
+    /// server named by `socket` — the control-plane `capture` counterpart to
+    /// [`Self::send_text_on`]. The default impl ignores `socket` and delegates
+    /// to [`Self::capture_pane`]; tmux overrides it to pin the server so a
+    /// shared pane id can't capture the wrong screen.
+    fn capture_pane_on(&self, _socket: Option<&str>, pane_id: &str) -> Option<String> {
+        self.capture_pane(pane_id)
+    }
+
     /// Static capability descriptor. Default impl returns "everything
     /// supported" because that's the tmux shape and most backends
     /// model their gaps as exceptions to that baseline.
@@ -491,6 +515,12 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn send_text(&self, pane_id: &str, text: &str) -> bool {
         (**self).send_text(pane_id, text)
+    }
+    fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        (**self).send_text_on(socket, pane_id, text)
+    }
+    fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
+        (**self).capture_pane_on(socket, pane_id)
     }
     fn caps(&self) -> BackendCaps {
         (**self).caps()

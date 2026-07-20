@@ -124,11 +124,12 @@ fn tmux_output(args: &[&str]) -> Result<Output, TmuxError> {
 /// names a specific server socket.
 ///
 /// The other single-socket helpers target whatever the default socket /
-/// `$TMUX_TMPDIR` resolves to. Control actions ([`send_text`]) instead have
-/// to reach the *particular* server the target pane lives on. When the daemon
-/// is scoped to one server (`MUXA_TMUX_SOCKET`, as in an isolated or test
-/// context) we pass `-S <socket>` so `send-keys` lands on that server rather
-/// than the default one. Unset ⇒ no `-S`, byte-identical to `tmux_command()`.
+/// `$TMUX_TMPDIR` resolves to. When the daemon is scoped to one server
+/// (`MUXA_TMUX_SOCKET`, as in an isolated or test context) we pass
+/// `-S <socket>` so the command lands on that server rather than the default
+/// one. Unset ⇒ no `-S`, byte-identical to `tmux_command()`. This is the
+/// *env-scoped* fallback; a control op that knows the pane's server prefers
+/// [`tmux_command_targeting`], which pins the exact server the pane lives on.
 fn tmux_command_scoped() -> Command {
     let mut cmd = tmux_command();
     if let Ok(sock) = std::env::var("MUXA_TMUX_SOCKET") {
@@ -140,28 +141,207 @@ fn tmux_command_scoped() -> Command {
     cmd
 }
 
+/// Resolve a short tmux socket name (a pane row's recorded `tmux_socket`, e.g.
+/// `default` / `amux` — the socket file's basename) to the full socket *path*
+/// of a live server, by matching the basename against the scanner's socket
+/// enumeration. `None` when no enumerated socket matches (server gone, or the
+/// name came from a non-standard socket dir the scanner doesn't walk).
+///
+/// This is what lets a control op target the *specific* server a pane lives
+/// on: pane id `%5` exists on every tmux server, so `send-keys` / `capture-pane`
+/// must be pinned to the right one via `-S <full-path>`. Matching against
+/// [`scanner::enumerate_sockets`] (which already honors `MUXA_TMUX_SOCKET`
+/// scoping and the macOS `/tmp`↔`/private/tmp` split) keeps the targeting
+/// byte-identical to how the pane was discovered in the first place.
+fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
+    let short_name = short_name.trim();
+    if short_name.is_empty() {
+        return None;
+    }
+    scanner::enumerate_sockets()
+        .into_iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(short_name))
+}
+
+/// Build a tmux `Command` pinned to the specific server named by `socket` (a
+/// pane row's recorded short socket name). Resolves the name to the live
+/// server's full socket path and passes `-S <path>` so the command can't leak
+/// onto a different server that happens to share the pane id.
+///
+/// Falls back to [`tmux_command_scoped`] (the `MUXA_TMUX_SOCKET`-or-default
+/// behavior) when `socket` is `None`/empty or doesn't resolve to a live
+/// server — i.e. when the agent row has no recorded socket — preserving the
+/// pre-control-plane single-server behavior.
+fn tmux_command_targeting(socket: Option<&str>) -> Command {
+    if let Some(path) = socket.and_then(resolve_socket_path) {
+        let mut cmd = tmux_command();
+        cmd.arg("-S").arg(path);
+        return cmd;
+    }
+    tmux_command_scoped()
+}
+
 /// The `send-keys` argv (after any server-scope flags) for a literal text
-/// injection. Split out from [`send_text`] so the argument construction is
+/// injection. Split out from [`send_text_on`] so the argument construction is
 /// unit-testable without a running tmux server.
 ///
 /// `-l` sends the text literally — no key-name lookup — so arbitrary prompt
-/// text can't be misread as a tmux key (`Enter`, `C-c`, …). A bare `"\r"`
-/// submits the pane's current line (byte-identical to `send-keys Enter`).
-fn send_keys_argv<'a>(pane_id: &'a str, text: &'a str) -> [&'a str; 5] {
-    ["send-keys", "-t", pane_id, "-l", text]
+/// text can't be misread as a tmux key (`Enter`, `C-c`, …). The `--` marks the
+/// end of options so text that *starts* with `-` (e.g. `-rf`) is taken as the
+/// literal argument, not a flag — MCP forwards arbitrary model text, so this
+/// path must survive hostile leading characters.
+///
+/// The `--` does NOT rescue a *trailing* `;`: tmux consumes a trailing
+/// unescaped `;` as a command separator at its command-parse layer, before this
+/// command's own option scanner runs. Text ending in `;` (and multi-line text)
+/// is routed through the paste path instead — see [`needs_paste`].
+fn send_keys_argv<'a>(pane_id: &'a str, text: &'a str) -> [&'a str; 6] {
+    ["send-keys", "-t", pane_id, "-l", "--", text]
 }
 
-/// Inject `text` into `pane_id` as literal keystrokes. Backs the tmux
-/// [`crate::backend::PaneBackend::send_text`] capability and, through it, the
-/// daemon's `send_prompt` IPC. Returns `true` on a zero exit; `false` when
-/// the pane is gone, tmux errors, or the shell-out times out (best-effort,
-/// matching the rest of this module).
+/// Whether literal `text` must be injected via the paste-buffer path rather
+/// than a single `send-keys -l -- …` call.
 ///
-/// Known limitation: text that *starts* with `-` can be misparsed by tmux's
-/// `send-keys` option scanner; muxa never generates such prompts and callers
-/// should avoid leading dashes.
+/// Two hazards can't be sent verbatim through `send-keys` and are NOT fixed by
+/// the `--` terminator (both are resolved by tmux *before* send-keys' own
+/// option scanner runs):
+///   - **embedded newline** — `send-keys -l` replays each `\n` as an Enter, so
+///     a multi-line prompt is submitted line-by-line even with `submit:false`.
+///   - **trailing `;`** — tmux eats a trailing unescaped `;` as a command
+///     separator, silently dropping it (verified on tmux 3.x: `-l -- ';'` types
+///     nothing, while `-l -- 'a;b'` is fine — only a *trailing* `;` is lost).
+///
+/// Feeding the text on stdin via `load-buffer` and replaying it with a
+/// bracketed `paste-buffer` sidesteps argv parsing entirely, so both land
+/// literally. The lone submit CR (`"\r"`) has neither hazard, so it stays on
+/// the fast `send-keys` path.
+fn needs_paste(text: &str) -> bool {
+    text.contains('\n') || text.ends_with(';')
+}
+
+/// A process-unique scratch tmux buffer name for one paste injection. Unique
+/// (pid + monotonic counter) so concurrent control ops can't clobber each
+/// other's buffer between `load-buffer` and `paste-buffer`.
+fn paste_buffer_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("muxa-send-{}-{n}", std::process::id())
+}
+
+/// Like [`command_output_with_timeout`] but writes `input` to the child's
+/// stdin (then closes it) before waiting — for `load-buffer -b <buf> -`, which
+/// reads the paste payload from stdin so it never passes through argv.
+fn feed_stdin_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    command: String,
+    input: &[u8],
+) -> Result<Output, TmuxError> {
+    use std::io::Write;
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Write the payload and drop the handle so tmux sees EOF. Best-effort: a
+    // failed write (child already died) falls through to the wait/timeout
+    // below, which surfaces the real failure via the exit status.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(TmuxError::Spawn);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TmuxError::Timeout { command, timeout });
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Inject `text` into `pane_id` via tmux's paste buffer instead of
+/// `send-keys`, so multi-line text lands as one bracketed paste (not an
+/// Enter-per-newline submit) and a trailing `;` survives. Used by
+/// [`send_text_on`] for text that [`needs_paste`] flags.
+///
+/// Sequence: `load-buffer -b <buf> -` (payload on stdin, never in argv) →
+/// `paste-buffer -p -b <buf> -t <pane>` (`-p` = bracketed paste) →
+/// `delete-buffer -b <buf>` (best-effort scratch cleanup).
+///
+/// Bracketed paste is best-effort by nature: a paste-aware target (Claude
+/// Code's input, a modern readline shell with bracketed-paste on) inserts the
+/// whole block without executing intermediate newlines; a target that doesn't
+/// honor bracketed paste still sees the raw newlines and may run them
+/// line-by-line. This is strictly better than `send-keys -l` (which ALWAYS
+/// submits per newline), so it's the least-surprising default for multi-line
+/// submit semantics. The trailing submit CR (`submit:true`) is sent separately
+/// as a `send-keys` Enter and is unaffected.
+fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+    let buf = paste_buffer_name();
+
+    let mut load = tmux_command_targeting(socket);
+    load.args(["load-buffer", "-b", &buf, "-"]);
+    let loaded = feed_stdin_with_timeout(
+        load,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux load-buffer -b {buf}"),
+        text.as_bytes(),
+    )
+    .is_ok_and(|o| o.status.success());
+    if !loaded {
+        return false;
+    }
+
+    let mut paste = tmux_command_targeting(socket);
+    paste.args(["paste-buffer", "-p", "-b", &buf, "-t", pane_id]);
+    let pasted = command_output_with_timeout(
+        paste,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux paste-buffer -t {pane_id}"),
+    )
+    .is_ok_and(|o| o.status.success());
+
+    // `paste-buffer` without `-d` leaves the named buffer behind; delete it so
+    // scratch buffers don't accumulate. A leaked buffer is harmless, so the
+    // result is ignored — the paste's success is what we report.
+    let mut del = tmux_command_targeting(socket);
+    del.args(["delete-buffer", "-b", &buf]);
+    let _ = command_output_with_timeout(
+        del,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux delete-buffer -b {buf}"),
+    );
+
+    pasted
+}
+
+/// Inject `text` into `pane_id` as literal keystrokes on the env-scoped
+/// default server. Thin wrapper over [`send_text_on`] with no pinned socket —
+/// kept for callers/tests that don't carry a recorded socket. The control
+/// plane uses [`send_text_on`] with the agent row's recorded socket.
 pub fn send_text(pane_id: &str, text: &str) -> bool {
-    let mut cmd = tmux_command_scoped();
+    send_text_on(None, pane_id, text)
+}
+
+/// Inject `text` into `pane_id` on the specific tmux server named by `socket`
+/// (a pane row's recorded short socket name; `None` ⇒ env-scoped default).
+/// Backs the tmux [`crate::backend::PaneBackend::send_text_on`] capability
+/// and, through it, the daemon's `send_prompt` IPC.
+///
+/// Simple single-line text goes through a fast `send-keys -l -- <text>`; text
+/// with an embedded newline or a trailing `;` is routed through the paste
+/// buffer instead (see [`needs_paste`] / [`paste_text_on`]) so it lands
+/// verbatim. Returns `true` on success; `false` when the pane is gone, tmux
+/// errors, or the shell-out times out (best-effort, matching this module).
+pub fn send_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+    if needs_paste(text) {
+        return paste_text_on(socket, pane_id, text);
+    }
+    let mut cmd = tmux_command_targeting(socket);
     cmd.args(send_keys_argv(pane_id, text));
     command_output_with_timeout(
         cmd,
@@ -541,11 +721,33 @@ pub fn inside_tmux() -> bool {
 /// status is non-zero, the stderr is short — so callers should treat
 /// `NonZero` as "ephemeral, retry next tick" rather than fatal.
 pub fn capture_pane(pane_id: &str) -> Result<String, TmuxError> {
-    // Scope to `MUXA_TMUX_SOCKET` (via `-S`) when set so a capture reaches the
-    // specific server the pane lives on — the same targeting `send_text` uses,
-    // which is what makes the control-plane `capture` IPC work in an isolated
-    // single-server context. Unset ⇒ default socket, unchanged.
-    let mut cmd = tmux_command_scoped();
+    // DEFAULT-SERVER capture. This is the `muxa watch` preview + web dashboard
+    // path, which must always hit the default tmux server (whatever the user's
+    // interactive `$TMUX_TMPDIR` / `default` socket resolves to) — NOT a
+    // pane-row-recorded socket. Kept on `tmux_output` (no `-S`): a PR that
+    // scoped this to `MUXA_TMUX_SOCKET` regressed the preview/dashboard when a
+    // stale env socket was set in the daemon.
+    //
+    // The control-plane `capture` IPC uses [`capture_pane_on`] instead, which
+    // pins the specific server a pane lives on. The two paths are deliberately
+    // distinct — see that function.
+    let out = tmux_output(&["capture-pane", "-ep", "-t", pane_id])?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
+/// Capture the visible contents of a pane on the specific tmux server named by
+/// `socket` (a pane row's recorded short socket name; `None` ⇒ env-scoped
+/// default). Backs the tmux [`crate::backend::PaneBackend::capture_pane_on`]
+/// capability and the control-plane `capture` IPC, whose whole point is to read
+/// the RIGHT `%5` when the pane id exists on several servers. Same `-ep`
+/// flags / error mapping as [`capture_pane`]; only the server targeting differs.
+pub fn capture_pane_on(socket: Option<&str>, pane_id: &str) -> Result<String, TmuxError> {
+    let mut cmd = tmux_command_targeting(socket);
     cmd.args(["capture-pane", "-ep", "-t", pane_id]);
     let out = command_output_with_timeout(
         cmd,
@@ -657,19 +859,62 @@ mod tests {
     use super::*;
 
     /// Locks the `send-keys` argv shape: literal (`-l`) injection targeting
-    /// the pane id, with the text passed verbatim as the final arg. `-l`
-    /// keeps prompt text from being reinterpreted as a tmux key name.
+    /// the pane id, with `--` terminating options and the text passed verbatim
+    /// as the final arg. `-l` keeps prompt text from being reinterpreted as a
+    /// tmux key name; `--` keeps a leading `-` from being parsed as a flag.
     #[test]
     fn send_keys_argv_is_literal_and_targeted() {
         assert_eq!(
             send_keys_argv("%12", "fix the bug"),
-            ["send-keys", "-t", "%12", "-l", "fix the bug"],
+            ["send-keys", "-t", "%12", "-l", "--", "fix the bug"],
         );
         // A bare carriage return is the submit form (send-keys Enter equiv).
         assert_eq!(
             send_keys_argv("%3", "\r"),
-            ["send-keys", "-t", "%3", "-l", "\r"],
+            ["send-keys", "-t", "%3", "-l", "--", "\r"],
         );
+    }
+
+    /// Hostile argv shapes the `--` terminator must neutralize: text that
+    /// *begins* with a dash (would otherwise be read as a send-keys flag),
+    /// a bare semicolon, and the empty string. MCP forwards arbitrary model
+    /// text, so these are real inputs — the argv always keeps `--` in front
+    /// of the payload so the text is positional, never optional.
+    #[test]
+    fn send_keys_argv_terminates_options_for_hostile_text() {
+        // Leading dash: `--` makes `-rf x` the literal text, not flags.
+        assert_eq!(
+            send_keys_argv("%1", "-rf x"),
+            ["send-keys", "-t", "%1", "-l", "--", "-rf x"],
+        );
+        // Bare semicolon: still placed after `--` (runtime routing sends it
+        // via the paste path — see `needs_paste` — because a *trailing* `;`
+        // is eaten by tmux's command splitter regardless of `--`).
+        assert_eq!(
+            send_keys_argv("%1", ";"),
+            ["send-keys", "-t", "%1", "-l", "--", ";"],
+        );
+        // Empty string: a harmless no-op injection, shape unchanged.
+        assert_eq!(
+            send_keys_argv("%1", ""),
+            ["send-keys", "-t", "%1", "-l", "--", ""],
+        );
+    }
+
+    /// The paste-vs-send-keys routing predicate: multi-line text and text with
+    /// a trailing `;` must take the paste path (both are corrupted by
+    /// `send-keys -l`); everything else — including an embedded `;`, a leading
+    /// dash, the empty string, and the lone submit CR — stays on the fast path.
+    #[test]
+    fn needs_paste_flags_newline_and_trailing_semicolon() {
+        assert!(needs_paste("line one\nline two"));
+        assert!(needs_paste("run this;"));
+        assert!(needs_paste(";")); // lone `;` ends with `;`
+        assert!(!needs_paste("a;b")); // embedded `;` is safe
+        assert!(!needs_paste("-rf x")); // leading dash handled by `--`
+        assert!(!needs_paste("")); // empty is a no-op, not hazardous
+        assert!(!needs_paste("\r")); // lone submit CR stays on send-keys
+        assert!(!needs_paste("plain text"));
     }
 
     #[test]

@@ -24,10 +24,16 @@
 //! control plane.
 
 use anyhow::{bail, Result};
+use muxa::event::AgentState;
 use muxa::ipc::Client;
+use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 /// MCP protocol revision we speak. `2024-11-05` is the widely-deployed
 /// revision Claude Code and other hosts negotiate; a tools-only server is
@@ -43,6 +49,17 @@ const DEFAULT_WAIT_SECS: u64 = 30;
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
 
+/// How often `muxa_wait_for_change` reconciles against a fresh daemon
+/// snapshot while blocking on the transition stream. A broadcast lag on the
+/// daemon can silently drop the exact transition we're waiting for (the
+/// daemon emits a `{"event":"lagged"}` marker, but the shared
+/// `TransitionStream` consumer skips it and this consumer has no other lag
+/// signal), so we poll on this cadence and compare the target pane's current
+/// state against a baseline captured at entry. Small enough to stay
+/// responsive, large enough that even a 600 s wait costs only a few hundred
+/// cheap snapshot round-trips.
+const RECONCILE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Run the MCP stdio server until stdin closes. Refuses to start if the
 /// daemon socket is unreachable.
 pub async fn run(client: Client) -> Result<()> {
@@ -55,49 +72,152 @@ pub async fn run(client: Client) -> Result<()> {
         );
     }
 
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    let mut stdout = tokio::io::stdout();
+    serve(
+        client,
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await
+}
+
+/// Read newline-delimited JSON-RPC requests from `reader` and write one
+/// response line per request to `writer`, **dispatching each request on its
+/// own task**. This is the crux of the non-blocking transport: a
+/// long-running tool (`muxa_wait_for_change`, up to 600 s) must never wedge
+/// unrelated traffic, so a `ping` / `tools/list` issued while a wait is
+/// outstanding is answered immediately rather than queued behind it.
+///
+/// Responses may therefore interleave in time; that is expected for
+/// concurrent JSON-RPC requests, and the `id` echoed on each response lets
+/// the client correlate. Line framing is still strict: the shared `writer`
+/// mutex is held across the whole `write_all` + newline, so two concurrent
+/// responses can never splice mid-line.
+///
+/// `Client` is a cheap handle (a socket path) and every tool opens its own
+/// short-lived daemon connection per call, so cloning it per task shares no
+/// serial connection between dispatches.
+///
+/// Generic over the transport so tests can drive it through an in-memory
+/// duplex pipe instead of the real stdio handles.
+async fn serve<R, W>(client: Client, reader: R, writer: W) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut lines = reader.lines();
+    let writer = Arc::new(Mutex::new(writer));
+    // In-flight dispatch tasks, tracked so we can drain them when stdin
+    // closes rather than dropping a response mid-flight.
+    let mut tasks: JoinSet<()> = JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Value>(trimmed) {
-            Ok(req) => dispatch(&client, &req).await,
-            Err(e) => Some(error_response(
-                &Value::Null,
-                -32700,
-                &format!("parse error: {e}"),
-            )),
-        };
-        // Notifications (and parse-error-on-a-notification) produce no
-        // response; only write when there is one.
-        if let Some(resp) = response {
-            let mut bytes = serde_json::to_vec(&resp)?;
-            bytes.push(b'\n');
-            stdout.write_all(&bytes).await?;
-            stdout.flush().await?;
-        }
+        let client = client.clone();
+        let writer = Arc::clone(&writer);
+        tasks.spawn(async move {
+            let response = match serde_json::from_str::<Value>(&line) {
+                Ok(req) => dispatch(&client, &req).await,
+                // A line that isn't valid JSON at all: -32700, id unknown.
+                Err(e) => Some(error_response(
+                    &Value::Null,
+                    -32700,
+                    &format!("parse error: {e}"),
+                )),
+            };
+            // Notifications (and a parse error on what was meant to be a
+            // notification) produce no response; only write when there is one.
+            if let Some(resp) = response {
+                if let Err(e) = write_response(&writer, &resp).await {
+                    // stdout is gone (host closed the pipe): nothing left to do
+                    // for this response. The read loop will see EOF and exit.
+                    tracing::debug!(error = %e, "mcp: failed to write response");
+                }
+            }
+        });
+        // Reap finished tasks opportunistically so the set can't grow without
+        // bound under steady traffic.
+        while tasks.try_join_next().is_some() {}
     }
+
+    // stdin closed: let any in-flight dispatches finish writing before exit.
+    while tasks.join_next().await.is_some() {}
     Ok(())
 }
 
-/// Handle one JSON-RPC message. Returns `Some(response)` for requests and
-/// `None` for notifications (messages without an `id`).
+/// Write one response object followed by a newline, holding the shared
+/// writer lock across the entire write so concurrent responses never
+/// interleave mid-line.
+async fn write_response<W>(writer: &Arc<Mutex<W>>, resp: &Value) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut bytes = serde_json::to_vec(resp).unwrap_or_else(|_| b"{}".to_vec());
+    bytes.push(b'\n');
+    let mut guard = writer.lock().await;
+    guard.write_all(&bytes).await?;
+    guard.flush().await
+}
+
+/// Handle one parsed JSON-RPC message. Returns `Some(response)` for
+/// anything that warrants a reply and `None` for notifications (a request
+/// object with no `id`), which JSON-RPC forbids answering.
+///
+/// Framing robustness (JSON-RPC 2.0 + MCP `2024-11-05`) — no valid JSON is
+/// ever silently dropped:
+/// - a **batch array** is rejected with a single `-32600` error (muxa does
+///   not implement batching; documented in `docs/MCP.md`);
+/// - a **bare value** (number / string / bool / null) is not a request
+///   object and carries no `id`, so `-32600` with `id: null`;
+/// - an **object** is routed by [`dispatch_object`], which still returns a
+///   proper error for a missing/invalid `jsonrpc` or `method` whenever an
+///   `id` is present to address the reply to.
 async fn dispatch(client: &Client, req: &Value) -> Option<Value> {
-    let method = req
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    match req {
+        Value::Object(_) => dispatch_object(client, req).await,
+        Value::Array(_) => Some(error_response(
+            &Value::Null,
+            -32600,
+            "batch requests are not supported; send one JSON-RPC object per line",
+        )),
+        // Valid JSON, but not a JSON-RPC request object — and no id to
+        // address a reply to.
+        _ => Some(error_response(
+            &Value::Null,
+            -32600,
+            "invalid request: expected a JSON-RPC object",
+        )),
+    }
+}
+
+/// Route a JSON-RPC **object**: split notifications (no `id`) from requests,
+/// validate the envelope, then dispatch by `method`.
+async fn dispatch_object(client: &Client, req: &Value) -> Option<Value> {
     let id = req.get("id").cloned();
 
-    // A message without an `id` is a notification: never answered.
+    // No `id` key at all → notification: never answered (even if malformed,
+    // there's nothing to address a reply to). The only one we expect is
+    // `notifications/initialized`.
     let Some(id) = id else {
-        // The only notification we expect is `notifications/initialized`;
-        // anything else is harmlessly ignored.
         return None;
+    };
+
+    // From here the message has an `id`, so any envelope problem yields a
+    // proper error response addressed to it rather than a silent drop.
+    if req.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(error_response(
+            &id,
+            -32600,
+            "invalid request: \"jsonrpc\" must be \"2.0\"",
+        ));
+    }
+    let Some(method) = req.get("method").and_then(Value::as_str) else {
+        return Some(error_response(
+            &id,
+            -32600,
+            "invalid request: missing or non-string \"method\"",
+        ));
     };
 
     let response = match method {
@@ -244,11 +364,13 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
             // Submit defaults to true — the common case is "prompt and run".
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
             Ok(match client.send_prompt(pane, text, submit).await {
-                Ok(()) => text_result(&format!(
-                    "sent {} chars to {pane}{}",
-                    text.len(),
-                    if submit { " and submitted" } else { "" },
-                )),
+                // The daemon distinguishes "text injected" (`sent`) from
+                // "Enter delivered" (`submitted`); surface the latter so a
+                // caller whose submit was requested but not delivered learns
+                // the text already landed and must not blindly resend it.
+                Ok(outcome) => {
+                    render_send_result(text.len(), pane, submit, Some(outcome.submitted))
+                }
                 Err(e) => error_result(&format!("send_prompt failed: {e}")),
             })
         }
@@ -269,8 +391,64 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
     }
 }
 
-/// `muxa_wait_for_change`: stream transitions from the daemon until one
-/// matches (optionally scoped to a pane) or the timeout elapses.
+/// Render the `muxa_send_prompt` result, defensively tolerating both the
+/// legacy contract (success = text sent, and Enter pressed if requested) and
+/// the newer daemon shape that reports Enter delivery separately.
+///
+/// `submitted` is what the daemon actually reported about the Enter keystroke:
+/// - `None` — the daemon didn't say (older client method that returns `()`):
+///   fall back to the caller's `submit` intent.
+/// - `Some(true)` — Enter was delivered; the line is committed.
+/// - `Some(false)` — the text landed but Enter did **not**; surfaced plainly
+///   so the caller doesn't assume the line was committed.
+fn render_send_result(text_len: usize, pane: &str, submit: bool, submitted: Option<bool>) -> Value {
+    match submitted {
+        Some(false) if submit => text_result(&format!(
+            "sent {text_len} chars to {pane}, but the line was NOT submitted \
+             (Enter not delivered) — the text is typed but not yet committed",
+        )),
+        _ => {
+            // No daemon signal → trust the requested `submit`; an explicit
+            // `Some(true)` confirms it.
+            let committed = submitted.unwrap_or(submit);
+            text_result(&format!(
+                "sent {text_len} chars to {pane}{}",
+                if committed { " and submitted" } else { "" },
+            ))
+        }
+    }
+}
+
+/// Terminal outcome of a `muxa_wait_for_change` race, before it's rendered
+/// into a tool result.
+enum WaitOutcome {
+    /// A live transition arrived on the stream and matched the pane filter.
+    Observed(Transition),
+    /// A reconcile poll (or a post-lag / post-timeout reconcile) detected the
+    /// target pane's state had moved. Carries the ready-made result value.
+    Reconciled(Value),
+    /// The daemon closed the stream before any matching change, and a
+    /// reconcile found nothing.
+    Closed,
+}
+
+/// `muxa_wait_for_change`: block until a matching state transition is
+/// observed, or a reconciled post-lag state match is detected, or the
+/// timeout elapses. **Returns on the first observed change OR a reconciled
+/// post-lag state match.**
+///
+/// Two signals race under one deadline:
+/// 1. the daemon's transition **stream** (push, ~1 ms latency); and
+/// 2. a periodic snapshot **reconcile** ([`RECONCILE_POLL_INTERVAL`]) that
+///    compares the target pane's current state against a baseline captured
+///    at entry.
+///
+/// The reconcile exists because a broadcast **lag** on the daemon can drop
+/// the exact transition we're waiting for: the daemon emits a
+/// `{"event":"lagged"}` marker, but the shared `TransitionStream` consumer
+/// skips it, so a matching change dropped during lag would otherwise be
+/// misreported as a timeout. Polling the snapshot closes that hole without
+/// depending on the stream surfacing the lag to this consumer.
 async fn wait_for_change(client: &Client, args: &Value) -> Value {
     let pane = args.get("pane").and_then(Value::as_str);
     let timeout_secs = args
@@ -279,45 +457,125 @@ async fn wait_for_change(client: &Client, args: &Value) -> Value {
         .unwrap_or(DEFAULT_WAIT_SECS)
         .clamp(1, MAX_WAIT_SECS);
 
+    // Baseline pane→state map so a reconcile can tell whether the target moved
+    // even if the stream never delivered the transition.
+    let baseline = pane_states(client, pane).await;
+
     let mut stream = match client.subscribe().await {
         Ok(s) => s,
         Err(e) => return error_result(&format!("subscribe failed: {e}")),
     };
 
+    let mut poll = tokio::time::interval(RECONCILE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await; // consume the immediate first tick
+
     let deadline = Duration::from_secs(timeout_secs);
     let outcome = tokio::time::timeout(deadline, async {
         loop {
-            match stream.recv().await {
-                Ok(Some(t)) => {
-                    if pane.is_none_or(|p| t.agent.pane.as_deref() == Some(p)) {
-                        return Some(t);
+            tokio::select! {
+                recv = stream.recv() => match recv {
+                    Ok(Some(t)) => {
+                        if pane.is_none_or(|p| t.agent.pane.as_deref() == Some(p)) {
+                            return WaitOutcome::Observed(t);
+                        }
+                    }
+                    // Stream closed (daemon shutdown) or a read error. Try one
+                    // reconcile before giving up — the change may already have
+                    // landed — otherwise report the closed stream.
+                    Ok(None) | Err(_) => {
+                        return match reconcile(client, pane, &baseline).await {
+                            Some(v) => WaitOutcome::Reconciled(v),
+                            None => WaitOutcome::Closed,
+                        };
+                    }
+                },
+                _ = poll.tick() => {
+                    if let Some(v) = reconcile(client, pane, &baseline).await {
+                        return WaitOutcome::Reconciled(v);
                     }
                 }
-                // Daemon closed the stream (shutdown) or a read error —
-                // either way, stop waiting.
-                Ok(None) | Err(_) => return None,
             }
         }
     })
     .await;
 
     match outcome {
-        Ok(Some(t)) => json_result(&json!({
+        Ok(WaitOutcome::Observed(t)) => json_result(&json!({
             "changed": true,
             "from": t.from,
             "to": t.to,
             "agent": &*t.agent,
         })),
-        Ok(None) => json_result(&json!({
+        Ok(WaitOutcome::Reconciled(v)) => v,
+        Ok(WaitOutcome::Closed) => json_result(&json!({
             "changed": false,
             "reason": "stream closed before a matching change",
         })),
-        Err(_) => json_result(&json!({
-            "changed": false,
-            "reason": "timeout",
-            "timeout_secs": timeout_secs,
-        })),
+        // Deadline hit. One last reconcile guards the narrow window where a
+        // transition was dropped between the final poll tick and the timeout.
+        Err(_) => reconcile(client, pane, &baseline).await.unwrap_or_else(|| {
+            json_result(&json!({
+                "changed": false,
+                "reason": "timeout",
+                "timeout_secs": timeout_secs,
+            }))
+        }),
     }
+}
+
+/// Snapshot the current `pane → state` map for the reconcile baseline and
+/// polls, scoped to one pane when the caller asked for one, else the whole
+/// fleet. A daemon error yields an empty map — the reconcile then simply
+/// can't detect a change, degrading to the stream/timeout path.
+async fn pane_states(client: &Client, pane: Option<&str>) -> HashMap<String, AgentState> {
+    fetch_agents(client, pane)
+        .await
+        .into_iter()
+        .filter_map(|a| a.pane.clone().map(|p| (p, a.state)))
+        .collect()
+}
+
+/// Compare the target pane(s)' current state against `baseline`; if any has
+/// moved — or a matching pane appeared that wasn't there before — return a
+/// synthetic transition result flagged `reconciled` so the caller can tell it
+/// came from a snapshot rather than the live stream. `None` when nothing
+/// changed.
+async fn reconcile(
+    client: &Client,
+    pane: Option<&str>,
+    baseline: &HashMap<String, AgentState>,
+) -> Option<Value> {
+    for agent in fetch_agents(client, pane).await {
+        let Some(p) = agent.pane.clone() else {
+            continue;
+        };
+        if pane.is_some_and(|want| want != p) {
+            continue;
+        }
+        let previous = baseline.get(&p).copied();
+        if previous != Some(agent.state) {
+            return Some(json_result(&json!({
+                "changed": true,
+                "reconciled": true,
+                // `null` when the pane is newly observed (no baseline entry).
+                "from": previous,
+                "to": agent.state,
+                "agent": agent,
+            })));
+        }
+    }
+    None
+}
+
+/// Fetch the agents relevant to a wait: just the target pane's rows when
+/// scoped, else the whole snapshot. Daemon errors degrade to an empty list.
+async fn fetch_agents(client: &Client, pane: Option<&str>) -> Vec<Agent> {
+    match pane {
+        Some(p) => client.by_pane(p).await,
+        None => client.snapshot().await,
+    }
+    .unwrap_or_default()
 }
 
 // --- JSON-RPC / MCP result helpers --------------------------------------
@@ -356,11 +614,13 @@ fn error_result(message: &str) -> Value {
 mod tests {
     use super::*;
     use muxa::backend::{BackendCaps, HostKind, PaneBackend, SharedBackend};
+    use muxa::event::AgentEvent;
     use muxa::ipc::Server;
     use muxa::state::Store;
     use muxa::tmux::PaneInfo;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
     use tokio::sync::broadcast;
 
     /// Fake backend that always accepts `send_text` and records the calls,
@@ -592,5 +852,198 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    /// Ingest one synthetic hook event so a pane appears in the store with a
+    /// derived state (`prompt_submitted` → Working, `turn_stopped` → Idle).
+    async fn ingest(client: &Client, pane: &str, ty: &str, extra: Value) {
+        let mut ev = json!({
+            "type": ty,
+            "id": { "kind": "claude_code", "session_id": pane, "pane": pane, "cwd": null },
+            "at": "2026-07-20T00:00:00Z",
+        });
+        let (Value::Object(fields), Value::Object(more)) = (&mut ev, extra) else {
+            unreachable!("event and extra are objects");
+        };
+        for (k, v) in more {
+            fields.insert(k, v);
+        }
+        let event: AgentEvent = serde_json::from_value(ev).unwrap();
+        client.ingest(&event).await.unwrap();
+    }
+
+    /// `render_send_result` tolerates the unknown/legacy shape and the newer
+    /// `{sent, submitted}` daemon signal, surfacing "not submitted" plainly.
+    #[test]
+    fn render_send_result_covers_all_submit_shapes() {
+        let text = |v: &Value| v["content"][0]["text"].as_str().unwrap().to_string();
+
+        // Unknown submit status (client returns `()` today) → trust intent.
+        assert!(text(&render_send_result(5, "%1", true, None)).contains("and submitted"));
+        assert!(!text(&render_send_result(5, "%1", false, None)).contains("submitted"));
+        // Daemon confirms Enter landed.
+        assert!(text(&render_send_result(5, "%1", true, Some(true))).contains("and submitted"));
+        // Daemon says text landed but Enter did NOT — surfaced to the caller.
+        let not_submitted = text(&render_send_result(5, "%1", true, Some(false)));
+        assert!(not_submitted.contains("NOT submitted"), "{not_submitted}");
+    }
+
+    /// Framing robustness: batch arrays, bare values, and malformed envelopes
+    /// all yield a proper error (or a silent drop only for a true
+    /// notification) instead of vanishing.
+    #[tokio::test]
+    async fn framing_rejects_non_object_and_bad_envelope() {
+        let client = Client::new(std::path::PathBuf::from("/nonexistent/muxa.sock"));
+
+        // Batch array → single -32600, id null (batching unsupported).
+        let batch = dispatch(&client, &json!([{"jsonrpc":"2.0","id":1,"method":"ping"}]))
+            .await
+            .unwrap();
+        assert_eq!(batch["error"]["code"], -32600);
+        assert!(batch["id"].is_null());
+
+        // Bare value → -32600, id null.
+        let bare = dispatch(&client, &json!(42)).await.unwrap();
+        assert_eq!(bare["error"]["code"], -32600);
+        assert!(bare["id"].is_null());
+
+        // Object with an id but a bad `jsonrpc` → -32600 addressed to the id.
+        let bad = dispatch(&client, &json!({"id":7,"method":"ping"}))
+            .await
+            .unwrap();
+        assert_eq!(bad["error"]["code"], -32600);
+        assert_eq!(bad["id"], 7);
+
+        // Object with an id but no method → -32600 addressed to the id.
+        let no_method = dispatch(&client, &json!({"jsonrpc":"2.0","id":8}))
+            .await
+            .unwrap();
+        assert_eq!(no_method["error"]["code"], -32600);
+        assert_eq!(no_method["id"], 8);
+
+        // Object with no id → notification: no response even though malformed.
+        assert!(dispatch(&client, &json!({"foo":"bar"})).await.is_none());
+    }
+
+    /// A raw line that isn't JSON at all yields a `-32700` parse error with a
+    /// null id, and never crashes the server loop.
+    #[tokio::test]
+    async fn serve_reports_parse_error_for_garbage_line() {
+        let client = Client::new(std::path::PathBuf::from("/nonexistent/muxa.sock"));
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, client_out) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(async move {
+            serve(client, BufReader::new(server_in), server_out)
+                .await
+                .unwrap();
+        });
+        let mut client_out = BufReader::new(client_out);
+
+        client_in.write_all(b"this is not json\n").await.unwrap();
+        client_in.flush().await.unwrap();
+
+        let mut line = String::new();
+        client_out.read_line(&mut line).await.unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["error"]["code"], -32700);
+        assert!(resp["id"].is_null());
+
+        drop(client_in);
+        handle.await.unwrap();
+    }
+
+    /// The core non-blocking property: a slow `muxa_wait_for_change` in flight
+    /// must not delay an unrelated `ping` — the ping response comes back
+    /// promptly, well before the wait's timeout.
+    #[tokio::test]
+    async fn slow_wait_does_not_block_ping() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-concurrent.sock");
+        let (client, _sends, tx, daemon) = spawn_daemon(&sock).await;
+
+        let (mut client_in, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_out) = tokio::io::duplex(8192);
+        let serve_handle = tokio::spawn(async move {
+            serve(client, BufReader::new(server_in), server_out)
+                .await
+                .unwrap();
+        });
+        let mut client_out = BufReader::new(client_out);
+
+        // Slow wait (2 s, empty fleet → will time out) then an immediate ping.
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":\
+                  {\"name\":\"muxa_wait_for_change\",\"arguments\":{\"timeout_secs\":2}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        client_in.flush().await.unwrap();
+
+        // First response back must be the ping (id 2), and quickly.
+        let start = Instant::now();
+        let mut first = String::new();
+        client_out.read_line(&mut first).await.unwrap();
+        let first: Value = serde_json::from_str(first.trim()).unwrap();
+        assert_eq!(
+            first["id"], 2,
+            "ping should return before the slow wait; got {first}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "ping was blocked by the outstanding wait ({:?})",
+            start.elapsed(),
+        );
+
+        // The wait's own response (id 1) lands later, timing out.
+        let mut second = String::new();
+        client_out.read_line(&mut second).await.unwrap();
+        let second: Value = serde_json::from_str(second.trim()).unwrap();
+        assert_eq!(second["id"], 1);
+        assert!(second["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("timeout"));
+
+        drop(client_in);
+        serve_handle.await.unwrap();
+        tx.send(()).unwrap();
+        daemon.await.unwrap();
+    }
+
+    /// `wait_for_change`'s reconcile catches a state move that the transition
+    /// stream might have dropped during a broadcast lag: baseline is captured,
+    /// the pane moves, and a snapshot comparison surfaces the change.
+    #[tokio::test]
+    async fn reconcile_detects_state_change_missed_by_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-reconcile.sock");
+        let (client, _sends, tx, daemon) = spawn_daemon(&sock).await;
+
+        // Put %1 into Working via a prompt, then baseline it.
+        ingest(&client, "%1", "prompt_submitted", json!({ "prompt": "go" })).await;
+        let baseline = pane_states(&client, Some("%1")).await;
+        assert_eq!(baseline.get("%1").copied(), Some(AgentState::Working));
+
+        // No movement yet → reconcile reports nothing.
+        assert!(reconcile(&client, Some("%1"), &baseline).await.is_none());
+
+        // End the turn → Idle. Even if the stream had dropped this transition,
+        // the reconcile compares against the baseline and catches it.
+        ingest(&client, "%1", "turn_stopped", json!({})).await;
+        let v = reconcile(&client, Some("%1"), &baseline)
+            .await
+            .expect("reconcile should detect the state move");
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"reconciled\": true"), "{text}");
+        assert!(text.contains("\"from\": \"working\""), "{text}");
+        assert!(text.contains("\"to\": \"idle\""), "{text}");
+
+        tx.send(()).unwrap();
+        daemon.await.unwrap();
     }
 }

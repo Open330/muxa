@@ -80,10 +80,24 @@ impl PaneBackend for TmuxBackend {
 
     fn send_text(&self, pane_id: &str, text: &str) -> bool {
         // `send-keys -l` (literal) so prompt text can't be reinterpreted as
-        // a tmux key. Scoped to `MUXA_TMUX_SOCKET` when set so the injection
-        // reaches the right server. Best-effort: a non-zero exit (pane gone)
-        // collapses to `false`, which the daemon surfaces as a send failure.
+        // a tmux key; env-scoped default server. Best-effort: a non-zero exit
+        // (pane gone) collapses to `false`, which the daemon surfaces as a
+        // send failure.
         crate::tmux::send_text(pane_id, text)
+    }
+
+    fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        // Control-plane injection pinned to the pane's recorded server via
+        // `-S <socket>` — `%5` exists on every tmux server, so this targets
+        // the right one. Handles leading-dash / trailing-`;` / multi-line text
+        // (see `crate::tmux::send_text_on`).
+        crate::tmux::send_text_on(socket, pane_id, text)
+    }
+
+    fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
+        // Control-plane capture pinned to the pane's recorded server, so a
+        // shared pane id can't read the wrong screen. Best-effort → `None`.
+        crate::tmux::capture_pane_on(socket, pane_id).ok()
     }
 
     // `caps()` uses the default impl from the trait — tmux supports

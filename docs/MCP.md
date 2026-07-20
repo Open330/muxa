@@ -43,6 +43,30 @@ on its existing `serde_json`/`tokio` deps rather than pulling the `rmcp` SDK's
 dependency tree (which would have to clear MSRV 1.88 and the workspace's
 cargo-deny policy). No new dependencies. Protocol revision: `2024-11-05`.
 
+### Concurrency and framing
+
+Requests are read line-by-line from stdin and **each is dispatched on its own
+task**, so a long-running tool (`muxa_wait_for_change`, up to 600 s) never
+blocks unrelated traffic — a `ping` or `tools/list` issued while a wait is
+outstanding is answered immediately. Responses may therefore interleave in
+time; that is expected for concurrent JSON-RPC, and the `id` echoed on each
+response lets the client correlate. Output framing stays strict: the shared
+stdout writer is locked across each whole `write` + newline, so two
+concurrent responses never splice mid-line (one JSON object per line).
+
+Framing is robust against non-conforming input rather than silently dropping
+it:
+
+- A line that isn't valid JSON → `-32700` parse error, `id: null`.
+- A **batch array** → a single `-32600` error (`"batch requests are not
+  supported"`). muxa **does not implement JSON-RPC batching**; MCP hosts in
+  practice send one request per line, so batches are rejected explicitly.
+- A **bare value** (number/string/bool/null) → `-32600`, `id: null`.
+- An **object with an `id`** but a missing/invalid `jsonrpc` or `method` →
+  `-32600` addressed to that `id`; an unknown method → `-32601`.
+- An **object with no `id`** is a notification and draws no response (per
+  JSON-RPC), even if otherwise malformed — there is no `id` to reply to.
+
 ## Tools
 
 | Tool | Arguments | Does |
@@ -88,6 +112,23 @@ muxa_capture_pane  { "pane": "%18" }        # read the result on screen
 `muxa_wait_for_change` returns `{ "changed": false, "reason": "timeout" }`
 when nothing matching happened in the window, so a polling loop stays cheap and
 bounded (default 30 s, max 600 s).
+
+**Semantics:** it returns on the **first observed change OR a reconciled
+post-lag state match.** Two signals race under the deadline: the daemon's
+push transition stream, and a periodic snapshot **reconcile** (every 2 s) that
+compares the target pane's current state against a baseline captured when the
+wait began. The reconcile is a backstop for a daemon-side broadcast *lag*: a
+lag can drop the very transition being waited for, which would otherwise be
+misreported as a timeout. A change surfaced by the reconcile (rather than the
+live stream) carries `"reconciled": true`, and its `from` may be `null` when
+the pane wasn't present at baseline. This poll backstop is deliberately
+self-contained in the MCP server, so it holds regardless of whether the
+subscribe stream ever exposes the lag marker to this consumer.
+
+`muxa_send_prompt` reports whether the line was committed. When the underlying
+control path can confirm that the text was injected but the submitting Enter
+was **not** delivered, the result says so explicitly ("text sent but not
+submitted") so the caller doesn't assume the agent started working.
 
 ## Safety
 

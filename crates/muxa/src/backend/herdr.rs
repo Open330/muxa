@@ -291,11 +291,17 @@ impl PaneBackend for HerdrBackend {
 
     fn send_text(&self, pane_id: &str, text: &str) -> bool {
         let raw = strip_prefix(pane_id);
-        // `pane.send_text` writes the text into the pane's pty. The daemon
-        // sends a bare `"\r"` as a follow-up call to submit — a CR through
-        // the pty is Enter for both cooked-mode shells (ICRNL → NL) and
-        // raw-mode TUIs (crossterm reads CR as Enter), so no separate
-        // key-name call is needed. Any non-error reply means it landed.
+        // `pane.send_text` writes the text into the pane's pty as one literal
+        // block — including any embedded newlines, which are delivered as raw
+        // bytes, NOT as per-line Enter presses (unlike tmux `send-keys -l`).
+        // So a multi-line prompt lands intact here with no special paste path;
+        // the daemon's `submit:false` semantics hold, and `submit:true` sends a
+        // separate bare `"\r"` to commit. A CR through the pty is Enter for both
+        // cooked-mode shells (ICRNL → NL) and raw-mode TUIs (crossterm reads CR
+        // as Enter), so no separate key-name call is needed. herdr has no
+        // per-server socket concept, so `send_text_on` inherits the trait
+        // default (ignores `socket`, delegates here). Any non-error reply means
+        // it landed.
         self.request("pane.send_text", json!({ "pane_id": raw, "text": text }))
             .is_ok()
     }
