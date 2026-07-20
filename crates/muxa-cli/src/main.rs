@@ -7,6 +7,7 @@ mod doctor;
 mod init;
 mod logs;
 mod stats;
+mod swarm;
 mod theme;
 mod time_range;
 mod timeline;
@@ -106,6 +107,9 @@ enum Cmd {
     Timeline(timeline::Args),
     /// Session-card TUI console for inspecting and operating agents.
     Dashboard(dashboard_tui::Args),
+    /// Fleet command center: cluster every agent as a swarm, then dispatch
+    /// prompts to one agent or broadcast to a whole marked squad.
+    Swarm(swarm::Args),
     /// Query raw activity ledger intervals.
     Activity(activity_query::Args),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
@@ -330,6 +334,7 @@ async fn main() -> Result<()> {
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
         Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
+        Cmd::Swarm(swarm_args) => cmd_swarm(&client, &cfg, swarm_args).await,
         Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => {
@@ -798,6 +803,26 @@ async fn cmd_dashboard(client: &Client, cfg: &Config, args: dashboard_tui::Args)
         }
         Some(dashboard_tui::OpenTarget::PtySession(session_id)) => {
             attach_session(client, &session_id).await?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+async fn cmd_swarm(client: &Client, cfg: &Config, args: swarm::Args) -> Result<()> {
+    let activity_path = cfg
+        .activity
+        .enabled
+        .then(|| {
+            cfg.activity
+                .path
+                .clone()
+                .or_else(paths::default_activity_file)
+        })
+        .flatten();
+    match swarm::run(client, cfg, args).await? {
+        Some(swarm::OpenTarget::Pane(pane_id)) => {
+            jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
         }
         None => {}
     }

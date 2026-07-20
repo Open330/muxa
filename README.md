@@ -41,6 +41,7 @@ backend; zellij has a CLI baseline and a planned richer plugin path.
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
 | `muxa watch` | Full-screen TUI for agents and panes, with attach, prompt composition, and live previews. |
 | `muxa dashboard` | Session-card TUI console for inspecting panes and sending prompts without attaching. |
+| `muxa swarm` | Fleet command center: cluster every agent as a swarm, dispatch a prompt to one, or broadcast to a marked squad. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
@@ -85,6 +86,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
 | `muxa watch [--view pane\|session]` | Live TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Session-card TUI console with live capture, prompt composer, abort/terminate actions, and ACT/WACT totals. |
+| `muxa swarm [--group-by project\|session]` | Fleet command center TUI: state-colored swarm map, per-agent prompt dispatch, and squad broadcast (mark with Space, `b` to send). |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
