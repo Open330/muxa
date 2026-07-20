@@ -6959,6 +6959,7 @@ mod tests {
             &app.panes,
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
+            app.watch_cfg.summary,
         );
         let cell = text
             .lines
