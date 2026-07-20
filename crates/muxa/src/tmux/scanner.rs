@@ -12,6 +12,22 @@
 //! a wedged `attach-session` losing the controlling terminal) cannot
 //! stall the dashboard.
 //!
+//! ## Herdr hosts
+//!
+//! Herdr is a single-server-per-user model too, but — unlike zellij — it
+//! ships a socket API that enumerates every pane out of the box, so the
+//! dashboard's `/api/panes` route does *not* go through [`scan`] on a
+//! herdr host. Instead the daemon's active [`HerdrBackend`] answers
+//! `pane.list` directly and the result is folded into the same
+//! [`ScanResult`] shape by [`herdr_scan_result`]. The branch lives in the
+//! dashboard's pane-cache refresh closure (see
+//! `crate::dashboard::server`); the tmux path here is untouched. The
+//! `MUXA_TMUX_SOCKET` scope is a *tmux-socket* concept and never applies
+//! to herdr panes (consistent with the ingest scope gate treating a
+//! socket-less herdr event as in-scope).
+//!
+//! [`HerdrBackend`]: crate::backend::herdr::HerdrBackend
+//!
 //! ## Zellij hosts
 //!
 //! Zellij is a single-server-per-user model with no multi-socket
@@ -339,6 +355,56 @@ fn to_summary(p: PaneInfo, socket: PathBuf) -> PaneSummary {
         title: p.title,
         socket,
         attach_command,
+    }
+}
+
+/// The synthetic socket identity stamped on every herdr [`PaneSummary`].
+///
+/// A herdr [`PaneInfo`] carries `socket: None` (herdr never reuses the
+/// tmux-socket channel — see `backend::herdr::to_pane_info`), but the
+/// dashboard's [`PaneSummary`] socket is a required part of a pane's
+/// identity and the web UI splits it on `/` for the socket-filter chip.
+/// The daemon observes exactly one herdr server, so a single constant
+/// "server" name is both accurate and gives the UI one clean chip.
+const HERDR_SOCKET_LABEL: &str = "herdr";
+
+/// Fold the daemon's herdr `pane.list` result into the dashboard's
+/// [`ScanResult`] shape, so `/api/panes` renders herdr panes without the
+/// tmux multi-socket scanner (which sees nothing on a herdr host).
+///
+/// Called from the dashboard pane-cache refresh closure when the active
+/// backend is herdr; the [`scan`] tmux path is untouched. The muxa
+/// [`PaneInfo`] rows already carry herdr-native fields — `pane_id`
+/// `herdr:<id>`, `session` = workspace id, `window_index` = tab id,
+/// `current_command`/`current_path` enriched from `pane.process_info` —
+/// so this only supplies the two dashboard-only fields the herdr backend
+/// leaves blank: a synthetic [`HERDR_SOCKET_LABEL`] socket identity and an
+/// empty `attach_command` (herdr has no copyable shell attach line; the
+/// CLI attaches over the socket via `pane.focus`). `errors` is always
+/// empty — a single in-process backend call has no per-socket partial
+/// failures to collect. `MUXA_TMUX_SOCKET` is not consulted: it scopes
+/// tmux sockets only, and herdr panes are never subject to it.
+pub(crate) fn herdr_scan_result(panes: Vec<PaneInfo>) -> ScanResult {
+    ScanResult {
+        panes: panes.into_iter().map(to_herdr_summary).collect(),
+        errors: Vec::new(),
+        fetched_at: OffsetDateTime::now_utc(),
+    }
+}
+
+fn to_herdr_summary(p: PaneInfo) -> PaneSummary {
+    PaneSummary {
+        pane_id: p.pane_id,
+        session: p.session,
+        window_index: p.window_index,
+        pane_index: p.pane_index,
+        tty: p.tty,
+        current_command: p.current_command,
+        title: p.title,
+        socket: PathBuf::from(HERDR_SOCKET_LABEL),
+        // herdr has no `tmux attach`-style command a user copies; the CLI
+        // (`muxa` jump / `jump_to_pane`) focuses over the socket instead.
+        attach_command: String::new(),
     }
 }
 
@@ -698,6 +764,48 @@ mod tests {
             .await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn herdr_scan_result_maps_panes_and_stamps_synthetic_socket() {
+        // Mirror what `HerdrBackend::list_panes` hands the dashboard: a
+        // muxa PaneInfo already namespaced/enriched, socket None.
+        let mut pane = fake_pane("herdr:p1", "ws1");
+        pane.window_index = "tab1".into();
+        pane.pane_index = "p1".into();
+        pane.current_command = "vim".into();
+        pane.title = "editor".into();
+        pane.current_path = "/home/u/proj".into();
+
+        let result = herdr_scan_result(vec![pane]);
+        assert!(
+            result.errors.is_empty(),
+            "single backend call has no per-socket errors"
+        );
+        assert_eq!(result.panes.len(), 1);
+        let s = &result.panes[0];
+        assert_eq!(s.pane_id, "herdr:p1");
+        assert_eq!(s.session, "ws1", "session ← workspace_id");
+        assert_eq!(s.window_index, "tab1", "window_index ← tab_id");
+        assert_eq!(s.pane_index, "p1", "pane_index is the raw herdr id");
+        assert_eq!(s.current_command, "vim");
+        assert_eq!(s.title, "editor");
+        assert_eq!(
+            s.socket,
+            PathBuf::from(HERDR_SOCKET_LABEL),
+            "herdr panes carry the synthetic socket identity, not None",
+        );
+        assert!(
+            s.attach_command.is_empty(),
+            "herdr has no copyable tmux-style attach command",
+        );
+    }
+
+    #[test]
+    fn herdr_scan_result_empty_input_is_well_formed() {
+        let result = herdr_scan_result(Vec::new());
+        assert!(result.panes.is_empty());
+        assert!(result.errors.is_empty());
     }
 
     #[test]

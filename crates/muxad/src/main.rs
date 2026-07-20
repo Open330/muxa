@@ -254,6 +254,7 @@ async fn main() -> Result<()> {
             })
             .flatten();
         let sessions_for_dash = sessions.clone();
+        let backend_for_dash = backend.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
@@ -265,6 +266,7 @@ async fn main() -> Result<()> {
                 store_for_dash,
                 pane_cache,
                 sessions_for_dash,
+                backend_for_dash,
                 dashboard_runtime,
                 shutdown_rx,
             )

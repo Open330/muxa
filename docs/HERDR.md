@@ -139,9 +139,31 @@ can tell which host governs a row (see reaping guard below).
    it was host-agnostic and needed no change. zellij has no session concept
    here and stays empty.
 
-Out of scope for Phase 1: the web dashboard's tmux scanner panes view,
-`muxa status-line` (a tmux status-right concept; herdr has its own
-sidebar).
+8. **Web dashboard panes view** (`dashboard/server.rs`, done): the
+   `/api/panes` route sources its rows from the tmux multi-socket scanner
+   (`tmux::scanner::scan`), which sees nothing on a herdr host. The daemon
+   now threads its active `SharedBackend` into the dashboard `AppState`;
+   the pane-cache refresh closure branches on `backend.kind() ==
+   HostKind::Herdr` and folds `HerdrBackend::list_panes()` (a blocking
+   socket call, so `spawn_blocking`) into the scanner's `ScanResult` shape
+   via `tmux::scanner::herdr_scan_result`. Both `/api/panes` and the
+   timeline handler's pane→session map go through the same refresh, so
+   they agree on herdr. Field mapping reuses the muxa `PaneInfo` the
+   backend already returns (`pane_id` `herdr:<id>`, `session` =
+   `workspace_id`, `window_index` = `tab_id`, `pane_index` = raw id,
+   `current_command`/`current_path` enriched); the two dashboard-only
+   fields the backend leaves blank are filled with a synthetic `"herdr"`
+   socket identity (the web UI's socket-filter chip splits on `/`, and the
+   daemon observes exactly one herdr server) and an empty `attach_command`
+   (herdr has no copyable shell attach line — the CLI focuses over the
+   socket). `MUXA_TMUX_SOCKET` is *not* consulted on the herdr path — it
+   scopes tmux sockets only, consistent with the ingest scope gate that
+   passes socket-less herdr events. The tmux scanner path is byte-identical
+   (`backend == None`/non-herdr → unchanged `scanner::scan`). zellij stays
+   empty (no pane-metadata surface until the WASM plugin lands).
+
+Out of scope for Phase 1: `muxa status-line` (a tmux status-right concept;
+herdr has its own sidebar).
 
 ## Phase 2 — herdr-native agent state (event bridge)
 

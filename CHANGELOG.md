@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **herdr web dashboard panes view.** The dashboard's `/api/panes` route
+  (and the timeline's pane→session map) now populate on herdr hosts. The
+  daemon threads its active pane backend into the dashboard; when the host
+  is herdr the pane-cache refresh sources rows from `HerdrBackend::list_panes()`
+  over the socket and folds them into the scanner's result shape instead of
+  the tmux multi-socket scanner (which sees nothing on herdr). Panes carry
+  their herdr-native fields (`herdr:<id>`, workspace as session, tab as
+  window) plus a synthetic `"herdr"` socket identity for the UI's
+  socket-filter chip. `MUXA_TMUX_SOCKET` scopes tmux sockets only and is not
+  applied to herdr panes; the tmux path is unchanged. See `docs/HERDR.md`.
 - **herdr watch session view.** `muxa watch --view session` (the default
   view) now populates on herdr hosts: sessions are derived from herdr
   workspaces over the socket (`workspace.list`) instead of `tmux

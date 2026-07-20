@@ -1373,7 +1373,7 @@ function renderPanes() {
     : `${rows.length} shown`;
   renderDataMeta();
   if (rows.length === 0 && store.paneErrors.length === 0) {
-    dom.panesBody.innerHTML = `<tr class="empty"><td colspan="7">no panes (no tmux servers, or all filtered out)</td></tr>`;
+    dom.panesBody.innerHTML = `<tr class="empty"><td colspan="7">no panes (no running multiplexer server, or all filtered out)</td></tr>`;
     return;
   }
 
