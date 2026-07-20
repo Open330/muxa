@@ -199,9 +199,7 @@ async fn dispatch_object(client: &Client, req: &Value) -> Option<Value> {
     // No `id` key at all → notification: never answered (even if malformed,
     // there's nothing to address a reply to). The only one we expect is
     // `notifications/initialized`.
-    let Some(id) = id else {
-        return None;
-    };
+    let id = id?;
 
     // From here the message has an `id`, so any envelope problem yields a
     // proper error response addressed to it rather than a silent drop.
