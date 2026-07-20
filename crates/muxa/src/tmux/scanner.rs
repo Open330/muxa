@@ -101,6 +101,58 @@ fn scoped_socket() -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
+/// The `MUXA_TMUX_SOCKET` scope canonicalized once for the process lifetime.
+/// `None` when the env var is unset/empty. Canonicalization collapses the
+/// macOS `/tmp` → `/private/tmp` symlink (and any others) so the scope
+/// compares equal to a hook's captured `$TMUX` socket regardless of which
+/// form either side spelled.
+fn scope_socket_canonical() -> Option<&'static Path> {
+    static SCOPE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SCOPE
+        .get_or_init(|| scoped_socket().map(|p| p.canonicalize().unwrap_or(p)))
+        .as_deref()
+}
+
+/// Whether a hook event's captured tmux socket falls within the configured
+/// `MUXA_TMUX_SOCKET` scope.
+///
+/// The daemon calls this on every ingested hook event to drop events from
+/// unrelated tmux servers that happen to share muxa's globally-installed
+/// agent hooks — e.g. agents another multiplexer (cmux) launches on its own
+/// `-L`/`-S` server. Those agents report pane ids from a server muxa doesn't
+/// track, so without scoping they surface as unmappable `%NN` ghost rows that
+/// no reap/prune pass can hold down (their live hooks keep re-registering
+/// them). `MUXA_TMUX_SOCKET` already scopes the pane *scanner*; this extends
+/// the same scope to *ingest* so the two agree.
+///
+/// Keeps the event (`true`) when no scope is configured (the historical
+/// global-ingest behavior) or when the event carries no tmux socket
+/// (surface/paneless/non-tmux agents are never tmux-scoped). Drops it
+/// (`false`) only when a scope is set and the event's socket resolves to a
+/// different server.
+#[must_use]
+pub fn event_tmux_socket_in_scope(event_socket: Option<&str>) -> bool {
+    event_in_scope_with(scope_socket_canonical(), event_socket)
+}
+
+/// Pure core of [`event_tmux_socket_in_scope`], with the scope injected so
+/// it's testable without touching the process-global env cache. `scope` is
+/// expected already-canonical (as the cached env scope is).
+fn event_in_scope_with(scope: Option<&Path>, event_socket: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let Some(sock) = event_socket else {
+        return true;
+    };
+    match Path::new(sock).canonicalize() {
+        Ok(p) => p == scope,
+        // A socket that no longer exists can't be canonicalized; fall back
+        // to a raw compare rather than silently keeping a foreign event.
+        Err(_) => Path::new(sock) == scope,
+    }
+}
+
 fn enumerate_sockets_with(scoped: Option<PathBuf>, dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut socks = match scoped {
         Some(sock) => vec![sock],
@@ -418,6 +470,45 @@ mod tests {
         // Unscoped: the full dir scan finds both live sockets.
         let all = enumerate_sockets_with(None, &[dir.path().to_path_buf()]);
         assert_eq!(all.len(), 2, "unscoped scan should see both: {all:?}");
+    }
+
+    #[test]
+    fn event_in_scope_keeps_everything_when_unscoped() {
+        // No scope configured → every event is in scope, including foreign
+        // sockets. This is the historical global-ingest default.
+        assert!(event_in_scope_with(None, Some("/tmp/anything")));
+        assert!(event_in_scope_with(None, None));
+    }
+
+    #[test]
+    fn event_in_scope_drops_foreign_socket_but_keeps_scoped_and_paneless() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_path = dir.path().join("default");
+        let _scope = std::os::unix::net::UnixListener::bind(&scope_path).unwrap();
+        let foreign = dir.path().join("cmux-debug");
+        let _foreign = std::os::unix::net::UnixListener::bind(&foreign).unwrap();
+
+        // Production caches the scope already-canonical; mirror that here.
+        let scope = scope_path.canonicalize().unwrap();
+
+        // Same server → kept, even if the caller spelled the path uncanonically.
+        assert!(event_in_scope_with(
+            Some(&scope),
+            Some(scope_path.to_str().unwrap())
+        ));
+        // A different live server (the cmux case) → dropped.
+        assert!(!event_in_scope_with(
+            Some(&scope),
+            Some(foreign.to_str().unwrap())
+        ));
+        // A socket-less event (surface/paneless/non-tmux) is never scoped out.
+        assert!(event_in_scope_with(Some(&scope), None));
+        // A vanished socket path can't canonicalize; raw compare still drops
+        // a clearly-foreign one.
+        assert!(!event_in_scope_with(
+            Some(&scope),
+            Some("/tmp/tmux-1000/gone")
+        ));
     }
 
     #[test]

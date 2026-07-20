@@ -7,11 +7,14 @@
 # tmux socket to attach to for control mode. Default: auto-detect from $TMUX.
 # tmux_socket = "default"
 
-# Env-only: MUXA_TMUX_SOCKET scopes the multi-server pane scan to a single
-# tmux socket path instead of enumerating every server under /tmp/tmux-$UID.
-# Opt-in — unset keeps the default global view across all your tmux servers.
-# Useful to isolate muxa to one server (single-server users, tests, or an
-# isolated demo/CI recording that must not pick up unrelated tmux servers):
+# Env-only: MUXA_TMUX_SOCKET scopes muxa to a single tmux socket path instead
+# of enumerating every server under /tmp/tmux-$UID. It scopes BOTH the
+# multi-server pane scan AND hook ingest: events whose captured $TMUX socket
+# is a different server are dropped. Opt-in — unset keeps the global view.
+# Set it on the daemon (e.g. in the launchd/systemd unit) to isolate muxa to
+# one server: handy for single-server users, tests, isolated demo/CI
+# recordings, or excluding agents another multiplexer (e.g. cmux) runs on its
+# own server but which share muxa's globally-installed agent hooks:
 #   MUXA_TMUX_SOCKET=/tmp/tmux-1000/work muxad
 
 [ui]

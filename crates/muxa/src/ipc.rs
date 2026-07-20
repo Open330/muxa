@@ -805,8 +805,24 @@ async fn handle(
                 }
                 RequestBody::Ingest { event } => {
                     kind = "ingest";
-                    tracing::debug!(?event, "ingest");
-                    store.apply(&event).await;
+                    // Drop events from tmux servers outside the configured
+                    // `MUXA_TMUX_SOCKET` scope. muxa's agent hooks are
+                    // installed globally, so an agent another multiplexer
+                    // (e.g. cmux) launched on its own server would otherwise
+                    // register here with pane ids muxa can't correlate —
+                    // unmappable `%NN` ghost rows. Ack it either way so the
+                    // agent's hook never sees an error on its critical path.
+                    if crate::tmux::scanner::event_tmux_socket_in_scope(
+                        event.id().tmux_socket.as_deref(),
+                    ) {
+                        tracing::debug!(?event, "ingest");
+                        store.apply(&event).await;
+                    } else {
+                        tracing::debug!(
+                            socket = event.id().tmux_socket.as_deref(),
+                            "ingest skipped: tmux socket outside MUXA_TMUX_SOCKET scope",
+                        );
+                    }
                     Response::ok()
                 }
                 RequestBody::Register {
