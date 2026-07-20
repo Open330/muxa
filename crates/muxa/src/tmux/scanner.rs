@@ -87,7 +87,25 @@ pub struct ScanResult {
 /// so we deduplicate by canonical path). Each entry must be a Unix
 /// socket; regular files and subdirectories are filtered out.
 pub fn enumerate_sockets() -> Vec<PathBuf> {
-    let mut socks = enumerate_sockets_in(&default_socket_dirs());
+    enumerate_sockets_with(scoped_socket(), &default_socket_dirs())
+}
+
+/// `MUXA_TMUX_SOCKET`, when set to a tmux socket path, scopes the multi-server
+/// pane scan to that single server instead of globbing every socket under the
+/// standard dirs. Opt-in — unset keeps the default global view. Lets an
+/// isolated context (a demo recording, integration tests, a single-server
+/// user) avoid picking up unrelated tmux servers running under the same uid.
+fn scoped_socket() -> Option<PathBuf> {
+    let v = std::env::var("MUXA_TMUX_SOCKET").ok()?;
+    let trimmed = v.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn enumerate_sockets_with(scoped: Option<PathBuf>, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut socks = match scoped {
+        Some(sock) => vec![sock],
+        None => enumerate_sockets_in(dirs),
+    };
     // Drop dead socket files before any caller spawns a `tmux -S <sock>`
     // against them. tmux only unlinks a server's *own* socket on a clean
     // shutdown, so a server killed abnormally (test timeout, SIGKILL,
@@ -381,6 +399,25 @@ mod tests {
         let found = enumerate_sockets_in(&[dir.path().to_path_buf()]);
         assert_eq!(found.len(), 1, "expected only the socket: {found:?}");
         assert_eq!(found[0], sock_path);
+    }
+
+    #[test]
+    fn enumerate_sockets_with_scopes_to_a_single_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let scoped = dir.path().join("muxa-demo");
+        let _s = std::os::unix::net::UnixListener::bind(&scoped).unwrap();
+        // A sibling live socket that a global scan would also pick up.
+        let other = dir.path().join("default");
+        let _o = std::os::unix::net::UnixListener::bind(&other).unwrap();
+
+        // Scoped: only the named socket, sibling ignored even though it's live.
+        let scoped_found =
+            enumerate_sockets_with(Some(scoped.clone()), &[dir.path().to_path_buf()]);
+        assert_eq!(scoped_found, vec![scoped]);
+
+        // Unscoped: the full dir scan finds both live sockets.
+        let all = enumerate_sockets_with(None, &[dir.path().to_path_buf()]);
+        assert_eq!(all.len(), 2, "unscoped scan should see both: {all:?}");
     }
 
     #[test]

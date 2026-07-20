@@ -121,6 +121,63 @@ TMUX_PANE="$PA" muxa hook claude --event stop \
 TMUX_PANE="$PA" muxa hook claude --event user_prompt_submit \
   <<<'{"session_id":"s-a","prompt":"continue with protocol compatibility tests and update the watch session summary docs"}'
 
+# In-flight Task subagents on the main Claude agent so `muxa watch --view swarm`
+# renders a populated subagent tree (each is a pre_tool_use{Task} with no
+# matching post, so they stay live for the recording).
+for spec in "Explore:trace the pane→session cache" \
+            "general-purpose:write the round-trip tests" \
+            "code-reviewer:review the framing diff"; do
+  k=${spec%%:*}; d=${spec#*:}
+  TMUX_PANE="$PA" muxa hook claude --event pre_tool_use \
+    <<<"{\"session_id\":\"s-a\",\"tool_name\":\"Task\",\"tool_input\":{\"subagent_type\":\"$k\",\"description\":\"$d\"}}"
+done
+
+# 3b) A richer fleet for the `muxa watch` hero — more sessions across every
+#     state, with a second subagent-bearing agent, so the session view and the
+#     swarm view both read as a real fleet-at-a-glance.
+mk() { # <session>  → echoes the pane id
+  "$TM" -u -L "$TMUX_LBL" new-session -d -s "$1" -x 200 -y 40 cat
+  "$TM" -u -L "$TMUX_LBL" display-message -p -t "$1:0.0" '#{pane_id}'
+}
+P_API=$(mk api)
+P_WEB=$(mk web)
+P_INFRA=$(mk infra)
+P_AUTH=$(mk auth)
+P_DATA=$(mk data)
+
+# api — Claude working, with its own Task subagents (second tree in swarm).
+TMUX_PANE="$P_API" muxa hook claude --event user_prompt_submit \
+  <<<'{"session_id":"s-api","prompt":"port the reconciler onto the new PaneBackend trait"}'
+for spec in "Explore:map the reconcile call sites" "general-purpose:port and de-dup"; do
+  k=${spec%%:*}; d=${spec#*:}
+  TMUX_PANE="$P_API" muxa hook claude --event pre_tool_use \
+    <<<"{\"session_id\":\"s-api\",\"tool_name\":\"Task\",\"tool_input\":{\"subagent_type\":\"$k\",\"description\":\"$d\"}}"
+done
+
+# infra — Codex working (another spinner).
+TMUX_PANE="$P_INFRA" muxa hook codex --event user_prompt_submit \
+  <<<'{"session_id":"s-infra","prompt":"terraform: split the network module and pin providers"}'
+TMUX_PANE="$P_INFRA" muxa hook codex --event pre_tool_use \
+  <<<'{"session_id":"s-infra","tool_name":"shell"}'
+
+# web — Claude waiting on input (yellow, needs you).
+TMUX_PANE="$P_WEB" muxa hook claude --event user_prompt_submit \
+  <<<'{"session_id":"s-web","prompt":"fix the SSE reconnect backoff"}'
+TMUX_PANE="$P_WEB" muxa hook claude --event notification \
+  <<<'{"session_id":"s-web","notification_type":"permission_prompt","message":"Allow edit to crates/muxa/src/dashboard/server.rs?"}'
+
+# auth — Claude blocked on a choice (magenta menu).
+TMUX_PANE="$P_AUTH" muxa hook claude --event user_prompt_submit \
+  <<<'{"session_id":"s-auth","prompt":"rotate the JWT signing keys across environments"}'
+TMUX_PANE="$P_AUTH" muxa hook claude --event pre_tool_use \
+  <<<'{"session_id":"s-auth","tool_name":"AskUserQuestion"}'
+
+# data — Claude idle, just finished a turn (the "done" resting state).
+TMUX_PANE="$P_DATA" muxa hook claude --event user_prompt_submit \
+  <<<'{"session_id":"s-data","prompt":"backfill the analytics rollups for last week"}'
+TMUX_PANE="$P_DATA" muxa hook claude --event stop \
+  <<<'{"session_id":"s-data"}'
+
 # 4) Seed activity.ndjson. The live hooks above prove agent ingest works, but
 #    a short GIF cannot wait minutes for durations to accumulate. These closed
 #    intervals make the stats/activity scenes representative while staying

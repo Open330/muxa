@@ -1,18 +1,17 @@
-# muxa demo — "which of your agents needs you right now?"
+# muxa demo — "your whole agent fleet on one screen"
 #
 #   vhs docs/demo.tape   →   docs/demo.gif
 #
-# Story arc (see docs/demo-README.md):
-#   0–3s   overwhelm     — muxa status: claude working, codex blocked, gemini waiting
-#   3–7s   the accountant — muxa stats: where the day actually went
-#   7–12s  the god view  — prefix+s → muxa watch, all agents one screen, with the
-#                          real prompt/response in the preview
-#   12–17s the finale    — `muxa attend` teleports to the longest-blocked agent
-#                          (codex, mid shell-approval) — the strongest note to end on
+# muxa watch is the hero. Arc:
+#   0–6s    the fleet      — `muxa watch`: every session on one screen, working
+#                            agents spinning, attention floated to the top
+#   6–13s   the swarm      — `muxa watch --view swarm`: k9s-style clusters with
+#                            live dot spinners and an expandable subagent tree
+#   13–17s  teleport       — `muxa attend` jumps to whoever's blocked longest
 #
-# Depends on docs/demo-setup.sh painting the codex/gemini panes with
-# docs/demo-paint.sh instead of bare `cat`, so attend/attach land on a
-# believable agent frame rather than an empty shell.
+# Depends on docs/demo-setup.sh standing up a rich isolated fleet (many
+# sessions, varied states, in-flight Task subagents) and docs/demo-paint.sh
+# painting the codex approval pane attend lands on.
 
 Output docs/demo.gif
 
@@ -25,10 +24,8 @@ Set Theme "GitHub Dark"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
-# ── Prelude — invisible setup (same isolation as the old tape) ───────────
+# ── Prelude — invisible setup (isolated demo daemon + tmux) ──────────────
 Hide
-# Resolve the real tmux BEFORE the shim shadows it on PATH, so attach/detach
-# work whether tmux lives at /usr/bin (Docker/CI) or Homebrew (mac).
 Type "export MUXA_DEMO_TMUX=$(command -v tmux)"
 Enter
 Type "export PATH=$HOME/.cargo/bin:/tmp/muxa-demo-shim:$PATH"
@@ -47,11 +44,31 @@ Type "cat > $MUXA_CONFIG <<'EOF'"
 Enter
 Type "[ui]"
 Enter
-Type "theme = 'high-contrast'"
+Type "theme = 'oh-my-muxa'"
+Enter
+Type "[discovery]"
+Enter
+Type "enabled = false"
+Enter
+Type "[reconciler]"
+Enter
+Type "enabled = false"
+Enter
+Type "[state]"
+Enter
+Type "enabled = false"
+Enter
+Type "[history]"
+Enter
+Type "enabled = false"
+Enter
+Type "[activity]"
+Enter
+Type "enabled = false"
 Enter
 Type "[watch]"
 Enter
-Type "theme = 'high-contrast'"
+Type "theme = 'oh-my-muxa'"
 Enter
 Type "view = 'session'"
 Enter
@@ -67,14 +84,23 @@ Type "rm -rf $XDG_DATA_HOME"
 Enter
 Type "rm -f $MUXA_SOCKET"
 Enter
-Type "muxad >/dev/null 2>&1 &"
+# Scope muxad's tmux scan to the demo server only, so a real tmux fleet on the
+# same host can't leak into the recording. Resolve the socket path from a
+# throwaway server, then let demo-setup recreate `-L muxa-demo` at that path.
+Type "$MUXA_DEMO_TMUX -L muxa-demo new-session -d -s _probe cat"
+Enter
+Type "export MUXA_TMUX_SOCKET=$($MUXA_DEMO_TMUX -L muxa-demo display-message -p '#{socket_path}')"
+Enter
+Type "$MUXA_DEMO_TMUX -L muxa-demo kill-server"
+Enter
+Type "muxad --config $MUXA_CONFIG >/dev/null 2>&1 &"
 Enter
 Sleep 500ms
 Type "until [ -S $MUXA_SOCKET ]; do sleep 0.1; done"
 Enter
 Type "bash docs/demo-setup.sh >/dev/null"
 Enter
-Sleep 300ms
+Sleep 400ms
 Type "clear"
 Enter
 Type "exec $MUXA_DEMO_TMUX -u -L muxa-demo attach -t main:0"
@@ -82,52 +108,36 @@ Enter
 Sleep 1500ms
 Show
 
-# All shell commands run FIRST, from the main:0 bash pane, so nothing is
-# ever typed into a non-shell (painted) pane. `muxa attend` teleports us
-# away for the finale, so it must come last.
-
-# ── 1. Overwhelm (0–3s) ──────────────────────────────────────────────────
-# status-right at the top already shows this pane's agent glyph. The table
-# makes the fleet legible: one working, one blocked on approval, one waiting.
-Type "muxa status"
+# ── 1. The fleet (0–6s) ──────────────────────────────────────────────────
+# muxa watch: the whole fleet on one screen. Working agents spin; sort=state
+# floats the agents that need you (input/choice) to the top; the gutter shows
+# each session's state at a glance.
+Type "muxa watch"
 Enter
-Sleep 3000ms
-
-# ── 2. The accountant (3–7s) ─────────────────────────────────────────────
-# muxa also quantifies the day: how long agents worked, how long they sat
-# blocked on you, how long you actually spent driving.
-Type "clear"
-Enter
-Type "muxa stats --since today --limit 4"
-Enter
-Sleep 3200ms
-
-# ── 3. The god view (7–12s) ──────────────────────────────────────────────
-# prefix + s pops muxa watch. sort=['state'] floats blocked/error agents to
-# the top; the status gutter shows multi/single/bare sessions at a glance.
-Type "clear"
-Enter
-Ctrl+B
-Type "s"
-Sleep 2200ms
-# p — preview the highlighted agent's real prompt + response body
-# (default_content=prompt_response), then q q back out to the shell.
-Type "p"
-Sleep 2600ms
+Sleep 3800ms
+Down@600ms 2
+Sleep 2400ms
 Type "q"
-Sleep 400ms
-Type "q"
-Sleep 600ms
+Sleep 500ms
 
-# ── 4. The finale — teleport to whoever needs you (12–17s) ───────────────
-# Don't hunt across windows. One command jumps the tmux client to whichever
-# agent has been blocked the longest — here, codex on the shell approval.
-# demo-paint.sh has painted a real-looking approval prompt, so the teleport
-# lands somewhere that reads as genuine. Strongest note to end on.
+# ── 2. The swarm (6–13s) ─────────────────────────────────────────────────
+# The k9s-style swarm console: one cluster per session, animated dot spinners
+# on the working agents, and an expandable subagent tree under the agents that
+# spawned Task children.
+Type "muxa watch --view swarm"
+Enter
+Sleep 5500ms
+Down@700ms 2
+Sleep 1600ms
+Type "q"
+Sleep 500ms
+
+# ── 3. Teleport (13–17s) ─────────────────────────────────────────────────
+# Don't hunt across windows — jump the tmux client straight to whichever agent
+# has been blocked the longest.
 Type "muxa attend"
 Enter
-Sleep 700ms
-Sleep 3200ms
+Sleep 3400ms
 Ctrl+B
 Type "d"
 Sleep 600ms
