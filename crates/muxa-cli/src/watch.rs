@@ -652,6 +652,20 @@ pub(crate) enum WatchRow {
     Session(Box<SessionRow>),
 }
 
+/// Stable identity of a table row, used to keep the cursor pinned to the
+/// same session / agent / pane across refreshes and re-sorts.
+///
+/// Deliberately *not* based on `pane_id`: a session row's
+/// `representative_pane` is whichever of its agents was most recently
+/// active, so it changes on its own as the session works. Identity has to
+/// survive that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowIdentity {
+    Agent(AgentKind, String),
+    BarePane(String),
+    Session(String),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRow {
     pub session: String,
@@ -763,6 +777,15 @@ impl WatchRow {
             Self::Agent(a) => a.pane.as_deref(),
             Self::BarePane(p) => Some(&p.pane_id),
             Self::Session(s) => s.representative_pane.as_deref(),
+        }
+    }
+
+    /// Identity that survives a rebuild of the row set — see [`RowIdentity`].
+    fn identity(&self) -> RowIdentity {
+        match self {
+            Self::Agent(a) => RowIdentity::Agent(a.kind, a.session_id.clone()),
+            Self::BarePane(p) => RowIdentity::BarePane(p.pane_id.clone()),
+            Self::Session(s) => RowIdentity::Session(s.session.clone()),
         }
     }
 
@@ -1557,6 +1580,13 @@ impl App {
         sessions: Vec<SessionInfo>,
         session_activity: Vec<SessionActivity>,
     ) {
+        // Remember *which row* the cursor is on before the row set is
+        // rebuilt from scratch below. Every refresh re-sorts, and the
+        // default `sort = ["state", "session", "latest"]` reorders as
+        // agents flip state, so holding the raw table index would silently
+        // slide the highlight onto a neighbouring session.
+        let selected = self.selected_identity();
+
         // Filter out paneless agents up front when the user has opted in
         // (the default). They can't be attached to from the picker — Enter
         // is a no-op — so listing them just clutters the actionable view.
@@ -1593,7 +1623,7 @@ impl App {
             self.sessions = sessions;
             self.session_activity = session_activity;
             self.last_refresh = OffsetDateTime::now_utc();
-            self.clamp_selection();
+            self.restore_selection(selected);
             return;
         }
 
@@ -1640,7 +1670,7 @@ impl App {
         self.sessions = sessions;
         self.session_activity = session_activity;
         self.last_refresh = OffsetDateTime::now_utc();
-        self.clamp_selection();
+        self.restore_selection(selected);
     }
 
     pub(crate) fn apply_sort_preset(&mut self, preset: WatchSortPreset) {
@@ -1649,7 +1679,7 @@ impl App {
     }
 
     fn resort_rows_preserving_selection(&mut self) {
-        let selected_pane = self.selected_pane();
+        let selected = self.selected_identity();
         let sort_context = SortContext::new(
             &self.panes,
             &self.sessions,
@@ -1679,8 +1709,32 @@ impl App {
             });
         }
 
-        if let Some(pane) = selected_pane {
-            if let Some(idx) = self.rows.iter().position(|r| r.contains_pane(&pane)) {
+        self.restore_selection(selected);
+    }
+
+    /// Identity of the row the cursor is on, if any.
+    fn selected_identity(&self) -> Option<RowIdentity> {
+        self.selected_row().map(WatchRow::identity)
+    }
+
+    /// Re-pin the cursor after `rows` was rebuilt or re-sorted.
+    ///
+    /// **Why identity and not the table index**: rows are re-sorted on
+    /// every refresh (~2 Hz, plus one per pushed transition), and the
+    /// default sort leads with `state`. When a *neighbouring* session
+    /// starts working or goes blocked it jumps past the highlighted row,
+    /// which shifts everything below it down one. Keeping the raw index
+    /// then leaves the highlight sitting on a different session than the
+    /// one the user aimed at — the "list looks shifted by one, Enter
+    /// opened the wrong session" report. Pinning by identity makes the
+    /// highlight travel *with* its row, so Enter always targets what the
+    /// user is looking at.
+    ///
+    /// Falls back to the index clamp only when the row genuinely
+    /// disappeared (session killed, agent exited).
+    fn restore_selection(&mut self, previous: Option<RowIdentity>) {
+        if let Some(prev) = previous {
+            if let Some(idx) = self.rows.iter().position(|r| r.identity() == prev) {
                 self.table_state.select(Some(idx));
                 return;
             }
@@ -6324,6 +6378,135 @@ mod tests {
             Some("new")
         );
         assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+    }
+
+    /// Regression: a full refresh that reorders the list must not drag the
+    /// highlight onto a neighbouring session.
+    ///
+    /// Reported as "the list looks shifted by one — I hit Enter twice on
+    /// `muxa` and the `amux` session opened". `set_data_with_sessions`
+    /// rebuilds and re-sorts on every refresh (~2 Hz), and the default sort
+    /// leads with `state`; when `amux` goes Error it jumps above `muxa`, so
+    /// holding the raw table index left the cursor on `amux`.
+    #[test]
+    fn full_refresh_reorder_keeps_the_cursor_on_the_same_session() {
+        let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![
+                WatchSortKey::State,
+                WatchSortKey::Session,
+                WatchSortKey::Activity,
+            ],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+
+        let panes = || {
+            vec![
+                fake_pane("%1", "amux", 0, 0, "claude"),
+                fake_pane("%2", "muxa", 0, 0, "claude"),
+            ]
+        };
+        let sessions = || vec![fake_session("$1", "amux", 0), fake_session("$2", "muxa", 0)];
+        let session_names = |app: &App| -> Vec<String> {
+            app.rows
+                .iter()
+                .filter_map(|r| match r {
+                    WatchRow::Session(s) => Some(s.session.clone()),
+                    WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
+                })
+                .collect()
+        };
+
+        // `muxa` is blocked on an error, so it leads; `amux` is idle below it.
+        let mut muxa_agent = fake_agent_at("m", "%2", now);
+        muxa_agent.state = AgentState::Error;
+        app.set_data_with_sessions(
+            vec![fake_agent_at("a", "%1", now), muxa_agent],
+            panes(),
+            sessions(),
+            vec![],
+        );
+        assert_eq!(session_names(&app), vec!["muxa", "amux"]);
+
+        // The user puts the cursor on `muxa` (row 0 here).
+        app.table_state.select(Some(0));
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+
+        // Next refresh: `muxa` recovers to Idle and `amux` errors, so the two
+        // rows swap. The cursor must travel with `muxa`, not stay on row 0.
+        let mut amux_agent = fake_agent_at("a", "%1", now);
+        amux_agent.state = AgentState::Error;
+        app.set_data_with_sessions(
+            vec![amux_agent, fake_agent_at("m", "%2", now)],
+            panes(),
+            sessions(),
+            vec![],
+        );
+        assert_eq!(session_names(&app), vec!["amux", "muxa"]);
+        assert_eq!(app.table_state.selected(), Some(1));
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+        // …and Enter therefore composes against the pane the user is looking at.
+        assert!(
+            matches!(quick_prompt_action(&app), Action::OpenPrompt(p) if p.pane_id == "%2"),
+            "Enter must target the highlighted session's pane"
+        );
+    }
+
+    /// A session row's `representative_pane` is whichever of its agents was
+    /// most recently active, so it changes on its own. Pinning the cursor by
+    /// pane id alone would lose the row; identity is pinned by session name.
+    #[test]
+    fn refresh_keeps_the_cursor_when_the_representative_pane_changes() {
+        let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
+        let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
+        let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Activity],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let panes = vec![
+            fake_pane("%1", "side", 0, 0, "claude"),
+            fake_pane("%2", "muxa", 0, 0, "claude"),
+            fake_pane("%3", "muxa", 0, 1, "codex"),
+        ];
+        let sessions = vec![fake_session("$1", "side", 0), fake_session("$2", "muxa", 0)];
+
+        app.set_data_with_sessions(
+            vec![
+                fake_agent_at("s", "%1", t0),
+                fake_agent_at("m1", "%2", t1),
+                fake_agent_at("m2", "%3", t0),
+            ],
+            panes.clone(),
+            sessions.clone(),
+            vec![],
+        );
+        assert_eq!(app.table_state.selected(), Some(0));
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+
+        // `side` becomes the most recently active session so the rows swap,
+        // and inside `muxa` the codex pane %3 overtakes %2 as representative.
+        // Both moved — the cursor still belongs on `muxa`.
+        app.set_data_with_sessions(
+            vec![
+                fake_agent_at("s", "%1", t2),
+                fake_agent_at("m1", "%2", t0),
+                fake_agent_at("m2", "%3", t1),
+            ],
+            panes,
+            sessions,
+            vec![],
+        );
+        assert_eq!(app.table_state.selected(), Some(1));
+        let WatchRow::Session(selected) = app.selected_row().expect("selection survives") else {
+            panic!("expected session row");
+        };
+        assert_eq!(selected.session, "muxa");
+        assert_eq!(selected.representative_pane.as_deref(), Some("%3"));
     }
 
     #[test]
