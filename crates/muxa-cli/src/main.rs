@@ -6,6 +6,7 @@ mod dashboard_tui;
 mod doctor;
 mod init;
 mod logs;
+mod mcp;
 mod stats;
 mod theme;
 mod time_range;
@@ -192,6 +193,12 @@ enum Cmd {
     Init(init::Args),
     /// Run end-to-end diagnostics and report any setup issues.
     Doctor,
+    /// Run a Model Context Protocol (MCP) stdio server so a coding agent
+    /// can orchestrate muxa — inspect other agents, send them prompts,
+    /// capture panes, and wait for state changes. Wire it into Claude Code
+    /// with `claude mcp add muxa -- muxa mcp`. Refuses to start if the
+    /// daemon socket is unreachable. See docs/MCP.md.
+    Mcp,
     /// Tail muxad's stdout/stderr logs without remembering paths.
     /// Falls back to `journalctl --user -u muxad` on Linux when the
     /// systemd unit is the source of truth.
@@ -372,6 +379,7 @@ async fn main() -> Result<()> {
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
+        Cmd::Mcp => mcp::run(client).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune {

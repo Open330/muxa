@@ -205,6 +205,11 @@ impl PaneBackend for ZellijBackend {
             capture_pane: false,
             // Always works.
             focus_pane: true,
+            // `zellij action write-chars` only reaches the *focused* pane —
+            // there's no per-pane-id targeting — so injecting into an
+            // arbitrary pane id would type into the wrong place. Unsupported;
+            // `send_text` inherits the trait default (`false`).
+            send_text: false,
         }
     }
 }

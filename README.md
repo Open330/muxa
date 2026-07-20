@@ -106,6 +106,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
+| `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
 
@@ -151,6 +152,7 @@ Patterns are case-sensitive and support `*` and `?`, e.g.
 | Topic | Doc |
 | --- | --- |
 | Install and wiring | [docs/INSTALL.md](docs/INSTALL.md) |
+| MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |
 | CLI dashboard | [docs/DASHBOARD_CLI.md](docs/DASHBOARD_CLI.md) |
 | Stats, reports, activity ledger | [docs/ACTIVITY.md](docs/ACTIVITY.md) |

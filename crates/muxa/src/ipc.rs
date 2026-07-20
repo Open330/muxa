@@ -19,7 +19,7 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
-use crate::backend::{default_backend, SharedBackend};
+use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::session::{
     PtySessionBackend, SessionBackend, SessionOutput, SessionRef, SharedSessionBackend,
@@ -147,8 +147,42 @@ enum RequestBody {
     /// `ok` ack, then writes one JSON-encoded `Transition` per
     /// state change (newline-delimited) until the client closes the
     /// socket. Used by `muxa watch` to switch from 500 ms polling to
-    /// push-based updates.
-    Subscribe,
+    /// push-based updates, and by the `muxa mcp` server's
+    /// `muxa_wait_for_change` tool.
+    ///
+    /// `lagged_markers` (default `false`) opts the connection into receiving
+    /// the `{"event":"lagged","dropped":N}` control frame after a broadcast
+    /// overflow. It defaults OFF so a pre-marker client (whose `Transition`
+    /// parser would choke on the frame and abandon push mode) keeps the
+    /// historical behavior — the server silently continues after a lag, and the
+    /// client reconciles the gap via its fallback snapshot poll. muxa's own
+    /// `TransitionStream` reader understands the frame and opts in.
+    Subscribe {
+        #[serde(default)]
+        lagged_markers: bool,
+    },
+
+    /// Control action: inject `text` into `pane` as literal keystrokes,
+    /// resolving the backend from the pane-id namespace. When `submit`,
+    /// a trailing carriage return is sent as a second injection so the
+    /// agent's current line is committed. Refused with a structured
+    /// error (never a panic) when the target backend lacks the
+    /// `send_text` capability (e.g. zellij). Backs `muxa mcp`'s
+    /// `muxa_send_prompt` tool.
+    SendPrompt {
+        pane: String,
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
+
+    /// Control/observation: capture the visible contents of `pane` via
+    /// the namespace-resolved backend. Backs `muxa mcp`'s
+    /// `muxa_capture_pane` tool. Returns `capture = null` when the pane
+    /// is gone or the backend can't capture (best-effort).
+    Capture {
+        pane: String,
+    },
 
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
     /// backend source — today the zellij WASM plugin forwarding
@@ -269,6 +303,24 @@ pub struct Response {
     pub output: Option<SessionOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pruned: Option<usize>,
+    /// Visible pane contents for a `capture` request. `Some("")` is a
+    /// real empty capture; `None` means the field is absent (any other
+    /// response kind, or a `capture` whose backend returned nothing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    /// Whether a `send_prompt`'s text injection landed. Present only on a
+    /// `send_prompt` response. `true` means the text is already in the pane
+    /// — a caller MUST NOT resend it, even if `submitted` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent: Option<bool>,
+    /// Whether a `send_prompt`'s submit CR landed. Present only on a
+    /// `send_prompt` response. `false` with `sent:true` and a requested
+    /// `submit:true` is a PARTIAL success: the text is in the pane but the
+    /// Enter didn't commit — retry the submit alone (e.g. `send_prompt` with
+    /// empty text + submit), never the whole prompt. `false` is also the
+    /// normal value when `submit:false` was requested (nothing to submit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,6 +346,9 @@ impl Response {
             terminal: None,
             output: None,
             pruned: None,
+            capture: None,
+            sent: None,
+            submitted: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -345,6 +400,21 @@ impl Response {
         r.pruned = Some(pruned);
         r
     }
+    fn with_capture(capture: Option<String>) -> Self {
+        let mut r = Self::ok();
+        r.capture = capture;
+        r
+    }
+    /// A `send_prompt` success carrying the two non-atomic outcomes distinctly
+    /// (Fix: honest partial-failure signal). Only built when the text landed
+    /// (`sent = true`), so `ok = true`; `submitted` reflects whether the
+    /// follow-up submit CR also landed.
+    fn with_send_result(sent: bool, submitted: bool) -> Self {
+        let mut r = Self::ok();
+        r.sent = Some(sent);
+        r.submitted = Some(submitted);
+        r
+    }
     fn hello() -> Self {
         let mut r = Self::ok();
         r.min_protocol = Some(MIN_PROTOCOL_VERSION);
@@ -358,17 +428,26 @@ impl Response {
 pub struct Server {
     socket_path: PathBuf,
     store: SharedStore,
+    /// Backend the server forwards `BackendPaneSnapshot` pushes to (the
+    /// zellij backend in a multi-host daemon; see `with_backend`).
     backend: SharedBackend,
+    /// The full set of backends the daemon observes, for namespace-scoped
+    /// control routing (`send_prompt` / `capture`). Never empty:
+    /// `backends[0]` is the primary/env-preferred host, used as the
+    /// fallback when a pane id doesn't classify to a known namespace.
+    backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
     handler_limit: usize,
 }
 
 impl Server {
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
+        let backend = default_backend();
         Self {
             socket_path,
             store,
-            backend: default_backend(),
+            backend: backend.clone(),
+            backends: vec![backend],
             sessions: PtySessionBackend::shared(),
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
@@ -382,6 +461,21 @@ impl Server {
     #[must_use]
     pub fn with_backend(mut self, backend: SharedBackend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Thread the daemon's full backend set into the server so control
+    /// methods (`send_prompt`, `capture`) can resolve the backend that
+    /// governs a given pane id's namespace (`%…` → tmux, `herdr:…` →
+    /// herdr, …), falling back to the primary (`backends[0]`) for
+    /// unclassifiable ids. An empty set is ignored (keeps the
+    /// [`Self::new`] default) so the invariant "`backends` is never
+    /// empty" holds for the resolver.
+    #[must_use]
+    pub fn with_backends(mut self, backends: Vec<SharedBackend>) -> Self {
+        if !backends.is_empty() {
+            self.backends = backends;
+        }
         self
     }
 
@@ -477,11 +571,12 @@ impl Server {
                     };
                     let store = self.store.clone();
                     let backend = self.backend.clone();
+                    let backends = self.backends.clone();
                     let sessions = self.sessions.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
-                        if let Err(e) = handle(stream, store, backend, sessions).await {
+                        if let Err(e) = handle(stream, store, backend, backends, sessions).await {
                             if e.is_client_disconnect() {
                                 tracing::debug!(error = %e, "client disconnected");
                                 return;
@@ -641,6 +736,27 @@ where
     Ok(line.len())
 }
 
+/// Encode the `{"event":"lagged","dropped":N}` overflow control frame — but
+/// only for a subscriber that opted in (`emit = true`, from
+/// `subscribe { lagged_markers: true }`).
+///
+/// Returns `Ok(None)` when the connection did NOT opt in, so the caller writes
+/// nothing and the stream silently continues past the lag — the pre-marker
+/// behavior a legacy client's `Transition` parser needs (it would otherwise
+/// choke on the marker and abandon push mode). Split out so the opt-in gate is
+/// unit-testable without forcing a real broadcast overflow.
+fn lagged_marker_bytes(
+    emit: bool,
+    dropped: u64,
+    protocol: u32,
+) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    if !emit {
+        return Ok(None);
+    }
+    let marker = serde_json::json!({ "event": "lagged", "dropped": dropped });
+    encode_line(&marker, protocol).map(Some)
+}
+
 /// Pump every state transition from `store` to `writer` as a JSON
 /// line. Runs until the broadcast channel closes (daemon shutting
 /// down) or the client closes its half of the socket — the first
@@ -655,6 +771,7 @@ async fn stream_transitions(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     store: SharedStore,
     protocol: u32,
+    emit_lagged: bool,
 ) -> Result<(), RuntimeError> {
     let mut rx = store.subscribe();
     // Periodic keepalive so a watch client that dies without a clean close is
@@ -683,6 +800,22 @@ async fn stream_transitions(
                         dropped = n,
                         "subscribe lagged; client will reconcile via fallback poll"
                     );
+                    // Emit a lagged marker ONLY for clients that opted in
+                    // (`subscribe { lagged_markers: true }`). It's a distinct
+                    // object shape (`event` tag, no `from`/`to`), which an
+                    // opted-in reader (`TransitionStream::recv`) skips — but a
+                    // pre-marker client's `Transition` parser would choke on it
+                    // and abandon push mode, so an un-opted client gets the
+                    // historical behavior: silently continue after the lag and
+                    // let its fallback snapshot poll reconcile the gap.
+                    if let Some(bytes) = lagged_marker_bytes(emit_lagged, n, protocol)? {
+                        if writer.write_all(&bytes).await.is_err() {
+                            return Ok(());
+                        }
+                        if writer.flush().await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
             },
             _ = keepalive.tick() => {
@@ -701,12 +834,36 @@ async fn stream_transitions(
     }
 }
 
-#[tracing::instrument(level = "debug", skip(stream, store, backend, sessions))]
+/// Resolve the backend that governs `pane`'s id namespace (`%…` → tmux,
+/// `herdr:…` → herdr, `zellij:…` → zellij).
+///
+/// - A pane id that classifies to a KNOWN namespace whose backend is in the
+///   active set → `Ok(backend)`.
+/// - A pane id that classifies to a known namespace whose backend is NOT
+///   observed → `Err(kind)`: a **structured refusal**. We must NOT fall back
+///   to the primary here — routing e.g. a `herdr:` keystroke onto the tmux
+///   backend would inject into the wrong host entirely. The caller turns this
+///   into a `namespace-unavailable` error.
+/// - An UNCLASSIFIED pane id (legacy/synthetic/unknown shape) → `Ok(primary)`:
+///   only these fall back to `backends[0]`, which is never empty (the `Server`
+///   builder guarantees it), preserving pre-guard behavior.
+fn resolve_backend<'a>(
+    backends: &'a [SharedBackend],
+    pane: &str,
+) -> Result<&'a SharedBackend, HostKind> {
+    match crate::backend::pane_id_host_kind(pane) {
+        Some(kind) => backends.iter().find(|b| b.kind() == kind).ok_or(kind),
+        None => Ok(&backends[0]),
+    }
+}
+
+#[tracing::instrument(level = "debug", skip(stream, store, backend, backends, sessions))]
 #[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
 async fn handle(
     stream: UnixStream,
     store: SharedStore,
     backend: SharedBackend,
+    backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
 ) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
@@ -888,6 +1045,93 @@ async fn handle(
                     tracing::debug!(panes = count, "backend_pane_snapshot");
                     Response::ok()
                 }
+                RequestBody::SendPrompt { pane, text, submit } => {
+                    kind = "send_prompt";
+                    match resolve_backend(&backends, &pane) {
+                        // Known namespace, but no active backend observes it —
+                        // refuse rather than mis-route keystrokes to another
+                        // host (routing `herdr:` onto tmux would type into the
+                        // wrong pane entirely).
+                        Err(missing) => Response::err(format!(
+                            "namespace unavailable: no active {missing} backend for pane {pane}",
+                        )),
+                        // Structured refusal, not a panic: the backend that
+                        // owns this pane's namespace can't inject keystrokes
+                        // (e.g. zellij).
+                        Ok(target) if !target.caps().send_text => Response::err(format!(
+                            "backend {} does not support send_text (pane {pane})",
+                            target.kind(),
+                        )),
+                        Ok(target) => {
+                            let target = target.clone();
+                            // Pin the injection to the specific server this
+                            // pane's agent row was recorded on — `%5` exists on
+                            // every tmux server, so an env-scoped send could hit
+                            // the wrong one. `None` for hosts without a server
+                            // concept (herdr) or an untracked pane, which falls
+                            // back to the env-scoped default.
+                            let socket = store
+                                .by_pane(&pane)
+                                .await
+                                .into_iter()
+                                .find_map(|a| a.tmux_socket);
+                            // `send_text_on` is a blocking shell-out / socket
+                            // call, so run it off the async worker. The text and
+                            // the submit CR are TWO non-atomic injections, so
+                            // report the outcomes distinctly (`sent` /
+                            // `submitted`): a caller that sees `sent:true,
+                            // submitted:false` knows the text already landed and
+                            // must NOT resend it. The submit CR is attempted only
+                            // when the text landed — never commit a half-sent
+                            // line, and never let a CR failure masquerade as a
+                            // text failure (which would drive a double-inject
+                            // retry).
+                            let (sent, submitted) = tokio::task::spawn_blocking(move || {
+                                let s = socket.as_deref();
+                                let sent = target.send_text_on(s, &pane, &text);
+                                let submitted =
+                                    sent && submit && target.send_text_on(s, &pane, "\r");
+                                (sent, submitted)
+                            })
+                            .await
+                            .unwrap_or((false, false));
+                            if sent {
+                                tracing::debug!(submit, submitted, "send_prompt");
+                                Response::with_send_result(sent, submitted)
+                            } else {
+                                // Nothing landed — safe for the caller to retry
+                                // the whole send.
+                                Response::err("send_text failed: pane gone or host unreachable")
+                            }
+                        }
+                    }
+                }
+                RequestBody::Capture { pane } => {
+                    kind = "capture";
+                    match resolve_backend(&backends, &pane) {
+                        // Same structured refusal as send_prompt: capturing via
+                        // the wrong backend would read a different host's screen.
+                        Err(missing) => Response::err(format!(
+                            "namespace unavailable: no active {missing} backend for pane {pane}",
+                        )),
+                        Ok(target) => {
+                            let target = target.clone();
+                            // Capture the RIGHT `%5` by pinning to the pane's
+                            // recorded server (see send_prompt above).
+                            let socket = store
+                                .by_pane(&pane)
+                                .await
+                                .into_iter()
+                                .find_map(|a| a.tmux_socket);
+                            let text = tokio::task::spawn_blocking(move || {
+                                target.capture_pane_on(socket.as_deref(), &pane)
+                            })
+                            .await
+                            .unwrap_or(None);
+                            Response::with_capture(text)
+                        }
+                    }
+                }
                 RequestBody::SpawnSession {
                     command,
                     args,
@@ -982,7 +1226,7 @@ async fn handle(
                         Err(e) => Response::err(e.to_string()),
                     }
                 }
-                RequestBody::Subscribe => {
+                RequestBody::Subscribe { lagged_markers } => {
                     kind = "subscribe";
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     // Stream takeover. Send ack, then write transitions
@@ -1000,7 +1244,7 @@ async fn handle(
                         kind,
                         "ipc.handle (stream takeover)",
                     );
-                    return stream_transitions(writer, store, stream_proto).await;
+                    return stream_transitions(writer, store, stream_proto, lagged_markers).await;
                 }
             },
             Err(e) => {
@@ -1048,6 +1292,23 @@ pub struct Client {
     socket_path: PathBuf,
 }
 
+/// The result of a [`Client::send_prompt`]: the two non-atomic keystroke
+/// injections (the text, then the optional submit CR) reported distinctly.
+///
+/// Only produced on `Ok`, i.e. when the text landed. `submitted` is `false`
+/// either because `submit:false` was requested (nothing to submit) or because
+/// a requested submit CR failed after the text landed — a **partial failure**
+/// the caller distinguishes using its own `submit` intent. Either way, when
+/// this value exists the text is already in the pane and MUST NOT be resent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendPromptOutcome {
+    /// The text injection landed. Always `true` here (a failed text send is an
+    /// `Err`); carried explicitly for symmetry and forward-compatibility.
+    pub sent: bool,
+    /// The submit carriage return landed and committed the line.
+    pub submitted: bool,
+}
+
 /// Long-lived handle returned by [`Client::subscribe`]. Calls to
 /// [`Self::recv`] yield successive `Transition`s as they happen on
 /// the daemon. Returns `Ok(None)` when the daemon closes the
@@ -1056,6 +1317,22 @@ pub struct Client {
 pub struct TransitionStream {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     line: String,
+}
+
+/// Whether a subscribe-stream line is the daemon's `lagged` control marker
+/// (`{"event":"lagged",…}`) rather than a `Transition`. Kept cheap: a real
+/// `Transition` is tagged by `from`/`to`, never an `event` field, so a
+/// single parse-and-check disambiguates without a speculative `Transition`
+/// deserialize.
+fn is_lagged_marker(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("event")
+                .and_then(serde_json::Value::as_str)
+                .map(|e| e == "lagged")
+        })
+        .unwrap_or(false)
 }
 
 fn decode_agents(resp: &serde_json::Value) -> Vec<Agent> {
@@ -1081,6 +1358,16 @@ impl TransitionStream {
             }
             let trimmed = self.line.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+            // The daemon interleaves non-transition control frames on this
+            // stream: a bare newline keepalive (handled above) and a lagged
+            // marker (`{"event":"lagged","dropped":N}`) after a broadcast
+            // overflow. Skip the lagged marker — the caller reconciles holes
+            // via its fallback snapshot poll — so it never reaches the
+            // `Transition` deserializer below.
+            if is_lagged_marker(trimmed) {
+                tracing::debug!("subscribe stream lagged; skipping marker");
                 continue;
             }
             let t: crate::state::Transition = serde_json::from_str(trimmed)?;
@@ -1138,6 +1425,53 @@ impl Client {
         });
         let resp = self.call(&req).await?;
         Ok(usize::try_from(resp["pruned"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX))
+    }
+
+    /// Inject `text` into `pane` via the daemon, resolving the backend
+    /// from the pane-id namespace. When `submit`, the daemon follows the
+    /// text with a carriage return so the agent's line is committed.
+    ///
+    /// `Ok` means the **text landed** — the returned [`SendPromptOutcome`]
+    /// reports the two non-atomic injections distinctly (`sent` / `submitted`)
+    /// so a caller can tell a partial failure (text in, Enter not) from a total
+    /// one and must NOT resend the text on the former. `Err` means nothing
+    /// landed (structured refusal — unavailable namespace / unsupported backend
+    /// — or a failed text send), so the whole send is safe to retry. Backs
+    /// `muxa mcp`'s `muxa_send_prompt`.
+    pub async fn send_prompt(
+        &self,
+        pane: &str,
+        text: &str,
+        submit: bool,
+    ) -> Result<SendPromptOutcome, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "send_prompt",
+            "pane": pane,
+            "text": text,
+            "submit": submit,
+        });
+        let resp = self.call_checked(&req).await?;
+        Ok(SendPromptOutcome {
+            // On `Ok` the text landed; default to `true` for forward-compat
+            // with a daemon that predates the explicit field.
+            sent: resp["sent"].as_bool().unwrap_or(true),
+            // Absent field (older daemon) → fall back to the requested intent.
+            submitted: resp["submitted"].as_bool().unwrap_or(submit),
+        })
+    }
+
+    /// Capture the visible contents of `pane` through the daemon's
+    /// namespace-resolved backend. Returns `None` when the pane is gone or
+    /// the backend can't capture. Backs `muxa mcp`'s `muxa_capture_pane`.
+    pub async fn capture(&self, pane: &str) -> Result<Option<String>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "capture",
+            "pane": pane,
+        });
+        let resp = self.call_checked(&req).await?;
+        Ok(resp["capture"].as_str().map(str::to_owned))
     }
 
     pub async fn snapshot_with_timeout(
@@ -1246,6 +1580,11 @@ impl Client {
         let mut req = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "subscribe",
+            // muxa's `TransitionStream::recv` understands the lagged marker
+            // frame, so opt in — `muxa watch` and `muxa mcp`'s
+            // `muxa_wait_for_change` both consume the stream through this
+            // client and want the explicit overflow signal.
+            "lagged_markers": true,
         }))?;
         req.push(b'\n');
         if req.len() > MAX_IPC_LINE_BYTES {
@@ -1766,6 +2105,7 @@ mod tests {
             server_stream,
             store,
             default_backend(),
+            vec![default_backend()],
             PtySessionBackend::shared(),
         ));
 
@@ -2196,5 +2536,535 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    // --- Control-plane routing tests (send_prompt / capture) -------------
+
+    // `HostKind` comes in via `use super::*` (it's imported at module top).
+    use crate::backend::{BackendCaps, PaneBackend};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// Recorded `(pane_id, text)` injections from a `RecordingBackend`.
+    type SendLog = Arc<Mutex<Vec<(String, String)>>>;
+    /// Recorded per-injection `socket` argument threaded into `send_text_on`
+    /// (the pane row's recorded server, or `None`).
+    type SocketLog = Arc<Mutex<Vec<Option<String>>>>;
+
+    /// A fake backend that records every `send_text_on` call — both the
+    /// `(pane_id, text)` and the pinned `socket` — and answers `capture_pane`
+    /// with a canned string. `has_cap` (advertised `caps().send_text`) and
+    /// `send_ok` (the runtime injection result) are decoupled so we can model
+    /// "backend can't inject" (refusal) separately from "backend accepted the
+    /// call but the pane is gone" (runtime failure). `fail_on_cr` makes just
+    /// the submit CR (`"\r"`) fail while the text send still succeeds, to
+    /// exercise the partial-failure signal.
+    struct RecordingBackend {
+        kind: HostKind,
+        has_cap: bool,
+        send_ok: bool,
+        fail_on_cr: bool,
+        sends: SendLog,
+        sockets: SocketLog,
+    }
+
+    impl RecordingBackend {
+        /// The common case: a backend whose `send_text` capability and runtime
+        /// result are the same bool (`true` = injects fine; `false` = no cap,
+        /// so it's refused before any injection is attempted).
+        fn new(kind: HostKind, can_send: bool) -> (Arc<Self>, SendLog) {
+            let (backend, sends, _sockets) = Self::new_full(kind, can_send, can_send, false);
+            (backend, sends)
+        }
+
+        /// Full constructor exposing the socket log and decoupled cap / runtime
+        /// / CR-failure toggles.
+        fn new_full(
+            kind: HostKind,
+            has_cap: bool,
+            send_ok: bool,
+            fail_on_cr: bool,
+        ) -> (Arc<Self>, SendLog, SocketLog) {
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let sockets = Arc::new(Mutex::new(Vec::new()));
+            let backend = Arc::new(Self {
+                kind,
+                has_cap,
+                send_ok,
+                fail_on_cr,
+                sends: sends.clone(),
+                sockets: sockets.clone(),
+            });
+            (backend, sends, sockets)
+        }
+    }
+
+    impl PaneBackend for RecordingBackend {
+        fn kind(&self) -> HostKind {
+            self.kind
+        }
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            Vec::new()
+        }
+        fn resolve_pane(&self, _: &str) -> Option<PaneInfo> {
+            None
+        }
+        fn capture_pane(&self, pane_id: &str) -> Option<String> {
+            Some(format!("captured:{pane_id}"))
+        }
+        fn pane_pid_map(&self) -> std::collections::HashMap<u32, String> {
+            std::collections::HashMap::new()
+        }
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+        fn focus_pane(&self, _: &str) -> bool {
+            false
+        }
+        fn send_text(&self, pane_id: &str, text: &str) -> bool {
+            self.sends
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            if self.fail_on_cr && text == "\r" {
+                return false;
+            }
+            self.send_ok
+        }
+        fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+            self.sockets.lock().unwrap().push(socket.map(str::to_owned));
+            self.send_text(pane_id, text)
+        }
+        fn caps(&self) -> BackendCaps {
+            BackendCaps {
+                send_text: self.has_cap,
+                ..BackendCaps::default()
+            }
+        }
+    }
+
+    async fn serve<B: PaneBackend>(
+        sock: &Path,
+        store: SharedStore,
+        backends: Vec<Arc<B>>,
+    ) -> (broadcast::Sender<()>, tokio::task::JoinHandle<()>) {
+        let backends: Vec<SharedBackend> =
+            backends.into_iter().map(|b| b as SharedBackend).collect();
+        let server = Server::new(sock.to_path_buf(), store).with_backends(backends);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(sock).await;
+        (tx, handle)
+    }
+
+    /// `send_prompt` routes to the backend that governs the pane's
+    /// namespace and, with `submit`, follows the text with a carriage
+    /// return as a second injection.
+    #[tokio::test]
+    async fn send_prompt_injects_text_then_submit_cr() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send.sock");
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        Client::new(sock.clone())
+            .send_prompt("%1", "fix the bug", true)
+            .await
+            .expect("send_prompt ok");
+
+        let recorded = sends.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                ("%1".to_string(), "fix the bug".to_string()),
+                ("%1".to_string(), "\r".to_string()),
+            ],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Without `submit`, only the text is injected — no trailing CR.
+    #[tokio::test]
+    async fn send_prompt_without_submit_omits_cr() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-nosub.sock");
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        Client::new(sock.clone())
+            .send_prompt("%1", "note", false)
+            .await
+            .expect("send_prompt ok");
+
+        assert_eq!(
+            sends.lock().unwrap().clone(),
+            vec![("%1".to_string(), "note".to_string())],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A backend that lacks the `send_text` capability is refused with a
+    /// structured error — never a panic, and no injection is attempted.
+    #[tokio::test]
+    async fn send_prompt_refused_when_backend_lacks_cap() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-refuse.sock");
+        let (backend, sends) = RecordingBackend::new(HostKind::Zellij, false);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        let err = Client::new(sock.clone())
+            .send_prompt("zellij:3", "hi", true)
+            .await
+            .expect_err("must refuse without send_text cap");
+        assert!(
+            format!("{err}").contains("does not support send_text"),
+            "unexpected error: {err}",
+        );
+        assert!(
+            sends.lock().unwrap().is_empty(),
+            "no injection when the cap is absent",
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// With a mixed backend set, `send_prompt` resolves the target by the
+    /// pane-id namespace: a `herdr:` pane routes to the herdr backend even
+    /// though tmux is primary (`backends[0]`).
+    #[tokio::test]
+    async fn send_prompt_resolves_by_pane_namespace() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-ns.sock");
+        let (tmux, tmux_sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (herdr, herdr_sends) = RecordingBackend::new(HostKind::Herdr, true);
+        // tmux leads (primary); herdr trails.
+        let backends: Vec<SharedBackend> = vec![tmux as SharedBackend, herdr as SharedBackend];
+        let server = Server::new(sock.clone(), Store::shared()).with_backends(backends);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        Client::new(sock.clone())
+            .send_prompt("herdr:p9", "hey", false)
+            .await
+            .expect("send_prompt ok");
+
+        assert!(
+            tmux_sends.lock().unwrap().is_empty(),
+            "tmux must not receive"
+        );
+        assert_eq!(
+            herdr_sends.lock().unwrap().clone(),
+            vec![("herdr:p9".to_string(), "hey".to_string())],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// `capture` routes to the namespace backend and returns its screen text.
+    #[tokio::test]
+    async fn capture_returns_backend_screen_text() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-capture.sock");
+        let (backend, _sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        let text = Client::new(sock.clone())
+            .capture("%7")
+            .await
+            .expect("capture ok");
+        assert_eq!(text.as_deref(), Some("captured:%7"));
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Fix 3 — routing: a pane whose namespace classifies to a KNOWN host
+    /// (`herdr:`) but whose backend is NOT in the active set is a structured
+    /// refusal (`Err(kind)`), never a silent fall-through to the primary. An
+    /// unclassified id still falls back to `backends[0]`.
+    #[test]
+    fn resolve_backend_refuses_known_but_absent_namespace() {
+        let (tmux, _s) = RecordingBackend::new(HostKind::Tmux, true);
+        let backends: Vec<SharedBackend> = vec![tmux as SharedBackend];
+
+        // Known + present → the tmux backend.
+        assert!(matches!(
+            resolve_backend(&backends, "%5"),
+            Ok(b) if b.kind() == HostKind::Tmux
+        ));
+        // Known (herdr:) + absent from the set → refusal carrying the kind.
+        assert!(matches!(
+            resolve_backend(&backends, "herdr:p1"),
+            Err(HostKind::Herdr)
+        ));
+        // Unclassified id → fall back to the primary (backends[0]).
+        assert!(matches!(
+            resolve_backend(&backends, "weird-legacy-id"),
+            Ok(b) if b.kind() == HostKind::Tmux
+        ));
+    }
+
+    /// Fix 3 — end to end: `send_prompt` to a pane in an unobserved namespace
+    /// is refused with a `namespace unavailable` error and injects nothing —
+    /// it must NOT type into the tmux (primary) backend.
+    #[tokio::test]
+    async fn send_prompt_refused_for_unavailable_namespace() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-ns-absent.sock");
+        let (tmux, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![tmux]).await;
+
+        let err = Client::new(sock.clone())
+            .send_prompt("herdr:p1", "hi", true)
+            .await
+            .expect_err("must refuse an unobserved namespace");
+        assert!(
+            format!("{err}").contains("namespace unavailable"),
+            "unexpected error: {err}",
+        );
+        assert!(
+            sends.lock().unwrap().is_empty(),
+            "no injection when the namespace is unavailable",
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Fix 1 — the control op is pinned to the pane's RECORDED server: the
+    /// daemon looks the agent row up by pane and threads its `tmux_socket`
+    /// into `send_text_on` (both the text and the submit CR), so a shared
+    /// pane id like `%5` reaches the right tmux server.
+    #[tokio::test]
+    async fn send_prompt_threads_recorded_socket() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-socket.sock");
+        let store = Store::shared();
+        // Seed an agent on pane %5 recorded against the `amux` server.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: Some("amux".into()),
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "sock-sess".into(),
+                    surface: None,
+                    pane: Some("%5".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let (backend, _sends, sockets) =
+            RecordingBackend::new_full(HostKind::Tmux, true, true, false);
+        let (tx, handle) = serve(&sock, store, vec![backend]).await;
+
+        Client::new(sock.clone())
+            .send_prompt("%5", "go", true)
+            .await
+            .expect("send_prompt ok");
+
+        // Both injections (text + CR) were pinned to the recorded socket.
+        assert_eq!(
+            sockets.lock().unwrap().clone(),
+            vec![Some("amux".to_string()), Some("amux".to_string())],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Fix 1 — with no recorded agent row for the pane, the threaded socket is
+    /// `None` (the tmux backend then falls back to the env-scoped default).
+    #[tokio::test]
+    async fn send_prompt_threads_none_socket_when_untracked() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-nosock.sock");
+        let (backend, _sends, sockets) =
+            RecordingBackend::new_full(HostKind::Tmux, true, true, false);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        Client::new(sock.clone())
+            .send_prompt("%9", "hi", false)
+            .await
+            .expect("send_prompt ok");
+
+        assert_eq!(sockets.lock().unwrap().clone(), vec![None]);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Fix 6 — honest partial-failure signal: when the text lands but the
+    /// submit CR fails, the response is `ok:true` with `sent:true,
+    /// submitted:false` (NOT a total failure), so a caller knows the text is
+    /// already in the pane and must not resend it.
+    #[tokio::test]
+    async fn send_prompt_reports_partial_failure_when_cr_fails() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-partial.sock");
+        // Text send succeeds; the `\r` submit fails.
+        let (backend, sends, _sockets) =
+            RecordingBackend::new_full(HostKind::Tmux, true, true, true);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        let outcome = Client::new(sock.clone())
+            .send_prompt("%1", "hello", true)
+            .await
+            .expect("text landed → Ok, not a total failure");
+        assert!(outcome.sent, "text landed");
+        assert!(!outcome.submitted, "submit CR failed");
+
+        // The CR WAS attempted (text-send succeeded first), and the text was
+        // sent exactly once — no double-inject.
+        assert_eq!(
+            sends.lock().unwrap().clone(),
+            vec![
+                ("%1".to_string(), "hello".to_string()),
+                ("%1".to_string(), "\r".to_string()),
+            ],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Fix 6 — a total text-send failure is an `Err` (nothing landed, safe to
+    /// retry the whole send), and the submit CR is NOT attempted.
+    #[tokio::test]
+    async fn send_prompt_total_failure_skips_cr() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-total-fail.sock");
+        // Every send fails.
+        let (backend, sends, _sockets) =
+            RecordingBackend::new_full(HostKind::Tmux, true, false, false);
+        let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
+
+        let err = Client::new(sock.clone())
+            .send_prompt("%1", "hello", true)
+            .await
+            .expect_err("nothing landed → Err");
+        assert!(format!("{err}").contains("send_text failed"), "err: {err}");
+        // Only the text was attempted; the CR is skipped when the text fails.
+        assert_eq!(
+            sends.lock().unwrap().clone(),
+            vec![("%1".to_string(), "hello".to_string())],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Fix 7 — the lagged marker is gated on the connection's opt-in: an
+    /// un-opted subscriber gets `None` (silently continue, pre-marker
+    /// behavior), an opted-in one gets the encoded `{"event":"lagged",…}` frame.
+    #[test]
+    fn lagged_marker_bytes_gated_on_opt_in() {
+        // Not opted in → nothing on the wire.
+        assert!(lagged_marker_bytes(false, 7, PROTOCOL_VERSION)
+            .unwrap()
+            .is_none());
+        // Opted in → a newline-terminated lagged frame carrying the drop count.
+        let bytes = lagged_marker_bytes(true, 7, PROTOCOL_VERSION)
+            .unwrap()
+            .expect("opted-in subscriber gets the marker");
+        let line = String::from_utf8(bytes).unwrap();
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["event"], "lagged");
+        assert_eq!(v["dropped"], 7);
+    }
+
+    /// Fix 7 — muxa's own client opts in: the `subscribe` request it sends
+    /// carries `lagged_markers: true` so `muxa watch` / `muxa mcp` receive the
+    /// overflow signal their `TransitionStream` reader knows how to skip.
+    #[test]
+    fn subscribe_request_defaults_and_opt_in_parse() {
+        // Absent field → default false (a pre-marker client stays legacy).
+        let req: Request = serde_json::from_str(r#"{"protocol":3,"kind":"subscribe"}"#).unwrap();
+        assert!(matches!(
+            req.body,
+            RequestBody::Subscribe {
+                lagged_markers: false
+            }
+        ));
+        // Explicit opt-in parses through.
+        let req: Request =
+            serde_json::from_str(r#"{"protocol":3,"kind":"subscribe","lagged_markers":true}"#)
+                .unwrap();
+        assert!(matches!(
+            req.body,
+            RequestBody::Subscribe {
+                lagged_markers: true
+            }
+        ));
+    }
+
+    /// `is_lagged_marker` recognizes the daemon's overflow marker and
+    /// rejects a normal transition line.
+    #[test]
+    fn lagged_marker_is_recognized() {
+        assert!(is_lagged_marker(r#"{"event":"lagged","dropped":5}"#));
+        assert!(!is_lagged_marker(
+            r#"{"from":"idle","to":"working","agent":{}}"#
+        ));
+        assert!(!is_lagged_marker("not json"));
+    }
+
+    /// `TransitionStream::recv` skips a lagged marker frame and returns the
+    /// next real `Transition`.
+    #[tokio::test]
+    async fn transition_stream_skips_lagged_marker() {
+        use crate::event::{AgentEvent, AgentId, AgentKind};
+        use time::OffsetDateTime;
+
+        // Produce a real serialized Transition via a store.
+        let store = Store::shared();
+        let mut rx = store.subscribe();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "lag".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let transition = rx.recv().await.unwrap();
+        let transition_json = serde_json::to_string(&transition).unwrap();
+
+        // Wire the marker + transition into a TransitionStream's reader.
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let (cr, _cw) = client_side.into_split();
+        let mut ts = TransitionStream {
+            reader: BufReader::new(cr),
+            line: String::new(),
+        };
+        let (_sr, mut sw) = server_side.into_split();
+        let mut payload = String::from(r#"{"event":"lagged","dropped":3}"#);
+        payload.push('\n');
+        payload.push_str(&transition_json);
+        payload.push('\n');
+        sw.write_all(payload.as_bytes()).await.unwrap();
+        sw.flush().await.unwrap();
+
+        let got = ts
+            .recv()
+            .await
+            .expect("recv ok")
+            .expect("a transition after the skipped marker");
+        assert_eq!(got.to, transition.to);
+        assert_eq!(got.agent.session_id, "lag");
     }
 }

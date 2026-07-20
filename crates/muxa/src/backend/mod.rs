@@ -292,11 +292,19 @@ pub enum HostKind {
 /// capability table — only backends with gaps zero out the relevant
 /// flag.
 ///
-/// The four-bool shape trips clippy's `struct_excessive_bools` lint;
+/// The multi-bool shape trips clippy's `struct_excessive_bools` lint;
 /// allowed here because each flag really is an independent capability
 /// (no state-machine ordering between them) and a `bitflags!` macro
-/// would be overkill at this scale. Add an enum if a fifth flag lands
-/// — until then, named bools are the most grep-able shape.
+/// would be overkill at this scale.
+///
+/// A prior version of this comment said "add an enum if a fifth flag
+/// lands". The fifth flag has now landed (`send_text`, added for the
+/// control-plane `send_prompt` path), and we **consciously supersede**
+/// that guidance: an enum/bitflags representation would force every
+/// call site that reads a single field (e.g. `caps().capture_pane`) to
+/// go through a lookup and lose the grep-ability that makes the current
+/// shape easy to audit. Named bools remain the clearest form; revisit
+/// only if the set grows past a handful.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendCaps {
@@ -319,6 +327,15 @@ pub struct BackendCaps {
     /// return false here and the watch picker hides the "Enter to
     /// jump" hint accordingly.
     pub focus_pane: bool,
+    /// Whether `send_text()` can inject keystrokes into a pane. This is
+    /// the control-plane capability the daemon's `send_prompt` IPC (and
+    /// the `muxa mcp` server on top of it) gates on: a backend that
+    /// returns `false` here is refused with a structured error rather
+    /// than silently dropping the prompt. tmux (`send-keys`) and herdr
+    /// (`pane.send_text`) support it; zellij does not — `zellij action
+    /// write-chars` only reaches the *focused* pane, so it can't safely
+    /// target an arbitrary pane id.
+    pub send_text: bool,
 }
 
 impl Default for BackendCaps {
@@ -328,6 +345,7 @@ impl Default for BackendCaps {
             pane_pid_map: true,
             capture_pane: true,
             focus_pane: true,
+            send_text: true,
         }
     }
 }
@@ -394,6 +412,52 @@ pub trait PaneBackend: Send + Sync + 'static {
     /// host couldn't action the request.
     fn focus_pane(&self, pane_id: &str) -> bool;
 
+    /// Inject `text` into the pane as if typed. This is a **control
+    /// action** — the entry point for the daemon's `send_prompt` IPC
+    /// (see `docs/PROTOCOL.md`) and the `muxa mcp` server that proxies
+    /// it — so callers MUST gate on [`BackendCaps::send_text`] and refuse
+    /// (structured error) rather than call a backend that can't honor it.
+    ///
+    /// The text is sent *literally*: no key-name interpretation, no
+    /// implicit submit. To submit the pane's current line, send a
+    /// carriage return as a separate call — `send_text(pane, "\r")` — which
+    /// is byte-identical to tmux's `send-keys Enter` and to writing a CR to
+    /// a herdr pane's pty (the daemon does exactly this for `submit: true`).
+    /// Splitting text from submit keeps the primitive minimal and lets one
+    /// trait method + one capability flag cover both hosts.
+    ///
+    /// Returns `true` when the host accepted the injection; `false`
+    /// (best-effort) when the pane is gone, the host errored, or the
+    /// backend doesn't support injection at all. The default impl returns
+    /// `false` so a backend that never overrides it is safely inert.
+    fn send_text(&self, _pane_id: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Like [`Self::send_text`] but targeting the pane on a specific host
+    /// *server* named by `socket`. This is the control-plane entry point: a
+    /// tmux pane id like `%5` exists on every running tmux server, so the
+    /// daemon threads the agent row's recorded `tmux_socket` here to inject
+    /// into the RIGHT server rather than whichever one answers first.
+    ///
+    /// `socket` is the pane row's recorded short socket name (`default` /
+    /// `amux`), or `None` when the row has no recorded socket. The default
+    /// impl ignores `socket` and delegates to [`Self::send_text`] — correct
+    /// for hosts without a per-server socket concept (herdr, zellij); tmux
+    /// overrides it to pin the server.
+    fn send_text_on(&self, _socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        self.send_text(pane_id, text)
+    }
+
+    /// Like [`Self::capture_pane`] but targeting the pane on the specific host
+    /// server named by `socket` — the control-plane `capture` counterpart to
+    /// [`Self::send_text_on`]. The default impl ignores `socket` and delegates
+    /// to [`Self::capture_pane`]; tmux overrides it to pin the server so a
+    /// shared pane id can't capture the wrong screen.
+    fn capture_pane_on(&self, _socket: Option<&str>, pane_id: &str) -> Option<String> {
+        self.capture_pane(pane_id)
+    }
+
     /// Static capability descriptor. Default impl returns "everything
     /// supported" because that's the tmux shape and most backends
     /// model their gaps as exceptions to that baseline.
@@ -448,6 +512,15 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn focus_pane(&self, pane_id: &str) -> bool {
         (**self).focus_pane(pane_id)
+    }
+    fn send_text(&self, pane_id: &str, text: &str) -> bool {
+        (**self).send_text(pane_id, text)
+    }
+    fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        (**self).send_text_on(socket, pane_id, text)
+    }
+    fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
+        (**self).capture_pane_on(socket, pane_id)
     }
     fn caps(&self) -> BackendCaps {
         (**self).caps()
@@ -864,6 +937,7 @@ mod tests {
         assert!(caps.pane_pid_map);
         assert!(caps.capture_pane);
         assert!(caps.focus_pane);
+        assert!(caps.send_text);
     }
 
     /// `MUXA_HOSTS` is an explicit ordered set: names normalize, unknown

@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Control plane + MCP server (`muxa mcp`).** muxa can now *drive* agents,
+  not only observe them. A new `muxa mcp` subcommand runs a Model Context
+  Protocol stdio server so a coding agent can orchestrate the others — wire it
+  into Claude Code with `claude mcp add muxa -- muxa mcp` (see
+  [docs/MCP.md](docs/MCP.md)). Tools: `muxa_status`, `muxa_recent_prompts`,
+  `muxa_send_prompt`, `muxa_capture_pane`, and `muxa_wait_for_change`. It is a
+  hand-rolled, tools-only JSON-RPC 2.0 server (no new dependencies; not the
+  `rmcp` SDK) and refuses to start when the daemon socket is unreachable.
+- **Control IPC methods** (`PROTOCOL.md`): `send_prompt { pane, text, submit }`
+  injects keystrokes into a pane (resolving the backend by pane-id namespace,
+  and committing the line with a trailing Enter when `submit`) and `capture
+  { pane }` returns a pane's visible contents. `send_prompt` refuses backends
+  without the new `send_text` capability with a structured error. The daemon
+  threads its full multi-host backend set into the IPC server
+  (`Server::with_backends`) for namespace-scoped routing. The socket stays
+  owner-only (`0600`).
+  - **Wrong-target keystroke hardening.** Control ops are pinned to the
+    **specific tmux server** the pane's agent row was recorded on (`tmux -S
+    <socket>`), not an env-global socket — a pane id like `%5` exists on every
+    server, so an unpinned send/capture could hit the wrong one. A pane in a
+    KNOWN-but-unobserved namespace (e.g. `herdr:` on a tmux-only daemon) is
+    refused with a `namespace unavailable` error instead of falling through to
+    the primary backend. The plain (watch preview / dashboard) `capture_pane`
+    stays on the default server; only the control path targets a recorded
+    socket.
+  - **`send_prompt` reports `{ sent, submitted }`** so the text-send and the
+    submit-CR outcomes are distinct: a caller that sees `sent:true,
+    submitted:false` knows the text already landed and must retry only the
+    submit, never the whole prompt (which would double-inject). The submit CR
+    is attempted only after the text lands.
+  - **Argument-injection & multi-line hardening.** tmux `send-keys` uses `--`
+    so text starting with `-` isn't parsed as a flag; text with an embedded
+    newline or a trailing `;` is injected via a bracketed paste
+    (`load-buffer` + `paste-buffer -p`) so newlines don't submit line-by-line
+    and a trailing `;` (which tmux would eat as a command separator) survives.
+  - **`subscribe` lagged marker is now opt-in** (`subscribe { lagged_markers:
+    true }`). It defaults off so a pre-marker client isn't broken by the
+    `{"event":"lagged"}` frame; the server silently continues past an overflow
+    for un-opted clients. muxa's own `watch` / `mcp` client opts in.
+- **`PaneBackend::send_text`** capability (and its server-pinned
+  `send_text_on` / `capture_pane_on` variants): tmux (`send-keys -l --`, or a
+  bracketed paste for multi-line / trailing-`;` text) and herdr
+  (`pane.send_text`) support keystroke injection; zellij does not
+  (`write-chars` only reaches the focused pane).
+
 ## [0.8.21] - 2026-07-21
 
 ### Added

@@ -326,6 +326,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| primary.clone());
     let server = Server::new(socket.clone(), store)
         .with_backend(ipc_backend)
+        // The full observed set, so control methods (`send_prompt`,
+        // `capture`) resolve the backend per pane-id namespace. `backends`
+        // is ordered by env preference, so `backends[0]` is the primary
+        // fallback for unclassifiable ids.
+        .with_backends(backends.clone())
         .with_sessions(sessions);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
