@@ -53,7 +53,16 @@ planned richer plugin path.
 
 ## Quick Start
 
-Requires Rust 1.88+, tmux 3.x, and a Unix-like OS.
+Requires tmux 3.x (or herdr) and a Unix-like OS.
+
+Homebrew (pre-built binaries, no Rust toolchain needed):
+
+```bash
+brew install open330/tap/muxa
+muxa init
+```
+
+Or the one-shot installer (builds from source, requires Rust 1.88+):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh

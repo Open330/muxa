@@ -1,0 +1,135 @@
+name: tap-bump
+
+# Keep Open330/homebrew-tap's Formula/muxa.rb pointing at the newest
+# published release. Runs on `release: published` (NOT on tag push) so
+# the formula's download URLs are live by the time it lands — the
+# release workflow creates a *draft* whose asset URLs 404 until a
+# maintainer publishes it.
+#
+# Requires the `TAP_GITHUB_TOKEN` repo secret: a fine-grained PAT with
+# Contents read/write on Open330/homebrew-tap (the default
+# GITHUB_TOKEN cannot push to a sibling repo). When the secret is
+# absent the job exits early with a notice instead of failing, so
+# releases stay green while the tap is bumped by hand.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to sync the formula to (e.g. v0.8.21)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump-formula:
+    name: bump homebrew formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect release asset checksums
+        id: sums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ref.outputs.tag }}"
+          mkdir sums && cd sums
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256'
+          sum_for() {
+            # Sidecar format: "<sha256>  <archive name>" (first field).
+            awk '{print $1; exit}' "muxa-${tag}-$1.sha256"
+          }
+          {
+            echo "mac_arm=$(sum_for aarch64-apple-darwin)"
+            echo "mac_x86=$(sum_for x86_64-apple-darwin)"
+            echo "linux_arm=$(sum_for aarch64-unknown-linux-gnu)"
+            echo "linux_x86=$(sum_for x86_64-unknown-linux-gnu)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render and push formula
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          MAC_ARM: ${{ steps.sums.outputs.mac_arm }}
+          MAC_X86: ${{ steps.sums.outputs.mac_x86 }}
+          LINUX_ARM: ${{ steps.sums.outputs.linux_arm }}
+          LINUX_X86: ${{ steps.sums.outputs.linux_x86 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_GITHUB_TOKEN}" ]; then
+            echo "::notice::TAP_GITHUB_TOKEN is not configured — skipping the tap bump. Update Open330/homebrew-tap manually or add the secret."
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/Open330/homebrew-tap.git" tap
+          cat > tap/Formula/muxa.rb <<EOF
+          class Muxa < Formula
+            desc "Agent CLI observability and orchestration layer for terminal multiplexers"
+            homepage "https://github.com/Open330/muxa"
+            version "${VERSION}"
+            license "MIT OR Apache-2.0"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MAC_ARM}"
+              else
+                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${MAC_X86}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_ARM}"
+              else
+                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "muxa"
+              bin.install "muxad"
+            end
+
+            service do
+              run [opt_bin/"muxad"]
+              keep_alive true
+              log_path var/"log/muxad.log"
+              error_log_path var/"log/muxad.err.log"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/muxa --version")
+            end
+          end
+          EOF
+          cd tap
+          if git diff --quiet; then
+            echo "formula already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/muxa.rb
+          git commit -m "muxa ${VERSION}"
+          git push

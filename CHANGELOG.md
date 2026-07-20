@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.21] - 2026-07-21
+
 ### Added
 
+- **Homebrew tap.** `brew install open330/tap/muxa` installs pre-built
+  `muxa`/`muxad` binaries (macOS + Linux, arm64 + x86_64) with a
+  `brew services`-compatible `muxad` service. A new `tap-bump` workflow
+  rewrites the formula in Open330/homebrew-tap whenever a release is
+  published (requires the `TAP_GITHUB_TOKEN` secret; skips with a notice
+  otherwise).
 - **multi-host observation (daemon).** `muxad` now observes every backend
   in `muxa::active_backends()` at once (tmux + herdr during a migration)
   instead of a single env-detected backend. One reconciler runs over the
@@ -1461,7 +1469,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.15...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.21...HEAD
+[0.8.21]: https://github.com/Open330/muxa/releases/tag/v0.8.21
 [0.8.15]: https://github.com/Open330/muxa/compare/v0.8.14...v0.8.15
 [0.8.14]: https://github.com/Open330/muxa/compare/v0.8.13...v0.8.14
 [0.8.13]: https://github.com/Open330/muxa/compare/v0.8.12...v0.8.13
