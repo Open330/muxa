@@ -18,15 +18,17 @@ status line, a live TUI, desktop notifications, and local reports.
 
 ---
 
-`muxa` is a small daemon and CLI for observing AI coding agents running
-inside terminal multiplexer panes. It supports Claude Code, OpenAI Codex,
-and Google Gemini CLI through their existing hook/event systems, then
-correlates those events with tmux panes and sessions.
+`muxa` is a small daemon and CLI for observing — and now driving — AI
+coding agents running inside terminal multiplexer panes. It reads agent
+state from existing hook/event systems (Claude Code, OpenAI Codex, Google
+Gemini CLI), falls back to screen-manifest detection for hook-less agents,
+and correlates it all with multiplexer panes and sessions. Through `muxa
+mcp` a coding agent can also orchestrate the others — inspect state, send
+prompts, wait for changes.
 
-It does not fork tmux or modify agent binaries. tmux is the default full
-backend; [herdr](https://herdr.dev) is supported through its socket API
-(see [docs/HERDR.md](docs/HERDR.md)); zellij has a CLI baseline and a
-planned richer plugin path.
+It does not fork the multiplexer or modify agent binaries. tmux and
+[herdr](https://herdr.dev) are full backends and can be observed at the
+same time; zellij has a CLI baseline. See the Hosts table below.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa demo" width="900" />
@@ -140,6 +142,9 @@ Patterns are case-sensitive and support `*` and `?`, e.g.
 
 ## Supported Agents
 
+**Hook-based (authoritative).** These wire into their existing hook/event
+systems, so muxa gets exact state transitions:
+
 | Agent | Status | Config |
 | --- | --- | --- |
 | Claude Code | Supported | `~/.claude/settings.json` |
@@ -147,12 +152,38 @@ Patterns are case-sensitive and support `*` and `?`, e.g.
 | Google Gemini CLI | Supported | `~/.gemini/settings.json` |
 | opencode | Planned | [tracking issue](https://github.com/Open330/muxa/issues/14) |
 
+**Screen-detected (fallback).** Agents with no hooks are classified from
+their pane contents via TOML manifests — bundled best-effort for
+`cursor-agent`, `amp`, `copilot`, `aider`, and `goose`, extensible per
+user. Hooks always win when present. See
+[docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md).
+
+On [herdr](https://herdr.dev) hosts, muxa additionally surfaces every
+agent herdr's own detection sees, with no manifest needed.
+
+## Hosts
+
+muxa observes agents across terminal-multiplexer backends and can watch
+several at once (e.g. during a tmux→herdr migration):
+
+| Host | Status | Notes |
+| --- | --- | --- |
+| tmux | Full | The default backend. |
+| [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
+| zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/ZELLIJ.md). |
+
+See [docs/MULTI_HOST.md](docs/MULTI_HOST.md) for observing multiple hosts
+simultaneously.
+
 ## More Docs
 
 | Topic | Doc |
 | --- | --- |
 | Install and wiring | [docs/INSTALL.md](docs/INSTALL.md) |
 | MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
+| herdr host support | [docs/HERDR.md](docs/HERDR.md) |
+| Multi-host observation | [docs/MULTI_HOST.md](docs/MULTI_HOST.md) |
+| Screen-manifest detection | [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |
 | CLI dashboard | [docs/DASHBOARD_CLI.md](docs/DASHBOARD_CLI.md) |
 | Stats, reports, activity ledger | [docs/ACTIVITY.md](docs/ACTIVITY.md) |

@@ -50,7 +50,16 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 
 ## 빠른 시작
 
-필요 조건: Rust 1.88+, tmux 3.x, Unix-like OS.
+필요 조건: tmux 3.x(또는 herdr), Unix-like OS.
+
+Homebrew(프리빌트 바이너리, Rust 툴체인 불필요):
+
+```bash
+brew install open330/tap/muxa
+muxa init
+```
+
+또는 원샷 설치 스크립트(소스 빌드, Rust 1.88+ 필요):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
@@ -124,12 +133,33 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 
 ## 지원 에이전트
 
+**훅 기반(authoritative).** 기존 훅/이벤트 시스템에 연결해 정확한 상태
+전이를 받습니다:
+
 | Agent | 상태 | Config |
 | --- | --- | --- |
 | Claude Code | 지원 | `~/.claude/settings.json` |
 | OpenAI Codex | 지원 | `~/.codex/config.toml` |
 | Google Gemini CLI | 지원 | `~/.gemini/settings.json` |
 | opencode | 예정 | [tracking issue](https://github.com/Open330/muxa/issues/14) |
+
+**화면 감지(fallback).** 훅이 없는 에이전트는 pane 내용을 TOML 매니페스트로
+분류합니다 — `cursor-agent`, `amp`, `copilot`, `aider`, `goose`용 매니페스트가
+기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 항상 훅이 우선합니다.
+[docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) 참고.
+
+## 호스트
+
+muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측하며, 여러 호스트를
+동시에 볼 수 있습니다(tmux→herdr 마이그레이션 등):
+
+| 호스트 | 상태 | 비고 |
+| --- | --- | --- |
+| tmux | 전체 | 기본 백엔드. |
+| [herdr](https://herdr.dev) | 전체 | herdr 소켓 API 경유; [docs/HERDR.md](docs/HERDR.md). |
+| zellij | CLI 기본 | 플러그인 경로 예정; [docs/ZELLIJ.md](docs/ZELLIJ.md). |
+
+여러 호스트 동시 관측은 [docs/MULTI_HOST.md](docs/MULTI_HOST.md) 참고.
 
 ## 상세 문서
 
