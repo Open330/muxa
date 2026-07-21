@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.22] - 2026-07-21
+
 ### Added
 
 - **Control plane + MCP server (`muxa mcp`).** muxa can now *drive* agents,
@@ -53,6 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bracketed paste for multi-line / trailing-`;` text) and herdr
   (`pane.send_text`) support keystroke injection; zellij does not
   (`write-chars` only reaches the focused pane).
+- **Screen-manifest fallback detection.** Agent CLIs muxa has no hooks for
+  (`cursor-agent`, `amp`, `copilot`, `aider`, `goose`) now surface their state
+  on tmux hosts by matching TOML manifests against a pane capture — the
+  fallback-detection model herdr validated, with hooks staying authoritative.
+  Classification is `blocked → working → idle`, else keep-previous; blocked is
+  strict (only unambiguous approval UI) so a false "needs input" is avoided.
+  Five conservative manifests ship bundled; override or add your own at
+  `$XDG_CONFIG_HOME/muxa/agents/*.toml`. Rows are synthetic, so a real hook
+  evicts them the moment it claims the pane (precedence: hooks > herdr bridge >
+  screen detection). A `muxad` `[screen_detect]` task (on by default, 3 s)
+  captures candidate panes across the multi-host backend set. See
+  [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md).
 
 ## [0.8.21] - 2026-07-21
 
@@ -1516,7 +1530,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.21...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.22...HEAD
+[0.8.22]: https://github.com/Open330/muxa/releases/tag/v0.8.22
 [0.8.21]: https://github.com/Open330/muxa/releases/tag/v0.8.21
 [0.8.15]: https://github.com/Open330/muxa/compare/v0.8.14...v0.8.15
 [0.8.14]: https://github.com/Open330/muxa/compare/v0.8.13...v0.8.14

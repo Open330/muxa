@@ -6,12 +6,14 @@ database.
 ## Flow
 
 ```text
-agent hook/status event
+agent hook/status event ─┐
+herdr agent_status event ─┤
+screen-manifest match ───┘
         |
         v
       muxa hook  ---- unix socket ---->  muxad in-memory registry
-                                             |
-                                             +--> state.json
+      (or a daemon                           |
+       detection task)                       +--> state.json
                                              +--> prompts.ndjson
                                              +--> activity.ndjson
                                              +--> notifications / sinks
@@ -19,17 +21,24 @@ agent hook/status event
 ```
 
 The CLI reads live daemon state over the socket and local retained files
-for history/reporting views.
+for history/reporting views, and can drive agents back through the socket
+(`send_prompt`/`capture`, exposed to other agents via `muxa mcp`).
 
 ## Components
 
 | Component | Role |
 | --- | --- |
 | `muxad` | Long-running daemon. Owns the registry, IPC server, background tasks, and optional dashboard. |
-| `muxa` | CLI for status, watch, attend, recap, stats, reports, activity queries, init, and hook entrypoints. |
+| `muxa` | CLI for status, watch, attend, recap, stats, reports, activity queries, init, hook entrypoints, and the `mcp` control server. |
 | Agent adapters | Translate Claude/Codex/Gemini hook events into muxa state transitions. |
-| tmux backend | Resolves panes, sessions, pane captures, and foreground session activity. |
-| Activity ledger | Append-only duration source for state/tmux/human intervals. |
+| Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, herdr, zellij). The daemon can observe several at once; each pane id is namespaced by host. |
+| herdr bridge | Translates herdr's own `agent_status` stream into synthetic rows for agents muxa has no hooks for. |
+| Screen detection | Classifies hook-less agents (cursor, amp, …) from pane captures against TOML manifests; synthetic, hook-authoritative. |
+| Activity ledger | Append-only duration source for state/foreground/human intervals. |
+
+Precedence when several producers describe one pane: **hooks > herdr
+bridge > screen detection** — synthetic rows are evicted the moment a real
+hook claims the pane.
 
 ## Data Files
 
