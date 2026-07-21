@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "dev.barshelf.muxa-watch",
   "name": "muxa Watch",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "icon": "rectangle.3.group.bubble.left.fill",
   "bucket": { "group": "Agents", "order": 10, "size": "L", "pinned": true },
 
@@ -11,7 +11,7 @@
   "source": {
     "kind": "script",
     "command": ["muxa"],
-    "discover": ["$MUXA_BIN", "~/.cargo/bin/muxa", "/opt/homebrew/bin/muxa", "/usr/local/bin/muxa", "PATH"],
+    "discover": ["$MUXA_BIN", "/opt/homebrew/bin/muxa", "/usr/local/bin/muxa", "~/.cargo/bin/muxa", "PATH"],
     "timeoutMs": 4000,
     "output": "viewtree"
   },
