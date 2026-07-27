@@ -9,9 +9,11 @@
 
 pub mod scanner;
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::{ObservationCompleteness, PaneObservation};
@@ -89,17 +91,84 @@ pub enum TmuxError {
     BadOutput(String),
 }
 
-fn command_output_with_timeout(
-    mut cmd: Command,
+/// Reader threads draining a child's stdout/stderr for the whole wait.
+///
+/// A pipe holds only its capacity before the writer blocks in `write`, and
+/// that capacity is not the 64 KB one might assume: once a user's total pipe
+/// pages cross `fs.pipe-user-pages-soft`, Linux hands out minimum-size pipes
+/// (one page). A box running dozens of agents crosses that line easily, and
+/// an 8 KB pipe is smaller than one `list-panes -a` payload on a busy tmux
+/// server.
+///
+/// So the parent must never block while a child still has output to write.
+/// Waiting on the child without reading deadlocks: tmux blocks writing, so it
+/// never exits, so we kill it at the timeout and [`list_panes`] collapses to
+/// an empty inventory — which surfaces to the user as every NAME column
+/// falling back to a raw `%42` pane id. Draining on separate threads keeps
+/// the child unblocked regardless of payload size.
+struct Drains {
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl Drains {
+    /// Start draining both pipes. Call this before any blocking parent-side
+    /// work — a stdin write, the wait loop — so a full pipe can never stall
+    /// the child.
+    fn start(child: &mut Child) -> Self {
+        Self {
+            stdout: child.stdout.take().map(spawn_drain),
+            stderr: child.stderr.take().map(spawn_drain),
+        }
+    }
+
+    /// Join both readers and hand back what they read. Only valid once the
+    /// child has exited, which closes the write ends and lets `read_to_end`
+    /// see EOF.
+    fn collect(&mut self) -> (Vec<u8>, Vec<u8>) {
+        (
+            join_drain(self.stdout.take()),
+            join_drain(self.stderr.take()),
+        )
+    }
+}
+
+/// Read one child pipe to EOF on a dedicated thread. A read error collapses
+/// to the bytes seen so far: callers parse the payload and already treat a
+/// short read the same as malformed output, so there is nothing extra to
+/// recover.
+fn spawn_drain<R: Read + Send + 'static>(mut pipe: R) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+fn join_drain(handle: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle.map_or_else(Vec::new, |h| h.join().unwrap_or_default())
+}
+
+/// Wait for `child` under `timeout` while `drains` empties its pipes.
+///
+/// On timeout the drain threads are dropped rather than joined — killing the
+/// child closes the write ends, so they finish on their own, and we must not
+/// block the caller on a process we just gave up on.
+fn wait_drained(
+    mut child: Child,
+    mut drains: Drains,
     timeout: Duration,
     command: String,
 ) -> Result<Output, TmuxError> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
     let started = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(TmuxError::Spawn);
+        if let Some(status) = child.try_wait()? {
+            let (stdout, stderr) = drains.collect();
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
@@ -108,6 +177,17 @@ fn command_output_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn command_output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    command: String,
+) -> Result<Output, TmuxError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let drains = Drains::start(&mut child);
+    wait_drained(child, drains, timeout, command)
 }
 
 fn tmux_output(args: &[&str]) -> Result<Output, TmuxError> {
@@ -243,24 +323,17 @@ fn feed_stdin_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
+    // Drain before writing: `write_all` on a paste payload larger than the
+    // stdin pipe blocks until tmux consumes it, and tmux can only do that if
+    // its own output side is not already wedged. See [`Drains`].
+    let drains = Drains::start(&mut child);
     // Write the payload and drop the handle so tmux sees EOF. Best-effort: a
     // failed write (child already died) falls through to the wait/timeout
     // below, which surfaces the real failure via the exit status.
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input);
     }
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(TmuxError::Spawn);
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TmuxError::Timeout { command, timeout });
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_drained(child, drains, timeout, command)
 }
 
 /// Inject `text` into `pane_id` via tmux's paste buffer instead of
@@ -930,6 +1003,53 @@ mod tests {
 
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    /// Regression: the wait loop used to poll `try_wait` without reading the
+    /// child's pipes, so any output past the pipe capacity blocked tmux in
+    /// `write` forever and the helper killed it at the timeout. `list_panes`
+    /// then returned nothing and every status row fell back to a raw `%42`.
+    /// 1 MiB clears both the 64 KB default capacity and the one-page minimum
+    /// a host over `fs.pipe-user-pages-soft` hands out.
+    #[test]
+    fn bounded_command_drains_output_larger_than_a_pipe_buffer() {
+        const MIB: usize = 1024 * 1024;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' 'x'",
+        ]);
+        let out = command_output_with_timeout(
+            cmd,
+            Duration::from_secs(30),
+            "test large output".to_string(),
+        )
+        .expect("output larger than a pipe buffer must not time out");
+
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), MIB);
+    }
+
+    /// Same deadlock, stderr side: a child that only writes to stderr must
+    /// not stall either, and its bytes must survive into `Output`.
+    #[test]
+    fn bounded_command_drains_large_stderr() {
+        const MIB: usize = 1024 * 1024;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' 'x' >&2",
+        ]);
+        let out = command_output_with_timeout(
+            cmd,
+            Duration::from_secs(30),
+            "test large stderr".to_string(),
+        )
+        .expect("stderr larger than a pipe buffer must not time out");
+
+        assert!(out.status.success());
+        assert_eq!(out.stderr.len(), MIB);
+        assert!(out.stdout.is_empty());
     }
 
     #[test]

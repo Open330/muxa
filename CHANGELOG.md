@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every NAME column collapsing to raw `%42` pane ids on a busy host.** The
+  synchronous tmux wrapper waited on the child while its stdout/stderr pipes
+  went unread, so any payload larger than the pipe capacity blocked tmux in
+  `write` — it never exited, the 1 s timeout killed it, and `list_panes`
+  returned an empty inventory that made every status row fall back to a raw
+  pane id. The capacity is not the assumed 64 KB: once a user's total pipe
+  pages cross `fs.pipe-user-pages-soft`, Linux hands out one-page pipes, and a
+  box running dozens of agents crosses that line — an 8 KB pipe against a
+  ~10 KB `list-panes -a` payload flapped between correct and broken run to
+  run. Both pipes are now drained on reader threads for the whole wait, so
+  output size no longer matters. Also fixes the same stall in the paste path
+  (`load-buffer` stdin) and in `capture-pane`, whose scrollback payloads clear
+  a small pipe routinely.
+
 ## [0.8.22] - 2026-07-21
 
 ### Added
