@@ -55,8 +55,8 @@ stats while newer activity ledger intervals are accumulating.
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
-sort = ["session", "latest"]
+columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
+sort = ["state", "session", "latest"]
 hide_paneless = true
 
 [watch.widths]

@@ -121,7 +121,7 @@
 # `muxa watch` TUI columns. Default keeps the table prompt-forward; uncomment
 # to opt back into model / ctx / cost, always-visible workload, or to reorder.
 #
-# Valid column keys: pane, kind, state, model, ctx, cost, limits, workload,
+# Valid column keys: pane, kind, state, state_age, model, ctx, cost, limits, workload,
 # prompt, activity, session_time.
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
@@ -130,7 +130,7 @@
 # view = "pane"       # one row per agent/pane
 # view = "swarm"      # k9s-style console: session clusters, animated dot spinners
 #                     # for working/starting agents, and an expandable subagent tree
-# columns = ["pane", "state", "model", "ctx", "cost", "workload", "prompt", "activity"]
+# columns = ["pane", "state_age", "model", "ctx", "cost", "workload", "prompt", "activity"]
 
 # What the summary ("prompt") column leads with. Each value names the highest
 # tier it will show and then degrades, so the column is never blank when a
@@ -169,8 +169,8 @@
 # `pane_id` as a final stable tiebreaker. Stale agents (pane closed)
 # always sink to the bottom regardless of what's listed here.
 #
-# Default: ["session", "latest"] — groups by tmux session, floats
-# the most recently active agent inside each group to the top.
+# Default: ["state", "session", "latest"] — floats attention states first,
+# then groups by tmux session and recency.
 #
 # Available keys:
 #   session   — tmux session name asc (groups same-session panes)

@@ -19,6 +19,7 @@ const WATCH_COLUMN_KEYS: &[&str] = &[
     "pane",
     "kind",
     "state",
+    "state_age",
     "model",
     "ctx",
     "cost",
@@ -1087,8 +1088,9 @@ pub enum WatchSortKey {
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        // Pane-view defaults: NAME / ST / ACT / LAST PROMPT — lead with
-        // identity, then state/activity, with the variable-width prompt last
+        // Pane-view defaults: NAME / STATE / ACT / LAST PROMPT — lead with
+        // identity, then the current state plus time spent in it, with the
+        // variable-width prompt last
         // so it can absorb the remaining width. Child shell/subagent workload
         // is shown in the selected row's detail line by default; users can
         // opt back into an always-visible `workload` column if they prefer.
@@ -1098,13 +1100,14 @@ impl Default for WatchConfig {
         // opt back in via config.
         let columns = vec![
             "pane".to_string(),
-            "state".to_string(),
+            "state_age".to_string(),
             "activity".to_string(),
             "prompt".to_string(),
         ];
         let mut widths = HashMap::new();
         widths.insert("pane".to_string(), WidthSpec::Length(22));
         widths.insert("state".to_string(), WidthSpec::Length(3));
+        widths.insert("state_age".to_string(), WidthSpec::Length(12));
         widths.insert("prompt".to_string(), WidthSpec::Min(20));
         widths.insert("activity".to_string(), WidthSpec::Length(6));
         widths.insert("workload".to_string(), WidthSpec::Length(8));
@@ -1310,7 +1313,7 @@ mod tests {
     fn watch_default_is_prompt_forward() {
         let cfg = WatchConfig::default();
         assert_eq!(cfg.theme, None);
-        assert_eq!(cfg.columns, vec!["pane", "state", "activity", "prompt"]);
+        assert_eq!(cfg.columns, vec!["pane", "state_age", "activity", "prompt"]);
         assert!(matches!(
             cfg.widths.get("pane"),
             Some(WidthSpec::Length(22))
@@ -1319,6 +1322,14 @@ mod tests {
             cfg.widths.get("state"),
             Some(WidthSpec::Length(3))
         ));
+        assert!(matches!(
+            cfg.widths.get("state_age"),
+            Some(WidthSpec::Length(12))
+        ));
+        assert!(cfg
+            .columns
+            .iter()
+            .all(|column| WATCH_COLUMN_KEYS.contains(&column.as_str())));
         assert!(matches!(cfg.widths.get("prompt"), Some(WidthSpec::Min(20))));
         assert!(matches!(
             cfg.widths.get("activity"),

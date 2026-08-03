@@ -24,18 +24,63 @@ row per pane.
 
 | Key | Action |
 | --- | --- |
+| Printable text | Immediately filter by session, agent, cwd, model, or prompt. |
+| `/` | Explicitly start filtering, including queries beginning with a reserved key. |
+| `Backspace` / `Ctrl-W` / `Ctrl-U` | Delete a character / word / the whole filter. |
+| `j` / `k`, `↑` / `↓` | Move between sessions; after entering a child, move between agents. |
+| `h` / `l`, `←` / `→` | Return to the parent session / select the first child agent. |
+| `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
+| `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Open prompt composer for the selected pane. Empty `Enter` attaches. |
-| `Esc` / `q` | Quit or close the active popup. |
-| `p` | Open live preview. |
+| `o` / `Alt-P` | Open live preview. |
+| `:` | Open the command palette; `Tab` completes the first match. |
+| `r` / `Ctrl-R` / `Alt-R` | Refresh while browsing. |
+| `?` / `F1` / `Alt-?` | Help. |
+| `q` / `Ctrl-C` | Quit while browsing / quit globally. |
+| `Alt-I` | Toggle the persistent wide-screen inspector. |
+| `Alt-E` | Open the completion/error/attention event inbox. |
+| `Alt-A` | Toggle attention-only filtering. |
 | `[` / `]` | In preview, show the previous / next agent in the selected session. |
 | `c` | Toggle preview content. |
 | `f` | Toggle popup/fullscreen preview. |
-| `?` | Help. |
-| `l` / `a` | Sort by latest activity. |
-| `d` | Sort by session duration. |
-| `s` | Sort by session grouping. |
-| `t` | Sort attention states first. |
-| `r` | Refresh. |
+| `Alt-L/D/S/T` | Sort by latest / duration / session / attention state. |
+
+## Filter, Inspector, and Events
+
+Printable characters immediately narrow the table case-insensitively. While
+the query is empty, conventional browse keys such as `hjkl`, `q`, `r`, `o`,
+and `g` remain commands. After any non-reserved character starts a query,
+those keys become ordinary search text. Press `/` first when the query itself
+must begin with a reserved key; Backspace may then return to an empty but still
+armed filter. `Ctrl-W` deletes a word, while `Ctrl-U` or `Esc` clears the query
+and returns to browsing. Search and the `Alt-A` attention-only filter compose.
+With no query, `Esc` disables attention-only mode before a subsequent `Esc`
+quits.
+
+In session view, the selected session's children appear automatically, but
+`↑`/`↓` (and `j`/`k` while browsing) skip them and continue moving between
+session rows. Press `→` or `l` to enter child selection; then the same vertical
+keys cycle that session's agents, and `←` or `h` returns to the parent. Moving
+to another session folds the previous one and opens the new one in its place.
+A single-pane session does not add a redundant child row.
+The existing `↳ detail` line remains visible for both selected parents and
+selected children; process-tree detail shares the same secondary row when
+available.
+
+At 120 columns or wider, the selected pane's live capture stays visible in a
+right-hand inspector. `Alt-I` toggles it. Completion, error, and input/choice
+transitions remain in a 50-entry in-process inbox opened with `Alt-E`; the
+header shows the unread count.
+
+## Command Palette
+
+Press `:` while browsing to open the command palette. Type a command and press
+`Enter`; `Tab` completes the first visible match and `Esc` cancels. Available
+commands include `refresh`, `preview`, `copy`, `attention`, `events`,
+`inspector`, `sort latest|duration|session|state`, `view pane|session|swarm`,
+`help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
+Runtime `view` changes use the cached snapshot immediately and remain active
+for subsequent refreshes in the current watch process.
 
 ## Prompt Composer
 
@@ -48,7 +93,7 @@ Prompt input time is recorded as a human interaction interval in
 
 ## Preview
 
-Press `p` to preview the selected pane. In session view, if the selected
+Press `o` or `Alt-P` to preview the selected pane. In session view, if the selected
 session has multiple agent panes, press `]` for the next agent or `[` for the
 previous agent. `Tab` and `Shift+Tab` work as aliases. The preview title shows
 the current position, such as `2/3`, when more than one agent is available.
@@ -88,7 +133,7 @@ Columns are configured under `[watch]`:
 ```toml
 [watch]
 view = "session"
-columns = ["pane", "state", "model", "ctx", "cost", "prompt", "activity"]
+columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
 
 [watch.widths]
 prompt = "min:20"
@@ -96,8 +141,10 @@ workload = 8
 activity = 6
 ```
 
-Available column keys include `pane`, `state`, `kind`, `model`, `ctx`,
+Available column keys include `pane`, `state`, `state_age`, `kind`, `model`, `ctx`,
 `cost`, `limits`, `workload`, `prompt`, `activity`, and `session_time`.
+The default `state_age` column renders values such as `▶ WAIT 3m` and
+`● WORK 42s`; use `state` when only the compact glyph is wanted.
 By default, child shell/subagent work is shown only on the selected row's
 detail line as `tree ◇1 ▸1 +2`. Add `workload` to `columns` to render the
 always-visible `TREE` column. `◇` means subagent, `▸` means shell, and `+`
@@ -107,7 +154,7 @@ means other visible process.
 
 ```toml
 [watch]
-sort = ["session", "latest"]
+sort = ["state", "session", "latest"]
 # sort = ["latest"]
 # sort = ["session_time"]
 # sort = ["state", "latest"]
@@ -117,9 +164,9 @@ sort = ["session", "latest"]
 
 Runtime sort keys mirror these presets and save the selected preset back to
 `[watch].sort`. The `--sort` flag remains a one-shot launch override until
-you press a runtime sort key. The default groups by tmux session and floats
-the most recently active agent in each group. `activity` and `act` remain
-accepted aliases for `latest`.
+you press a runtime sort key. The default floats attention states first,
+then groups by tmux session and floats the most recently active agent in each
+group. `activity` and `act` remain accepted aliases for `latest`.
 
 ## Detail Row
 

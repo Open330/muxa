@@ -4,17 +4,18 @@
 //! live-updating table of tracked agents. Input is handled via crossterm
 //! events:
 //!
-//! - Navigation: `q`/`Esc`/`Ctrl-C` to quit, `r` to force-refresh, `↑/↓`
-//!   or `j/k` for selection, `Enter` to prompt the selected pane
-//!   (`Enter` again on an empty prompt attaches).
-//! - Inspection: `p` pops open a full-screen preview of the selected
-//!   row's prompt and response (`q`/`Esc`/`p` returns to the table).
-//! - Quick actions (act on the selected row): `c` copies the last
-//!   prompt to the system clipboard, capital `K` kills the pane (with
-//!   a confirm popup), capital `R` aborts the current turn (also with
-//!   a confirm popup). The Shift requirement on `K` / `R` is a safety
-//!   rail so accidental key presses don't blow up panes.
-//! - Discovery: `?` toggles a help overlay listing every binding.
+//! - Direct filtering: printable characters immediately narrow the row set;
+//!   `/` explicitly arms the filter so queries may start with a reserved key.
+//!   Backspace edits and Esc clears before quitting.
+//! - Navigation: arrows always move between sessions. While the filter is
+//!   empty, `hjkl`, `gg` / `G`, Home / End, page keys, and Ctrl-U / Ctrl-D add
+//!   conventional TUI navigation. Enter opens the prompt composer (`Enter`
+//!   again on an empty prompt attaches).
+//! - Inspection: `Alt-P` opens preview, `Alt-I` toggles the responsive split
+//!   inspector, and `Alt-E` opens the persistent transition inbox.
+//! - Destructive and sort actions retain Alt chords (`Alt-K`, `Alt-X`, …),
+//!   while common browse actions also have `o`, `r`, `?`, and `:` aliases.
+//! - Discovery: F1 / `Alt-?` toggles the complete binding reference.
 //!
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
@@ -50,10 +51,10 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
 };
 use ratatui::{Frame, Terminal};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -385,6 +386,7 @@ pub(crate) enum WatchColumn {
     Pane,
     Kind,
     State,
+    StateAge,
     Model,
     Ctx,
     Cost,
@@ -403,6 +405,7 @@ impl WatchColumn {
             "pane" => Self::Pane,
             "kind" => Self::Kind,
             "state" => Self::State,
+            "state_age" => Self::StateAge,
             "model" => Self::Model,
             "ctx" => Self::Ctx,
             "cost" => Self::Cost,
@@ -420,6 +423,7 @@ impl WatchColumn {
             Self::Pane => "NAME",
             Self::Kind => "KIND",
             Self::State => "ST",
+            Self::StateAge => "STATE",
             Self::Model => "MODEL",
             Self::Ctx => "CTX%",
             Self::Cost => "COST$",
@@ -435,7 +439,7 @@ impl WatchColumn {
         match self {
             // PANE — "session:window.pane" can run long; 22 covers most.
             Self::Pane => Constraint::Length(22),
-            Self::Kind => Constraint::Length(12),
+            Self::Kind | Self::StateAge => Constraint::Length(12),
             // STATE — compact colored state marker; full state remains
             // available in detail placeholders and structured snapshots.
             Self::State => Constraint::Length(3),
@@ -489,6 +493,7 @@ impl WatchColumn {
                 let (symbol, style) = state_marker(a.state, theme, spin);
                 Text::from(Span::styled(symbol, style))
             }
+            Self::StateAge => state_age_text(a, now, theme, spin),
             Self::Model => a.model.as_deref().unwrap_or("-").to_string().into(),
             Self::Ctx => a
                 .context_used_pct
@@ -532,7 +537,7 @@ impl WatchColumn {
                 let summary: String = summary.chars().take(80).collect();
                 Text::from(Span::styled(summary, dim))
             }
-            Self::Kind | Self::State => Text::from(Span::styled("—", dim)),
+            Self::Kind | Self::State | Self::StateAge => Text::from(Span::styled("—", dim)),
             Self::Model
             | Self::Ctx
             | Self::Cost
@@ -553,6 +558,9 @@ impl WatchColumn {
         summary: WatchSummary,
     ) -> Text<'a> {
         let dim = theme.dim_style().add_modifier(Modifier::DIM);
+        if matches!(self, Self::StateAge) {
+            return session_state_age_text(s, now, theme, spin);
+        }
         let Some(agent) = s.latest_agent.as_ref() else {
             return match self {
                 Self::Pane => session_label(s, theme, spin),
@@ -563,7 +571,7 @@ impl WatchColumn {
                     dim,
                 )),
                 Self::SessionTime => session_time_text(s, now),
-                Self::Kind | Self::State => Text::from(Span::styled("—", dim)),
+                Self::Kind | Self::State | Self::StateAge => Text::from(Span::styled("—", dim)),
                 Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
                     Text::from(Span::styled("-", dim))
                 }
@@ -575,6 +583,7 @@ impl WatchColumn {
             Self::Pane => session_label(s, theme, spin),
             Self::Kind
             | Self::State
+            | Self::StateAge
             | Self::Model
             | Self::Ctx
             | Self::Cost
@@ -609,6 +618,37 @@ pub(crate) fn resolve_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
     out
 }
 
+/// Resolve columns and apply the session-view duration default. This is used
+/// both at startup and when `:view` changes granularity at runtime so the two
+/// paths cannot drift into different table shapes.
+fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
+    let mut columns = resolve_columns(cfg);
+    if cfg.view == WatchView::Session && !columns.contains(&WatchColumn::SessionTime) {
+        if columns.as_slice()
+            == [
+                WatchColumn::Pane,
+                WatchColumn::State,
+                WatchColumn::Activity,
+                WatchColumn::Prompt,
+            ]
+        {
+            columns = vec![
+                WatchColumn::Pane,
+                WatchColumn::SessionTime,
+                WatchColumn::Activity,
+                WatchColumn::Prompt,
+            ];
+        } else {
+            let insert_at = columns
+                .iter()
+                .position(|c| matches!(c, WatchColumn::Prompt | WatchColumn::Activity))
+                .unwrap_or(columns.len());
+            columns.insert(insert_at, WatchColumn::SessionTime);
+        }
+    }
+    columns
+}
+
 /// Resolve the width Constraint for `col`, falling back to its default
 /// when the config has no entry or an `Invalid` spec.
 fn resolve_width(col: WatchColumn, cfg: &WatchConfig) -> Constraint {
@@ -631,6 +671,7 @@ impl WatchColumn {
             Self::Pane => "pane",
             Self::Kind => "kind",
             Self::State => "state",
+            Self::StateAge => "state_age",
             Self::Model => "model",
             Self::Ctx => "ctx",
             Self::Cost => "cost",
@@ -665,6 +706,33 @@ pub(crate) enum RowIdentity {
     BarePane(String),
     Session(String),
 }
+
+/// One selectable line after runtime filtering and optional session
+/// expansion have been applied. `agent_idx` points at a child agent inside a
+/// session row; `None` is the ordinary top-level row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleTarget {
+    row_idx: usize,
+    agent_idx: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchEventKind {
+    Done,
+    Attention,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct WatchEventEntry {
+    kind: WatchEventKind,
+    state: AgentState,
+    label: String,
+    summary: String,
+    occurred_at: OffsetDateTime,
+}
+
+const MAX_WATCH_EVENTS: usize = 50;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRow {
@@ -1122,29 +1190,29 @@ pub(crate) fn apply_outcome_to_app(app: &mut App, outcome: ActionOutcome) {
 /// canonical reference.
 pub(crate) fn help_overlay_text() -> Vec<&'static str> {
     vec![
-        "Keybindings",
-        "",
-        "Navigation",
-        "  ↑ / k          move selection up",
-        "  ↓ / j          move selection down",
+        "Filter & navigation",
+        "  type or /       filter; / allows reserved first characters",
+        "  Backspace/C-W   edit filter / delete previous word",
+        "  Ctrl-U / Esc    clear filter; Esc again backs out / quits",
+        "  ↑/↓ · j/k       move sessions/children while browsing",
+        "  ←/→ · h/l       return to parent / enter first child agent",
+        "  gg/G · Home/End first / last selectable row",
+        "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          compose prompt for selected pane",
         "  empty Enter    attach to selected pane",
-        "  r              force refresh",
-        "  q / Esc        quit",
         "",
-        "Inspection",
-        "  p              open preview overlay",
+        "Commands & inspection",
+        "  :              command palette (Tab completes)",
+        "  o / Alt-P      open preview overlay",
+        "  Alt-I          toggle wide-screen inspector",
+        "  Alt-E          open persistent event inbox",
+        "  Alt-A          attention-only filter",
         "  [ / ]          (in preview) previous / next agent",
-        "  f              (in preview) toggle popup ↔ fullscreen",
-        "  c              (in preview) toggle prompt ↔ live pane",
+        "  f / c          (in preview) geometry / content",
         "  Enter          (in preview) compose prompt",
         "",
         "Sorting",
-        "  s              sort by session name",
-        "  l / a          sort by latest activity",
-        "  d              sort by duration (DUR)",
-        "  t              sort by state (ST)",
-        "",
+        "  Alt-S/L/D/T    session / latest / duration / state",
         "State markers",
         match crate::icon_set() {
             IconSet::Unicode => {
@@ -1157,10 +1225,11 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden",
         "",
         "Quick actions (act on selected row)",
-        "  c              copy last prompt to clipboard",
-        "  K              kill the pane (Shift — confirm popup)",
-        "  R              abort current turn (Shift — confirm popup)",
-        "  ?              toggle this overlay",
+        "  Alt-C          copy last prompt to clipboard",
+        "  Alt-K          kill the pane (confirm popup)",
+        "  Alt-X          abort current turn (confirm popup)",
+        "  r/Ctrl-R/Alt-R force refresh while browsing",
+        "  ?/F1/Alt-?     toggle help; q/Ctrl-C quits",
     ]
 }
 
@@ -1250,6 +1319,89 @@ impl PromptPopup {
     }
 }
 
+/// Editable `:` command line. It deliberately mirrors the prompt composer's
+/// UTF-8-safe cursor behavior without carrying pane-specific fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CommandPalette {
+    pub input: String,
+    pub cursor: usize,
+}
+
+impl CommandPalette {
+    fn insert(&mut self, c: char) {
+        let idx = char_to_byte_idx(&self.input, self.cursor);
+        self.input.insert(idx, c);
+        self.cursor += 1;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.insert(c);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, self.cursor - 1);
+        let end = char_to_byte_idx(&self.input, self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, self.cursor);
+        let end = char_to_byte_idx(&self.input, self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn delete_word(&mut self) {
+        while self.cursor > 0
+            && self
+                .input
+                .chars()
+                .nth(self.cursor - 1)
+                .is_some_and(char::is_whitespace)
+        {
+            self.backspace();
+        }
+        while self.cursor > 0
+            && self
+                .input
+                .chars()
+                .nth(self.cursor - 1)
+                .is_some_and(|c| !c.is_whitespace())
+        {
+            self.backspace();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.input.chars().count());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+}
+
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
     if char_idx == 0 {
         return 0;
@@ -1290,6 +1442,7 @@ impl FooterHint {
 ///
 /// Kept separate from rendering so the smoke test can construct it
 /// directly without touching a real terminal.
+#[allow(clippy::struct_excessive_bools)] // independent overlay/filter/runtime flags are clearer than a coupled state enum
 pub(crate) struct App {
     pub rows: Vec<WatchRow>,
     pub table_state: TableState,
@@ -1304,6 +1457,33 @@ pub(crate) struct App {
     /// Active transition pulses, same `(kind, session_id)` key. Pruned as they
     /// expire past [`PULSE_WINDOW`].
     pulses: HashMap<(AgentKind, String), Pulse>,
+    /// Incremental filter entered directly from table mode.
+    pub search_query: String,
+    /// True after `/` explicitly arms filter input. Unlike implicit direct
+    /// typing, this remains true when the query is empty so reserved browse
+    /// keys (`q`, `g`, `h`, …) can be used as the first search character.
+    pub explicit_search: bool,
+    /// First half of the conventional `gg` jump. Any non-`g` key clears it.
+    pending_g: bool,
+    /// Number of selectable rows in the most recently rendered table body.
+    /// Page movement uses this rather than a hard-coded terminal size.
+    table_page_rows: usize,
+    /// When true, only error / input / choice targets remain visible.
+    pub attention_only: bool,
+    /// Session group currently expanded into individually-selectable child
+    /// rows. Selection keeps this to at most one group: the selected session,
+    /// or the parent session of the selected child agent.
+    expanded_sessions: HashSet<String>,
+    /// Wide terminals show a persistent live inspector unless explicitly
+    /// disabled with Alt-I.
+    pub inspector_enabled: bool,
+    /// Set by the last render pass; lets the capture loop avoid polling a
+    /// live pane when the terminal is too narrow to show the inspector.
+    pub inspector_visible: bool,
+    /// Persistent transition inbox for this watch process.
+    events: VecDeque<WatchEventEntry>,
+    pub unread_events: usize,
+    pub event_inbox_open: bool,
     pub last_error: Option<DaemonError>,
     pub last_refresh: OffsetDateTime,
     /// Watch config — held by value so the rendering path doesn't need to
@@ -1336,7 +1516,7 @@ pub(crate) struct App {
     /// keep snapping the cursor away from the user's manual selection.
     initial_pane: Option<String>,
     /// `Some` when the user has popped open the full-screen detail
-    /// preview (key `p`). The table is hidden behind the preview while
+    /// preview (`o` / `Alt-P`). The table is hidden behind the preview while
     /// this is set; `q`/`Esc`/`p` clears it.
     pub preview: Option<PreviewState>,
     /// Count of paneless agents that were filtered out of `rows` because
@@ -1357,7 +1537,8 @@ pub(crate) struct App {
     /// tick while the preview stays open in that mode. `None` when the
     /// preview is closed or showing prompt/response content.
     pub pane_capture: Option<CapturedPane>,
-    /// `Some` when a destructive action (`K` / `R`) is waiting on a
+    /// `Some` when a destructive action (`Alt-K`, `Alt-X`, or a `:` command)
+    /// is waiting on a
     /// y/N reply. Suppresses table input and renders a centred popup;
     /// the input handler resolves the popup before any other key is
     /// interpreted.
@@ -1365,6 +1546,9 @@ pub(crate) struct App {
     /// `Some` while the user is composing a prompt to send directly to
     /// the selected pane. Steals table input until submitted or canceled.
     pub prompt: Option<PromptPopup>,
+    /// Editable `:` command palette. Like other overlays it owns keyboard
+    /// input until Enter executes or Esc cancels.
+    pub command_palette: Option<CommandPalette>,
     /// True while the `?` help overlay is visible. Renders as a centred
     /// popup listing every keybinding — the same pattern as `confirm`,
     /// just with a static body and no follow-up dispatch.
@@ -1456,36 +1640,24 @@ impl App {
     }
 
     pub(crate) fn with_config(cfg: WatchConfig) -> Self {
-        let mut columns = resolve_columns(&cfg);
-        if cfg.view == WatchView::Session && !columns.contains(&WatchColumn::SessionTime) {
-            if columns.as_slice()
-                == [
-                    WatchColumn::Pane,
-                    WatchColumn::State,
-                    WatchColumn::Activity,
-                    WatchColumn::Prompt,
-                ]
-            {
-                columns = vec![
-                    WatchColumn::Pane,
-                    WatchColumn::SessionTime,
-                    WatchColumn::Activity,
-                    WatchColumn::Prompt,
-                ];
-            } else {
-                let insert_at = columns
-                    .iter()
-                    .position(|c| matches!(c, WatchColumn::Prompt | WatchColumn::Activity))
-                    .unwrap_or(columns.len());
-                columns.insert(insert_at, WatchColumn::SessionTime);
-            }
-        }
+        let columns = resolve_display_columns(&cfg);
         Self {
             rows: Vec::new(),
             table_state: TableState::default(),
             anim_frame: 0,
             prev_agent_states: HashMap::new(),
             pulses: HashMap::new(),
+            search_query: String::new(),
+            explicit_search: false,
+            pending_g: false,
+            table_page_rows: 10,
+            attention_only: false,
+            expanded_sessions: HashSet::new(),
+            inspector_enabled: true,
+            inspector_visible: false,
+            events: VecDeque::new(),
+            unread_events: 0,
+            event_inbox_open: false,
             last_error: None,
             last_refresh: OffsetDateTime::now_utc(),
             watch_cfg: cfg,
@@ -1501,6 +1673,7 @@ impl App {
             pane_capture: None,
             confirm: None,
             prompt: None,
+            command_palette: None,
             help_open: false,
             footer_hint: None,
         }
@@ -1521,47 +1694,91 @@ impl App {
         self.set_data_with_sessions(agents, panes, Vec::new(), Vec::new());
     }
 
-    /// Iterate `((kind, session_id), state)` for every agent currently in
-    /// `rows`.
-    fn current_agent_states(&self) -> Vec<((AgentKind, String), AgentState)> {
+    /// Clone the lightweight agent records needed for transition detection.
+    /// A session row also keeps a cloned agent list, so this is independent of
+    /// the current table granularity.
+    fn current_agents(&self) -> Vec<Agent> {
         self.rows
             .iter()
             .flat_map(|r| match r {
-                WatchRow::Agent(a) => vec![((a.kind, a.session_id.clone()), a.state)],
-                WatchRow::Session(s) => s
-                    .agents
-                    .iter()
-                    .map(|a| ((a.kind, a.session_id.clone()), a.state))
-                    .collect(),
+                WatchRow::Agent(a) => vec![(**a).clone()],
+                WatchRow::Session(s) => s.agents.clone(),
                 WatchRow::BarePane(_) => Vec::new(),
             })
             .collect()
     }
 
     /// Diff the current agent states against the previous snapshot and record a
-    /// [`Pulse`] for any transition worth flashing (done / error). No-op — and
-    /// clears any state — when `[watch] spinner` is off. Called after every
-    /// live update in `apply_outcome`.
+    /// [`Pulse`] for any transition worth flashing (done / error), and append
+    /// durable entries to the in-process event inbox. Disabling animation
+    /// suppresses pulses only; inbox tracking remains active.
     fn detect_pulses(&mut self) {
         if !self.watch_cfg.spinner {
-            self.prev_agent_states.clear();
             self.pulses.clear();
-            return;
         }
         let now = std::time::Instant::now();
-        let current = self.current_agent_states();
-        for (key, state) in &current {
-            if let Some(pk) = pulse_kind(self.prev_agent_states.get(key).copied(), *state) {
-                self.pulses.insert(
-                    key.clone(),
-                    Pulse {
-                        kind: pk,
-                        started: now,
-                    },
+        let current = self.current_agents();
+        for agent in &current {
+            let key = (agent.kind, agent.session_id.clone());
+            let previous = self.prev_agent_states.get(&key).copied();
+            if self.watch_cfg.spinner {
+                if let Some(pk) = pulse_kind(previous, agent.state) {
+                    self.pulses.insert(
+                        key.clone(),
+                        Pulse {
+                            kind: pk,
+                            started: now,
+                        },
+                    );
+                }
+            }
+
+            let event_kind = match (previous, agent.state) {
+                (Some(AgentState::Working), AgentState::Idle) => Some(WatchEventKind::Done),
+                (Some(prev), AgentState::Error) if prev != AgentState::Error => {
+                    Some(WatchEventKind::Error)
+                }
+                (Some(prev), AgentState::WaitingInput | AgentState::WaitingChoice)
+                    if prev != agent.state =>
+                {
+                    Some(WatchEventKind::Attention)
+                }
+                _ => None,
+            };
+            if let Some(kind) = event_kind {
+                let label = agent.pane.as_deref().map_or_else(
+                    || agent.session_id.clone(),
+                    |pane| pane_display(Some(pane), &self.panes),
                 );
+                let summary = agent
+                    .last_notification
+                    .as_deref()
+                    .or(agent.last_response.as_deref())
+                    .or(agent.last_prompt.as_deref())
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect();
+                self.events.push_front(WatchEventEntry {
+                    kind,
+                    state: agent.state,
+                    label,
+                    summary,
+                    occurred_at: agent.state_entered_at,
+                });
+                self.events.truncate(MAX_WATCH_EVENTS);
+                if !self.event_inbox_open {
+                    self.unread_events = self.unread_events.saturating_add(1);
+                }
             }
         }
-        self.prev_agent_states = current.into_iter().collect();
+        self.prev_agent_states = current
+            .into_iter()
+            .map(|a| ((a.kind, a.session_id), a.state))
+            .collect();
         self.pulses
             .retain(|_, p| now.duration_since(p.started) < PULSE_WINDOW);
     }
@@ -1691,6 +1908,42 @@ impl App {
         self.resort_rows_preserving_selection();
     }
 
+    /// Change granularity using the cached refresh payload, then keep the
+    /// cursor on the same pane where possible. The next daemon refresh uses
+    /// the new view automatically because `watch_cfg.view` is already set.
+    pub(crate) fn apply_view(&mut self, view: WatchView) {
+        if self.watch_cfg.view == view {
+            return;
+        }
+        let selected_pane = self.selected_pane();
+        let paneless_hidden = self.paneless_hidden;
+        let paneless_attention = self.paneless_attention;
+        let agents = self.current_agents();
+        let panes = self.panes.clone();
+        let sessions = self.sessions.clone();
+        let session_activity = self.session_activity.clone();
+
+        self.watch_cfg.view = view;
+        self.columns = resolve_display_columns(&self.watch_cfg);
+        self.expanded_sessions.clear();
+        self.set_data_with_sessions(agents, panes, sessions, session_activity);
+        // Hidden paneless agents are not present in `current_agents()`, so a
+        // cache-only view rebuild cannot recount them. Preserve the counts
+        // until the next full daemon refresh supplies the complete agent set.
+        self.paneless_hidden = paneless_hidden;
+        self.paneless_attention = paneless_attention;
+
+        if let Some(pane_id) = selected_pane {
+            if let Some(index) = self.visible_targets().iter().position(|target| {
+                target_pane(self, *target).as_deref() == Some(pane_id.as_str())
+                    || self.rows[target.row_idx].contains_pane(&pane_id)
+            }) {
+                self.table_state.select(Some(index));
+                self.sync_auto_expansion();
+            }
+        }
+    }
+
     fn resort_rows_preserving_selection(&mut self) {
         let selected = self.selected_identity();
         let sort_context = SortContext::new(
@@ -1727,7 +1980,82 @@ impl App {
 
     /// Identity of the row the cursor is on, if any.
     fn selected_identity(&self) -> Option<RowIdentity> {
-        self.selected_row().map(WatchRow::identity)
+        let target = self.selected_target()?;
+        self.identity_for_target(target)
+    }
+
+    fn identity_for_target(&self, target: VisibleTarget) -> Option<RowIdentity> {
+        if let Some(agent_idx) = target.agent_idx {
+            let WatchRow::Session(session) = self.rows.get(target.row_idx)? else {
+                return None;
+            };
+            let agent = session.agents.get(agent_idx)?;
+            Some(RowIdentity::Agent(agent.kind, agent.session_id.clone()))
+        } else {
+            self.rows.get(target.row_idx).map(WatchRow::identity)
+        }
+    }
+
+    fn session_group_for_identity(&self, identity: &RowIdentity) -> Option<String> {
+        if self.watch_cfg.view != WatchView::Session {
+            return None;
+        }
+        match identity {
+            RowIdentity::Session(group_key) => self
+                .rows
+                .iter()
+                .any(|row| {
+                    matches!(
+                        row,
+                        WatchRow::Session(session)
+                            if &session.group_key == group_key
+                                && session.pane_count > 1
+                                && !session.agents.is_empty()
+                    )
+                })
+                .then(|| group_key.clone()),
+            RowIdentity::Agent(kind, session_id) => self.rows.iter().find_map(|row| {
+                let WatchRow::Session(session) = row else {
+                    return None;
+                };
+                (session.pane_count > 1
+                    && !session.agents.is_empty()
+                    && session
+                        .agents
+                        .iter()
+                        .any(|agent| agent.kind == *kind && agent.session_id == *session_id))
+                .then(|| session.group_key.clone())
+            }),
+            RowIdentity::BarePane(_) => None,
+        }
+    }
+
+    fn set_auto_expansion(&mut self, identity: Option<&RowIdentity>) {
+        let group_key = identity.and_then(|id| self.session_group_for_identity(id));
+        self.expanded_sessions.clear();
+        if let Some(group_key) = group_key {
+            self.expanded_sessions.insert(group_key);
+        }
+    }
+
+    fn target_index_for_identity(&self, identity: &RowIdentity) -> Option<usize> {
+        self.visible_targets().iter().position(|target| {
+            self.identity_for_target(*target)
+                .is_some_and(|candidate| &candidate == identity)
+        })
+    }
+
+    /// Keep the selected session open without requiring a separate expand
+    /// keystroke. Selecting one of its child agents keeps the same parent open;
+    /// moving to another session folds the previous one and opens the new one.
+    fn sync_auto_expansion(&mut self) {
+        let identity = self.selected_identity();
+        self.set_auto_expansion(identity.as_ref());
+        if let Some(identity) = identity {
+            if let Some(index) = self.target_index_for_identity(&identity) {
+                self.table_state.select(Some(index));
+            }
+        }
     }
 
     /// Re-pin the cursor after `rows` was rebuilt or re-sorted.
@@ -1746,8 +2074,9 @@ impl App {
     /// Falls back to the index clamp only when the row genuinely
     /// disappeared (session killed, agent exited).
     fn restore_selection(&mut self, previous: Option<RowIdentity>) {
-        if let Some(prev) = previous {
-            if let Some(idx) = self.rows.iter().position(|r| r.identity() == prev) {
+        if let Some(prev) = previous.as_ref() {
+            self.set_auto_expansion(Some(prev));
+            if let Some(idx) = self.target_index_for_identity(prev) {
                 self.table_state.select(Some(idx));
                 return;
             }
@@ -1756,13 +2085,15 @@ impl App {
     }
 
     fn clamp_selection(&mut self) {
-        if self.rows.is_empty() {
+        let targets = self.visible_targets();
+        if targets.is_empty() {
             self.table_state.select(None);
+            self.expanded_sessions.clear();
             return;
         }
         match self.table_state.selected() {
-            Some(i) if i >= self.rows.len() => {
-                self.table_state.select(Some(self.rows.len() - 1));
+            Some(i) if i >= targets.len() => {
+                self.table_state.select(Some(targets.len() - 1));
             }
             None => {
                 // First non-empty load: prefer the row matching the pane the
@@ -1771,44 +2102,204 @@ impl App {
                 let hint = self.initial_pane.take();
                 let initial = hint
                     .as_deref()
-                    .and_then(|id| self.rows.iter().position(|r| r.contains_pane(id)))
+                    .and_then(|id| {
+                        targets.iter().position(|target| {
+                            target_pane(self, *target).as_deref() == Some(id)
+                                || self.rows[target.row_idx].contains_pane(id)
+                        })
+                    })
                     .unwrap_or(0);
                 self.table_state.select(Some(initial));
             }
             Some(_) => {}
         }
+        self.sync_auto_expansion();
     }
 
     pub(crate) fn move_down(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        let i = match self.table_state.selected() {
-            Some(i) if i + 1 < self.rows.len() => i + 1,
-            // wrap from the bottom row back to the top; `None` (no prior
-            // selection) also lands here and starts at row 0
-            Some(_) | None => 0,
-        };
-        self.table_state.select(Some(i));
+        self.move_vertical(1);
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.rows.is_empty() {
+        self.move_vertical(-1);
+    }
+
+    fn move_first(&mut self) {
+        self.move_to_vertical_boundary(false);
+    }
+
+    fn move_last(&mut self) {
+        self.move_to_vertical_boundary(true);
+    }
+
+    fn move_page_down(&mut self) {
+        self.move_vertical_bounded(self.page_step(false));
+    }
+
+    fn move_page_up(&mut self) {
+        self.move_vertical_bounded(-self.page_step(false));
+    }
+
+    fn move_half_page_down(&mut self) {
+        self.move_vertical_bounded(self.page_step(true));
+    }
+
+    fn move_half_page_up(&mut self) {
+        self.move_vertical_bounded(-self.page_step(true));
+    }
+
+    fn page_step(&self, half: bool) -> isize {
+        let rows = if half {
+            (self.table_page_rows / 2).max(1)
+        } else {
+            self.table_page_rows.max(1)
+        };
+        isize::try_from(rows).unwrap_or(isize::MAX)
+    }
+
+    /// Move across session parents by default, even though the selected
+    /// session's children are already visible. Once `→` enters a child, the
+    /// same keys cycle only that session's visible children until `←` returns
+    /// to the parent. This keeps a long child roster from slowing down the
+    /// common case of scanning between sessions.
+    fn move_vertical(&mut self, delta: isize) {
+        let targets = self.visible_targets();
+        if targets.is_empty() {
             return;
         }
-        let i = match self.table_state.selected() {
-            Some(i) if i > 0 => i - 1,
-            // wrap from the top row back to the bottom
-            Some(_) => self.rows.len() - 1,
-            None => 0,
+        let selected = self.selected_visible_index(&targets);
+        let candidates = self.vertical_candidates(&targets, selected);
+        if candidates.is_empty() {
+            return;
+        }
+        let current_position =
+            selected.and_then(|index| candidates.iter().position(|candidate| *candidate == index));
+        let next_position = match (current_position, delta.is_positive()) {
+            (Some(position), true) => (position + 1) % candidates.len(),
+            (Some(0), false) => candidates.len() - 1,
+            (Some(position), false) => position - 1,
+            (None, _) => 0,
         };
-        self.table_state.select(Some(i));
+        self.table_state.select(Some(candidates[next_position]));
+        self.sync_auto_expansion();
+    }
+
+    fn move_vertical_bounded(&mut self, delta: isize) {
+        let targets = self.visible_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let selected = self.selected_visible_index(&targets);
+        let candidates = self.vertical_candidates(&targets, selected);
+        if candidates.is_empty() {
+            return;
+        }
+        let current = selected
+            .and_then(|index| candidates.iter().position(|candidate| *candidate == index))
+            .unwrap_or(0);
+        let last = candidates.len() - 1;
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs()).min(last)
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(last)
+        };
+        self.table_state.select(Some(candidates[next]));
+        self.sync_auto_expansion();
+    }
+
+    fn move_to_vertical_boundary(&mut self, last: bool) {
+        let targets = self.visible_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let selected = self.selected_visible_index(&targets);
+        let candidates = self.vertical_candidates(&targets, selected);
+        let next = if last {
+            candidates.last()
+        } else {
+            candidates.first()
+        };
+        if let Some(index) = next {
+            self.table_state.select(Some(*index));
+            self.sync_auto_expansion();
+        }
+    }
+
+    fn selected_visible_index(&self, targets: &[VisibleTarget]) -> Option<usize> {
+        self.table_state
+            .selected()
+            .filter(|index| *index < targets.len())
+    }
+
+    fn vertical_candidates(
+        &self,
+        targets: &[VisibleTarget],
+        selected: Option<usize>,
+    ) -> Vec<usize> {
+        let current = selected.and_then(|index| targets.get(index));
+        if self.watch_cfg.view == WatchView::Session {
+            match current {
+                Some(target) if target.agent_idx.is_some() => targets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, candidate)| {
+                        (candidate.row_idx == target.row_idx && candidate.agent_idx.is_some())
+                            .then_some(index)
+                    })
+                    .collect(),
+                _ => targets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, target)| target.agent_idx.is_none().then_some(index))
+                    .collect(),
+            }
+        } else {
+            (0..targets.len()).collect()
+        }
+    }
+
+    fn move_into_session(&mut self) {
+        self.sync_auto_expansion();
+        let Some(index) = self.table_state.selected() else {
+            return;
+        };
+        let targets = self.visible_targets();
+        let Some(current) = targets.get(index) else {
+            return;
+        };
+        if current.agent_idx.is_some() {
+            return;
+        }
+        if targets
+            .get(index + 1)
+            .is_some_and(|next| next.row_idx == current.row_idx && next.agent_idx.is_some())
+        {
+            self.table_state.select(Some(index + 1));
+            self.sync_auto_expansion();
+        }
+    }
+
+    fn move_to_session_parent(&mut self) {
+        let Some(target) = self.selected_target() else {
+            return;
+        };
+        if target.agent_idx.is_none() {
+            return;
+        }
+        let Some(WatchRow::Session(session)) = self.rows.get(target.row_idx) else {
+            return;
+        };
+        self.restore_selection(Some(RowIdentity::Session(session.group_key.clone())));
     }
 
     /// `pane_id` of the currently selected row, if any.
     pub(crate) fn selected_pane(&self) -> Option<String> {
-        let i = self.table_state.selected()?;
-        self.rows.get(i)?.pane_id().map(String::from)
+        target_pane(self, self.selected_target()?)
+    }
+
+    fn selected_target(&self) -> Option<VisibleTarget> {
+        let index = self.table_state.selected()?;
+        self.visible_targets().get(index).copied()
     }
 
     /// Borrow the currently-selected row, if any. Used by the quick-
@@ -1816,18 +2307,110 @@ impl App {
     /// (e.g. `K` only applies to `WatchRow::Agent` rows with a
     /// non-`None` pane).
     pub(crate) fn selected_row(&self) -> Option<&WatchRow> {
-        let i = self.table_state.selected()?;
-        self.rows.get(i)
+        let target = self.selected_target()?;
+        self.rows.get(target.row_idx)
+    }
+
+    fn selected_agent(&self) -> Option<&Agent> {
+        let target = self.selected_target()?;
+        match self.rows.get(target.row_idx)? {
+            WatchRow::Agent(agent) => Some(agent),
+            WatchRow::Session(session) => target
+                .agent_idx
+                .and_then(|idx| session.agents.get(idx))
+                .or(session.latest_agent.as_ref()),
+            WatchRow::BarePane(_) => None,
+        }
     }
 
     /// `last_prompt` for the selected agent row, if it has one and
     /// the row is an `Agent` (bare panes have no prompt). Threaded
     /// through `c` to populate `QuickAction::CopyPrompt`.
     pub(crate) fn selected_last_prompt(&self) -> Option<&str> {
-        match self.selected_row()? {
-            WatchRow::Agent(a) => a.last_prompt.as_deref(),
-            WatchRow::BarePane(_) => None,
-            WatchRow::Session(s) => s.latest_agent.as_ref()?.last_prompt.as_deref(),
+        self.selected_agent()?.last_prompt.as_deref()
+    }
+
+    fn visible_targets(&self) -> Vec<VisibleTarget> {
+        let query = self.search_query.trim().to_lowercase();
+        let mut targets = Vec::new();
+        for (row_idx, row) in self.rows.iter().enumerate() {
+            let row_query_match = query.is_empty() || row_matches_query(row, &self.panes, &query);
+            let row_attention_match = !self.attention_only || row_needs_attention(row);
+            if row_query_match && row_attention_match {
+                targets.push(VisibleTarget {
+                    row_idx,
+                    agent_idx: None,
+                });
+            }
+
+            let WatchRow::Session(session) = row else {
+                continue;
+            };
+            if self.watch_cfg.view == WatchView::Swarm
+                || session.pane_count <= 1
+                || !self.expanded_sessions.contains(&session.group_key)
+            {
+                continue;
+            }
+            let session_name_match = query.is_empty()
+                || contains_ci(&session.display_name, &query)
+                || contains_ci(&session.session, &query);
+            for (agent_idx, agent) in session.agents.iter().enumerate() {
+                let query_match =
+                    session_name_match || agent_matches_query(agent, &self.panes, &query);
+                let attention_match = !self.attention_only || agent_needs_attention(agent.state);
+                if query_match && attention_match {
+                    targets.push(VisibleTarget {
+                        row_idx,
+                        agent_idx: Some(agent_idx),
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    fn edit_search(&mut self, edit: impl FnOnce(&mut String)) {
+        let selected = self.selected_identity();
+        edit(&mut self.search_query);
+        self.restore_selection(selected);
+    }
+
+    fn browse_keys_active(&self) -> bool {
+        self.search_query.is_empty() && !self.explicit_search
+    }
+
+    fn arm_explicit_search(&mut self) {
+        self.explicit_search = true;
+        self.pending_g = false;
+    }
+
+    fn clear_search(&mut self) {
+        self.explicit_search = false;
+        self.edit_search(String::clear);
+    }
+
+    fn delete_search_word(&mut self) {
+        self.edit_search(|query| {
+            while query.chars().last().is_some_and(char::is_whitespace) {
+                query.pop();
+            }
+            while query.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                query.pop();
+            }
+        });
+    }
+
+    fn toggle_attention_only(&mut self) {
+        let selected = self.selected_identity();
+        self.attention_only = !self.attention_only;
+        self.restore_selection(selected);
+    }
+
+    fn toggle_event_inbox(&mut self) {
+        self.event_inbox_open = !self.event_inbox_open;
+        if self.event_inbox_open {
+            self.unread_events = 0;
         }
     }
 
@@ -1848,6 +2431,86 @@ impl App {
             level,
             set_at: Instant::now(),
         });
+    }
+}
+
+fn target_pane(app: &App, target: VisibleTarget) -> Option<String> {
+    match app.rows.get(target.row_idx)? {
+        WatchRow::Session(session) => target
+            .agent_idx
+            .and_then(|idx| session.agents.get(idx))
+            .and_then(|agent| agent.pane.clone())
+            .or_else(|| session.representative_pane.clone()),
+        row => row.pane_id().map(String::from),
+    }
+}
+
+fn contains_ci(value: &str, lowercase_query: &str) -> bool {
+    value.to_lowercase().contains(lowercase_query)
+}
+
+fn agent_matches_query(agent: &Agent, panes: &[PaneInfo], query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let pane_label = pane_display(agent.pane.as_deref(), panes);
+    let kind = agent.kind.to_string();
+    let state = agent.state.to_string();
+    let matches = [
+        Some(agent.session_id.as_str()),
+        Some(kind.as_str()),
+        Some(state.as_str()),
+        Some(pane_label.as_str()),
+        agent.tmux_session.as_deref(),
+        agent.cwd.as_deref(),
+        agent.model.as_deref(),
+        agent.last_prompt.as_deref(),
+        agent.last_response.as_deref(),
+        agent.last_notification.as_deref(),
+        agent.recap.as_deref(),
+        agent.ai_title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| contains_ci(value, query));
+    matches
+}
+
+fn row_matches_query(row: &WatchRow, panes: &[PaneInfo], query: &str) -> bool {
+    match row {
+        WatchRow::Agent(agent) => agent_matches_query(agent, panes, query),
+        WatchRow::BarePane(pane) => [
+            pane.pane_id.as_str(),
+            pane.session.as_str(),
+            pane.current_command.as_str(),
+            pane.title.as_str(),
+            pane.current_path.as_str(),
+        ]
+        .into_iter()
+        .any(|value| contains_ci(value, query)),
+        WatchRow::Session(session) => {
+            contains_ci(&session.display_name, query)
+                || contains_ci(&session.session, query)
+                || session
+                    .bare_summary
+                    .as_deref()
+                    .is_some_and(|value| contains_ci(value, query))
+                || session
+                    .agents
+                    .iter()
+                    .any(|agent| agent_matches_query(agent, panes, query))
+        }
+    }
+}
+
+fn row_needs_attention(row: &WatchRow) -> bool {
+    match row {
+        WatchRow::Agent(agent) => agent_needs_attention(agent.state),
+        WatchRow::Session(session) => session
+            .agents
+            .iter()
+            .any(|agent| agent_needs_attention(agent.state)),
+        WatchRow::BarePane(_) => false,
     }
 }
 
@@ -2230,6 +2893,14 @@ fn prepend_host_badge(text: &mut Text<'_>, host: muxa::HostKind) {
     }
 }
 
+fn prepend_tree_prefix(text: &mut Text<'_>, prefix: &str, style: Style) {
+    let prefix = Span::styled(prefix.to_string(), style);
+    match text.lines.first_mut() {
+        Some(line) => line.spans.insert(0, prefix),
+        None => text.lines.push(Line::from(prefix)),
+    }
+}
+
 fn sort_panes(a: &PaneInfo, b: &PaneInfo) -> std::cmp::Ordering {
     a.session
         .cmp(&b.session)
@@ -2525,6 +3196,55 @@ fn state_marker(state: AgentState, theme: WatchThemeSpec, spin: Spinner) -> (&'s
         .glyph(state)
         .unwrap_or_else(|| crate::state_icon(state));
     (icon, theme.state_style(state))
+}
+
+fn state_age_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Error => "ERR",
+        AgentState::WaitingChoice => "CHOICE",
+        AgentState::WaitingInput => "WAIT",
+        AgentState::Working => "WORK",
+        AgentState::Starting => "START",
+        AgentState::Idle => "IDLE",
+        AgentState::Stopped => "STOP",
+    }
+}
+
+fn state_age_text(
+    agent: &Agent,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) -> Text<'static> {
+    let (symbol, style) = state_marker(agent.state, theme, spin);
+    Text::from(Line::from(vec![
+        Span::styled(format!("{symbol} "), style),
+        Span::styled(
+            format!(
+                "{} {}",
+                state_age_label(agent.state),
+                relative_time(agent.state_entered_at, now)
+            ),
+            style,
+        ),
+    ]))
+}
+
+fn session_state_age_text(
+    session: &SessionRow,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) -> Text<'static> {
+    let agent = session.agents.iter().min_by(|a, b| {
+        state_sort_rank(a.state)
+            .cmp(&state_sort_rank(b.state))
+            .then_with(|| b.last_activity_at.cmp(&a.last_activity_at))
+    });
+    agent.map_or_else(
+        || Text::from(Span::styled("—", theme.dim_style())),
+        |agent| state_age_text(agent, now, theme, spin),
+    )
 }
 
 /// A one-shot state-transition flash on an agent's State cell — a green `✓`
@@ -3515,6 +4235,15 @@ pub async fn run(
                         }
                     }
                 }
+                Action::SetView(view) => {
+                    app.apply_view(view);
+                    let label = match view {
+                        WatchView::Pane => "pane",
+                        WatchView::Session => "session",
+                        WatchView::Swarm => "swarm",
+                    };
+                    app.set_hint(format!("view: {label}"), HintLevel::Ok);
+                }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
                 }
@@ -3610,33 +4339,41 @@ pub async fn run(
             }
         }
 
-        // Live pane capture: when the preview is open in LivePane
-        // mode and the cache is missing or stale (>500 ms), call into
+        // Live pane capture: the modal live preview and the wide-screen
+        // inspector share one cache. When either is visible and the cache is
+        // missing or stale (>500 ms), call into
         // the active backend on a worker thread. Bounded by the
         // existing 500 ms TTL so we never fork more than ~2 Hz,
         // regardless of how fast the input loop spins. Capability-
         // gated: backends that report `caps().capture_pane == false`
         // (zellij CLI today) skip the call and the renderer shows a
         // "(not supported)" placeholder.
-        if let Some(p) = &app.preview {
+        let capture_pane = app
+            .preview
+            .as_ref()
+            .filter(|preview| preview.content == PreviewContent::LivePane)
+            .map(|preview| preview.pane_id.clone())
+            .or_else(|| app.inspector_visible.then(|| app.selected_pane()).flatten());
+        if let Some(capture_pane) = capture_pane {
             // Resolve the capturing backend by the pane id's namespace so a
             // herdr row captures via herdr even when tmux is the primary
             // host (and vice versa). Cheap to build per capture (bounded to
             // ~2 Hz by the TTL below).
-            let cap_backend = crate::backend_for_pane(&p.pane_id);
-            if p.content == PreviewContent::LivePane && cap_backend.caps().capture_pane {
+            let cap_backend = crate::backend_for_pane(&capture_pane);
+            if cap_backend.caps().capture_pane {
                 let stale = app.pane_capture.as_ref().is_none_or(|c| {
-                    c.pane_id != p.pane_id || c.fetched_at.elapsed() >= Duration::from_millis(500)
+                    c.pane_id != capture_pane
+                        || c.fetched_at.elapsed() >= Duration::from_millis(500)
                 });
                 if stale {
-                    let pane_id = p.pane_id.clone();
+                    let pane_id = capture_pane.clone();
                     let captured =
                         tokio::task::spawn_blocking(move || cap_backend.capture_pane(&pane_id))
                             .await
                             .ok()
                             .flatten();
                     app.pane_capture = Some(CapturedPane {
-                        pane_id: p.pane_id.clone(),
+                        pane_id: capture_pane,
                         text: captured.unwrap_or_default(),
                         fetched_at: std::time::Instant::now(),
                     });
@@ -3782,6 +4519,8 @@ pub(crate) enum Action {
     TogglePreviewContent,
     /// Change the table's primary sort while staying inside the watch TUI.
     SetSort(WatchSortPreset),
+    /// Change table granularity from the command palette.
+    SetView(WatchView),
     /// Open the inline prompt composer for the selected pane.
     OpenPrompt(PromptPopup),
     /// Submit the active inline prompt.
@@ -3807,17 +4546,166 @@ pub(crate) enum Action {
     NotApplicable(&'static str),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CommandSpec {
+    command: &'static str,
+    description: &'static str,
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        command: "refresh",
+        description: "refresh data now",
+    },
+    CommandSpec {
+        command: "preview",
+        description: "preview selected pane",
+    },
+    CommandSpec {
+        command: "copy",
+        description: "copy selected prompt",
+    },
+    CommandSpec {
+        command: "attention",
+        description: "toggle attention-only rows",
+    },
+    CommandSpec {
+        command: "events",
+        description: "open transition inbox",
+    },
+    CommandSpec {
+        command: "inspector",
+        description: "toggle wide-screen inspector",
+    },
+    CommandSpec {
+        command: "sort latest",
+        description: "sort by latest activity",
+    },
+    CommandSpec {
+        command: "sort duration",
+        description: "sort by session duration",
+    },
+    CommandSpec {
+        command: "sort session",
+        description: "sort by session name",
+    },
+    CommandSpec {
+        command: "sort state",
+        description: "sort by attention state",
+    },
+    CommandSpec {
+        command: "view session",
+        description: "group by session",
+    },
+    CommandSpec {
+        command: "view pane",
+        description: "show individual panes",
+    },
+    CommandSpec {
+        command: "view swarm",
+        description: "show swarm clusters",
+    },
+    CommandSpec {
+        command: "kill",
+        description: "kill selected pane (confirm)",
+    },
+    CommandSpec {
+        command: "abort",
+        description: "abort selected turn (confirm)",
+    },
+    CommandSpec {
+        command: "help",
+        description: "show keybindings",
+    },
+    CommandSpec {
+        command: "quit",
+        description: "exit muxa watch",
+    },
+];
+
+fn command_suggestions(input: &str) -> Vec<CommandSpec> {
+    let query = input.trim().to_lowercase();
+    COMMAND_SPECS
+        .iter()
+        .copied()
+        .filter(|spec| query.is_empty() || spec.command.starts_with(&query))
+        .take(8)
+        .collect()
+}
+
+fn execute_palette_command(app: &mut App, input: &str) -> Action {
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let command = normalized.to_lowercase();
+    match command.as_str() {
+        "q" | "quit" => Action::Quit,
+        "r" | "refresh" => Action::Refresh,
+        "o" | "open" | "preview" => Action::OpenPreview,
+        "copy" | "yank" => quick_copy_action(app),
+        "kill" => quick_kill_action(app),
+        "abort" => quick_abort_action(app),
+        "help" | "?" => Action::Quick(QuickAction::ShowHelp),
+        "attention" => {
+            app.toggle_attention_only();
+            app.set_hint(
+                if app.attention_only {
+                    "attention filter enabled"
+                } else {
+                    "attention filter disabled"
+                },
+                HintLevel::Ok,
+            );
+            Action::None
+        }
+        "events" => {
+            app.toggle_event_inbox();
+            Action::None
+        }
+        "inspector" => {
+            app.inspector_enabled = !app.inspector_enabled;
+            app.inspector_visible = false;
+            app.pane_capture = None;
+            app.set_hint(
+                if app.inspector_enabled {
+                    "inspector enabled"
+                } else {
+                    "inspector disabled"
+                },
+                HintLevel::Ok,
+            );
+            Action::None
+        }
+        "sort latest" => Action::SetSort(WatchSortPreset::Latest),
+        "sort duration" => Action::SetSort(WatchSortPreset::Duration),
+        "sort session" => Action::SetSort(WatchSortPreset::Session),
+        "sort state" | "sort attention" => Action::SetSort(WatchSortPreset::State),
+        "view session" | "view sessions" => Action::SetView(WatchView::Session),
+        "view pane" | "view panes" => Action::SetView(WatchView::Pane),
+        "view swarm" => Action::SetView(WatchView::Swarm),
+        "" => {
+            app.set_hint("command: type a command or press Esc", HintLevel::Warn);
+            Action::None
+        }
+        _ => {
+            app.set_hint(format!("unknown command: {normalized}"), HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one ordered input-mode dispatcher keeps modal precedence explicit
 fn handle_event(ev: Event, app: &mut App) -> Action {
-    // Bracketed paste arrives as one event carrying the whole payload,
-    // newlines and all. Route it into the prompt composer as literal text
-    // so a pasted `\n` lands in the buffer instead of being read as a
-    // submit — only a real Enter keypress (a separate `Event::Key`)
-    // submits. Outside the composer a paste has nowhere to go, so drop it.
+    // Bracketed paste arrives as one event carrying the whole payload.
+    // Prompt/command modes keep it literal; table mode treats it as a search
+    // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
         if let Some(prompt) = app.prompt.as_mut() {
             for c in pasted.chars() {
                 prompt.insert(c);
             }
+        } else if let Some(command) = app.command_palette.as_mut() {
+            command.insert_str(&pasted.replace(['\r', '\n'], " "));
+        } else if app.preview.is_none() && !app.help_open && !app.event_inbox_open {
+            app.edit_search(|query| query.push_str(&pasted.replace(['\r', '\n'], " ")));
         }
         return Action::None;
     }
@@ -3862,13 +4750,35 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_prompt_event(code, modifiers, prompt);
     }
 
+    if app.command_palette.is_some() {
+        return handle_command_event(code, modifiers, app);
+    }
+
     // Help overlay: `?` toggles it; `q` / `Esc` close it. Anything
     // else passes through but is ignored — we don't want `c` while
     // the overlay is open to silently copy a prompt the user can't
     // see.
     if app.help_open {
         return match code {
-            KeyCode::Char('?' | 'q') | KeyCode::Esc => Action::Quick(QuickAction::ShowHelp),
+            KeyCode::F(1) | KeyCode::Esc | KeyCode::Char('q' | '?') => {
+                Action::Quick(QuickAction::ShowHelp)
+            }
+            _ => Action::None,
+        };
+    }
+
+    if app.event_inbox_open {
+        return match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.toggle_event_inbox();
+                Action::None
+            }
+            KeyCode::Char(c)
+                if modifiers.contains(KeyModifiers::ALT) && c.eq_ignore_ascii_case(&'e') =>
+            {
+                app.toggle_event_inbox();
+                Action::None
+            }
             _ => Action::None,
         };
     }
@@ -3877,30 +4787,263 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_preview_event(code, app);
     }
 
+    if modifiers.contains(KeyModifiers::ALT) {
+        return match code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => Action::OpenPreview,
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => Action::Refresh,
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
+                Action::SetSort(WatchSortPreset::Session)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'l') => {
+                Action::SetSort(WatchSortPreset::Latest)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'d') => {
+                Action::SetSort(WatchSortPreset::Duration)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'t') => {
+                Action::SetSort(WatchSortPreset::State)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => quick_copy_action(app),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => quick_kill_action(app),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'x') => quick_abort_action(app),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a') => {
+                app.toggle_attention_only();
+                Action::None
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'i') => {
+                app.inspector_enabled = !app.inspector_enabled;
+                app.inspector_visible = false;
+                app.pane_capture = None;
+                Action::None
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => {
+                app.toggle_event_inbox();
+                Action::None
+            }
+            KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
+            _ => Action::None,
+        };
+    }
+
+    if app.pending_g && !matches!(code, KeyCode::Char('g') | KeyCode::Esc) {
+        app.pending_g = false;
+    }
+
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-        KeyCode::Char('r') => Action::Refresh,
+        KeyCode::F(1) => Action::Quick(QuickAction::ShowHelp),
+        KeyCode::Esc if app.explicit_search || !app.search_query.is_empty() => {
+            app.clear_search();
+            Action::None
+        }
+        KeyCode::Esc if app.pending_g => {
+            app.pending_g = false;
+            Action::None
+        }
+        KeyCode::Esc if app.attention_only => {
+            app.toggle_attention_only();
+            Action::None
+        }
+        KeyCode::Esc => Action::Quit,
         KeyCode::Enter => quick_prompt_action(app),
-        KeyCode::Char('p') => Action::OpenPreview,
-        KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
-        KeyCode::Char('s') => Action::SetSort(WatchSortPreset::Session),
-        KeyCode::Char('l' | 'a') => Action::SetSort(WatchSortPreset::Latest),
-        KeyCode::Char('d') => Action::SetSort(WatchSortPreset::Duration),
-        KeyCode::Char('t') => Action::SetSort(WatchSortPreset::State),
-        // Capital-K / Capital-R require Shift in the spec — crossterm
-        // surfaces Shift-letter as `Char('K')` regardless of whether
-        // the user pressed Shift+k or had CapsLock on, so we accept
-        // both. The lowercase variants intentionally do NOT trigger
-        // these destructive actions; they fall through to `None`.
-        KeyCode::Char('K') => quick_kill_action(app),
-        KeyCode::Char('R') => quick_abort_action(app),
-        KeyCode::Char('c') => quick_copy_action(app),
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             app.move_down();
             Action::None
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             app.move_up();
+            Action::None
+        }
+        KeyCode::Right => {
+            app.move_into_session();
+            Action::None
+        }
+        KeyCode::Left => {
+            app.move_to_session_parent();
+            Action::None
+        }
+        KeyCode::Home => {
+            app.move_first();
+            Action::None
+        }
+        KeyCode::End => {
+            app.move_last();
+            Action::None
+        }
+        KeyCode::PageDown => {
+            app.move_page_down();
+            Action::None
+        }
+        KeyCode::PageUp => {
+            app.move_page_up();
+            Action::None
+        }
+        KeyCode::Char('u')
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && (app.explicit_search || !app.search_query.is_empty()) =>
+        {
+            app.clear_search();
+            Action::None
+        }
+        KeyCode::Char('w')
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && (app.explicit_search || !app.search_query.is_empty()) =>
+        {
+            app.delete_search_word();
+            Action::None
+        }
+        KeyCode::Char('u')
+            if modifiers.contains(KeyModifiers::CONTROL) && app.browse_keys_active() =>
+        {
+            app.move_half_page_up();
+            Action::None
+        }
+        KeyCode::Char('d')
+            if modifiers.contains(KeyModifiers::CONTROL) && app.browse_keys_active() =>
+        {
+            app.move_half_page_down();
+            Action::None
+        }
+        KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => Action::Refresh,
+        KeyCode::Char('/') if app.browse_keys_active() => {
+            app.arm_explicit_search();
+            Action::None
+        }
+        KeyCode::Char(':') if app.browse_keys_active() => {
+            app.command_palette = Some(CommandPalette::default());
+            app.pending_g = false;
+            Action::None
+        }
+        KeyCode::Char('q') if app.browse_keys_active() => Action::Quit,
+        KeyCode::Char('?') if app.browse_keys_active() => Action::Quick(QuickAction::ShowHelp),
+        KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
+        KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
+        KeyCode::Char('h') if app.browse_keys_active() => {
+            app.move_to_session_parent();
+            Action::None
+        }
+        KeyCode::Char('l') if app.browse_keys_active() => {
+            app.move_into_session();
+            Action::None
+        }
+        KeyCode::Char('G') if app.browse_keys_active() => {
+            app.move_last();
+            Action::None
+        }
+        KeyCode::Char('g') if app.browse_keys_active() && app.pending_g => {
+            app.pending_g = false;
+            app.move_first();
+            Action::None
+        }
+        KeyCode::Char('g') if app.browse_keys_active() => {
+            app.pending_g = true;
+            Action::None
+        }
+        KeyCode::Backspace => {
+            app.edit_search(|query| {
+                query.pop();
+            });
+            Action::None
+        }
+        KeyCode::Char('j')
+            if app.browse_keys_active() && !modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.move_down();
+            Action::None
+        }
+        KeyCode::Char('k')
+            if app.browse_keys_active() && !modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.move_up();
+            Action::None
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            app.edit_search(|query| query.push(c));
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+/// `:` command input owns keystrokes until Enter or Esc. Tab completes the
+/// first visible suggestion; editing follows the same conventions as the
+/// prompt composer and common shell command lines.
+fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    match code {
+        KeyCode::Esc => {
+            app.command_palette = None;
+            Action::None
+        }
+        KeyCode::Enter => {
+            let input = app
+                .command_palette
+                .take()
+                .map(|command| command.input)
+                .unwrap_or_default();
+            execute_palette_command(app, &input)
+        }
+        KeyCode::Tab => {
+            let completion = app
+                .command_palette
+                .as_ref()
+                .and_then(|command| command_suggestions(&command.input).first().copied());
+            if let (Some(command), Some(spec)) = (app.command_palette.as_mut(), completion) {
+                command.input = spec.command.to_string();
+                command.move_end();
+            }
+            Action::None
+        }
+        KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.delete_word();
+            }
+            Action::None
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.clear();
+            }
+            Action::None
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.insert(c);
+            }
+            Action::None
+        }
+        KeyCode::Backspace => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.backspace();
+            }
+            Action::None
+        }
+        KeyCode::Delete => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.delete();
+            }
+            Action::None
+        }
+        KeyCode::Left => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.move_left();
+            }
+            Action::None
+        }
+        KeyCode::Right => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.move_right();
+            }
+            Action::None
+        }
+        KeyCode::Home => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.move_home();
+            }
+            Action::None
+        }
+        KeyCode::End => {
+            if let Some(command) = app.command_palette.as_mut() {
+                command.move_end();
+            }
             Action::None
         }
         _ => Action::None,
@@ -4042,7 +5185,7 @@ fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
     }
 
     match code {
-        KeyCode::Char('q' | 'p') | KeyCode::Esc => Action::ClosePreview,
+        KeyCode::Char('q' | 'p' | 'o') | KeyCode::Esc => Action::ClosePreview,
         KeyCode::Char('f') => Action::TogglePreviewMode,
         KeyCode::Char('c') => Action::TogglePreviewContent,
         KeyCode::Char('r') => Action::Refresh,
@@ -4089,6 +5232,18 @@ fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
 /// the same logic can be unit-tested without the `handle_event`
 /// keystroke matrix in the way.
 pub(crate) fn quick_kill_action(app: &App) -> Action {
+    if app
+        .selected_target()
+        .is_some_and(|target| target.agent_idx.is_some())
+    {
+        return match app.selected_agent().and_then(|agent| agent.pane.as_deref()) {
+            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
+                message: format!("Kill pane {}?", app.pane_label(pane_id)),
+                on_confirm: QuickAction::KillPane(pane_id.to_string()),
+            }),
+            None => Action::NotApplicable("kill: no tmux pane on this row"),
+        };
+    }
     match app.selected_row() {
         Some(WatchRow::Agent(a)) => match a.pane.as_deref() {
             Some(pane_id) => Action::AskConfirm(ConfirmPopup {
@@ -4122,26 +5277,20 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
 /// but the destructive verb in the popup says "Abort" instead of "Kill".
 pub(crate) fn quick_abort_action(app: &App) -> Action {
     match app.selected_row() {
-        Some(WatchRow::Agent(a)) => match a.pane.as_deref() {
-            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
-                message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
-                on_confirm: QuickAction::AbortTurn(pane_id.to_string()),
-            }),
-            None => Action::NotApplicable("abort: no tmux pane on this row"),
-        },
+        Some(WatchRow::Agent(_) | WatchRow::Session(_)) => {
+            match app.selected_agent().and_then(|agent| agent.pane.as_deref()) {
+                Some(pane_id) => Action::AskConfirm(ConfirmPopup {
+                    message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
+                    on_confirm: QuickAction::AbortTurn(pane_id.to_string()),
+                }),
+                None => Action::NotApplicable("abort: not a tracked agent"),
+            }
+        }
         // Bare panes have no agent state to abort — Ctrl-C would still
         // reach the foreground process, but it's no longer a "muxa
         // agent action" in any meaningful sense. Skip rather than
         // surprise.
         Some(WatchRow::BarePane(_)) => Action::NotApplicable("abort: not a tracked agent"),
-        Some(WatchRow::Session(s)) => match s.latest_agent.as_ref().and_then(|a| a.pane.as_deref())
-        {
-            Some(pane_id) => Action::AskConfirm(ConfirmPopup {
-                message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
-                on_confirm: QuickAction::AbortTurn(pane_id.to_string()),
-            }),
-            None => Action::NotApplicable("abort: not a tracked agent"),
-        },
         None => Action::NotApplicable("abort: no row selected"),
     }
 }
@@ -4173,6 +5322,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // Advance the animation clock once per paint so the swarm view's dot
     // spinners cycle. Harmless for the table views (which ignore it).
     app.anim_frame = app.anim_frame.wrapping_add(1);
+    app.sync_auto_expansion();
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -4215,6 +5365,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_help(f, popup_area, app);
     }
+    if app.event_inbox_open {
+        let popup_area = centered_rect(76, 72, chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_event_inbox(f, popup_area, app);
+    }
     if app.confirm.is_some() {
         // 50 × 30 % keeps the popup small enough that the table
         // behind stays scannable, but still leaves room for the
@@ -4230,7 +5385,76 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_prompt(f, popup_area, app);
     }
+    if app.command_palette.is_some() {
+        let popup_area = command_popup_rect(chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_command_palette(f, popup_area, app);
+    }
     render_footer(f, chunks[2], app);
+}
+
+fn command_popup_rect(r: Rect) -> Rect {
+    let width = r.width.saturating_mul(70).saturating_div(100).max(48);
+    centered_rect_by_size(width, r.height.min(12), r)
+}
+
+fn render_command_palette(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let command = app
+        .command_palette
+        .as_ref()
+        .expect("render_command_palette without command state");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " commands · Enter run · Tab complete · Esc cancel ",
+            theme.action_badge(),
+        ));
+    let inner = block.inner(area);
+    let visible_input =
+        truncate_prompt_input(&command.input, inner.width.saturating_sub(2) as usize);
+    let suggestions = command_suggestions(&command.input);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(": ", theme.accent_badge()),
+            Span::raw(visible_input.text.clone()),
+        ]),
+        Line::from(""),
+    ];
+    if suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching command",
+            theme.dim_style().add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        for (index, spec) in suggestions.iter().enumerate() {
+            let command_style = if index == 0 {
+                theme.selected_style()
+            } else {
+                theme.table_header_style()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<18}", spec.command), command_style),
+                Span::styled(spec.description, theme.dim_style()),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    let cursor_visible = command.cursor.saturating_sub(visible_input.skipped_chars);
+    let before_cursor: String = visible_input.text.chars().take(cursor_visible).collect();
+    let before_cursor_width = u16::try_from(before_cursor.width()).unwrap_or(u16::MAX);
+    let cursor_x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(before_cursor_width);
+    if cursor_x < inner.x.saturating_add(inner.width) {
+        f.set_cursor_position((cursor_x, inner.y));
+    }
 }
 
 /// Render the `?` help overlay — a centred popup with one line per
@@ -4242,7 +5466,10 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
-        .title(Span::styled(" help · ? to close ", theme.accent_badge()));
+        .title(Span::styled(
+            " help · F1/Esc to close ",
+            theme.accent_badge(),
+        ));
     let lines: Vec<Line> = help_overlay_text()
         .into_iter()
         .map(|s| {
@@ -4264,6 +5491,64 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
+}
+
+fn render_event_inbox(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " Events · Alt-E/Esc to close ",
+            theme.accent_badge(),
+        ));
+    let inner_height = usize::from(block.inner(area).height);
+    let now = OffsetDateTime::now_utc();
+    let lines = if app.events.is_empty() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No transitions yet.",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Completions, errors, and input requests stay here.",
+                theme.dim_style(),
+            )),
+        ]
+    } else {
+        app.events
+            .iter()
+            .take(inner_height)
+            .map(|event| {
+                let (glyph, style) = match event.kind {
+                    WatchEventKind::Done => ("✓", Style::default().fg(Color::Green)),
+                    WatchEventKind::Attention => (
+                        crate::state_icon(event.state),
+                        theme.state_style(event.state),
+                    ),
+                    WatchEventKind::Error => ("■", Style::default().fg(Color::Red)),
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<4} ", relative_time(event.occurred_at, now)),
+                        theme.dim_style(),
+                    ),
+                    Span::styled(format!("{glyph} "), style.add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{:<24}", truncate_chars(&event.label, 24)),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(truncate_chars(
+                        &event.summary,
+                        usize::from(area.width.saturating_sub(38)),
+                    )),
+                ])
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Render the destructive-action confirm popup. Centred, two lines:
@@ -4444,7 +5729,8 @@ fn help_popup_rect(r: Rect) -> Rect {
     centered_rect_by_size(width, height, r)
 }
 
-/// Full-screen detail view for the agent / pane the user pinned with `p`.
+/// Full-screen detail view for the agent / pane the user pinned with `o` or
+/// `Alt-P`.
 ///
 /// Lays out as: title (pane label + kind/state) → bold "Last prompt"
 /// section → bold "Last response" section → optional notification block.
@@ -4601,7 +5887,7 @@ fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         )));
         out.push(Line::from(Span::styled(
-            "(press q / Esc / p to return to the picker)",
+            "(press o / q / Esc / p to return to the picker)",
             Style::default().add_modifier(Modifier::DIM),
         )));
     }
@@ -4737,6 +6023,16 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    if app.unread_events > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("◆ {} new", app.unread_events),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     spans.push(Span::raw("   "));
     spans.push(Span::styled(
         format!("sort {}", sort_label(&app.watch_cfg.sort)),
@@ -4760,24 +6056,41 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         title
     };
 
-    let err_line = app
-        .last_error
-        .as_ref()
-        .map(|e| {
-            // The NotConnected variant already reads as a complete sentence
-            // ("daemon not reachable at … — is `muxad` running? …"), so a
-            // `daemon error: ` prefix would just stutter. Other IO errors
-            // benefit from the prefix to mark them as daemon-related.
-            let text = if e.self_describing {
-                e.message.clone()
-            } else {
-                format!("daemon error: {}", e.message)
-            };
-            Line::from(Span::styled(text, Style::default().fg(Color::Red)))
-        })
-        .unwrap_or_default();
+    let status_line = if let Some(e) = app.last_error.as_ref() {
+        // The NotConnected variant already reads as a complete sentence
+        // ("daemon not reachable at … — is `muxad` running? …"), so a
+        // `daemon error: ` prefix would just stutter. Other IO errors
+        // benefit from the prefix to mark them as daemon-related.
+        let text = if e.self_describing {
+            e.message.clone()
+        } else {
+            format!("daemon error: {}", e.message)
+        };
+        Line::from(Span::styled(text, Style::default().fg(Color::Red)))
+    } else if app.explicit_search || !app.search_query.is_empty() || app.attention_only {
+        let visible = app.visible_targets().len();
+        let mut parts = Vec::new();
+        if app.explicit_search && app.search_query.is_empty() {
+            parts.push("filter: ▏".to_string());
+        } else if !app.search_query.is_empty() {
+            parts.push(format!("filter: {}", truncate_chars(&app.search_query, 80)));
+        }
+        if app.attention_only {
+            parts.push("attention only".to_string());
+        }
+        parts.push(format!("{visible} shown"));
+        Line::from(Span::styled(
+            parts.join("  ·  "),
+            Style::default().fg(theme.accent),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "j/k move  ·  type or / filter  ·  : commands  ·  ? help",
+            theme.dim_style().add_modifier(Modifier::DIM),
+        ))
+    };
 
-    let header = Paragraph::new(vec![title, err_line]).block(
+    let header = Paragraph::new(vec![title, status_line]).block(
         Block::default()
             .borders(Borders::BOTTOM)
             .border_style(theme.border_style())
@@ -4789,11 +6102,83 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 /// Dispatch the main body: the k9s-style swarm console for
 /// [`WatchView::Swarm`], otherwise the classic table.
 fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
+    let split_inspector = app.inspector_enabled
+        && area.width >= 120
+        && app.selected_pane().is_some()
+        && app.preview.is_none()
+        && !app.help_open
+        && !app.event_inbox_open;
+    app.inspector_visible = split_inspector;
+    if split_inspector {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(area);
+        render_primary_body(f, columns[0], app);
+        render_inspector(f, columns[1], app);
+        return;
+    }
+    render_primary_body(f, area, app);
+}
+
+fn render_primary_body(f: &mut Frame, area: Rect, app: &mut App) {
+    app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
     if app.watch_cfg.view == WatchView::Swarm {
         render_swarm(f, area, app);
     } else {
         render_table(f, area, app);
     }
+}
+
+fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(pane_id) = app.selected_pane() else {
+        return;
+    };
+    let mut title = format!(" Inspector · {} ", app.pane_label(&pane_id));
+    if let Some(agent) = app.selected_agent() {
+        title = format!(
+            " Inspector · {} · {} {} ",
+            app.pane_label(&pane_id),
+            state_age_label(agent.state),
+            relative_time(agent.state_entered_at, OffsetDateTime::now_utc())
+        );
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(title, theme.accent_badge()));
+
+    let mut lines = Vec::new();
+    if let Some(agent) = app.selected_agent() {
+        lines.push(Line::from(vec![
+            Span::styled("kind ", theme.dim_style()),
+            Span::raw(agent.kind.to_string()),
+            Span::raw("  "),
+            Span::styled("model ", theme.dim_style()),
+            Span::raw(agent.model.as_deref().unwrap_or("—").to_string()),
+        ]));
+        let summary = agent
+            .last_notification
+            .as_deref()
+            .or(agent.last_prompt.as_deref())
+            .unwrap_or("—")
+            .replace('\n', " ");
+        lines.push(Line::from(vec![
+            Span::styled("latest ", theme.dim_style()),
+            Span::raw(truncate_chars(
+                &summary,
+                usize::from(area.width.saturating_sub(10)),
+            )),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(usize::from(area.width.saturating_sub(2))),
+            theme.dim_style(),
+        )));
+    }
+    lines.extend(build_pane_capture_body(app, &pane_id).lines);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 // cli-spinners frames: `dots` for parent agents, `dots2` (denser) for
@@ -4998,7 +6383,9 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line: Option<usize> = None;
 
-    for (i, row) in app.rows.iter().enumerate() {
+    let visible_targets = app.visible_targets();
+    for (i, target) in visible_targets.iter().enumerate() {
+        let row = &app.rows[target.row_idx];
         let WatchRow::Session(sr) = row else {
             continue;
         };
@@ -5047,12 +6434,13 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
                                  // assembly reads better inline than split across helpers
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let visible_targets = app.visible_targets();
 
     // Empty grid reads as "muxa is broken" rather than "nothing is
     // running yet". Replace it with a centered hint that tells the user
     // what to do — and, when rows exist but are all hidden paneless
     // agents, says so instead of implying there's nothing at all.
-    if app.rows.is_empty() {
+    if visible_targets.is_empty() {
         render_empty_table(f, area, app, theme);
         return;
     }
@@ -5089,7 +6477,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let state_col = app
         .columns
         .iter()
-        .position(|c| matches!(c, WatchColumn::State));
+        .position(|c| matches!(c, WatchColumn::State | WatchColumn::StateAge));
     // Host badges: only when the row set spans >1 host (the cross-
     // multiplexer console) do we tag each row's SESSION/PANE cell, so a
     // single-host user sees no change. The Pane column is the natural
@@ -5100,28 +6488,72 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .position(|c| matches!(c, WatchColumn::Pane));
     let multi_host = rows_multi_host(&app.rows);
     let row_pulses = resolve_row_pulses(app);
+    let target_pulses: Vec<Option<PulseKind>> = visible_targets
+        .iter()
+        .map(|target| {
+            target
+                .agent_idx
+                .map_or(row_pulses[target.row_idx], |agent_idx| {
+                    let WatchRow::Session(session) = &app.rows[target.row_idx] else {
+                        return None;
+                    };
+                    let agent = session.agents.get(agent_idx)?;
+                    app.active_pulse(agent.kind, &agent.session_id, std::time::Instant::now())
+                })
+        })
+        .collect();
     let rows: Vec<Row> = app
-        .rows
+        .visible_targets()
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            let mut texts: Vec<Text> = match r {
-                WatchRow::Agent(a) => app
-                    .columns
+        .map(|(i, target)| {
+            let r = &app.rows[target.row_idx];
+            let child_agent = match (r, target.agent_idx) {
+                (WatchRow::Session(session), Some(agent_idx)) => session.agents.get(agent_idx),
+                _ => None,
+            };
+            let mut texts: Vec<Text> = if let Some(agent) = child_agent {
+                app.columns
                     .iter()
-                    .map(|c| c.agent_text(a, now, &app.panes, theme, spin, app.watch_cfg.summary))
-                    .collect(),
-                WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
-                WatchRow::Session(s) => app
-                    .columns
-                    .iter()
-                    .map(|c| c.session_text(s, now, &app.panes, theme, spin, app.watch_cfg.summary))
-                    .collect(),
+                    .map(|c| {
+                        c.agent_text(agent, now, &app.panes, theme, spin, app.watch_cfg.summary)
+                    })
+                    .collect()
+            } else {
+                match r {
+                    WatchRow::Agent(a) => app
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            c.agent_text(a, now, &app.panes, theme, spin, app.watch_cfg.summary)
+                        })
+                        .collect(),
+                    WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
+                    WatchRow::Session(s) => app
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            c.session_text(s, now, &app.panes, theme, spin, app.watch_cfg.summary)
+                        })
+                        .collect(),
+                }
             };
 
             // Overlay a transition pulse on the State cell.
-            if let (Some(sc), Some(kind)) = (state_col, row_pulses[i]) {
+            if let (Some(sc), Some(kind)) = (state_col, target_pulses[i]) {
                 texts[sc] = pulse_cell(kind, theme, anim_frame);
+            }
+
+            if let Some(pc) = pane_col {
+                if target.agent_idx.is_some() {
+                    prepend_tree_prefix(&mut texts[pc], "  └─ ", theme.dim_style());
+                } else if matches!(r, WatchRow::Session(_)) {
+                    // Parent rows use one stable, glyph-free gutter. Triangle
+                    // markers are East-Asian-width ambiguous in some macOS
+                    // terminal fonts and made single/multi-pane labels appear
+                    // offset even when ratatui measured them as one cell.
+                    prepend_tree_prefix(&mut texts[pc], "  ", theme.dim_style());
+                }
             }
 
             // Tag the row with its host when the console spans multiple.
@@ -5133,17 +6565,34 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 
             let mut expanded = false;
             if Some(i) == selected && app.watch_cfg.detail.enabled {
-                if let Some(workload) = row_workload_badge(r) {
-                    if let Some(host) = status_host {
-                        let detail = format!("tree {workload}");
+                // Child rows used to suppress the selected-row detail entirely.
+                // Resolve against the exact selected agent instead, while parent
+                // session rows continue to use their latest-agent fallback.
+                let child_row = child_agent.cloned().map(WatchRow::agent);
+                let detail_row = child_row.as_ref().unwrap_or(r);
+                let configured_detail =
+                    format_detail(&app.watch_cfg.detail.template, detail_row, &app.panes, now);
+                let workload_detail =
+                    row_workload_badge(detail_row).map(|workload| format!("tree {workload}"));
+
+                if detail_host == status_host {
+                    let combined = match (configured_detail, workload_detail) {
+                        (Some(detail), Some(workload)) => Some(format!("{detail} · {workload}")),
+                        (Some(detail), None) => Some(detail),
+                        (None, Some(workload)) => Some(workload),
+                        (None, None) => None,
+                    };
+                    if let (Some(host), Some(detail)) = (detail_host, combined) {
                         texts[host] = stack_detail(std::mem::take(&mut texts[host]), &detail);
                         expanded = true;
                     }
-                } else if let Some(host) = detail_host {
-                    if let Some(detail) =
-                        format_detail(&app.watch_cfg.detail.template, r, &app.panes, now)
-                    {
+                } else {
+                    if let (Some(host), Some(detail)) = (detail_host, configured_detail) {
                         texts[host] = stack_detail(std::mem::take(&mut texts[host]), &detail);
+                        expanded = true;
+                    }
+                    if let (Some(host), Some(workload)) = (status_host, workload_detail) {
+                        texts[host] = stack_detail(std::mem::take(&mut texts[host]), &workload);
                         expanded = true;
                     }
                 }
@@ -5178,7 +6627,10 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 }),
         )
         .row_highlight_style(theme.selected_style())
-        .highlight_symbol("> ");
+        // Keep the selection marker useful without shifting any columns: the
+        // same two-cell gutter is reserved for every row and the header.
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
 
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -5203,7 +6655,28 @@ fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpe
     f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    if app.paneless_attention > 0 {
+    if !app.rows.is_empty() && (!app.search_query.is_empty() || app.attention_only) {
+        let description = match (app.search_query.is_empty(), app.attention_only) {
+            (false, true) => format!(
+                "No attention items match ‘{}’.",
+                truncate_chars(&app.search_query, 60)
+            ),
+            (false, false) => format!(
+                "No sessions or agents match ‘{}’.",
+                truncate_chars(&app.search_query, 60)
+            ),
+            (true, true) => "No agents currently need attention.".to_string(),
+            (true, false) => unreachable!(),
+        };
+        lines.push(Line::from(Span::styled(
+            description,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Backspace edits the filter; Esc clears it.",
+            theme.dim_style(),
+        )));
+    } else if app.paneless_attention > 0 {
         lines.push(Line::from(Span::styled(
             format!(
                 "{} agent{} waiting — but with no tmux pane to show.",
@@ -5851,6 +7324,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
+    if app.command_palette.is_some() {
+        let spans = vec![
+            Span::styled(" Enter ", theme.action_badge()),
+            Span::raw(" run  "),
+            Span::styled(" Tab ", theme.key_badge()),
+            Span::raw(" complete  "),
+            Span::styled(" Ctrl-W ", theme.key_badge()),
+            Span::raw(" delete word  "),
+            Span::styled(" Esc ", theme.key_badge()),
+            Span::raw(" cancel"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     if app.prompt.is_some() {
         render_prompt_footer(f, area, theme);
         return;
@@ -5861,42 +7349,45 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let mut spans = vec![
-        Span::styled(" ↑/↓ ", theme.key_badge()),
-        Span::raw(" move  "),
-        Span::styled(" ⏎ ", theme.action_badge()),
-        Span::raw(" prompt  "),
-        Span::styled(" ⏎⏎ ", theme.key_badge()),
-        Span::raw(" attach  "),
-        Span::styled(" p ", theme.key_badge()),
-        Span::raw(" preview  "),
-        Span::styled(" r ", theme.key_badge()),
-        Span::raw(" refresh  "),
-        Span::styled(" s/l/d/t ", theme.key_badge()),
-        Span::raw(" sort  "),
-        Span::styled(" ? ", theme.key_badge()),
-        Span::raw(" help  "),
-        Span::styled(" q ", theme.key_badge()),
-        Span::raw(" quit"),
-    ];
-    // When the highlighted row has no pane to attach to (e.g. a Claude
-    // SDK sub-process whose env didn't carry TMUX_PANE and whose
-    // ancestry walk didn't recover one) tell the user why Enter is a
-    // no-op rather than letting the keystroke vanish silently.
+    if app.explicit_search || !app.search_query.is_empty() {
+        let spans = vec![
+            Span::styled(" type ", theme.action_badge()),
+            Span::raw(" filter  "),
+            Span::styled(" Backspace ", theme.key_badge()),
+            Span::raw(" edit  "),
+            Span::styled(" Ctrl-W ", theme.key_badge()),
+            Span::raw(" delete word  "),
+            Span::styled(" Ctrl-U/Esc ", theme.key_badge()),
+            Span::raw(" clear"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
+    if app.pending_g {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" g… ", theme.action_badge()),
+                Span::raw("press g for first row · Esc cancels"),
+            ])),
+            area,
+        );
+        return;
+    }
+
+    let mut spans = Vec::new();
+    // Put row-specific warnings first so they survive footer clipping on
+    // narrow popup layouts.
     if selected_has_no_pane(app) {
-        spans.push(Span::raw("    "));
         spans.push(Span::styled(
             "no tmux pane — attach unavailable",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
-    }
-    // When paneless agents were hidden by config, surface the count so
-    // they remain discoverable. `--include-paneless` (or
-    // `[watch] hide_paneless = false`) brings them back.
-    if app.paneless_hidden > 0 {
         spans.push(Span::raw("    "));
+    }
+    if app.paneless_hidden > 0 {
         spans.push(Span::styled(
             format!(
                 "+{} paneless (use --include-paneless to show)",
@@ -5906,7 +7397,24 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 .dim_style()
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
+        spans.push(Span::raw("    "));
     }
+    spans.extend([
+        Span::styled(" j/k ", theme.key_badge()),
+        Span::raw(" move  "),
+        Span::styled(" h/l ", theme.key_badge()),
+        Span::raw(" tree  "),
+        Span::styled(" / ", theme.action_badge()),
+        Span::raw(" filter  "),
+        Span::styled(" : ", theme.action_badge()),
+        Span::raw(" commands  "),
+        Span::styled(" ⏎ ", theme.action_badge()),
+        Span::raw(" prompt  "),
+        Span::styled(" o ", theme.key_badge()),
+        Span::raw(" preview  "),
+        Span::styled(" ? ", theme.key_badge()),
+        Span::raw(" help"),
+    ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -5958,23 +7466,14 @@ fn render_preview_footer(
         Span::raw(" prompt  "),
         Span::styled(" r ", theme.key_badge()),
         Span::raw(" refresh  "),
-        Span::styled(" p/q/Esc ", theme.key_badge()),
+        Span::styled(" o/p/q/Esc ", theme.key_badge()),
         Span::raw(" back"),
     ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn selected_has_no_pane(app: &App) -> bool {
-    let Some(i) = app.table_state.selected() else {
-        return false;
-    };
-    match app.rows.get(i) {
-        Some(WatchRow::Agent(a)) => a.pane.is_none(),
-        // BarePane rows always have a pane id; tmux gives them a
-        // pane_id by definition.
-        Some(WatchRow::Session(s)) => s.representative_pane.is_none(),
-        Some(WatchRow::BarePane(_)) | None => false,
-    }
+    app.selected_row().is_some() && app.selected_pane().is_none()
 }
 
 #[cfg(test)]
@@ -7360,6 +8859,7 @@ mod tests {
             app.columns,
             vec![
                 WatchColumn::Pane,
+                WatchColumn::StateAge,
                 WatchColumn::SessionTime,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
@@ -7557,12 +9057,11 @@ mod tests {
         for (key, preset) in [
             ('s', WatchSortPreset::Session),
             ('l', WatchSortPreset::Latest),
-            ('a', WatchSortPreset::Latest),
             ('d', WatchSortPreset::Duration),
             ('t', WatchSortPreset::State),
         ] {
             let action = handle_event(
-                Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT)),
                 &mut app,
             );
             assert!(matches!(action, Action::SetSort(p) if p == preset));
@@ -7965,8 +9464,8 @@ sort = ["state"]
         }
 
         assert!(
-            dump.contains("> %25"),
-            "expected the highlighted '%25' row to be scrolled into view, got:\n{dump}",
+            dump.contains("%25"),
+            "expected the selected '%25' row to be scrolled into view, got:\n{dump}",
         );
     }
 
@@ -8006,7 +9505,7 @@ sort = ["state"]
             app.columns,
             vec![
                 WatchColumn::Pane,
-                WatchColumn::State,
+                WatchColumn::StateAge,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
             ]
@@ -8729,8 +10228,8 @@ sort = ["state"]
     }
 
     #[test]
-    fn selected_row_prefers_tree_detail_when_workload_is_visible() {
-        let backend = TestBackend::new(140, 12);
+    fn selected_row_keeps_configured_detail_alongside_workload() {
+        let backend = TestBackend::new(110, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         let mut agent = fake_agent(
@@ -8743,7 +10242,7 @@ sort = ["state"]
             None,
             None,
         );
-        agent.last_response = Some("assistant detail should be hidden".into());
+        agent.last_response = Some("assistant detail remains visible".into());
         agent.workload = muxa::WorkloadSummary {
             primary_pid: Some(20),
             process_count: 2,
@@ -8765,8 +10264,8 @@ sort = ["state"]
 
         assert!(text.contains("↳ tree ▸1 +1"), "missing tree detail: {text}");
         assert!(
-            !text.contains("assistant detail should be hidden"),
-            "tree detail should replace prompt/response detail when workload is visible"
+            text.contains("assistant detail remains visible"),
+            "configured detail must remain visible beside workload detail: {text:?}"
         );
     }
 
@@ -9982,12 +11481,24 @@ sort = ["state"]
         )
     }
 
+    fn alt_key_action(app: &mut App, c: char) -> Action {
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)),
+            app,
+        )
+    }
+
     /// Press a key and apply the resulting `Action` to `app` the same
     /// way the main run loop does. Mirrors the dispatch table in
     /// `watch::run` so tests can read as "press X, expect Y" without
     /// inlining the open/close/toggle book-keeping every time.
     fn press(app: &mut App, c: char) {
-        match key_action(app, c) {
+        let action = if app.preview.is_none() && c.eq_ignore_ascii_case(&'p') {
+            alt_key_action(app, c)
+        } else {
+            key_action(app, c)
+        };
+        match action {
             Action::OpenPreview => {
                 if let Some(pane) = app.selected_pane() {
                     app.preview = Some(PreviewState {
@@ -10025,6 +11536,9 @@ sort = ["state"]
             Action::SetSort(preset) => {
                 app.apply_sort_preset(preset);
             }
+            Action::SetView(view) => {
+                app.apply_view(view);
+            }
             // Quick-action paths aren't exercised through `press` —
             // tests that need them call `handle_event` directly so
             // they can inspect the `Action` variant. Anything we
@@ -10046,12 +11560,12 @@ sort = ["state"]
     }
 
     #[test]
-    fn preview_opens_with_p_and_pins_selected_pane_id() {
+    fn preview_opens_with_alt_p_and_pins_selected_pane_id() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.table_state.select(Some(1)); // %2
 
         assert!(app.preview.is_none());
-        let action = key_action(&mut app, 'p');
+        let action = alt_key_action(&mut app, 'p');
         assert!(matches!(action, Action::OpenPreview));
 
         // run loop applies OpenPreview by reading selected_pane(); we
@@ -10074,8 +11588,13 @@ sort = ["state"]
     }
 
     #[test]
-    fn preview_closes_with_q_esc_or_p() {
-        for key in [KeyCode::Char('q'), KeyCode::Esc, KeyCode::Char('p')] {
+    fn preview_closes_with_q_esc_p_or_o() {
+        for key in [
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+            KeyCode::Char('p'),
+            KeyCode::Char('o'),
+        ] {
             let mut app = three_agent_app(muxa::config::DetailConfig::default());
             app.preview = Some(PreviewState {
                 pane_id: "%1".into(),
@@ -10367,7 +11886,7 @@ sort = ["state"]
         // popup, not full-screen — keeps surrounding rows visible.
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.table_state.select(Some(0));
-        let action = key_action(&mut app, 'p');
+        let action = alt_key_action(&mut app, 'p');
         assert!(matches!(action, Action::OpenPreview));
         if let (Action::OpenPreview, Some(pane)) = (action, app.selected_pane()) {
             app.preview = Some(PreviewState {
@@ -10999,13 +12518,12 @@ sort = ["state"]
     }
 
     #[test]
-    fn paste_outside_composer_is_ignored() {
+    fn paste_outside_composer_becomes_search_query() {
         let mut app = app_with_paneless_and_pane();
-        // No prompt open — a stray paste has nowhere to go and must not
-        // panic or mutate anything.
         let action = handle_event(Event::Paste("junk".into()), &mut app);
         assert!(matches!(action, Action::None));
         assert!(app.prompt.is_none());
+        assert_eq!(app.search_query, "junk");
     }
 
     #[test]
@@ -11166,49 +12684,24 @@ sort = ["state"]
         // reference, so any drift between the keybinding matrix and
         // the help text should land here loud and clear.
         let body = help_overlay_text().join("\n");
-        let expected = "Keybindings\n\
-                        \n\
-                        Navigation\n\
-                        \x20\x20↑ / k          move selection up\n\
-                        \x20\x20↓ / j          move selection down\n\
-                        \x20\x20Enter          compose prompt for selected pane\n\
-                        \x20\x20empty Enter    attach to selected pane\n\
-                        \x20\x20r              force refresh\n\
-                        \x20\x20q / Esc        quit\n\
-                        \n\
-                        Inspection\n\
-                        \x20\x20p              open preview overlay\n\
-                        \x20\x20[ / ]          (in preview) previous / next agent\n\
-                        \x20\x20f              (in preview) toggle popup ↔ fullscreen\n\
-                        \x20\x20c              (in preview) toggle prompt ↔ live pane\n\
-                        \x20\x20Enter          (in preview) compose prompt\n\
-                        \n\
-                        Sorting\n\
-                        \x20\x20s              sort by session name\n\
-                        \x20\x20l / a          sort by latest activity\n\
-                        \x20\x20d              sort by duration (DUR)\n\
-                        \x20\x20t              sort by state (ST)\n\
-                        \n\
-                        State markers\n\
-                        \x20\x20● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped\n\
-                        \x20\x20TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden\n\
-                        \n\
-                        Quick actions (act on selected row)\n\
-                        \x20\x20c              copy last prompt to clipboard\n\
-                        \x20\x20K              kill the pane (Shift — confirm popup)\n\
-                        \x20\x20R              abort current turn (Shift — confirm popup)\n\
-                        \x20\x20?              toggle this overlay";
-        assert_eq!(body, expected);
+        assert!(body.contains("type or /       filter"));
+        assert!(body.contains("gg/G · Home/End first / last selectable row"));
+        assert!(body.contains("↑/↓ · j/k       move sessions/children"));
+        assert!(body.contains(":              command palette"));
+        assert!(body.contains("Alt-A          attention-only filter"));
+        assert!(body.contains("Alt-S/L/D/T    session / latest / duration / state"));
+        assert!(body.contains("Alt-E          open persistent event inbox"));
+        assert!(body.contains("toggle help; q/Ctrl-C quits"));
     }
 
     #[test]
-    fn question_mark_toggles_help_overlay() {
+    fn f1_toggles_help_overlay() {
         let mut app = app_with_paneless_and_pane();
         assert!(!app.help_open);
 
         // First press — opens.
         let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
             &mut app,
         );
         assert!(matches!(action, Action::Quick(QuickAction::ShowHelp)));
@@ -11218,11 +12711,11 @@ sort = ["state"]
         }
         assert!(app.help_open, "first ? press must open the overlay");
 
-        // Second press — closes. With help open, only ? / q / Esc
+        // Second press — closes. With help open, only F1 / Alt-? / Esc
         // are accepted; everything else is ignored to avoid
         // double-binding.
         let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
             &mut app,
         );
         assert!(matches!(action, Action::Quick(QuickAction::ShowHelp)));
@@ -11400,10 +12893,7 @@ sort = ["state"]
     }
 
     #[test]
-    fn lowercase_k_and_r_do_not_trigger_destructive_actions() {
-        // The Shift safety rail: lowercase `k` and `r` must keep their
-        // existing meanings (move-up cursor / refresh) and NEVER ask
-        // the user to confirm a kill.
+    fn j_and_k_navigate_until_another_letter_starts_filtering() {
         let mut app = app_with_paneless_and_pane();
         let pane_idx = app
             .rows
@@ -11412,19 +12902,532 @@ sort = ["state"]
             .unwrap();
         app.table_state.select(Some(pane_idx));
 
-        // lowercase k = move up — yields Action::None, not AskConfirm.
         let action = key_action(&mut app, 'k');
-        assert!(
-            matches!(action, Action::None),
-            "lowercase k must move cursor (Action::None), not ask confirm"
+        assert!(matches!(action, Action::None));
+        assert!(app.search_query.is_empty());
+
+        let action = key_action(&mut app, 'b');
+        assert!(matches!(action, Action::None));
+        let action = key_action(&mut app, 'r');
+        assert!(matches!(action, Action::None));
+        let action = key_action(&mut app, 'k');
+        assert!(matches!(action, Action::None));
+        assert_eq!(app.search_query, "brk");
+
+        app.edit_search(String::clear);
+        assert!(matches!(alt_key_action(&mut app, 'r'), Action::Refresh));
+        assert!(matches!(
+            alt_key_action(&mut app, 'k'),
+            Action::AskConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn clearing_filter_restores_j_and_k_navigation() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+
+        assert!(matches!(key_action(&mut app, 'j'), Action::None));
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+        assert!(app.search_query.is_empty());
+
+        assert!(matches!(key_action(&mut app, 'b'), Action::None));
+        assert!(matches!(key_action(&mut app, 'j'), Action::None));
+        assert!(matches!(key_action(&mut app, 'k'), Action::None));
+        assert_eq!(app.search_query, "bjk");
+
+        app.edit_search(String::clear);
+        assert!(matches!(key_action(&mut app, 'k'), Action::None));
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn direct_typing_filters_and_escape_clears_before_quit() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(0));
+
+        for c in "beta".chars() {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
+        assert_eq!(app.search_query, "beta");
+        assert_eq!(app.visible_targets().len(), 1);
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.visible_targets().len(), 3);
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::Quit));
+    }
+
+    #[test]
+    fn slash_search_accepts_reserved_keys_and_restores_browse_shortcuts() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
+        assert!(app.explicit_search);
+        for c in "qghlro?".chars() {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
+        assert_eq!(app.search_query, "qghlro?");
+
+        let clear = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            &mut app,
+        );
+        assert!(matches!(clear, Action::None));
+        assert!(app.search_query.is_empty());
+        assert!(!app.explicit_search);
+        assert!(matches!(key_action(&mut app, 'q'), Action::Quit));
+    }
+
+    #[test]
+    fn explicit_search_stays_armed_after_backspacing_to_empty() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
+        assert!(matches!(key_action(&mut app, 'q'), Action::None));
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert!(app.search_query.is_empty());
+        assert!(app.explicit_search);
+
+        assert!(matches!(key_action(&mut app, 'q'), Action::None));
+        assert_eq!(app.search_query, "q");
+    }
+
+    #[test]
+    fn conventional_browse_keys_cover_boundaries_and_pages() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_page_rows = 2;
+        app.table_state.select(Some(0));
+
+        for (key, expected) in [
+            (KeyCode::End, 2),
+            (KeyCode::Home, 0),
+            (KeyCode::PageDown, 2),
+            (KeyCode::PageUp, 0),
+        ] {
+            assert!(matches!(
+                handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app,),
+                Action::None
+            ));
+            assert_eq!(app.table_state.selected(), Some(expected));
+        }
+
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL,)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert_eq!(app.table_state.selected(), Some(1));
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL,)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        assert!(matches!(key_action(&mut app, 'G'), Action::None));
+        assert_eq!(app.table_state.selected(), Some(2));
+        assert!(matches!(key_action(&mut app, 'g'), Action::None));
+        assert!(app.pending_g);
+        assert!(matches!(key_action(&mut app, 'g'), Action::None));
+        assert_eq!(app.table_state.selected(), Some(0));
+        assert!(!app.pending_g);
+    }
+
+    #[test]
+    fn empty_filter_exposes_common_single_key_actions() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        assert!(matches!(key_action(&mut app, 'r'), Action::Refresh));
+        assert!(matches!(key_action(&mut app, 'o'), Action::OpenPreview));
+        assert!(matches!(
+            key_action(&mut app, '?'),
+            Action::Quick(QuickAction::ShowHelp)
+        ));
+
+        assert!(matches!(key_action(&mut app, 'b'), Action::None));
+        for c in ['r', 'o', 'q', '?'] {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
+        assert_eq!(app.search_query, "broq?");
+    }
+
+    #[test]
+    fn command_palette_completes_and_dispatches_safe_actions() {
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(
+                |row| matches!(row, WatchRow::Agent(agent) if agent.pane.as_deref() == Some("%42")),
+            )
+            .unwrap();
+        app.table_state.select(Some(pane_idx));
+
+        assert!(matches!(key_action(&mut app, ':'), Action::None));
+        for c in "sort l".chars() {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert_eq!(
+            app.command_palette.as_ref().map(|c| c.input.as_str()),
+            Some("sort latest")
+        );
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app,
+            ),
+            Action::SetSort(WatchSortPreset::Latest)
+        ));
+        assert!(app.command_palette.is_none());
+
+        assert!(matches!(key_action(&mut app, ':'), Action::None));
+        for c in "kill".chars() {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app,
+            ),
+            Action::AskConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn command_view_rebuilds_cached_rows_and_preserves_a_pane_target() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.table_state.select(Some(1));
+        app.paneless_hidden = 2;
+        app.paneless_attention = 1;
+        let selected = app.selected_pane();
+
+        app.apply_view(WatchView::Session);
+        assert!(app
+            .rows
+            .iter()
+            .all(|row| matches!(row, WatchRow::Session(_))));
+        assert!(app.columns.contains(&WatchColumn::SessionTime));
+        assert_eq!(app.selected_pane(), selected);
+        assert_eq!(app.paneless_hidden, 2);
+        assert_eq!(app.paneless_attention, 1);
+
+        app.apply_view(WatchView::Pane);
+        assert!(app.rows.iter().any(|row| matches!(row, WatchRow::Agent(_))));
+        assert_eq!(app.selected_pane(), selected);
+    }
+
+    #[test]
+    fn command_palette_renders_input_and_matching_suggestions() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.command_palette = Some(CommandPalette {
+            input: "sort".into(),
+            cursor: 4,
+        });
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("commands · Enter run"));
+        assert!(screen.contains(": sort"));
+        assert!(screen.contains("sort latest"));
+        assert!(screen.contains("sort duration"));
+    }
+
+    #[test]
+    fn attention_filter_keeps_only_blocked_agents() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        let WatchRow::Agent(agent) = &mut app.rows[1] else {
+            panic!("expected agent row");
+        };
+        agent.state = AgentState::WaitingInput;
+
+        assert!(matches!(alt_key_action(&mut app, 'a'), Action::None));
+        assert!(app.attention_only);
+        assert_eq!(app.visible_targets().len(), 1);
+        assert_eq!(app.selected_pane().as_deref(), Some("%2"));
+    }
+
+    #[test]
+    fn selected_session_auto_expands_and_children_are_exact_action_targets() {
+        let mut app = session_preview_app();
+        assert_eq!(app.visible_targets().len(), 3);
+        assert!(matches!(
+            app.selected_identity(),
+            Some(RowIdentity::Session(_))
+        ));
+        let expected_child_pane = match &app.rows[0] {
+            WatchRow::Session(session) => session.agents[0].pane.clone(),
+            _ => None,
+        };
+        let expected_second_child_pane = match &app.rows[0] {
+            WatchRow::Session(session) => session.agents[1].pane.clone(),
+            _ => None,
+        };
+
+        let _ = key_action(&mut app, 'l');
+        assert_eq!(app.visible_targets().len(), 3);
+        assert_eq!(app.selected_pane(), expected_child_pane);
+        app.move_down();
+        assert_eq!(app.selected_pane(), expected_second_child_pane);
+        app.move_down();
+        assert_eq!(app.selected_pane(), expected_child_pane);
+        let Action::AskConfirm(popup) = quick_kill_action(&app) else {
+            panic!("expanded child should be killable");
+        };
+        assert_eq!(
+            popup.on_confirm,
+            QuickAction::KillPane(app.selected_pane().unwrap())
         );
 
-        // lowercase r = refresh — must yield Refresh, not AskConfirm.
-        let action = key_action(&mut app, 'r');
-        assert!(
-            matches!(action, Action::Refresh),
-            "lowercase r must refresh, not ask confirm"
+        let _ = key_action(&mut app, 'h');
+        assert_eq!(app.visible_targets().len(), 3);
+        assert!(matches!(
+            app.selected_identity(),
+            Some(RowIdentity::Session(_))
+        ));
+    }
+
+    #[test]
+    fn moving_to_another_session_folds_the_previous_and_opens_the_new_one() {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let now = OffsetDateTime::now_utc();
+        app.set_data_with_sessions(
+            vec![
+                fake_agent_at("alpha", "%1", now),
+                fake_agent_at("beta", "%2", now),
+            ],
+            vec![
+                fake_pane("%1", "alpha", 0, 0, "claude"),
+                fake_pane("%3", "alpha", 0, 1, "zsh"),
+                fake_pane("%2", "beta", 0, 0, "codex"),
+                fake_pane("%4", "beta", 0, 1, "zsh"),
+            ],
+            vec![
+                fake_session("$1", "alpha", 1),
+                fake_session("$2", "beta", 1),
+            ],
+            vec![],
         );
+
+        let initial = app.visible_targets();
+        assert_eq!(initial.len(), 3);
+        assert_eq!(initial[0].row_idx, 0);
+        assert_eq!(initial[1].agent_idx, Some(0));
+        assert_eq!(initial[2].row_idx, 1);
+
+        app.move_down();
+
+        let selected = app.selected_target().expect("second session selected");
+        assert_eq!(selected.row_idx, 1);
+        assert_eq!(selected.agent_idx, None);
+        let switched = app.visible_targets();
+        assert_eq!(switched.len(), 3);
+        assert_eq!(switched[0].row_idx, 0);
+        assert_eq!(switched[0].agent_idx, None);
+        assert_eq!(switched[1].row_idx, 1);
+        assert_eq!(switched[1].agent_idx, None);
+        assert_eq!(switched[2].row_idx, 1);
+        assert_eq!(switched[2].agent_idx, Some(0));
+    }
+
+    #[test]
+    fn single_pane_session_keeps_detail_without_a_redundant_child_row() {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let now = OffsetDateTime::now_utc();
+        let mut agent = fake_agent_at("solo-agent", "%1", now);
+        agent.last_response = Some("solo detail remains visible".into());
+        app.set_data_with_sessions(
+            vec![agent],
+            vec![fake_pane("%1", "solo", 0, 0, "codex")],
+            vec![fake_session("$1", "solo", 1)],
+            vec![],
+        );
+
+        assert_eq!(app.visible_targets().len(), 1);
+        app.move_into_session();
+        assert_eq!(app.visible_targets().len(), 1);
+        assert!(matches!(
+            app.selected_identity(),
+            Some(RowIdentity::Session(_))
+        ));
+
+        let backend = TestBackend::new(110, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            dump.contains("↳ solo detail remains visible"),
+            "single-pane detail missing: {dump:?}"
+        );
+        let session_line = row_text(terminal.backend().buffer(), 5);
+        assert!(
+            !session_line.contains('▸') && !session_line.contains('▾'),
+            "single pane must not show an expansion marker: {session_line:?}"
+        );
+    }
+
+    #[test]
+    fn single_and_multi_pane_session_names_start_in_the_same_column() {
+        let cfg = WatchConfig {
+            view: WatchView::Session,
+            sort: vec![WatchSortKey::Session],
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        let now = OffsetDateTime::now_utc();
+        app.set_data_with_sessions(
+            vec![
+                fake_agent_at("one-agent", "%1", now),
+                fake_agent_at("two-agent", "%2", now),
+            ],
+            vec![
+                fake_pane("%1", "one-pane", 0, 0, "codex"),
+                fake_pane("%2", "two-pane", 0, 0, "claude"),
+                fake_pane("%3", "two-pane", 0, 1, "zsh"),
+            ],
+            vec![
+                fake_session("$1", "one-pane", 1),
+                fake_session("$2", "two-pane", 1),
+            ],
+            vec![],
+        );
+
+        let backend = TestBackend::new(110, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let lines: Vec<String> = (0..terminal.backend().buffer().area.height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect();
+        let one = lines
+            .iter()
+            .find(|line| line.contains("one-pane"))
+            .expect("single-pane row");
+        let two = lines
+            .iter()
+            .find(|line| line.contains("two-pane"))
+            .expect("multi-pane row");
+        assert_eq!(
+            one.find("one-pane"),
+            two.find("two-pane"),
+            "session labels must share one left edge: {one:?} / {two:?}"
+        );
+    }
+
+    #[test]
+    fn selected_session_and_selected_child_both_render_detail() {
+        let mut app = session_preview_app();
+        let expected_detail = match &app.rows[0] {
+            WatchRow::Session(session) => session.agents[0]
+                .last_response
+                .clone()
+                .expect("first child response"),
+            _ => panic!("expected session row"),
+        };
+        let backend = TestBackend::new(140, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let parent_detail = row_text(terminal.backend().buffer(), 6);
+        assert!(
+            parent_detail.contains('↳') && parent_detail.contains(&expected_detail),
+            "parent detail missing above children: {parent_detail:?}"
+        );
+
+        app.move_into_session();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let child_detail = row_text(terminal.backend().buffer(), 7);
+        assert!(
+            child_detail.contains('↳') && child_detail.contains(&expected_detail),
+            "selected child detail missing: {child_detail:?}"
+        );
+    }
+
+    #[test]
+    fn state_age_cell_shows_state_and_time_in_state() {
+        let now = time::macros::datetime!(2026-08-03 12:00:00 UTC);
+        let mut agent = fake_agent_at("waiting", "%1", now);
+        agent.state = AgentState::WaitingInput;
+        agent.state_entered_at = now - time::Duration::minutes(5);
+        let text = state_age_text(&agent, now, watch_theme(WatchTheme::Classic), Spinner::OFF);
+        assert_eq!(plain_text(&text), "▶ WAIT 5m");
+    }
+
+    #[test]
+    fn transitions_stay_in_event_inbox_until_opened() {
+        let mut app = App::new();
+        let working = fake_agent(
+            "event-agent",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+            Some("finish the task"),
+            None,
+            None,
+            None,
+        );
+        app.set_data(
+            vec![working.clone()],
+            vec![fake_pane("%1", "main", 0, 0, "claude")],
+        );
+        app.detect_pulses();
+
+        let mut done = working;
+        done.state = AgentState::Idle;
+        done.state_entered_at = OffsetDateTime::now_utc();
+        apply_outcome(&mut app, RefreshOutcome::SingleAgent(done));
+
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(app.events[0].kind, WatchEventKind::Done);
+        assert_eq!(app.unread_events, 1);
+        app.toggle_event_inbox();
+        assert!(app.event_inbox_open);
+        assert_eq!(app.unread_events, 0);
     }
 
     #[test]
@@ -11484,8 +13487,8 @@ sort = ["state"]
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            dump.contains("Keybindings"),
-            "missing Keybindings: {dump:?}"
+            dump.contains("Filter & navigation"),
+            "missing filter help: {dump:?}"
         );
         assert!(
             dump.contains("Quick actions"),
