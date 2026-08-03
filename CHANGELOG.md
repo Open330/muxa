@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.23] - 2026-08-03
+
+### Added
+
+- **Direct filtering and familiar navigation in `muxa watch`.** Printable text
+  now filters immediately, while `/` explicitly arms search for queries that
+  begin with a reserved browse key. Empty-query navigation supports `hjkl`,
+  arrows, `gg`/`G`, Home/End, Page Up/Down, Ctrl-U/D, `q`, `?`, `r`, and `o`.
+  A new `:` command palette exposes refresh, preview, copy, attention/events,
+  inspector, sort, view, kill/abort, help, and quit actions with Tab completion.
+- **Watch inspector and event inbox.** Wide terminals can keep the selected
+  pane's live capture visible alongside the table, and completion, error, and
+  attention transitions remain available in a 50-entry in-process inbox with
+  an unread count.
+- **State-age and workload context.** The default state column includes time in
+  the current state, and selected-row details can show child process/subagent
+  workload without requiring a permanently visible extra column.
+
+### Changed
+
+- **Session navigation keeps context visible without adding keystrokes.** The
+  selected multi-pane session shows its agent rows automatically, but vertical
+  navigation still moves between sessions until Right/`l` deliberately enters
+  child selection. Single-pane sessions avoid a duplicate child row, selection
+  gutters stay aligned, and the existing detail row remains visible for both
+  parent and child selections.
+- The default watch sort now prioritizes attention state, groups by session,
+  and orders each group by latest activity. Runtime sort actions persist their
+  selected preset to the watch configuration.
+
 ### Fixed
 
 - **Every NAME column collapsing to raw `%42` pane ids on a busy host.** The
@@ -1546,7 +1576,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.22...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.23...HEAD
+[0.8.23]: https://github.com/Open330/muxa/releases/tag/v0.8.23
 [0.8.22]: https://github.com/Open330/muxa/releases/tag/v0.8.22
 [0.8.21]: https://github.com/Open330/muxa/releases/tag/v0.8.21
 [0.8.15]: https://github.com/Open330/muxa/compare/v0.8.14...v0.8.15
