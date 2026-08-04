@@ -97,6 +97,14 @@ enabled = true
 wake = "idle_only"
 ```
 
+두 agent가 메시지를 직접 읽고 답할 수 있도록 MCP도 한 번 등록한 뒤 실행 중인
+agent를 다시 시작합니다.
+
+```bash
+claude mcp add muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
+```
+
 평소에는:
 
 1. 같은 tmux window의 두 pane에서 agent를 각각 실행합니다.

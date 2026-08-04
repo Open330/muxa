@@ -100,6 +100,17 @@ agent in the same tmux window and press `m`. When the room has exactly one
 peer, watch selects it automatically. `Tab` changes request kind and `Ctrl-E`
 switches between `read-only` and `execute`; `Enter` sends.
 
+- `? QUESTION` (cyan) asks for an answer.
+- `◆ REVIEW` (magenta) asks for review findings.
+- `▶ TASK` (yellow) delegates a concrete task.
+- `! NOTICE` (blue) is informational and does not expect a reply.
+
+`○ READ-ONLY` (green) authorizes investigation and an answer, not changes.
+`Ctrl-E` switches to `● EXECUTE` (red), explicitly authorizing commands and
+file changes. This is a contract delivered to the receiving agent, not a
+command that muxa executes immediately. Watch has no separate path-scope
+field, so include the intended edit scope in an execute request's body.
+
 Press `b` for incoming/sent history. In the mailbox, `Tab` switches mailbox,
 `j`/`k` selects a request, `i` claims pending incoming work, and `e` replies.
 If watch was opened from a normal shell, observation still works and the UI

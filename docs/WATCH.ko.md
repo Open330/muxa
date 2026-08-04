@@ -108,6 +108,17 @@ window의 상대 agent를 선택한 뒤 `m`을 누릅니다. room에 peer가 하
 자동으로 선택합니다. composer에서 `Tab`은 request kind, `Ctrl-E`는
 `read-only`/`execute`를 바꾸고 `Enter`는 전송합니다.
 
+- `? QUESTION`(청록): 답을 요청합니다.
+- `◆ REVIEW`(자홍): 코드나 판단의 검토 결과를 요청합니다.
+- `▶ TASK`(노랑): 구체적인 작업을 위임합니다.
+- `! NOTICE`(파랑): 회신이 필요 없는 알림입니다.
+
+`○ READ-ONLY`(초록)는 조사·답변만 허용하고 변경은 위임하지 않는 계약입니다.
+`Ctrl-E`로 바꾸는 `● EXECUTE`(빨강)는 실행과 파일 변경을 명시적으로 허용합니다.
+이는 muxa가 즉시 명령을 실행한다는 뜻이 아니라, 수신 agent가 inbox에서 읽는 작업
+계약입니다. watch는 별도 path scope 입력을 제공하지 않으므로 execute 요청에는
+메시지 본문에 수정 범위를 함께 적는 것이 좋습니다.
+
 `b`는 incoming/sent mailbox를 엽니다. `Tab`으로 mailbox를 전환하고 `j`/`k`로
 request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다. 일반
 shell에서 watch를 열었다면 조회는 가능하지만, 협업하려면 agent pane에서

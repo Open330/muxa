@@ -24,12 +24,15 @@ enabled = true
 wake = "idle_only"
 ```
 
-각 agent에 `muxa mcp`가 등록돼 있어야 합니다. Claude Code 예시는 다음과
-같습니다.
+각 agent에 `muxa mcp`가 등록돼 있어야 합니다. Claude Code와 Codex에는 다음처럼
+등록합니다.
 
 ```bash
 claude mcp add muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
 ```
+
+이미 실행 중인 agent는 등록된 MCP 목록을 다시 읽도록 종료 후 재실행합니다.
 
 기존 `prefix+s` watch 단축키가 있다면 업그레이드 후 추가 단축키가 필요 없습니다.
 
@@ -103,6 +106,11 @@ tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle�
 사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는
 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. `muxa dashboard`는
 같은 기능을 더 상세한 session-card 화면으로 제공합니다.
+
+watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 다른
+색상으로 표시합니다. `○ READ-ONLY`는 조사·답변만 위임하고 `● EXECUTE`는 명령과
+파일 변경을 허용합니다. 두 mode는 수신 agent에게 전달되는 계약이며 muxa가 직접
+작업을 실행하는 스위치가 아닙니다.
 
 ## MCP tools
 

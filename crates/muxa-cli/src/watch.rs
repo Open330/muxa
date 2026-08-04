@@ -4825,6 +4825,107 @@ fn request_kind_label(kind: RequestKind) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollaborationBadge {
+    icon: &'static str,
+    label: &'static str,
+    foreground: Color,
+    background: Color,
+}
+
+impl CollaborationBadge {
+    fn span(self) -> Span<'static> {
+        Span::styled(
+            format!(" {} {} ", self.icon, self.label),
+            Style::default()
+                .fg(self.foreground)
+                .bg(self.background)
+                .add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
+fn request_kind_badge(kind: RequestKind) -> CollaborationBadge {
+    match kind {
+        RequestKind::Question => CollaborationBadge {
+            icon: "?",
+            label: "QUESTION",
+            foreground: Color::Black,
+            background: Color::Cyan,
+        },
+        RequestKind::Review => CollaborationBadge {
+            icon: "◆",
+            label: "REVIEW",
+            foreground: Color::White,
+            background: Color::Magenta,
+        },
+        RequestKind::Task => CollaborationBadge {
+            icon: "▶",
+            label: "TASK",
+            foreground: Color::Black,
+            background: Color::Yellow,
+        },
+        RequestKind::Notice => CollaborationBadge {
+            icon: "!",
+            label: "NOTICE",
+            foreground: Color::White,
+            background: Color::Blue,
+        },
+    }
+}
+
+fn work_mode_badge(mode: WorkMode) -> CollaborationBadge {
+    match mode {
+        WorkMode::ReadOnly => CollaborationBadge {
+            icon: "○",
+            label: "READ-ONLY",
+            foreground: Color::Black,
+            background: Color::Green,
+        },
+        WorkMode::Execute => CollaborationBadge {
+            icon: "●",
+            label: "EXECUTE",
+            foreground: Color::White,
+            background: Color::Red,
+        },
+    }
+}
+
+fn reply_status_badge(status: RequestStatus) -> CollaborationBadge {
+    match status {
+        RequestStatus::Completed => CollaborationBadge {
+            icon: "✓",
+            label: "COMPLETED",
+            foreground: Color::Black,
+            background: Color::Green,
+        },
+        RequestStatus::Blocked => CollaborationBadge {
+            icon: "!",
+            label: "BLOCKED",
+            foreground: Color::Black,
+            background: Color::Yellow,
+        },
+        RequestStatus::Declined => CollaborationBadge {
+            icon: "×",
+            label: "DECLINED",
+            foreground: Color::White,
+            background: Color::DarkGray,
+        },
+        RequestStatus::Failed => CollaborationBadge {
+            icon: "■",
+            label: "FAILED",
+            foreground: Color::White,
+            background: Color::Red,
+        },
+        _ => CollaborationBadge {
+            icon: "·",
+            label: request_status_label(status),
+            foreground: Color::Black,
+            background: Color::Gray,
+        },
+    }
+}
+
 fn work_mode_label(mode: WorkMode) -> &'static str {
     match mode {
         WorkMode::ReadOnly => "read-only",
@@ -6277,26 +6378,12 @@ fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
         .collaboration_composer
         .as_ref()
         .expect("render_collaboration_composer without composer");
-    let mode = match composer.target {
-        CollaborationComposeTarget::Send {
-            kind, work_mode, ..
-        } => format!(
-            "message · {} · {} · Tab kind · Ctrl-E mode",
-            request_kind_label(kind),
-            work_mode_label(work_mode)
-        ),
-        CollaborationComposeTarget::Reply { status, .. } => {
-            format!("reply · {} · Tab status", request_status_label(status))
-        }
-    };
+    let (title, border_color) = collaboration_composer_title(composer, theme);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.action))
+        .border_style(Style::default().fg(border_color))
         .border_type(theme.border_type)
-        .title(Span::styled(
-            format!(" {mode} → {} ", composer.label),
-            theme.action_badge().add_modifier(Modifier::BOLD),
-        ));
+        .title(title);
     let inner = block.inner(area);
     let visible_input =
         truncate_prompt_input(&composer.input, inner.width.saturating_sub(2) as usize);
@@ -6317,6 +6404,60 @@ fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
         .saturating_add(u16::try_from(before_cursor.width()).unwrap_or(u16::MAX));
     if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
         f.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+fn collaboration_composer_title(
+    composer: &CollaborationComposer,
+    theme: WatchThemeSpec,
+) -> (Line<'static>, Color) {
+    match composer.target {
+        CollaborationComposeTarget::Send {
+            kind, work_mode, ..
+        } => {
+            let kind_badge = request_kind_badge(kind);
+            let mode_badge = work_mode_badge(work_mode);
+            let border = if work_mode == WorkMode::Execute {
+                mode_badge.background
+            } else {
+                kind_badge.background
+            };
+            (
+                Line::from(vec![
+                    Span::raw(" "),
+                    kind_badge.span(),
+                    Span::raw(" "),
+                    mode_badge.span(),
+                    Span::styled(
+                        format!(" → {}  ", composer.label),
+                        theme.table_header_style(),
+                    ),
+                    Span::styled(" Tab ", theme.key_badge()),
+                    Span::raw("kind  "),
+                    Span::styled(" Ctrl-E ", theme.key_badge()),
+                    Span::raw("mode "),
+                ]),
+                border,
+            )
+        }
+        CollaborationComposeTarget::Reply { status, .. } => {
+            let status_badge = reply_status_badge(status);
+            (
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(" REPLY ", theme.action_badge()),
+                    Span::raw(" "),
+                    status_badge.span(),
+                    Span::styled(
+                        format!(" → {}  ", composer.label),
+                        theme.table_header_style(),
+                    ),
+                    Span::styled(" Tab ", theme.key_badge()),
+                    Span::raw("status "),
+                ]),
+                status_badge.background,
+            )
+        }
     }
 }
 
@@ -8883,6 +9024,61 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn watch_collaboration_composer_badges_make_contract_changes_visible() {
+        for (kind, icon, label, background) in [
+            (RequestKind::Question, "?", "QUESTION", Color::Cyan),
+            (RequestKind::Review, "◆", "REVIEW", Color::Magenta),
+            (RequestKind::Task, "▶", "TASK", Color::Yellow),
+            (RequestKind::Notice, "!", "NOTICE", Color::Blue),
+        ] {
+            let badge = request_kind_badge(kind);
+            assert_eq!(
+                (badge.icon, badge.label, badge.background),
+                (icon, label, background)
+            );
+        }
+        assert_eq!(work_mode_badge(WorkMode::ReadOnly).icon, "○");
+        assert_eq!(work_mode_badge(WorkMode::ReadOnly).background, Color::Green);
+        assert_eq!(work_mode_badge(WorkMode::Execute).icon, "●");
+        assert_eq!(work_mode_badge(WorkMode::Execute).background, Color::Red);
+
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        let theme = watch_theme(WatchTheme::Classic);
+        let composer = app.collaboration_composer.as_ref().unwrap();
+        let (title, border) = collaboration_composer_title(composer, theme);
+        let text = title
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("? QUESTION"));
+        assert!(text.contains("○ READ-ONLY"));
+        assert_eq!(border, Color::Cyan);
+
+        handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        handle_collaboration_composer_event(KeyCode::Char('e'), KeyModifiers::CONTROL, &mut app);
+        let composer = app.collaboration_composer.as_ref().unwrap();
+        let (title, border) = collaboration_composer_title(composer, theme);
+        let text = title
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("◆ REVIEW"));
+        assert!(text.contains("● EXECUTE"));
+        assert_eq!(border, Color::Red);
+        assert_eq!(
+            title
+                .spans
+                .iter()
+                .find(|span| span.content.contains("REVIEW"))
+                .and_then(|span| span.style.bg),
+            Some(Color::Magenta)
+        );
     }
 
     #[test]

@@ -102,6 +102,14 @@ enabled = true
 wake = "idle_only"
 ```
 
+Register the MCP server once for both agent hosts, then restart agents that
+were already running so they can read and reply to requests themselves.
+
+```bash
+claude mcp add muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
+```
+
 Then:
 
 1. Run two agents in two panes of the same tmux window.

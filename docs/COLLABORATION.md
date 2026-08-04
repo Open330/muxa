@@ -23,11 +23,14 @@ enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
 ```
 
-Restart `muxad` and register `muxa mcp` with each agent host. For Claude Code:
+Restart `muxad` and register `muxa mcp` with each agent host:
 
 ```bash
 claude mcp add muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
 ```
+
+Restart agents that were already running so they reload their MCP server list.
 
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
@@ -71,6 +74,11 @@ The same lifecycle is available interactively in `muxa watch`: `m` sends to the
 selected room peer, `b` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. `muxa dashboard` provides the richer session-card form
 of the same controls.
+
+The watch composer gives `? QUESTION`, `◆ REVIEW`, `▶ TASK`, and `! NOTICE`
+distinct colors. `○ READ-ONLY` delegates investigation and an answer only;
+`● EXECUTE` authorizes commands and file changes. These modes are contracts
+delivered to the receiver, not commands executed directly by muxa.
 
 `question` and `review` are read-only contracts by default. Use `--execute`
 and one or more `--path` arguments to explicitly delegate edits. Path scopes
