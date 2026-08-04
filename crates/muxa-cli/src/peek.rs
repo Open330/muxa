@@ -187,7 +187,7 @@ async fn drive(
     // the interval.
     let mut stale = false;
     loop {
-        terminal.draw(|f| draw(f, &cells, placement, zoomed))?;
+        terminal.draw(|f| draw(f, &cells, placement, zoomed, &typed))?;
 
         if event::poll(INPUT_POLL)? {
             match event::read()? {
@@ -204,6 +204,12 @@ async fn drive(
                             Selection::Prefix => {}
                             Selection::Miss => typed.clear(),
                         }
+                    }
+                    Action::Commit => {
+                        if let Some(pane_id) = exact_match(&typed, &cells) {
+                            return Ok(Outcome::Jump(pane_id));
+                        }
+                        typed.clear();
                     }
                     Action::Ignore => {}
                 },
@@ -244,6 +250,8 @@ async fn drive(
 
 enum Action {
     Digit(char),
+    /// Commit whatever digits are pending, ambiguity be damned.
+    Commit,
     Refresh,
     Dismiss,
     Ignore,
@@ -262,10 +270,12 @@ enum Selection {
 ///
 /// Single-digit windows (nearly all of them) jump on the first keypress.
 /// A window with ten or more panes makes `1` a prefix of `10`, so those
-/// jump on the second — which beats tmux's own `display-panes`, where a
-/// pane you can see but whose index needs two digits is still reachable
-/// but easy to mistype, and beats the alternative of leaving panes 10+
-/// unreachable entirely.
+/// wait for a second digit rather than leaving panes 10+ unreachable.
+///
+/// The wait is why `Enter` exists: with panes 1, 10 and 11 on screen,
+/// every continuation of `1` names a *different* pane, so pane 1 could
+/// never be reached by typing alone. `Enter` commits what's pending —
+/// see [`exact_match`].
 fn resolve_typed(typed: &str, cells: &[PeekCell]) -> Selection {
     let exact = cells.iter().find(|c| c.geo.pane_index == typed);
     let ambiguous = cells
@@ -276,6 +286,15 @@ fn resolve_typed(typed: &str, cells: &[PeekCell]) -> Selection {
         (_, true) => Selection::Prefix,
         (None, false) => Selection::Miss,
     }
+}
+
+/// The pane whose index is exactly `typed`, ignoring the ambiguity that
+/// makes [`resolve_typed`] wait. This is what `Enter` commits.
+fn exact_match(typed: &str, cells: &[PeekCell]) -> Option<String> {
+    cells
+        .iter()
+        .find(|c| c.geo.pane_index == typed)
+        .map(|c| c.geo.pane_id.clone())
 }
 
 fn classify(key: KeyEvent) -> Action {
@@ -291,6 +310,7 @@ fn classify(key: KeyEvent) -> Action {
         // `Q` too: the key that opened the overlay should close it.
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Enter => Action::Commit,
         KeyCode::Char(c) if c.is_ascii_digit() => Action::Digit(c),
         _ => Action::Ignore,
     }
@@ -357,7 +377,14 @@ fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
 /// `last_prompt` is really its command line has no history of its own to
 /// borrow from.
 async fn attach_prompt_times(client: &Client, cells: &mut [PeekCell]) {
+    // One deadline for the whole pass, not per pane: a wedged daemon
+    // would otherwise freeze the redraw for `panes × timeout`, which on a
+    // ten-pane window is four seconds of dead overlay.
+    let started = Instant::now();
     for cell in cells.iter_mut() {
+        if started.elapsed() >= PEEK_IPC_TIMEOUT {
+            break;
+        }
         let Some(session_id) = cell.agent.as_ref().map(|a| a.session_id.clone()) else {
             continue;
         };
@@ -365,7 +392,7 @@ async fn attach_prompt_times(client: &Client, cells: &mut [PeekCell]) {
             .recent_prompts_with_timeout(
                 Some(&cell.geo.pane_id),
                 Some(PROMPT_HISTORY_LOOKBACK),
-                PEEK_IPC_TIMEOUT,
+                PEEK_IPC_TIMEOUT.saturating_sub(started.elapsed()),
             )
             .await
             .unwrap_or_default();
@@ -465,7 +492,7 @@ impl From<Option<WindowFrame>> for Placement {
     }
 }
 
-fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool) {
+fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool, pending: &str) {
     let area = f.area();
     f.render_widget(Clear, area);
     for cell in cells {
@@ -494,7 +521,7 @@ fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool) {
             width: area.width,
             height: 1,
         };
-        f.render_widget(Paragraph::new(hint_line(cells)), hint);
+        f.render_widget(Paragraph::new(hint_line(cells, pending)), hint);
     }
 }
 
@@ -886,7 +913,7 @@ fn meta_line(cell: &PeekCell, width: u16) -> Option<Line<'static>> {
 /// Footer strip drawn over the row tmux's status line occupies. Leads
 /// with the attention count when anything is blocked, because that is the
 /// one fact worth stealing focus for.
-pub(crate) fn hint_line(cells: &[PeekCell]) -> Line<'static> {
+pub(crate) fn hint_line(cells: &[PeekCell], pending: &str) -> Line<'static> {
     let blocked = cells
         .iter()
         .filter(|c| {
@@ -907,12 +934,30 @@ pub(crate) fn hint_line(cells: &[PeekCell]) -> Line<'static> {
         ));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled(
-        " 0-9 jump · r refresh · q/Esc close",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    ));
+    if pending.is_empty() {
+        spans.push(Span::styled(
+            " 0-9 jump · r refresh · q/Esc close",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    } else {
+        // Digits only pend when the window has enough panes to make them
+        // ambiguous. Showing them is the difference between "waiting for
+        // your second digit" and "the overlay ignored my keypress".
+        spans.push(Span::styled(
+            format!(" {pending}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "… more digits, or Enter to take it",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -1236,11 +1281,11 @@ mod tests {
             ],
         );
         assert_eq!(cells.len(), 2, "both panes keep a cell");
-        assert!(line_text(&hint_line(&cells)).starts_with(" 1 needs you "));
+        assert!(line_text(&hint_line(&cells, "")).starts_with(" 1 needs you "));
 
         let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), true))
+            .draw(|f| draw(f, &cells, Placement::default(), true, ""))
             .unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains(" 1 "), "{rendered}");
@@ -1257,7 +1302,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
         terminal
-            .draw(|f| draw(f, &split, Placement::default(), false))
+            .draw(|f| draw(f, &split, Placement::default(), false, ""))
             .unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains(" 0 "), "{rendered}");
@@ -1305,6 +1350,29 @@ mod tests {
         assert!(matches!(resolve_typed("1", &many), Selection::Prefix));
         assert!(matches!(resolve_typed("10", &many), Selection::Hit(id) if id == "%10"));
         assert!(matches!(resolve_typed("19", &many), Selection::Miss));
+
+        // Pane 1 is reachable only via Enter: every continuation of "1"
+        // names a different pane, so typing alone can never commit to it.
+        assert_eq!(exact_match("1", &many).as_deref(), Some("%1"));
+        assert_eq!(exact_match("19", &many), None);
+        assert_eq!(exact_match("", &many), None);
+    }
+
+    #[test]
+    fn pending_digits_are_shown_rather_than_swallowed() {
+        // A digit that pends looks identical to a dropped keypress unless
+        // the footer says otherwise.
+        let cells = build_cells(
+            vec![geo("1", 0, 0, 40, 5, true), geo("10", 0, 6, 40, 5, false)],
+            &[],
+        );
+        let idle = line_text(&hint_line(&cells, ""));
+        assert!(idle.contains("0-9 jump"), "{idle}");
+
+        let waiting = line_text(&hint_line(&cells, "1"));
+        assert!(waiting.contains(" 1"), "{waiting}");
+        assert!(waiting.contains("Enter"), "{waiting}");
+        assert!(!waiting.contains("0-9 jump"), "{waiting}");
     }
 
     #[test]
@@ -1485,7 +1553,7 @@ mod tests {
     #[test]
     fn hint_leads_with_the_attention_count() {
         let quiet = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &[]);
-        assert!(!line_text(&hint_line(&quiet)).contains("need"));
+        assert!(!line_text(&hint_line(&quiet, "")).contains("need"));
 
         let cells = build_cells(
             vec![geo("0", 0, 0, 80, 12, true), geo("1", 0, 13, 80, 11, false)],
@@ -1494,7 +1562,7 @@ mod tests {
                 agent("%1", AgentState::WaitingChoice),
             ],
         );
-        assert!(line_text(&hint_line(&cells)).starts_with(" 2 need you "));
+        assert!(line_text(&hint_line(&cells, "")).starts_with(" 2 need you "));
     }
 
     #[test]
@@ -1524,6 +1592,10 @@ mod tests {
             classify(KeyEvent::from(KeyCode::Char('r'))),
             Action::Refresh
         ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Enter)),
+            Action::Commit
+        ));
         // Ctrl-digit is a terminal chord, not a jump request.
         assert!(matches!(
             classify(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL)),
@@ -1542,7 +1614,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
             .unwrap();
         let rendered = screen(&terminal);
         // Pane digits are the jump affordance — both must be visible.
@@ -1561,7 +1633,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
             .unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains(" 7 "), "{rendered}");
@@ -1590,7 +1662,7 @@ mod tests {
         let cells = build_cells(vec![geo("0", 0, 0, 20, 5, true)], &[]);
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, placement, false))
+            .draw(|f| draw(f, &cells, placement, false, ""))
             .unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(rows[0].contains("0-9 jump"), "{rows:#?}");
@@ -1608,7 +1680,9 @@ mod tests {
         }));
         assert_eq!(bottom.origin_y, 0);
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
-        terminal.draw(|f| draw(f, &cells, bottom, false)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, bottom, false, ""))
+            .unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(rows[0].contains(" 0 "), "{rows:#?}");
         assert!(rows[5].contains("0-9 jump"), "{rows:#?}");
@@ -1629,7 +1703,7 @@ mod tests {
         // status line, and it's where the hint bar goes.
         let mut terminal = Terminal::new(TestBackend::new(30, 13)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
             .unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains("auth refactor"), "{rendered}");
@@ -1714,7 +1788,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
             .unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
 
@@ -1744,7 +1818,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
             .unwrap();
         assert!(!screen(&terminal).contains("ago"));
     }
@@ -1766,7 +1840,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(16, 9)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
             .unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(!rows[0].contains("ago"), "{rows:#?}");
