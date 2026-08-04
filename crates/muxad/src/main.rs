@@ -598,7 +598,12 @@ async fn send_collaboration_wake(
     let prompt = prompt.to_string();
     tokio::task::spawn_blocking(move || {
         let sent = backend.send_text_on(socket.as_deref(), &pane, &prompt);
-        let submitted = sent && backend.send_text_on(socket.as_deref(), &pane, "\r");
+        let submitted = if sent {
+            std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+            backend.send_text_on(socket.as_deref(), &pane, "\r")
+        } else {
+            false
+        };
         (sent, submitted)
     })
     .await

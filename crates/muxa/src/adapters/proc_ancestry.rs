@@ -35,6 +35,22 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
     parse_ppid_from_status(&content)
 }
 
+/// Portable fallback for hosts without Linux `/proc`. This path is only used
+/// for the MCP ancestry recovery; hook reconciliation already takes a shared
+/// one-shot process snapshot on macOS/BSD. A failed or unavailable `ps`
+/// degrades cleanly to no ancestry match.
+#[cfg(not(target_os = "linux"))]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
 /// Parse the `PPid:` field out of `/proc/<pid>/status` content.
 ///
 /// Pulled out for direct testing — `parent_pid` itself is hard to unit

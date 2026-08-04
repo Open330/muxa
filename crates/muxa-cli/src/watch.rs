@@ -102,7 +102,7 @@ const FOOTER_HINT_TTL: Duration = Duration::from_secs(2);
 /// content; without a small gap, the trailing Enter can be swallowed into
 /// that burst and the prompt stays composed until the user presses Enter
 /// again manually.
-const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(120);
+const PROMPT_SUBMIT_GRACE: Duration = muxa::backend::PROMPT_SUBMIT_GRACE;
 
 /// Channel capacity for the wake signal sent from the input loop to the
 /// background refresh task. Capacity 1 is intentional: when the user mashes

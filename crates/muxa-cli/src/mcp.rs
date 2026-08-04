@@ -32,7 +32,7 @@ use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -786,9 +786,17 @@ fn collaboration_guide(room: RoomContext) -> Value {
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
-    let pane = std::env::var("TMUX_PANE").map_err(|_| {
-        "collaboration requires this MCP server to run inside a tmux pane".to_string()
-    })?;
+    let pane = std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(current_process_tmux_pane)
+        .ok_or_else(|| {
+            "collaboration could not identify this MCP server's tmux pane; \
+             TMUX_PANE is unset and process ancestry did not reach a pane shell. \
+             For Codex, add env_vars = [\"TMUX\", \"TMUX_PANE\", \"MUXA_SOCKET\"] \
+             under [mcp_servers.muxa] and restart Codex"
+                .to_string()
+        })?;
     let socket = std::env::var("TMUX").ok().and_then(|value| {
         let path = value.split(',').next()?.trim();
         Path::new(path)
@@ -797,6 +805,40 @@ fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, St
             .map(str::to_string)
     });
     Ok(CollaborationOrigin { pane, socket })
+}
+
+/// Recover the owning tmux pane when an MCP host sanitizes subprocess
+/// environment variables. Current Codex releases only forward variables
+/// explicitly listed in `mcp_servers.<name>.env_vars`, so an existing muxa
+/// registration may launch with neither `TMUX_PANE` nor `TMUX` even though
+/// Codex itself is running in a pane.
+///
+/// The MCP process is still a descendant of the pane shell. Match the first
+/// ancestor whose PID appears in `tmux list-panes` and use that pane as a
+/// local/default-socket fallback. Explicit env remains authoritative because
+/// it also identifies non-default tmux sockets without ambiguity.
+fn current_process_tmux_pane() -> Option<String> {
+    let pane_pids = muxa::tmux::pane_pid_map();
+    pane_from_ancestry(std::process::id(), &pane_pids, |pid| {
+        muxa::adapters::proc_ancestry::parent_pid(pid)
+    })
+}
+
+fn pane_from_ancestry<F>(
+    start_pid: u32,
+    pane_pids: &HashMap<u32, String>,
+    parent_of: F,
+) -> Option<String>
+where
+    F: Fn(u32) -> Option<u32>,
+{
+    if let Some(pane) = pane_pids.get(&start_pid) {
+        return Some(pane.clone());
+    }
+    let candidates: HashSet<u32> = pane_pids.keys().copied().collect();
+    let pane_shell =
+        muxa::adapters::proc_ancestry::ancestor_in_set(start_pid, &candidates, parent_of)?;
+    pane_pids.get(&pane_shell).cloned()
 }
 
 fn parse_request_kind(value: Option<&str>) -> std::result::Result<RequestKind, &'static str> {
@@ -1289,6 +1331,38 @@ mod tests {
             .unwrap()
             .iter()
             .any(|rule| rule.as_str().unwrap().contains("separate worktrees")));
+    }
+
+    #[test]
+    fn collaboration_origin_recovers_pane_from_process_ancestry() {
+        let pane_pids = HashMap::from([(40, "%659".to_string()), (70, "%700".to_string())]);
+        let parents = HashMap::from([(100, 90), (90, 80), (80, 40), (40, 1)]);
+
+        assert_eq!(
+            pane_from_ancestry(100, &pane_pids, |pid| parents.get(&pid).copied()),
+            Some("%659".to_string())
+        );
+    }
+
+    #[test]
+    fn collaboration_origin_ancestry_fallback_is_bounded_to_known_panes() {
+        let pane_pids = HashMap::from([(40, "%659".to_string())]);
+        let parents = HashMap::from([(100, 90), (90, 80), (80, 1)]);
+
+        assert_eq!(
+            pane_from_ancestry(100, &pane_pids, |pid| parents.get(&pid).copied()),
+            None
+        );
+    }
+
+    #[test]
+    fn collaboration_origin_accepts_mcp_process_as_pane_root() {
+        let pane_pids = HashMap::from([(100, "%659".to_string())]);
+
+        assert_eq!(
+            pane_from_ancestry(100, &pane_pids, |_| None),
+            Some("%659".to_string())
+        );
     }
 
     /// A notification (no `id`) yields no response.

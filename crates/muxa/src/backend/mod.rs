@@ -58,8 +58,16 @@ pub mod zellij;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::tmux::PaneInfo;
+
+/// Grace period between literal prompt injection and the submit key.
+/// Codex's TUI treats an immediate trailing Enter as part of a pasted burst,
+/// leaving the prompt composed but unsubmitted. All control-plane send paths
+/// use the same delay so dashboard sends, MCP sends, and collaboration wakes
+/// behave consistently.
+pub const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(120);
 
 /// Whether a pane observation is authoritative enough for destructive use.
 ///
