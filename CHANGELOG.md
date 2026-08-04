@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a borderless fullscreen popup that repaints the current window's pane
   layout: each pane's live screen is captured and dimmed as a backdrop, with
   a box over it carrying that pane's agent state glyph, session summary,
-  latest prompt, latest response, and a `model · ctx% · 5h%` strip. The box
+  latest prompt (stamped with how long ago you sent it), latest response,
+  and a `model · ctx% · 5h%` strip. The box
   claims only the rows it needs (never more than two thirds of the pane), so
   the terminal underneath stays readable; panes running a plain shell get a
   bare digit badge instead. Pressing a pane's digit jumps to it and the

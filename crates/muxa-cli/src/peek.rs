@@ -51,6 +51,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+use time::OffsetDateTime;
 use unicode_width::UnicodeWidthChar;
 
 use crate::attend;
@@ -74,6 +75,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Input poll slice. Short enough that a digit feels instant, long enough
 /// that idling costs nothing.
 const INPUT_POLL: Duration = Duration::from_millis(100);
+
+/// How far back to look in a pane's prompt history for an entry
+/// belonging to the current agent session. History is newest-first, so
+/// the match is normally the first entry; the small slack covers a pane
+/// whose previous occupant's prompts have not aged out yet.
+const PROMPT_HISTORY_LOOKBACK: usize = 8;
 
 /// Smallest box that can carry a border plus one row of content. Below
 /// this, [`render_cell`] drops the border and prints a bare badge.
@@ -100,6 +107,11 @@ pub(crate) struct PeekCell {
     /// hasn't been reaped yet, or a `muxa register`ed task). Surfaced as a
     /// `+N` badge rather than silently dropped.
     pub extra: usize,
+    /// When the human last sent this agent a prompt, from the daemon's
+    /// prompt history. `None` when history holds nothing for this
+    /// agent's session — a fresh session, or history switched off — in
+    /// which case the prompt line simply carries no age.
+    pub last_prompt_at: Option<OffsetDateTime>,
     /// The pane's visible screen, one entry per row, painted dim behind
     /// the info box. Taken once when the overlay opens and re-taken only
     /// on `r`/resize, so it is a snapshot rather than a live mirror.
@@ -126,6 +138,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         .await
         .unwrap_or_default();
     let mut cells = build_cells(panes, &agents);
+    attach_prompt_times(client, &mut cells).await;
 
     if args.plain {
         for line in plain_lines(&cells) {
@@ -209,6 +222,7 @@ async fn drive(
                     .await
                     .unwrap_or_default();
                 let mut next = build_cells(panes, &agents);
+                attach_prompt_times(client, &mut next).await;
                 // Agent state is cheap to re-read and worth keeping live.
                 // Backdrops are neither: one `capture-pane` per pane per
                 // second buys a flicker of scrollback nobody is reading
@@ -309,6 +323,7 @@ pub(crate) fn build_cells(panes: Vec<PaneGeometry>, agents: &[Agent]) -> Vec<Pee
             PeekCell {
                 agent: mine.first().map(|a| (*a).clone()),
                 extra,
+                last_prompt_at: None,
                 capture: Vec::new(),
                 geo,
             }
@@ -331,6 +346,33 @@ fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
         cell.capture = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id)
             .map(|raw| raw.lines().map(str::to_string).collect())
             .unwrap_or_default();
+    }
+}
+
+/// Stamp each cell with when its agent last received a prompt.
+///
+/// One in-memory history read per pane, matched on `session_id`: a pane
+/// that has been reused by a *new* agent session must not inherit the
+/// previous occupant's timestamp, and a `muxa register`ed task whose
+/// `last_prompt` is really its command line has no history of its own to
+/// borrow from.
+async fn attach_prompt_times(client: &Client, cells: &mut [PeekCell]) {
+    for cell in cells.iter_mut() {
+        let Some(session_id) = cell.agent.as_ref().map(|a| a.session_id.clone()) else {
+            continue;
+        };
+        let history = client
+            .recent_prompts_with_timeout(
+                Some(&cell.geo.pane_id),
+                Some(PROMPT_HISTORY_LOOKBACK),
+                PEEK_IPC_TIMEOUT,
+            )
+            .await
+            .unwrap_or_default();
+        cell.last_prompt_at = history
+            .into_iter()
+            .find(|e| e.session_id == session_id)
+            .map(|e| e.at);
     }
 }
 
@@ -686,6 +728,7 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
             &mut budget,
             summary,
             "",
+            Style::default(),
             allowance,
             Style::default()
                 .fg(Color::Cyan)
@@ -694,11 +737,17 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
         );
     }
     if let Some(prompt) = agent.last_prompt.as_deref() {
+        // The age rides in the glyph slot so it reads as a stamp on the
+        // prompt rather than as part of what the human typed, and so
+        // wrapped continuation lines indent past it.
         push_tier(
             &mut lines,
             &mut budget,
             prompt,
-            glyph_prompt(),
+            &prompt_lead(cell),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
             2,
             Style::default().fg(Color::White),
             width,
@@ -710,6 +759,7 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
             &mut budget,
             response,
             glyph_response(),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
             3,
             Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
             width,
@@ -720,11 +770,13 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
 
 /// Wrap one tier into at most `max_lines` rows (further capped by what's
 /// left of the box), prefixing the first row with `glyph`.
+#[allow(clippy::too_many_arguments)]
 fn push_tier(
     lines: &mut Vec<Line<'static>>,
     budget: &mut usize,
     raw: &str,
     glyph: &str,
+    glyph_style: Style,
     max_lines: usize,
     style: Style,
     width: usize,
@@ -748,10 +800,23 @@ fn push_tier(
             " ".repeat(indent)
         };
         lines.push(Line::from(vec![
-            Span::styled(prefix, style),
+            Span::styled(prefix, glyph_style),
             Span::styled(chunk, style),
         ]));
         *budget -= 1;
+    }
+}
+
+/// `▸ ` on its own, or `▸ 3m ago ` when the daemon knows when the human
+/// last sent this agent a prompt.
+fn prompt_lead(cell: &PeekCell) -> String {
+    match cell.last_prompt_at {
+        Some(at) => format!(
+            "{}{} ",
+            glyph_prompt(),
+            crate::relative_time(OffsetDateTime::now_utc(), at)
+        ),
+        None => glyph_prompt().to_string(),
     }
 }
 
@@ -850,9 +915,13 @@ pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
                 .as_ref()
                 .and_then(|a| summary_source(a).or(a.last_prompt.as_deref()))
                 .map_or_else(|| "-".to_string(), collapse);
+            let age = cell.last_prompt_at.map_or_else(
+                || "-".to_string(),
+                |at| crate::relative_time(OffsetDateTime::now_utc(), at),
+            );
             format!(
-                "{} {} {} {:<8} {}",
-                cell.geo.pane_index, cell.geo.pane_id, glyph, label, summary
+                "{} {} {} {:<8} {:>8}  {}",
+                cell.geo.pane_index, cell.geo.pane_id, glyph, label, age, summary
             )
         })
         .collect()
@@ -1259,6 +1328,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
+            last_prompt_at: None,
             capture: Vec::new(),
         };
 
@@ -1293,6 +1363,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
+            last_prompt_at: None,
             capture: Vec::new(),
         };
         for height in 0..12u16 {
@@ -1315,6 +1386,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
+            last_prompt_at: None,
             capture: Vec::new(),
         };
         let text = body_text(&cell, 38, 6);
@@ -1378,6 +1450,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(agent("%0", AgentState::Working)),
             extra: 0,
+            last_prompt_at: None,
             capture: Vec::new(),
         };
         assert!(meta_line(&cell, 30).is_none());
@@ -1576,6 +1649,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 30, true),
             agent: Some(a),
             extra: 0,
+            last_prompt_at: None,
             capture: Vec::new(),
         };
         for height in MIN_BORDERED_HEIGHT..30 {
@@ -1598,6 +1672,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 24, true),
             agent: Some(agent("%0", AgentState::Idle)),
             extra: 0,
+            last_prompt_at: None,
             capture: Vec::new(),
         };
         let rect = Rect::new(0, 0, 40, 24);
@@ -1612,6 +1687,69 @@ mod tests {
             ..quiet
         };
         assert!(box_height(&talkative, rect) > MIN_BORDERED_HEIGHT);
+    }
+
+    #[test]
+    fn prompt_line_carries_when_the_human_last_typed() {
+        let mut a = agent("%0", AgentState::Working);
+        a.last_prompt = Some("fix the token check".into());
+        let mut cell = PeekCell {
+            geo: geo("0", 0, 0, 40, 12, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: Some(OffsetDateTime::now_utc() - time::Duration::minutes(5)),
+            capture: Vec::new(),
+        };
+
+        let text = body_text(&cell, 38, 6);
+        let stamped = text
+            .lines
+            .iter()
+            .map(line_text)
+            .find(|l| l.contains("fix the token check"))
+            .expect("prompt line rendered");
+        assert!(stamped.contains("5m ago"), "{stamped}");
+
+        // Unknown time degrades to the bare glyph rather than a filler
+        // value — an invented "0s ago" would be a lie about when the
+        // human last touched this agent.
+        cell.last_prompt_at = None;
+        let plainer = body_text(&cell, 38, 6)
+            .lines
+            .iter()
+            .map(line_text)
+            .find(|l| l.contains("fix the token check"))
+            .expect("prompt line rendered");
+        assert!(!plainer.contains("ago"), "{plainer}");
+    }
+
+    #[test]
+    fn prompt_age_indents_wrapped_continuation_lines() {
+        // The age sits in the glyph slot, so a prompt that wraps must
+        // indent past it rather than starting under the timestamp.
+        let mut a = agent("%0", AgentState::Working);
+        a.last_prompt = Some("alpha bravo charlie delta echo foxtrot golf".into());
+        let cell = PeekCell {
+            geo: geo("0", 0, 0, 40, 12, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: Some(OffsetDateTime::now_utc() - time::Duration::minutes(5)),
+            capture: Vec::new(),
+        };
+        let text = body_text(&cell, 24, 4);
+        let rows: Vec<String> = text.lines.iter().map(line_text).collect();
+        assert!(rows.len() >= 2, "{rows:#?}");
+        let indent = rows[0].len() - rows[0].trim_start().len();
+        let continuation = &rows[1];
+        assert_eq!(
+            continuation.len() - continuation.trim_start().len(),
+            display_width("▸ 5m ago "),
+            "continuation should clear the glyph+age lead: {rows:#?}"
+        );
+        assert_eq!(indent, 0, "the first line starts at the glyph: {rows:#?}");
+        for row in &rows {
+            assert!(display_width(row) <= 24, "{rows:#?}");
+        }
     }
 
     #[test]

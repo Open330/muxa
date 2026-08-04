@@ -2001,7 +2001,7 @@ pub(crate) fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String 
 
 /// Human-friendly delta between `then` and `now`, rounded to the largest
 /// unit. Past timestamps only — future clocks collapse to "0s ago".
-fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
+pub(crate) fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
     let delta = now - then;
     let secs = delta.whole_seconds().max(0);
     if secs < 60 {

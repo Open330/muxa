@@ -1899,6 +1899,33 @@ impl Client {
         Ok(decode_agents(&resp))
     }
 
+    /// [`Self::recent_prompts`] under an explicit deadline, for callers on
+    /// a redraw budget. The daemon serves this from an in-memory deque, so
+    /// the deadline guards against a wedged daemon rather than a slow read.
+    pub async fn recent_prompts_with_timeout(
+        &self,
+        pane: Option<&str>,
+        limit: Option<usize>,
+        deadline: Duration,
+    ) -> Result<Vec<crate::history::HistoryEntry>, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "recent_prompts",
+        });
+        if let Some(p) = pane {
+            req["pane"] = serde_json::Value::String(p.to_string());
+        }
+        if let Some(l) = limit {
+            req["limit"] = serde_json::Value::from(l);
+        }
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        Ok(resp["prompts"]
+            .as_array()
+            .cloned()
+            .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
+            .unwrap_or_default())
+    }
+
     pub async fn by_surface(&self, surface_id: &str) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
