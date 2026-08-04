@@ -172,6 +172,24 @@ pub fn current_window_panes() -> (Vec<PaneGeometry>, bool) {
     }
 }
 
+/// Short name of the tmux server this process is talking to, read from
+/// `$TMUX` (`<socket_path>,<server_pid>,<session_id>`).
+///
+/// Pane ids are unique only per server, so consumers that match agent rows
+/// by pane id use this to reject a same-id row recorded against a
+/// different server. `None` outside tmux, or when `$TMUX` is malformed —
+/// callers must treat that as "unknown", never as "no match".
+pub fn current_socket_name() -> Option<String> {
+    socket_name_from_tmux_env(&std::env::var("TMUX").ok()?)
+}
+
+/// Pure half of [`current_socket_name`], split out so the parsing is
+/// testable without mutating process-wide environment.
+fn socket_name_from_tmux_env(raw: &str) -> Option<String> {
+    let path = raw.split(',').next().filter(|p| !p.is_empty())?;
+    Some(super::socket_short_name(path))
+}
+
 /// Dimensions of the client's current window. `None` when tmux is
 /// unavailable or the response can't be parsed.
 pub fn current_window_frame() -> Option<WindowFrame> {
@@ -275,6 +293,24 @@ mod tests {
         // not wrap around to 65535 and paint the overlay off-screen.
         let frame = parse_window_frame_line("120\t40\t120\t39\ttop").unwrap();
         assert_eq!(frame.pane_origin_y(), 0);
+    }
+
+    #[test]
+    fn socket_name_comes_from_the_tmux_env_path() {
+        // `$TMUX` is `<socket_path>,<server_pid>,<session_id>`; only the
+        // socket's basename identifies the server.
+        assert_eq!(
+            socket_name_from_tmux_env("/tmp/tmux-1044/amux,32037,30").as_deref(),
+            Some("amux")
+        );
+        assert_eq!(
+            socket_name_from_tmux_env("/private/tmp/tmux-501/default,900,3").as_deref(),
+            Some("default")
+        );
+        // A malformed value means "unknown" — callers must not read that
+        // as "no match".
+        assert!(socket_name_from_tmux_env("").is_none());
+        assert!(socket_name_from_tmux_env(",32037,30").is_none());
     }
 
     #[test]

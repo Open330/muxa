@@ -105,7 +105,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
         .await
         .unwrap_or_default();
-    let cells = build_cells(panes, zoomed, &agents);
+    let cells = build_cells(panes, &agents);
 
     if args.plain {
         for line in plain_lines(&cells) {
@@ -114,9 +114,12 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         return Ok(());
     }
 
-    let mut terminal = setup_terminal()?;
-    let outcome = drive(&mut terminal, client, cells, frame).await;
-    restore_terminal(&mut terminal);
+    // The guard restores the terminal on the way out of every path,
+    // including a panic mid-draw. Outside a popup (`muxa peek` run bare in
+    // a shell) nothing else would put the terminal back.
+    let mut guard = TerminalGuard::new(setup_terminal()?);
+    let outcome = drive(guard.terminal_mut(), client, cells, frame, zoomed).await;
+    drop(guard);
     // Jump only after the popup's screen is torn down: `select-pane`
     // repaints the window underneath, and doing it while we still own the
     // alternate screen leaves the user looking at our leftovers.
@@ -139,24 +142,32 @@ async fn drive(
     client: &Client,
     mut cells: Vec<PeekCell>,
     frame: Option<WindowFrame>,
+    mut zoomed: bool,
 ) -> Result<Outcome> {
     let placement = Placement::from(frame);
+    let mut typed = String::new();
     let mut last_refresh = Instant::now();
     // Set when something invalidated the current frame (an explicit `r`, a
     // resize) so the next pass re-reads immediately instead of waiting out
     // the interval.
     let mut stale = false;
     loop {
-        terminal.draw(|f| draw(f, &cells, placement))?;
+        terminal.draw(|f| draw(f, &cells, placement, zoomed))?;
 
         if event::poll(INPUT_POLL)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match classify(key) {
                     Action::Dismiss => return Ok(Outcome::Dismissed),
-                    Action::Refresh => stale = true,
-                    Action::Select(digit) => {
-                        if let Some(cell) = cells.iter().find(|c| c.geo.pane_index == digit) {
-                            return Ok(Outcome::Jump(cell.geo.pane_id.clone()));
+                    Action::Refresh => {
+                        typed.clear();
+                        stale = true;
+                    }
+                    Action::Digit(d) => {
+                        typed.push(d);
+                        match resolve_typed(&typed, &cells) {
+                            Selection::Hit(pane_id) => return Ok(Outcome::Jump(pane_id)),
+                            Selection::Prefix => {}
+                            Selection::Miss => typed.clear(),
                         }
                     }
                     Action::Ignore => {}
@@ -169,13 +180,14 @@ async fn drive(
         }
 
         if stale || last_refresh.elapsed() >= REFRESH_INTERVAL {
-            let (panes, zoomed) = muxa::tmux::layout::current_window_panes();
+            let (panes, now_zoomed) = muxa::tmux::layout::current_window_panes();
             if !panes.is_empty() {
                 let agents = client
                     .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
                     .await
                     .unwrap_or_default();
-                cells = build_cells(panes, zoomed, &agents);
+                cells = build_cells(panes, &agents);
+                zoomed = now_zoomed;
             }
             last_refresh = Instant::now();
             stale = false;
@@ -184,10 +196,39 @@ async fn drive(
 }
 
 enum Action {
-    Select(String),
+    Digit(char),
     Refresh,
     Dismiss,
     Ignore,
+}
+
+/// What the digits typed so far mean.
+enum Selection {
+    Hit(String),
+    /// Still ambiguous — `1` when both pane 1 and pane 10 exist. Waiting
+    /// for another digit is the only way to tell them apart.
+    Prefix,
+    Miss,
+}
+
+/// Resolve typed digits against the visible pane indexes.
+///
+/// Single-digit windows (nearly all of them) jump on the first keypress.
+/// A window with ten or more panes makes `1` a prefix of `10`, so those
+/// jump on the second — which beats tmux's own `display-panes`, where a
+/// pane you can see but whose index needs two digits is still reachable
+/// but easy to mistype, and beats the alternative of leaving panes 10+
+/// unreachable entirely.
+fn resolve_typed(typed: &str, cells: &[PeekCell]) -> Selection {
+    let exact = cells.iter().find(|c| c.geo.pane_index == typed);
+    let ambiguous = cells
+        .iter()
+        .any(|c| c.geo.pane_index.len() > typed.len() && c.geo.pane_index.starts_with(typed));
+    match (exact, ambiguous) {
+        (Some(cell), false) => Selection::Hit(cell.geo.pane_id.clone()),
+        (_, true) => Selection::Prefix,
+        (None, false) => Selection::Miss,
+    }
 }
 
 fn classify(key: KeyEvent) -> Action {
@@ -200,31 +241,29 @@ fn classify(key: KeyEvent) -> Action {
     match key.code {
         // `q` mirrors tmux's own `display-panes` dismissal; Esc is the
         // reflex for anything popup-shaped.
-        KeyCode::Char('q') | KeyCode::Esc => Action::Dismiss,
+        // `Q` too: the key that opened the overlay should close it.
+        KeyCode::Char('q' | 'Q') | KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('r') => Action::Refresh,
-        KeyCode::Char(c) if c.is_ascii_digit() => Action::Select(c.to_string()),
+        KeyCode::Char(c) if c.is_ascii_digit() => Action::Digit(c),
         _ => Action::Ignore,
     }
 }
 
 /// Pair pane geometry with the agent rows the daemon holds for it.
 ///
-/// When the window has a zoomed pane, tmux still reports the *unzoomed*
-/// rectangles for its siblings — boxes drawn from those would land on
-/// screen the zoomed pane now covers, so only the zoomed (active) pane is
-/// kept.
-pub(crate) fn build_cells(
-    panes: Vec<PaneGeometry>,
-    zoomed: bool,
-    agents: &[Agent],
-) -> Vec<PeekCell> {
+/// Every visible pane gets a cell, including the ones a zoomed pane is
+/// currently covering: the attention count in the footer must still see
+/// them, and `--plain` lists them. Hiding the covered ones is a *drawing*
+/// concern, handled in [`draw`].
+pub(crate) fn build_cells(panes: Vec<PaneGeometry>, agents: &[Agent]) -> Vec<PeekCell> {
+    let here = muxa::tmux::layout::current_socket_name();
     panes
         .into_iter()
-        .filter(|p| !zoomed || p.active)
         .map(|geo| {
             let mut mine: Vec<&Agent> = agents
                 .iter()
                 .filter(|a| a.pane.as_deref() == Some(geo.pane_id.as_str()))
+                .filter(|a| on_this_server(a, here.as_deref()))
                 .collect();
             // Most interesting first: a pane holding both a live agent and
             // the husk of a previous one should read as the live one.
@@ -241,6 +280,21 @@ pub(crate) fn build_cells(
             }
         })
         .collect()
+}
+
+/// Whether an agent row can belong to the tmux server peek is running on.
+///
+/// Pane ids are only unique *per server*, so with two tmux servers up, a
+/// `%5` recorded against one can collide with `%5` on the other and put a
+/// stranger's prompt in your box. Only reject when both sides actually
+/// name a socket: the field is backfilled best-effort by the reconciler
+/// and is routinely `None`, where dropping the row would be worse than the
+/// collision it guards against.
+fn on_this_server(agent: &Agent, here: Option<&str>) -> bool {
+    match (agent.tmux_socket.as_deref(), here) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => true,
+    }
 }
 
 /// Sort key for "which agent speaks for this pane" — lower wins. Blocked
@@ -302,10 +356,16 @@ impl From<Option<WindowFrame>> for Placement {
     }
 }
 
-fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement) {
+fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool) {
     let area = f.area();
     f.render_widget(Clear, area);
     for cell in cells {
+        // A zoomed window still reports the *unzoomed* rectangles for the
+        // covered panes; drawing those would stamp boxes over screen the
+        // zoomed pane now owns.
+        if zoomed && !cell.geo.active {
+            continue;
+        }
         if let Some(rect) = cell_rect(&cell.geo, placement.origin_y, area) {
             render_cell(f, cell, rect);
         }
@@ -805,6 +865,36 @@ fn ellipsize(s: &str, width: usize) -> String {
     format!("{head}…")
 }
 
+/// Puts the terminal back on every exit path — including a panic, which
+/// would otherwise strand a bare `muxa peek` in raw mode on the alternate
+/// screen. (Inside a popup tmux tears the pty down for us; outside one,
+/// nothing does.)
+struct TerminalGuard {
+    terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
+}
+
+impl TerminalGuard {
+    fn new(terminal: Terminal<CrosstermBackend<Stdout>>) -> Self {
+        Self {
+            terminal: Some(terminal),
+        }
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        self.terminal.as_mut().expect("terminal present")
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Some(mut t) = self.terminal.take() {
+            let _ = disable_raw_mode();
+            let _ = execute!(t.backend_mut(), LeaveAlternateScreen);
+            let _ = t.show_cursor();
+        }
+    }
+}
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -813,12 +903,6 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // and matters for `muxa peek` run bare in a shell.
     execute!(stdout, EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
-}
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
 }
 
 #[cfg(test)]
@@ -919,23 +1003,89 @@ mod tests {
     }
 
     #[test]
-    fn zoom_keeps_only_the_active_pane() {
-        // tmux leaves stale rectangles on the hidden siblings; drawing
-        // them would paint boxes over the zoomed pane's screen.
-        let panes = vec![
-            geo("0", 0, 0, 120, 19, false),
-            geo("1", 0, 0, 120, 39, true),
-        ];
-        let cells = build_cells(panes, true, &[]);
-        assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].geo.pane_index, "1");
+    fn zoom_draws_only_the_active_pane_but_still_counts_the_rest() {
+        // tmux leaves stale rectangles on the covered siblings, so drawing
+        // them would paint boxes over the zoomed pane's screen. The hidden
+        // agent must still reach the footer count — a pane you cannot see
+        // is exactly the one you need told about.
+        let panes = vec![geo("0", 0, 0, 20, 5, false), geo("1", 0, 0, 20, 11, true)];
+        let cells = build_cells(
+            panes,
+            &[
+                agent("%0", AgentState::WaitingInput),
+                agent("%1", AgentState::Working),
+            ],
+        );
+        assert_eq!(cells.len(), 2, "both panes keep a cell");
+        assert!(line_text(&hint_line(&cells)).starts_with(" 1 needs you "));
 
-        // Unzoomed, both survive.
-        let panes = vec![
-            geo("0", 0, 0, 120, 19, false),
-            geo("1", 0, 20, 120, 19, true),
-        ];
-        assert_eq!(build_cells(panes, false, &[]).len(), 2);
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), true))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains(" 1 "), "{rendered}");
+        assert!(
+            !rendered.contains(" 0 "),
+            "the covered pane must not be painted over the zoomed one: {rendered}"
+        );
+
+        // Unzoomed, both are drawn — with the real (non-overlapping)
+        // rectangles tmux reports once the zoom is released.
+        let split = build_cells(
+            vec![geo("0", 0, 0, 20, 5, false), geo("1", 0, 6, 20, 5, true)],
+            &[],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal
+            .draw(|f| draw(f, &split, Placement::default(), false))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains(" 0 "), "{rendered}");
+        assert!(rendered.contains(" 1 "), "{rendered}");
+    }
+
+    #[test]
+    fn agent_from_another_tmux_server_is_not_borrowed() {
+        // Pane ids are unique per server, so `%0` on socket `amux` must not
+        // narrate `%0` here.
+        let mut theirs = agent("%0", AgentState::Working);
+        theirs.tmux_socket = Some("amux".into());
+        theirs.ai_title = Some("someone else's work".into());
+        assert!(!on_this_server(&theirs, Some("default")));
+        assert!(on_this_server(&theirs, Some("amux")));
+
+        // Unknown on either side means "can't tell" — keep the row rather
+        // than blanking a box, since the field is backfilled best-effort
+        // and is routinely absent.
+        let unknown = agent("%0", AgentState::Working);
+        assert!(on_this_server(&unknown, Some("default")));
+        assert!(on_this_server(&theirs, None));
+    }
+
+    #[test]
+    fn digits_resolve_and_wait_only_when_ambiguous() {
+        let few = build_cells(
+            vec![geo("0", 0, 0, 20, 5, true), geo("1", 0, 6, 20, 5, false)],
+            &[],
+        );
+        // Nine-or-fewer panes: the first keypress is the jump.
+        assert!(matches!(resolve_typed("1", &few), Selection::Hit(id) if id == "%1"));
+        assert!(matches!(resolve_typed("7", &few), Selection::Miss));
+
+        // With a pane 10, `1` is a prefix — jumping immediately would make
+        // pane 10 unreachable.
+        let many = build_cells(
+            vec![
+                geo("1", 0, 0, 20, 5, true),
+                geo("10", 0, 6, 20, 5, false),
+                geo("11", 0, 12, 20, 5, false),
+            ],
+            &[],
+        );
+        assert!(matches!(resolve_typed("1", &many), Selection::Prefix));
+        assert!(matches!(resolve_typed("10", &many), Selection::Hit(id) if id == "%10"));
+        assert!(matches!(resolve_typed("19", &many), Selection::Miss));
     }
 
     #[test]
@@ -947,7 +1097,7 @@ mod tests {
             agent("%0", AgentState::WaitingChoice),
             agent("%0", AgentState::Working),
         ];
-        let cells = build_cells(vec![geo("0", 0, 0, 80, 24, true)], false, &agents);
+        let cells = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &agents);
         assert_eq!(cells.len(), 1);
         assert_eq!(
             cells[0].agent.as_ref().unwrap().state,
@@ -958,7 +1108,7 @@ mod tests {
 
     #[test]
     fn pane_without_agent_still_gets_a_cell() {
-        let cells = build_cells(vec![geo("0", 0, 0, 80, 24, true)], false, &[]);
+        let cells = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &[]);
         assert_eq!(cells.len(), 1);
         assert!(cells[0].agent.is_none());
         assert_eq!(cells[0].extra, 0);
@@ -1107,12 +1257,11 @@ mod tests {
 
     #[test]
     fn hint_leads_with_the_attention_count() {
-        let quiet = build_cells(vec![geo("0", 0, 0, 80, 24, true)], false, &[]);
+        let quiet = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &[]);
         assert!(!line_text(&hint_line(&quiet)).contains("need"));
 
         let cells = build_cells(
             vec![geo("0", 0, 0, 80, 12, true), geo("1", 0, 13, 80, 11, false)],
-            false,
             &[
                 agent("%0", AgentState::WaitingInput),
                 agent("%1", AgentState::WaitingChoice),
@@ -1125,7 +1274,7 @@ mod tests {
     fn keys_map_to_actions() {
         assert!(matches!(
             classify(KeyEvent::from(KeyCode::Char('3'))),
-            Action::Select(d) if d == "3"
+            Action::Digit('3')
         ));
         assert!(matches!(
             classify(KeyEvent::from(KeyCode::Esc)),
@@ -1133,6 +1282,11 @@ mod tests {
         ));
         assert!(matches!(
             classify(KeyEvent::from(KeyCode::Char('q'))),
+            Action::Dismiss
+        ));
+        // The key that opened the overlay should also close it.
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('Q'))),
             Action::Dismiss
         ));
         assert!(matches!(
@@ -1157,12 +1311,11 @@ mod tests {
         a.last_prompt = Some("fix the token check".into());
         let cells = build_cells(
             vec![geo("0", 0, 0, 40, 11, false), geo("1", 0, 12, 40, 11, true)],
-            false,
             &[a],
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default()))
+            .draw(|f| draw(f, &cells, Placement::default(), false))
             .unwrap();
         let rendered = screen(&terminal);
         // Pane digits are the jump affordance — both must be visible.
@@ -1177,12 +1330,11 @@ mod tests {
     fn tiny_pane_drops_the_border_for_the_label() {
         let cells = build_cells(
             vec![geo("7", 0, 0, 20, 2, true)],
-            false,
             &[agent("%7", AgentState::Working)],
         );
         let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
         terminal
-            .draw(|f| draw(f, &cells, Placement::default()))
+            .draw(|f| draw(f, &cells, Placement::default(), false))
             .unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains(" 7 "), "{rendered}");
@@ -1208,9 +1360,11 @@ mod tests {
         assert_eq!(placement.origin_y, 1);
         assert!(placement.hint_at_top);
 
-        let cells = build_cells(vec![geo("0", 0, 0, 20, 5, true)], false, &[]);
+        let cells = build_cells(vec![geo("0", 0, 0, 20, 5, true)], &[]);
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
-        terminal.draw(|f| draw(f, &cells, placement)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, placement, false))
+            .unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(rows[0].contains("0-9 jump"), "{rows:#?}");
         // The pane box is pushed down by the status row and keeps its own
@@ -1226,7 +1380,7 @@ mod tests {
         }));
         assert_eq!(bottom.origin_y, 0);
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
-        terminal.draw(|f| draw(f, &cells, bottom)).unwrap();
+        terminal.draw(|f| draw(f, &cells, bottom, false)).unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(rows[0].contains(" 0 "), "{rows:#?}");
         assert!(rows[5].contains("0-9 jump"), "{rows:#?}");
@@ -1238,7 +1392,6 @@ mod tests {
         a.ai_title = Some("auth refactor".into());
         let cells = build_cells(
             vec![geo("0", 0, 0, 40, 11, false), geo("1", 0, 12, 40, 11, true)],
-            false,
             &[a],
         );
         let lines = plain_lines(&cells);
