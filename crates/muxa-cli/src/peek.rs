@@ -570,7 +570,22 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         })
-        .title(Line::from(header));
+        .title(Line::from(header.clone()));
+    // Right-aligned on the same border row as the header. A box too
+    // narrow to hold both would render them overlapping, so the stamp
+    // yields to the identity that makes the pane jumpable.
+    let block = match age_stamp(cell) {
+        Some(stamp) if fits_alongside_header(&header, &stamp, rect.width) => block.title_top(
+            Line::from(Span::styled(
+                stamp,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ))
+            .right_aligned(),
+        ),
+        _ => block,
+    };
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.height == 0 || inner.width == 0 {
@@ -648,6 +663,15 @@ pub(crate) fn box_height(cell: &PeekCell, rect: Rect) -> u16 {
         needed += 1;
     }
     (needed + 2).clamp(MIN_BORDERED_HEIGHT, ceiling)
+}
+
+/// Whether the header and the age stamp can share the top border without
+/// colliding. Both are drawn on the same row from opposite ends, and
+/// ratatui will happily overlap them; the two corners plus a gap between
+/// is the floor.
+fn fits_alongside_header(header: &[Span<'static>], stamp: &str, width: u16) -> bool {
+    let header_width: usize = header.iter().map(|s| display_width(&s.content)).sum();
+    header_width + display_width(stamp) + 3 <= width as usize
 }
 
 /// `1 ● claude +2` — the box title, and the whole box when it's one row.
@@ -728,7 +752,6 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
             &mut budget,
             summary,
             "",
-            Style::default(),
             allowance,
             Style::default()
                 .fg(Color::Cyan)
@@ -737,17 +760,11 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
         );
     }
     if let Some(prompt) = agent.last_prompt.as_deref() {
-        // The age rides in the glyph slot so it reads as a stamp on the
-        // prompt rather than as part of what the human typed, and so
-        // wrapped continuation lines indent past it.
         push_tier(
             &mut lines,
             &mut budget,
             prompt,
-            &prompt_lead(cell),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            glyph_prompt(),
             2,
             Style::default().fg(Color::White),
             width,
@@ -759,7 +776,6 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
             &mut budget,
             response,
             glyph_response(),
-            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
             3,
             Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
             width,
@@ -770,13 +786,11 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
 
 /// Wrap one tier into at most `max_lines` rows (further capped by what's
 /// left of the box), prefixing the first row with `glyph`.
-#[allow(clippy::too_many_arguments)]
 fn push_tier(
     lines: &mut Vec<Line<'static>>,
     budget: &mut usize,
     raw: &str,
     glyph: &str,
-    glyph_style: Style,
     max_lines: usize,
     style: Style,
     width: usize,
@@ -800,24 +814,25 @@ fn push_tier(
             " ".repeat(indent)
         };
         lines.push(Line::from(vec![
-            Span::styled(prefix, glyph_style),
+            Span::styled(prefix, style),
             Span::styled(chunk, style),
         ]));
         *budget -= 1;
     }
 }
 
-/// `▸ ` on its own, or `▸ 3m ago ` when the daemon knows when the human
-/// last sent this agent a prompt.
-fn prompt_lead(cell: &PeekCell) -> String {
-    match cell.last_prompt_at {
-        Some(at) => format!(
-            "{}{} ",
-            glyph_prompt(),
-            crate::relative_time(OffsetDateTime::now_utc(), at)
-        ),
-        None => glyph_prompt().to_string(),
-    }
+/// ` 5m ago ` for the box's top-right corner — how long since the human
+/// last prompted this agent.
+///
+/// It lives on the border rather than inline with the prompt text, where
+/// it broke the reading flow of the very line it was annotating. The
+/// border is chrome; a timestamp is chrome.
+pub(crate) fn age_stamp(cell: &PeekCell) -> Option<String> {
+    let at = cell.last_prompt_at?;
+    Some(format!(
+        " {} ",
+        crate::relative_time(OffsetDateTime::now_utc(), at)
+    ))
 }
 
 fn glyph_prompt() -> &'static str {
@@ -1690,66 +1705,72 @@ mod tests {
     }
 
     #[test]
-    fn prompt_line_carries_when_the_human_last_typed() {
+    fn age_stamp_sits_on_the_border_not_in_the_prompt() {
         let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
         a.last_prompt = Some("fix the token check".into());
-        let mut cell = PeekCell {
-            geo: geo("0", 0, 0, 40, 12, true),
-            agent: Some(a),
-            extra: 0,
-            last_prompt_at: Some(OffsetDateTime::now_utc() - time::Duration::minutes(5)),
-            capture: Vec::new(),
-        };
+        let mut cells = build_cells(vec![geo("0", 0, 0, 40, 12, true)], &[a]);
+        cells[0].last_prompt_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(5));
 
-        let text = body_text(&cell, 38, 6);
-        let stamped = text
-            .lines
-            .iter()
-            .map(line_text)
-            .find(|l| l.contains("fix the token check"))
-            .expect("prompt line rendered");
-        assert!(stamped.contains("5m ago"), "{stamped}");
+        let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
 
-        // Unknown time degrades to the bare glyph rather than a filler
-        // value — an invented "0s ago" would be a lie about when the
-        // human last touched this agent.
-        cell.last_prompt_at = None;
-        let plainer = body_text(&cell, 38, 6)
-            .lines
+        // On the border, hugging the right corner.
+        assert!(rows[0].contains("5m ago"), "{rows:#?}");
+        assert!(rows[0].trim_end().ends_with('╗'), "{rows:#?}");
+        // Not wedged into the prompt line, which broke the reading flow of
+        // the very text it annotated.
+        let prompt_row = rows
             .iter()
-            .map(line_text)
-            .find(|l| l.contains("fix the token check"))
+            .find(|r| r.contains("fix the token check"))
             .expect("prompt line rendered");
-        assert!(!plainer.contains("ago"), "{plainer}");
+        assert!(!prompt_row.contains("ago"), "{prompt_row}");
+        // The glyph leads the text directly, with nothing wedged between.
+        assert!(prompt_row.contains("▸ fix the token check"), "{prompt_row}");
     }
 
     #[test]
-    fn prompt_age_indents_wrapped_continuation_lines() {
-        // The age sits in the glyph slot, so a prompt that wraps must
-        // indent past it rather than starting under the timestamp.
+    fn unknown_prompt_time_leaves_the_border_bare() {
+        // An invented "0s ago" would be a lie about when the human last
+        // showed up — the question the stamp exists to answer.
         let mut a = agent("%0", AgentState::Working);
-        a.last_prompt = Some("alpha bravo charlie delta echo foxtrot golf".into());
-        let cell = PeekCell {
-            geo: geo("0", 0, 0, 40, 12, true),
-            agent: Some(a),
-            extra: 0,
-            last_prompt_at: Some(OffsetDateTime::now_utc() - time::Duration::minutes(5)),
-            capture: Vec::new(),
-        };
-        let text = body_text(&cell, 24, 4);
-        let rows: Vec<String> = text.lines.iter().map(line_text).collect();
-        assert!(rows.len() >= 2, "{rows:#?}");
-        let indent = rows[0].len() - rows[0].trim_start().len();
-        let continuation = &rows[1];
-        assert_eq!(
-            continuation.len() - continuation.trim_start().len(),
-            display_width("▸ 5m ago "),
-            "continuation should clear the glyph+age lead: {rows:#?}"
-        );
-        assert_eq!(indent, 0, "the first line starts at the glyph: {rows:#?}");
-        for row in &rows {
-            assert!(display_width(row) <= 24, "{rows:#?}");
-        }
+        a.last_prompt = Some("fix the token check".into());
+        let cells = build_cells(vec![geo("0", 0, 0, 40, 12, true)], &[a]);
+        assert!(cells[0].last_prompt_at.is_none());
+        assert!(age_stamp(&cells[0]).is_none());
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .unwrap();
+        assert!(!screen(&terminal).contains("ago"));
+    }
+
+    #[test]
+    fn narrow_box_drops_the_stamp_rather_than_overlapping_the_header() {
+        // ratatui draws both titles on the same row from opposite ends and
+        // will happily let them collide; the digit is what makes the pane
+        // jumpable, so the stamp is what yields.
+        let mut a = agent("%0", AgentState::Working);
+        a.last_prompt = Some("fix it".into());
+        let mut cells = build_cells(vec![geo("0", 0, 0, 16, 8, true)], &[a]);
+        cells[0].last_prompt_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(5));
+
+        let header = header_spans(&cells[0]);
+        let stamp = age_stamp(&cells[0]).unwrap();
+        assert!(!fits_alongside_header(&header, &stamp, 16));
+        assert!(fits_alongside_header(&header, &stamp, 40));
+
+        let mut terminal = Terminal::new(TestBackend::new(16, 9)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+        assert!(!rows[0].contains("ago"), "{rows:#?}");
+        assert!(rows[0].contains(" 0 "), "the digit survives: {rows:#?}");
     }
 
     #[test]
