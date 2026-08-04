@@ -109,12 +109,53 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
+    pub collaboration: CollaborationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
     pub stats: StatsConfig,
+}
+
+/// `[collaboration]` config — same-window durable agent request/reply.
+/// Disabled by default because idle wake-up injects a short prompt into a
+/// peer pane. Enabling it is an explicit grant for local peer coordination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollaborationConfig {
+    pub enabled: bool,
+    /// Atomic mailbox snapshot. Defaults to
+    /// `$XDG_DATA_HOME/muxa/collaboration.json`.
+    pub path: Option<PathBuf>,
+    /// `never` keeps delivery pull-only; `idle_only` wakes hook-authoritative
+    /// agents only at their top-level idle prompt.
+    pub wake: CollaborationWake,
+    #[serde(default = "default_collaboration_max_message_bytes")]
+    pub max_message_bytes: usize,
+}
+
+impl Default for CollaborationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            wake: CollaborationWake::IdleOnly,
+            max_message_bytes: default_collaboration_max_message_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationWake {
+    Never,
+    #[default]
+    IdleOnly,
+}
+
+fn default_collaboration_max_message_bytes() -> usize {
+    16 * 1024
 }
 
 /// `[stats]` config — tuning for the engaged ("active") time estimate in
@@ -1293,6 +1334,18 @@ mod tests {
             toml::from_str("[screen_detect]\nenabled = false\ninterval_secs = 10\n").unwrap();
         assert!(!cfg.screen_detect.enabled);
         assert_eq!(cfg.screen_detect.interval_secs, 10);
+    }
+
+    #[test]
+    fn collaboration_is_opt_in_and_parses_wake_policy() {
+        assert!(!Config::default().collaboration.enabled);
+        let cfg: Config = toml::from_str(
+            "[collaboration]\nenabled = true\nwake = \"never\"\nmax_message_bytes = 4096\n",
+        )
+        .unwrap();
+        assert!(cfg.collaboration.enabled);
+        assert_eq!(cfg.collaboration.wake, CollaborationWake::Never);
+        assert_eq!(cfg.collaboration.max_message_bytes, 4096);
     }
 
     #[test]

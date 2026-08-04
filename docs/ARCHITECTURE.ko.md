@@ -13,6 +13,7 @@ agent hook/status event
                                              +--> state.json
                                              +--> prompts.ndjson
                                              +--> activity.ndjson
+                                             +--> collaboration.json
                                              +--> notifications / sinks
                                              +--> dashboard SSE
 ```
@@ -38,6 +39,7 @@ file도 함께 사용합니다.
 | `prompts.ndjson` | retained prompt audit log. |
 | `activity.ndjson` | append-only duration ledger. |
 | `session-activity.json` | legacy/compat tmux foreground total. |
+| `collaboration.json` | same-window agent request/reply mailbox snapshot. |
 
 경로는 설정 가능하며 기본값은 `$XDG_DATA_HOME/muxa` 아래입니다.
 

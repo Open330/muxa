@@ -9,6 +9,7 @@ pub const HISTORY_FILENAME: &str = "prompts.ndjson";
 pub const ACTIVITY_FILENAME: &str = "activity.ndjson";
 pub const STATE_FILENAME: &str = "state.json";
 pub const SESSION_ACTIVITY_FILENAME: &str = "session-activity.json";
+pub const COLLABORATION_FILENAME: &str = "collaboration.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -52,6 +53,11 @@ pub fn default_state_file() -> Option<PathBuf> {
 /// cleanup policies stay simple.
 pub fn default_session_activity_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(SESSION_ACTIVITY_FILENAME))
+}
+
+/// Default durable collaboration mailbox snapshot.
+pub fn default_collaboration_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_FILENAME))
 }
 
 fn posix_uid() -> u32 {

@@ -7734,7 +7734,10 @@ mod tests {
         PaneInfo {
             socket: None,
             pane_id: pane.into(),
+            session_id: String::new(),
             session: session.into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: window.to_string(),
             pane_index: pane_idx.to_string(),
             tty: "/dev/pts/0".into(),
@@ -9277,7 +9280,10 @@ sort = ["state"]
         let panes = vec![PaneInfo {
             socket: None,
             pane_id: "%42".into(),
+            session_id: String::new(),
             session: "main".into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "1".into(),
             pane_index: "0".into(),
             tty: String::new(),

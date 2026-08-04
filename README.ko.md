@@ -96,6 +96,7 @@ muxa watch
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
+| `muxa peers` / `muxa msg` | 같은 tmux window의 agent를 찾고 durable request/reply 메시지를 주고받음. |
 | `muxa stats --since today` | WACT/ACT/WORK/WAIT 중심 summary. day/project/agent/session 단위로 묶을 수 있고, `--graph`는 WACT 시간 그래프만, `--verbose`는 진단 컬럼을 표시. |
 | `muxa report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
@@ -175,6 +176,7 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
 | Zellij 계획 | [docs/ZELLIJ.md](docs/ZELLIJ.md) |
 | Architecture와 개발 | [docs/ARCHITECTURE.ko.md](docs/ARCHITECTURE.ko.md) |
+| Agent 간 협업 | [docs/COLLABORATION.ko.md](docs/COLLABORATION.ko.md) |
 
 ## 개발
 

@@ -21,6 +21,7 @@ use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{
     claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
 };
+use muxa::collaboration::{CollaborationOrigin, NewRequest, RequestKind, RequestStatus, WorkMode};
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
 use muxa::state::Agent;
@@ -98,6 +99,17 @@ enum Cmd {
         /// Overrides `--limit`.
         #[arg(long, conflicts_with = "limit")]
         all: bool,
+    },
+    /// List collaboration peers in the current tmux window.
+    Peers {
+        /// Emit the full room context as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Durable request/reply messaging with agents in the current tmux window.
+    Msg {
+        #[command(subcommand)]
+        action: MsgCmd,
     },
     /// Summarize retained prompt history, live agents, and session duration.
     Stats(stats::Args),
@@ -227,6 +239,46 @@ enum Cmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum MsgCmd {
+    /// Send a request to `peer`, `%N`, or `pane:%N`.
+    Send {
+        target: String,
+        body: String,
+        #[arg(long, default_value = "question")]
+        kind: String,
+        /// Explicitly authorize edits; the default collaboration contract is read-only.
+        #[arg(long)]
+        execute: bool,
+        /// Advisory writable path scope. Repeat for multiple paths.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Fire-and-forget message; do not expect a reply.
+        #[arg(long)]
+        no_reply: bool,
+    },
+    /// Claim and print this agent's pending requests.
+    Inbox {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Complete, block, decline, or fail a request.
+    Reply {
+        request_id: String,
+        body: String,
+        #[arg(long, default_value = "completed")]
+        status: String,
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+    },
+    /// Wait for the structured reply to a sent request.
+    Wait {
+        request_id: String,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum HookCmd {
     /// Claude Code hook handler. Reads hook JSON on stdin.
     Claude {
@@ -333,6 +385,8 @@ async fn main() -> Result<()> {
             needs_attention,
         } => cmd_status_line(&client, pane, needs_attention).await,
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
+        Cmd::Peers { json } => cmd_peers(&client, json).await,
+        Cmd::Msg { action } => cmd_msg(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
@@ -454,6 +508,151 @@ async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> R
     }
     let pruned = client.prune(Duration::from_secs(max_age_secs)).await?;
     println!("Pruned {pruned} orphan agent row(s).");
+    Ok(())
+}
+
+fn collaboration_origin() -> Result<CollaborationOrigin> {
+    let pane = std::env::var("TMUX_PANE")
+        .context("collaboration commands must run inside a tmux pane (TMUX_PANE is unset)")?;
+    let socket = std::env::var("TMUX").ok().and_then(|value| {
+        let path = value.split(',').next()?.trim();
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    Ok(CollaborationOrigin { pane, socket })
+}
+
+fn collaboration_request_kind(value: &str) -> Result<RequestKind> {
+    match value {
+        "question" => Ok(RequestKind::Question),
+        "review" => Ok(RequestKind::Review),
+        "task" => Ok(RequestKind::Task),
+        "notice" => Ok(RequestKind::Notice),
+        _ => anyhow::bail!("kind must be question, review, task, or notice"),
+    }
+}
+
+fn collaboration_reply_status(value: &str) -> Result<RequestStatus> {
+    match value {
+        "completed" => Ok(RequestStatus::Completed),
+        "blocked" => Ok(RequestStatus::Blocked),
+        "declined" => Ok(RequestStatus::Declined),
+        "failed" => Ok(RequestStatus::Failed),
+        _ => anyhow::bail!("status must be completed, blocked, declined, or failed"),
+    }
+}
+
+async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
+    let room = client
+        .collaboration_context(&collaboration_origin()?)
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&room)?);
+        return Ok(());
+    }
+    println!(
+        "room {} · self {} · {} unread",
+        room.current.room.window_id,
+        room.current.label(),
+        room.unread,
+    );
+    if room.peers.is_empty() {
+        println!("No collaboration peers in this window.");
+    } else {
+        for peer in room.peers {
+            println!("{}  {:<16}  {}", peer.pane, peer.label(), peer.state);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
+    let origin = collaboration_origin()?;
+    match action {
+        MsgCmd::Send {
+            target,
+            body,
+            kind,
+            execute,
+            paths,
+            no_reply,
+        } => {
+            let kind = collaboration_request_kind(&kind)?;
+            let request = client
+                .collaboration_send(
+                    &origin,
+                    &target,
+                    &NewRequest {
+                        kind,
+                        body,
+                        expects_reply: !no_reply && kind != RequestKind::Notice,
+                        work_mode: if execute {
+                            WorkMode::Execute
+                        } else {
+                            WorkMode::ReadOnly
+                        },
+                        paths,
+                    },
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&request)?);
+        }
+        MsgCmd::Inbox { json } => {
+            let requests = client.collaboration_inbox(&origin).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&requests)?);
+            } else if requests.is_empty() {
+                println!("Inbox is empty.");
+            } else {
+                for request in requests {
+                    println!(
+                        "{}  {:?} from {}  {:?}\n  {}",
+                        request.id,
+                        request.kind,
+                        request.from.label(),
+                        request.work_mode,
+                        request.body,
+                    );
+                }
+            }
+        }
+        MsgCmd::Reply {
+            request_id,
+            body,
+            status,
+            artifacts,
+        } => {
+            let request = client
+                .collaboration_reply(
+                    &origin,
+                    &request_id,
+                    collaboration_reply_status(&status)?,
+                    &body,
+                    &artifacts,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&request)?);
+        }
+        MsgCmd::Wait {
+            request_id,
+            timeout_secs,
+        } => {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+            loop {
+                let request = client.collaboration_get(&origin, &request_id).await?;
+                if request.status.is_terminal() {
+                    println!("{}", serde_json::to_string_pretty(&request)?);
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting for {request_id}");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1870,7 +2069,10 @@ mod tests {
         muxa::tmux::PaneInfo {
             socket: None,
             pane_id: id.into(),
+            session_id: String::new(),
             session: session.into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "12".into(),
             pane_index: "3".into(),
             tty: "/dev/pts/0".into(),

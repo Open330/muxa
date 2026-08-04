@@ -1416,7 +1416,10 @@ mod tests {
 
         let tmux_pane = PaneSummary {
             pane_id: "%1".into(),
+            session_id: "$1".into(),
             session: "main".into(),
+            window_id: "@1".into(),
+            window_name: "main".into(),
             window_index: "0".into(),
             pane_index: "0".into(),
             tty: String::new(),
@@ -1436,7 +1439,10 @@ mod tests {
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
             socket: None,
             pane_id: "herdr:p1".into(),
+            session_id: "ws1".into(),
             session: "ws1".into(),
+            window_id: "tab1".into(),
+            window_name: "tab1".into(),
             window_index: "tab1".into(),
             pane_index: "p1".into(),
             tty: String::new(),

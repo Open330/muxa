@@ -64,7 +64,10 @@ const TMUX_LIST_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Serialize)]
 pub struct PaneSummary {
     pub pane_id: String,
+    pub session_id: String,
     pub session: String,
+    pub window_id: String,
+    pub window_name: String,
     pub window_index: String,
     pub pane_index: String,
     pub tty: String,
@@ -348,7 +351,10 @@ fn to_summary(p: PaneInfo, socket: PathBuf) -> PaneSummary {
     );
     PaneSummary {
         pane_id: p.pane_id,
+        session_id: p.session_id,
         session: p.session,
+        window_id: p.window_id,
+        window_name: p.window_name,
         window_index: p.window_index,
         pane_index: p.pane_index,
         tty: p.tty,
@@ -396,7 +402,10 @@ pub(crate) fn herdr_scan_result(panes: Vec<PaneInfo>) -> ScanResult {
 fn to_herdr_summary(p: PaneInfo) -> PaneSummary {
     PaneSummary {
         pane_id: p.pane_id,
+        session_id: p.session_id,
         session: p.session,
+        window_id: p.window_id,
+        window_name: p.window_name,
         window_index: p.window_index,
         pane_index: p.pane_index,
         tty: p.tty,
@@ -485,7 +494,10 @@ mod tests {
         PaneInfo {
             socket: None,
             pane_id: id.into(),
+            session_id: String::new(),
             session: session.into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "0".into(),
             pane_index: "0".into(),
             tty: "/dev/pts/0".into(),

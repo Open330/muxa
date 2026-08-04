@@ -2541,7 +2541,10 @@ mod tests {
         let pane = PaneInfo {
             socket: None,
             pane_id: "%1".into(),
+            session_id: String::new(),
             session: "s".into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "0".into(),
             pane_index: "0".into(),
             tty: String::new(),
@@ -4328,7 +4331,10 @@ mod tests {
         PaneInfo {
             socket: None,
             pane_id: id.into(),
+            session_id: String::new(),
             session: "s".into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "0".into(),
             pane_index: "0".into(),
             tty: String::new(),

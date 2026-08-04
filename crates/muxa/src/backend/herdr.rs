@@ -503,7 +503,10 @@ fn to_pane_info(pane: &HerdrPaneInfo, process: Option<&HerdrProcessInfo>) -> Pan
     };
     PaneInfo {
         pane_id: format!("{PANE_ID_PREFIX}{}", pane.pane_id),
+        session_id: pane.workspace_id.clone(),
         session: pane.workspace_id.clone(),
+        window_id: pane.tab_id.clone(),
+        window_name: pane.tab_id.clone(),
         window_index: pane.tab_id.clone(),
         pane_index: pane.pane_id.clone(),
         tty,

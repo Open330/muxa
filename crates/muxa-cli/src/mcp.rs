@@ -24,11 +24,13 @@
 //! control plane.
 
 use anyhow::{bail, Result};
+use muxa::collaboration::{CollaborationOrigin, NewRequest, RequestKind, RequestStatus, WorkMode};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -242,14 +244,19 @@ fn initialize_result() -> Value {
             "name": "muxa",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "muxa control plane. Use muxa_status to see what agents \
+        "instructions": "muxa control plane. Use muxa_room_context to discover \
+            same-window peers, muxa_send_message/muxa_inbox/muxa_reply for durable \
+            peer collaboration, and muxa_wait_reply for a structured result. Use \
+            muxa_status to see what agents \
             are doing, muxa_send_prompt to drive one, muxa_capture_pane to read \
             its screen, and muxa_wait_for_change to block until an agent changes \
             state.",
     })
 }
 
-/// The five tools this server exposes, with JSON-Schema `inputSchema`s.
+/// The control and collaboration tools this server exposes, with JSON-Schema
+/// `inputSchema`s.
+#[allow(clippy::too_many_lines)] // declarative JSON schemas are clearest kept beside tool names
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -318,6 +325,61 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "muxa_room_context",
+            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request count. Call this before addressing a peer.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": "muxa_send_message",
+            "description": "Send a durable request to a same-window peer. Use target=peer when exactly one other agent is present, or pane:%N for an explicit peer. review/question are read-only by default.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "peer, pane:%N, or %N" },
+                    "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
+                    "body": { "type": "string" },
+                    "expects_reply": { "type": "boolean", "description": "Default true except notice." },
+                    "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." }
+                },
+                "required": ["target", "body"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_inbox",
+            "description": "Claim and read pending collaboration requests addressed to this exact agent session.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": "muxa_reply",
+            "description": "Finish a claimed request with a structured response. The response returns directly to the sender; do not type into its pane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["completed", "blocked", "declined", "failed"] },
+                    "body": { "type": "string" },
+                    "artifacts": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["request_id", "status", "body"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_wait_reply",
+            "description": "Wait until a collaboration request reaches a terminal status, returning its structured reply. Default 30 seconds, max 600.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
+                },
+                "required": ["request_id"],
+                "additionalProperties": false
+            },
+        }),
     ]
 }
 
@@ -325,6 +387,7 @@ fn tool_definitions() -> Vec<Value> {
 /// (missing tool name, malformed params); a tool that runs but fails to do
 /// its job returns an `isError` result so the calling model sees the
 /// message rather than a transport fault.
+#[allow(clippy::too_many_lines)] // one explicit MCP tool dispatch table
 async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
     let params = params.ok_or_else(|| anyhow::anyhow!("missing params"))?;
     let name = params
@@ -385,7 +448,175 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
             })
         }
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
+        "muxa_room_context" => {
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_context(&origin).await {
+                Ok(room) => json_result(&json!(room)),
+                Err(error) => error_result(&format!("room context failed: {error}")),
+            })
+        }
+        "muxa_send_message" => {
+            let Some(target) = args.get("target").and_then(Value::as_str) else {
+                return Ok(error_result("send_message requires a `target` argument"));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str) else {
+                return Ok(error_result("send_message requires a `body` argument"));
+            };
+            let kind = match parse_request_kind(args.get("kind").and_then(Value::as_str)) {
+                Ok(kind) => kind,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let work_mode = match parse_work_mode(args.get("work_mode").and_then(Value::as_str)) {
+                Ok(mode) => mode,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let paths = string_array(&args, "paths");
+            let expects_reply = args
+                .get("expects_reply")
+                .and_then(Value::as_bool)
+                .unwrap_or(kind != RequestKind::Notice);
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let request = NewRequest {
+                kind,
+                body: body.to_string(),
+                expects_reply,
+                work_mode,
+                paths,
+            };
+            Ok(
+                match client.collaboration_send(&origin, target, &request).await {
+                    Ok(request) => json_result(&json!(request)),
+                    Err(error) => error_result(&format!("send_message failed: {error}")),
+                },
+            )
+        }
+        "muxa_inbox" => {
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_inbox(&origin).await {
+                Ok(requests) => json_result(&json!({ "requests": requests })),
+                Err(error) => error_result(&format!("inbox failed: {error}")),
+            })
+        }
+        "muxa_reply" => {
+            let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+                return Ok(error_result("reply requires a `request_id` argument"));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str) else {
+                return Ok(error_result("reply requires a `body` argument"));
+            };
+            let status = match parse_reply_status(args.get("status").and_then(Value::as_str)) {
+                Ok(status) => status,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let artifacts = string_array(&args, "artifacts");
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client
+                    .collaboration_reply(&origin, request_id, status, body, &artifacts)
+                    .await
+                {
+                    Ok(request) => json_result(&json!(request)),
+                    Err(error) => error_result(&format!("reply failed: {error}")),
+                },
+            )
+        }
+        "muxa_wait_reply" => Ok(wait_for_reply(client, &args).await),
         other => Ok(error_result(&format!("unknown tool: {other}"))),
+    }
+}
+
+fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
+    let pane = std::env::var("TMUX_PANE").map_err(|_| {
+        "collaboration requires this MCP server to run inside a tmux pane".to_string()
+    })?;
+    let socket = std::env::var("TMUX").ok().and_then(|value| {
+        let path = value.split(',').next()?.trim();
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    Ok(CollaborationOrigin { pane, socket })
+}
+
+fn parse_request_kind(value: Option<&str>) -> std::result::Result<RequestKind, &'static str> {
+    match value.unwrap_or("question") {
+        "question" => Ok(RequestKind::Question),
+        "review" => Ok(RequestKind::Review),
+        "task" => Ok(RequestKind::Task),
+        "notice" => Ok(RequestKind::Notice),
+        _ => Err("kind must be question, review, task, or notice"),
+    }
+}
+
+fn parse_work_mode(value: Option<&str>) -> std::result::Result<WorkMode, &'static str> {
+    match value.unwrap_or("read_only") {
+        "read_only" => Ok(WorkMode::ReadOnly),
+        "execute" => Ok(WorkMode::Execute),
+        _ => Err("work_mode must be read_only or execute"),
+    }
+}
+
+fn parse_reply_status(value: Option<&str>) -> std::result::Result<RequestStatus, &'static str> {
+    match value {
+        Some("completed") => Ok(RequestStatus::Completed),
+        Some("blocked") => Ok(RequestStatus::Blocked),
+        Some("declined") => Ok(RequestStatus::Declined),
+        Some("failed") => Ok(RequestStatus::Failed),
+        _ => Err("status must be completed, blocked, declined, or failed"),
+    }
+}
+
+fn string_array(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+async fn wait_for_reply(client: &Client, args: &Value) -> Value {
+    let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+        return error_result("wait_reply requires a `request_id` argument");
+    };
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_WAIT_SECS)
+        .min(MAX_WAIT_SECS);
+    let origin = match current_collaboration_origin() {
+        Ok(origin) => origin,
+        Err(error) => return error_result(&error),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match client.collaboration_get(&origin, request_id).await {
+            Ok(request) if request.status.is_terminal() => return json_result(&json!(request)),
+            Ok(_) => {}
+            Err(error) => return error_result(&format!("wait_reply failed: {error}")),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return json_result(&json!({
+                "completed": false,
+                "reason": "timeout",
+                "request_id": request_id,
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -723,6 +954,11 @@ mod tests {
                 "muxa_send_prompt",
                 "muxa_capture_pane",
                 "muxa_wait_for_change",
+                "muxa_room_context",
+                "muxa_send_message",
+                "muxa_inbox",
+                "muxa_reply",
+                "muxa_wait_reply",
             ],
         );
 

@@ -30,7 +30,7 @@ claude mcp add muxa -- muxa --socket /run/user/1000/muxa.sock mcp
 MUXA_SOCKET=/run/user/1000/muxa.sock claude mcp add muxa -- muxa mcp
 ```
 
-Verify from Claude Code with `/mcp` (the `muxa` server should list five
+Verify from Claude Code with `/mcp` (the `muxa` server should list ten
 tools). Other MCP hosts: run `muxa mcp` as a stdio server command in their
 config.
 
@@ -76,6 +76,11 @@ it:
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?` | Block until an agent's state changes (or timeout); returns the transition. |
+| `muxa_room_context` | — | Identify self and list collaboration peers in the same tmux window. |
+| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?` | Create a durable same-window peer request. |
+| `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
+| `muxa_reply` | `request_id`, `status`, `body`, `artifacts?` | Return a structured terminal response. |
+| `muxa_wait_reply` | `request_id`, `timeout_secs?` | Wait for a structured peer response. |
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
@@ -83,6 +88,11 @@ only reaches the focused pane. tmux and herdr support it.
 
 Pane ids carry their host namespace: tmux `%12`, herdr `herdr:p1`. Use the
 `pane` field from `muxa_status` verbatim.
+
+The collaboration tools are higher-level than `muxa_send_prompt`: muxad pins
+each request to the target's current agent session, persists it before wake-up,
+and restricts routing to the caller's stable tmux window. Enable them with
+`[collaboration] enabled = true`; see `docs/COLLABORATION.ko.md`.
 
 ## Orchestration examples
 

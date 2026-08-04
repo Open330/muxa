@@ -3384,7 +3384,10 @@ mod tests {
         PaneInfo {
             socket: None,
             pane_id: pane_id.to_string(),
+            session_id: String::new(),
             session: session.to_string(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "1".into(),
             pane_index: "0".into(),
             tty: "/dev/pts/1".into(),

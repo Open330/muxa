@@ -50,6 +50,20 @@ interval_secs = 5
 This tmux foreground sampler remains as a compatibility source and helps
 stats while newer activity ledger intervals are accumulating.
 
+## Collaboration
+
+```toml
+[collaboration]
+enabled = true
+wake = "idle_only" # idle_only | never
+max_message_bytes = 16384
+```
+
+Opt-in durable request/reply between agents in the same stable tmux window.
+The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json`.
+`idle_only` injects a short inbox notification only at a hook-authoritative
+top-level Idle prompt. See [COLLABORATION.md](COLLABORATION.md).
+
 ## Watch
 
 ```toml
