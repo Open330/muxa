@@ -9,14 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`muxa peek` — `display-panes` with context.** A new `prefix + Q` binding
-  opens a borderless fullscreen popup that repaints the current window's pane
-  layout, labeling each pane with its agent's state glyph, session summary,
-  latest prompt, and latest response, plus a `model · ctx% · 5h%` strip.
-  Content degrades by pane size, pressing a pane's digit jumps to it, and the
+- **`muxa peek` — `display-panes` with context.** Takes over `prefix + q`
+  with a borderless fullscreen popup that repaints the current window's pane
+  layout: each pane's live screen is captured and dimmed as a backdrop, with
+  a box over it carrying that pane's agent state glyph, session summary,
+  latest prompt, latest response, and a `model · ctx% · 5h%` strip. The box
+  claims only the rows it needs (never more than two thirds of the pane), so
+  the terminal underneath stays readable; panes running a plain shell get a
+  bare digit badge instead. Pressing a pane's digit jumps to it and the
   footer carries the global attention count. Install with
-  `muxa init --component tmux-peek`; `muxa peek --plain` prints the same
-  per-pane lines as text.
+  `muxa init --component tmux-peek` (uninstall restores stock
+  `display-panes`); `muxa peek --plain` prints the same per-pane lines as
+  text.
 
 ## [0.8.23] - 2026-08-03
 

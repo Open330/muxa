@@ -21,18 +21,20 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.
 ///
-/// Uppercase `Q` on purpose: tmux's own `prefix + q` (`display-panes`)
-/// stays exactly where the user's fingers expect it, and peek reads as
-/// "the same thing, with more to say".
+/// Takes over `prefix + q` rather than sitting on a shifted key. peek is
+/// a strict superset of `display-panes` — same digits, same jump, plus the
+/// agent context — so putting it anywhere else would mean reaching for a
+/// modifier to get the better version of a reflex you already have.
+/// Uninstalling the component restores the stock binding.
 ///
 /// The popup is borderless (`-B`) and covers the whole client at its
 /// origin (`-w/-h 100% -x/-y 0`) because `muxa peek` repaints the window's
 /// pane layout inside it — any border or inset would shift every box off
 /// the pane it describes.
-pub const PEEK_BODY: &str = r#"# prefix + Q: overlay each pane with its agent's state, summary, and
-# latest prompt/response. Press a pane's digit to jump to it, q/Esc to close.
-# tmux's stock prefix+q (display-panes) is deliberately left alone.
-bind-key Q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
+pub const PEEK_BODY: &str = r#"# prefix + q: display-panes, plus each pane's agent state, summary, and
+# latest prompt/response over its live content. A pane's digit jumps to it.
+# Replaces tmux's stock display-panes; `muxa init --uninstall` puts it back.
+bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
 
 /// The body that goes inside the `tmux-statusline` marker block.
 ///
@@ -144,7 +146,7 @@ mod tests {
     fn peek_round_trip() {
         let (after, o1) = upsert("", Component::TmuxPeek);
         assert_eq!(o1, Outcome::Inserted);
-        assert!(after.contains("bind-key Q display-popup"));
+        assert!(after.contains("bind-key q display-popup"));
         assert!(after.contains("muxa peek"));
         // The overlay repaints pane rectangles at their own coordinates,
         // so any border or inset would slide every box off its pane.
@@ -162,15 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn peek_leaves_tmux_display_panes_alone() {
-        // Stock `prefix + q` is muscle memory; peek takes the shifted key
-        // so installing it can never shadow tmux's own binding.
+    fn peek_takes_over_display_panes_without_a_modifier() {
+        // peek is a superset of `display-panes` — same digits, same jump —
+        // so it claims the reflex key outright rather than making the user
+        // reach for Shift to get the better version.
         let (after, _) = upsert("", Component::TmuxPeek);
-        assert!(after.contains("bind-key Q "));
+        assert!(after.contains("bind-key q display-popup"));
         assert!(
-            !after.contains("bind-key q "),
-            "peek must not rebind lowercase q: {after}"
+            !after.contains("bind-key Q "),
+            "peek should not hide behind a shifted key: {after}"
         );
+        // Uninstall must hand the key back rather than leave it dangling.
+        let (restored, o) = remove(&after, Component::TmuxPeek);
+        assert_eq!(o, Outcome::Removed);
+        assert!(!restored.contains("bind-key q"));
     }
 
     #[test]

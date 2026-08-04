@@ -38,7 +38,7 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa peek` | `prefix + Q` 오버레이: window의 모든 pane 위에 각 agent의 상태·요약·최근 프롬프트/응답을 겹쳐 보여주고, 숫자 키로 이동. |
+| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답을 얹음. 숫자 키로 이동. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | pane 조작과 같은 tmux window의 agent 협업을 제공하는 session-card TUI. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |

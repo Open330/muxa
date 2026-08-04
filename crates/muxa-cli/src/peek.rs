@@ -1,20 +1,28 @@
 //! `muxa peek` — tmux's `display-panes`, carrying muxa's per-pane context.
 //!
-//! `prefix + q` answers "which pane is which number". This answers "which
-//! pane is doing what": every pane in the current window gets a box drawn
-//! at its own coordinates, holding the agent's state glyph, session
-//! summary, latest prompt, and latest response. Typing the pane's digit
-//! jumps there, the same muscle memory as `display-panes`.
+//! `display-panes` answers "which pane is which number". This answers
+//! "which pane is doing what": over each pane's own screen sits a box with
+//! its agent's state glyph, session summary, latest prompt, and latest
+//! response. Typing the pane's digit jumps there, so it takes over
+//! `prefix + q` outright rather than asking for a modifier to reach the
+//! better version of a reflex you already have.
 //!
-//! ## Why one fullscreen popup
+//! ## Faking transparency
 //!
-//! tmux allows exactly one popup per client and offers no per-pane
-//! overlay primitive, so "a little card floating over each pane" is not
-//! expressible. What *is* expressible is one borderless popup covering the
-//! whole client, into which we repaint the window's pane layout from
-//! `#{pane_left}`/`#{pane_top}` (see [`muxa::tmux::layout`]). The popup is
-//! opaque, so we draw each pane's border ourselves — the overlay is a
-//! redrawn map of the layout rather than a translucent film over it.
+//! tmux allows exactly one popup per client, offers no per-pane overlay
+//! primitive, and its popups are opaque. So "a translucent card floating
+//! over each pane" is not expressible — but it can be *reconstructed*: one
+//! borderless popup covers the whole client, and inside it we repaint the
+//! window's pane layout from `#{pane_left}`/`#{pane_top}` (see
+//! [`muxa::tmux::layout`]), fill each rectangle with that pane's captured
+//! screen dimmed to a backdrop, and lay the info box on top.
+//!
+//! Two rules keep the illusion honest. The box takes only the rows its
+//! content needs, never more than two thirds of the pane, so the terminal
+//! underneath stays readable — a box that filled its pane would be an
+//! opaque overlay again. And the box's own rectangle is cleared before
+//! drawing, because backdrop text bleeding through the box's interior
+//! reads as corruption rather than depth.
 //!
 //! ## Reading the focused pane
 //!
@@ -66,7 +74,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
 /// Smallest box that can carry a border plus one row of content. Below
-/// this, [`render_cell`] drops the border and prints a bare label.
+/// this, [`render_cell`] drops the border and prints a bare badge.
 const MIN_BORDERED_HEIGHT: u16 = 3;
 
 #[derive(Debug, Clone, clap::Args)]
@@ -83,13 +91,17 @@ pub(crate) struct Args {
 pub(crate) struct PeekCell {
     pub geo: PaneGeometry,
     /// The agent whose story this box tells. `None` for a pane running a
-    /// plain shell — the box still renders so the layout stays legible and
-    /// the digit still jumps.
+    /// plain shell, which gets a bare digit badge instead of a box —
+    /// nothing to narrate, and its output stays fully visible.
     pub agent: Option<Agent>,
     /// Agents sharing this pane beyond `agent` (a restarted session that
     /// hasn't been reaped yet, or a `muxa register`ed task). Surfaced as a
     /// `+N` badge rather than silently dropped.
     pub extra: usize,
+    /// The pane's visible screen, one entry per row, painted dim behind
+    /// the info box. Empty when the capture failed or wasn't requested
+    /// (`--plain`, tests) — the box then renders over blank space.
+    pub capture: Vec<String>,
 }
 
 pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
@@ -97,7 +109,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     if panes.is_empty() {
         anyhow::bail!(
             "no tmux panes visible — `muxa peek` reads the current window, so run it inside tmux \
-             (normally via `prefix + Q`)"
+             (normally via `prefix + q`)"
         );
     }
     let frame = muxa::tmux::layout::current_window_frame();
@@ -105,7 +117,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
         .await
         .unwrap_or_default();
-    let cells = build_cells(panes, &agents);
+    let mut cells = build_cells(panes, &agents);
 
     if args.plain {
         for line in plain_lines(&cells) {
@@ -113,6 +125,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         }
         return Ok(());
     }
+    attach_captures(&mut cells, zoomed);
 
     // The guard restores the terminal on the way out of every path,
     // including a panic mid-draw. Outside a popup (`muxa peek` run bare in
@@ -188,6 +201,7 @@ async fn drive(
                     .unwrap_or_default();
                 cells = build_cells(panes, &agents);
                 zoomed = now_zoomed;
+                attach_captures(&mut cells, zoomed);
             }
             last_refresh = Instant::now();
             stale = false;
@@ -276,10 +290,29 @@ pub(crate) fn build_cells(panes: Vec<PaneGeometry>, agents: &[Agent]) -> Vec<Pee
             PeekCell {
                 agent: mine.first().map(|a| (*a).clone()),
                 extra,
+                capture: Vec::new(),
                 geo,
             }
         })
         .collect()
+}
+
+/// Read each visible pane's screen into its cell.
+///
+/// One `capture-pane` shell-out per pane per refresh. Panes a zoomed pane
+/// covers are skipped — they are not drawn, so capturing them would spend
+/// a subprocess on pixels nobody sees. A failed capture leaves the cell's
+/// backdrop empty rather than failing the frame.
+fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
+    for cell in cells.iter_mut() {
+        if zoomed && !cell.geo.active {
+            cell.capture.clear();
+            continue;
+        }
+        cell.capture = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id)
+            .map(|raw| raw.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+    }
 }
 
 /// Whether an agent row can belong to the tmux server peek is running on.
@@ -415,12 +448,36 @@ pub(crate) fn cell_rect(geo: &PaneGeometry, origin_y: u16, area: Rect) -> Option
 }
 
 fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect) {
+    // The pane's own screen goes down first, dimmed, so the overlay reads
+    // as something laid *over* your terminal rather than instead of it.
+    // tmux popups have no transparency, so this redraw is the only way to
+    // keep the context that tells you which pane you're looking at.
+    render_backdrop(f, cell, rect);
+
     let header = header_spans(cell);
+    let one_line = Rect { height: 1, ..rect };
     if rect.height < MIN_BORDERED_HEIGHT || rect.width < 4 {
         // Too small to frame — spend every cell on the label itself.
-        f.render_widget(Paragraph::new(Line::from(header)), rect);
+        f.render_widget(Clear, one_line);
+        f.render_widget(Paragraph::new(Line::from(header)), one_line);
         return;
     }
+    if cell.agent.is_none() {
+        // No agent, nothing to narrate. A bare badge keeps the pane
+        // jumpable without framing an empty box over its output.
+        f.render_widget(Clear, one_line);
+        f.render_widget(Paragraph::new(Line::from(header)), one_line);
+        return;
+    }
+    // The box covers only what it needs, so the pane's content stays
+    // readable below it.
+    let rect = Rect {
+        height: box_height(cell, rect),
+        ..rect
+    };
+    // Wipe the backdrop out from under the box: the dim capture showing
+    // through the box's own interior reads as corruption, not as depth.
+    f.render_widget(Clear, rect);
 
     let accent = cell.agent.as_ref().map_or_else(
         || Style::default().fg(Color::DarkGray),
@@ -471,6 +528,50 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect) {
             f.render_widget(Paragraph::new(line), meta);
         }
     }
+}
+
+/// Paint the pane's captured screen as a dim backdrop.
+fn render_backdrop(f: &mut Frame, cell: &PeekCell, rect: Rect) {
+    if cell.capture.is_empty() {
+        return;
+    }
+    let lines: Vec<Line> = cell
+        .capture
+        .iter()
+        .take(rect.height as usize)
+        .map(|raw| {
+            Line::from(Span::styled(
+                raw.clone(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), rect);
+}
+
+/// How many rows the info box claims out of a pane's rectangle.
+///
+/// Only as many as the content needs, and never more than two thirds of
+/// the pane — a box that swallowed the whole pane would put us back to an
+/// opaque overlay, which is the thing the backdrop exists to avoid.
+pub(crate) fn box_height(cell: &PeekCell, rect: Rect) -> u16 {
+    let ceiling = (rect.height.saturating_mul(2) / 3).max(MIN_BORDERED_HEIGHT);
+    let ceiling = ceiling.min(rect.height);
+    let inner_width = rect.width.saturating_sub(2);
+    // Ask for the content the box *would* render at full allowance, then
+    // shrink to it. `body_text` is already budget-aware, so passing the
+    // ceiling keeps the two in agreement about what fits.
+    let content = body_text(cell, inner_width, ceiling.saturating_sub(2));
+    // `body_text` is bounded by the row budget we just handed it, so the
+    // count always fits — clamp rather than cast so a future change to
+    // that contract can't silently wrap.
+    let mut needed = u16::try_from(content.lines.len()).unwrap_or(u16::MAX);
+    if meta_line(cell, inner_width).is_some() {
+        needed += 1;
+    }
+    (needed + 2).clamp(MIN_BORDERED_HEIGHT, ceiling)
 }
 
 /// `1 ● claude +2` — the box title, and the whole box when it's one row.
@@ -1124,6 +1225,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
+            capture: Vec::new(),
         };
 
         // One row: summary only — the question the overlay exists to answer.
@@ -1157,6 +1259,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
+            capture: Vec::new(),
         };
         for height in 0..12u16 {
             let text = body_text(&cell, 20, height);
@@ -1178,6 +1281,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
+            capture: Vec::new(),
         };
         let text = body_text(&cell, 38, 6);
         let hits = text
@@ -1240,6 +1344,7 @@ mod tests {
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(agent("%0", AgentState::Working)),
             extra: 0,
+            capture: Vec::new(),
         };
         assert!(meta_line(&cell, 30).is_none());
 
@@ -1367,10 +1472,11 @@ mod tests {
             .unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(rows[0].contains("0-9 jump"), "{rows:#?}");
-        // The pane box is pushed down by the status row and keeps its own
-        // last row — nothing of it is sacrificed to the hint.
+        // The pane's box is pushed down clear of the status row, and the
+        // pane's own last row stays its own — nothing is sacrificed to the
+        // hint at either end.
         assert!(rows[1].contains(" 0 "), "{rows:#?}");
-        assert!(rows[5].starts_with('╚'), "{rows:#?}");
+        assert!(!rows[5].contains("0-9 jump"), "{rows:#?}");
 
         // Status at the bottom (tmux's default) puts the hint back on the
         // last row and starts panes at row 0.
@@ -1384,6 +1490,94 @@ mod tests {
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(rows[0].contains(" 0 "), "{rows:#?}");
         assert!(rows[5].contains("0-9 jump"), "{rows:#?}");
+    }
+
+    #[test]
+    fn pane_content_stays_visible_under_the_box() {
+        // The whole point of the backdrop: you still see what the pane was
+        // showing, so the overlay reads as a layer over your terminal
+        // rather than a replacement for it.
+        let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        let mut cells = build_cells(vec![geo("0", 0, 0, 30, 12, true)], &[a]);
+        cells[0].capture = (0..12).map(|i| format!("output line {i}")).collect();
+
+        // The client is one row taller than the window — that row is the
+        // status line, and it's where the hint bar goes.
+        let mut terminal = Terminal::new(TestBackend::new(30, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("auth refactor"), "{rendered}");
+
+        let rows: Vec<String> = rendered.lines().map(str::to_string).collect();
+        let box_rows = box_height(&cells[0], Rect::new(0, 0, 30, 12)) as usize;
+        // Inside the box, the backdrop must be wiped: dim capture text
+        // showing through the box's own interior reads as corruption, not
+        // as depth. (Checked row-wise — "output line 1" is a substring of
+        // "output line 11", which legitimately appears further down.)
+        for (i, row) in rows.iter().take(box_rows).enumerate() {
+            assert!(
+                !row.contains("output line"),
+                "row {i} inside the box leaked the backdrop: {rows:#?}"
+            );
+        }
+        // Below it, the pane's own output survives to its last row.
+        assert!(rows[box_rows].contains("output line"), "{rows:#?}");
+        assert!(rendered.contains("output line 11"), "{rows:#?}");
+    }
+
+    #[test]
+    fn box_never_swallows_the_whole_pane() {
+        // A box that filled its pane would put us back to an opaque
+        // overlay, which is exactly what the backdrop exists to avoid.
+        let mut a = agent("%0", AgentState::Working);
+        a.recap = Some("word ".repeat(200));
+        a.last_prompt = Some("word ".repeat(200));
+        a.last_response = Some("word ".repeat(200));
+        a.model = Some("Opus".into());
+        let cell = PeekCell {
+            geo: geo("0", 0, 0, 40, 30, true),
+            agent: Some(a),
+            extra: 0,
+            capture: Vec::new(),
+        };
+        for height in MIN_BORDERED_HEIGHT..30 {
+            let rect = Rect::new(0, 0, 40, height);
+            let h = box_height(&cell, rect);
+            assert!(h >= MIN_BORDERED_HEIGHT, "height {height} gave {h}");
+            assert!(h <= height, "height {height} gave {h}");
+            // Two thirds is the ceiling, except where the minimum box is
+            // already taller than that.
+            let ceiling = (height * 2 / 3).max(MIN_BORDERED_HEIGHT);
+            assert!(h <= ceiling, "height {height} gave {h}, ceiling {ceiling}");
+        }
+    }
+
+    #[test]
+    fn box_shrinks_to_the_content_it_has() {
+        // A pane whose agent has nothing to say should not reserve rows it
+        // will only render blank.
+        let quiet = PeekCell {
+            geo: geo("0", 0, 0, 40, 24, true),
+            agent: Some(agent("%0", AgentState::Idle)),
+            extra: 0,
+            capture: Vec::new(),
+        };
+        let rect = Rect::new(0, 0, 40, 24);
+        assert_eq!(box_height(&quiet, rect), MIN_BORDERED_HEIGHT);
+
+        let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        a.model = Some("Opus".into());
+        let talkative = PeekCell {
+            agent: Some(a),
+            ..quiet
+        };
+        assert!(box_height(&talkative, rect) > MIN_BORDERED_HEIGHT);
     }
 
     #[test]

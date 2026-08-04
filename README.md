@@ -43,7 +43,7 @@ same time; zellij has a CLI baseline. See the Hosts table below.
 | Surface | What it does |
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
-| `muxa peek` | `prefix + Q` overlay: every pane in the window labeled with its agent's state, summary, and latest prompt/response; press a digit to jump. |
+| `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its agent's state, summary, and latest prompt/response; press a digit to jump. |
 | `muxa watch` | Main TUI for agents, prompts, live previews, and same-window collaboration. |
 | `muxa dashboard` | Session-card TUI console for pane operations and authenticated same-room agent collaboration. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |

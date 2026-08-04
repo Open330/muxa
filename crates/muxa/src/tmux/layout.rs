@@ -172,6 +172,31 @@ pub fn current_window_panes() -> (Vec<PaneGeometry>, bool) {
     }
 }
 
+/// The pane's currently visible text, with no escape sequences.
+///
+/// Deliberately *not* [`super::capture_pane`], which passes `-e` to keep
+/// the pane's colors. The overlay paints this as a uniformly dimmed
+/// backdrop behind its own boxes — the pane's real colors bleeding
+/// through would compete with the foreground it exists to set off, so we
+/// ask tmux for plain text and style it ourselves.
+///
+/// Returns `None` when the pane is gone or tmux errors; the caller draws
+/// an empty backdrop rather than failing the frame.
+pub fn capture_pane_plain(pane_id: &str) -> Option<String> {
+    let mut cmd = tmux_command();
+    cmd.args(["capture-pane", "-p", "-t", pane_id]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux capture-pane -t {pane_id}"),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
 /// Short name of the tmux server this process is talking to, read from
 /// `$TMUX` (`<socket_path>,<server_pid>,<session_id>`).
 ///
