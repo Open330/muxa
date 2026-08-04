@@ -113,6 +113,11 @@ enum Cmd {
         #[command(subcommand)]
         action: MsgCmd,
     },
+    /// Register a room-local alias and roles for this exact agent session.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityCmd,
+    },
     /// Summarize retained prompt history, live agents, and session duration.
     Stats(stats::Args),
     /// Generate a Markdown activity report from the retained stats.
@@ -242,7 +247,7 @@ enum Cmd {
 
 #[derive(Debug, Subcommand)]
 enum MsgCmd {
-    /// Send a request to `peer`, `%N`, or `pane:%N`.
+    /// Send to `peer`, `%N`, `@alias`, or `role:<role>`.
     Send {
         target: String,
         body: String,
@@ -287,6 +292,24 @@ enum MsgCmd {
     },
     /// Cancel a request that the recipient has not claimed yet.
     Cancel { request_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCmd {
+    /// Show this agent's current identity and room peers.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace this agent's alias and role set.
+    Set {
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+    },
+    /// Remove this exact agent session's alias and roles.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -398,6 +421,7 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
+        Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
@@ -583,10 +607,62 @@ async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
         println!("No collaboration peers in this window.");
     } else {
         for peer in room.peers {
-            println!("{}  {:<16}  {}", peer.pane, peer.label(), peer.state);
+            println!(
+                "{}  {:<16}  {:<12}  {}",
+                peer.pane,
+                peer.label(),
+                peer.state,
+                display_roles(&peer.roles),
+            );
         }
     }
     Ok(())
+}
+
+async fn cmd_identity(client: &Client, action: IdentityCmd) -> Result<()> {
+    let origin = collaboration_origin()?;
+    let (room, json) = match action {
+        IdentityCmd::Show { json } => (client.collaboration_context(&origin).await?, json),
+        IdentityCmd::Set { alias, roles } => (
+            client
+                .collaboration_set_identity(&origin, alias.as_deref(), &roles)
+                .await?,
+            false,
+        ),
+        IdentityCmd::Clear => (
+            client
+                .collaboration_set_identity(&origin, None, &[])
+                .await?,
+            false,
+        ),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&room)?);
+    } else {
+        println!(
+            "self {}  roles: {}  room: {}",
+            room.current.label(),
+            display_roles(&room.current.roles),
+            room.current.room.window_id,
+        );
+        for peer in room.peers {
+            println!(
+                "peer {}  roles: {}  state: {}",
+                peer.label(),
+                display_roles(&peer.roles),
+                peer.state,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn display_roles(roles: &[String]) -> String {
+    if roles.is_empty() {
+        "-".into()
+    } else {
+        roles.join(",")
+    }
 }
 
 async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {

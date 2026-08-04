@@ -49,7 +49,7 @@ hook claims the pane.
 | `prompts.ndjson` | Retained prompt audit log. |
 | `activity.ndjson` | Append-only duration ledger. |
 | `session-activity.json` | Legacy/compat tmux foreground totals. |
-| `collaboration.json` | Durable same-window agent request/reply mailbox snapshot. |
+| `collaboration.json` | Durable same-window mailbox plus exact-session aliases and roles. |
 
 Paths are configurable; defaults live under `$XDG_DATA_HOME/muxa`.
 

@@ -67,17 +67,50 @@ pub struct Participant {
     pub state: AgentState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Optional room-local address registered by this exact agent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// Advisory capabilities/responsibilities used by `role:<name>` routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 impl Participant {
     pub fn label(&self) -> String {
-        format!("{}@{}", self.agent_kind, self.pane)
+        self.alias.as_ref().map_or_else(
+            || format!("{}@{}", self.agent_kind, self.pane),
+            |alias| format!("{alias}@{}", self.pane),
+        )
     }
 
     fn same_endpoint(&self, other: &Self) -> bool {
         self.pane == other.pane
             && self.socket == other.socket
             && self.agent_session_id == other.agent_session_id
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CollaborationIdentity {
+    room: RoomId,
+    pane: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    socket: Option<String>,
+    agent_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roles: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl CollaborationIdentity {
+    fn matches(&self, participant: &Participant) -> bool {
+        self.room == participant.room
+            && self.pane == participant.pane
+            && self.socket == participant.socket
+            && self.agent_session_id == participant.agent_session_id
     }
 }
 
@@ -239,6 +272,14 @@ pub enum CollaborationError {
     AlreadyTerminal(String),
     #[error("request {0} has already been claimed and can no longer be cancelled")]
     AlreadyClaimed(String),
+    #[error("invalid collaboration alias {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
+    InvalidAlias(String),
+    #[error("invalid collaboration role {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
+    InvalidRole(String),
+    #[error("an agent may register at most 8 collaboration roles")]
+    TooManyRoles,
+    #[error("collaboration alias {0:?} is already used by a live peer in this room")]
+    AliasInUse(String),
     #[error("persistence error: {0}")]
     Persistence(#[from] std::io::Error),
     #[error("invalid persisted mailbox: {0}")]
@@ -251,6 +292,8 @@ pub enum CollaborationError {
 struct Snapshot {
     version: u32,
     requests: Vec<CollaborationRequest>,
+    #[serde(default)]
+    identities: Vec<CollaborationIdentity>,
 }
 
 /// In-memory mailbox with an optional atomic JSON snapshot. Collaboration
@@ -259,6 +302,7 @@ struct Snapshot {
 pub struct CollaborationStore {
     opts: CollaborationOptions,
     requests: RwLock<HashMap<String, CollaborationRequest>>,
+    identities: RwLock<Vec<CollaborationIdentity>>,
     persist_lock: Mutex<()>,
 }
 
@@ -270,12 +314,14 @@ impl CollaborationStore {
                 ..options
             },
             requests: RwLock::new(HashMap::new()),
+            identities: RwLock::new(Vec::new()),
             persist_lock: Mutex::new(()),
         })
     }
 
     pub async fn load(options: CollaborationOptions) -> Result<Arc<Self>, CollaborationError> {
         let mut requests = HashMap::new();
+        let mut identities = Vec::new();
         if let Some(path) = options.path.as_ref() {
             match tokio::fs::read(path).await {
                 Ok(bytes) => {
@@ -284,6 +330,7 @@ impl CollaborationStore {
                         return Err(CollaborationError::UnsupportedSchema(snapshot.version));
                     }
                     requests.extend(snapshot.requests.into_iter().map(|r| (r.id.clone(), r)));
+                    identities = snapshot.identities;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -292,12 +339,76 @@ impl CollaborationStore {
         Ok(Arc::new(Self {
             opts: options,
             requests: RwLock::new(requests),
+            identities: RwLock::new(identities),
             persist_lock: Mutex::new(()),
         }))
     }
 
     pub fn enabled(&self) -> bool {
         self.opts.enabled
+    }
+
+    /// Attach persisted aliases and roles only to the exact live agent
+    /// generation that registered them. A later process reusing the same pane
+    /// remains anonymous until it registers its own identity.
+    pub async fn enrich_participants(&self, participants: &mut [Participant]) {
+        let identities = self.identities.read().await;
+        for participant in participants {
+            participant.alias = None;
+            participant.roles.clear();
+            if let Some(identity) = identities
+                .iter()
+                .find(|identity| identity.matches(participant))
+            {
+                participant.alias.clone_from(&identity.alias);
+                participant.roles.clone_from(&identity.roles);
+            }
+        }
+    }
+
+    pub async fn set_identity(
+        &self,
+        caller: &Participant,
+        live_participants: &[Participant],
+        alias: Option<String>,
+        roles: Vec<String>,
+    ) -> Result<Participant, CollaborationError> {
+        self.ensure_enabled()?;
+        let alias = normalize_alias(alias)?;
+        let roles = normalize_roles(roles)?;
+        {
+            let mut identities = self.identities.write().await;
+            if let Some(alias) = alias.as_deref() {
+                let in_use = identities.iter().any(|identity| {
+                    identity.room == caller.room
+                        && identity.alias.as_deref() == Some(alias)
+                        && !identity.matches(caller)
+                        && live_participants
+                            .iter()
+                            .any(|participant| identity.matches(participant))
+                });
+                if in_use {
+                    return Err(CollaborationError::AliasInUse(alias.to_string()));
+                }
+            }
+            identities.retain(|identity| !identity.matches(caller));
+            if alias.is_some() || !roles.is_empty() {
+                identities.push(CollaborationIdentity {
+                    room: caller.room.clone(),
+                    pane: caller.pane.clone(),
+                    socket: caller.socket.clone(),
+                    agent_session_id: caller.agent_session_id.clone(),
+                    alias: alias.clone(),
+                    roles: roles.clone(),
+                    updated_at: OffsetDateTime::now_utc(),
+                });
+            }
+        }
+        self.persist().await?;
+        let mut updated = caller.clone();
+        updated.alias = alias;
+        updated.roles = roles;
+        Ok(updated)
     }
 
     pub async fn create(
@@ -607,9 +718,27 @@ impl CollaborationStore {
         let _guard = self.persist_lock.lock().await;
         let mut requests: Vec<_> = self.requests.read().await.values().cloned().collect();
         requests.sort_by_key(|request| request.created_at);
+        let mut identities = self.identities.read().await.clone();
+        identities.sort_by(|left, right| {
+            (
+                &left.room.host,
+                &left.room.socket,
+                &left.room.window_id,
+                &left.pane,
+                &left.agent_session_id,
+            )
+                .cmp(&(
+                    &right.room.host,
+                    &right.room.socket,
+                    &right.room.window_id,
+                    &right.pane,
+                    &right.agent_session_id,
+                ))
+        });
         let snapshot = Snapshot {
             version: COLLABORATION_SCHEMA_VERSION,
             requests,
+            identities,
         };
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
         if let Some(parent) = path.parent() {
@@ -677,6 +806,8 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
             window_name: (!pane.window_name.is_empty()).then(|| pane.window_name.clone()),
             state: agent.state,
             cwd: agent.cwd.clone(),
+            alias: None,
+            roles: Vec::new(),
         };
         let key = (socket, pane_id.clone());
         let replace = resolved
@@ -732,11 +863,49 @@ pub fn resolve_target(
             _ => Err(CollaborationError::AmbiguousTarget(selector.to_string())),
         };
     }
+    if let Some(alias) = selector
+        .strip_prefix('@')
+        .or_else(|| selector.strip_prefix("alias:"))
+    {
+        let matches: Vec<_> = peers
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .alias
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(alias))
+            })
+            .collect();
+        return select_target(matches, selector);
+    }
+    if let Some(role) = selector.strip_prefix("role:") {
+        let matches: Vec<_> = peers
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .roles
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(role))
+            })
+            .collect();
+        return select_target(matches, selector);
+    }
     let pane = selector.strip_prefix("pane:").unwrap_or(selector);
     let matches: Vec<_> = peers
         .into_iter()
-        .filter(|candidate| candidate.pane == pane || candidate.label() == selector)
+        .filter(|candidate| {
+            candidate.pane == pane
+                || candidate.label() == selector
+                || format!("{}@{}", candidate.agent_kind, candidate.pane) == selector
+        })
         .collect();
+    select_target(matches, selector)
+}
+
+fn select_target(
+    matches: Vec<&Participant>,
+    selector: &str,
+) -> Result<Participant, CollaborationError> {
     match matches.as_slice() {
         [participant] => Ok((*participant).clone()),
         [] => Err(CollaborationError::UnknownTarget(selector.to_string())),
@@ -772,6 +941,47 @@ fn next_request_id(now: OffsetDateTime) -> String {
     format!("req_{nanos:x}_{counter:x}")
 }
 
+fn normalize_alias(alias: Option<String>) -> Result<Option<String>, CollaborationError> {
+    let Some(alias) = alias else {
+        return Ok(None);
+    };
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(None);
+    }
+    if !valid_identity_token(alias) {
+        return Err(CollaborationError::InvalidAlias(alias.to_string()));
+    }
+    Ok(Some(alias.to_ascii_lowercase()))
+}
+
+fn normalize_roles(roles: Vec<String>) -> Result<Vec<String>, CollaborationError> {
+    let mut normalized = Vec::new();
+    for role in roles {
+        let role = role.trim();
+        if !valid_identity_token(role) {
+            return Err(CollaborationError::InvalidRole(role.to_string()));
+        }
+        let role = role.to_ascii_lowercase();
+        if !normalized.contains(&role) {
+            normalized.push(role);
+        }
+    }
+    if normalized.len() > 8 {
+        return Err(CollaborationError::TooManyRoles);
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn valid_identity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +1002,8 @@ mod tests {
             window_name: Some("feature".into()),
             state: AgentState::Idle,
             cwd: Some("/repo".into()),
+            alias: None,
+            roles: Vec::new(),
         }
     }
 
@@ -971,5 +1183,95 @@ mod tests {
             Err(CollaborationError::AmbiguousTarget(_))
         ));
         assert_eq!(resolve_target(&sender, "%2", &peers).unwrap().pane, "%2");
+    }
+
+    #[tokio::test]
+    async fn aliases_and_roles_route_only_to_live_exact_sessions() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let reviewer = participant("%2", "reviewer-session");
+        let second_reviewer = participant("%3", "second-reviewer-session");
+        let live = vec![sender.clone(), reviewer.clone(), second_reviewer.clone()];
+
+        mailbox
+            .set_identity(
+                &reviewer,
+                &live,
+                Some("Reviewer".into()),
+                vec!["Rust".into(), "review".into()],
+            )
+            .await
+            .unwrap();
+        mailbox
+            .set_identity(
+                &second_reviewer,
+                &live,
+                Some("Verifier".into()),
+                vec!["review".into()],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            mailbox
+                .set_identity(&second_reviewer, &live, Some("reviewer".into()), Vec::new(),)
+                .await,
+            Err(CollaborationError::AliasInUse(_))
+        ));
+
+        let mut enriched = live;
+        mailbox.enrich_participants(&mut enriched).await;
+        let enriched_sender = enriched
+            .iter()
+            .find(|participant| participant.pane == "%1")
+            .unwrap();
+        assert_eq!(
+            resolve_target(enriched_sender, "@REVIEWER", &enriched)
+                .unwrap()
+                .pane,
+            "%2"
+        );
+        assert_eq!(
+            resolve_target(enriched_sender, "role:rust", &enriched)
+                .unwrap()
+                .pane,
+            "%2"
+        );
+        assert!(matches!(
+            resolve_target(enriched_sender, "role:review", &enriched),
+            Err(CollaborationError::AmbiguousTarget(_))
+        ));
+
+        let mut replacement = vec![participant("%2", "replacement-session")];
+        mailbox.enrich_participants(&mut replacement).await;
+        assert!(replacement[0].alias.is_none());
+        assert!(replacement[0].roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_survives_reload_without_following_pane_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.json");
+        let options = CollaborationOptions {
+            path: Some(path),
+            ..CollaborationOptions::default()
+        };
+        let original = participant("%4", "original-session");
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        mailbox
+            .set_identity(
+                &original,
+                std::slice::from_ref(&original),
+                Some("builder".into()),
+                vec!["implementation".into()],
+            )
+            .await
+            .unwrap();
+
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        let mut participants = vec![original, participant("%4", "replacement-session")];
+        reloaded.enrich_participants(&mut participants).await;
+        assert_eq!(participants[0].alias.as_deref(), Some("builder"));
+        assert_eq!(participants[0].roles, vec!["implementation"]);
+        assert!(participants[1].alias.is_none());
     }
 }

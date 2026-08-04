@@ -246,8 +246,9 @@ fn initialize_result() -> Value {
             "name": "muxa",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "muxa control plane. Use muxa_room_context to discover \
-            same-window peers, muxa_send_message/muxa_inbox/muxa_reply for durable \
+        "instructions": "muxa control plane. Use muxa_set_identity to register a \
+            room-local alias/roles, muxa_room_context to discover same-window peers, \
+            muxa_send_message/muxa_inbox/muxa_reply for durable \
             peer collaboration, muxa_list_messages for lifecycle visibility, and \
             muxa_wait_reply for a structured result. Use \
             muxa_status to see what agents \
@@ -334,12 +335,24 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
-            "name": "muxa_send_message",
-            "description": "Send a durable request to a same-window peer. Use target=peer when exactly one other agent is present, or pane:%N for an explicit peer. review/question are read-only by default.",
+            "name": "muxa_set_identity",
+            "description": "Replace this exact agent session's room-local alias and roles. Aliases enable @alias routing; roles enable role:<name> routing. An empty call clears identity.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "peer, pane:%N, or %N" },
+                    "alias": { "type": "string", "description": "Unique room-local alias, 1-32 slug characters." },
+                    "roles": { "type": "array", "maxItems": 8, "items": { "type": "string" }, "description": "Advisory role names used for routing." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_send_message",
+            "description": "Send a durable request to a same-window peer. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role). review/question are read-only by default.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, or role:<name>" },
                     "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
                     "body": { "type": "string" },
                     "expects_reply": { "type": "boolean", "description": "Default true except notice." },
@@ -481,6 +494,23 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 Ok(room) => json_result(&json!(room)),
                 Err(error) => error_result(&format!("room context failed: {error}")),
             })
+        }
+        "muxa_set_identity" => {
+            let alias = args.get("alias").and_then(Value::as_str);
+            let roles = string_array(&args, "roles");
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client
+                    .collaboration_set_identity(&origin, alias, &roles)
+                    .await
+                {
+                    Ok(room) => json_result(&json!(room)),
+                    Err(error) => error_result(&format!("set_identity failed: {error}")),
+                },
+            )
         }
         "muxa_send_message" => {
             let Some(target) = args.get("target").and_then(Value::as_str) else {
@@ -1019,6 +1049,7 @@ mod tests {
                 "muxa_capture_pane",
                 "muxa_wait_for_change",
                 "muxa_room_context",
+                "muxa_set_identity",
                 "muxa_send_message",
                 "muxa_inbox",
                 "muxa_list_messages",

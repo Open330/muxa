@@ -77,6 +77,7 @@ it:
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?` | Block until an agent's state changes (or timeout); returns the transition. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
+| `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?` | Create a durable same-window peer request. |
 | `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
 | `muxa_list_messages` | `mailbox?` | List incoming, sent, or all requests without claiming. |
@@ -97,6 +98,10 @@ and restricts routing to the caller's stable tmux window. Request and reply
 wake prompts contain no message body and are sent only to idle agents. Enable
 the tools with `[collaboration] enabled = true`; see
 `docs/COLLABORATION.ko.md`.
+
+For rooms with several agents, call `muxa_set_identity` once per agent and
+route with `@alias` or `role:<name>`. Aliases must be unique among live peers;
+role routing refuses multiple matches instead of picking one arbitrarily.
 
 ## Orchestration examples
 

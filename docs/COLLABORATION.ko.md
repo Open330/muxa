@@ -30,6 +30,7 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 - 같은 `(tmux socket, stable window id)`를 공유하는 agent가 한 room입니다.
 - agent가 정확히 둘이면 상대를 `peer`로 지정할 수 있습니다.
 - 셋 이상이면 `%12` 또는 `pane:%12`처럼 pane을 명시합니다.
+- identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
 - 다른 window의 pane은 명시해도 거부됩니다.
 - 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
   재사용해도 이전 요청을 받지 않습니다.
@@ -40,6 +41,26 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 muxa peers
 muxa peers --json
 ```
+
+## Agent identity
+
+pane이 셋 이상인 room에서는 각 agent가 의미 있는 alias와 role을 등록할 수
+있습니다. identity는 pane이 아니라 현재 agent session에 고정되므로 pane을 새
+agent가 재사용해도 이전 이름이나 역할을 상속하지 않습니다.
+
+```bash
+muxa identity set --alias reviewer --role review --role rust
+muxa identity show
+
+muxa msg send @reviewer "auth 변경을 검토해 주세요" --kind review
+muxa msg send role:rust "이 lifetime 오류의 원인을 찾아 주세요"
+
+muxa identity clear
+```
+
+alias는 live peer 사이에서 room-local unique이며 32자 이하 slug입니다. role은
+여러 agent가 공유할 수 있지만 `role:<name>`과 일치하는 peer가 둘 이상이면
+오배송을 피하기 위해 요청을 거부합니다. 이 경우 `@alias`나 pane을 명시하세요.
 
 ## CLI
 
@@ -71,6 +92,7 @@ muxa msg cancel req_...
 | Tool | 역할 |
 | --- | --- |
 | `muxa_room_context` | self, same-window peers, unread count 조회 |
+| `muxa_set_identity` | 현재 agent session의 room-local alias/roles 교체 |
 | `muxa_send_message` | durable request 생성 |
 | `muxa_inbox` | 현재 agent session의 요청 claim/read |
 | `muxa_list_messages` | incoming/sent/all request 상태 조회(미claim) |
@@ -82,6 +104,7 @@ muxa msg cancel req_...
 
 ```text
 Agent A: muxa_room_context
+Agent A: muxa_set_identity(alias="implementer", roles=["rust"])
 Agent A: muxa_send_message(target="peer", kind="review", ...)
 Agent A: muxa_wait_reply(request_id="req_...", timeout_secs=300)
 

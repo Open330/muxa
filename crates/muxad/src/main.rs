@@ -506,7 +506,8 @@ async fn wake_idle_collaboration_peers(
     })
     .await
     .unwrap_or_default();
-    let participants = muxa::collaboration::participants_from(&agents, &panes);
+    let mut participants = muxa::collaboration::participants_from(&agents, &panes);
+    collaboration.enrich_participants(&mut participants).await;
 
     for request in requests {
         let Some(recipient) = idle_collaboration_participant(&participants, &request.to) else {

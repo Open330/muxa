@@ -192,6 +192,13 @@ enum RequestBody {
     CollaborationContext {
         origin: CollaborationOrigin,
     },
+    CollaborationSetIdentity {
+        origin: CollaborationOrigin,
+        #[serde(default)]
+        alias: Option<String>,
+        #[serde(default)]
+        roles: Vec<String>,
+    },
     CollaborationSend {
         origin: CollaborationOrigin,
         target: String,
@@ -318,6 +325,7 @@ const CAPABILITIES: &[&str] = &[
     "rate_limited",
     "collaboration_mailbox",
     "collaboration_lifecycle",
+    "collaboration_identity",
 ];
 
 #[derive(Debug, Serialize)]
@@ -940,6 +948,7 @@ fn resolve_backend<'a>(
 async fn collaboration_participants(
     store: &SharedStore,
     backends: &[SharedBackend],
+    collaboration: &CollaborationStore,
 ) -> Vec<collaboration::Participant> {
     let agents = store.snapshot().await;
     let backends = backends.to_vec();
@@ -951,7 +960,9 @@ async fn collaboration_participants(
     })
     .await
     .unwrap_or_default();
-    collaboration::participants_from(&agents, &panes)
+    let mut participants = collaboration::participants_from(&agents, &panes);
+    collaboration.enrich_participants(&mut participants).await;
+    participants
 }
 
 #[tracing::instrument(
@@ -1236,7 +1247,8 @@ async fn handle(
                 RequestBody::CollaborationContext { origin } => {
                     kind = "collaboration_context";
                     if collaboration.enabled() {
-                        let participants = collaboration_participants(&store, &backends).await;
+                        let participants =
+                            collaboration_participants(&store, &backends, &collaboration).await;
                         match collaboration::resolve_origin(&origin, &participants) {
                             Ok(current) => Response::with_room(
                                 collaboration::room_context(
@@ -1254,13 +1266,40 @@ async fn handle(
                         )
                     }
                 }
+                RequestBody::CollaborationSetIdentity {
+                    origin,
+                    alias,
+                    roles,
+                } => {
+                    kind = "collaboration_set_identity";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => match collaboration
+                            .set_identity(&current, &participants, alias, roles)
+                            .await
+                        {
+                            Ok(current) => Response::with_room(
+                                collaboration::room_context(
+                                    collaboration.as_ref(),
+                                    current,
+                                    &participants,
+                                )
+                                .await,
+                            ),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationSend {
                     origin,
                     target,
                     request,
                 } => {
                     kind = "collaboration_send";
-                    let participants = collaboration_participants(&store, &backends).await;
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
                     let result =
                         collaboration::resolve_origin(&origin, &participants).and_then(|sender| {
                             collaboration::resolve_target(&sender, &target, &participants)
@@ -1278,7 +1317,8 @@ async fn handle(
                 }
                 RequestBody::CollaborationInbox { origin } => {
                     kind = "collaboration_inbox";
-                    let participants = collaboration_participants(&store, &backends).await;
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
                     match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration.claim_for(&current).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
@@ -1289,7 +1329,8 @@ async fn handle(
                 }
                 RequestBody::CollaborationList { origin, mailbox } => {
                     kind = "collaboration_list";
-                    let participants = collaboration_participants(&store, &backends).await;
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
                     match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration.list_for(&current, mailbox).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
@@ -1306,7 +1347,8 @@ async fn handle(
                     artifacts,
                 } => {
                     kind = "collaboration_reply";
-                    let participants = collaboration_participants(&store, &backends).await;
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
                     match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration
                             .reply(&current, &request_id, status, body, artifacts)
@@ -1320,7 +1362,8 @@ async fn handle(
                 }
                 RequestBody::CollaborationGet { origin, request_id } => {
                     kind = "collaboration_get";
-                    let participants = collaboration_participants(&store, &backends).await;
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
                     match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration.get_for(&current, &request_id).await {
                             Ok(request) => Response::with_collaboration_request(request),
@@ -1331,7 +1374,8 @@ async fn handle(
                 }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
-                    let participants = collaboration_participants(&store, &backends).await;
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
                     match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => {
                             match collaboration.cancel_for(&current, &request_id).await {
@@ -1692,6 +1736,23 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "collaboration_context",
             "origin": origin,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_set_identity(
+        &self,
+        origin: &CollaborationOrigin,
+        alias: Option<&str>,
+        roles: &[String],
+    ) -> Result<RoomContext, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_set_identity",
+            "origin": origin,
+            "alias": alias,
+            "roles": roles,
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
@@ -2260,10 +2321,12 @@ mod tests {
         let store = Store::shared();
         add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%3", "verifier", AgentKind::GeminiCli).await;
         let backend: SharedBackend = Arc::new(CollaborationTestBackend {
             panes: vec![
                 collaboration_test_pane("%1", "0"),
                 collaboration_test_pane("%2", "1"),
+                collaboration_test_pane("%3", "2"),
             ],
         });
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
@@ -2283,14 +2346,56 @@ mod tests {
             pane: "%2".into(),
             socket: Some("default".into()),
         };
+        let verifier = CollaborationOrigin {
+            pane: "%3".into(),
+            socket: Some("default".into()),
+        };
+        client
+            .collaboration_set_identity(
+                &recipient,
+                Some("reviewer"),
+                &["review".into(), "rust".into()],
+            )
+            .await
+            .unwrap();
+        assert!(client
+            .collaboration_set_identity(&verifier, Some("reviewer"), &[])
+            .await
+            .is_err());
+        client
+            .collaboration_set_identity(&verifier, Some("verifier"), &["review".into()])
+            .await
+            .unwrap();
         let room = client.collaboration_context(&sender).await.unwrap();
-        assert_eq!(room.peers.len(), 1);
-        assert_eq!(room.peers[0].pane, "%2");
+        assert_eq!(room.peers.len(), 2);
+        assert_eq!(
+            room.peers
+                .iter()
+                .find(|peer| peer.pane == "%2")
+                .unwrap()
+                .alias
+                .as_deref(),
+            Some("reviewer")
+        );
+        assert!(client
+            .collaboration_send(
+                &sender,
+                "role:review",
+                &NewRequest {
+                    kind: collaboration::RequestKind::Question,
+                    body: "ambiguous".into(),
+                    expects_reply: true,
+                    work_mode: collaboration::WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                },
+            )
+            .await
+            .is_err());
 
         let request = client
             .collaboration_send(
                 &sender,
-                "peer",
+                "@reviewer",
                 &NewRequest {
                     kind: collaboration::RequestKind::Review,
                     body: "review this".into(),
@@ -2353,7 +2458,7 @@ mod tests {
         let queued = client
             .collaboration_send(
                 &sender,
-                "peer",
+                "role:rust",
                 &NewRequest {
                     kind: collaboration::RequestKind::Question,
                     body: "obsolete question".into(),

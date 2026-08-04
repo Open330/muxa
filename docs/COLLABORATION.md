@@ -31,6 +31,20 @@ Cross-window targets are refused. Requests are also pinned to the target's
 current agent session, so a new process reusing that pane cannot inherit old
 work.
 
+An exact agent session can register a room-local alias and advisory roles:
+
+```bash
+muxa identity set --alias reviewer --role review --role rust
+muxa identity show
+muxa msg send @reviewer "review the auth change" --kind review
+muxa msg send role:rust "investigate this lifetime error"
+muxa identity clear
+```
+
+Aliases are unique among live peers in a room. Roles may be shared, but a
+`role:<name>` target is accepted only when exactly one peer matches; ambiguity
+is refused. Identity never follows a later agent that reuses the pane.
+
 ```bash
 muxa peers
 muxa msg send peer "review the auth change" --kind review
@@ -51,6 +65,7 @@ worktrees remain the safest choice for concurrent edits.
 | Tool | Purpose |
 | --- | --- |
 | `muxa_room_context` | Identify self, list same-window peers, and show unread count. |
+| `muxa_set_identity` | Replace this exact session's room-local alias and roles. |
 | `muxa_send_message` | Create a durable peer request. |
 | `muxa_inbox` | Claim/read requests for this exact agent session. |
 | `muxa_list_messages` | List incoming, sent, or all requests without claiming. |

@@ -60,7 +60,8 @@ max_message_bytes = 16384
 ```
 
 Opt-in durable request/reply between agents in the same stable tmux window.
-The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json`.
+The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json` and
+stores both mailbox state and exact-session aliases/roles.
 `idle_only` injects short request/reply notifications only at a
 hook-authoritative top-level Idle prompt; message bodies stay in the mailbox.
 See [COLLABORATION.md](COLLABORATION.md).

@@ -303,6 +303,10 @@ other agent occupies the same stable tmux window.
 { "protocol": 3, "kind": "collaboration_context",
   "origin": { "pane": "%12", "socket": "default" } }
 
+{ "protocol": 3, "kind": "collaboration_set_identity",
+  "origin": { "pane": "%18", "socket": "default" },
+  "alias": "reviewer", "roles": ["review", "rust"] }
+
 { "protocol": 3, "kind": "collaboration_send",
   "origin": { "pane": "%12", "socket": "default" },
   "target": "peer",
@@ -338,6 +342,9 @@ persisted before an optional idle-only wake prompt is injected.
 `collaboration_cancel` succeeds only while the request is still `queued`.
 Terminal replies also receive an idle-only wake; a sender-side
 `collaboration_get` acknowledges the reply so it is not woken again.
+Identity is pinned to the registering agent session. `@alias` targets a unique
+live alias, while `role:<name>` succeeds only when exactly one live peer in the
+room carries that role.
 
 #### `subscribe`
 
