@@ -514,7 +514,7 @@ async fn wake_idle_collaboration_peers(
             continue;
         };
         let prompt = format!(
-            "[muxa:{}] New {:?} request from {}. Call muxa_inbox to read it, then muxa_reply to respond.",
+            "[muxa:{}] New {:?} request from {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond with muxa_reply or `muxa msg reply`.",
             request.id,
             request.kind,
             request.from.label(),
@@ -538,7 +538,7 @@ async fn wake_idle_collaboration_peers(
             continue;
         };
         let prompt = format!(
-            "[muxa:{}] {:?} reply from {} is ready. Call muxa_wait_reply for {} to read it.",
+            "[muxa:{}] {:?} reply from {} is ready. Read it with muxa_wait_reply (MCP) or `muxa msg wait {}`.",
             request.id,
             request.status,
             request.to.label(),
@@ -1734,18 +1734,8 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
+                    air_artifacts: Vec::new(),
                 },
-            )
-            .await
-            .unwrap();
-        mailbox.claim_for(&recipient).await.unwrap();
-        mailbox
-            .reply(
-                &recipient,
-                &request.id,
-                RequestStatus::Completed,
-                "secret reply body".into(),
-                Vec::new(),
             )
             .await
             .unwrap();
@@ -1755,6 +1745,32 @@ mod tests {
             panes,
             sends: sends.clone(),
         });
+        wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
+        {
+            let mut sends = sends.lock().unwrap();
+            assert_eq!(sends.len(), 2);
+            assert_eq!(sends[0].0, "%2");
+            assert!(sends[0].1.contains("muxa_inbox"));
+            assert!(sends[0].1.contains("muxa msg inbox --json"));
+            assert!(sends[0].1.contains("kind/work_mode/paths"));
+            assert!(!sends[0].1.contains("secret request body"));
+            assert_eq!(sends[1], ("%2".into(), "\r".into()));
+            sends.clear();
+        }
+
+        mailbox.claim_for(&recipient).await.unwrap();
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "secret reply body".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
         wake_idle_collaboration_peers(&mailbox, &store, &[backend]).await;
 
         {
@@ -1763,6 +1779,8 @@ mod tests {
             assert_eq!(sends[0].0, "%1");
             assert!(sends[0].1.contains("reply"));
             assert!(sends[0].1.contains(&request.id));
+            assert!(sends[0].1.contains("muxa_wait_reply"));
+            assert!(sends[0].1.contains("muxa msg wait"));
             assert!(!sends[0].1.contains("secret request body"));
             assert!(!sends[0].1.contains("secret reply body"));
             assert_eq!(sends[1], ("%1".into(), "\r".into()));

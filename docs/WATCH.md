@@ -116,6 +116,11 @@ Press `b` for incoming/sent history. In the mailbox, `Tab` switches mailbox,
 If watch was opened from a normal shell, observation still works and the UI
 explains that collaboration requires opening `prefix+s` from an agent pane.
 
+Requests with AIR artifact references carry profile-colored mailbox badges:
+blue `AIR WORKFLOW`, magenta `AIR PLAN`, cyan `AIR TRACE`, and light-cyan
+`AIR SESSION`. The selected detail shows whether each reference is an input or
+reply output, plus its short digest, label, and display-only locator.
+
 ## Preview
 
 Press `o` or `Alt-P` to preview the selected pane. In session view, if the selected

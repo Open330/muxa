@@ -17,6 +17,9 @@ use tokio::sync::{Mutex, RwLock};
 
 pub const COLLABORATION_SCHEMA_VERSION: u32 = 1;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MAX_AIR_ARTIFACT_REFERENCES: usize = 8;
+const MAX_AIR_REFERENCE_LABEL_BYTES: usize = 256;
+const MAX_AIR_LOCATOR_DISPLAY_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct CollaborationOptions {
@@ -131,6 +134,69 @@ pub enum WorkMode {
     Execute,
 }
 
+/// AIR 1 profiles that may be referenced by a collaboration request or
+/// reply. A reference does not make muxa an AIR producer or validator; the
+/// artifact itself remains subject to AIR Workbench's schema and runtime
+/// conformance checks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AirArtifactProfile {
+    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/workflow-skill")]
+    WorkflowSkill,
+    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/plan-native-cli")]
+    PlanNativeCli,
+    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/trace-native-run")]
+    TraceNativeRun,
+    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot")]
+    TraceSessionSnapshot,
+}
+
+impl AirArtifactProfile {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::WorkflowSkill => "workflow",
+            Self::PlanNativeCli => "plan",
+            Self::TraceNativeRun | Self::TraceSessionSnapshot => "trace",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WorkflowSkill => "AIR WORKFLOW",
+            Self::PlanNativeCli => "AIR PLAN",
+            Self::TraceNativeRun => "AIR TRACE",
+            Self::TraceSessionSnapshot => "AIR SESSION",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AirLocatorDisclosure {
+    LocalOnly,
+    Redacted,
+}
+
+/// Display-only locator following AIR 1's locator vocabulary. It is never
+/// treated as authority or opened automatically by muxa.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AirArtifactLocator {
+    pub display: String,
+    pub disclosure: AirLocatorDisclosure,
+}
+
+/// A typed reference to an AIR 1 artifact envelope. Only the stable content
+/// identity/profile and optional display metadata travel through muxa; the
+/// source-bearing artifact stays in AIR Workbench or another AIR consumer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AirArtifactReference {
+    pub artifact_id: String,
+    pub profile: AirArtifactProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<AirArtifactLocator>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
@@ -173,6 +239,8 @@ pub struct CollaborationReply {
     pub body: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub air_artifacts: Vec<AirArtifactReference>,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -188,6 +256,8 @@ pub struct CollaborationRequest {
     pub work_mode: WorkMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub air_artifacts: Vec<AirArtifactReference>,
     pub status: RequestStatus,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -242,6 +312,8 @@ pub struct NewRequest {
     pub expects_reply: bool,
     pub work_mode: WorkMode,
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub air_artifacts: Vec<AirArtifactReference>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +334,8 @@ pub enum CollaborationError {
     EmptyMessage,
     #[error("message exceeds the configured {0}-byte limit")]
     MessageTooLarge(usize),
+    #[error("invalid AIR artifact reference: {0}")]
+    InvalidAirArtifactReference(String),
     #[error("request not found: {0}")]
     NotFound(String),
     #[error("request {0} does not belong to the calling participant")]
@@ -427,6 +501,7 @@ impl CollaborationStore {
                 self.opts.max_message_bytes,
             ));
         }
+        validate_air_artifact_references(&input.air_artifacts)?;
         let now = OffsetDateTime::now_utc();
         let request = CollaborationRequest {
             id: next_request_id(now),
@@ -437,6 +512,7 @@ impl CollaborationStore {
             expects_reply: input.expects_reply,
             work_mode: input.work_mode,
             paths: input.paths,
+            air_artifacts: input.air_artifacts,
             status: RequestStatus::Queued,
             created_at: now,
             claimed_at: None,
@@ -497,6 +573,7 @@ impl CollaborationStore {
         status: RequestStatus,
         body: String,
         artifacts: Vec<String>,
+        air_artifacts: Vec<AirArtifactReference>,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         if !matches!(
@@ -513,6 +590,7 @@ impl CollaborationStore {
                 self.opts.max_message_bytes,
             ));
         }
+        validate_air_artifact_references(&air_artifacts)?;
         let updated = {
             let mut requests = self.requests.write().await;
             let request = requests
@@ -529,6 +607,7 @@ impl CollaborationStore {
                 status,
                 body,
                 artifacts,
+                air_artifacts,
                 at: OffsetDateTime::now_utc(),
             });
             request.clone()
@@ -941,6 +1020,57 @@ fn next_request_id(now: OffsetDateTime) -> String {
     format!("req_{nanos:x}_{counter:x}")
 }
 
+fn validate_air_artifact_references(
+    references: &[AirArtifactReference],
+) -> Result<(), CollaborationError> {
+    if references.len() > MAX_AIR_ARTIFACT_REFERENCES {
+        return Err(CollaborationError::InvalidAirArtifactReference(format!(
+            "at most {MAX_AIR_ARTIFACT_REFERENCES} references are allowed"
+        )));
+    }
+    for (index, reference) in references.iter().enumerate() {
+        let digest = reference
+            .artifact_id
+            .strip_prefix("urn:air:sha256:")
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if digest.is_none() {
+            return Err(CollaborationError::InvalidAirArtifactReference(
+                "artifact_id must be urn:air:sha256 followed by 64 lowercase hex characters".into(),
+            ));
+        }
+        if references[..index]
+            .iter()
+            .any(|prior| prior.artifact_id == reference.artifact_id)
+        {
+            return Err(CollaborationError::InvalidAirArtifactReference(format!(
+                "duplicate artifact_id {}",
+                reference.artifact_id
+            )));
+        }
+        if reference.label.as_ref().is_some_and(|label| {
+            label.trim().is_empty() || label.len() > MAX_AIR_REFERENCE_LABEL_BYTES
+        }) {
+            return Err(CollaborationError::InvalidAirArtifactReference(format!(
+                "label must be non-empty and at most {MAX_AIR_REFERENCE_LABEL_BYTES} bytes"
+            )));
+        }
+        if reference.locator.as_ref().is_some_and(|locator| {
+            locator.display.trim().is_empty()
+                || locator.display.len() > MAX_AIR_LOCATOR_DISPLAY_BYTES
+        }) {
+            return Err(CollaborationError::InvalidAirArtifactReference(format!(
+                "locator display must be non-empty and at most {MAX_AIR_LOCATOR_DISPLAY_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_alias(alias: Option<String>) -> Result<Option<String>, CollaborationError> {
     let Some(alias) = alias else {
         return Ok(None);
@@ -1007,6 +1137,18 @@ mod tests {
         }
     }
 
+    fn air_reference(profile: AirArtifactProfile) -> AirArtifactReference {
+        AirArtifactReference {
+            artifact_id: format!("urn:air:sha256:{}", "a".repeat(64)),
+            profile,
+            label: Some("review plan".into()),
+            locator: Some(AirArtifactLocator {
+                display: "plans/review.air.json".into(),
+                disclosure: AirLocatorDisclosure::LocalOnly,
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn request_claim_and_reply_round_trip() {
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
@@ -1022,10 +1164,12 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: vec!["src/auth.rs".into()],
+                    air_artifacts: vec![air_reference(AirArtifactProfile::PlanNativeCli)],
                 },
             )
             .await
             .unwrap();
+        assert_eq!(request.air_artifacts[0].profile.kind(), "plan");
         let inbox = mailbox.claim_for(&recipient).await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].status, RequestStatus::Claimed);
@@ -1037,10 +1181,17 @@ mod tests {
                 RequestStatus::Completed,
                 "looks good".into(),
                 Vec::new(),
+                vec![air_reference(AirArtifactProfile::TraceNativeRun)],
             )
             .await
             .unwrap();
         assert_eq!(completed.status, RequestStatus::Completed);
+        assert_eq!(
+            completed.reply.as_ref().unwrap().air_artifacts[0]
+                .profile
+                .label(),
+            "AIR TRACE"
+        );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 1);
         assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
         assert_eq!(
@@ -1058,6 +1209,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_air_reference_is_rejected_before_persistence() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut invalid = air_reference(AirArtifactProfile::WorkflowSkill);
+        invalid.artifact_id = format!("urn:air:sha256:{}", "A".repeat(64));
+        let result = mailbox
+            .create(
+                participant("%1", "sender"),
+                participant("%2", "recipient"),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review workflow".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: vec![invalid],
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollaborationError::InvalidAirArtifactReference(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn sender_can_list_and_cancel_only_unclaimed_requests() {
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
         let sender = participant("%1", "sender");
@@ -1072,6 +1249,7 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
+                    air_artifacts: Vec::new(),
                 },
             )
             .await
@@ -1086,6 +1264,7 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
                     paths: vec!["src/**".into()],
+                    air_artifacts: Vec::new(),
                 },
             )
             .await
@@ -1139,6 +1318,7 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
+                    air_artifacts: Vec::new(),
                 },
             )
             .await

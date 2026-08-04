@@ -11,28 +11,33 @@ Every tool proxies the daemon over its existing owner-only unix socket, so the
 MCP server adds no new surface area: it can only do what a shell on the same
 machine could already do through `muxa`.
 
-## Wire it into Claude Code
+## Wire it into Claude Code and Codex
 
 Start the daemon (`muxad`) first — the MCP server **refuses to start** when
 the socket is unreachable, with a clear error, so an agent never talks to a
 dead control plane. Then register it:
 
 ```bash
-claude mcp add muxa -- muxa mcp
+claude mcp add --scope user muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
 ```
 
 That runs `muxa mcp` as a stdio MCP server. Point it at a non-default socket
 with the global flag or env var if you run an isolated daemon:
 
 ```bash
-claude mcp add muxa -- muxa --socket /run/user/1000/muxa.sock mcp
+claude mcp add --scope user muxa -- muxa --socket /run/user/1000/muxa.sock mcp
 # or
-MUXA_SOCKET=/run/user/1000/muxa.sock claude mcp add muxa -- muxa mcp
+claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa mcp
 ```
 
-Verify from Claude Code with `/mcp` (the `muxa` server should list ten
-tools). Other MCP hosts: run `muxa mcp` as a stdio server command in their
-config.
+Restart agents that were already running, then verify with `claude mcp list`
+or `codex mcp list` (the `muxa` server should list fourteen tools). Other MCP
+hosts can run `muxa mcp` as a stdio server command in their config.
+
+At initialization muxa tells the agent how to use same-window peers as a
+reviewer, focused question target, or delegated subagent. The agent can call
+`muxa_collaboration_guide` to retrieve that contract again at any time.
 
 ## Implementation
 
@@ -76,12 +81,13 @@ it:
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?` | Block until an agent's state changes (or timeout); returns the transition. |
+| `muxa_collaboration_guide` | — | Show the recommended reviewer, question, delegated-subagent, incoming-work, and AIR handoff contracts. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
-| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?` | Create a durable same-window peer request. |
+| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?` | Create a durable same-window peer request. |
 | `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
 | `muxa_list_messages` | `mailbox?` | List incoming, sent, or all requests without claiming. |
-| `muxa_reply` | `request_id`, `status`, `body`, `artifacts?` | Return a structured terminal response. |
+| `muxa_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
 | `muxa_wait_reply` | `request_id`, `timeout_secs?` | Wait for a structured peer response. |
 | `muxa_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
@@ -102,6 +108,49 @@ the tools with `[collaboration] enabled = true`; see
 For rooms with several agents, call `muxa_set_identity` once per agent and
 route with `@alias` or `role:<name>`. Aliases must be unique among live peers;
 role routing refuses multiple matches instead of picking one arbitrarily.
+
+### Peer reviewer or delegated subagent
+
+For substantial work, start with `muxa_collaboration_guide`, then inspect
+`muxa_room_context`. Continue independent work while the peer handles a narrow,
+non-overlapping request:
+
+```text
+# reviewer: findings only, no edits
+muxa_send_message(target="peer", kind="review", work_mode="read_only",
+                  paths=["crates/auth/**"], body="Review this change for races and regressions")
+
+# delegated subagent: explicitly authorized edits, with a narrow path scope
+muxa_send_message(target="peer", kind="task", work_mode="execute",
+                  paths=["crates/auth/tests/**"], body="Add regression tests; do not edit production code")
+```
+
+The receiver should claim promptly with `muxa_inbox`, honor the request kind,
+work mode, and paths, and always terminate with `muxa_reply`. The sender waits
+with `muxa_wait_reply`, then verifies and integrates the result. Avoid
+concurrent edits to the same files; use separate worktrees when scopes cannot
+be isolated.
+
+### AIR artifact handoff
+
+Collaboration requests and replies can carry typed references to existing AIR
+1.0 artifacts. muxa transports and visualizes the reference; AIR Workbench
+remains the validator, editor, and graph viewer. This does not turn muxa into
+an AIR executor and does not make an unvalidated document conformant.
+
+```json
+{
+  "artifact_id": "urn:air:sha256:<64 lowercase hex characters>",
+  "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
+  "label": "CAL-6924 execution plan",
+  "locator": { "display": ".air/cal-6924-plan.air.json", "disclosure": "local-only" }
+}
+```
+
+The exact supported profiles are workflow skill, native CLI plan, native run
+trace, and metadata-only session snapshot. Locators are display-only hints,
+never authority. Session snapshot references must not be used to smuggle
+prompts, messages, filesystem paths, or provider identifiers into AIR data.
 
 ## Orchestration examples
 

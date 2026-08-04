@@ -311,7 +311,14 @@ other agent occupies the same stable tmux window.
   "origin": { "pane": "%12", "socket": "default" },
   "target": "peer",
   "request": { "kind": "review", "body": "review auth", "expects_reply": true,
-               "work_mode": "read_only", "paths": ["crates/auth/**"] } }
+               "work_mode": "read_only", "paths": ["crates/auth/**"],
+               "air_artifacts": [{
+                 "artifact_id": "urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                 "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
+                 "label": "auth review plan",
+                 "locator": { "display": ".air/auth-plan.air.json",
+                              "disclosure": "local-only" }
+               }] } }
 
 { "protocol": 3, "kind": "collaboration_inbox",
   "origin": { "pane": "%18", "socket": "default" } }
@@ -323,7 +330,7 @@ other agent occupies the same stable tmux window.
 { "protocol": 3, "kind": "collaboration_reply",
   "origin": { "pane": "%18", "socket": "default" },
   "request_id": "req_...", "status": "completed", "body": "looks good",
-  "artifacts": [] }
+  "artifacts": [], "air_artifacts": [] }
 
 { "protocol": 3, "kind": "collaboration_get",
   "origin": { "pane": "%12", "socket": "default" },
@@ -345,6 +352,13 @@ Terminal replies also receive an idle-only wake; a sender-side
 Identity is pinned to the registering agent session. `@alias` targets a unique
 live alias, while `role:<name>` succeeds only when exactly one live peer in the
 room carries that role.
+
+`air_artifacts` is an additive list of typed AIR 1.0 references on both
+requests and replies. The daemon validates the SHA-256 URN, exact supported
+profile URI, label/locator bounds, and duplicates, but does not read the
+locator or assert AIR document conformance. Locators are display-only and have
+`local-only` or `redacted` disclosure. Existing persisted requests without the
+field decode as an empty list.
 
 #### `subscribe`
 

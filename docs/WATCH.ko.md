@@ -124,6 +124,11 @@ request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합�
 shell에서 watch를 열었다면 조회는 가능하지만, 협업하려면 agent pane에서
 `prefix+s`로 다시 열라는 안내가 표시됩니다.
 
+AIR artifact 참조가 첨부된 request는 mailbox에서 profile별 색상 배지로
+표시됩니다. `AIR WORKFLOW`는 파랑, `AIR PLAN`은 자홍, `AIR TRACE`는 청록,
+`AIR SESSION`은 밝은 청록입니다. 선택 상세에는 참조가 작업 입력인지 응답
+출력인지와 짧은 digest, label, 표시용 locator가 함께 나옵니다.
+
 ## Preview
 
 `o` 또는 `Alt-P`를 누르면 선택 pane의 preview가 열립니다. session view에서 선택한 session에

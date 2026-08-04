@@ -26,11 +26,14 @@ wake = "idle_only" # or "never" for pull-only delivery
 Restart `muxad` and register `muxa mcp` with each agent host:
 
 ```bash
-claude mcp add muxa -- muxa mcp
+claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
 
 Restart agents that were already running so they reload their MCP server list.
+Once connected, muxa's initialization instructions surface same-window peers
+as reviewers or narrowly scoped delegated subagents. An agent can call
+`muxa_collaboration_guide` to retrieve the contract again.
 
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
@@ -63,6 +66,8 @@ is refused. Identity never follows a later agent that reuses the pane.
 ```bash
 muxa peers
 muxa msg send peer "review the auth change" --kind review
+muxa msg send peer "review the risks in this plan" --kind review \
+  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
 muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
 muxa msg wait req_... --timeout-secs 300
@@ -89,6 +94,7 @@ worktrees remain the safest choice for concurrent edits.
 
 | Tool | Purpose |
 | --- | --- |
+| `muxa_collaboration_guide` | Retrieve reviewer, question, delegated-subagent, and AIR handoff contracts. |
 | `muxa_room_context` | Identify self, list same-window peers, and show unread count. |
 | `muxa_set_identity` | Replace this exact session's room-local alias and roles. |
 | `muxa_send_message` | Create a durable peer request. |
@@ -97,6 +103,41 @@ worktrees remain the safest choice for concurrent edits.
 | `muxa_reply` | Return a completed/blocked/declined/failed response. |
 | `muxa_wait_reply` | Wait for the structured terminal response. |
 | `muxa_cancel_message` | Cancel a sent request while it is still queued. |
+
+## Reviewers and delegated subagents
+
+For substantial work, call `muxa_collaboration_guide` and
+`muxa_room_context` first. Send reviewers `kind=review` with
+`work_mode=read_only`. Send implementation work as `kind=task` with
+`work_mode=execute` and a narrow, non-overlapping path scope. Continue
+independent work while the peer handles the request, then wait for the reply,
+verify it, and integrate it.
+
+The receiver should claim its inbox promptly, honor kind/work mode/paths, and
+always produce a terminal `muxa_reply`. Avoid concurrent edits to the same
+files; use separate worktrees when scopes cannot be isolated.
+
+## AIR artifact handoff and visualization
+
+Requests and replies can attach up to eight typed AIR 1.0 artifact references
+through `air_artifacts`. The watch and dashboard mailboxes color the first
+reference by profile and show its input/output direction, short digest, label,
+and display-only locator in the detail view.
+
+The exact supported profiles are:
+
+- `https://open330.github.io/air/profiles/1.0.0/workflow-skill` → `AIR WORKFLOW`
+- `https://open330.github.io/air/profiles/1.0.0/plan-native-cli` → `AIR PLAN`
+- `https://open330.github.io/air/profiles/1.0.0/trace-native-run` → `AIR TRACE`
+- `https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot` → `AIR SESSION`
+
+Artifact IDs must be `urn:air:sha256:` followed by a 64-character lowercase
+SHA-256 digest. A locator has `local-only` or `redacted` disclosure and is only
+a display hint, never file or execution authority. muxa validates reference
+syntax but does not claim artifact conformance: validate, edit, and graph the
+artifact in AIR Workbench. Do not invent a collaboration trace profile or put
+prompts, messages, filesystem paths, or provider identifiers into an AIR
+session snapshot.
 
 ## Wake-up safety
 

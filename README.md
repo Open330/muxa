@@ -106,9 +106,14 @@ Register the MCP server once for both agent hosts, then restart agents that
 were already running so they can read and reply to requests themselves.
 
 ```bash
-claude mcp add muxa -- muxa mcp
+claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
+
+Connected agents are told that room peers can serve as read-only reviewers or
+narrowly scoped execution subagents. Requests and replies can also carry
+validated AIR 1.0 artifact references, which watch/dashboard visualize with
+profile-colored mailbox badges.
 
 Then:
 
@@ -143,7 +148,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
-| `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
+| `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
 

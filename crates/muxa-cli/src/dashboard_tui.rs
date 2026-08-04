@@ -12,8 +12,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use muxa::collaboration::{
-    CollaborationOrigin, CollaborationRequest, NewRequest, Participant, RequestKind,
-    RequestMailbox, RequestStatus, RoomContext, WorkMode,
+    AirArtifactProfile, AirArtifactReference, CollaborationOrigin, CollaborationRequest,
+    NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use muxa::config::{IconSet, WatchTheme};
 use muxa::event::RateLimitScope;
@@ -2289,6 +2289,7 @@ async fn run_pending_action(client: &Client, action: PendingAction) -> ActionOut
                 expects_reply: kind != RequestKind::Notice,
                 work_mode,
                 paths: Vec::new(),
+                air_artifacts: Vec::new(),
             };
             match client.collaboration_send(&origin, &target, &request).await {
                 Ok(request) => ActionOutcome::Ok(format!(
@@ -2307,7 +2308,7 @@ async fn run_pending_action(client: &Client, action: PendingAction) -> ActionOut
             body,
         } => {
             match client
-                .collaboration_reply(&origin, &request_id, status, &body, &[])
+                .collaboration_reply(&origin, &request_id, status, &body, &[], &[])
                 .await
             {
                 Ok(request) => ActionOutcome::Ok(format!(
@@ -3727,11 +3728,19 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &DashboardApp) {
         return;
     }
 
+    let has_air = app.selected_collaboration_request().is_some_and(|request| {
+        !request.air_artifacts.is_empty()
+            || request
+                .reply
+                .as_ref()
+                .is_some_and(|reply| !reply.air_artifacts.is_empty())
+    });
+    let detail_height = if has_air { 9 } else { 7 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(4),
-            Constraint::Length(7),
+            Constraint::Length(detail_height),
             Constraint::Length(1),
         ])
         .split(inner);
@@ -3754,6 +3763,10 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &DashboardApp) {
                 CollaborationTab::Incoming => request.from.label(),
                 CollaborationTab::Sent => request.to.label(),
             };
+            let air_badge = request.air_artifacts.first();
+            let air_width = air_badge.map_or(0, |reference| {
+                reference.profile.label().len().saturating_add(3)
+            });
             let text = truncate_width(
                 &format!(
                     "{} {:<11} {:<9} {:<12} {:<9} {}",
@@ -3764,28 +3777,31 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &DashboardApp) {
                     work_mode_label(request.work_mode),
                     squash_ws(&request.body)
                 ),
-                width.saturating_sub(2),
+                width.saturating_sub(2).saturating_sub(air_width),
             );
-            Line::from(vec![
-                Span::styled(
-                    if focused { "> " } else { "  " },
-                    if focused {
-                        app.theme.selected_border()
-                    } else {
-                        app.theme.dim_style()
-                    },
-                ),
-                Span::styled(
-                    text,
-                    if focused {
-                        Style::default()
-                            .fg(app.theme.title)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(app.theme.panel)
-                    },
-                ),
-            ])
+            let mut spans = vec![Span::styled(
+                if focused { "> " } else { "  " },
+                if focused {
+                    app.theme.selected_border()
+                } else {
+                    app.theme.dim_style()
+                },
+            )];
+            if let Some(reference) = air_badge {
+                spans.push(dashboard_air_artifact_badge(reference));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                text,
+                if focused {
+                    Style::default()
+                        .fg(app.theme.title)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(app.theme.panel)
+                },
+            ));
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
     if lines.is_empty() {
@@ -3861,6 +3877,12 @@ fn collaboration_request_detail(
             width,
         )));
     }
+    lines.extend(
+        request
+            .air_artifacts
+            .iter()
+            .map(|reference| dashboard_air_artifact_detail_line("input", reference, width)),
+    );
     if let Some(reply) = request.reply.as_ref() {
         lines.push(Line::from(Span::styled(
             truncate_width(
@@ -3873,8 +3895,57 @@ fn collaboration_request_detail(
             ),
             Style::default().fg(theme.ok),
         )));
+        lines.extend(
+            reply
+                .air_artifacts
+                .iter()
+                .map(|reference| dashboard_air_artifact_detail_line("output", reference, width)),
+        );
     }
+    lines.truncate(8);
     lines
+}
+
+fn dashboard_air_artifact_badge(reference: &AirArtifactReference) -> Span<'static> {
+    let (foreground, background) = match reference.profile {
+        AirArtifactProfile::WorkflowSkill => (Color::White, Color::Blue),
+        AirArtifactProfile::PlanNativeCli => (Color::White, Color::Magenta),
+        AirArtifactProfile::TraceNativeRun => (Color::Black, Color::Cyan),
+        AirArtifactProfile::TraceSessionSnapshot => (Color::Black, Color::LightCyan),
+    };
+    Span::styled(
+        format!(" {} ", reference.profile.label()),
+        Style::default()
+            .fg(foreground)
+            .bg(background)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn dashboard_air_artifact_detail_line(
+    direction: &str,
+    reference: &AirArtifactReference,
+    width: usize,
+) -> Line<'static> {
+    let short_id = reference
+        .artifact_id
+        .strip_prefix("urn:air:sha256:")
+        .unwrap_or(&reference.artifact_id)
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let label = reference.label.as_deref().unwrap_or("-");
+    let locator = reference
+        .locator
+        .as_ref()
+        .map_or("", |locator| locator.display.as_str());
+    Line::from(vec![
+        dashboard_air_artifact_badge(reference),
+        Span::raw(truncate_width(
+            &format!(" {direction} · {short_id} · {label} · {locator}"),
+            width.saturating_sub(reference.profile.label().len() + 2),
+        )),
+    ])
 }
 
 fn render_confirm(f: &mut Frame, area: Rect, app: &DashboardApp) {
@@ -4336,6 +4407,7 @@ mod tests {
             expects_reply: true,
             work_mode: WorkMode::ReadOnly,
             paths: Vec::new(),
+            air_artifacts: Vec::new(),
             status,
             created_at: now,
             claimed_at: (status == RequestStatus::Claimed).then_some(now),
@@ -4701,13 +4773,20 @@ mod tests {
         let current = fake_participant("%1", "self", Some("builder"), &["rust"]);
         let peer = fake_participant("%2", "peer", Some("reviewer"), &["review"]);
         attach_collaboration(&mut data, current.clone(), vec![peer.clone()]);
-        data.collaboration.incoming.push(fake_collaboration_request(
+        let mut request = fake_collaboration_request(
             "req_render_123456",
             peer,
             current,
             RequestStatus::Claimed,
             now,
-        ));
+        );
+        request.air_artifacts.push(AirArtifactReference {
+            artifact_id: format!("urn:air:sha256:{}", "a".repeat(64)),
+            profile: AirArtifactProfile::PlanNativeCli,
+            label: Some("CAL-6924 execution plan".into()),
+            locator: None,
+        });
+        data.collaboration.incoming.push(request);
         let backend = TestBackend::new(104, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = DashboardApp::new(data, WatchTheme::Classic);
@@ -4725,6 +4804,8 @@ mod tests {
 
         assert!(dump.contains("incoming 1"));
         assert!(dump.contains("reviewer@%2"));
+        assert!(dump.contains("AIR PLAN"));
+        assert!(dump.contains("aaaaaaaaaaaa"));
         assert!(dump.contains("review the auth change"));
         assert!(dump.contains("e reply"));
     }

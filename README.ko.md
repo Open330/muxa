@@ -101,9 +101,14 @@ wake = "idle_only"
 agent를 다시 시작합니다.
 
 ```bash
-claude mcp add muxa -- muxa mcp
+claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
+
+연결된 agent에는 같은 room의 peer를 read-only reviewer 또는 좁은 범위의 실행
+subagent로 활용하라는 협업 지침이 자동으로 노출됩니다. 요청과 응답에는 검증된
+AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 profile별 색상
+배지로 표시합니다.
 
 평소에는:
 

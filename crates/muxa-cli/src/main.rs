@@ -22,7 +22,8 @@ use muxa::adapters::{
     claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
 };
 use muxa::collaboration::{
-    CollaborationOrigin, NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
+    AirArtifactReference, CollaborationOrigin, NewRequest, RequestKind, RequestMailbox,
+    RequestStatus, WorkMode,
 };
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
@@ -215,7 +216,7 @@ enum Cmd {
     /// Run a Model Context Protocol (MCP) stdio server so a coding agent
     /// can orchestrate muxa — inspect other agents, send them prompts,
     /// capture panes, and wait for state changes. Wire it into Claude Code
-    /// with `claude mcp add muxa -- muxa mcp`. Refuses to start if the
+    /// with `claude mcp add --scope user muxa -- muxa mcp`. Refuses to start if the
     /// daemon socket is unreachable. See docs/MCP.md.
     Mcp,
     /// Tail muxad's stdout/stderr logs without remembering paths.
@@ -259,6 +260,9 @@ enum MsgCmd {
         /// Advisory writable path scope. Repeat for multiple paths.
         #[arg(long = "path")]
         paths: Vec<String>,
+        /// AIR 1 artifact reference as JSON. Repeat for multiple references.
+        #[arg(long = "air-ref")]
+        air_refs: Vec<String>,
         /// Fire-and-forget message; do not expect a reply.
         #[arg(long)]
         no_reply: bool,
@@ -283,6 +287,9 @@ enum MsgCmd {
         status: String,
         #[arg(long = "artifact")]
         artifacts: Vec<String>,
+        /// AIR 1 artifact reference as JSON. Repeat for multiple references.
+        #[arg(long = "air-ref")]
+        air_refs: Vec<String>,
     },
     /// Wait for the structured reply to a sent request.
     Wait {
@@ -579,6 +586,17 @@ fn collaboration_reply_status(value: &str) -> Result<RequestStatus> {
     }
 }
 
+fn collaboration_air_references(values: &[String]) -> Result<Vec<AirArtifactReference>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            serde_json::from_str(value)
+                .with_context(|| format!("invalid --air-ref #{} JSON", index + 1))
+        })
+        .collect()
+}
+
 fn collaboration_mailbox(value: &str) -> Result<RequestMailbox> {
     match value {
         "incoming" | "inbox" => Ok(RequestMailbox::Incoming),
@@ -674,9 +692,11 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             kind,
             execute,
             paths,
+            air_refs,
             no_reply,
         } => {
             let kind = collaboration_request_kind(&kind)?;
+            let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
                 .collaboration_send(
                     &origin,
@@ -691,6 +711,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                             WorkMode::ReadOnly
                         },
                         paths,
+                        air_artifacts,
                     },
                 )
                 .await?;
@@ -726,7 +747,9 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             body,
             status,
             artifacts,
+            air_refs,
         } => {
+            let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
                 .collaboration_reply(
                     &origin,
@@ -734,6 +757,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     collaboration_reply_status(&status)?,
                     &body,
                     &artifacts,
+                    &air_artifacts,
                 )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&request)?);
@@ -741,26 +765,33 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::Wait {
             request_id,
             timeout_secs,
-        } => {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-            loop {
-                let request = client.collaboration_get(&origin, &request_id).await?;
-                if request.status.is_terminal() {
-                    println!("{}", serde_json::to_string_pretty(&request)?);
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out waiting for {request_id}");
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
+        } => cmd_msg_wait(client, &origin, &request_id, timeout_secs).await?,
         MsgCmd::Cancel { request_id } => {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
             println!("{}", serde_json::to_string_pretty(&request)?);
         }
     }
     Ok(())
+}
+
+async fn cmd_msg_wait(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    request_id: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let request = client.collaboration_get(origin, request_id).await?;
+        if request.status.is_terminal() {
+            println!("{}", serde_json::to_string_pretty(&request)?);
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for {request_id}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 fn print_collaboration_messages(

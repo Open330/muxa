@@ -28,11 +28,14 @@ wake = "idle_only"
 등록합니다.
 
 ```bash
-claude mcp add muxa -- muxa mcp
+claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
 
 이미 실행 중인 agent는 등록된 MCP 목록을 다시 읽도록 종료 후 재실행합니다.
+MCP가 연결되면 muxa는 초기 지침에서 같은 window의 agent를 reviewer나 좁은 범위의
+subagent로 활용할 수 있음을 알립니다. agent는 필요할 때
+`muxa_collaboration_guide`로 같은 지침을 다시 조회할 수 있습니다.
 
 기존 `prefix+s` watch 단축키가 있다면 업그레이드 후 추가 단축키가 필요 없습니다.
 
@@ -87,6 +90,10 @@ muxa msg send peer "auth 변경의 race 가능성을 검토해 주세요" --kind
 muxa msg send pane:%18 "테스트를 보강해 주세요" \
   --kind task --execute --path 'crates/auth/**'
 
+# 검증된 AIR plan을 작업 입력으로 함께 전달
+muxa msg send peer "이 계획의 위험을 검토해 주세요" --kind review \
+  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
+
 # 수신 agent
 muxa msg inbox
 muxa msg reply req_... "검토 완료: ..." --status completed
@@ -116,6 +123,7 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 
 | Tool | 역할 |
 | --- | --- |
+| `muxa_collaboration_guide` | reviewer/question/subagent/AIR 전달의 권장 계약 조회 |
 | `muxa_room_context` | self, same-window peers, unread count 조회 |
 | `muxa_set_identity` | 현재 agent session의 room-local alias/roles 교체 |
 | `muxa_send_message` | durable request 생성 |
@@ -140,6 +148,43 @@ Agent B: muxa_reply(request_id="req_...", status="completed", ...)
 Agent A: wait 중이 아니고 Idle이면 짧은 reply wake prompt 수신
 Agent A: muxa_wait_reply(request_id="req_...")
 ```
+
+## Reviewer와 subagent로 활용하기
+
+agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니다.
+
+1. `muxa_collaboration_guide`, `muxa_room_context`로 같은 room의 peer와 계약을
+   확인합니다.
+2. reviewer에는 `kind=review`, `work_mode=read_only`와 검토 범위를 보냅니다.
+3. 구현을 위임할 subagent에는 `kind=task`, `work_mode=execute`와 겹치지 않는 좁은
+   path scope를 보냅니다.
+4. 발신 agent는 독립적으로 진행하고, 응답을 받은 뒤 결과를 직접 검증해
+   통합합니다.
+
+수신 agent는 inbox를 빠르게 claim하고 kind/work mode/path를 지키며, 성공 여부와
+관계없이 `muxa_reply`로 terminal 상태를 남겨야 합니다. 두 agent가 같은 파일을
+동시에 수정해야 한다면 별도 worktree를 사용하세요.
+
+## AIR artifact 전달과 시각화
+
+request와 reply의 `air_artifacts`에는 AIR 1.0 artifact의 타입이 지정된 참조를 최대
+8개까지 첨부할 수 있습니다. `muxa watch`와 `muxa dashboard` mailbox는 첫 참조를
+색상 배지로 표시하고, 상세 영역에서 input/output, 짧은 digest, label, 표시용
+locator를 보여줍니다.
+
+지원 profile은 AIR 1.0의 정확한 네 profile입니다.
+
+- `https://open330.github.io/air/profiles/1.0.0/workflow-skill` → `AIR WORKFLOW`
+- `https://open330.github.io/air/profiles/1.0.0/plan-native-cli` → `AIR PLAN`
+- `https://open330.github.io/air/profiles/1.0.0/trace-native-run` → `AIR TRACE`
+- `https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot` → `AIR SESSION`
+
+artifact ID는 `urn:air:sha256:` 뒤에 소문자 64자리 SHA-256 digest가 와야 합니다.
+locator는 `local-only` 또는 `redacted` disclosure를 가진 표시용 힌트일 뿐이며 파일
+접근 권한이나 실행 권한이 아닙니다. muxa는 참조 형식만 검사하고 artifact의 AIR
+conformance를 주장하지 않습니다. 검증·편집·그래프 탐색은 AIR Workbench에서
+수행하세요. muxa 협업 내용을 위해 새 trace profile을 만들거나 session snapshot에
+prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
 
 ## 전달 안전성
 

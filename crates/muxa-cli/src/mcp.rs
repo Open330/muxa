@@ -25,7 +25,8 @@
 
 use anyhow::{bail, Result};
 use muxa::collaboration::{
-    CollaborationOrigin, NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
+    AirArtifactReference, CollaborationOrigin, NewRequest, RequestKind, RequestMailbox,
+    RequestStatus, RoomContext, WorkMode,
 };
 use muxa::event::AgentState;
 use muxa::ipc::Client;
@@ -52,6 +53,23 @@ const DEFAULT_WAIT_SECS: u64 = 30;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
+
+/// Sent to MCP hosts during initialization so collaboration is a first-class
+/// workflow rather than a capability the model has to infer from tool names.
+const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
+    At the start of substantial work, call muxa_collaboration_guide (or \
+    muxa_room_context) to discover available peer agents. Improve important work \
+    with a peer when useful: use review + read_only after implementation and tests \
+    for an independent critique; question + read_only for focused analysis; task + \
+    execute + narrow paths only for bounded, non-overlapping delegated edits. Keep \
+    primary ownership: continue useful work while the peer runs, wait for its \
+    structured reply, then verify and integrate the result yourself. Avoid \
+    overlapping edits unless separate worktrees isolate them. When notified of an \
+    incoming request, call muxa_inbox promptly, honor kind/work_mode/paths, and \
+    always finish with muxa_reply using completed, blocked, declined, or failed. \
+    When work is already represented by a validated AIR 1 workflow, plan, or trace, \
+    attach its typed air_artifacts reference for shared identity and visualization; \
+    AIR Workbench remains the validator/editor and muxa never implies conformance.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -246,15 +264,47 @@ fn initialize_result() -> Value {
             "name": "muxa",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "muxa control plane. Use muxa_set_identity to register a \
-            room-local alias/roles, muxa_room_context to discover same-window peers, \
-            muxa_send_message/muxa_inbox/muxa_reply for durable \
-            peer collaboration, muxa_list_messages for lifecycle visibility, and \
-            muxa_wait_reply for a structured result. Use \
-            muxa_status to see what agents \
-            are doing, muxa_send_prompt to drive one, muxa_capture_pane to read \
-            its screen, and muxa_wait_for_change to block until an agent changes \
-            state.",
+        "instructions": MCP_SERVER_INSTRUCTIONS,
+    })
+}
+
+fn air_artifact_reference_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "artifact_id": {
+                "type": "string",
+                "pattern": "^urn:air:sha256:[0-9a-f]{64}$",
+                "description": "AIR content identity from the validated artifact envelope."
+            },
+            "profile": {
+                "type": "string",
+                "enum": [
+                    "https://open330.github.io/air/profiles/1.0.0/workflow-skill",
+                    "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
+                    "https://open330.github.io/air/profiles/1.0.0/trace-native-run",
+                    "https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot"
+                ]
+            },
+            "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Optional display-only label; never artifact authority."
+            },
+            "locator": {
+                "type": "object",
+                "properties": {
+                    "display": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "disclosure": { "type": "string", "enum": ["local-only", "redacted"] }
+                },
+                "required": ["display", "disclosure"],
+                "additionalProperties": false,
+                "description": "Optional AIR 1 display-only locator. Muxa never opens it automatically."
+            }
+        },
+        "required": ["artifact_id", "profile"],
+        "additionalProperties": false
     })
 }
 
@@ -330,8 +380,13 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_collaboration_guide",
+            "description": "Discover same-window peer agents and get concrete reviewer/subagent workflows. Call near the start of substantial work and again before finalizing important changes when an independent review could improve the result.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
             "name": "muxa_room_context",
-            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Call this before addressing a peer.",
+            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Use the returned pane, alias, role, and state to choose an appropriate reviewer or delegated subagent.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
@@ -348,7 +403,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_send_message",
-            "description": "Send a durable request to a same-window peer. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role). review/question are read-only by default.",
+            "description": "Send a durable request to a same-window peer. Use review + read_only for an independent critique before finalizing important work; question + read_only for focused analysis; task + execute + narrow paths for bounded, non-overlapping delegated edits. Attach typed air_artifacts when a validated AIR workflow, plan, or trace is the shared review context. Continue useful work, wait for the structured reply, and verify the result yourself. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -357,7 +412,13 @@ fn tool_definitions() -> Vec<Value> {
                     "body": { "type": "string" },
                     "expects_reply": { "type": "boolean", "description": "Default true except notice." },
                     "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." }
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
+                    "air_artifacts": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": air_artifact_reference_schema(),
+                        "description": "Typed references to AIR 1 workflow, plan, or trace artifacts. Muxa transports the reference; AIR Workbench validates and visualizes the artifact."
+                    }
                 },
                 "required": ["target", "body"],
                 "additionalProperties": false
@@ -365,7 +426,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_inbox",
-            "description": "Claim and read pending collaboration requests addressed to this exact agent session.",
+            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
@@ -388,7 +449,13 @@ fn tool_definitions() -> Vec<Value> {
                     "request_id": { "type": "string" },
                     "status": { "type": "string", "enum": ["completed", "blocked", "declined", "failed"] },
                     "body": { "type": "string" },
-                    "artifacts": { "type": "array", "items": { "type": "string" } }
+                    "artifacts": { "type": "array", "items": { "type": "string" } },
+                    "air_artifacts": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": air_artifact_reference_schema(),
+                        "description": "Typed AIR 1 artifact references returned to the sender."
+                    }
                 },
                 "required": ["request_id", "status", "body"],
                 "additionalProperties": false
@@ -396,7 +463,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_wait_reply",
-            "description": "Wait until a collaboration request reaches a terminal status, returning its structured reply. Default 30 seconds, max 600.",
+            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -485,6 +552,16 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
             })
         }
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
+        "muxa_collaboration_guide" => {
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_context(&origin).await {
+                Ok(room) => json_result(&collaboration_guide(room)),
+                Err(error) => error_result(&format!("collaboration guide failed: {error}")),
+            })
+        }
         "muxa_room_context" => {
             let origin = match current_collaboration_origin() {
                 Ok(origin) => origin,
@@ -528,6 +605,10 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 Err(error) => return Ok(error_result(error)),
             };
             let paths = string_array(&args, "paths");
+            let air_artifacts = match parse_air_artifact_references(&args) {
+                Ok(references) => references,
+                Err(error) => return Ok(error_result(&error)),
+            };
             let expects_reply = args
                 .get("expects_reply")
                 .and_then(Value::as_bool)
@@ -542,6 +623,7 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 expects_reply,
                 work_mode,
                 paths,
+                air_artifacts,
             };
             Ok(
                 match client.collaboration_send(&origin, target, &request).await {
@@ -586,13 +668,24 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 Err(error) => return Ok(error_result(error)),
             };
             let artifacts = string_array(&args, "artifacts");
+            let air_artifacts = match parse_air_artifact_references(&args) {
+                Ok(references) => references,
+                Err(error) => return Ok(error_result(&error)),
+            };
             let origin = match current_collaboration_origin() {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(
                 match client
-                    .collaboration_reply(&origin, request_id, status, body, &artifacts)
+                    .collaboration_reply(
+                        &origin,
+                        request_id,
+                        status,
+                        body,
+                        &artifacts,
+                        &air_artifacts,
+                    )
                     .await
                 {
                     Ok(request) => json_result(&json!(request)),
@@ -620,6 +713,76 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
         }
         other => Ok(error_result(&format!("unknown tool: {other}"))),
     }
+}
+
+fn collaboration_guide(room: RoomContext) -> Value {
+    let next_step = match room.peers.len() {
+        0 => "No peer is available. Continue locally or run another agent in this tmux window.",
+        1 => "One peer is available; target `peer` or its explicit pane id.",
+        _ => {
+            "Multiple peers are available; choose an explicit pane, @alias, or unique role:<name>."
+        }
+    };
+    json!({
+        "purpose": "Use another live agent as an independent reviewer or a bounded delegated subagent to improve important work.",
+        "room": room,
+        "next_step": next_step,
+        "workflows": {
+            "reviewer": {
+                "when": "After implementation, self-review, and relevant tests; before declaring important work complete.",
+                "request": {
+                    "kind": "review",
+                    "work_mode": "read_only",
+                    "body_should_include": [
+                        "objective and acceptance criteria",
+                        "diff, commit, or artifact to inspect",
+                        "tests already run",
+                        "specific risks or uncertainties"
+                    ]
+                },
+                "after_sending": "Continue any independent checks, wait with muxa_wait_reply, then verify and address the findings."
+            },
+            "subagent": {
+                "when": "A useful subtask is independently verifiable and does not overlap your active edits.",
+                "request": {
+                    "kind": "task",
+                    "work_mode": "execute",
+                    "paths": "Set the narrowest advisory path scope possible.",
+                    "body_should_include": [
+                        "one bounded deliverable",
+                        "constraints and definition of done",
+                        "required verification",
+                        "expected reply artifacts"
+                    ]
+                },
+                "after_sending": "Retain primary ownership; inspect the peer's edits and rerun relevant verification before integrating."
+            },
+            "focused_question": {
+                "when": "You need independent analysis without edits.",
+                "request": { "kind": "question", "work_mode": "read_only" }
+            },
+            "air_handoff": {
+                "when": "The work already has a validated AIR 1 workflow, plan, or trace artifact.",
+                "steps": [
+                    "Pass artifact_id, exact AIR 1 profile, and optional display-only locator in air_artifacts.",
+                    "Use the same artifact identity in review requests and structured replies so watch/dashboard can visualize the handoff.",
+                    "Open the source-bearing artifact in AIR Workbench for graph inspection or editing; muxa transports references and does not validate or execute AIR."
+                ]
+            },
+            "incoming_request": {
+                "steps": [
+                    "Call muxa_inbox promptly to claim and read it.",
+                    "Honor kind, work_mode, and paths; read_only never authorizes edits.",
+                    "Reply exactly once with completed, blocked, declined, or failed and include useful artifacts."
+                ]
+            }
+        },
+        "guardrails": [
+            "Do not create overlapping concurrent edits unless separate worktrees isolate them.",
+            "Do not treat a peer reply as proof; verify it against the repository and tests.",
+            "Do not delegate merely for ceremony or recursively bounce work without a concrete benefit."
+        ]
+    })
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -681,6 +844,16 @@ fn string_array(args: &Value, key: &str) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect()
+}
+
+fn parse_air_artifact_references(
+    args: &Value,
+) -> std::result::Result<Vec<AirArtifactReference>, String> {
+    let Some(value) = args.get("air_artifacts") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("air_artifacts must match the AIR reference schema: {error}"))
 }
 
 async fn wait_for_reply(client: &Client, args: &Value) -> Value {
@@ -1031,6 +1204,11 @@ mod tests {
         assert_eq!(init["result"]["serverInfo"]["name"], "muxa");
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("start of substantial work"));
+        assert!(instructions.contains("review + read_only"));
+        assert!(instructions.contains("task + execute + narrow paths"));
+        assert!(instructions.contains("verify and integrate the result yourself"));
 
         let list = dispatch(
             &client,
@@ -1048,6 +1226,7 @@ mod tests {
                 "muxa_send_prompt",
                 "muxa_capture_pane",
                 "muxa_wait_for_change",
+                "muxa_collaboration_guide",
                 "muxa_room_context",
                 "muxa_set_identity",
                 "muxa_send_message",
@@ -1058,9 +1237,58 @@ mod tests {
                 "muxa_cancel_message",
             ],
         );
+        let guide = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_collaboration_guide")
+            .unwrap();
+        assert!(guide["description"]
+            .as_str()
+            .unwrap()
+            .contains("reviewer/subagent workflows"));
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn collaboration_guide_surfaces_reviewer_and_subagent_contracts() {
+        let participant = |kind: &str, session: &str, pane: &str| {
+            json!({
+                "agent_kind": kind,
+                "agent_session_id": session,
+                "pane": pane,
+                "socket": "default",
+                "room": { "host": "tmux", "socket": "default", "window_id": "@1" },
+                "tmux_session_id": "$1",
+                "tmux_session_name": "cal-6924",
+                "window_name": "agents",
+                "state": "idle"
+            })
+        };
+        let room: RoomContext = serde_json::from_value(json!({
+            "self": participant("codex", "sender", "%1"),
+            "peers": [participant("claude_code", "reviewer", "%2")],
+            "unread": 0,
+            "unread_replies": 0
+        }))
+        .unwrap();
+
+        let guide = collaboration_guide(room);
+        assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
+        assert_eq!(guide["workflows"]["reviewer"]["request"]["kind"], "review");
+        assert_eq!(
+            guide["workflows"]["reviewer"]["request"]["work_mode"],
+            "read_only"
+        );
+        assert_eq!(
+            guide["workflows"]["subagent"]["request"]["work_mode"],
+            "execute"
+        );
+        assert!(guide["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule.as_str().unwrap().contains("separate worktrees")));
     }
 
     /// A notification (no `id`) yields no response.

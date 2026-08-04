@@ -21,8 +21,8 @@
 
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
-    self, CollaborationOptions, CollaborationOrigin, CollaborationRequest, CollaborationStore,
-    NewRequest, RequestMailbox, RequestStatus, RoomContext,
+    self, AirArtifactReference, CollaborationOptions, CollaborationOrigin, CollaborationRequest,
+    CollaborationStore, NewRequest, RequestMailbox, RequestStatus, RoomContext,
 };
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::session::{
@@ -220,6 +220,8 @@ enum RequestBody {
         body: String,
         #[serde(default)]
         artifacts: Vec<String>,
+        #[serde(default)]
+        air_artifacts: Vec<AirArtifactReference>,
     },
     CollaborationGet {
         origin: CollaborationOrigin,
@@ -1345,13 +1347,21 @@ async fn handle(
                     status,
                     body,
                     artifacts,
+                    air_artifacts,
                 } => {
                     kind = "collaboration_reply";
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
                     match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration
-                            .reply(&current, &request_id, status, body, artifacts)
+                            .reply(
+                                &current,
+                                &request_id,
+                                status,
+                                body,
+                                artifacts,
+                                air_artifacts,
+                            )
                             .await
                         {
                             Ok(request) => Response::with_collaboration_request(request),
@@ -1810,6 +1820,7 @@ impl Client {
         status: RequestStatus,
         body: &str,
         artifacts: &[String],
+        air_artifacts: &[AirArtifactReference],
     ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
@@ -1819,6 +1830,7 @@ impl Client {
             "status": status,
             "body": body,
             "artifacts": artifacts,
+            "air_artifacts": air_artifacts,
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
@@ -2387,6 +2399,7 @@ mod tests {
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     paths: Vec::new(),
+                    air_artifacts: Vec::new(),
                 },
             )
             .await
@@ -2402,6 +2415,7 @@ mod tests {
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     paths: vec!["src/**".into()],
+                    air_artifacts: Vec::new(),
                 },
             )
             .await
@@ -2422,6 +2436,7 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "looks good",
+                &[],
                 &[],
             )
             .await
@@ -2465,6 +2480,7 @@ mod tests {
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     paths: Vec::new(),
+                    air_artifacts: Vec::new(),
                 },
             )
             .await
