@@ -202,9 +202,13 @@ fn enumerate_sockets_with(scoped: Option<PathBuf>, dirs: &[PathBuf]) -> Vec<Path
 /// merely failed to probe — the worst case there is the old per-socket cost
 /// for that single file.
 fn socket_is_live(path: &Path) -> bool {
+    classify_socket_connect(std::os::unix::net::UnixStream::connect(path).map(|_| ()))
+}
+
+fn classify_socket_connect(result: std::io::Result<()>) -> bool {
     use std::io::ErrorKind;
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => true,
+    match result {
+        Ok(()) => true,
         Err(e) => !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
     }
 }
@@ -629,18 +633,19 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
         assert!(socket_is_live(&live));
 
-        // Orphan: bind then drop the listener. std's UnixListener does not
-        // unlink on drop, so the socket file persists with no one listening —
-        // exactly the stale-tmux-socket shape — and connect() must refuse.
-        let dead = dir.path().join("dead");
-        {
-            let _tmp = std::os::unix::net::UnixListener::bind(&dead).unwrap();
-        }
-        assert!(dead.exists(), "socket file should outlive its listener");
-        assert!(!socket_is_live(&dead));
-
-        // Missing file → dead.
-        assert!(!socket_is_live(&dir.path().join("does-not-exist")));
+        // Classify the two dead outcomes deterministically. Exercising a
+        // dropped listener with a real connect is flaky under the full
+        // parallel suite: process-wide fd pressure can replace ECONNREFUSED
+        // with EMFILE, which production deliberately treats as unknown/live.
+        assert!(!classify_socket_connect(Err(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        ))));
+        assert!(!classify_socket_connect(Err(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        ))));
+        assert!(classify_socket_connect(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        ))));
     }
 
     #[test]

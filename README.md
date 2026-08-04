@@ -115,6 +115,10 @@ narrowly scoped execution subagents. Requests and replies can also carry
 validated AIR 1.0 artifact references, which watch/dashboard visualize with
 profile-colored mailbox badges.
 
+Agents reported as synthetic by `muxa doctor` are omitted from collaboration
+until a hook event establishes a stable session identity. Submit a prompt or
+restart that agent, then check again.
+
 Then:
 
 1. Run two agents in two panes of the same tmux window.
