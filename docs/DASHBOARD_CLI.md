@@ -93,11 +93,15 @@ Collaboration writes are enabled only when the dashboard itself runs inside a
 pane that muxad recognizes as a tracked agent. A dashboard opened from an
 untracked shell can still inspect sessions, but the mailbox explains why its
 collaboration actions are unavailable. This preserves the same authenticated
-origin and same-window boundary as the CLI and MCP helpers.
+origin and same-window boundary as the CLI and MCP helpers. tmux popup and
+key-binding launches are supported even when tmux omits `TMUX_PANE`; the
+dashboard resolves the active pane from the exact tmux session instead.
 
 ## ACT/WACT
 
 The header and cards use the same last-touch attribution code path as
 `muxa stats`, so `WACT` stays a subset of `ACT` for each session. If the
 activity ledger is unavailable, the dashboard still opens and surfaces a note
-instead of failing the whole TUI. Press `n` to read those notes.
+instead of failing the whole TUI. Press `n` to read those notes. Automatic
+one-second refreshes are silent so action and mailbox hints remain visible;
+only an explicit `r` refresh shows `refreshing` / `refreshed` feedback.

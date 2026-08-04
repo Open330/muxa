@@ -93,10 +93,14 @@ Collaboration write는 dashboard 자체가 muxad가 추적하는 agent pane 안�
 실행될 때만 활성화됩니다. 추적되지 않은 shell에서 연 dashboard도 session 조회는
 가능하지만 mailbox에 collaboration action이 비활성화된 이유가 표시됩니다. 따라서
 CLI/MCP helper와 같은 authenticated origin 및 same-window 경계를 유지합니다.
+tmux popup이나 key binding 실행에서 `TMUX_PANE`이 누락되면 dashboard가 정확한
+tmux session의 active pane을 조회하므로 popup에서도 같은 경계를 유지합니다.
 
 ## ACT/WACT
 
 Header와 card의 ACT/WACT는 `muxa stats`와 같은 last-touch attribution 코드
 경로를 사용합니다. 따라서 각 session의 `WACT`는 항상 해당 `ACT`의 subset으로
 유지됩니다. activity ledger를 읽을 수 없어도 dashboard 자체는 열리고 note로
-상태를 표시합니다. `n`을 누르면 note 내용을 볼 수 있습니다.
+상태를 표시합니다. `n`을 누르면 note 내용을 볼 수 있습니다. 1초 간격 automatic
+refresh는 action/mailbox hint를 가리지 않도록 조용히 처리하며, 사용자가 `r`을
+누른 explicit refresh만 `refreshing` / `refreshed` 상태를 표시합니다.

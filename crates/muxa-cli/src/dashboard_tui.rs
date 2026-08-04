@@ -1099,7 +1099,7 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
     let theme = args.theme.map_or(cfg.ui.theme, WatchTheme::from);
     let mut app = DashboardApp::new(initial, theme);
     let mut last_refresh = Instant::now();
-    let mut refresh_task: Option<tokio::task::JoinHandle<Result<DashboardData>>> = None;
+    let mut refresh_task: Option<DashboardRefresh> = None;
 
     refresh_capture(client, &mut app).await;
 
@@ -1124,20 +1124,21 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
                     if refresh_task.is_some() {
                         app.set_hint("refresh already running", HintLevel::Info);
                     } else {
-                        refresh_task = Some(spawn_refresh(client, cfg, &args));
+                        refresh_task =
+                            Some(spawn_refresh(client, cfg, &args, RefreshSource::Manual));
                         last_refresh = Instant::now();
                         app.set_hint("refreshing", HintLevel::Info);
                     }
                 }
                 UiAction::Open(target) => {
-                    if let Some(task) = refresh_task.take() {
-                        task.abort();
+                    if let Some(refresh) = refresh_task.take() {
+                        refresh.task.abort();
                     }
                     return Ok(Some(target));
                 }
                 UiAction::Run(action) => {
-                    if let Some(task) = refresh_task.take() {
-                        task.abort();
+                    if let Some(refresh) = refresh_task.take() {
+                        refresh.task.abort();
                     }
                     let outcome = run_pending_action(client, action).await;
                     apply_outcome(&mut app, outcome);
@@ -1150,43 +1151,62 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
 
         if refresh_task
             .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+            .is_some_and(|refresh| refresh.task.is_finished())
         {
-            let task = refresh_task.take().expect("checked above");
-            match task.await {
-                Ok(Ok(data)) => {
-                    app.replace_data(data);
-                    app.set_hint("refreshed", HintLevel::Ok);
-                }
+            let refresh = refresh_task.take().expect("checked above");
+            match refresh.task.await {
+                Ok(Ok(data)) => apply_refresh_data(&mut app, data, refresh.source),
                 Ok(Err(e)) => app.set_hint(format!("refresh failed: {e}"), HintLevel::Err),
                 Err(e) => app.set_hint(format!("refresh task failed: {e}"), HintLevel::Err),
             }
             refresh_capture(client, &mut app).await;
             last_refresh = Instant::now();
         } else if last_refresh.elapsed() >= REFRESH_INTERVAL && refresh_task.is_none() {
-            refresh_task = Some(spawn_refresh(client, cfg, &args));
+            refresh_task = Some(spawn_refresh(client, cfg, &args, RefreshSource::Automatic));
             last_refresh = Instant::now();
         } else {
             refresh_capture(client, &mut app).await;
         }
     }
 
-    if let Some(task) = refresh_task.take() {
-        task.abort();
+    if let Some(refresh) = refresh_task.take() {
+        refresh.task.abort();
     }
 
     Ok(None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshSource {
+    Manual,
+    Automatic,
+}
+
+struct DashboardRefresh {
+    task: tokio::task::JoinHandle<Result<DashboardData>>,
+    source: RefreshSource,
 }
 
 fn spawn_refresh(
     client: &Client,
     cfg: &Config,
     args: &Args,
-) -> tokio::task::JoinHandle<Result<DashboardData>> {
+    source: RefreshSource,
+) -> DashboardRefresh {
     let client = client.clone();
     let cfg = cfg.clone();
     let args = args.clone();
-    tokio::spawn(async move { load_dashboard_data(&client, &cfg, &args).await })
+    DashboardRefresh {
+        task: tokio::spawn(async move { load_dashboard_data(&client, &cfg, &args).await }),
+        source,
+    }
+}
+
+fn apply_refresh_data(app: &mut DashboardApp, data: DashboardData, source: RefreshSource) {
+    app.replace_data(data);
+    if source == RefreshSource::Manual {
+        app.set_hint("refreshed", HintLevel::Ok);
+    }
 }
 
 async fn load_dashboard_data(client: &Client, cfg: &Config, args: &Args) -> Result<DashboardData> {
@@ -1287,8 +1307,22 @@ async fn refresh_collaboration_data(client: &Client, app: &mut DashboardApp) {
 }
 
 fn dashboard_collaboration_origin() -> Option<CollaborationOrigin> {
-    let pane = std::env::var("TMUX_PANE").ok()?;
-    let socket = std::env::var("TMUX").ok().and_then(|value| {
+    dashboard_collaboration_origin_from(
+        std::env::var("TMUX_PANE").ok(),
+        std::env::var("TMUX").ok(),
+        muxa::tmux::current_pane,
+    )
+}
+
+fn dashboard_collaboration_origin_from(
+    pane: Option<String>,
+    tmux: Option<String>,
+    fallback_pane: impl FnOnce() -> Option<String>,
+) -> Option<CollaborationOrigin> {
+    let pane = pane
+        .filter(|pane| !pane.is_empty())
+        .or_else(fallback_pane)?;
+    let socket = tmux.and_then(|value| {
         let path = value.split(',').next()?.trim();
         Path::new(path)
             .file_name()
@@ -4407,6 +4441,63 @@ mod tests {
         assert_eq!(composer.cursor, 0);
         composer.delete();
         assert_eq!(composer.input, "");
+    }
+
+    #[test]
+    fn automatic_refresh_preserves_existing_footer_hint() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let data = build_dashboard_data(
+            now,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let mut app = DashboardApp::new(data.clone(), WatchTheme::Classic);
+        app.set_hint("request sent", HintLevel::Ok);
+
+        apply_refresh_data(&mut app, data.clone(), RefreshSource::Automatic);
+        assert_eq!(
+            app.hint.as_ref().map(|hint| hint.message.as_str()),
+            Some("request sent")
+        );
+
+        apply_refresh_data(&mut app, data, RefreshSource::Manual);
+        assert_eq!(
+            app.hint.as_ref().map(|hint| hint.message.as_str()),
+            Some("refreshed")
+        );
+    }
+
+    #[test]
+    fn collaboration_origin_falls_back_to_tmux_active_pane() {
+        let origin = dashboard_collaboration_origin_from(
+            None,
+            Some("/tmp/tmux-1000/custom,42,7".into()),
+            || Some("%9".into()),
+        )
+        .unwrap();
+
+        assert_eq!(origin.pane, "%9");
+        assert_eq!(origin.socket.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn collaboration_origin_prefers_nonempty_tmux_pane_env() {
+        let origin = dashboard_collaboration_origin_from(
+            Some("%3".into()),
+            Some("/tmp/tmux-1000/default,42,7".into()),
+            || panic!("fallback must not run when TMUX_PANE is available"),
+        )
+        .unwrap();
+
+        assert_eq!(origin.pane, "%3");
+        assert_eq!(origin.socket.as_deref(), Some("default"));
     }
 
     #[test]
