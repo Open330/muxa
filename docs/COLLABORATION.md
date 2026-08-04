@@ -30,6 +30,13 @@ claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
 
+Codex users should then add the following line under the generated
+`[mcp_servers.muxa]` table in `~/.codex/config.toml`:
+
+```toml
+env_vars = ["TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+```
+
 Restart agents that were already running so they reload their MCP server list.
 Once connected, muxa's initialization instructions surface same-window peers
 as reviewers or narrowly scoped delegated subagents. An agent can call
@@ -43,9 +50,11 @@ a placeholder identity that the later real session could never claim.
 
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
-The MCP process inherits `TMUX` and `TMUX_PANE`. muxad validates that origin
-against its live agent and pane registries; collaboration tools do not accept
-an arbitrary sender pane.
+Claude's MCP process inherits `TMUX` and `TMUX_PANE`; Codex forwards them via
+the `env_vars` allowlist above. For an older default-socket Codex registration,
+muxa also attempts to recover the pane from process ancestry. muxad validates
+the resolved origin against its live agent and pane registries; collaboration
+tools do not accept an arbitrary sender pane.
 
 ## Addressing and CLI
 

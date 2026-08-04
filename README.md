@@ -111,6 +111,18 @@ claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
 
+Codex only forwards explicitly allowed environment variables to stdio MCP
+servers. Add this line to the generated `[mcp_servers.muxa]` table in
+`~/.codex/config.toml` (especially when using a custom muxa/tmux socket):
+
+```toml
+env_vars = ["TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+```
+
+Muxa also recovers the pane from process ancestry for existing default-socket
+Codex registrations, so older setups fail safely rather than appearing
+paneless.
+
 Connected agents are told that room peers can serve as read-only reviewers or
 narrowly scoped execution subagents. Requests and replies can also carry
 validated AIR 1.0 artifact references, which watch/dashboard visualize with

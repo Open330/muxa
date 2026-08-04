@@ -22,6 +22,22 @@ claude mcp add --scope user muxa -- muxa mcp
 codex mcp add muxa -- muxa mcp
 ```
 
+Codex sanitizes the environment of stdio MCP processes unless variables are
+explicitly allowed. After `codex mcp add`, add `env_vars` to its generated
+table in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.muxa]
+command = "muxa"
+args = ["mcp"]
+env_vars = ["TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+```
+
+This preserves the exact pane, tmux socket, and non-default muxa socket.
+For existing Codex registrations, muxa can recover a default-socket pane by
+walking the MCP process ancestry back to the pane shell. Explicit forwarding
+remains the reliable configuration for custom or multiple sockets.
+
 That runs `muxa mcp` as a stdio MCP server. Point it at a non-default socket
 with the global flag or env var if you run an isolated daemon:
 

@@ -1203,8 +1203,14 @@ async fn handle(
                             let (sent, submitted) = tokio::task::spawn_blocking(move || {
                                 let s = socket.as_deref();
                                 let sent = target.send_text_on(s, &pane, &text);
-                                let submitted =
-                                    sent && submit && target.send_text_on(s, &pane, "\r");
+                                let submitted = if sent && submit {
+                                    if !text.is_empty() {
+                                        std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+                                    }
+                                    target.send_text_on(s, &pane, "\r")
+                                } else {
+                                    false
+                                };
                                 (sent, submitted)
                             })
                             .await
