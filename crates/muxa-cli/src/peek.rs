@@ -43,7 +43,7 @@ use crossterm::terminal::{
 use muxa::config::IconSet;
 use muxa::ipc::Client;
 use muxa::state::Agent;
-use muxa::tmux::layout::{PaneGeometry, WindowFrame};
+use muxa::tmux::layout::{PaneGeometry, WindowFrame, WindowTarget};
 use muxa::AgentState;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -66,7 +66,9 @@ const PEEK_IPC_TIMEOUT: Duration = Duration::from_millis(400);
 /// How often the overlay re-reads agents and pane geometry while open.
 /// Peek stays up until dismissed (unlike `display-panes`, whose content
 /// is static enough to time out), so a state flip or a layout change made
-/// from another client should show up without a manual refresh.
+/// from another client should show up without a manual refresh. Pane
+/// backdrops are deliberately *not* on this tick — see the refresh arm in
+/// [`drive`].
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Input poll slice. Short enough that a digit feels instant, long enough
@@ -99,20 +101,26 @@ pub(crate) struct PeekCell {
     /// `+N` badge rather than silently dropped.
     pub extra: usize,
     /// The pane's visible screen, one entry per row, painted dim behind
-    /// the info box. Empty when the capture failed or wasn't requested
-    /// (`--plain`, tests) — the box then renders over blank space.
+    /// the info box. Taken once when the overlay opens and re-taken only
+    /// on `r`/resize, so it is a snapshot rather than a live mirror.
+    /// Empty when the capture failed or wasn't requested (`--plain`,
+    /// tests) — the box then renders over blank space.
     pub capture: Vec<String>,
 }
 
 pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
-    let (panes, zoomed) = muxa::tmux::layout::current_window_panes();
+    // Pin the window before anything else: every later query is scoped to
+    // it, so a keystroke in another terminal can't reroute the overlay
+    // onto a different session mid-read.
+    let target = WindowTarget::resolve();
+    let (panes, zoomed) = muxa::tmux::layout::current_window_panes(&target);
     if panes.is_empty() {
         anyhow::bail!(
             "no tmux panes visible — `muxa peek` reads the current window, so run it inside tmux \
              (normally via `prefix + q`)"
         );
     }
-    let frame = muxa::tmux::layout::current_window_frame();
+    let frame = muxa::tmux::layout::current_window_frame(&target);
     let agents = client
         .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
         .await
@@ -131,7 +139,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // including a panic mid-draw. Outside a popup (`muxa peek` run bare in
     // a shell) nothing else would put the terminal back.
     let mut guard = TerminalGuard::new(setup_terminal()?);
-    let outcome = drive(guard.terminal_mut(), client, cells, frame, zoomed).await;
+    let outcome = drive(guard.terminal_mut(), client, cells, frame, zoomed, &target).await;
     drop(guard);
     // Jump only after the popup's screen is torn down: `select-pane`
     // repaints the window underneath, and doing it while we still own the
@@ -156,6 +164,7 @@ async fn drive(
     mut cells: Vec<PeekCell>,
     frame: Option<WindowFrame>,
     mut zoomed: bool,
+    target: &WindowTarget,
 ) -> Result<Outcome> {
     let placement = Placement::from(frame);
     let mut typed = String::new();
@@ -193,15 +202,25 @@ async fn drive(
         }
 
         if stale || last_refresh.elapsed() >= REFRESH_INTERVAL {
-            let (panes, now_zoomed) = muxa::tmux::layout::current_window_panes();
+            let (panes, now_zoomed) = muxa::tmux::layout::current_window_panes(target);
             if !panes.is_empty() {
                 let agents = client
                     .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
                     .await
                     .unwrap_or_default();
-                cells = build_cells(panes, &agents);
+                let mut next = build_cells(panes, &agents);
+                // Agent state is cheap to re-read and worth keeping live.
+                // Backdrops are neither: one `capture-pane` per pane per
+                // second buys a flicker of scrollback nobody is reading
+                // while the overlay is up. They refresh when the user asks
+                // (`r`) or when a resize reflows them.
+                if stale {
+                    attach_captures(&mut next, now_zoomed);
+                } else {
+                    carry_captures(&cells, &mut next);
+                }
+                cells = next;
                 zoomed = now_zoomed;
-                attach_captures(&mut cells, zoomed);
             }
             last_refresh = Instant::now();
             stale = false;
@@ -312,6 +331,21 @@ fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
         cell.capture = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id)
             .map(|raw| raw.lines().map(str::to_string).collect())
             .unwrap_or_default();
+    }
+}
+
+/// Move backdrops from the previous cells onto freshly built ones,
+/// matched by pane id. A pane that appeared since the last capture simply
+/// has no backdrop until the next `r`.
+fn carry_captures(previous: &[PeekCell], next: &mut [PeekCell]) {
+    for cell in next.iter_mut() {
+        if let Some(old) = previous
+            .iter()
+            .find(|c| c.geo.pane_id == cell.geo.pane_id)
+            .filter(|c| !c.capture.is_empty())
+        {
+            cell.capture.clone_from(&old.capture);
+        }
     }
 }
 
@@ -1578,6 +1612,35 @@ mod tests {
             ..quiet
         };
         assert!(box_height(&talkative, rect) > MIN_BORDERED_HEIGHT);
+    }
+
+    #[test]
+    fn backdrops_survive_an_agent_refresh() {
+        // Agent state re-reads every second; backdrops must ride along
+        // rather than be re-shelled, or the "capture once" saving is lost
+        // the first time a state flips.
+        let mut before = build_cells(
+            vec![geo("0", 0, 0, 20, 5, true), geo("1", 0, 6, 20, 5, false)],
+            &[],
+        );
+        before[0].capture = vec!["pane zero output".into()];
+        before[1].capture = vec!["pane one output".into()];
+
+        let mut after = build_cells(
+            vec![
+                geo("0", 0, 0, 20, 5, true),
+                geo("1", 0, 6, 20, 5, false),
+                // A pane split into existence since the last capture.
+                geo("2", 0, 12, 20, 5, false),
+            ],
+            &[],
+        );
+        carry_captures(&before, &mut after);
+        assert_eq!(after[0].capture, vec!["pane zero output".to_string()]);
+        assert_eq!(after[1].capture, vec!["pane one output".to_string()]);
+        // No backdrop yet for the newcomer — it gets one on the next `r`,
+        // which beats inventing one from a pane we never read.
+        assert!(after[2].capture.is_empty());
     }
 
     #[test]

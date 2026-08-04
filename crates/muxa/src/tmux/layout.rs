@@ -11,6 +11,17 @@
 //! runs once per keypress, against one window. Widening the hot query to
 //! serve the cold one would tax every tick for nothing.
 //!
+//! ## Targeting
+//!
+//! Every query here is scoped to an explicit [`WindowTarget`] resolved
+//! once, when the overlay opens. An unscoped tmux command resolves
+//! against the *current client*, which tmux defines as the most recently
+//! active one — so with several terminals attached to the same server,
+//! typing in another tab silently reroutes the next query to that
+//! session, and the overlay repaints itself with somebody else's panes
+//! mid-read. Pinning the window id at open makes the overlay describe the
+//! window it was raised over for as long as it is up.
+//!
 //! ## Coordinate systems
 //!
 //! tmux reports `pane_left`/`pane_top` relative to the **window**, while a
@@ -143,19 +154,65 @@ pub fn parse_window_frame_line(stdout: &str) -> Option<WindowFrame> {
     })
 }
 
-/// Panes of the client's current window, with on-screen geometry.
+/// The window an overlay is describing, resolved once at open time.
 ///
-/// Deliberately unscoped (no `-t`): run from inside a `display-popup`, a
-/// bare `list-panes` resolves to the window the popup was raised over,
-/// which is exactly the one we want to describe. Note that `$TMUX_PANE`
-/// inside that popup names the *popup's own* pane, so callers must take
-/// "which pane is focused" from [`PaneGeometry::active`] rather than from
-/// [`super::current_pane`].
+/// Both ids come from `$TMUX`, which names the session whose client
+/// triggered the popup. Holding them means later queries never have to
+/// ask tmux "which client is current?" — an answer that changes the
+/// moment the user touches another terminal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowTarget {
+    /// tmux session target (`$0`), used for client-scoped queries.
+    pub session: Option<String>,
+    /// tmux window id (`@0`), used for window-scoped queries. Pinning the
+    /// *window* rather than the session additionally survives another
+    /// client switching that session's current window while we're up.
+    pub window: Option<String>,
+}
+
+impl WindowTarget {
+    /// Resolve from `$TMUX`. Both fields fall back to `None` outside tmux
+    /// or on a malformed env, where queries go unscoped — no worse than
+    /// having never pinned anything.
+    pub fn resolve() -> Self {
+        let session = std::env::var("TMUX")
+            .ok()
+            .and_then(|raw| super::parse_tmux_session_target(&raw));
+        let window = session.as_deref().and_then(window_id_for);
+        Self { session, window }
+    }
+}
+
+fn window_id_for(session: &str) -> Option<String> {
+    let mut cmd = tmux_command();
+    cmd.args(["display-message", "-p", "-t", session, "-F", "#{window_id}"]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        "tmux display-message (window id)".into(),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let id = stdout.lines().next()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Panes of the target window, with on-screen geometry.
+///
+/// Note that `$TMUX_PANE` inside a popup names the *popup's own* pane, so
+/// callers must take "which pane is focused" from
+/// [`PaneGeometry::active`] rather than from [`super::current_pane`].
 ///
 /// Returns `(panes, zoomed)`; empty when tmux is unavailable or errors.
-pub fn current_window_panes() -> (Vec<PaneGeometry>, bool) {
+pub fn current_window_panes(target: &WindowTarget) -> (Vec<PaneGeometry>, bool) {
     let mut cmd = tmux_command();
     cmd.args(["list-panes", "-F", PANE_GEOMETRY_FMT]);
+    if let Some(window) = &target.window {
+        cmd.args(["-t", window]);
+    }
     let Ok(out) = command_output_with_timeout(
         cmd,
         TMUX_COMMAND_TIMEOUT,
@@ -215,11 +272,18 @@ fn socket_name_from_tmux_env(raw: &str) -> Option<String> {
     Some(super::socket_short_name(path))
 }
 
-/// Dimensions of the client's current window. `None` when tmux is
-/// unavailable or the response can't be parsed.
-pub fn current_window_frame() -> Option<WindowFrame> {
+/// Dimensions of the target window and the client showing it. `None`
+/// when tmux is unavailable or the response can't be parsed.
+///
+/// Scoped to the *session* rather than the window: the reading includes
+/// client dimensions, and a bare window id doesn't tell tmux which
+/// client's geometry to report.
+pub fn current_window_frame(target: &WindowTarget) -> Option<WindowFrame> {
     let mut cmd = tmux_command();
     cmd.args(["display-message", "-p", "-F", FRAME_FMT]);
+    if let Some(session) = &target.session {
+        cmd.args(["-t", session]);
+    }
     let out = command_output_with_timeout(
         cmd,
         TMUX_COMMAND_TIMEOUT,
