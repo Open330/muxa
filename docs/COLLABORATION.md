@@ -55,6 +55,11 @@ muxa msg list --mailbox sent
 muxa msg cancel req_... # queued requests only
 ```
 
+The same lifecycle is available interactively in `muxa dashboard` when the
+dashboard runs inside a tracked agent pane: `m` sends to the selected room
+peer, `b` opens non-claiming mailbox history, and `i` claims the inbox. From
+the mailbox, use `e` to reply or `x` to cancel a queued sent request.
+
 `question` and `review` are read-only contracts by default. Use `--execute`
 and one or more `--path` arguments to explicitly delegate edits. Path scopes
 are advisory collaboration contracts, not an OS sandbox; separate git

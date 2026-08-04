@@ -11,6 +11,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use muxa::collaboration::{
+    CollaborationOrigin, CollaborationRequest, NewRequest, Participant, RequestKind,
+    RequestMailbox, RequestStatus, RoomContext, WorkMode,
+};
 use muxa::config::{IconSet, WatchTheme};
 use muxa::event::RateLimitScope;
 use muxa::ipc::Client;
@@ -29,6 +33,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -364,6 +369,33 @@ struct DashboardData {
     cards: Vec<SessionCard>,
     totals: DashboardTotals,
     notes: Vec<String>,
+    collaboration: CollaborationData,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollaborationData {
+    origin: Option<CollaborationOrigin>,
+    room: Option<RoomContext>,
+    incoming: Vec<CollaborationRequest>,
+    sent: Vec<CollaborationRequest>,
+    unavailable: Option<String>,
+}
+
+impl CollaborationData {
+    fn participant_for_pane(&self, pane: &str) -> Option<&Participant> {
+        let room = self.room.as_ref()?;
+        std::iter::once(&room.current)
+            .chain(room.peers.iter())
+            .find(|participant| participant.pane == pane)
+    }
+
+    fn peer_for_pane(&self, pane: &str) -> Option<&Participant> {
+        self.room
+            .as_ref()?
+            .peers
+            .iter()
+            .find(|participant| participant.pane == pane)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -611,6 +643,7 @@ struct DashboardApp {
     hint: Option<FooterHint>,
     confirm: Option<ConfirmPopup>,
     composer: Option<PromptComposer>,
+    collaboration_mailbox: CollaborationMailbox,
     capture: CaptureCache,
     capture_scroll: usize,
     theme: DashboardTheme,
@@ -628,6 +661,7 @@ impl DashboardApp {
             hint: None,
             confirm: None,
             composer: None,
+            collaboration_mailbox: CollaborationMailbox::default(),
             capture: CaptureCache::default(),
             capture_scroll: 0,
             theme: dashboard_theme(theme),
@@ -646,6 +680,7 @@ impl DashboardApp {
         self.selected = next_selected;
         self.clamp_selected();
         self.clamp_selected_target();
+        self.clamp_collaboration_request();
     }
 
     fn selected_card(&self) -> Option<&SessionCard> {
@@ -788,6 +823,54 @@ impl DashboardApp {
     fn reset_capture_view(&mut self) {
         self.capture_scroll = 0;
     }
+
+    fn selected_collaboration_peer(&self) -> Option<&Participant> {
+        let ActionTarget::Pane(pane) = self.selected_action_target()? else {
+            return None;
+        };
+        self.data.collaboration.peer_for_pane(&pane)
+    }
+
+    fn collaboration_requests(&self) -> &[CollaborationRequest] {
+        match self.collaboration_mailbox.tab {
+            CollaborationTab::Incoming => &self.data.collaboration.incoming,
+            CollaborationTab::Sent => &self.data.collaboration.sent,
+        }
+    }
+
+    fn selected_collaboration_request(&self) -> Option<&CollaborationRequest> {
+        self.collaboration_requests()
+            .get(self.collaboration_mailbox.selected)
+    }
+
+    fn clamp_collaboration_request(&mut self) {
+        let len = self.collaboration_requests().len();
+        self.collaboration_mailbox.selected = if len == 0 {
+            0
+        } else {
+            self.collaboration_mailbox.selected.min(len - 1)
+        };
+    }
+
+    fn move_collaboration_request(&mut self, delta: isize) {
+        let len = self.collaboration_requests().len();
+        if len == 0 {
+            return;
+        }
+        self.collaboration_mailbox.selected = self
+            .collaboration_mailbox
+            .selected
+            .saturating_add_signed(delta)
+            .min(len - 1);
+    }
+
+    fn toggle_collaboration_mailbox(&mut self) {
+        self.collaboration_mailbox.tab = match self.collaboration_mailbox.tab {
+            CollaborationTab::Incoming => CollaborationTab::Sent,
+            CollaborationTab::Sent => CollaborationTab::Incoming,
+        };
+        self.collaboration_mailbox.selected = 0;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -797,6 +880,20 @@ enum Overlay {
     Help,
     Notes,
     CaptureFullscreen,
+    Collaboration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CollaborationTab {
+    #[default]
+    Incoming,
+    Sent,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollaborationMailbox {
+    tab: CollaborationTab,
+    selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -822,9 +919,32 @@ struct ConfirmPopup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
     Quick(QuickAction),
-    PtyPrompt { session_id: String, text: String },
+    PtyPrompt {
+        session_id: String,
+        text: String,
+    },
     PtyCtrlC(String),
     TerminatePty(String),
+    CollaborationInbox {
+        origin: CollaborationOrigin,
+    },
+    CollaborationSend {
+        origin: CollaborationOrigin,
+        target: String,
+        kind: RequestKind,
+        body: String,
+        work_mode: WorkMode,
+    },
+    CollaborationReply {
+        origin: CollaborationOrigin,
+        request_id: String,
+        status: RequestStatus,
+        body: String,
+    },
+    CollaborationCancel {
+        origin: CollaborationOrigin,
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -891,6 +1011,17 @@ impl PromptComposer {
 enum PromptTarget {
     Pane(String),
     PtySession(String),
+    CollaborationSend {
+        origin: CollaborationOrigin,
+        target: String,
+        kind: RequestKind,
+        work_mode: WorkMode,
+    },
+    CollaborationReply {
+        origin: CollaborationOrigin,
+        request_id: String,
+        status: RequestStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1005,8 +1136,12 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
                     return Ok(Some(target));
                 }
                 UiAction::Run(action) => {
+                    if let Some(task) = refresh_task.take() {
+                        task.abort();
+                    }
                     let outcome = run_pending_action(client, action).await;
                     apply_outcome(&mut app, outcome);
+                    refresh_collaboration_data(client, &mut app).await;
                     refresh_capture(client, &mut app).await;
                     last_refresh = Instant::now();
                 }
@@ -1084,7 +1219,7 @@ async fn load_dashboard_data(client: &Client, cfg: &Config, args: &Args) -> Resu
             }
         };
 
-    Ok(build_dashboard_data(
+    let mut data = build_dashboard_data(
         now,
         agents,
         panes,
@@ -1095,7 +1230,72 @@ async fn load_dashboard_data(client: &Client, cfg: &Config, args: &Args) -> Resu
         args.sort,
         host,
         notes,
-    ))
+    );
+    data.collaboration = load_collaboration_data(client).await;
+    Ok(data)
+}
+
+async fn load_collaboration_data(client: &Client) -> CollaborationData {
+    let Some(origin) = dashboard_collaboration_origin() else {
+        return CollaborationData {
+            unavailable: Some(
+                "run dashboard inside a tracked tmux agent pane to use collaboration".into(),
+            ),
+            ..CollaborationData::default()
+        };
+    };
+    let room = match client.collaboration_context(&origin).await {
+        Ok(room) => room,
+        Err(error) => {
+            return CollaborationData {
+                origin: Some(origin),
+                unavailable: Some(error.to_string()),
+                ..CollaborationData::default()
+            };
+        }
+    };
+    let (incoming, sent) = tokio::join!(
+        client.collaboration_list(&origin, RequestMailbox::Incoming),
+        client.collaboration_list(&origin, RequestMailbox::Sent),
+    );
+    match (incoming, sent) {
+        (Ok(incoming), Ok(sent)) => CollaborationData {
+            origin: Some(origin),
+            room: Some(room),
+            incoming,
+            sent,
+            unavailable: None,
+        },
+        (incoming, sent) => {
+            let error = incoming
+                .err()
+                .or_else(|| sent.err())
+                .expect("at least one mailbox request failed");
+            CollaborationData {
+                origin: Some(origin),
+                room: Some(room),
+                unavailable: Some(format!("mailbox unavailable: {error}")),
+                ..CollaborationData::default()
+            }
+        }
+    }
+}
+
+async fn refresh_collaboration_data(client: &Client, app: &mut DashboardApp) {
+    app.data.collaboration = load_collaboration_data(client).await;
+    app.clamp_collaboration_request();
+}
+
+fn dashboard_collaboration_origin() -> Option<CollaborationOrigin> {
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let socket = std::env::var("TMUX").ok().and_then(|value| {
+        let path = value.split(',').next()?.trim();
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    Some(CollaborationOrigin { pane, socket })
 }
 
 async fn load_session_activities(cfg: &Config) -> Vec<SessionActivity> {
@@ -1230,6 +1430,7 @@ fn build_dashboard_data(
         cards,
         totals,
         notes,
+        collaboration: CollaborationData::default(),
     }
 }
 
@@ -1484,16 +1685,16 @@ enum UiAction {
 }
 
 fn handle_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
-    if app.overlay != Overlay::None {
-        return handle_overlay_key(app, key);
-    }
-
     if app.confirm.is_some() {
         return handle_confirm_key(app, key);
     }
 
     if app.composer.is_some() {
         return handle_composer_key(app, key);
+    }
+
+    if app.overlay != Overlay::None {
+        return handle_overlay_key(app, key);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
@@ -1522,6 +1723,7 @@ fn handle_overlay_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
             KeyCode::End | KeyCode::Char('G') => app.reset_capture_view(),
             _ => {}
         },
+        Overlay::Collaboration => return handle_collaboration_overlay_key(app, key),
         Overlay::None => {}
     }
     UiAction::None
@@ -1588,6 +1790,12 @@ fn handle_normal_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
             UiAction::None
         }
         KeyCode::Char('p') => open_composer(app),
+        KeyCode::Char('m') => open_collaboration_composer(app),
+        KeyCode::Char('b') => {
+            app.overlay = Overlay::Collaboration;
+            UiAction::None
+        }
+        KeyCode::Char('i') => claim_collaboration_inbox(app),
         KeyCode::Char('o') => app.selected_action_target().map_or_else(
             || {
                 app.set_hint("no pane or PTY session to open", HintLevel::Err);
@@ -1641,7 +1849,37 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
                 PromptTarget::PtySession(session_id) => {
                     PendingAction::PtyPrompt { session_id, text }
                 }
+                PromptTarget::CollaborationSend {
+                    origin,
+                    target,
+                    kind,
+                    work_mode,
+                } => PendingAction::CollaborationSend {
+                    origin,
+                    target,
+                    kind,
+                    body: text,
+                    work_mode,
+                },
+                PromptTarget::CollaborationReply {
+                    origin,
+                    request_id,
+                    status,
+                } => PendingAction::CollaborationReply {
+                    origin,
+                    request_id,
+                    status,
+                    body: text,
+                },
             })
+        }
+        KeyCode::Tab => {
+            cycle_composer_option(composer);
+            UiAction::None
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            toggle_composer_execute(composer);
+            UiAction::None
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             composer.insert(c);
@@ -1673,6 +1911,183 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
         }
         _ => UiAction::None,
     }
+}
+
+fn cycle_composer_option(composer: &mut PromptComposer) {
+    match &mut composer.target {
+        PromptTarget::CollaborationSend { kind, .. } => {
+            *kind = match *kind {
+                RequestKind::Question => RequestKind::Review,
+                RequestKind::Review => RequestKind::Task,
+                RequestKind::Task => RequestKind::Notice,
+                RequestKind::Notice => RequestKind::Question,
+            };
+        }
+        PromptTarget::CollaborationReply { status, .. } => {
+            *status = match *status {
+                RequestStatus::Completed => RequestStatus::Blocked,
+                RequestStatus::Blocked => RequestStatus::Declined,
+                RequestStatus::Declined => RequestStatus::Failed,
+                RequestStatus::Failed
+                | RequestStatus::Queued
+                | RequestStatus::Claimed
+                | RequestStatus::Expired
+                | RequestStatus::Cancelled => RequestStatus::Completed,
+            };
+        }
+        PromptTarget::Pane(_) | PromptTarget::PtySession(_) => {}
+    }
+}
+
+fn toggle_composer_execute(composer: &mut PromptComposer) {
+    if let PromptTarget::CollaborationSend { work_mode, .. } = &mut composer.target {
+        *work_mode = match *work_mode {
+            WorkMode::ReadOnly => WorkMode::Execute,
+            WorkMode::Execute => WorkMode::ReadOnly,
+        };
+    }
+}
+
+fn handle_collaboration_overlay_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('b' | 'q') => {
+            app.overlay = Overlay::None;
+            UiAction::None
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('[' | ']') => {
+            app.toggle_collaboration_mailbox();
+            UiAction::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_collaboration_request(-1);
+            UiAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_collaboration_request(1);
+            UiAction::None
+        }
+        KeyCode::Char('i') => claim_collaboration_inbox(app),
+        KeyCode::Char('e') => open_collaboration_reply_composer(app),
+        KeyCode::Char('x') => confirm_collaboration_cancel(app),
+        _ => UiAction::None,
+    }
+}
+
+fn collaboration_origin_for_action(app: &mut DashboardApp) -> Option<CollaborationOrigin> {
+    if app.data.collaboration.room.is_none() {
+        let message = app
+            .data
+            .collaboration
+            .unavailable
+            .clone()
+            .unwrap_or_else(|| "collaboration is unavailable".into());
+        app.set_hint(message, HintLevel::Err);
+        return None;
+    }
+    app.data.collaboration.origin.clone()
+}
+
+fn claim_collaboration_inbox(app: &mut DashboardApp) -> UiAction {
+    let Some(origin) = collaboration_origin_for_action(app) else {
+        return UiAction::None;
+    };
+    app.overlay = Overlay::Collaboration;
+    app.collaboration_mailbox.tab = CollaborationTab::Incoming;
+    app.collaboration_mailbox.selected = 0;
+    UiAction::Run(PendingAction::CollaborationInbox { origin })
+}
+
+fn open_collaboration_composer(app: &mut DashboardApp) -> UiAction {
+    let Some(origin) = collaboration_origin_for_action(app) else {
+        return UiAction::None;
+    };
+    let Some(peer) = app.selected_collaboration_peer() else {
+        app.set_hint(
+            "selected target is not a peer in this collaboration room",
+            HintLevel::Err,
+        );
+        return UiAction::None;
+    };
+    let target = format!("pane:{}", peer.pane);
+    let label = peer.label();
+    app.composer = Some(PromptComposer::new(
+        PromptTarget::CollaborationSend {
+            origin,
+            target,
+            kind: RequestKind::Question,
+            work_mode: WorkMode::ReadOnly,
+        },
+        label,
+    ));
+    UiAction::None
+}
+
+fn open_collaboration_reply_composer(app: &mut DashboardApp) -> UiAction {
+    if app.collaboration_mailbox.tab != CollaborationTab::Incoming {
+        app.set_hint("switch to incoming requests to reply", HintLevel::Err);
+        return UiAction::None;
+    }
+    let Some(origin) = collaboration_origin_for_action(app) else {
+        return UiAction::None;
+    };
+    let Some(request) = app.selected_collaboration_request() else {
+        app.set_hint("no incoming request selected", HintLevel::Err);
+        return UiAction::None;
+    };
+    if request.status == RequestStatus::Queued {
+        app.set_hint(
+            "press i to claim the request before replying",
+            HintLevel::Err,
+        );
+        return UiAction::None;
+    }
+    if request.status.is_terminal() {
+        app.set_hint("selected request is already terminal", HintLevel::Err);
+        return UiAction::None;
+    }
+    let request_id = request.id.clone();
+    let label = format!(
+        "{} · {}",
+        request.from.label(),
+        short_request_id(&request_id)
+    );
+    app.composer = Some(PromptComposer::new(
+        PromptTarget::CollaborationReply {
+            origin,
+            request_id,
+            status: RequestStatus::Completed,
+        },
+        label,
+    ));
+    UiAction::None
+}
+
+fn confirm_collaboration_cancel(app: &mut DashboardApp) -> UiAction {
+    if app.collaboration_mailbox.tab != CollaborationTab::Sent {
+        app.set_hint("switch to sent requests to cancel", HintLevel::Err);
+        return UiAction::None;
+    }
+    let Some(origin) = collaboration_origin_for_action(app) else {
+        return UiAction::None;
+    };
+    let Some(request) = app.selected_collaboration_request() else {
+        app.set_hint("no sent request selected", HintLevel::Err);
+        return UiAction::None;
+    };
+    if request.status != RequestStatus::Queued {
+        app.set_hint("only queued requests can be cancelled", HintLevel::Err);
+        return UiAction::None;
+    }
+    let request_id = request.id.clone();
+    app.confirm = Some(ConfirmPopup {
+        message: format!(
+            "Cancel {} to {}?",
+            short_request_id(&request_id),
+            request.to.label()
+        ),
+        on_confirm: PendingAction::CollaborationCancel { origin, request_id },
+    });
+    UiAction::None
 }
 
 fn selected_target_context(app: &DashboardApp) -> Option<(CardHost, String, ActionTarget)> {
@@ -1789,6 +2204,69 @@ async fn run_pending_action(client: &Client, action: PendingAction) -> ActionOut
             match client.terminate_session(&session_id).await {
                 Ok(()) => ActionOutcome::Ok(format!("terminated {session_id}")),
                 Err(e) => ActionOutcome::Err(format!("terminate failed: {e}")),
+            }
+        }
+        PendingAction::CollaborationInbox { origin } => {
+            match client.collaboration_inbox(&origin).await {
+                Ok(requests) if requests.is_empty() => {
+                    ActionOutcome::Ok("collaboration inbox is empty".into())
+                }
+                Ok(requests) => ActionOutcome::Ok(format!(
+                    "claimed {} collaboration request{}",
+                    requests.len(),
+                    if requests.len() == 1 { "" } else { "s" }
+                )),
+                Err(e) => ActionOutcome::Err(format!("inbox failed: {e}")),
+            }
+        }
+        PendingAction::CollaborationSend {
+            origin,
+            target,
+            kind,
+            body,
+            work_mode,
+        } => {
+            let request = NewRequest {
+                kind,
+                body,
+                expects_reply: kind != RequestKind::Notice,
+                work_mode,
+                paths: Vec::new(),
+            };
+            match client.collaboration_send(&origin, &target, &request).await {
+                Ok(request) => ActionOutcome::Ok(format!(
+                    "sent {} to {} ({})",
+                    short_request_id(&request.id),
+                    request.to.label(),
+                    request_kind_label(kind)
+                )),
+                Err(e) => ActionOutcome::Err(format!("collaboration send failed: {e}")),
+            }
+        }
+        PendingAction::CollaborationReply {
+            origin,
+            request_id,
+            status,
+            body,
+        } => {
+            match client
+                .collaboration_reply(&origin, &request_id, status, &body, &[])
+                .await
+            {
+                Ok(request) => ActionOutcome::Ok(format!(
+                    "replied to {} ({})",
+                    short_request_id(&request.id),
+                    request_status_label(status)
+                )),
+                Err(e) => ActionOutcome::Err(format!("collaboration reply failed: {e}")),
+            }
+        }
+        PendingAction::CollaborationCancel { origin, request_id } => {
+            match client.collaboration_cancel(&origin, &request_id).await {
+                Ok(request) => {
+                    ActionOutcome::Ok(format!("cancelled {}", short_request_id(&request.id)))
+                }
+                Err(e) => ActionOutcome::Err(format!("collaboration cancel failed: {e}")),
             }
         }
     }
@@ -1910,9 +2388,14 @@ fn render(f: &mut Frame, app: &mut DashboardApp) {
         render_notes(f, popup, app);
     }
     if app.overlay == Overlay::Help {
-        let popup = centered_rect_by_size(76, 22, area);
+        let popup = centered_rect_by_size(76, 25, area);
         f.render_widget(Clear, popup);
         render_help(f, popup, app.theme);
+    }
+    if app.overlay == Overlay::Collaboration {
+        let popup = centered_rect_by_size(104, 24, area);
+        f.render_widget(Clear, popup);
+        render_collaboration_mailbox(f, popup, app);
     }
     if app.confirm.is_some() {
         let popup = centered_rect_by_size(60, 7, area);
@@ -1982,6 +2465,21 @@ fn render_header(f: &mut Frame, area: Rect, app: &DashboardApp) {
             Color::Black,
             app.theme.warn,
         ));
+    }
+    if let Some(room) = app.data.collaboration.room.as_ref() {
+        spans.push(Span::raw("  "));
+        spans.push(subtle_pill(
+            format!("room {}", room.current.room.window_id),
+            app.theme,
+        ));
+        if room.unread > 0 || room.unread_replies > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(pill(
+                format!("mail {}/{}", room.unread, room.unread_replies),
+                Color::Black,
+                app.theme.warn,
+            ));
+        }
     }
 
     let block = Block::default()
@@ -2580,7 +3078,19 @@ fn render_summary_strip(f: &mut Frame, area: Rect, card: &SessionCard, app: &Das
                 card.agents.len(),
                 card.pane_ids.len()
             ),
-            card.counts.compact(),
+            app.data.collaboration.room.as_ref().map_or_else(
+                || card.counts.compact(),
+                |room| {
+                    format!(
+                        "{} · room {} · self {} · unread {}/{}",
+                        card.counts.compact(),
+                        room.current.room.window_id,
+                        room.current.label(),
+                        room.unread,
+                        room.unread_replies
+                    )
+                },
+            ),
         ],
         app.theme,
     );
@@ -2693,6 +3203,10 @@ fn render_agent_roster_panel(f: &mut Frame, area: Rect, card: &SessionCard, app:
                 action_target
                     .as_ref()
                     .is_some_and(|target| agent_matches_action_target(agent, target)),
+                agent
+                    .pane
+                    .as_deref()
+                    .and_then(|pane| app.data.collaboration.participant_for_pane(pane)),
             )
         })
         .collect::<Vec<_>>();
@@ -2743,11 +3257,12 @@ fn render_detail_panel(f: &mut Frame, area: Rect, card: &SessionCard, app: &Dash
             ),
             width,
         )),
-        Line::from(truncate_width(
-            &format!("cwd {}", card.cwd.as_deref().unwrap_or("-")),
-            width,
-        )),
     ];
+    lines.extend(collaboration_inspector_lines(app, width));
+    lines.push(Line::from(truncate_width(
+        &format!("cwd {}", card.cwd.as_deref().unwrap_or("-")),
+        width,
+    )));
     if let Some(prompt) = card.last_prompt.as_deref() {
         lines.push(Line::from(truncate_width(
             &format!("prompt {}", squash_ws(prompt)),
@@ -2773,6 +3288,10 @@ fn render_detail_panel(f: &mut Frame, area: Rect, card: &SessionCard, app: &Dash
                 action_target
                     .as_ref()
                     .is_some_and(|target| agent_matches_action_target(agent, target)),
+                agent
+                    .pane
+                    .as_deref()
+                    .and_then(|pane| app.data.collaboration.participant_for_pane(pane)),
             ));
         }
         if visible_agents < card.agents.len() && lines.len() < max_lines {
@@ -2785,12 +3304,44 @@ fn render_detail_panel(f: &mut Frame, area: Rect, card: &SessionCard, app: &Dash
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn collaboration_inspector_lines(app: &DashboardApp, width: usize) -> Vec<Line<'static>> {
+    let Some(room) = app.data.collaboration.room.as_ref() else {
+        return Vec::new();
+    };
+    let mut lines = vec![Line::from(truncate_width(
+        &format!(
+            "room {} · self {} · unread {}/{}",
+            room.current.room.window_id,
+            room.current.label(),
+            room.unread,
+            room.unread_replies
+        ),
+        width,
+    ))];
+    if let Some(peer) = app.selected_collaboration_peer() {
+        lines.push(Line::from(truncate_width(
+            &format!(
+                "peer {} · roles {}",
+                peer.label(),
+                if peer.roles.is_empty() {
+                    "-".into()
+                } else {
+                    peer.roles.join(",")
+                }
+            ),
+            width,
+        )));
+    }
+    lines
+}
+
 fn agent_roster_line(
     agent: &Agent,
     now: OffsetDateTime,
     width: usize,
     theme: DashboardTheme,
     primary: bool,
+    collaboration_participant: Option<&Participant>,
 ) -> Line<'static> {
     let target = agent
         .pane
@@ -2802,12 +3353,21 @@ fn agent_roster_line(
         .as_deref()
         .or(agent.last_prompt.as_deref())
         .map_or_else(|| "-".to_string(), squash_ws);
+    let collaboration = collaboration_participant.map_or_else(String::new, |participant| {
+        let roles = if participant.roles.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", participant.roles.join(","))
+        };
+        format!(" · {}{roles}", participant.label())
+    });
     let text = truncate_width(
         &format!(
-            "{} {} · {} · {} · {}",
+            "{} {} · {}{} · {} · {}",
             agent.kind,
             agent.state,
             target,
+            collaboration,
             relative_time(agent.last_activity_at, now),
             message
         ),
@@ -2959,6 +3519,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &DashboardApp) {
         Span::raw(" capture  "),
         key("Enter", app.theme),
         Span::raw(" inspect  "),
+        key("m", app.theme),
+        Span::raw(" message  "),
+        key("b", app.theme),
+        Span::raw(" mailbox  "),
+        key("i", app.theme),
+        Span::raw(" inbox  "),
         key("p", app.theme),
         Span::raw(" prompt  "),
         key("R", app.theme),
@@ -3003,6 +3569,9 @@ fn render_help(f: &mut Frame, area: Rect, theme: DashboardTheme) {
         Line::from("  n                 show dashboard notes"),
         Line::from("  Enter             toggle inspector"),
         Line::from("  p                 compose prompt for selected target"),
+        Line::from("  m                 message selected same-room peer"),
+        Line::from("  b                 open collaboration mailbox"),
+        Line::from("  i                 claim collaboration inbox"),
         Line::from("  c                 copy last prompt"),
         Line::from("  R                 abort current turn"),
         Line::from("  K                 terminate pane or PTY session"),
@@ -3050,6 +3619,212 @@ fn render_notes(f: &mut Frame, area: Rect, app: &DashboardApp) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+#[allow(clippy::too_many_lines)]
+fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &DashboardApp) {
+    let tab = app.collaboration_mailbox.tab;
+    let incoming_count = app.data.collaboration.incoming.len();
+    let sent_count = app.data.collaboration.sent.len();
+    let title = Line::from(vec![
+        Span::styled(" collaboration ", app.theme.title_style()),
+        Span::styled(
+            format!(" incoming {incoming_count} "),
+            if tab == CollaborationTab::Incoming {
+                app.theme.key_style()
+            } else {
+                app.theme.dim_style()
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" sent {sent_count} "),
+            if tab == CollaborationTab::Sent {
+                app.theme.key_style()
+            } else {
+                app.theme.dim_style()
+            },
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(app.theme.selected_border())
+        .border_type(BorderType::Plain)
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.data.collaboration.room.is_none() {
+        let message = app
+            .data
+            .collaboration
+            .unavailable
+            .as_deref()
+            .unwrap_or("collaboration is unavailable");
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    message.to_string(),
+                    Style::default()
+                        .fg(app.theme.error)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Esc/b closes", app.theme.dim_style())),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(4),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let requests = app.collaboration_requests();
+    let width = usize::from(chunks[0].width).max(1);
+    let max_lines = usize::from(chunks[0].height).max(1);
+    let selected = app.collaboration_mailbox.selected;
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(max_lines)
+        .min(requests.len().saturating_sub(max_lines));
+    let mut lines = requests
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_lines)
+        .map(|(index, request)| {
+            let focused = index == selected;
+            let peer = match tab {
+                CollaborationTab::Incoming => request.from.label(),
+                CollaborationTab::Sent => request.to.label(),
+            };
+            let text = truncate_width(
+                &format!(
+                    "{} {:<11} {:<9} {:<12} {:<9} {}",
+                    short_request_id(&request.id),
+                    request_kind_label(request.kind),
+                    request_status_label(request.status),
+                    peer,
+                    work_mode_label(request.work_mode),
+                    squash_ws(&request.body)
+                ),
+                width.saturating_sub(2),
+            );
+            Line::from(vec![
+                Span::styled(
+                    if focused { "> " } else { "  " },
+                    if focused {
+                        app.theme.selected_border()
+                    } else {
+                        app.theme.dim_style()
+                    },
+                ),
+                Span::styled(
+                    text,
+                    if focused {
+                        Style::default()
+                            .fg(app.theme.title)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(app.theme.panel)
+                    },
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            match tab {
+                CollaborationTab::Incoming => "no incoming requests",
+                CollaborationTab::Sent => "no sent requests",
+            },
+            app.theme.dim_style(),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let detail_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(app.theme.border_style())
+        .title(Span::styled(" selected request ", app.theme.dim_style()));
+    let detail_width = usize::from(detail_block.inner(chunks[1]).width).max(1);
+    let detail_lines = app.selected_collaboration_request().map_or_else(
+        || vec![Line::from(Span::styled("-", app.theme.dim_style()))],
+        |request| collaboration_request_detail(request, detail_width, app.theme),
+    );
+    f.render_widget(Paragraph::new(detail_lines).block(detail_block), chunks[1]);
+
+    let help = app.data.collaboration.unavailable.as_deref().map_or_else(
+        || match tab {
+            CollaborationTab::Incoming => {
+                "Tab mailbox · ↑↓ select · i claim inbox · e reply · Esc/b close"
+            }
+            CollaborationTab::Sent => "Tab mailbox · ↑↓ select · x cancel queued · Esc/b close",
+        },
+        |error| error,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(help, app.theme.dim_style()))),
+        chunks[2],
+    );
+}
+
+fn collaboration_request_detail(
+    request: &CollaborationRequest,
+    width: usize,
+    theme: DashboardTheme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(truncate_width(
+            &format!(
+                "{} · {} → {}",
+                request.id,
+                request.from.label(),
+                request.to.label()
+            ),
+            width,
+        )),
+        Line::from(truncate_width(
+            &format!(
+                "{} · {} · reply {} · {}",
+                request_kind_label(request.kind),
+                request_status_label(request.status),
+                if request.expects_reply { "yes" } else { "no" },
+                work_mode_label(request.work_mode)
+            ),
+            width,
+        )),
+        Line::from(truncate_width(
+            &format!("body: {}", squash_ws(&request.body)),
+            width,
+        )),
+    ];
+    if !request.paths.is_empty() {
+        lines.push(Line::from(truncate_width(
+            &format!("paths: {}", request.paths.join(", ")),
+            width,
+        )));
+    }
+    if let Some(reply) = request.reply.as_ref() {
+        lines.push(Line::from(Span::styled(
+            truncate_width(
+                &format!(
+                    "reply [{}]: {}",
+                    request_status_label(reply.status),
+                    squash_ws(&reply.body)
+                ),
+                width,
+            ),
+            Style::default().fg(theme.ok),
+        )));
+    }
+    lines
+}
+
 fn render_confirm(f: &mut Frame, area: Rect, app: &DashboardApp) {
     let popup = app.confirm.as_ref().expect("confirm checked by caller");
     let block = Block::default()
@@ -3083,7 +3858,7 @@ fn render_composer(f: &mut Frame, area: Rect, app: &DashboardApp) {
         .border_style(app.theme.selected_border())
         .border_type(BorderType::Plain)
         .title(Span::styled(
-            format!(" prompt → {} ", composer.label),
+            format!(" {} → {} ", composer_title(composer), composer.label),
             app.theme.title_style(),
         ));
     let inner = block.inner(area);
@@ -3107,6 +3882,22 @@ fn render_composer(f: &mut Frame, area: Rect, app: &DashboardApp) {
         .saturating_add(u16::try_from(before_cursor.width()).unwrap_or(u16::MAX));
     if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
         f.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+fn composer_title(composer: &PromptComposer) -> String {
+    match &composer.target {
+        PromptTarget::Pane(_) | PromptTarget::PtySession(_) => "prompt".into(),
+        PromptTarget::CollaborationSend {
+            kind, work_mode, ..
+        } => format!(
+            "message · {} · {} · Tab kind · Ctrl-E mode",
+            request_kind_label(*kind),
+            work_mode_label(*work_mode)
+        ),
+        PromptTarget::CollaborationReply { status, .. } => {
+            format!("reply · {} · Tab status", request_status_label(*status))
+        }
     }
 }
 
@@ -3210,6 +4001,45 @@ fn capture_target_label(target: &CaptureTarget) -> String {
     match target {
         CaptureTarget::Pane(pane) => format!("pane {pane}"),
         CaptureTarget::PtySession(session) => format!("pty {session}"),
+    }
+}
+
+fn request_kind_label(kind: RequestKind) -> &'static str {
+    match kind {
+        RequestKind::Question => "question",
+        RequestKind::Review => "review",
+        RequestKind::Task => "task",
+        RequestKind::Notice => "notice",
+    }
+}
+
+fn work_mode_label(mode: WorkMode) -> &'static str {
+    match mode {
+        WorkMode::ReadOnly => "read-only",
+        WorkMode::Execute => "execute",
+    }
+}
+
+fn request_status_label(status: RequestStatus) -> &'static str {
+    match status {
+        RequestStatus::Queued => "queued",
+        RequestStatus::Claimed => "claimed",
+        RequestStatus::Completed => "completed",
+        RequestStatus::Blocked => "blocked",
+        RequestStatus::Declined => "declined",
+        RequestStatus::Failed => "failed",
+        RequestStatus::Expired => "expired",
+        RequestStatus::Cancelled => "cancelled",
+    }
+}
+
+fn short_request_id(request_id: &str) -> String {
+    const MAX_CHARS: usize = 18;
+    let chars = request_id.chars().collect::<Vec<_>>();
+    if chars.len() <= MAX_CHARS {
+        request_id.to_string()
+    } else {
+        chars[..MAX_CHARS].iter().collect()
     }
 }
 
@@ -3335,6 +4165,7 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxa::collaboration::RoomId;
     use muxa::event::SurfaceRef;
     use ratatui::backend::TestBackend;
     use time::macros::datetime;
@@ -3409,6 +4240,78 @@ mod tests {
             exit_status: None,
             pid: Some(99),
         }
+    }
+
+    fn fake_participant(
+        pane: &str,
+        session_id: &str,
+        alias: Option<&str>,
+        roles: &[&str],
+    ) -> Participant {
+        Participant {
+            agent_kind: AgentKind::Codex,
+            agent_session_id: session_id.into(),
+            pane: pane.into(),
+            socket: Some("default".into()),
+            room: RoomId {
+                host: "tmux".into(),
+                socket: Some("default".into()),
+                window_id: "@1".into(),
+            },
+            tmux_session_id: Some("$1".into()),
+            tmux_session_name: Some("main".into()),
+            window_name: Some("agents".into()),
+            state: AgentState::Idle,
+            cwd: Some("/tmp/project".into()),
+            alias: alias.map(str::to_string),
+            roles: roles.iter().map(|role| (*role).to_string()).collect(),
+        }
+    }
+
+    fn fake_collaboration_request(
+        id: &str,
+        from: Participant,
+        to: Participant,
+        status: RequestStatus,
+        now: OffsetDateTime,
+    ) -> CollaborationRequest {
+        CollaborationRequest {
+            id: id.into(),
+            from,
+            to,
+            kind: RequestKind::Review,
+            body: "review the auth change".into(),
+            expects_reply: true,
+            work_mode: WorkMode::ReadOnly,
+            paths: Vec::new(),
+            status,
+            created_at: now,
+            claimed_at: (status == RequestStatus::Claimed).then_some(now),
+            notified_at: None,
+            reply_notified_at: None,
+            reply_read_at: None,
+            reply: None,
+        }
+    }
+
+    fn attach_collaboration(
+        data: &mut DashboardData,
+        current: Participant,
+        peers: Vec<Participant>,
+    ) {
+        data.collaboration = CollaborationData {
+            origin: Some(CollaborationOrigin {
+                pane: current.pane.clone(),
+                socket: current.socket.clone(),
+            }),
+            room: Some(RoomContext {
+                current,
+                peers,
+                unread: 0,
+                unread_replies: 0,
+            }),
+            ..CollaborationData::default()
+        };
     }
 
     #[test]
@@ -3504,6 +4407,173 @@ mod tests {
         assert_eq!(composer.cursor, 0);
         composer.delete();
         assert_eq!(composer.input, "");
+    }
+
+    #[test]
+    fn collaboration_composer_targets_selected_same_room_peer() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let mut data = build_dashboard_data(
+            now,
+            vec![
+                fake_agent("self", Some("%1"), AgentState::Idle, None, now),
+                fake_agent("peer", Some("%2"), AgentState::WaitingInput, None, now),
+            ],
+            vec![fake_pane("%1", "main"), fake_pane("%2", "main")],
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        attach_collaboration(
+            &mut data,
+            fake_participant("%1", "self", Some("builder"), &["rust"]),
+            vec![fake_participant(
+                "%2",
+                "peer",
+                Some("reviewer"),
+                &["review"],
+            )],
+        );
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+
+        assert!(matches!(
+            open_collaboration_composer(&mut app),
+            UiAction::None
+        ));
+        let composer = app.composer.as_mut().unwrap();
+        assert_eq!(composer.label, "reviewer@%2");
+        assert!(matches!(
+            composer.target,
+            PromptTarget::CollaborationSend {
+                ref target,
+                kind: RequestKind::Question,
+                work_mode: WorkMode::ReadOnly,
+                ..
+            } if target == "pane:%2"
+        ));
+        cycle_composer_option(composer);
+        toggle_composer_execute(composer);
+        assert!(matches!(
+            composer.target,
+            PromptTarget::CollaborationSend {
+                kind: RequestKind::Review,
+                work_mode: WorkMode::Execute,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn collaboration_inbox_reply_and_cancel_actions_preserve_origin() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let mut data = build_dashboard_data(
+            now,
+            vec![fake_agent("self", Some("%1"), AgentState::Idle, None, now)],
+            vec![fake_pane("%1", "main")],
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let current = fake_participant("%1", "self", Some("builder"), &["rust"]);
+        let peer = fake_participant("%2", "peer", Some("reviewer"), &["review"]);
+        attach_collaboration(&mut data, current.clone(), vec![peer.clone()]);
+        data.collaboration.incoming.push(fake_collaboration_request(
+            "req_incoming_123456",
+            peer.clone(),
+            current.clone(),
+            RequestStatus::Claimed,
+            now,
+        ));
+        data.collaboration.sent.push(fake_collaboration_request(
+            "req_sent_123456",
+            current,
+            peer,
+            RequestStatus::Queued,
+            now,
+        ));
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+
+        assert!(matches!(
+            claim_collaboration_inbox(&mut app),
+            UiAction::Run(PendingAction::CollaborationInbox {
+                origin: CollaborationOrigin { ref pane, .. }
+            }) if pane == "%1"
+        ));
+        assert_eq!(app.overlay, Overlay::Collaboration);
+        assert!(matches!(
+            open_collaboration_reply_composer(&mut app),
+            UiAction::None
+        ));
+        assert!(matches!(
+            app.composer.as_ref().map(|composer| &composer.target),
+            Some(PromptTarget::CollaborationReply { request_id, .. })
+                if request_id == "req_incoming_123456"
+        ));
+
+        app.composer = None;
+        app.collaboration_mailbox.tab = CollaborationTab::Sent;
+        assert!(matches!(
+            confirm_collaboration_cancel(&mut app),
+            UiAction::None
+        ));
+        assert!(matches!(
+            app.confirm.as_ref().map(|popup| &popup.on_confirm),
+            Some(PendingAction::CollaborationCancel { request_id, .. })
+                if request_id == "req_sent_123456"
+        ));
+    }
+
+    #[test]
+    fn collaboration_mailbox_renders_request_and_peer_identity() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let mut data = build_dashboard_data(
+            now,
+            vec![fake_agent("self", Some("%1"), AgentState::Idle, None, now)],
+            vec![fake_pane("%1", "main")],
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let current = fake_participant("%1", "self", Some("builder"), &["rust"]);
+        let peer = fake_participant("%2", "peer", Some("reviewer"), &["review"]);
+        attach_collaboration(&mut data, current.clone(), vec![peer.clone()]);
+        data.collaboration.incoming.push(fake_collaboration_request(
+            "req_render_123456",
+            peer,
+            current,
+            RequestStatus::Claimed,
+            now,
+        ));
+        let backend = TestBackend::new(104, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = DashboardApp::new(data, WatchTheme::Classic);
+
+        terminal
+            .draw(|f| render_collaboration_mailbox(f, f.area(), &app))
+            .unwrap();
+        let dump = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(dump.contains("incoming 1"));
+        assert!(dump.contains("reviewer@%2"));
+        assert!(dump.contains("review the auth change"));
+        assert!(dump.contains("e reply"));
     }
 
     #[test]
@@ -3716,7 +4786,7 @@ mod tests {
     #[test]
     fn inspector_renders_agent_roster_for_selected_session() {
         let now = datetime!(2026-06-16 00:00 UTC);
-        let data = build_dashboard_data(
+        let mut data = build_dashboard_data(
             now,
             vec![
                 fake_agent("a", Some("%1"), AgentState::Working, Some("build"), now),
@@ -3737,6 +4807,11 @@ mod tests {
             HostKind::Tmux,
             Vec::new(),
         );
+        attach_collaboration(
+            &mut data,
+            fake_participant("%1", "a", Some("builder"), &["rust"]),
+            vec![fake_participant("%2", "b", Some("reviewer"), &["review"])],
+        );
         let backend = TestBackend::new(96, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = DashboardApp::new(data, WatchTheme::Classic);
@@ -3756,6 +4831,8 @@ mod tests {
         assert!(dump.contains("agents"));
         assert!(dump.contains("working"));
         assert!(dump.contains("waiting_input"));
+        assert!(dump.contains("reviewer@%2"));
+        assert!(dump.contains("roles review"));
     }
 
     #[test]

@@ -6,6 +6,8 @@ tmux에 먼저 attach하지 않고 한 화면에서 확인하고 조작하는 �
 작고 빠른 picker/table이 필요하면 `muxa watch`를 쓰고, card, inspector, live
 terminal capture, prompt composer, session 단위 ACT/WACT total이 필요한
 운영 화면은 `muxa dashboard`를 씁니다.
+tracked tmux agent pane 안에서 실행하면 현재 agent의 collaboration room
+console 역할도 함께 수행합니다.
 
 ## 실행
 
@@ -31,6 +33,9 @@ muxa dashboard --include-paneless
 | `n` | 진단 note가 있을 때 notes popup 열기. |
 | `Enter` | 선택 session inspector toggle. |
 | `p` | 선택 pane 또는 muxa PTY session에 prompt composer 열기. |
+| `m` | 선택한 same-room agent에게 구조화 요청 작성. |
+| `b` | request를 claim하지 않고 incoming/sent collaboration mailbox 열기. |
+| `i` | pending collaboration request를 claim하고 incoming mailbox 열기. |
 | `c` | 선택 session의 최신 prompt 복사. |
 | `R` | 확인 후 선택 pane 또는 PTY session에 Ctrl-C 전송. |
 | `K` | 확인 후 선택 pane 또는 PTY session 종료. |
@@ -66,6 +71,28 @@ unavailable 상태로 표시합니다.
 multi-pane card에서는 강조된 action target이 `p`, `R`, `K`, `o`, capture의
 대상입니다. `Tab`, `[`, `]`로 dashboard 안에서 target을 바꿀 수 있고,
 destructive action 확인창은 실행 전 정확한 pane 또는 PTY session을 표시합니다.
+
+## Collaboration room
+
+Header와 inspector에는 현재 room, 호출 agent의 alias, room participant의 role,
+읽지 않은 request/reply 수가 표시됩니다. `Tab`, `[`, `]`로 peer pane을 선택한
+뒤 `m`을 누르면 그 agent session에 고정된 durable request를 작성합니다.
+message composer에서는 다음 키를 사용합니다.
+
+- `Tab`: `question`, `review`, `task`, `notice` 전환
+- `Ctrl-E`: 명시적인 `read-only` / `execute` 작업 계약 전환
+- `Enter`: 전송, `Esc`: dashboard로 복귀
+
+`b`는 claim 없이 incoming/sent 이력을 보여줍니다. Mailbox 안에서는 `Tab`으로
+mailbox를 바꾸고 화살표로 request를 선택합니다. `i`는 pending incoming 작업을
+원자적으로 claim하고, `e`는 claimed request에 응답하며, `x`는 아직 queued인
+발신 request의 취소 확인창을 엽니다. reply composer의 `Tab`은 `completed`,
+`blocked`, `declined`, `failed`를 전환합니다.
+
+Collaboration write는 dashboard 자체가 muxad가 추적하는 agent pane 안에서
+실행될 때만 활성화됩니다. 추적되지 않은 shell에서 연 dashboard도 session 조회는
+가능하지만 mailbox에 collaboration action이 비활성화된 이유가 표시됩니다. 따라서
+CLI/MCP helper와 같은 authenticated origin 및 same-window 경계를 유지합니다.
 
 ## ACT/WACT
 

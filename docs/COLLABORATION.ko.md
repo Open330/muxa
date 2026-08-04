@@ -87,6 +87,11 @@ muxa msg list --mailbox incoming --json
 muxa msg cancel req_...
 ```
 
+tracked agent pane 안에서 `muxa dashboard`를 실행하면 같은 lifecycle을 TUI로
+사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는
+mailbox 이력을 열며, `i`는 inbox를 claim합니다. Mailbox에서는 `e`로 응답하고
+`x`로 아직 queued인 발신 요청을 취소할 수 있습니다.
+
 ## MCP tools
 
 | Tool | 역할 |

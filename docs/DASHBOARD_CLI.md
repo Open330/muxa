@@ -6,6 +6,8 @@ multiple agent sessions from one screen without attaching to tmux first.
 Use `muxa watch` when you want the compact picker/table. Use
 `muxa dashboard` when you want a richer console with cards, an inspector,
 live terminal capture, prompt composition, and session-level ACT/WACT totals.
+When it runs inside a tracked tmux agent pane, it also becomes that agent's
+collaboration-room console.
 
 ## Open
 
@@ -31,6 +33,9 @@ muxa dashboard --include-paneless
 | `n` | Open dashboard notes when diagnostics are available. |
 | `Enter` | Toggle the selected session inspector. |
 | `p` | Open the prompt composer for the selected pane or muxa PTY session. |
+| `m` | Compose a structured request for the selected same-room agent. |
+| `b` | Open incoming/sent collaboration mailbox history without claiming requests. |
+| `i` | Claim pending collaboration requests and open the incoming mailbox. |
 | `c` | Copy the selected session's latest prompt. |
 | `R` | Confirm and send Ctrl-C to the selected pane or PTY session. |
 | `K` | Confirm and terminate the selected pane or PTY session. |
@@ -66,6 +71,29 @@ For multi-pane cards, the highlighted action target controls where `p`, `R`,
 `K`, `o`, and capture apply. Use `Tab`, `[` or `]` to move that target without
 leaving the dashboard. Confirm prompts name the exact pane or PTY session before
 running destructive actions.
+
+## Collaboration room
+
+The header and inspector show the current room, the calling agent's alias,
+roles on room participants, and unread request/reply counts. Select a peer's
+pane with `Tab`, `[` or `]`, then press `m` to send a durable request pinned to
+that exact agent session. In the message composer:
+
+- `Tab` cycles `question`, `review`, `task`, and `notice`.
+- `Ctrl-E` toggles the explicit `read-only` / `execute` work contract.
+- `Enter` sends and `Esc` returns to the dashboard.
+
+Press `b` for non-claiming incoming/sent history. In the mailbox, `Tab` changes
+mailbox, arrows select a request, `i` atomically claims pending incoming work,
+`e` replies to a claimed request, and `x` confirms cancellation of a sent
+request that is still queued. The reply composer uses `Tab` to cycle
+`completed`, `blocked`, `declined`, and `failed`.
+
+Collaboration writes are enabled only when the dashboard itself runs inside a
+pane that muxad recognizes as a tracked agent. A dashboard opened from an
+untracked shell can still inspect sessions, but the mailbox explains why its
+collaboration actions are unavailable. This preserves the same authenticated
+origin and same-window boundary as the CLI and MCP helpers.
 
 ## ACT/WACT
 
