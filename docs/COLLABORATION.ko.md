@@ -4,6 +4,16 @@
 request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 범위를 표현하고,
 실제 메시지는 `muxad`의 owner-only Unix socket과 local mailbox를 통과합니다.
 
+## 이것만 기억하세요
+
+- tmux window 하나가 협업 room 하나입니다.
+- `prefix+D`를 누를 때 보고 있던 agent가 발신자입니다.
+- `Tab`으로 같은 window의 다른 agent를 고르고 `m`으로 메시지를 보냅니다.
+
+즉, 같은 window에 agent 둘을 실행하고, 보낼 agent를 선택해 `prefix+D`, `Tab`,
+`m` 순서로 누르면 됩니다. 일반 shell pane은 agent가 아니므로 발신자가 될 수
+없습니다.
+
 ## 활성화
 
 `~/.config/muxa/config.toml`에 다음을 추가하고 daemon을 재시작합니다.
@@ -20,6 +30,9 @@ wake = "idle_only"
 ```bash
 claude mcp add muxa -- muxa mcp
 ```
+
+업그레이드한 기존 사용자는 `muxa init`을 한 번 더 실행하면 `prefix+D` popup
+단축키가 설치됩니다.
 
 MCP process는 agent와 같은 pane의 `TMUX_PANE`/`TMUX` 환경을 상속받습니다.
 이 값과 daemon의 live agent/pane registry를 대조해 발신자를 결정하므로 tool

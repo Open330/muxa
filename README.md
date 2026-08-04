@@ -88,6 +88,31 @@ muxa status
 muxa watch
 ```
 
+### Collaborate in three steps
+
+The model is simple: **one tmux window is one room**. The agent pane that is
+focused when the dashboard opens is the sender.
+
+One-time setup: add the following to `~/.config/muxa/config.toml`, restart
+`muxad`, and run `muxa init` to install the `prefix+D` popup.
+
+```toml
+[collaboration]
+enabled = true
+wake = "idle_only"
+```
+
+Then:
+
+1. Run two agents in two panes of the same tmux window.
+2. Focus the agent that should send, then press `prefix+D`.
+3. Choose the other agent with `Tab`, press `m`, type the request, and press
+   `Enter`.
+
+Do not open the collaboration dashboard from a spare shell pane: that shell is
+not an agent. For configuration and request/reply details, see
+[docs/COLLABORATION.md](docs/COLLABORATION.md).
+
 For install modes, `muxa init` presets, systemd, manual hook wiring, and
 rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 

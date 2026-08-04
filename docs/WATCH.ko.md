@@ -109,7 +109,11 @@ agent pane이 여러 개 있으면 `]`로 다음 agent, `[`로 이전 agent를 �
 
 ```tmux
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
+
+`prefix+s`는 picker를 열고, `prefix+D`는 현재 선택한 agent의 협업 Dashboard를
+엽니다.
 
 ## macOS 메뉴바 (BarShelf)
 

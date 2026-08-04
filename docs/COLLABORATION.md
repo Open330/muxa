@@ -5,6 +5,16 @@ request/reply messages between its top-level agents. tmux supplies topology;
 the message body travels through muxad's owner-only Unix socket and local
 mailbox, not through terminal screen scraping.
 
+## The whole model
+
+- One tmux window is one collaboration room.
+- The focused agent is the sender when you press `prefix+D`.
+- `Tab` chooses another agent in that window; `m` sends the request.
+
+So the normal workflow is simply: put two agents in one window, focus the
+sender, press `prefix+D`, choose the peer, and press `m`. A normal shell pane is
+not an agent and cannot be the sender.
+
 ## Enable
 
 ```toml
@@ -18,6 +28,9 @@ Restart `muxad` and register `muxa mcp` with each agent host. For Claude Code:
 ```bash
 claude mcp add muxa -- muxa mcp
 ```
+
+Run `muxa init` once more after upgrading to install the `prefix+D` popup
+binding.
 
 The MCP process inherits `TMUX` and `TMUX_PANE`. muxad validates that origin
 against its live agent and pane registries; collaboration tools do not accept

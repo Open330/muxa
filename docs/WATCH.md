@@ -102,7 +102,11 @@ the current position, such as `2/3`, when more than one agent is available.
 
 ```tmux
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
+
+`prefix+s` opens the picker. `prefix+D` opens the collaboration dashboard as
+the currently focused agent.
 
 ## macOS Menu Bar with BarShelf
 

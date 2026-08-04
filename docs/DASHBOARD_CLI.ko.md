@@ -11,6 +11,10 @@ console 역할도 함께 수행합니다.
 
 ## 실행
 
+조회만 할 때는 어디서든 `muxa dashboard`를 실행할 수 있습니다. 협업할 때는
+명령을 직접 입력하지 말고, 메시지를 보낼 agent pane을 선택한 뒤 `prefix+D`를
+누릅니다. 이 popup 단축키는 `muxa init`이 설치합니다.
+
 ```bash
 muxa dashboard
 muxa dashboard --since today
@@ -74,6 +78,16 @@ destructive action 확인창은 실행 전 정확한 pane 또는 PTY session을 
 
 ## Collaboration room
 
+평소 사용 순서는 세 단계입니다.
+
+1. 같은 tmux window의 두 pane에서 agent를 실행합니다.
+2. 메시지를 보낼 agent pane을 선택하고 `prefix+D`를 누릅니다.
+3. `Tab`으로 상대 agent를 고른 뒤 `m`을 눌러 메시지를 보냅니다.
+
+window 하나가 room 하나입니다. Dashboard를 열 때 선택한 agent가 발신자이고,
+Dashboard 안에서 card/target을 바꾸는 것은 수신자만 바꿉니다. 일반 shell에서
+연 Dashboard는 조회에는 쓸 수 있지만 agent로 메시지를 보낼 수 없습니다.
+
 Header와 inspector에는 현재 room, 호출 agent의 alias, room participant의 role,
 읽지 않은 request/reply 수가 표시됩니다. `Tab`, `[`, `]`로 peer pane을 선택한
 뒤 `m`을 누르면 그 agent session에 고정된 durable request를 작성합니다.
@@ -89,12 +103,10 @@ mailbox를 바꾸고 화살표로 request를 선택합니다. `i`는 pending inc
 발신 request의 취소 확인창을 엽니다. reply composer의 `Tab`은 `completed`,
 `blocked`, `declined`, `failed`를 전환합니다.
 
-Collaboration write는 dashboard 자체가 muxad가 추적하는 agent pane 안에서
-실행될 때만 활성화됩니다. 추적되지 않은 shell에서 연 dashboard도 session 조회는
-가능하지만 mailbox에 collaboration action이 비활성화된 이유가 표시됩니다. 따라서
-CLI/MCP helper와 같은 authenticated origin 및 same-window 경계를 유지합니다.
-tmux popup이나 key binding 실행에서 `TMUX_PANE`이 누락되면 dashboard가 정확한
-tmux session의 active pane을 조회하므로 popup에서도 같은 경계를 유지합니다.
+room에 다른 agent가 없다면 같은 window의 새 pane에서 agent를 하나 더
+실행합니다. 협업 불가 안내가 나오면 Dashboard를 닫고 agent pane을 선택한 뒤
+`prefix+D`로 다시 엽니다. 내부적으로 muxad가 해당 pane을 확인해 CLI/MCP와 같은
+same-window 보안 경계를 유지합니다.
 
 ## ACT/WACT
 

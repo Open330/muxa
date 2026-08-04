@@ -1258,9 +1258,7 @@ async fn load_dashboard_data(client: &Client, cfg: &Config, args: &Args) -> Resu
 async fn load_collaboration_data(client: &Client) -> CollaborationData {
     let Some(origin) = dashboard_collaboration_origin() else {
         return CollaborationData {
-            unavailable: Some(
-                "run dashboard inside a tracked tmux agent pane to use collaboration".into(),
-            ),
+            unavailable: Some(collaboration_open_hint().into()),
             ..CollaborationData::default()
         };
     };
@@ -1269,7 +1267,7 @@ async fn load_collaboration_data(client: &Client) -> CollaborationData {
         Err(error) => {
             return CollaborationData {
                 origin: Some(origin),
-                unavailable: Some(error.to_string()),
+                unavailable: Some(friendly_collaboration_error(&error.to_string())),
                 ..CollaborationData::default()
             };
         }
@@ -1298,6 +1296,18 @@ async fn load_collaboration_data(client: &Client) -> CollaborationData {
                 ..CollaborationData::default()
             }
         }
+    }
+}
+
+fn collaboration_open_hint() -> &'static str {
+    "collaboration unavailable here — focus an agent pane and press prefix+D"
+}
+
+fn friendly_collaboration_error(error: &str) -> String {
+    if error.contains("collaboration origin is not a tracked pane agent") {
+        collaboration_open_hint().into()
+    } else {
+        error.into()
     }
 }
 
@@ -2035,9 +2045,22 @@ fn open_collaboration_composer(app: &mut DashboardApp) -> UiAction {
     let Some(origin) = collaboration_origin_for_action(app) else {
         return UiAction::None;
     };
+    if app
+        .data
+        .collaboration
+        .room
+        .as_ref()
+        .is_some_and(|room| room.peers.is_empty())
+    {
+        app.set_hint(
+            "no peer here yet — run another agent in this tmux window",
+            HintLevel::Err,
+        );
+        return UiAction::None;
+    }
     let Some(peer) = app.selected_collaboration_peer() else {
         app.set_hint(
-            "selected target is not a peer in this collaboration room",
+            "choose another agent in this window with Tab, [ or ], then press m",
             HintLevel::Err,
         );
         return UiAction::None;
@@ -4496,6 +4519,18 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_error_explains_the_single_user_action() {
+        assert_eq!(
+            friendly_collaboration_error("collaboration origin is not a tracked pane agent: %12"),
+            "collaboration unavailable here — focus an agent pane and press prefix+D"
+        );
+        assert_eq!(
+            friendly_collaboration_error("agent collaboration is disabled"),
+            "agent collaboration is disabled"
+        );
+    }
+
+    #[test]
     fn collaboration_composer_targets_selected_same_room_peer() {
         let now = datetime!(2026-06-16 00:00 UTC);
         let mut data = build_dashboard_data(
@@ -4550,6 +4585,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn collaboration_composer_explains_when_the_room_has_no_peer() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let mut data = build_dashboard_data(
+            now,
+            vec![fake_agent("self", Some("%1"), AgentState::Idle, None, now)],
+            vec![fake_pane("%1", "main")],
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        attach_collaboration(
+            &mut data,
+            fake_participant("%1", "self", Some("builder"), &[]),
+            Vec::new(),
+        );
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+
+        assert!(matches!(
+            open_collaboration_composer(&mut app),
+            UiAction::None
+        ));
+        assert_eq!(
+            app.hint.as_ref().map(|hint| hint.message.as_str()),
+            Some("no peer here yet — run another agent in this tmux window")
+        );
     }
 
     #[test]

@@ -205,7 +205,7 @@ pub fn final_summary(
         body.push(format!("Dashboard: {}", dashboard_url(bind, token)));
         body.push("Token also stored in your config.toml.".into());
     }
-    body.push("Try `prefix + s` for the muxa picker.".into());
+    body.push("Use `prefix+s` to watch or `prefix+D` to collaborate.".into());
     body.push("Roll back with `muxa init --uninstall`.".into());
     note(mode, "Done", &body.join("\n"));
 }

@@ -39,7 +39,7 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
 | `muxa watch` | agent/pane 실시간 TUI. attach, prompt composer, live preview 포함. |
-| `muxa dashboard` | attach 없이 pane을 확인하고 prompt를 보내는 session-card TUI console. |
+| `muxa dashboard` | pane 조작과 같은 tmux window의 agent 협업을 제공하는 session-card TUI. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
@@ -82,6 +82,30 @@ muxad &
 muxa status
 muxa watch
 ```
+
+### Agent 협업은 세 단계입니다
+
+기억할 규칙은 하나입니다. **tmux window 하나가 협업 room 하나**입니다.
+Dashboard를 열 때 선택되어 있던 agent가 발신자가 됩니다.
+
+최초 한 번만 `~/.config/muxa/config.toml`에 다음 설정을 넣고 `muxad`를 재시작한
+뒤 `muxa init`으로 `prefix+D` popup을 설치합니다.
+
+```toml
+[collaboration]
+enabled = true
+wake = "idle_only"
+```
+
+평소에는:
+
+1. 같은 tmux window의 두 pane에서 agent를 각각 실행합니다.
+2. 메시지를 보낼 agent pane을 선택하고 `prefix+D`를 누릅니다.
+3. `Tab`으로 상대를 고른 뒤 `m`을 누르고 메시지를 작성해 `Enter`로 보냅니다.
+
+일반 shell pane에서 Dashboard를 열면 그 shell은 agent가 아니므로 협업할 수
+없습니다. 설정과 응답 흐름은
+[docs/COLLABORATION.ko.md](docs/COLLABORATION.ko.md)를 참고하세요.
 
 설치 모드, `muxa init` preset, systemd, 수동 hook wiring, rollback은
 [docs/INSTALL.ko.md](docs/INSTALL.ko.md)에 정리했습니다.

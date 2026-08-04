@@ -9,7 +9,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Component {
-    /// `prefix + s` → `display-popup -E muxa watch`
+    /// `prefix+s` → watch, `prefix+D` → collaboration dashboard
     TmuxPopup,
     /// per-pane glyph in `status-right`
     TmuxStatusLine,
@@ -70,7 +70,7 @@ impl Component {
     /// One-line label shown in the multi-select.
     pub fn label(self) -> &'static str {
         match self {
-            Component::TmuxPopup => "tmux: replace prefix+s with muxa watch popup",
+            Component::TmuxPopup => "tmux: prefix+s watch + prefix+D collaboration dashboard",
             Component::TmuxStatusLine => "tmux: per-pane agent glyphs in status-right",
             Component::ClaudeHooks => "Claude Code: shell hooks + statusLine",
             Component::CodexHooks => "OpenAI Codex: shell hooks",
@@ -86,7 +86,7 @@ impl Component {
     /// Longer help text shown next to the label.
     pub fn hint(self) -> &'static str {
         match self {
-            Component::TmuxPopup => "drop-in replacement for tmux's choose-tree",
+            Component::TmuxPopup => "open muxa without replacing the current agent pane",
             Component::TmuxStatusLine => "● / ○ / ▶ per pane, refreshed every 2s",
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
