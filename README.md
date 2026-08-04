@@ -43,7 +43,7 @@ same time; zellij has a CLI baseline. See the Hosts table below.
 | Surface | What it does |
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
-| `muxa watch` | Full-screen TUI for agents and panes, with attach, prompt composition, and live previews. |
+| `muxa watch` | Main TUI for agents, prompts, live previews, and same-window collaboration. |
 | `muxa dashboard` | Session-card TUI console for pane operations and authenticated same-room agent collaboration. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
@@ -88,13 +88,13 @@ muxa status
 muxa watch
 ```
 
-### Collaborate in three steps
+### Collaborate from `muxa watch`
 
 The model is simple: **one tmux window is one room**. The agent pane that is
-focused when the dashboard opens is the sender.
+focused when `muxa watch` opens is the sender.
 
 One-time setup: add the following to `~/.config/muxa/config.toml`, restart
-`muxad`, and run `muxa init` to install the `prefix+D` popup.
+`muxad`, and run `muxa init` to install the `prefix+s` watch popup.
 
 ```toml
 [collaboration]
@@ -105,12 +105,13 @@ wake = "idle_only"
 Then:
 
 1. Run two agents in two panes of the same tmux window.
-2. Focus the agent that should send, then press `prefix+D`.
-3. Choose the other agent with `Tab`, press `m`, type the request, and press
-   `Enter`.
+2. Focus the agent that should send, then press `prefix+s`.
+3. Select the other agent in watch, press `m`, type the request, and press
+   `Enter`. Press `b` to read and reply from the mailbox.
 
-Do not open the collaboration dashboard from a spare shell pane: that shell is
-not an agent. For configuration and request/reply details, see
+Do not open watch from a spare shell pane when you want to collaborate: that
+shell is not an agent. `muxa dashboard` remains an optional richer console,
+not a required collaboration entry point. For request/reply details, see
 [docs/COLLABORATION.md](docs/COLLABORATION.md).
 
 For install modes, `muxa init` presets, systemd, manual hook wiring, and

@@ -35,6 +35,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use muxa::collaboration::{
+    CollaborationOrigin, CollaborationRequest, NewRequest, Participant, RequestKind,
+    RequestMailbox, RequestStatus, RoomContext, WorkMode,
+};
 use muxa::config::{
     IconSet, WatchConfig, WatchSortKey, WatchSummary, WatchTheme, WatchView, WidthSpec,
 };
@@ -1204,12 +1208,12 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "Commands & inspection",
         "  :              command palette (Tab completes)",
         "  o / Alt-P      open preview overlay",
-        "  Alt-I          toggle wide-screen inspector",
-        "  Alt-E          open persistent event inbox",
+        "  Alt-I / Alt-E  inspector / persistent event inbox",
         "  Alt-A          attention-only filter",
-        "  [ / ]          (in preview) previous / next agent",
-        "  f / c          (in preview) geometry / content",
+        "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) compose prompt",
+        "  m / b          message selected room peer / mailbox",
+        "  i / e          (in mailbox) claim inbox / reply",
         "",
         "Sorting",
         "  Alt-S/L/D/T    session / latest / duration / state",
@@ -1265,6 +1269,114 @@ pub(crate) struct PromptPopup {
     /// Cursor position in chars, not bytes, so editing non-ASCII prompt
     /// text stays safe.
     pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WatchCollaboration {
+    origin: Option<CollaborationOrigin>,
+    room: Option<RoomContext>,
+    incoming: Vec<CollaborationRequest>,
+    sent: Vec<CollaborationRequest>,
+    unavailable: Option<String>,
+}
+
+impl WatchCollaboration {
+    fn peer_for_pane(&self, pane: &str) -> Option<&Participant> {
+        self.room
+            .as_ref()?
+            .peers
+            .iter()
+            .find(|participant| participant.pane == pane)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CollaborationMailboxTab {
+    #[default]
+    Incoming,
+    Sent,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollaborationMailboxState {
+    open: bool,
+    tab: CollaborationMailboxTab,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CollaborationComposeTarget {
+    Send {
+        origin: CollaborationOrigin,
+        target: String,
+        kind: RequestKind,
+        work_mode: WorkMode,
+    },
+    Reply {
+        origin: CollaborationOrigin,
+        request_id: String,
+        status: RequestStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollaborationComposer {
+    target: CollaborationComposeTarget,
+    label: String,
+    input: String,
+    cursor: usize,
+}
+
+impl CollaborationComposer {
+    fn new(target: CollaborationComposeTarget, label: String) -> Self {
+        Self {
+            target,
+            label,
+            input: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn insert(&mut self, c: char) {
+        let idx = char_to_byte_idx(&self.input, self.cursor);
+        self.input.insert(idx, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, self.cursor - 1);
+        let end = char_to_byte_idx(&self.input, self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, self.cursor);
+        let end = char_to_byte_idx(&self.input, self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.input.chars().count());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
 }
 
 impl PromptPopup {
@@ -1546,6 +1658,9 @@ pub(crate) struct App {
     /// `Some` while the user is composing a prompt to send directly to
     /// the selected pane. Steals table input until submitted or canceled.
     pub prompt: Option<PromptPopup>,
+    collaboration: WatchCollaboration,
+    collaboration_mailbox: CollaborationMailboxState,
+    collaboration_composer: Option<CollaborationComposer>,
     /// Editable `:` command palette. Like other overlays it owns keyboard
     /// input until Enter executes or Esc cancels.
     pub command_palette: Option<CommandPalette>,
@@ -1673,6 +1788,9 @@ impl App {
             pane_capture: None,
             confirm: None,
             prompt: None,
+            collaboration: WatchCollaboration::default(),
+            collaboration_mailbox: CollaborationMailboxState::default(),
+            collaboration_composer: None,
             command_palette: None,
             help_open: false,
             footer_hint: None,
@@ -4007,6 +4125,7 @@ pub async fn run(
     // the tie. Single-host: identical (the one backend answers or doesn't).
     let initial_pane = backends.iter().find_map(|b| b.current_pane());
     app.set_initial_pane(initial_pane.clone());
+    app.collaboration.origin = watch_collaboration_origin(initial_pane.clone());
     let watch_started_at = OffsetDateTime::now_utc();
     let mut prompt_started_at: Option<(OffsetDateTime, String)> = None;
 
@@ -4024,6 +4143,7 @@ pub async fn run(
         .terminal_mut()
         .draw(|f| render(f, &mut app))
         .map_err(anyhow::Error::from)?;
+    refresh_watch_collaboration(client, &mut app).await;
 
     // Background refresh task owns its own Client clone so the borrowed
     // `client: &Client` doesn't have to outlive the task. The clone is
@@ -4164,6 +4284,7 @@ pub async fn run(
                     // up the user's intent.
                     let _ = wake_tx.try_send(());
                     app.refresh_pending = true;
+                    refresh_watch_collaboration(client, &mut app).await;
                 }
                 Action::OpenPreview => {
                     if let Some(pane_id) = app.selected_pane() {
@@ -4291,6 +4412,45 @@ pub async fn run(
                         .await;
                     }
                     app.prompt = None;
+                }
+                Action::OpenCollaborationMessage => {
+                    refresh_watch_collaboration(client, &mut app).await;
+                    open_watch_collaboration_composer(&mut app);
+                }
+                Action::OpenCollaborationMailbox => {
+                    refresh_watch_collaboration(client, &mut app).await;
+                    app.collaboration_mailbox.open = true;
+                    clamp_collaboration_mailbox(&mut app);
+                }
+                Action::SubmitCollaboration => {
+                    if let Some(composer) = app.collaboration_composer.take() {
+                        let outcome = run_watch_collaboration_composer(client, composer).await;
+                        apply_outcome_to_app(&mut app, outcome);
+                        refresh_watch_collaboration(client, &mut app).await;
+                    }
+                }
+                Action::CancelCollaborationComposer => {
+                    app.collaboration_composer = None;
+                }
+                Action::ClaimCollaborationInbox => {
+                    let outcome = match app.collaboration.origin.clone() {
+                        Some(origin) => match client.collaboration_inbox(&origin).await {
+                            Ok(requests) if requests.is_empty() => {
+                                ActionOutcome::Ok("collaboration inbox is empty".into())
+                            }
+                            Ok(requests) => ActionOutcome::Ok(format!(
+                                "claimed {} collaboration request{}",
+                                requests.len(),
+                                if requests.len() == 1 { "" } else { "s" }
+                            )),
+                            Err(error) => ActionOutcome::Err(format!("inbox failed: {error}")),
+                        },
+                        None => ActionOutcome::Err(collaboration_open_hint().into()),
+                    };
+                    apply_outcome_to_app(&mut app, outcome);
+                    refresh_watch_collaboration(client, &mut app).await;
+                    app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
+                    clamp_collaboration_mailbox(&mut app);
                 }
                 Action::ConfirmYes => {
                     if let Some(popup) = app.confirm.take() {
@@ -4444,6 +4604,251 @@ pub async fn run(
     Ok(jump_target)
 }
 
+fn watch_collaboration_origin(initial_pane: Option<String>) -> Option<CollaborationOrigin> {
+    watch_collaboration_origin_from(initial_pane, std::env::var("TMUX").ok())
+}
+
+fn watch_collaboration_origin_from(
+    initial_pane: Option<String>,
+    tmux: Option<String>,
+) -> Option<CollaborationOrigin> {
+    let pane = initial_pane.filter(|pane| pane.starts_with('%'))?;
+    let socket = tmux.and_then(|value| {
+        let path = value.split(',').next()?.trim();
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    Some(CollaborationOrigin { pane, socket })
+}
+
+fn collaboration_open_hint() -> &'static str {
+    "collaboration unavailable here — focus an agent pane and open muxa watch with prefix+s"
+}
+
+fn friendly_watch_collaboration_error(error: &str) -> String {
+    if error.contains("collaboration origin is not a tracked pane agent") {
+        collaboration_open_hint().into()
+    } else {
+        error.into()
+    }
+}
+
+async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
+    let Some(origin) = app.collaboration.origin.clone() else {
+        app.collaboration = WatchCollaboration {
+            unavailable: Some(collaboration_open_hint().into()),
+            ..WatchCollaboration::default()
+        };
+        return;
+    };
+    let room = match client.collaboration_context(&origin).await {
+        Ok(room) => room,
+        Err(error) => {
+            app.collaboration = WatchCollaboration {
+                origin: Some(origin),
+                unavailable: Some(friendly_watch_collaboration_error(&error.to_string())),
+                ..WatchCollaboration::default()
+            };
+            return;
+        }
+    };
+    let (incoming, sent) = tokio::join!(
+        client.collaboration_list(&origin, RequestMailbox::Incoming),
+        client.collaboration_list(&origin, RequestMailbox::Sent),
+    );
+    match (incoming, sent) {
+        (Ok(incoming), Ok(sent)) => {
+            app.collaboration = WatchCollaboration {
+                origin: Some(origin),
+                room: Some(room),
+                incoming,
+                sent,
+                unavailable: None,
+            };
+        }
+        (incoming, sent) => {
+            let error = incoming
+                .err()
+                .or_else(|| sent.err())
+                .expect("at least one mailbox request failed");
+            app.collaboration = WatchCollaboration {
+                origin: Some(origin),
+                room: Some(room),
+                unavailable: Some(format!("mailbox unavailable: {error}")),
+                ..WatchCollaboration::default()
+            };
+        }
+    }
+    clamp_collaboration_mailbox(app);
+}
+
+fn open_watch_collaboration_composer(app: &mut App) {
+    let Some(room) = app.collaboration.room.as_ref() else {
+        let message = app
+            .collaboration
+            .unavailable
+            .clone()
+            .unwrap_or_else(|| collaboration_open_hint().into());
+        app.set_hint(message, HintLevel::Err);
+        return;
+    };
+    if room.peers.is_empty() {
+        app.set_hint(
+            "no peer here yet — run another agent in this tmux window",
+            HintLevel::Err,
+        );
+        return;
+    }
+    let selected_pane = app.selected_pane();
+    let peer = selected_pane
+        .as_deref()
+        .and_then(|pane| app.collaboration.peer_for_pane(pane))
+        .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]));
+    let Some(peer) = peer else {
+        app.set_hint(
+            "choose an agent in this tmux window, then press m",
+            HintLevel::Err,
+        );
+        return;
+    };
+    let Some(origin) = app.collaboration.origin.clone() else {
+        app.set_hint(collaboration_open_hint(), HintLevel::Err);
+        return;
+    };
+    app.collaboration_mailbox.open = false;
+    app.collaboration_composer = Some(CollaborationComposer::new(
+        CollaborationComposeTarget::Send {
+            origin,
+            target: format!("pane:{}", peer.pane),
+            kind: RequestKind::Question,
+            work_mode: WorkMode::ReadOnly,
+        },
+        peer.label(),
+    ));
+}
+
+async fn run_watch_collaboration_composer(
+    client: &Client,
+    composer: CollaborationComposer,
+) -> ActionOutcome {
+    match composer.target {
+        CollaborationComposeTarget::Send {
+            origin,
+            target,
+            kind,
+            work_mode,
+        } => {
+            let request = NewRequest {
+                kind,
+                body: composer.input,
+                expects_reply: kind != RequestKind::Notice,
+                work_mode,
+                paths: Vec::new(),
+            };
+            match client.collaboration_send(&origin, &target, &request).await {
+                Ok(request) => ActionOutcome::Ok(format!(
+                    "sent {} to {} ({})",
+                    short_collaboration_request_id(&request.id),
+                    request.to.label(),
+                    request_kind_label(kind)
+                )),
+                Err(error) => ActionOutcome::Err(format!("collaboration send failed: {error}")),
+            }
+        }
+        CollaborationComposeTarget::Reply {
+            origin,
+            request_id,
+            status,
+        } => match client
+            .collaboration_reply(&origin, &request_id, status, &composer.input, &[])
+            .await
+        {
+            Ok(request) => ActionOutcome::Ok(format!(
+                "replied to {} ({})",
+                short_collaboration_request_id(&request.id),
+                request_status_label(status)
+            )),
+            Err(error) => ActionOutcome::Err(format!("collaboration reply failed: {error}")),
+        },
+    }
+}
+
+fn collaboration_requests(app: &App) -> &[CollaborationRequest] {
+    match app.collaboration_mailbox.tab {
+        CollaborationMailboxTab::Incoming => &app.collaboration.incoming,
+        CollaborationMailboxTab::Sent => &app.collaboration.sent,
+    }
+}
+
+fn selected_collaboration_request(app: &App) -> Option<&CollaborationRequest> {
+    collaboration_requests(app).get(app.collaboration_mailbox.selected)
+}
+
+fn clamp_collaboration_mailbox(app: &mut App) {
+    let len = collaboration_requests(app).len();
+    app.collaboration_mailbox.selected = if len == 0 {
+        0
+    } else {
+        app.collaboration_mailbox.selected.min(len - 1)
+    };
+}
+
+fn move_collaboration_mailbox(app: &mut App, delta: isize) {
+    let len = collaboration_requests(app).len();
+    if len == 0 {
+        app.collaboration_mailbox.selected = 0;
+        return;
+    }
+    app.collaboration_mailbox.selected = app
+        .collaboration_mailbox
+        .selected
+        .saturating_add_signed(delta)
+        .min(len - 1);
+}
+
+fn toggle_collaboration_mailbox(app: &mut App) {
+    app.collaboration_mailbox.tab = match app.collaboration_mailbox.tab {
+        CollaborationMailboxTab::Incoming => CollaborationMailboxTab::Sent,
+        CollaborationMailboxTab::Sent => CollaborationMailboxTab::Incoming,
+    };
+    app.collaboration_mailbox.selected = 0;
+}
+
+fn request_kind_label(kind: RequestKind) -> &'static str {
+    match kind {
+        RequestKind::Question => "question",
+        RequestKind::Review => "review",
+        RequestKind::Task => "task",
+        RequestKind::Notice => "notice",
+    }
+}
+
+fn work_mode_label(mode: WorkMode) -> &'static str {
+    match mode {
+        WorkMode::ReadOnly => "read-only",
+        WorkMode::Execute => "execute",
+    }
+}
+
+fn request_status_label(status: RequestStatus) -> &'static str {
+    match status {
+        RequestStatus::Queued => "queued",
+        RequestStatus::Claimed => "claimed",
+        RequestStatus::Completed => "completed",
+        RequestStatus::Blocked => "blocked",
+        RequestStatus::Declined => "declined",
+        RequestStatus::Failed => "failed",
+        RequestStatus::Expired => "expired",
+        RequestStatus::Cancelled => "cancelled",
+    }
+}
+
+fn short_collaboration_request_id(request_id: &str) -> String {
+    request_id.chars().take(18).collect()
+}
+
 async fn append_human_interaction(
     path: Option<&Path>,
     kind: HumanInteractionKind,
@@ -4527,6 +4932,17 @@ pub(crate) enum Action {
     SubmitPrompt,
     /// Cancel the active inline prompt and return to the table.
     CancelPrompt,
+    /// Resolve the selected row as a same-window collaboration peer and open
+    /// the durable request composer.
+    OpenCollaborationMessage,
+    /// Refresh and open incoming/sent collaboration history.
+    OpenCollaborationMailbox,
+    /// Submit the active collaboration request or reply composer.
+    SubmitCollaboration,
+    /// Close the active collaboration composer.
+    CancelCollaborationComposer,
+    /// Atomically claim the current agent's pending inbox.
+    ClaimCollaborationInbox,
     /// Open a confirm popup for a destructive [`QuickAction`]. The
     /// popup itself is interpreted by the input loop; the action only
     /// dispatches when the user answers `y`.
@@ -4564,6 +4980,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         command: "copy",
         description: "copy selected prompt",
+    },
+    CommandSpec {
+        command: "message",
+        description: "message selected room peer",
+    },
+    CommandSpec {
+        command: "mailbox",
+        description: "open collaboration mailbox",
     },
     CommandSpec {
         command: "attention",
@@ -4640,6 +5064,8 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "q" | "quit" => Action::Quit,
         "r" | "refresh" => Action::Refresh,
         "o" | "open" | "preview" => Action::OpenPreview,
+        "m" | "message" => Action::OpenCollaborationMessage,
+        "b" | "mailbox" => Action::OpenCollaborationMailbox,
         "copy" | "yank" => quick_copy_action(app),
         "kill" => quick_kill_action(app),
         "abort" => quick_abort_action(app),
@@ -4698,13 +5124,21 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
-        if let Some(prompt) = app.prompt.as_mut() {
+        if let Some(composer) = app.collaboration_composer.as_mut() {
+            for c in pasted.chars() {
+                composer.insert(c);
+            }
+        } else if let Some(prompt) = app.prompt.as_mut() {
             for c in pasted.chars() {
                 prompt.insert(c);
             }
         } else if let Some(command) = app.command_palette.as_mut() {
             command.insert_str(&pasted.replace(['\r', '\n'], " "));
-        } else if app.preview.is_none() && !app.help_open && !app.event_inbox_open {
+        } else if app.preview.is_none()
+            && !app.help_open
+            && !app.event_inbox_open
+            && !app.collaboration_mailbox.open
+        {
             app.edit_search(|query| query.push_str(&pasted.replace(['\r', '\n'], " ")));
         }
         return Action::None;
@@ -4746,6 +5180,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         };
     }
 
+    if app.collaboration_composer.is_some() {
+        return handle_collaboration_composer_event(code, modifiers, app);
+    }
+
     if let Some(prompt) = app.prompt.as_mut() {
         return handle_prompt_event(code, modifiers, prompt);
     }
@@ -4765,6 +5203,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             }
             _ => Action::None,
         };
+    }
+
+    if app.collaboration_mailbox.open {
+        return handle_collaboration_mailbox_event(code, app);
     }
 
     if app.event_inbox_open {
@@ -4917,6 +5359,8 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('?') if app.browse_keys_active() => Action::Quick(QuickAction::ShowHelp),
         KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
         KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
+        KeyCode::Char('m') if app.browse_keys_active() => Action::OpenCollaborationMessage,
+        KeyCode::Char('b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_session_parent();
             Action::None
@@ -5092,6 +5536,175 @@ fn handle_prompt_event(code: KeyCode, modifiers: KeyModifiers, prompt: &mut Prom
         }
         _ => Action::None,
     }
+}
+
+fn handle_collaboration_composer_event(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    app: &mut App,
+) -> Action {
+    match code {
+        KeyCode::Esc => Action::CancelCollaborationComposer,
+        KeyCode::Enter => {
+            let empty = app
+                .collaboration_composer
+                .as_ref()
+                .is_none_or(|composer| composer.input.trim().is_empty());
+            if empty {
+                app.set_hint("message cannot be empty", HintLevel::Warn);
+                Action::None
+            } else {
+                Action::SubmitCollaboration
+            }
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                match &mut composer.target {
+                    CollaborationComposeTarget::Send { kind, .. } => {
+                        *kind = match *kind {
+                            RequestKind::Question => RequestKind::Review,
+                            RequestKind::Review => RequestKind::Task,
+                            RequestKind::Task => RequestKind::Notice,
+                            RequestKind::Notice => RequestKind::Question,
+                        };
+                    }
+                    CollaborationComposeTarget::Reply { status, .. } => {
+                        *status = match *status {
+                            RequestStatus::Completed => RequestStatus::Blocked,
+                            RequestStatus::Blocked => RequestStatus::Declined,
+                            RequestStatus::Declined => RequestStatus::Failed,
+                            _ => RequestStatus::Completed,
+                        };
+                    }
+                }
+            }
+            Action::None
+        }
+        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(CollaborationComposer {
+                target: CollaborationComposeTarget::Send { work_mode, .. },
+                ..
+            }) = app.collaboration_composer.as_mut()
+            {
+                *work_mode = match *work_mode {
+                    WorkMode::ReadOnly => WorkMode::Execute,
+                    WorkMode::Execute => WorkMode::ReadOnly,
+                };
+            }
+            Action::None
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.insert(c);
+            }
+            Action::None
+        }
+        KeyCode::Backspace => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.backspace();
+            }
+            Action::None
+        }
+        KeyCode::Delete => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.delete();
+            }
+            Action::None
+        }
+        KeyCode::Left => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_left();
+            }
+            Action::None
+        }
+        KeyCode::Right => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_right();
+            }
+            Action::None
+        }
+        KeyCode::Home => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_home();
+            }
+            Action::None
+        }
+        KeyCode::End => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_end();
+            }
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q' | 'b') => {
+            app.collaboration_mailbox.open = false;
+            Action::None
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            toggle_collaboration_mailbox(app);
+            Action::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            move_collaboration_mailbox(app, 1);
+            Action::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            move_collaboration_mailbox(app, -1);
+            Action::None
+        }
+        KeyCode::Char('i') => Action::ClaimCollaborationInbox,
+        KeyCode::Char('e') => {
+            open_watch_collaboration_reply_composer(app);
+            Action::None
+        }
+        KeyCode::Char('r') => Action::OpenCollaborationMailbox,
+        _ => Action::None,
+    }
+}
+
+fn open_watch_collaboration_reply_composer(app: &mut App) {
+    if app.collaboration_mailbox.tab != CollaborationMailboxTab::Incoming {
+        app.set_hint("switch to incoming requests to reply", HintLevel::Err);
+        return;
+    }
+    let Some(origin) = app.collaboration.origin.clone() else {
+        app.set_hint(collaboration_open_hint(), HintLevel::Err);
+        return;
+    };
+    let Some(request) = selected_collaboration_request(app) else {
+        app.set_hint("no incoming request selected", HintLevel::Err);
+        return;
+    };
+    if request.status == RequestStatus::Queued {
+        app.set_hint(
+            "press i to claim the request before replying",
+            HintLevel::Err,
+        );
+        return;
+    }
+    if request.status.is_terminal() {
+        app.set_hint("selected request is already terminal", HintLevel::Err);
+        return;
+    }
+    let request_id = request.id.clone();
+    let label = format!(
+        "{} · {}",
+        request.from.label(),
+        short_collaboration_request_id(&request_id)
+    );
+    app.collaboration_composer = Some(CollaborationComposer::new(
+        CollaborationComposeTarget::Reply {
+            origin,
+            request_id,
+            status: RequestStatus::Completed,
+        },
+        label,
+    ));
 }
 
 fn preview_targets_for_pane(app: &App, pane_id: &str) -> Vec<String> {
@@ -5370,6 +5983,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_event_inbox(f, popup_area, app);
     }
+    if app.collaboration_mailbox.open {
+        let popup_area = centered_rect(88, 78, chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_collaboration_mailbox(f, popup_area, app);
+    }
     if app.confirm.is_some() {
         // 50 × 30 % keeps the popup small enough that the table
         // behind stays scannable, but still leaves room for the
@@ -5384,6 +6002,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         let popup_area = bottom_prompt_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
         render_prompt(f, popup_area, app);
+    }
+    if app.collaboration_composer.is_some() {
+        let popup_area = bottom_prompt_rect(chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_collaboration_composer(f, popup_area, app);
     }
     if app.command_palette.is_some() {
         let popup_area = command_popup_rect(chunks[1]);
@@ -5644,6 +6267,257 @@ fn render_prompt(f: &mut Frame, area: Rect, app: &App) {
     {
         f.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let composer = app
+        .collaboration_composer
+        .as_ref()
+        .expect("render_collaboration_composer without composer");
+    let mode = match composer.target {
+        CollaborationComposeTarget::Send {
+            kind, work_mode, ..
+        } => format!(
+            "message · {} · {} · Tab kind · Ctrl-E mode",
+            request_kind_label(kind),
+            work_mode_label(work_mode)
+        ),
+        CollaborationComposeTarget::Reply { status, .. } => {
+            format!("reply · {} · Tab status", request_status_label(status))
+        }
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            format!(" {mode} → {} ", composer.label),
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let visible_input =
+        truncate_prompt_input(&composer.input, inner.width.saturating_sub(2) as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("> "),
+            Span::raw(visible_input.text.clone()),
+        ]))
+        .block(block),
+        area,
+    );
+
+    let cursor_visible = composer.cursor.saturating_sub(visible_input.skipped_chars);
+    let before_cursor: String = visible_input.text.chars().take(cursor_visible).collect();
+    let cursor_x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(before_cursor.width()).unwrap_or(u16::MAX));
+    if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
+        f.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(collaboration_mailbox_title(app, theme));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.collaboration.room.is_none() {
+        let message = app
+            .collaboration
+            .unavailable
+            .clone()
+            .unwrap_or_else(|| collaboration_open_hint().into());
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    message,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Esc/b closes", theme.dim_style())),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(6)])
+        .split(inner);
+    let max_lines = usize::from(chunks[0].height).max(1);
+    let width = usize::from(chunks[0].width).saturating_sub(2);
+    let lines = collaboration_mailbox_request_lines(app, width, max_lines, theme);
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let detail_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(theme.border_style())
+        .title(Span::styled(" selected request ", theme.dim_style()));
+    let detail_width = usize::from(detail_block.inner(chunks[1]).width).max(1);
+    let detail = selected_collaboration_request(app).map_or_else(
+        || vec![Line::from(Span::styled("-", theme.dim_style()))],
+        |request| collaboration_request_detail_lines(request, detail_width, theme),
+    );
+    f.render_widget(Paragraph::new(detail).block(detail_block), chunks[1]);
+}
+
+fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
+    let tab = app.collaboration_mailbox.tab;
+    Line::from(vec![
+        Span::styled(" collaboration ", theme.accent_badge()),
+        Span::raw(" "),
+        Span::styled(
+            format!(" incoming {} ", app.collaboration.incoming.len()),
+            if tab == CollaborationMailboxTab::Incoming {
+                theme.action_badge()
+            } else {
+                theme.dim_style()
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" sent {} ", app.collaboration.sent.len()),
+            if tab == CollaborationMailboxTab::Sent {
+                theme.action_badge()
+            } else {
+                theme.dim_style()
+            },
+        ),
+    ])
+}
+
+fn collaboration_mailbox_request_lines(
+    app: &App,
+    width: usize,
+    max_lines: usize,
+    theme: WatchThemeSpec,
+) -> Vec<Line<'static>> {
+    let requests = collaboration_requests(app);
+    let selected = app.collaboration_mailbox.selected;
+    let tab = app.collaboration_mailbox.tab;
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(max_lines)
+        .min(requests.len().saturating_sub(max_lines));
+    let mut lines = requests
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_lines)
+        .map(|(index, request)| {
+            let focused = index == selected;
+            let peer = match tab {
+                CollaborationMailboxTab::Incoming => request.from.label(),
+                CollaborationMailboxTab::Sent => request.to.label(),
+            };
+            let body = request
+                .body
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = truncate_chars(
+                &format!(
+                    "{} {:<9} {:<10} {:<14} {}",
+                    short_collaboration_request_id(&request.id),
+                    request_kind_label(request.kind),
+                    request_status_label(request.status),
+                    peer,
+                    body
+                ),
+                width,
+            );
+            Line::from(vec![
+                Span::styled(
+                    if focused { "> " } else { "  " },
+                    if focused {
+                        Style::default().fg(theme.action)
+                    } else {
+                        theme.dim_style()
+                    },
+                ),
+                Span::styled(
+                    text,
+                    if focused {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            match tab {
+                CollaborationMailboxTab::Incoming => "no incoming requests",
+                CollaborationMailboxTab::Sent => "no sent requests",
+            },
+            theme.dim_style(),
+        )));
+    }
+    lines
+}
+
+fn collaboration_request_detail_lines(
+    request: &CollaborationRequest,
+    width: usize,
+    theme: WatchThemeSpec,
+) -> Vec<Line<'static>> {
+    let body = request
+        .body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut lines = vec![
+        Line::from(truncate_chars(
+            &format!(
+                "{} · {} → {}",
+                request.id,
+                request.from.label(),
+                request.to.label()
+            ),
+            width,
+        )),
+        Line::from(truncate_chars(
+            &format!(
+                "{} · {} · {}",
+                request_kind_label(request.kind),
+                request_status_label(request.status),
+                work_mode_label(request.work_mode)
+            ),
+            width,
+        )),
+        Line::from(truncate_chars(&format!("body: {body}"), width)),
+    ];
+    if let Some(reply) = request.reply.as_ref() {
+        let reply_body = reply.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(Line::from(Span::styled(
+            truncate_chars(
+                &format!(
+                    "reply [{}]: {reply_body}",
+                    request_status_label(reply.status)
+                ),
+                width,
+            ),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    lines.truncate(5);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("-", theme.dim_style())));
+    }
+    lines
 }
 
 /// Prompt input should feel like a command bar, not a modal dialog: it
@@ -6033,6 +6907,18 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    if let Some(room) = app.collaboration.room.as_ref() {
+        if room.unread > 0 || room.unread_replies > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("mail {}/{}", room.unread, room.unread_replies),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
     spans.push(Span::raw("   "));
     spans.push(Span::styled(
         format!("sort {}", sort_label(&app.watch_cfg.sort)),
@@ -6107,7 +6993,9 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
         && app.selected_pane().is_some()
         && app.preview.is_none()
         && !app.help_open
-        && !app.event_inbox_open;
+        && !app.event_inbox_open
+        && !app.collaboration_mailbox.open
+        && app.collaboration_composer.is_none();
     app.inspector_visible = split_inspector;
     if split_inspector {
         let columns = Layout::default()
@@ -7324,54 +8212,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    if app.command_palette.is_some() {
-        let spans = vec![
-            Span::styled(" Enter ", theme.action_badge()),
-            Span::raw(" run  "),
-            Span::styled(" Tab ", theme.key_badge()),
-            Span::raw(" complete  "),
-            Span::styled(" Ctrl-W ", theme.key_badge()),
-            Span::raw(" delete word  "),
-            Span::styled(" Esc ", theme.key_badge()),
-            Span::raw(" cancel"),
-        ];
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-        return;
-    }
-
-    if app.prompt.is_some() {
-        render_prompt_footer(f, area, theme);
-        return;
-    }
-
-    if let Some(preview) = app.preview.as_ref() {
-        render_preview_footer(f, area, app, preview, theme);
-        return;
-    }
-
-    if app.explicit_search || !app.search_query.is_empty() {
-        let spans = vec![
-            Span::styled(" type ", theme.action_badge()),
-            Span::raw(" filter  "),
-            Span::styled(" Backspace ", theme.key_badge()),
-            Span::raw(" edit  "),
-            Span::styled(" Ctrl-W ", theme.key_badge()),
-            Span::raw(" delete word  "),
-            Span::styled(" Ctrl-U/Esc ", theme.key_badge()),
-            Span::raw(" clear"),
-        ];
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-        return;
-    }
-
-    if app.pending_g {
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" g… ", theme.action_badge()),
-                Span::raw("press g for first row · Esc cancels"),
-            ])),
-            area,
-        );
+    if render_contextual_footer(f, area, app, theme) {
         return;
     }
 
@@ -7412,10 +8253,90 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" prompt  "),
         Span::styled(" o ", theme.key_badge()),
         Span::raw(" preview  "),
+        Span::styled(" m ", theme.action_badge()),
+        Span::raw(" message  "),
+        Span::styled(" b ", theme.key_badge()),
+        Span::raw(" mailbox  "),
         Span::styled(" ? ", theme.key_badge()),
         Span::raw(" help"),
     ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) -> bool {
+    if app.command_palette.is_some() {
+        let spans = vec![
+            Span::styled(" Enter ", theme.action_badge()),
+            Span::raw(" run  "),
+            Span::styled(" Tab ", theme.key_badge()),
+            Span::raw(" complete  "),
+            Span::styled(" Ctrl-W ", theme.key_badge()),
+            Span::raw(" delete word  "),
+            Span::styled(" Esc ", theme.key_badge()),
+            Span::raw(" cancel"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
+    if app.prompt.is_some() {
+        render_prompt_footer(f, area, theme);
+        return true;
+    }
+
+    if app.collaboration_composer.is_some() {
+        render_collaboration_composer_footer(f, area, app, theme);
+        return true;
+    }
+
+    if app.collaboration_mailbox.open {
+        let spans = vec![
+            Span::styled(" Tab ", theme.action_badge()),
+            Span::raw("incoming/sent  "),
+            Span::styled(" j/k ", theme.key_badge()),
+            Span::raw("select  "),
+            Span::styled(" i ", theme.action_badge()),
+            Span::raw("claim  "),
+            Span::styled(" e ", theme.action_badge()),
+            Span::raw("reply  "),
+            Span::styled(" Esc/b ", theme.key_badge()),
+            Span::raw("close"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
+    if let Some(preview) = app.preview.as_ref() {
+        render_preview_footer(f, area, app, preview, theme);
+        return true;
+    }
+
+    if app.explicit_search || !app.search_query.is_empty() {
+        let spans = vec![
+            Span::styled(" type ", theme.action_badge()),
+            Span::raw(" filter  "),
+            Span::styled(" Backspace ", theme.key_badge()),
+            Span::raw(" edit  "),
+            Span::styled(" Ctrl-W ", theme.key_badge()),
+            Span::raw(" delete word  "),
+            Span::styled(" Ctrl-U/Esc ", theme.key_badge()),
+            Span::raw(" clear"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
+    if app.pending_g {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" g… ", theme.action_badge()),
+                Span::raw("press g for first row · Esc cancels"),
+            ])),
+            area,
+        );
+        return true;
+    }
+    false
 }
 
 fn render_prompt_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
@@ -7427,6 +8348,40 @@ fn render_prompt_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
         Span::styled(" Esc ", theme.key_badge()),
         Span::raw(" cancel"),
     ];
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_collaboration_composer_footer(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: WatchThemeSpec,
+) {
+    let target = app
+        .collaboration_composer
+        .as_ref()
+        .map(|composer| &composer.target);
+    let option = match target {
+        Some(CollaborationComposeTarget::Send { .. }) => "kind",
+        Some(CollaborationComposeTarget::Reply { .. }) => "status",
+        None => "option",
+    };
+    let mut spans = vec![
+        Span::styled(" Enter ", theme.action_badge()),
+        Span::raw("send  "),
+        Span::styled(" Tab ", theme.key_badge()),
+        Span::raw(format!("{option}  ")),
+    ];
+    if matches!(target, Some(CollaborationComposeTarget::Send { .. })) {
+        spans.extend([
+            Span::styled(" Ctrl-E ", theme.key_badge()),
+            Span::raw("read-only/execute  "),
+        ]);
+    }
+    spans.extend([
+        Span::styled(" Esc ", theme.key_badge()),
+        Span::raw("cancel"),
+    ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -7479,6 +8434,7 @@ fn selected_has_no_pane(app: &App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxa::collaboration::RoomId;
     use muxa::event::{AgentKind, AgentState};
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -7746,6 +8702,244 @@ mod tests {
             pane_pid: 0,
             current_path: String::new(),
         }
+    }
+
+    fn fake_collaboration_participant(
+        pane: &str,
+        session_id: &str,
+        alias: Option<&str>,
+    ) -> Participant {
+        Participant {
+            agent_kind: AgentKind::Codex,
+            agent_session_id: session_id.into(),
+            pane: pane.into(),
+            socket: Some("default".into()),
+            room: RoomId {
+                host: "tmux".into(),
+                socket: Some("default".into()),
+                window_id: "@1".into(),
+            },
+            tmux_session_id: Some("$1".into()),
+            tmux_session_name: Some("main".into()),
+            window_name: Some("agents".into()),
+            state: AgentState::Idle,
+            cwd: Some("/tmp/project".into()),
+            alias: alias.map(str::to_string),
+            roles: Vec::new(),
+        }
+    }
+
+    fn fake_watch_collaboration_request(
+        id: &str,
+        from: Participant,
+        to: Participant,
+        status: RequestStatus,
+    ) -> CollaborationRequest {
+        let now = OffsetDateTime::now_utc();
+        CollaborationRequest {
+            id: id.into(),
+            from,
+            to,
+            kind: RequestKind::Review,
+            body: "review the auth change".into(),
+            expects_reply: true,
+            work_mode: WorkMode::ReadOnly,
+            paths: Vec::new(),
+            status,
+            created_at: now,
+            claimed_at: (status == RequestStatus::Claimed).then_some(now),
+            notified_at: None,
+            reply_notified_at: None,
+            reply_read_at: None,
+            reply: None,
+        }
+    }
+
+    fn collaboration_watch_app() -> App {
+        let cfg = WatchConfig {
+            view: WatchView::Pane,
+            sort: vec![WatchSortKey::PaneId],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        };
+        let mut app = App::with_config(cfg);
+        app.set_data(
+            vec![
+                fake_agent(
+                    "self",
+                    Some("%1"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "peer",
+                    Some("%2"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![
+                fake_pane("%1", "main", 0, 0, "codex"),
+                fake_pane("%2", "main", 0, 1, "codex"),
+            ],
+        );
+        let current = fake_collaboration_participant("%1", "self", Some("builder"));
+        let peer = fake_collaboration_participant("%2", "peer", Some("reviewer"));
+        app.collaboration = WatchCollaboration {
+            origin: Some(CollaborationOrigin {
+                pane: "%1".into(),
+                socket: Some("default".into()),
+            }),
+            room: Some(RoomContext {
+                current,
+                peers: vec![peer],
+                unread: 0,
+                unread_replies: 0,
+            }),
+            ..WatchCollaboration::default()
+        };
+        app
+    }
+
+    #[test]
+    fn watch_collaboration_origin_uses_launch_pane_and_socket() {
+        let origin = watch_collaboration_origin_from(
+            Some("%9".into()),
+            Some("/tmp/tmux-1000/custom,42,7".into()),
+        )
+        .unwrap();
+
+        assert_eq!(origin.pane, "%9");
+        assert_eq!(origin.socket.as_deref(), Some("custom"));
+        assert!(watch_collaboration_origin_from(Some("zellij:3".into()), None).is_none());
+    }
+
+    #[test]
+    fn watch_message_uses_the_only_room_peer_without_extra_target_steps() {
+        let mut app = collaboration_watch_app();
+        app.table_state.select(Some(0));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            app.collaboration_composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%2"
+        ));
+    }
+
+    #[test]
+    fn watch_m_and_b_are_browse_actions() {
+        let mut app = collaboration_watch_app();
+
+        assert!(matches!(
+            key_action(&mut app, 'm'),
+            Action::OpenCollaborationMessage
+        ));
+        assert!(matches!(
+            key_action(&mut app, 'b'),
+            Action::OpenCollaborationMailbox
+        ));
+    }
+
+    #[test]
+    fn watch_collaboration_composer_cycles_contract_and_submits() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(matches!(
+            handle_collaboration_composer_event(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut app
+            ),
+            Action::None
+        ));
+        let composer = app.collaboration_composer.as_ref().unwrap();
+        assert!(matches!(
+            composer.target,
+            CollaborationComposeTarget::Send {
+                kind: RequestKind::Review,
+                work_mode: WorkMode::Execute,
+                ..
+            }
+        ));
+
+        app.collaboration_composer.as_mut().unwrap().insert('검');
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::SubmitCollaboration
+        ));
+    }
+
+    #[test]
+    fn watch_mailbox_opens_reply_for_claimed_incoming_request() {
+        let mut app = collaboration_watch_app();
+        let room = app.collaboration.room.as_ref().unwrap();
+        app.collaboration
+            .incoming
+            .push(fake_watch_collaboration_request(
+                "req_watch_123456",
+                room.peers[0].clone(),
+                room.current.clone(),
+                RequestStatus::Claimed,
+            ));
+        app.collaboration_mailbox.open = true;
+
+        assert!(matches!(
+            handle_collaboration_mailbox_event(KeyCode::Char('e'), &mut app),
+            Action::None
+        ));
+        assert!(matches!(
+            app.collaboration_composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(CollaborationComposeTarget::Reply { request_id, .. })
+                if request_id == "req_watch_123456"
+        ));
+    }
+
+    #[test]
+    fn watch_mailbox_render_contains_request_and_peer() {
+        let mut app = collaboration_watch_app();
+        let room = app.collaboration.room.as_ref().unwrap();
+        app.collaboration
+            .incoming
+            .push(fake_watch_collaboration_request(
+                "req_watch_render_123456",
+                room.peers[0].clone(),
+                room.current.clone(),
+                RequestStatus::Claimed,
+            ));
+        app.collaboration_mailbox.open = true;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(dump.contains("collaboration"));
+        assert!(dump.contains("reviewer@%2"));
+        assert!(dump.contains("review the auth change"));
     }
 
     fn fake_session(id: &str, name: &str, attached_clients: u32) -> SessionInfo {
@@ -11557,6 +12751,11 @@ sort = ["state"]
             | Action::OpenPrompt(_)
             | Action::SubmitPrompt
             | Action::CancelPrompt
+            | Action::OpenCollaborationMessage
+            | Action::OpenCollaborationMailbox
+            | Action::SubmitCollaboration
+            | Action::CancelCollaborationComposer
+            | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes
             | Action::ConfirmCancel
@@ -12696,7 +13895,9 @@ sort = ["state"]
         assert!(body.contains(":              command palette"));
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    session / latest / duration / state"));
-        assert!(body.contains("Alt-E          open persistent event inbox"));
+        assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
+        assert!(body.contains("m / b          message selected room peer / mailbox"));
+        assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("toggle help; q/Ctrl-C quits"));
     }
 
@@ -12912,13 +14113,13 @@ sort = ["state"]
         assert!(matches!(action, Action::None));
         assert!(app.search_query.is_empty());
 
-        let action = key_action(&mut app, 'b');
+        let action = key_action(&mut app, 'e');
         assert!(matches!(action, Action::None));
         let action = key_action(&mut app, 'r');
         assert!(matches!(action, Action::None));
         let action = key_action(&mut app, 'k');
         assert!(matches!(action, Action::None));
-        assert_eq!(app.search_query, "brk");
+        assert_eq!(app.search_query, "erk");
 
         app.edit_search(String::clear);
         assert!(matches!(alt_key_action(&mut app, 'r'), Action::Refresh));
@@ -12937,10 +14138,10 @@ sort = ["state"]
         assert_eq!(app.selected_pane().as_deref(), Some("%2"));
         assert!(app.search_query.is_empty());
 
-        assert!(matches!(key_action(&mut app, 'b'), Action::None));
+        assert!(matches!(key_action(&mut app, 'e'), Action::None));
         assert!(matches!(key_action(&mut app, 'j'), Action::None));
         assert!(matches!(key_action(&mut app, 'k'), Action::None));
-        assert_eq!(app.search_query, "bjk");
+        assert_eq!(app.search_query, "ejk");
 
         app.edit_search(String::clear);
         assert!(matches!(key_action(&mut app, 'k'), Action::None));
@@ -12952,10 +14153,10 @@ sort = ["state"]
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.table_state.select(Some(0));
 
-        for c in "beta".chars() {
+        for c in "eta".chars() {
             assert!(matches!(key_action(&mut app, c), Action::None));
         }
-        assert_eq!(app.search_query, "beta");
+        assert_eq!(app.search_query, "eta");
         assert_eq!(app.visible_targets().len(), 1);
         assert_eq!(app.selected_pane().as_deref(), Some("%2"));
 
@@ -13069,11 +14270,11 @@ sort = ["state"]
             Action::Quick(QuickAction::ShowHelp)
         ));
 
-        assert!(matches!(key_action(&mut app, 'b'), Action::None));
+        assert!(matches!(key_action(&mut app, 'e'), Action::None));
         for c in ['r', 'o', 'q', '?'] {
             assert!(matches!(key_action(&mut app, c), Action::None));
         }
-        assert_eq!(app.search_query, "broq?");
+        assert_eq!(app.search_query, "eroq?");
     }
 
     #[test]

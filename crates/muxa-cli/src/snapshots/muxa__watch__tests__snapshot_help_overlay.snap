@@ -1,6 +1,5 @@
 ---
 source: crates/muxa-cli/src/watch.rs
-assertion_line: 13841
 expression: "snapshot_helpers::buffer_string(&terminal)"
 ---
  muxa watch   1 agent  + 0 panes   sort PANE ID   <clock>
@@ -21,12 +20,12 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │Commands & inspection                                                             │                           │
 │                           │  :              command palette (Tab completes)                                  │                           │
 │                           │  o / Alt-P      open preview overlay                                             │                           │
-│                           │  Alt-I          toggle wide-screen inspector                                     │                           │
-│                           │  Alt-E          open persistent event inbox                                      │                           │
+│                           │  Alt-I / Alt-E  inspector / persistent event inbox                               │                           │
 │                           │  Alt-A          attention-only filter                                            │                           │
-│                           │  [ / ]          (in preview) previous / next agent                               │                           │
-│                           │  f / c          (in preview) geometry / content                                  │                           │
+│                           │  [/] · f/c      (in preview) agent / geometry / content                          │                           │
 │                           │  Enter          (in preview) compose prompt                                      │                           │
+│                           │  m / b          message selected room peer / mailbox                             │                           │
+│                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
 │                           │                                                                                  │                           │
 │                           │Sorting                                                                           │                           │
 │                           │  Alt-S/L/D/T    session / latest / duration / state                              │                           │
@@ -42,4 +41,4 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  ?/F1/Alt-?     toggle help; q/Ctrl-C quits                                      │                           │
 │                           └──────────────────────────────────────────────────────────────────────────────────┘                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- j/k  move   h/l  tree   /  filter   :  commands   ⏎  prompt   o  preview   ?  help
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  prompt   o  preview   m  message   b  mailbox   ?  help

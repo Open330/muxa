@@ -8,12 +8,12 @@ mailbox, not through terminal screen scraping.
 ## The whole model
 
 - One tmux window is one collaboration room.
-- The focused agent is the sender when you press `prefix+D`.
-- `Tab` chooses another agent in that window; `m` sends the request.
+- The focused agent is the sender when you open `prefix+s` watch.
+- Select another agent in that window; `m` sends and `b` opens the mailbox.
 
 So the normal workflow is simply: put two agents in one window, focus the
-sender, press `prefix+D`, choose the peer, and press `m`. A normal shell pane is
-not an agent and cannot be the sender.
+sender, press `prefix+s`, choose the peer, and press `m`. A normal shell pane is
+not an agent and cannot be the sender. The Dashboard is optional.
 
 ## Enable
 
@@ -29,8 +29,7 @@ Restart `muxad` and register `muxa mcp` with each agent host. For Claude Code:
 claude mcp add muxa -- muxa mcp
 ```
 
-Run `muxa init` once more after upgrading to install the `prefix+D` popup
-binding.
+Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
 The MCP process inherits `TMUX` and `TMUX_PANE`. muxad validates that origin
 against its live agent and pane registries; collaboration tools do not accept
@@ -68,10 +67,10 @@ muxa msg list --mailbox sent
 muxa msg cancel req_... # queued requests only
 ```
 
-The same lifecycle is available interactively in `muxa dashboard` when the
-dashboard runs inside a tracked agent pane: `m` sends to the selected room
-peer, `b` opens non-claiming mailbox history, and `i` claims the inbox. From
-the mailbox, use `e` to reply or `x` to cancel a queued sent request.
+The same lifecycle is available interactively in `muxa watch`: `m` sends to the
+selected room peer, `b` opens non-claiming mailbox history, `i` claims the
+inbox, and `e` replies. `muxa dashboard` provides the richer session-card form
+of the same controls.
 
 `question` and `review` are read-only contracts by default. Use `--execute`
 and one or more `--path` arguments to explicitly delegate edits. Path scopes
