@@ -49,6 +49,22 @@ interval_secs = 5
 tmux foreground sampler입니다. 새 activity ledger interval이 쌓이기 전까지
 compatibility source이자 stats fallback으로 사용됩니다.
 
+## Collaboration
+
+```toml
+[collaboration]
+enabled = true
+wake = "idle_only" # idle_only | never
+max_message_bytes = 16384
+```
+
+같은 stable tmux window에 있는 agent 사이의 durable request/reply 기능입니다.
+optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`이며 mailbox와
+exact-session alias/role을 함께 저장합니다.
+`idle_only`는 hook 기반 top-level agent가 Idle일 때만 짧은 request/reply
+notification을 입력하며 본문은 mailbox에 둡니다.
+[COLLABORATION.ko.md](COLLABORATION.ko.md)를 참고하세요.
+
 ## Watch
 
 ```toml

@@ -111,11 +111,15 @@ set -g status-interval 2
 set -g status-right "#(muxa status-line --pane #{pane_id}) | %H:%M"
 ```
 
-optional popup picker:
+optional popup:
 
 ```tmux
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
+
+전체 agent 조회는 `prefix+s`를 사용합니다. 협업할 때는 메시지를 보낼 agent
+pane을 선택하고 `prefix+D`를 누릅니다.
 
 reload:
 

@@ -1,8 +1,8 @@
 # Live TUI
 
 `muxa watch` is the main interactive surface. It shows tracked agents and
-plain tmux panes, lets you jump to panes, and can compose prompts directly
-from the picker.
+plain tmux panes, lets you jump to panes, composes prompts, and exchanges
+durable collaboration requests between agents in the same tmux window.
 
 For the session-card console that keeps you inside the TUI while sending
 prompts, aborting turns, and inspecting live captures, use
@@ -32,6 +32,8 @@ row per pane.
 | `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Open prompt composer for the selected pane. Empty `Enter` attaches. |
+| `m` | Message the selected same-window agent. |
+| `b` | Open incoming/sent mailbox; `i` claims and `e` replies. |
 | `o` / `Alt-P` | Open live preview. |
 | `:` | Open the command palette; `Tab` completes the first match. |
 | `r` / `Ctrl-R` / `Alt-R` | Refresh while browsing. |
@@ -91,6 +93,34 @@ If the composer is empty, `Enter` attaches to the pane instead.
 Prompt input time is recorded as a human interaction interval in
 `activity.ndjson` when activity logging is enabled.
 
+## Agent collaboration
+
+Focus the sending agent pane and open watch with `prefix+s`. Select another
+agent in the same tmux window and press `m`. When the room has exactly one
+peer, watch selects it automatically. `Tab` changes request kind and `Ctrl-E`
+switches between `read-only` and `execute`; `Enter` sends.
+
+- `? QUESTION` (cyan) asks for an answer.
+- `◆ REVIEW` (magenta) asks for review findings.
+- `▶ TASK` (yellow) delegates a concrete task.
+- `! NOTICE` (blue) is informational and does not expect a reply.
+
+`○ READ-ONLY` (green) authorizes investigation and an answer, not changes.
+`Ctrl-E` switches to `● EXECUTE` (red), explicitly authorizing commands and
+file changes. This is a contract delivered to the receiving agent, not a
+command that muxa executes immediately. Watch has no separate path-scope
+field, so include the intended edit scope in an execute request's body.
+
+Press `b` for incoming/sent history. In the mailbox, `Tab` switches mailbox,
+`j`/`k` selects a request, `i` claims pending incoming work, and `e` replies.
+If watch was opened from a normal shell, observation still works and the UI
+explains that collaboration requires opening `prefix+s` from an agent pane.
+
+Requests with AIR artifact references carry profile-colored mailbox badges:
+blue `AIR WORKFLOW`, magenta `AIR PLAN`, cyan `AIR TRACE`, and light-cyan
+`AIR SESSION`. The selected detail shows whether each reference is an input or
+reply output, plus its short digest, label, and display-only locator.
+
 ## Preview
 
 Press `o` or `Alt-P` to preview the selected pane. In session view, if the selected
@@ -102,7 +132,11 @@ the current position, such as `2/3`, when more than one agent is available.
 
 ```tmux
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
+
+`prefix+s` is the normal watch and collaboration entry point. `prefix+D` is an
+optional shortcut to the richer Dashboard.
 
 ## macOS Menu Bar with BarShelf
 

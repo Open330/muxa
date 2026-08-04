@@ -291,6 +291,75 @@ Response: `{ "ok": true, "protocol": 3, "capture": "<visible pane text>" }`.
 (best-effort — never an error). A `namespace unavailable` refusal is an
 `ok:false` error, distinct from a `null` capture.
 
+#### Collaboration mailbox
+
+These additive methods back the high-level same-window tools documented in
+`docs/COLLABORATION.md`. `origin` is derived by muxa's CLI/MCP process from
+`TMUX_PANE` and the tmux socket; the daemon correlates it with live agent and
+pane topology. The default target `peer` is accepted only when exactly one
+other agent occupies the same stable tmux window.
+
+```json
+{ "protocol": 3, "kind": "collaboration_context",
+  "origin": { "pane": "%12", "socket": "default" } }
+
+{ "protocol": 3, "kind": "collaboration_set_identity",
+  "origin": { "pane": "%18", "socket": "default" },
+  "alias": "reviewer", "roles": ["review", "rust"] }
+
+{ "protocol": 3, "kind": "collaboration_send",
+  "origin": { "pane": "%12", "socket": "default" },
+  "target": "peer",
+  "request": { "kind": "review", "body": "review auth", "expects_reply": true,
+               "work_mode": "read_only", "paths": ["crates/auth/**"],
+               "air_artifacts": [{
+                 "artifact_id": "urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                 "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
+                 "label": "auth review plan",
+                 "locator": { "display": ".air/auth-plan.air.json",
+                              "disclosure": "local-only" }
+               }] } }
+
+{ "protocol": 3, "kind": "collaboration_inbox",
+  "origin": { "pane": "%18", "socket": "default" } }
+
+{ "protocol": 3, "kind": "collaboration_list",
+  "origin": { "pane": "%12", "socket": "default" },
+  "mailbox": "sent" }
+
+{ "protocol": 3, "kind": "collaboration_reply",
+  "origin": { "pane": "%18", "socket": "default" },
+  "request_id": "req_...", "status": "completed", "body": "looks good",
+  "artifacts": [], "air_artifacts": [] }
+
+{ "protocol": 3, "kind": "collaboration_get",
+  "origin": { "pane": "%12", "socket": "default" },
+  "request_id": "req_..." }
+
+{ "protocol": 3, "kind": "collaboration_cancel",
+  "origin": { "pane": "%12", "socket": "default" },
+  "request_id": "req_..." }
+```
+
+Responses use `room`, `collaboration_requests`, or `collaboration_request`.
+Requests are pinned to both the target pane and its current agent session id;
+a process that later reuses the pane is not a valid recipient. Messages are
+persisted before an optional idle-only wake prompt is injected.
+`collaboration_list` is non-claiming and accepts `incoming`, `sent`, or `all`.
+`collaboration_cancel` succeeds only while the request is still `queued`.
+Terminal replies also receive an idle-only wake; a sender-side
+`collaboration_get` acknowledges the reply so it is not woken again.
+Identity is pinned to the registering agent session. `@alias` targets a unique
+live alias, while `role:<name>` succeeds only when exactly one live peer in the
+room carries that role.
+
+`air_artifacts` is an additive list of typed AIR 1.0 references on both
+requests and replies. The daemon validates the SHA-256 URN, exact supported
+profile URI, label/locator bounds, and duplicates, but does not read the
+locator or assert AIR document conformance. Locators are display-only and have
+`local-only` or `redacted` disclosure. Existing persisted requests without the
+field decode as an empty list.
+
 #### `subscribe`
 
 Long-lived push stream. The server replies with a one-shot `ok` ack, then

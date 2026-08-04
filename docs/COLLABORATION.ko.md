@@ -1,0 +1,226 @@
+# Agent collaboration
+
+`muxa`는 tmux window를 협업 room으로 보고, 그 안의 top-level agent가 durable
+request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 범위를 표현하고,
+실제 메시지는 `muxad`의 owner-only Unix socket과 local mailbox를 통과합니다.
+
+## 이것만 기억하세요
+
+- tmux window 하나가 협업 room 하나입니다.
+- `prefix+s`로 watch를 열 때 보고 있던 agent가 발신자입니다.
+- 같은 window의 다른 agent를 선택하고 `m`으로 보내며 `b`로 mailbox를 엽니다.
+
+즉, 같은 window에 agent 둘을 실행하고, 보낼 agent를 선택해 `prefix+s`로 watch를
+연 뒤 상대를 선택하고 `m`을 누르면 됩니다. 일반 shell pane은 agent가 아니므로
+발신자가 될 수 없습니다. Dashboard는 선택 사항입니다.
+
+## 활성화
+
+`~/.config/muxa/config.toml`에 다음을 추가하고 daemon을 재시작합니다.
+
+```toml
+[collaboration]
+enabled = true
+wake = "idle_only"
+```
+
+각 agent에 `muxa mcp`가 등록돼 있어야 합니다. Claude Code와 Codex에는 다음처럼
+등록합니다.
+
+```bash
+claude mcp add --scope user muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
+```
+
+이미 실행 중인 agent는 등록된 MCP 목록을 다시 읽도록 종료 후 재실행합니다.
+MCP가 연결되면 muxa는 초기 지침에서 같은 window의 agent를 reviewer나 좁은 범위의
+subagent로 활용할 수 있음을 알립니다. agent는 필요할 때
+`muxa_collaboration_guide`로 같은 지침을 다시 조회할 수 있습니다.
+
+기존 `prefix+s` watch 단축키가 있다면 업그레이드 후 추가 단축키가 필요 없습니다.
+
+MCP process는 agent와 같은 pane의 `TMUX_PANE`/`TMUX` 환경을 상속받습니다.
+이 값과 daemon의 live agent/pane registry를 대조해 발신자를 결정하므로 tool
+argument로 발신 pane을 임의 지정하지 않습니다.
+
+## Room과 주소
+
+- 같은 `(tmux socket, stable window id)`를 공유하는 agent가 한 room입니다.
+- agent가 정확히 둘이면 상대를 `peer`로 지정할 수 있습니다.
+- 셋 이상이면 `%12` 또는 `pane:%12`처럼 pane을 명시합니다.
+- identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
+- 다른 window의 pane은 명시해도 거부됩니다.
+- 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
+  재사용해도 이전 요청을 받지 않습니다.
+
+확인:
+
+```bash
+muxa peers
+muxa peers --json
+```
+
+## Agent identity
+
+pane이 셋 이상인 room에서는 각 agent가 의미 있는 alias와 role을 등록할 수
+있습니다. identity는 pane이 아니라 현재 agent session에 고정되므로 pane을 새
+agent가 재사용해도 이전 이름이나 역할을 상속하지 않습니다.
+
+```bash
+muxa identity set --alias reviewer --role review --role rust
+muxa identity show
+
+muxa msg send @reviewer "auth 변경을 검토해 주세요" --kind review
+muxa msg send role:rust "이 lifetime 오류의 원인을 찾아 주세요"
+
+muxa identity clear
+```
+
+alias는 live peer 사이에서 room-local unique이며 32자 이하 slug입니다. role은
+여러 agent가 공유할 수 있지만 `role:<name>`과 일치하는 peer가 둘 이상이면
+오배송을 피하기 위해 요청을 거부합니다. 이 경우 `@alias`나 pane을 명시하세요.
+
+## CLI
+
+```bash
+# 질문/리뷰는 read-only가 기본
+muxa msg send peer "auth 변경의 race 가능성을 검토해 주세요" --kind review
+
+# 수정 권한과 advisory path scope를 명시한 작업
+muxa msg send pane:%18 "테스트를 보강해 주세요" \
+  --kind task --execute --path 'crates/auth/**'
+
+# 검증된 AIR plan을 작업 입력으로 함께 전달
+muxa msg send peer "이 계획의 위험을 검토해 주세요" --kind review \
+  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
+
+# 수신 agent
+muxa msg inbox
+muxa msg reply req_... "검토 완료: ..." --status completed
+
+# 발신 agent
+muxa msg wait req_... --timeout-secs 300
+
+# claim하지 않고 request/reply lifecycle 확인
+muxa msg list --mailbox sent
+muxa msg list --mailbox incoming --json
+
+# 아직 상대가 claim하지 않은 요청 취소
+muxa msg cancel req_...
+```
+
+tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
+사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는
+mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. `muxa dashboard`는
+같은 기능을 더 상세한 session-card 화면으로 제공합니다.
+
+watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 다른
+색상으로 표시합니다. `○ READ-ONLY`는 조사·답변만 위임하고 `● EXECUTE`는 명령과
+파일 변경을 허용합니다. 두 mode는 수신 agent에게 전달되는 계약이며 muxa가 직접
+작업을 실행하는 스위치가 아닙니다.
+
+## MCP tools
+
+| Tool | 역할 |
+| --- | --- |
+| `muxa_collaboration_guide` | reviewer/question/subagent/AIR 전달의 권장 계약 조회 |
+| `muxa_room_context` | self, same-window peers, unread count 조회 |
+| `muxa_set_identity` | 현재 agent session의 room-local alias/roles 교체 |
+| `muxa_send_message` | durable request 생성 |
+| `muxa_inbox` | 현재 agent session의 요청 claim/read |
+| `muxa_list_messages` | incoming/sent/all request 상태 조회(미claim) |
+| `muxa_reply` | completed/blocked/declined/failed 구조화 응답 |
+| `muxa_wait_reply` | 요청의 terminal reply 대기 |
+| `muxa_cancel_message` | 아직 queued인 발신 요청 취소 |
+
+일반적인 흐름:
+
+```text
+Agent A: muxa_room_context
+Agent A: muxa_set_identity(alias="implementer", roles=["rust"])
+Agent A: muxa_send_message(target="peer", kind="review", ...)
+Agent A: muxa_wait_reply(request_id="req_...", timeout_secs=300)
+
+Agent B: idle 상태에서 짧은 mailbox wake prompt 수신
+Agent B: muxa_inbox
+Agent B: muxa_reply(request_id="req_...", status="completed", ...)
+
+Agent A: wait 중이 아니고 Idle이면 짧은 reply wake prompt 수신
+Agent A: muxa_wait_reply(request_id="req_...")
+```
+
+## Reviewer와 subagent로 활용하기
+
+agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니다.
+
+1. `muxa_collaboration_guide`, `muxa_room_context`로 같은 room의 peer와 계약을
+   확인합니다.
+2. reviewer에는 `kind=review`, `work_mode=read_only`와 검토 범위를 보냅니다.
+3. 구현을 위임할 subagent에는 `kind=task`, `work_mode=execute`와 겹치지 않는 좁은
+   path scope를 보냅니다.
+4. 발신 agent는 독립적으로 진행하고, 응답을 받은 뒤 결과를 직접 검증해
+   통합합니다.
+
+수신 agent는 inbox를 빠르게 claim하고 kind/work mode/path를 지키며, 성공 여부와
+관계없이 `muxa_reply`로 terminal 상태를 남겨야 합니다. 두 agent가 같은 파일을
+동시에 수정해야 한다면 별도 worktree를 사용하세요.
+
+## AIR artifact 전달과 시각화
+
+request와 reply의 `air_artifacts`에는 AIR 1.0 artifact의 타입이 지정된 참조를 최대
+8개까지 첨부할 수 있습니다. `muxa watch`와 `muxa dashboard` mailbox는 첫 참조를
+색상 배지로 표시하고, 상세 영역에서 input/output, 짧은 digest, label, 표시용
+locator를 보여줍니다.
+
+지원 profile은 AIR 1.0의 정확한 네 profile입니다.
+
+- `https://open330.github.io/air/profiles/1.0.0/workflow-skill` → `AIR WORKFLOW`
+- `https://open330.github.io/air/profiles/1.0.0/plan-native-cli` → `AIR PLAN`
+- `https://open330.github.io/air/profiles/1.0.0/trace-native-run` → `AIR TRACE`
+- `https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot` → `AIR SESSION`
+
+artifact ID는 `urn:air:sha256:` 뒤에 소문자 64자리 SHA-256 digest가 와야 합니다.
+locator는 `local-only` 또는 `redacted` disclosure를 가진 표시용 힌트일 뿐이며 파일
+접근 권한이나 실행 권한이 아닙니다. muxa는 참조 형식만 검사하고 artifact의 AIR
+conformance를 주장하지 않습니다. 검증·편집·그래프 탐색은 AIR Workbench에서
+수행하세요. muxa 협업 내용을 위해 새 trace profile을 만들거나 session snapshot에
+prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
+
+## 전달 안전성
+
+메시지와 응답 본문은 `$XDG_DATA_HOME/muxa/collaboration.json`에 먼저
+저장됩니다. `idle_only` wake는 새 요청뿐 아니라 아직 발신자가 읽지 않은 terminal
+응답에도 적용됩니다. 다음 조건을 모두 만족할 때만 짧은 notification prompt를
+pane에 넣으며 본문은 terminal에 주입하지 않습니다.
+
+- hook 기반의 실제 agent session
+- state가 `Idle`
+- target pane/session이 요청 생성 시점과 동일
+- backend가 targeted input을 지원
+
+`Working`, `WaitingInput`, `WaitingChoice`, `Error` 상태에는 입력하지 않습니다.
+화면 감지로 생성된 synthetic agent도 자동 wake 대상이 아닙니다. `wake =
+"never"`로 설정하면 mailbox는 유지하면서 모든 입력 주입을 끌 수 있습니다.
+
+요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다. wake prompt가 중복돼도
+동일 request id의 작업을 새 요청으로 만들지 않습니다.
+
+발신자가 `muxa_wait_reply`/`muxa msg wait`로 terminal 응답을 읽으면 이를 확인한
+것으로 기록해 이후 reply wake를 생략합니다. 먼저 reply wake가 전달된 경우에도
+본문은 mailbox에 그대로 남아 있어 `wait` 또는 `list`로 조회할 수 있습니다.
+
+## Request lifecycle
+
+`muxa msg list`와 `muxa_list_messages`는 메시지를 claim하지 않고 현재 agent
+session의 incoming/sent/all 이력을 보여줍니다. `room_context`는 새 incoming
+request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
+
+발신자는 요청이 `queued`인 동안만 취소할 수 있습니다. 수신자가 inbox를 읽어
+`claimed`가 된 뒤에는 이미 작업이 시작됐을 수 있으므로 취소를 거부합니다.
+
+## 작업공간 규칙
+
+`question`과 `review`는 read-only 계약이 기본입니다. shared worktree를 수정하게
+하려면 `work_mode = execute`와 path scope를 명시하세요. 현재 path scope는 agent
+간 협업 계약이며 OS sandbox는 아닙니다. 서로 다른 agent가 동시에 같은 파일을
+수정해야 하는 작업에는 별도 git worktree를 권장합니다.

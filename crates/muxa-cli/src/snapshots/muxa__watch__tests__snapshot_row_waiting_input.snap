@@ -1,6 +1,5 @@
 ---
 source: crates/muxa-cli/src/watch.rs
-assertion_line: 13708
 expression: "snapshot_helpers::buffer_string(&terminal)"
 ---
  muxa watch   1 agent  + 0 panes   sort PANE ID   <clock>
@@ -14,4 +13,4 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                                                                                                  │
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
- j/k  move   h/l  tree   /  filter   :  commands   ⏎  prompt   o  preview   ?  help
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  prompt   o  preview   m  message   b  mailbox

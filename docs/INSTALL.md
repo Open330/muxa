@@ -134,11 +134,15 @@ set -g status-interval 2
 set -g status-right "#(muxa status-line --pane #{pane_id}) | %H:%M"
 ```
 
-Optional popup picker:
+Optional popups:
 
 ```tmux
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
+
+Use `prefix+s` to watch all agents. For collaboration, focus the sending agent
+pane and use `prefix+D`.
 
 Reload:
 

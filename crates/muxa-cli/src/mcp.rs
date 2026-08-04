@@ -24,11 +24,16 @@
 //! control plane.
 
 use anyhow::{bail, Result};
+use muxa::collaboration::{
+    AirArtifactReference, CollaborationOrigin, NewRequest, RequestKind, RequestMailbox,
+    RequestStatus, RoomContext, WorkMode,
+};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -48,6 +53,23 @@ const DEFAULT_WAIT_SECS: u64 = 30;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
+
+/// Sent to MCP hosts during initialization so collaboration is a first-class
+/// workflow rather than a capability the model has to infer from tool names.
+const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
+    At the start of substantial work, call muxa_collaboration_guide (or \
+    muxa_room_context) to discover available peer agents. Improve important work \
+    with a peer when useful: use review + read_only after implementation and tests \
+    for an independent critique; question + read_only for focused analysis; task + \
+    execute + narrow paths only for bounded, non-overlapping delegated edits. Keep \
+    primary ownership: continue useful work while the peer runs, wait for its \
+    structured reply, then verify and integrate the result yourself. Avoid \
+    overlapping edits unless separate worktrees isolate them. When notified of an \
+    incoming request, call muxa_inbox promptly, honor kind/work_mode/paths, and \
+    always finish with muxa_reply using completed, blocked, declined, or failed. \
+    When work is already represented by a validated AIR 1 workflow, plan, or trace, \
+    attach its typed air_artifacts reference for shared identity and visualization; \
+    AIR Workbench remains the validator/editor and muxa never implies conformance.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -242,14 +264,53 @@ fn initialize_result() -> Value {
             "name": "muxa",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "muxa control plane. Use muxa_status to see what agents \
-            are doing, muxa_send_prompt to drive one, muxa_capture_pane to read \
-            its screen, and muxa_wait_for_change to block until an agent changes \
-            state.",
+        "instructions": MCP_SERVER_INSTRUCTIONS,
     })
 }
 
-/// The five tools this server exposes, with JSON-Schema `inputSchema`s.
+fn air_artifact_reference_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "artifact_id": {
+                "type": "string",
+                "pattern": "^urn:air:sha256:[0-9a-f]{64}$",
+                "description": "AIR content identity from the validated artifact envelope."
+            },
+            "profile": {
+                "type": "string",
+                "enum": [
+                    "https://open330.github.io/air/profiles/1.0.0/workflow-skill",
+                    "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
+                    "https://open330.github.io/air/profiles/1.0.0/trace-native-run",
+                    "https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot"
+                ]
+            },
+            "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Optional display-only label; never artifact authority."
+            },
+            "locator": {
+                "type": "object",
+                "properties": {
+                    "display": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "disclosure": { "type": "string", "enum": ["local-only", "redacted"] }
+                },
+                "required": ["display", "disclosure"],
+                "additionalProperties": false,
+                "description": "Optional AIR 1 display-only locator. Muxa never opens it automatically."
+            }
+        },
+        "required": ["artifact_id", "profile"],
+        "additionalProperties": false
+    })
+}
+
+/// The control and collaboration tools this server exposes, with JSON-Schema
+/// `inputSchema`s.
+#[allow(clippy::too_many_lines)] // declarative JSON schemas are clearest kept beside tool names
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -318,6 +379,111 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "muxa_collaboration_guide",
+            "description": "Discover same-window peer agents and get concrete reviewer/subagent workflows. Call near the start of substantial work and again before finalizing important changes when an independent review could improve the result.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": "muxa_room_context",
+            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Use the returned pane, alias, role, and state to choose an appropriate reviewer or delegated subagent.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": "muxa_set_identity",
+            "description": "Replace this exact agent session's room-local alias and roles. Aliases enable @alias routing; roles enable role:<name> routing. An empty call clears identity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "alias": { "type": "string", "description": "Unique room-local alias, 1-32 slug characters." },
+                    "roles": { "type": "array", "maxItems": 8, "items": { "type": "string" }, "description": "Advisory role names used for routing." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_send_message",
+            "description": "Send a durable request to a same-window peer. Use review + read_only for an independent critique before finalizing important work; question + read_only for focused analysis; task + execute + narrow paths for bounded, non-overlapping delegated edits. Attach typed air_artifacts when a validated AIR workflow, plan, or trace is the shared review context. Continue useful work, wait for the structured reply, and verify the result yourself. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, or role:<name>" },
+                    "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
+                    "body": { "type": "string" },
+                    "expects_reply": { "type": "boolean", "description": "Default true except notice." },
+                    "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
+                    "air_artifacts": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": air_artifact_reference_schema(),
+                        "description": "Typed references to AIR 1 workflow, plan, or trace artifacts. Muxa transports the reference; AIR Workbench validates and visualizes the artifact."
+                    }
+                },
+                "required": ["target", "body"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_inbox",
+            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": "muxa_list_messages",
+            "description": "List incoming, sent, or all collaboration requests for this exact agent session without claiming them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mailbox": { "type": "string", "enum": ["incoming", "sent", "all"], "description": "Default all." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_reply",
+            "description": "Finish a claimed request with a structured response. The response returns directly to the sender; do not type into its pane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["completed", "blocked", "declined", "failed"] },
+                    "body": { "type": "string" },
+                    "artifacts": { "type": "array", "items": { "type": "string" } },
+                    "air_artifacts": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": air_artifact_reference_schema(),
+                        "description": "Typed AIR 1 artifact references returned to the sender."
+                    }
+                },
+                "required": ["request_id", "status", "body"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_wait_reply",
+            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
+                },
+                "required": ["request_id"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_cancel_message",
+            "description": "Cancel a sent request only while it is still queued. A request already claimed by its recipient cannot be cancelled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "request_id": { "type": "string" } },
+                "required": ["request_id"],
+                "additionalProperties": false
+            },
+        }),
     ]
 }
 
@@ -325,6 +491,7 @@ fn tool_definitions() -> Vec<Value> {
 /// (missing tool name, malformed params); a tool that runs but fails to do
 /// its job returns an `isError` result so the calling model sees the
 /// message rather than a transport fault.
+#[allow(clippy::too_many_lines)] // one explicit MCP tool dispatch table
 async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
     let params = params.ok_or_else(|| anyhow::anyhow!("missing params"))?;
     let name = params
@@ -385,7 +552,338 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
             })
         }
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
+        "muxa_collaboration_guide" => {
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_context(&origin).await {
+                Ok(room) => json_result(&collaboration_guide(room)),
+                Err(error) => error_result(&format!("collaboration guide failed: {error}")),
+            })
+        }
+        "muxa_room_context" => {
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_context(&origin).await {
+                Ok(room) => json_result(&json!(room)),
+                Err(error) => error_result(&format!("room context failed: {error}")),
+            })
+        }
+        "muxa_set_identity" => {
+            let alias = args.get("alias").and_then(Value::as_str);
+            let roles = string_array(&args, "roles");
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client
+                    .collaboration_set_identity(&origin, alias, &roles)
+                    .await
+                {
+                    Ok(room) => json_result(&json!(room)),
+                    Err(error) => error_result(&format!("set_identity failed: {error}")),
+                },
+            )
+        }
+        "muxa_send_message" => {
+            let Some(target) = args.get("target").and_then(Value::as_str) else {
+                return Ok(error_result("send_message requires a `target` argument"));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str) else {
+                return Ok(error_result("send_message requires a `body` argument"));
+            };
+            let kind = match parse_request_kind(args.get("kind").and_then(Value::as_str)) {
+                Ok(kind) => kind,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let work_mode = match parse_work_mode(args.get("work_mode").and_then(Value::as_str)) {
+                Ok(mode) => mode,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let paths = string_array(&args, "paths");
+            let air_artifacts = match parse_air_artifact_references(&args) {
+                Ok(references) => references,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let expects_reply = args
+                .get("expects_reply")
+                .and_then(Value::as_bool)
+                .unwrap_or(kind != RequestKind::Notice);
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let request = NewRequest {
+                kind,
+                body: body.to_string(),
+                expects_reply,
+                work_mode,
+                paths,
+                air_artifacts,
+            };
+            Ok(
+                match client.collaboration_send(&origin, target, &request).await {
+                    Ok(request) => json_result(&json!(request)),
+                    Err(error) => error_result(&format!("send_message failed: {error}")),
+                },
+            )
+        }
+        "muxa_inbox" => {
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_inbox(&origin).await {
+                Ok(requests) => json_result(&json!({ "requests": requests })),
+                Err(error) => error_result(&format!("inbox failed: {error}")),
+            })
+        }
+        "muxa_list_messages" => {
+            let mailbox = match parse_mailbox(args.get("mailbox").and_then(Value::as_str)) {
+                Ok(mailbox) => mailbox,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_list(&origin, mailbox).await {
+                Ok(requests) => json_result(&json!({ "requests": requests })),
+                Err(error) => error_result(&format!("list_messages failed: {error}")),
+            })
+        }
+        "muxa_reply" => {
+            let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+                return Ok(error_result("reply requires a `request_id` argument"));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str) else {
+                return Ok(error_result("reply requires a `body` argument"));
+            };
+            let status = match parse_reply_status(args.get("status").and_then(Value::as_str)) {
+                Ok(status) => status,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let artifacts = string_array(&args, "artifacts");
+            let air_artifacts = match parse_air_artifact_references(&args) {
+                Ok(references) => references,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client
+                    .collaboration_reply(
+                        &origin,
+                        request_id,
+                        status,
+                        body,
+                        &artifacts,
+                        &air_artifacts,
+                    )
+                    .await
+                {
+                    Ok(request) => json_result(&json!(request)),
+                    Err(error) => error_result(&format!("reply failed: {error}")),
+                },
+            )
+        }
+        "muxa_wait_reply" => Ok(wait_for_reply(client, &args).await),
+        "muxa_cancel_message" => {
+            let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+                return Ok(error_result(
+                    "cancel_message requires a `request_id` argument",
+                ));
+            };
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client.collaboration_cancel(&origin, request_id).await {
+                    Ok(request) => json_result(&json!(request)),
+                    Err(error) => error_result(&format!("cancel_message failed: {error}")),
+                },
+            )
+        }
         other => Ok(error_result(&format!("unknown tool: {other}"))),
+    }
+}
+
+fn collaboration_guide(room: RoomContext) -> Value {
+    let next_step = match room.peers.len() {
+        0 => "No peer is available. Continue locally or run another agent in this tmux window.",
+        1 => "One peer is available; target `peer` or its explicit pane id.",
+        _ => {
+            "Multiple peers are available; choose an explicit pane, @alias, or unique role:<name>."
+        }
+    };
+    json!({
+        "purpose": "Use another live agent as an independent reviewer or a bounded delegated subagent to improve important work.",
+        "room": room,
+        "next_step": next_step,
+        "workflows": {
+            "reviewer": {
+                "when": "After implementation, self-review, and relevant tests; before declaring important work complete.",
+                "request": {
+                    "kind": "review",
+                    "work_mode": "read_only",
+                    "body_should_include": [
+                        "objective and acceptance criteria",
+                        "diff, commit, or artifact to inspect",
+                        "tests already run",
+                        "specific risks or uncertainties"
+                    ]
+                },
+                "after_sending": "Continue any independent checks, wait with muxa_wait_reply, then verify and address the findings."
+            },
+            "subagent": {
+                "when": "A useful subtask is independently verifiable and does not overlap your active edits.",
+                "request": {
+                    "kind": "task",
+                    "work_mode": "execute",
+                    "paths": "Set the narrowest advisory path scope possible.",
+                    "body_should_include": [
+                        "one bounded deliverable",
+                        "constraints and definition of done",
+                        "required verification",
+                        "expected reply artifacts"
+                    ]
+                },
+                "after_sending": "Retain primary ownership; inspect the peer's edits and rerun relevant verification before integrating."
+            },
+            "focused_question": {
+                "when": "You need independent analysis without edits.",
+                "request": { "kind": "question", "work_mode": "read_only" }
+            },
+            "air_handoff": {
+                "when": "The work already has a validated AIR 1 workflow, plan, or trace artifact.",
+                "steps": [
+                    "Pass artifact_id, exact AIR 1 profile, and optional display-only locator in air_artifacts.",
+                    "Use the same artifact identity in review requests and structured replies so watch/dashboard can visualize the handoff.",
+                    "Open the source-bearing artifact in AIR Workbench for graph inspection or editing; muxa transports references and does not validate or execute AIR."
+                ]
+            },
+            "incoming_request": {
+                "steps": [
+                    "Call muxa_inbox promptly to claim and read it.",
+                    "Honor kind, work_mode, and paths; read_only never authorizes edits.",
+                    "Reply exactly once with completed, blocked, declined, or failed and include useful artifacts."
+                ]
+            }
+        },
+        "guardrails": [
+            "Do not create overlapping concurrent edits unless separate worktrees isolate them.",
+            "Do not treat a peer reply as proof; verify it against the repository and tests.",
+            "Do not delegate merely for ceremony or recursively bounce work without a concrete benefit."
+        ]
+    })
+}
+
+fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
+    let pane = std::env::var("TMUX_PANE").map_err(|_| {
+        "collaboration requires this MCP server to run inside a tmux pane".to_string()
+    })?;
+    let socket = std::env::var("TMUX").ok().and_then(|value| {
+        let path = value.split(',').next()?.trim();
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    Ok(CollaborationOrigin { pane, socket })
+}
+
+fn parse_request_kind(value: Option<&str>) -> std::result::Result<RequestKind, &'static str> {
+    match value.unwrap_or("question") {
+        "question" => Ok(RequestKind::Question),
+        "review" => Ok(RequestKind::Review),
+        "task" => Ok(RequestKind::Task),
+        "notice" => Ok(RequestKind::Notice),
+        _ => Err("kind must be question, review, task, or notice"),
+    }
+}
+
+fn parse_work_mode(value: Option<&str>) -> std::result::Result<WorkMode, &'static str> {
+    match value.unwrap_or("read_only") {
+        "read_only" => Ok(WorkMode::ReadOnly),
+        "execute" => Ok(WorkMode::Execute),
+        _ => Err("work_mode must be read_only or execute"),
+    }
+}
+
+fn parse_reply_status(value: Option<&str>) -> std::result::Result<RequestStatus, &'static str> {
+    match value {
+        Some("completed") => Ok(RequestStatus::Completed),
+        Some("blocked") => Ok(RequestStatus::Blocked),
+        Some("declined") => Ok(RequestStatus::Declined),
+        Some("failed") => Ok(RequestStatus::Failed),
+        _ => Err("status must be completed, blocked, declined, or failed"),
+    }
+}
+
+fn parse_mailbox(value: Option<&str>) -> std::result::Result<RequestMailbox, &'static str> {
+    match value.unwrap_or("all") {
+        "incoming" => Ok(RequestMailbox::Incoming),
+        "sent" => Ok(RequestMailbox::Sent),
+        "all" => Ok(RequestMailbox::All),
+        _ => Err("mailbox must be incoming, sent, or all"),
+    }
+}
+
+fn string_array(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_air_artifact_references(
+    args: &Value,
+) -> std::result::Result<Vec<AirArtifactReference>, String> {
+    let Some(value) = args.get("air_artifacts") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("air_artifacts must match the AIR reference schema: {error}"))
+}
+
+async fn wait_for_reply(client: &Client, args: &Value) -> Value {
+    let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+        return error_result("wait_reply requires a `request_id` argument");
+    };
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_WAIT_SECS)
+        .min(MAX_WAIT_SECS);
+    let origin = match current_collaboration_origin() {
+        Ok(origin) => origin,
+        Err(error) => return error_result(&error),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match client.collaboration_get(&origin, request_id).await {
+            Ok(request) if request.status.is_terminal() => return json_result(&json!(request)),
+            Ok(_) => {}
+            Err(error) => return error_result(&format!("wait_reply failed: {error}")),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return json_result(&json!({
+                "completed": false,
+                "reason": "timeout",
+                "request_id": request_id,
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -706,6 +1204,11 @@ mod tests {
         assert_eq!(init["result"]["serverInfo"]["name"], "muxa");
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("start of substantial work"));
+        assert!(instructions.contains("review + read_only"));
+        assert!(instructions.contains("task + execute + narrow paths"));
+        assert!(instructions.contains("verify and integrate the result yourself"));
 
         let list = dispatch(
             &client,
@@ -723,11 +1226,69 @@ mod tests {
                 "muxa_send_prompt",
                 "muxa_capture_pane",
                 "muxa_wait_for_change",
+                "muxa_collaboration_guide",
+                "muxa_room_context",
+                "muxa_set_identity",
+                "muxa_send_message",
+                "muxa_inbox",
+                "muxa_list_messages",
+                "muxa_reply",
+                "muxa_wait_reply",
+                "muxa_cancel_message",
             ],
         );
+        let guide = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_collaboration_guide")
+            .unwrap();
+        assert!(guide["description"]
+            .as_str()
+            .unwrap()
+            .contains("reviewer/subagent workflows"));
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn collaboration_guide_surfaces_reviewer_and_subagent_contracts() {
+        let participant = |kind: &str, session: &str, pane: &str| {
+            json!({
+                "agent_kind": kind,
+                "agent_session_id": session,
+                "pane": pane,
+                "socket": "default",
+                "room": { "host": "tmux", "socket": "default", "window_id": "@1" },
+                "tmux_session_id": "$1",
+                "tmux_session_name": "cal-6924",
+                "window_name": "agents",
+                "state": "idle"
+            })
+        };
+        let room: RoomContext = serde_json::from_value(json!({
+            "self": participant("codex", "sender", "%1"),
+            "peers": [participant("claude_code", "reviewer", "%2")],
+            "unread": 0,
+            "unread_replies": 0
+        }))
+        .unwrap();
+
+        let guide = collaboration_guide(room);
+        assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
+        assert_eq!(guide["workflows"]["reviewer"]["request"]["kind"], "review");
+        assert_eq!(
+            guide["workflows"]["reviewer"]["request"]["work_mode"],
+            "read_only"
+        );
+        assert_eq!(
+            guide["workflows"]["subagent"]["request"]["work_mode"],
+            "execute"
+        );
+        assert!(guide["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule.as_str().unwrap().contains("separate worktrees")));
     }
 
     /// A notification (no `id`) yields no response.

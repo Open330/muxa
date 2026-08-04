@@ -20,6 +20,10 @@
 //! captures every state change the user actually triggered.
 
 use crate::backend::{default_backend, HostKind, SharedBackend};
+use crate::collaboration::{
+    self, AirArtifactReference, CollaborationOptions, CollaborationOrigin, CollaborationRequest,
+    CollaborationStore, NewRequest, RequestMailbox, RequestStatus, RoomContext,
+};
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::session::{
     PtySessionBackend, SessionBackend, SessionOutput, SessionRef, SharedSessionBackend,
@@ -30,6 +34,7 @@ use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -184,6 +189,49 @@ enum RequestBody {
         pane: String,
     },
 
+    CollaborationContext {
+        origin: CollaborationOrigin,
+    },
+    CollaborationSetIdentity {
+        origin: CollaborationOrigin,
+        #[serde(default)]
+        alias: Option<String>,
+        #[serde(default)]
+        roles: Vec<String>,
+    },
+    CollaborationSend {
+        origin: CollaborationOrigin,
+        target: String,
+        request: NewRequest,
+    },
+    CollaborationInbox {
+        origin: CollaborationOrigin,
+    },
+    CollaborationList {
+        origin: CollaborationOrigin,
+        #[serde(default)]
+        mailbox: RequestMailbox,
+    },
+    CollaborationReply {
+        origin: CollaborationOrigin,
+        request_id: String,
+        status: RequestStatus,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        artifacts: Vec<String>,
+        #[serde(default)]
+        air_artifacts: Vec<AirArtifactReference>,
+    },
+    CollaborationGet {
+        origin: CollaborationOrigin,
+        request_id: String,
+    },
+    CollaborationCancel {
+        origin: CollaborationOrigin,
+        request_id: String,
+    },
+
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
     /// backend source — today the zellij WASM plugin forwarding
     /// `PaneUpdate` events. The daemon hands the panes to its
@@ -273,7 +321,14 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// Stable feature tags advertised by `hello`. Each token names a
 /// semver-additive capability the server supports; clients use the list
 /// to feature-gate behaviour without re-reading `protocol`.
-const CAPABILITIES: &[&str] = &["waiting_choice", "needs_choice", "rate_limited"];
+const CAPABILITIES: &[&str] = &[
+    "waiting_choice",
+    "needs_choice",
+    "rate_limited",
+    "collaboration_mailbox",
+    "collaboration_lifecycle",
+    "collaboration_identity",
+];
 
 #[derive(Debug, Serialize)]
 pub struct Response {
@@ -321,6 +376,12 @@ pub struct Response {
     /// normal value when `submit:false` was requested (nothing to submit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_requests: Option<Vec<CollaborationRequest>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_request: Option<CollaborationRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -349,6 +410,9 @@ impl Response {
             capture: None,
             sent: None,
             submitted: None,
+            room: None,
+            collaboration_requests: None,
+            collaboration_request: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -415,6 +479,21 @@ impl Response {
         r.submitted = Some(submitted);
         r
     }
+    fn with_room(room: RoomContext) -> Self {
+        let mut r = Self::ok();
+        r.room = Some(room);
+        r
+    }
+    fn with_collaboration_requests(requests: Vec<CollaborationRequest>) -> Self {
+        let mut r = Self::ok();
+        r.collaboration_requests = Some(requests);
+        r
+    }
+    fn with_collaboration_request(request: CollaborationRequest) -> Self {
+        let mut r = Self::ok();
+        r.collaboration_request = Some(request);
+        r
+    }
     fn hello() -> Self {
         let mut r = Self::ok();
         r.min_protocol = Some(MIN_PROTOCOL_VERSION);
@@ -437,6 +516,7 @@ pub struct Server {
     /// fallback when a pane id doesn't classify to a known namespace.
     backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
+    collaboration: Arc<CollaborationStore>,
     handler_limit: usize,
 }
 
@@ -449,6 +529,7 @@ impl Server {
             backend: backend.clone(),
             backends: vec![backend],
             sessions: PtySessionBackend::shared(),
+            collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -482,6 +563,12 @@ impl Server {
     #[must_use]
     pub fn with_sessions(mut self, sessions: SharedSessionBackend) -> Self {
         self.sessions = sessions;
+        self
+    }
+
+    #[must_use]
+    pub fn with_collaboration(mut self, collaboration: Arc<CollaborationStore>) -> Self {
+        self.collaboration = collaboration;
         self
     }
 
@@ -573,10 +660,13 @@ impl Server {
                     let backend = self.backend.clone();
                     let backends = self.backends.clone();
                     let sessions = self.sessions.clone();
+                    let collaboration = self.collaboration.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
-                        if let Err(e) = handle(stream, store, backend, backends, sessions).await {
+                        if let Err(e) =
+                            handle(stream, store, backend, backends, sessions, collaboration).await
+                        {
                             if e.is_client_disconnect() {
                                 tracing::debug!(error = %e, "client disconnected");
                                 return;
@@ -857,7 +947,30 @@ fn resolve_backend<'a>(
     }
 }
 
-#[tracing::instrument(level = "debug", skip(stream, store, backend, backends, sessions))]
+async fn collaboration_participants(
+    store: &SharedStore,
+    backends: &[SharedBackend],
+    collaboration: &CollaborationStore,
+) -> Vec<collaboration::Participant> {
+    let agents = store.snapshot().await;
+    let backends = backends.to_vec();
+    let panes = tokio::task::spawn_blocking(move || {
+        backends
+            .iter()
+            .flat_map(|backend| backend.list_panes())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let mut participants = collaboration::participants_from(&agents, &panes);
+    collaboration.enrich_participants(&mut participants).await;
+    participants
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip(stream, store, backend, backends, sessions, collaboration)
+)]
 #[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
 async fn handle(
     stream: UnixStream,
@@ -865,6 +978,7 @@ async fn handle(
     backend: SharedBackend,
     backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
+    collaboration: Arc<CollaborationStore>,
 ) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -1130,6 +1244,156 @@ async fn handle(
                             .unwrap_or(None);
                             Response::with_capture(text)
                         }
+                    }
+                }
+                RequestBody::CollaborationContext { origin } => {
+                    kind = "collaboration_context";
+                    if collaboration.enabled() {
+                        let participants =
+                            collaboration_participants(&store, &backends, &collaboration).await;
+                        match collaboration::resolve_origin(&origin, &participants) {
+                            Ok(current) => Response::with_room(
+                                collaboration::room_context(
+                                    collaboration.as_ref(),
+                                    current,
+                                    &participants,
+                                )
+                                .await,
+                            ),
+                            Err(error) => Response::err(error.to_string()),
+                        }
+                    } else {
+                        Response::err(
+                            "agent collaboration is disabled; enable [collaboration].enabled",
+                        )
+                    }
+                }
+                RequestBody::CollaborationSetIdentity {
+                    origin,
+                    alias,
+                    roles,
+                } => {
+                    kind = "collaboration_set_identity";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => match collaboration
+                            .set_identity(&current, &participants, alias, roles)
+                            .await
+                        {
+                            Ok(current) => Response::with_room(
+                                collaboration::room_context(
+                                    collaboration.as_ref(),
+                                    current,
+                                    &participants,
+                                )
+                                .await,
+                            ),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationSend {
+                    origin,
+                    target,
+                    request,
+                } => {
+                    kind = "collaboration_send";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let result =
+                        collaboration::resolve_origin(&origin, &participants).and_then(|sender| {
+                            collaboration::resolve_target(&sender, &target, &participants)
+                                .map(|recipient| (sender, recipient))
+                        });
+                    match result {
+                        Ok((sender, recipient)) => {
+                            match collaboration.create(sender, recipient, request).await {
+                                Ok(request) => Response::with_collaboration_request(request),
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationInbox { origin } => {
+                    kind = "collaboration_inbox";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => match collaboration.claim_for(&current).await {
+                            Ok(requests) => Response::with_collaboration_requests(requests),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationList { origin, mailbox } => {
+                    kind = "collaboration_list";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => match collaboration.list_for(&current, mailbox).await {
+                            Ok(requests) => Response::with_collaboration_requests(requests),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationReply {
+                    origin,
+                    request_id,
+                    status,
+                    body,
+                    artifacts,
+                    air_artifacts,
+                } => {
+                    kind = "collaboration_reply";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => match collaboration
+                            .reply(
+                                &current,
+                                &request_id,
+                                status,
+                                body,
+                                artifacts,
+                                air_artifacts,
+                            )
+                            .await
+                        {
+                            Ok(request) => Response::with_collaboration_request(request),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationGet { origin, request_id } => {
+                    kind = "collaboration_get";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => match collaboration.get_for(&current, &request_id).await {
+                            Ok(request) => Response::with_collaboration_request(request),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationCancel { origin, request_id } => {
+                    kind = "collaboration_cancel";
+                    let participants =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match collaboration::resolve_origin(&origin, &participants) {
+                        Ok(current) => {
+                            match collaboration.cancel_for(&current, &request_id).await {
+                                Ok(request) => Response::with_collaboration_request(request),
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                        Err(error) => Response::err(error.to_string()),
                     }
                 }
                 RequestBody::SpawnSession {
@@ -1472,6 +1736,134 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         Ok(resp["capture"].as_str().map(str::to_owned))
+    }
+
+    pub async fn collaboration_context(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<RoomContext, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_context",
+            "origin": origin,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_set_identity(
+        &self,
+        origin: &CollaborationOrigin,
+        alias: Option<&str>,
+        roles: &[String],
+    ) -> Result<RoomContext, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_set_identity",
+            "origin": origin,
+            "alias": alias,
+            "roles": roles,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_send(
+        &self,
+        origin: &CollaborationOrigin,
+        target: &str,
+        request: &NewRequest,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_send",
+            "origin": origin,
+            "target": target,
+            "request": request,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_inbox(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_inbox",
+            "origin": origin,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_list(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_list",
+            "origin": origin,
+            "mailbox": mailbox,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_reply(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        status: RequestStatus,
+        body: &str,
+        artifacts: &[String],
+        air_artifacts: &[AirArtifactReference],
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_reply",
+            "origin": origin,
+            "request_id": request_id,
+            "status": status,
+            "body": body,
+            "artifacts": artifacts,
+            "air_artifacts": air_artifacts,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_get(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_get",
+            "origin": origin,
+            "request_id": request_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_cancel(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_cancel",
+            "origin": origin,
+            "request_id": request_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn snapshot_with_timeout(
@@ -1850,8 +2242,266 @@ mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentId, AgentKind, AgentState};
     use crate::state::Store;
+    use std::collections::HashMap;
     use tempfile::tempdir;
     use time::OffsetDateTime;
+
+    struct CollaborationTestBackend {
+        panes: Vec<PaneInfo>,
+    }
+
+    impl PaneBackend for CollaborationTestBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Tmux
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            self.panes.first().map(|pane| pane.pane_id.clone())
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            true
+        }
+
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
+    fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "collaboration".into(),
+            window_id: "@1".into(),
+            window_name: "agents".into(),
+            window_index: "0".into(),
+            pane_index: pane_index.into(),
+            tty: String::new(),
+            current_command: "agent".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 0,
+            socket: Some("default".into()),
+        }
+    }
+
+    async fn add_collaboration_agent(
+        store: &SharedStore,
+        pane: &str,
+        session_id: &str,
+        kind: AgentKind,
+    ) {
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind,
+                    session_id: session_id.into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-collaboration.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%3", "verifier", AgentKind::GeminiCli).await;
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+                collaboration_test_pane("%3", "2"),
+            ],
+        });
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let server = Server::new(sock.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let sender = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+        };
+        let recipient = CollaborationOrigin {
+            pane: "%2".into(),
+            socket: Some("default".into()),
+        };
+        let verifier = CollaborationOrigin {
+            pane: "%3".into(),
+            socket: Some("default".into()),
+        };
+        client
+            .collaboration_set_identity(
+                &recipient,
+                Some("reviewer"),
+                &["review".into(), "rust".into()],
+            )
+            .await
+            .unwrap();
+        assert!(client
+            .collaboration_set_identity(&verifier, Some("reviewer"), &[])
+            .await
+            .is_err());
+        client
+            .collaboration_set_identity(&verifier, Some("verifier"), &["review".into()])
+            .await
+            .unwrap();
+        let room = client.collaboration_context(&sender).await.unwrap();
+        assert_eq!(room.peers.len(), 2);
+        assert_eq!(
+            room.peers
+                .iter()
+                .find(|peer| peer.pane == "%2")
+                .unwrap()
+                .alias
+                .as_deref(),
+            Some("reviewer")
+        );
+        assert!(client
+            .collaboration_send(
+                &sender,
+                "role:review",
+                &NewRequest {
+                    kind: collaboration::RequestKind::Question,
+                    body: "ambiguous".into(),
+                    expects_reply: true,
+                    work_mode: collaboration::WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .is_err());
+
+        let request = client
+            .collaboration_send(
+                &sender,
+                "@reviewer",
+                &NewRequest {
+                    kind: collaboration::RequestKind::Review,
+                    body: "review this".into(),
+                    expects_reply: true,
+                    work_mode: collaboration::WorkMode::ReadOnly,
+                    paths: vec!["src/**".into()],
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .collaboration_context(&recipient)
+                .await
+                .unwrap()
+                .unread,
+            1
+        );
+        let inbox = client.collaboration_inbox(&recipient).await.unwrap();
+        assert_eq!(inbox[0].status, RequestStatus::Claimed);
+        client
+            .collaboration_reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "looks good",
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .collaboration_context(&sender)
+                .await
+                .unwrap()
+                .unread_replies,
+            1
+        );
+        let sent = client
+            .collaboration_list(&sender, RequestMailbox::Sent)
+            .await
+            .unwrap();
+        assert_eq!(sent[0].status, RequestStatus::Completed);
+        assert!(sent[0].reply_notified_at.is_none());
+        let observed = client
+            .collaboration_get(&sender, &request.id)
+            .await
+            .unwrap();
+        assert!(observed.reply_notified_at.is_some());
+        assert!(observed.reply_read_at.is_some());
+        assert_eq!(
+            client
+                .collaboration_context(&sender)
+                .await
+                .unwrap()
+                .unread_replies,
+            0
+        );
+
+        let queued = client
+            .collaboration_send(
+                &sender,
+                "role:rust",
+                &NewRequest {
+                    kind: collaboration::RequestKind::Question,
+                    body: "obsolete question".into(),
+                    expects_reply: true,
+                    work_mode: collaboration::WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .collaboration_cancel(&sender, &queued.id)
+                .await
+                .unwrap()
+                .status,
+            RequestStatus::Cancelled
+        );
+        assert!(client
+            .collaboration_inbox(&recipient)
+            .await
+            .unwrap()
+            .is_empty());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
 
     #[tokio::test]
     async fn end_to_end_ingest_and_query() {
@@ -2107,6 +2757,7 @@ mod tests {
             default_backend(),
             vec![default_backend()],
             PtySessionBackend::shared(),
+            CollaborationStore::in_memory(CollaborationOptions::default()),
         ));
 
         let req = serde_json::json!({
@@ -2511,7 +3162,10 @@ mod tests {
         let pane = PaneInfo {
             socket: None,
             pane_id: "zellij:3".into(),
+            session_id: String::new(),
             session: "z".into(),
+            window_id: String::new(),
+            window_name: String::new(),
             window_index: "0".into(),
             pane_index: "3".into(),
             tty: String::new(),

@@ -44,8 +44,8 @@ same time; zellij has a CLI baseline. See the Hosts table below.
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
 | `muxa peek` | `prefix + Q` overlay: every pane in the window labeled with its agent's state, summary, and latest prompt/response; press a digit to jump. |
-| `muxa watch` | Full-screen TUI for agents and panes, with attach, prompt composition, and live previews. |
-| `muxa dashboard` | Session-card TUI console for inspecting panes and sending prompts without attaching. |
+| `muxa watch` | Main TUI for agents, prompts, live previews, and same-window collaboration. |
+| `muxa dashboard` | Session-card TUI console for pane operations and authenticated same-room agent collaboration. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
@@ -89,6 +89,45 @@ muxa status
 muxa watch
 ```
 
+### Collaborate from `muxa watch`
+
+The model is simple: **one tmux window is one room**. The agent pane that is
+focused when `muxa watch` opens is the sender.
+
+One-time setup: add the following to `~/.config/muxa/config.toml`, restart
+`muxad`, and run `muxa init` to install the `prefix+s` watch popup.
+
+```toml
+[collaboration]
+enabled = true
+wake = "idle_only"
+```
+
+Register the MCP server once for both agent hosts, then restart agents that
+were already running so they can read and reply to requests themselves.
+
+```bash
+claude mcp add --scope user muxa -- muxa mcp
+codex mcp add muxa -- muxa mcp
+```
+
+Connected agents are told that room peers can serve as read-only reviewers or
+narrowly scoped execution subagents. Requests and replies can also carry
+validated AIR 1.0 artifact references, which watch/dashboard visualize with
+profile-colored mailbox badges.
+
+Then:
+
+1. Run two agents in two panes of the same tmux window.
+2. Focus the agent that should send, then press `prefix+s`.
+3. Select the other agent in watch, press `m`, type the request, and press
+   `Enter`. Press `b` to read and reply from the mailbox.
+
+Do not open watch from a spare shell pane when you want to collaborate: that
+shell is not an agent. `muxa dashboard` remains an optional richer console,
+not a required collaboration entry point. For request/reply details, see
+[docs/COLLABORATION.md](docs/COLLABORATION.md).
+
 For install modes, `muxa init` presets, systemd, manual hook wiring, and
 rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -98,11 +137,12 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | --- | --- |
 | `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
 | `muxa watch [--view pane\|session]` | Live TUI picker/dashboard. |
-| `muxa dashboard [--since today]` | Session-card TUI console with live capture, prompt composer, abort/terminate actions, and ACT/WACT totals. |
+| `muxa dashboard [--since today]` | Session-card TUI with live capture, prompt/actions, ACT/WACT totals, and collaboration mailbox controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
 | `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
+| `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
@@ -110,7 +150,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
-| `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
+| `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
 
@@ -195,6 +235,7 @@ simultaneously.
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
 | Zellij plan | [docs/ZELLIJ.md](docs/ZELLIJ.md) |
 | Architecture and development | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Agent collaboration | [docs/COLLABORATION.md](docs/COLLABORATION.md) |
 
 ## Development
 

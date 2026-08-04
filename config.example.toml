@@ -60,6 +60,17 @@
 #                                   # if the previous is still running, and no captures run when
 #                                   # no pane matches a manifest (idle cost ≈ one pane list).
 
+# Durable request/reply collaboration between top-level agents in the same
+# tmux window. Opt-in: idle_only delivery types a short mailbox notification
+# into a hook-authoritative agent only when muxa observes its top-level Idle
+# state. Working / waiting / choice / error panes and synthetic screen-detected
+# agents are never auto-woken. The message body itself stays in the mailbox.
+[collaboration]
+# enabled           = true
+# wake              = "idle_only"  # idle_only | never (pull-only)
+# path              = "/home/$USER/.local/share/muxa/collaboration.json"
+# max_message_bytes = 16384
+
 # Prompt audit log: every PromptSubmitted event is appended to a bounded
 # NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`
 # even after the live agent record has been reaped (daemon restart, pane

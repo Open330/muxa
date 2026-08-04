@@ -71,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Control plane + MCP server (`muxa mcp`).** muxa can now *drive* agents,
   not only observe them. A new `muxa mcp` subcommand runs a Model Context
   Protocol stdio server so a coding agent can orchestrate the others — wire it
-  into Claude Code with `claude mcp add muxa -- muxa mcp` (see
+  into Claude Code with `claude mcp add --scope user muxa -- muxa mcp` (see
   [docs/MCP.md](docs/MCP.md)). Tools: `muxa_status`, `muxa_recent_prompts`,
   `muxa_send_prompt`, `muxa_capture_pane`, and `muxa_wait_for_change`. It is a
   hand-rolled, tools-only JSON-RPC 2.0 server (no new dependencies; not the

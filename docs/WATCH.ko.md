@@ -1,7 +1,8 @@
 # Live TUI
 
 `muxa watch`는 주요 interactive surface입니다. 추적 중인 agent와 일반 tmux
-pane을 보여주고, pane attach, live preview, prompt composer를 제공합니다.
+pane을 보여주고, pane attach, live preview, prompt composer, 같은 window의
+agent 협업을 제공합니다.
 
 TUI 안에 머문 채 prompt 전송, turn abort, live capture 확인까지 하는
 session-card console이 필요하면 [`muxa dashboard`](DASHBOARD_CLI.ko.md)를
@@ -31,6 +32,8 @@ muxa watch --include-paneless
 | `gg` / `G`, `Home` / `End` | 첫 번째 / 마지막 선택 가능 행으로 이동. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane의 prompt composer 열기. 빈 `Enter`는 attach. |
+| `m` | 선택한 same-window agent에게 durable request 보내기. |
+| `b` | incoming/sent mailbox 열기. `i`는 claim, `e`는 reply. |
 | `o` / `Alt-P` | live preview 열기. |
 | `:` | 명령 팔레트 열기. `Tab`은 첫 번째 일치 명령 완성. |
 | `r` / `Ctrl-R` / `Alt-R` | 탐색 중 refresh. |
@@ -98,6 +101,34 @@ pane이 있는 row에서 `Enter`를 누르면 prompt composer가 열립니다. �
 activity logging이 켜져 있으면 prompt input 시간은 `activity.ndjson`에 human
 interaction interval로 기록됩니다.
 
+## Agent 협업
+
+메시지를 보낼 agent pane을 선택하고 `prefix+s`로 watch를 엽니다. 같은 tmux
+window의 상대 agent를 선택한 뒤 `m`을 누릅니다. room에 peer가 하나뿐이면 watch가
+자동으로 선택합니다. composer에서 `Tab`은 request kind, `Ctrl-E`는
+`read-only`/`execute`를 바꾸고 `Enter`는 전송합니다.
+
+- `? QUESTION`(청록): 답을 요청합니다.
+- `◆ REVIEW`(자홍): 코드나 판단의 검토 결과를 요청합니다.
+- `▶ TASK`(노랑): 구체적인 작업을 위임합니다.
+- `! NOTICE`(파랑): 회신이 필요 없는 알림입니다.
+
+`○ READ-ONLY`(초록)는 조사·답변만 허용하고 변경은 위임하지 않는 계약입니다.
+`Ctrl-E`로 바꾸는 `● EXECUTE`(빨강)는 실행과 파일 변경을 명시적으로 허용합니다.
+이는 muxa가 즉시 명령을 실행한다는 뜻이 아니라, 수신 agent가 inbox에서 읽는 작업
+계약입니다. watch는 별도 path scope 입력을 제공하지 않으므로 execute 요청에는
+메시지 본문에 수정 범위를 함께 적는 것이 좋습니다.
+
+`b`는 incoming/sent mailbox를 엽니다. `Tab`으로 mailbox를 전환하고 `j`/`k`로
+request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다. 일반
+shell에서 watch를 열었다면 조회는 가능하지만, 협업하려면 agent pane에서
+`prefix+s`로 다시 열라는 안내가 표시됩니다.
+
+AIR artifact 참조가 첨부된 request는 mailbox에서 profile별 색상 배지로
+표시됩니다. `AIR WORKFLOW`는 파랑, `AIR PLAN`은 자홍, `AIR TRACE`는 청록,
+`AIR SESSION`은 밝은 청록입니다. 선택 상세에는 참조가 작업 입력인지 응답
+출력인지와 짧은 digest, label, 표시용 locator가 함께 나옵니다.
+
 ## Preview
 
 `o` 또는 `Alt-P`를 누르면 선택 pane의 preview가 열립니다. session view에서 선택한 session에
@@ -109,7 +140,11 @@ agent pane이 여러 개 있으면 `]`로 다음 agent, `[`로 이전 agent를 �
 
 ```tmux
 bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
+
+`prefix+s`가 관측과 협업의 기본 진입점입니다. `prefix+D`는 더 상세한 Dashboard를
+바로 여는 선택 단축키입니다.
 
 ## macOS 메뉴바 (BarShelf)
 

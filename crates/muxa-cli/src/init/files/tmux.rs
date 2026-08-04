@@ -15,9 +15,9 @@ use std::path::Path;
 pub const ENV_BLOCK_ID: &str = "tmux-env";
 
 /// The body that goes inside the `tmux-popup` marker block.
-pub const POPUP_BODY: &str = r#"# Replace tmux's stock prefix+s (choose-tree) with muxa watch in a popup.
-# Enter opens a prompt composer; empty Enter again attaches.
-bind-key s display-popup -E -w 90% -h 85% "muxa watch""#;
+pub const POPUP_BODY: &str = r#"# Muxa popups: watch all agents, or collaborate as the focused agent.
+bind-key s display-popup -E -w 90% -h 85% "muxa watch"
+bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.
 ///
@@ -113,6 +113,8 @@ mod tests {
         assert_eq!(o1, Outcome::Inserted);
         assert!(after.contains("display-popup"));
         assert!(after.contains("muxa watch"));
+        assert!(after.contains("bind-key D"));
+        assert!(after.contains("muxa dashboard"));
 
         let (after2, o2) = upsert(&after, Component::TmuxPopup);
         assert_eq!(o2, Outcome::Unchanged);

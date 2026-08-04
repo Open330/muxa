@@ -428,7 +428,19 @@ pub fn send_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
+    /// tmux's stable session id (for example `$3`). Empty for backends that
+    /// do not expose a tmux session identity.
+    #[serde(default)]
+    pub session_id: String,
     pub session: String,
+    /// tmux's stable window id (for example `@7`). Collaboration rooms use
+    /// `(socket, window_id)` rather than the mutable name/index.
+    #[serde(default)]
+    pub window_id: String,
+    /// Human-readable tmux window name. Informational; never used as the
+    /// durable room identity.
+    #[serde(default)]
+    pub window_name: String,
     pub window_index: String,
     pub pane_index: String,
     pub tty: String,
@@ -514,7 +526,7 @@ pub struct ClientInfo {
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
 pub(crate) const CLIENT_FMT: &str =
@@ -542,7 +554,10 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
         let pane_pid = cols.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
         panes.push(PaneInfo {
             pane_id: cols[0].into(),
+            session_id: cols.get(9).map(|s| (*s).to_string()).unwrap_or_default(),
             session: cols[1].into(),
+            window_id: cols.get(10).map(|s| (*s).to_string()).unwrap_or_default(),
+            window_name: cols.get(11).map(|s| (*s).to_string()).unwrap_or_default(),
             window_index: cols[2].into(),
             pane_index: cols[3].into(),
             tty: cols[4].into(),
@@ -1098,6 +1113,15 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].pane_id, "%10");
         assert_eq!(panes[0].current_command, "claude");
+    }
+
+    #[test]
+    fn parses_stable_session_and_window_identity() {
+        let stdout = "%10\tmain\t2\t0\t/dev/pts/0\tclaude\tclaude session\t42\t/repo\t$3\t@7\tauth-refactor\n";
+        let panes = parse_pane_lines(stdout);
+        assert_eq!(panes[0].session_id, "$3");
+        assert_eq!(panes[0].window_id, "@7");
+        assert_eq!(panes[0].window_name, "auth-refactor");
     }
 
     #[test]
