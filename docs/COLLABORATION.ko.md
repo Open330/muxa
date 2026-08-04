@@ -37,6 +37,12 @@ MCP가 연결되면 muxa는 초기 지침에서 같은 window의 agent를 review
 subagent로 활용할 수 있음을 알립니다. agent는 필요할 때
 `muxa_collaboration_guide`로 같은 지침을 다시 조회할 수 있습니다.
 
+`muxa doctor`가 pane을 synthetic agent로 표시하면 그 agent는 아직 안정적인 session
+identity가 없으므로 room participant나 요청 대상에 포함되지 않습니다. agent에서 새
+prompt를 한 번 제출해 hook event를 발생시키고, 계속 synthetic이면 agent를 재시작한
+뒤 다시 확인하세요. 이는 synthetic session에 요청이 고정된 채 실제 session으로
+전환되어 claim할 수 없게 되는 상황을 방지합니다.
+
 기존 `prefix+s` watch 단축키가 있다면 업그레이드 후 추가 단축키가 필요 없습니다.
 
 MCP process는 agent와 같은 pane의 `TMUX_PANE`/`TMUX` 환경을 상속받습니다.
@@ -199,8 +205,9 @@ pane에 넣으며 본문은 terminal에 주입하지 않습니다.
 - backend가 targeted input을 지원
 
 `Working`, `WaitingInput`, `WaitingChoice`, `Error` 상태에는 입력하지 않습니다.
-화면 감지로 생성된 synthetic agent도 자동 wake 대상이 아닙니다. `wake =
-"never"`로 설정하면 mailbox는 유지하면서 모든 입력 주입을 끌 수 있습니다.
+화면 감지로 생성된 synthetic agent는 안정적인 session identity가 없어 room
+participant나 자동 wake 대상이 아닙니다. `wake = "never"`로 설정하면 mailbox는
+유지하면서 모든 입력 주입을 끌 수 있습니다.
 
 요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다. wake prompt가 중복돼도
 동일 request id의 작업을 새 요청으로 만들지 않습니다.

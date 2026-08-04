@@ -320,7 +320,9 @@ pub struct NewRequest {
 pub enum CollaborationError {
     #[error("agent collaboration is disabled; enable [collaboration].enabled")]
     Disabled,
-    #[error("collaboration origin is not a tracked pane agent: {0}")]
+    #[error(
+        "collaboration origin is not a hook-correlated tracked pane agent: {0}; trigger an agent event or restart the agent"
+    )]
     UnknownOrigin(String),
     #[error("collaboration origin is ambiguous across tmux servers: {0}")]
     AmbiguousOrigin(String),
@@ -371,13 +373,16 @@ struct Snapshot {
 }
 
 /// In-memory mailbox with an optional atomic JSON snapshot. Collaboration
-/// traffic is low-volume, so rewriting the bounded mailbox after mutations is
+/// traffic is low-volume, so rewriting the mailbox after mutations is
 /// simpler and safer than maintaining a database or partially-replayed log.
 pub struct CollaborationStore {
     opts: CollaborationOptions,
     requests: RwLock<HashMap<String, CollaborationRequest>>,
     identities: RwLock<Vec<CollaborationIdentity>>,
-    persist_lock: Mutex<()>,
+    /// Serializes each in-memory mutation with its durable snapshot. Wake
+    /// scans also take this lock, so an unpersisted request is never visible
+    /// to the delivery loop.
+    transaction_lock: Mutex<()>,
 }
 
 impl CollaborationStore {
@@ -389,7 +394,7 @@ impl CollaborationStore {
             },
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
-            persist_lock: Mutex::new(()),
+            transaction_lock: Mutex::new(()),
         })
     }
 
@@ -414,7 +419,7 @@ impl CollaborationStore {
             opts: options,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
-            persist_lock: Mutex::new(()),
+            transaction_lock: Mutex::new(()),
         }))
     }
 
@@ -426,6 +431,7 @@ impl CollaborationStore {
     /// generation that registered them. A later process reusing the same pane
     /// remains anonymous until it registers its own identity.
     pub async fn enrich_participants(&self, participants: &mut [Participant]) {
+        let _transaction = self.transaction_lock.lock().await;
         let identities = self.identities.read().await;
         for participant in participants {
             participant.alias = None;
@@ -450,6 +456,8 @@ impl CollaborationStore {
         self.ensure_enabled()?;
         let alias = normalize_alias(alias)?;
         let roles = normalize_roles(roles)?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.identities.read().await.clone();
         {
             let mut identities = self.identities.write().await;
             if let Some(alias) = alias.as_deref() {
@@ -478,7 +486,10 @@ impl CollaborationStore {
                 });
             }
         }
-        self.persist().await?;
+        if let Err(error) = self.persist_current().await {
+            *self.identities.write().await = previous;
+            return Err(error);
+        }
         let mut updated = caller.clone();
         updated.alias = alias;
         updated.roles = roles;
@@ -502,6 +513,8 @@ impl CollaborationStore {
             ));
         }
         validate_air_artifact_references(&input.air_artifacts)?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
         let request = CollaborationRequest {
             id: next_request_id(now),
@@ -525,7 +538,10 @@ impl CollaborationStore {
             .write()
             .await
             .insert(request.id.clone(), request.clone());
-        self.persist().await?;
+        if let Err(error) = self.persist_current().await {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
         Ok(request)
     }
 
@@ -534,6 +550,8 @@ impl CollaborationStore {
         caller: &Participant,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
         let mut changed = false;
         let mut inbox = Vec::new();
@@ -561,7 +579,10 @@ impl CollaborationStore {
         }
         inbox.sort_by_key(|request| request.created_at);
         if changed {
-            self.persist().await?;
+            if let Err(error) = self.persist_current().await {
+                *self.requests.write().await = previous;
+                return Err(error);
+            }
         }
         Ok(inbox)
     }
@@ -591,6 +612,8 @@ impl CollaborationStore {
             ));
         }
         validate_air_artifact_references(&air_artifacts)?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
         let updated = {
             let mut requests = self.requests.write().await;
             let request = requests
@@ -612,7 +635,10 @@ impl CollaborationStore {
             });
             request.clone()
         };
-        self.persist().await?;
+        if let Err(error) = self.persist_current().await {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
         Ok(updated)
     }
 
@@ -622,6 +648,8 @@ impl CollaborationStore {
         request_id: &str,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
         let mut changed = false;
         let request = {
             let mut requests = self.requests.write().await;
@@ -641,7 +669,10 @@ impl CollaborationStore {
             request.clone()
         };
         if changed {
-            self.persist().await?;
+            if let Err(error) = self.persist_current().await {
+                *self.requests.write().await = previous;
+                return Err(error);
+            }
         }
         Ok(request)
     }
@@ -652,6 +683,7 @@ impl CollaborationStore {
         mailbox: RequestMailbox,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
         let mut requests: Vec<_> = self
             .requests
             .read()
@@ -676,6 +708,8 @@ impl CollaborationStore {
         request_id: &str,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
         let cancelled = {
             let mut requests = self.requests.write().await;
             let request = requests
@@ -693,11 +727,15 @@ impl CollaborationStore {
             }
             request.clone()
         };
-        self.persist().await?;
+        if let Err(error) = self.persist_current().await {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
         Ok(cancelled)
     }
 
     pub async fn pending_unnotified(&self) -> Vec<CollaborationRequest> {
+        let _transaction = self.transaction_lock.lock().await;
         self.requests
             .read()
             .await
@@ -708,6 +746,7 @@ impl CollaborationStore {
     }
 
     pub async fn pending_reply_unnotified(&self) -> Vec<CollaborationRequest> {
+        let _transaction = self.transaction_lock.lock().await;
         self.requests
             .read()
             .await
@@ -722,6 +761,7 @@ impl CollaborationStore {
     }
 
     pub async fn mark_notified(&self, request_id: &str) -> Result<(), CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
         let changed = {
             let mut requests = self.requests.write().await;
             requests.get_mut(request_id).is_some_and(|request| {
@@ -734,12 +774,16 @@ impl CollaborationStore {
             })
         };
         if changed {
-            self.persist().await?;
+            // The terminal injection already happened. Keep the in-memory
+            // marker even if disk persistence fails so the live daemon does
+            // not inject the same wake every two seconds.
+            self.persist_current().await?;
         }
         Ok(())
     }
 
     pub async fn mark_reply_notified(&self, request_id: &str) -> Result<(), CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
         let changed = {
             let mut requests = self.requests.write().await;
             requests.get_mut(request_id).is_some_and(|request| {
@@ -755,12 +799,14 @@ impl CollaborationStore {
             })
         };
         if changed {
-            self.persist().await?;
+            // As above, a delivered side effect cannot be rolled back.
+            self.persist_current().await?;
         }
         Ok(())
     }
 
     pub async fn unread_count(&self, participant: &Participant) -> usize {
+        let _transaction = self.transaction_lock.lock().await;
         self.requests
             .read()
             .await
@@ -770,6 +816,7 @@ impl CollaborationStore {
     }
 
     pub async fn unread_reply_count(&self, participant: &Participant) -> usize {
+        let _transaction = self.transaction_lock.lock().await;
         self.requests
             .read()
             .await
@@ -790,11 +837,12 @@ impl CollaborationStore {
         }
     }
 
-    async fn persist(&self) -> Result<(), CollaborationError> {
+    /// Persist the current transaction. The caller must hold
+    /// `transaction_lock` until this returns.
+    async fn persist_current(&self) -> Result<(), CollaborationError> {
         let Some(path) = self.opts.path.as_ref() else {
             return Ok(());
         };
-        let _guard = self.persist_lock.lock().await;
         let mut requests: Vec<_> = self.requests.read().await.values().cloned().collect();
         requests.sort_by_key(|request| request.created_at);
         let mut identities = self.identities.read().await.clone();
@@ -825,12 +873,12 @@ impl CollaborationStore {
         }
         let tmp = path.with_extension("json.tmp");
         tokio::fs::write(&tmp, bytes).await?;
-        tokio::fs::rename(tmp, path).await?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
         }
+        tokio::fs::rename(tmp, path).await?;
         Ok(())
     }
 }
@@ -841,7 +889,12 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
     let mut resolved: HashMap<(Option<String>, String), (OffsetDateTime, Participant)> =
         HashMap::new();
     for agent in agents.iter().filter(|agent| {
-        agent.pane.is_some() && agent.state != AgentState::Stopped && agent.kind != AgentKind::Task
+        agent.pane.is_some()
+            && agent.state != AgentState::Stopped
+            && agent.kind != AgentKind::Task
+            && !agent
+                .session_id
+                .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX)
     }) {
         let pane_id = agent.pane.as_ref().expect("filtered pane");
         let agent_socket = agent
@@ -1137,6 +1190,24 @@ mod tests {
         }
     }
 
+    fn pane_info(pane_id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "main".into(),
+            window_id: "@1".into(),
+            window_name: "agents".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "codex".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 0,
+            socket: Some("default".into()),
+        }
+    }
+
     fn air_reference(profile: AirArtifactProfile) -> AirArtifactReference {
         AirArtifactReference {
             artifact_id: format!("urn:air:sha256:{}", "a".repeat(64)),
@@ -1147,6 +1218,30 @@ mod tests {
                 disclosure: AirLocatorDisclosure::LocalOnly,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn synthetic_rows_are_not_collaboration_participants() {
+        let store = crate::Store::shared();
+        let started = |session_id: &str| crate::event::AgentEvent::Started {
+            id: crate::event::AgentId {
+                kind: AgentKind::Codex,
+                session_id: session_id.into(),
+                surface: None,
+                pane: Some("%1".into()),
+                tmux_socket: Some("default".into()),
+                cwd: Some("/repo".into()),
+            },
+            at: OffsetDateTime::now_utc(),
+        };
+        store.apply(&started("synthetic-7:default:%1")).await;
+        let panes = vec![pane_info("%1")];
+        assert!(participants_from(&store.snapshot().await, &panes).is_empty());
+
+        store.apply(&started("real-session")).await;
+        let participants = participants_from(&store.snapshot().await, &panes);
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].agent_session_id, "real-session");
     }
 
     #[tokio::test]
@@ -1348,6 +1443,81 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_rolls_back_request_before_wake_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("mailbox");
+        std::fs::create_dir(&parent).unwrap();
+        let options = CollaborationOptions {
+            path: Some(parent.join("collaboration.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options).await.unwrap();
+
+        std::fs::remove_dir(&parent).unwrap();
+        std::fs::write(&parent, b"blocks create_dir_all").unwrap();
+        let sender = participant("%1", "sender");
+        let result = mailbox
+            .create(
+                sender.clone(),
+                participant("%2", "recipient"),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "must be durable before delivery".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(CollaborationError::Persistence(_))));
+        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert!(mailbox
+            .list_for(&sender, RequestMailbox::All)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivered_wake_marker_stays_in_memory_when_persistence_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("mailbox");
+        let path = parent.join("collaboration.json");
+        let mailbox = CollaborationStore::load(CollaborationOptions {
+            path: Some(path.clone()),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        let request = mailbox
+            .create(
+                participant("%1", "sender"),
+                participant("%2", "recipient"),
+                NewRequest {
+                    kind: RequestKind::Question,
+                    body: "persist me first".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        std::fs::write(&parent, b"blocks create_dir_all").unwrap();
+        assert!(matches!(
+            mailbox.mark_notified(&request.id).await,
+            Err(CollaborationError::Persistence(_))
+        ));
+        assert!(mailbox.pending_unnotified().await.is_empty());
     }
 
     #[test]

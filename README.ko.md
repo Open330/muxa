@@ -111,6 +111,10 @@ subagent로 활용하라는 협업 지침이 자동으로 노출됩니다. 요�
 AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 profile별 색상
 배지로 표시합니다.
 
+`muxa doctor`에서 synthetic으로 표시되는 agent는 안정적인 session identity가
+생길 때까지 협업 대상에서 제외됩니다. 새 prompt로 hook을 발생시키거나 agent를
+재시작한 뒤 다시 확인하세요.
+
 평소에는:
 
 1. 같은 tmux window의 두 pane에서 agent를 각각 실행합니다.

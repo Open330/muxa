@@ -35,6 +35,12 @@ Once connected, muxa's initialization instructions surface same-window peers
 as reviewers or narrowly scoped delegated subagents. An agent can call
 `muxa_collaboration_guide` to retrieve the contract again.
 
+If `muxa doctor` reports a pane as synthetic, that agent does not yet have a
+stable session identity and is omitted from room participants and request
+targets. Submit a prompt to trigger a hook event; if it remains synthetic,
+restart the agent and check again. This prevents a request from being pinned to
+a placeholder identity that the later real session could never claim.
+
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
 The MCP process inherits `TMUX` and `TMUX_PANE`. muxad validates that origin
@@ -145,8 +151,9 @@ The mailbox is persisted to `$XDG_DATA_HOME/muxa/collaboration.json` before
 delivery. With `idle_only`, muxad injects a short notification for new requests
 and terminal replies, and only when the exact hook-authoritative participant
 is `Idle`. Message bodies never enter the terminal. It never injects into
-`Working`, `WaitingInput`, `WaitingChoice`, or `Error` panes, and never
-auto-wakes synthetic screen-detected agents.
+`Working`, `WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic
+screen-detected agents have no stable session identity, so they are not room
+participants or auto-wake targets.
 
 Reading a terminal result through `muxa_wait_reply` acknowledges it and
 prevents a later reply wake. Room context reports incoming unread requests and
