@@ -43,6 +43,7 @@ same time; zellij has a CLI baseline. See the Hosts table below.
 | Surface | What it does |
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
+| `muxa peek` | `prefix + Q` overlay: every pane in the window labeled with its agent's state, summary, and latest prompt/response; press a digit to jump. |
 | `muxa watch` | Full-screen TUI for agents and panes, with attach, prompt composition, and live previews. |
 | `muxa dashboard` | Session-card TUI console for inspecting panes and sending prompts without attaching. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
@@ -100,6 +101,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa dashboard [--since today]` | Session-card TUI console with live capture, prompt composer, abort/terminate actions, and ACT/WACT totals. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
+| `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |

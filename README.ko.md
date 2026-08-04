@@ -38,6 +38,7 @@ zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
+| `muxa peek` | `prefix + Q` 오버레이: window의 모든 pane 위에 각 agent의 상태·요약·최근 프롬프트/응답을 겹쳐 보여주고, 숫자 키로 이동. |
 | `muxa watch` | agent/pane 실시간 TUI. attach, prompt composer, live preview 포함. |
 | `muxa dashboard` | attach 없이 pane을 확인하고 prompt를 보내는 session-card TUI console. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
@@ -95,6 +96,7 @@ muxa watch
 | `muxa dashboard [--since today]` | live capture, prompt composer, abort/terminate action, ACT/WACT total을 보여주는 session-card TUI console. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
+| `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa stats --since today` | WACT/ACT/WORK/WAIT 중심 summary. day/project/agent/session 단위로 묶을 수 있고, `--graph`는 WACT 시간 그래프만, `--verbose`는 진단 컬럼을 표시. |
 | `muxa report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |

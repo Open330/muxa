@@ -51,6 +51,7 @@ impl Detection {
         if self.tmux.is_some() {
             out.push(Component::TmuxPopup);
             out.push(Component::TmuxStatusLine);
+            out.push(Component::TmuxPeek);
         }
         if self.claude_settings.is_some() {
             out.push(Component::ClaudeHooks);

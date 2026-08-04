@@ -6213,7 +6213,10 @@ fn subagent_glyph(frame: usize, phase: usize) -> &'static str {
     SWARM_DOTS2[frame.wrapping_add(phase) % SWARM_DOTS2.len()]
 }
 
-fn swarm_kind_short(kind: AgentKind) -> &'static str {
+/// Short, fixed vocabulary for an agent kind — `AgentKind`'s own
+/// `Display` is the wire form (`claude_code`), which is too wide for a
+/// swarm row or a `muxa peek` box header.
+pub(crate) fn agent_kind_short(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
@@ -6325,7 +6328,7 @@ fn swarm_agent_lines(
         Span::raw("    "),
         Span::styled(format!("{glyph} "), gstyle),
         Span::styled(
-            format!("{:<9}", swarm_kind_short(agent.kind)),
+            format!("{:<9}", agent_kind_short(agent.kind)),
             Style::default(),
         ),
         Span::styled(

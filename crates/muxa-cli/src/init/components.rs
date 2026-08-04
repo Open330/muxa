@@ -13,6 +13,8 @@ pub enum Component {
     TmuxPopup,
     /// per-pane glyph in `status-right`
     TmuxStatusLine,
+    /// `prefix + Q` → `display-popup -B muxa peek`
+    TmuxPeek,
     /// Claude Code shell hooks + statusLine
     ClaudeHooks,
     /// Codex shell hooks
@@ -37,6 +39,7 @@ impl Component {
     pub const ALL: &'static [Component] = &[
         Component::TmuxPopup,
         Component::TmuxStatusLine,
+        Component::TmuxPeek,
         Component::ClaudeHooks,
         Component::CodexHooks,
         Component::GeminiHooks,
@@ -52,6 +55,7 @@ impl Component {
         match self {
             Component::TmuxPopup => "tmux-popup",
             Component::TmuxStatusLine => "tmux-statusline",
+            Component::TmuxPeek => "tmux-peek",
             Component::ClaudeHooks => "claude-hooks",
             Component::CodexHooks => "codex-hooks",
             Component::GeminiHooks => "gemini-hooks",
@@ -72,6 +76,7 @@ impl Component {
         match self {
             Component::TmuxPopup => "tmux: replace prefix+s with muxa watch popup",
             Component::TmuxStatusLine => "tmux: per-pane agent glyphs in status-right",
+            Component::TmuxPeek => "tmux: prefix+Q overlays each pane with its agent",
             Component::ClaudeHooks => "Claude Code: shell hooks + statusLine",
             Component::CodexHooks => "OpenAI Codex: shell hooks",
             Component::GeminiHooks => "Gemini CLI: shell hooks",
@@ -88,6 +93,7 @@ impl Component {
         match self {
             Component::TmuxPopup => "drop-in replacement for tmux's choose-tree",
             Component::TmuxStatusLine => "● / ○ / ▶ per pane, refreshed every 2s",
+            Component::TmuxPeek => "display-panes with summary + prompt; digit jumps",
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
             Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",
@@ -128,10 +134,15 @@ impl Component {
     pub fn preset(p: Preset) -> Vec<Component> {
         let dm = Component::recommended_daemon_manager();
         match p {
-            Preset::Minimal => vec![Component::TmuxPopup, Component::TmuxStatusLine],
+            Preset::Minimal => vec![
+                Component::TmuxPopup,
+                Component::TmuxStatusLine,
+                Component::TmuxPeek,
+            ],
             Preset::Standard => vec![
                 Component::TmuxPopup,
                 Component::TmuxStatusLine,
+                Component::TmuxPeek,
                 Component::ClaudeHooks,
                 Component::CodexHooks,
                 Component::GeminiHooks,

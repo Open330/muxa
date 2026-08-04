@@ -7,6 +7,7 @@ mod doctor;
 mod init;
 mod logs;
 mod mcp;
+mod peek;
 mod stats;
 mod theme;
 mod time_range;
@@ -116,6 +117,13 @@ enum Cmd {
     },
     /// Debug: print tmux pane inventory.
     Panes,
+    /// Overlay every pane in the current tmux window with its agent's
+    /// state, summary, latest prompt, and latest response — then jump to
+    /// one by its `display-panes` digit.
+    ///
+    /// Designed to be bound to `prefix + Q` via a borderless fullscreen
+    /// `display-popup` (see `muxa init --only tmux-peek`).
+    Peek(peek::Args),
     /// Fullscreen TUI dashboard of all tracked agents.
     Watch {
         /// Show agents that have no tmux pane attached. Default behavior
@@ -343,6 +351,7 @@ async fn main() -> Result<()> {
             cmd_panes();
             Ok(())
         }
+        Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
             include_paneless,
             view,

@@ -7,6 +7,7 @@
 //! `$TMUX_TMPDIR` / the `default` socket points to. For the global view —
 //! every tmux server running for this user — see [`scanner`].
 
+pub mod layout;
 pub mod scanner;
 
 use std::io::Read;

@@ -19,6 +19,21 @@ pub const POPUP_BODY: &str = r#"# Replace tmux's stock prefix+s (choose-tree) wi
 # Enter opens a prompt composer; empty Enter again attaches.
 bind-key s display-popup -E -w 90% -h 85% "muxa watch""#;
 
+/// The body that goes inside the `tmux-peek` marker block.
+///
+/// Uppercase `Q` on purpose: tmux's own `prefix + q` (`display-panes`)
+/// stays exactly where the user's fingers expect it, and peek reads as
+/// "the same thing, with more to say".
+///
+/// The popup is borderless (`-B`) and covers the whole client at its
+/// origin (`-w/-h 100% -x/-y 0`) because `muxa peek` repaints the window's
+/// pane layout inside it — any border or inset would shift every box off
+/// the pane it describes.
+pub const PEEK_BODY: &str = r#"# prefix + Q: overlay each pane with its agent's state, summary, and
+# latest prompt/response. Press a pane's digit to jump to it, q/Esc to close.
+# tmux's stock prefix+q (display-panes) is deliberately left alone.
+bind-key Q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
+
 /// The body that goes inside the `tmux-statusline` marker block.
 ///
 /// Two segments: a GLOBAL attention summary (`⚠ N need you`, red, empty
@@ -56,6 +71,7 @@ pub fn upsert(original: &str, component: Component) -> (String, Outcome) {
     match component {
         Component::TmuxPopup => marker::upsert(original, component.id(), POPUP_BODY),
         Component::TmuxStatusLine => marker::upsert(original, component.id(), STATUSLINE_BODY),
+        Component::TmuxPeek => marker::upsert(original, component.id(), PEEK_BODY),
         _ => (original.to_string(), Outcome::Unchanged),
     }
 }
@@ -63,7 +79,7 @@ pub fn upsert(original: &str, component: Component) -> (String, Outcome) {
 /// Reverse a previous `upsert`. No-op if the block is already absent.
 pub fn remove(original: &str, component: Component) -> (String, Outcome) {
     match component {
-        Component::TmuxPopup | Component::TmuxStatusLine => {
+        Component::TmuxPopup | Component::TmuxStatusLine | Component::TmuxPeek => {
             marker::remove(original, component.id())
         }
         _ => (original.to_string(), Outcome::Unchanged),
@@ -120,6 +136,39 @@ mod tests {
         let (after2, o2) = upsert(&after, Component::TmuxStatusLine);
         assert_eq!(o2, Outcome::Unchanged);
         assert_eq!(after, after2);
+    }
+
+    #[test]
+    fn peek_round_trip() {
+        let (after, o1) = upsert("", Component::TmuxPeek);
+        assert_eq!(o1, Outcome::Inserted);
+        assert!(after.contains("bind-key Q display-popup"));
+        assert!(after.contains("muxa peek"));
+        // The overlay repaints pane rectangles at their own coordinates,
+        // so any border or inset would slide every box off its pane.
+        assert!(after.contains("-B"));
+        assert!(after.contains("-w 100% -h 100%"));
+        assert!(after.contains("-x 0 -y 0"));
+
+        let (after2, o2) = upsert(&after, Component::TmuxPeek);
+        assert_eq!(o2, Outcome::Unchanged);
+        assert_eq!(after, after2);
+
+        let (after3, o3) = remove(&after2, Component::TmuxPeek);
+        assert_eq!(o3, Outcome::Removed);
+        assert!(!after3.contains("muxa peek"));
+    }
+
+    #[test]
+    fn peek_leaves_tmux_display_panes_alone() {
+        // Stock `prefix + q` is muscle memory; peek takes the shifted key
+        // so installing it can never shadow tmux's own binding.
+        let (after, _) = upsert("", Component::TmuxPeek);
+        assert!(after.contains("bind-key Q "));
+        assert!(
+            !after.contains("bind-key q "),
+            "peek must not rebind lowercase q: {after}"
+        );
     }
 
     #[test]
