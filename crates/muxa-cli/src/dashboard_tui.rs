@@ -2603,12 +2603,7 @@ fn render_card(f: &mut Frame, area: Rect, card: &SessionCard, selected: bool, ap
         || Span::styled("?", app.theme.dim_style()),
         |state| Span::styled(crate::state_icon(state), app.theme.state_style(state)),
     );
-    let mut title_spans = Vec::new();
-    if selected {
-        title_spans.push(pill("FOCUS", app.theme.selected_fg, app.theme.selected));
-        title_spans.push(Span::raw(" "));
-    }
-    title_spans.extend([
+    let title_spans = vec![
         Span::styled(
             icon_session(),
             Style::default()
@@ -2619,7 +2614,7 @@ fn render_card(f: &mut Frame, area: Rect, card: &SessionCard, selected: bool, ap
         status_span,
         Span::raw(" "),
         Span::styled(card_title(card), app.theme.title_style()),
-    ]);
+    ];
     let title = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4787,7 +4782,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_card_renders_focus_target_and_rate_limit_hint() {
+    fn selected_card_preserves_text_layout_and_renders_rate_limit_hint() {
         let now = datetime!(2026-06-16 00:00 UTC);
         let mut agent = fake_agent(
             "s1",
@@ -4825,7 +4820,23 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(dump.contains("FOCUS"));
+        let backend = TestBackend::new(96, 8);
+        let mut unselected_terminal = Terminal::new(backend).unwrap();
+        unselected_terminal
+            .draw(|f| {
+                render_card(f, f.area(), app.selected_card().unwrap(), false, &app);
+            })
+            .unwrap();
+        let unselected_dump = unselected_terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(!dump.contains("FOCUS"));
+        assert_eq!(dump, unselected_dump);
         assert!(dump.contains("codex pane %1"));
         assert!(dump.contains("5h 84%"));
     }
