@@ -60,8 +60,9 @@ max_message_bytes = 16384
 
 같은 stable tmux window에 있는 agent 사이의 durable request/reply 기능입니다.
 optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`입니다.
-`idle_only`는 hook 기반 top-level agent가 Idle일 때만 짧은 inbox notification을
-입력합니다. [COLLABORATION.ko.md](COLLABORATION.ko.md)를 참고하세요.
+`idle_only`는 hook 기반 top-level agent가 Idle일 때만 짧은 request/reply
+notification을 입력하며 본문은 mailbox에 둡니다.
+[COLLABORATION.ko.md](COLLABORATION.ko.md)를 참고하세요.
 
 ## Watch
 

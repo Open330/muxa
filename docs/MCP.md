@@ -76,11 +76,13 @@ it:
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?` | Block until an agent's state changes (or timeout); returns the transition. |
-| `muxa_room_context` | — | Identify self and list collaboration peers in the same tmux window. |
+| `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
 | `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?` | Create a durable same-window peer request. |
 | `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
+| `muxa_list_messages` | `mailbox?` | List incoming, sent, or all requests without claiming. |
 | `muxa_reply` | `request_id`, `status`, `body`, `artifacts?` | Return a structured terminal response. |
 | `muxa_wait_reply` | `request_id`, `timeout_secs?` | Wait for a structured peer response. |
+| `muxa_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
@@ -91,8 +93,10 @@ Pane ids carry their host namespace: tmux `%12`, herdr `herdr:p1`. Use the
 
 The collaboration tools are higher-level than `muxa_send_prompt`: muxad pins
 each request to the target's current agent session, persists it before wake-up,
-and restricts routing to the caller's stable tmux window. Enable them with
-`[collaboration] enabled = true`; see `docs/COLLABORATION.ko.md`.
+and restricts routing to the caller's stable tmux window. Request and reply
+wake prompts contain no message body and are sent only to idle agents. Enable
+the tools with `[collaboration] enabled = true`; see
+`docs/COLLABORATION.ko.md`.
 
 ## Orchestration examples
 

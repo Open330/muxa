@@ -492,7 +492,8 @@ async fn wake_idle_collaboration_peers(
     backends: &[muxa::SharedBackend],
 ) {
     let requests = collaboration.pending_unnotified().await;
-    if requests.is_empty() {
+    let replies = collaboration.pending_reply_unnotified().await;
+    if requests.is_empty() && replies.is_empty() {
         return;
     }
     let agents = store.snapshot().await;
@@ -508,42 +509,16 @@ async fn wake_idle_collaboration_peers(
     let participants = muxa::collaboration::participants_from(&agents, &panes);
 
     for request in requests {
-        let Some(recipient) = participants.iter().find(|participant| {
-            participant.pane == request.to.pane
-                && participant.socket == request.to.socket
-                && participant.agent_session_id == request.to.agent_session_id
-                && participant.state == muxa::AgentState::Idle
-                && !participant
-                    .agent_session_id
-                    .starts_with(muxa::state::SYNTHETIC_SESSION_PREFIX)
-        }) else {
+        let Some(recipient) = idle_collaboration_participant(&participants, &request.to) else {
             continue;
         };
-        let Some(kind) = muxa::backend::pane_id_host_kind(&recipient.pane) else {
-            continue;
-        };
-        let Some(backend) = backends
-            .iter()
-            .find(|backend| backend.kind() == kind && backend.caps().send_text)
-            .cloned()
-        else {
-            continue;
-        };
-        let pane = recipient.pane.clone();
-        let socket = recipient.socket.clone();
         let prompt = format!(
             "[muxa:{}] New {:?} request from {}. Call muxa_inbox to read it, then muxa_reply to respond.",
             request.id,
             request.kind,
             request.from.label(),
         );
-        let (sent, submitted) = tokio::task::spawn_blocking(move || {
-            let sent = backend.send_text_on(socket.as_deref(), &pane, &prompt);
-            let submitted = sent && backend.send_text_on(socket.as_deref(), &pane, "\r");
-            (sent, submitted)
-        })
-        .await
-        .unwrap_or((false, false));
+        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends).await;
         if sent {
             if let Err(error) = collaboration.mark_notified(&request.id).await {
                 tracing::warn!(request_id = request.id, %error, "failed to persist wake marker");
@@ -556,6 +531,77 @@ async fn wake_idle_collaboration_peers(
             );
         }
     }
+
+    for request in replies {
+        let Some(sender) = idle_collaboration_participant(&participants, &request.from) else {
+            continue;
+        };
+        let prompt = format!(
+            "[muxa:{}] {:?} reply from {} is ready. Call muxa_wait_reply for {} to read it.",
+            request.id,
+            request.status,
+            request.to.label(),
+            request.id,
+        );
+        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends).await;
+        if sent {
+            if let Err(error) = collaboration.mark_reply_notified(&request.id).await {
+                tracing::warn!(
+                    request_id = request.id,
+                    %error,
+                    "failed to persist reply wake marker",
+                );
+            }
+            tracing::debug!(
+                request_id = request.id,
+                pane = sender.pane,
+                submitted,
+                "collaboration reply wake delivered",
+            );
+        }
+    }
+}
+
+fn idle_collaboration_participant<'a>(
+    participants: &'a [muxa::collaboration::Participant],
+    target: &muxa::collaboration::Participant,
+) -> Option<&'a muxa::collaboration::Participant> {
+    participants.iter().find(|participant| {
+        participant.pane == target.pane
+            && participant.socket == target.socket
+            && participant.agent_session_id == target.agent_session_id
+            && participant.state == muxa::AgentState::Idle
+            && !participant
+                .agent_session_id
+                .starts_with(muxa::state::SYNTHETIC_SESSION_PREFIX)
+    })
+}
+
+async fn send_collaboration_wake(
+    participant: &muxa::collaboration::Participant,
+    prompt: &str,
+    backends: &[muxa::SharedBackend],
+) -> (bool, bool) {
+    let Some(kind) = muxa::backend::pane_id_host_kind(&participant.pane) else {
+        return (false, false);
+    };
+    let Some(backend) = backends
+        .iter()
+        .find(|backend| backend.kind() == kind && backend.caps().send_text)
+        .cloned()
+    else {
+        return (false, false);
+    };
+    let pane = participant.pane.clone();
+    let socket = participant.socket.clone();
+    let prompt = prompt.to_string();
+    tokio::task::spawn_blocking(move || {
+        let sent = backend.send_text_on(socket.as_deref(), &pane, &prompt);
+        let submitted = sent && backend.send_text_on(socket.as_deref(), &pane, "\r");
+        (sent, submitted)
+    })
+    .await
+    .unwrap_or((false, false))
 }
 
 /// Spawn the GC task: evicts long-stopped agents on a periodic timer.
@@ -1565,7 +1611,174 @@ fn spawn_periodic_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxa::backend::{BackendCaps, HostKind, PaneBackend};
+    use muxa::collaboration::{NewRequest, RequestKind, RequestStatus, WorkMode};
     use muxa::config::DiscoveryConfig;
+    use muxa::event::{AgentEvent, AgentId, AgentKind};
+    use muxa::tmux::PaneInfo;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use time::OffsetDateTime;
+
+    struct CollaborationWakeBackend {
+        panes: Vec<PaneInfo>,
+        sends: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl PaneBackend for CollaborationWakeBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Tmux
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, pane_id: &str, text: &str) -> bool {
+            self.sends
+                .lock()
+                .unwrap()
+                .push((pane_id.into(), text.into()));
+            true
+        }
+
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
+    fn collaboration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "collaboration".into(),
+            window_id: "@1".into(),
+            window_name: "agents".into(),
+            window_index: "0".into(),
+            pane_index: pane_index.into(),
+            tty: String::new(),
+            current_command: "agent".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 0,
+            socket: Some("default".into()),
+        }
+    }
+
+    async fn add_agent(store: &muxa::SharedStore, pane: &str, session_id: &str, kind: AgentKind) {
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind,
+                    session_id: session_id.into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_reply_wakes_idle_sender_without_injecting_body() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let agents = store.snapshot().await;
+        let participants = muxa::collaboration::participants_from(&agents, &panes);
+        let sender = participants
+            .iter()
+            .find(|participant| participant.pane == "%1")
+            .unwrap()
+            .clone();
+        let recipient = participants
+            .iter()
+            .find(|participant| participant.pane == "%2")
+            .unwrap()
+            .clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = mailbox
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "secret request body".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_for(&recipient).await.unwrap();
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "secret reply body".into(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        wake_idle_collaboration_peers(&mailbox, &store, &[backend]).await;
+
+        {
+            let sends = sends.lock().unwrap();
+            assert_eq!(sends.len(), 2);
+            assert_eq!(sends[0].0, "%1");
+            assert!(sends[0].1.contains("reply"));
+            assert!(sends[0].1.contains(&request.id));
+            assert!(!sends[0].1.contains("secret request body"));
+            assert!(!sends[0].1.contains("secret reply body"));
+            assert_eq!(sends[1], ("%1".into(), "\r".into()));
+        }
+        assert!(mailbox.pending_reply_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox
+                .unread_reply_count(
+                    participants
+                        .iter()
+                        .find(|participant| participant.pane == "%1")
+                        .unwrap(),
+                )
+                .await,
+            1
+        );
+    }
 
     #[test]
     fn heals_canonical_default_or_configured_socket() {

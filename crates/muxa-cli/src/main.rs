@@ -21,7 +21,9 @@ use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{
     claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
 };
-use muxa::collaboration::{CollaborationOrigin, NewRequest, RequestKind, RequestStatus, WorkMode};
+use muxa::collaboration::{
+    CollaborationOrigin, NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
+};
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
 use muxa::state::Agent;
@@ -261,6 +263,13 @@ enum MsgCmd {
         #[arg(long)]
         json: bool,
     },
+    /// List incoming, sent, or all requests without claiming them.
+    List {
+        #[arg(long, default_value = "all")]
+        mailbox: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Complete, block, decline, or fail a request.
     Reply {
         request_id: String,
@@ -276,6 +285,8 @@ enum MsgCmd {
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
+    /// Cancel a request that the recipient has not claimed yet.
+    Cancel { request_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -544,6 +555,15 @@ fn collaboration_reply_status(value: &str) -> Result<RequestStatus> {
     }
 }
 
+fn collaboration_mailbox(value: &str) -> Result<RequestMailbox> {
+    match value {
+        "incoming" | "inbox" => Ok(RequestMailbox::Incoming),
+        "sent" | "outgoing" => Ok(RequestMailbox::Sent),
+        "all" => Ok(RequestMailbox::All),
+        _ => anyhow::bail!("mailbox must be incoming, sent, or all"),
+    }
+}
+
 async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
     let room = client
         .collaboration_context(&collaboration_origin()?)
@@ -553,10 +573,11 @@ async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "room {} · self {} · {} unread",
+        "room {} · self {} · {} unread · {} replies",
         room.current.room.window_id,
         room.current.label(),
         room.unread,
+        room.unread_replies,
     );
     if room.peers.is_empty() {
         println!("No collaboration peers in this window.");
@@ -618,6 +639,12 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 }
             }
         }
+        MsgCmd::List { mailbox, json } => {
+            let requests = client
+                .collaboration_list(&origin, collaboration_mailbox(&mailbox)?)
+                .await?;
+            print_collaboration_messages(&requests, json, &origin)?;
+        }
         MsgCmd::Reply {
             request_id,
             body,
@@ -651,6 +678,40 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+        }
+        MsgCmd::Cancel { request_id } => {
+            let request = client.collaboration_cancel(&origin, &request_id).await?;
+            println!("{}", serde_json::to_string_pretty(&request)?);
+        }
+    }
+    Ok(())
+}
+
+fn print_collaboration_messages(
+    requests: &[muxa::collaboration::CollaborationRequest],
+    json: bool,
+    origin: &CollaborationOrigin,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(requests)?);
+    } else if requests.is_empty() {
+        println!("No collaboration messages.");
+    } else {
+        for request in requests {
+            let direction = if request.from.pane == origin.pane
+                && origin
+                    .socket
+                    .as_deref()
+                    .is_none_or(|socket| request.from.socket.as_deref() == Some(socket))
+            {
+                format!("to {}", request.to.label())
+            } else {
+                format!("from {}", request.from.label())
+            };
+            println!(
+                "{}  {:?}  {:?}  {}\n  {}",
+                request.id, request.status, request.kind, direction, request.body,
+            );
         }
     }
     Ok(())

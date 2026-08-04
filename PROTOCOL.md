@@ -312,6 +312,10 @@ other agent occupies the same stable tmux window.
 { "protocol": 3, "kind": "collaboration_inbox",
   "origin": { "pane": "%18", "socket": "default" } }
 
+{ "protocol": 3, "kind": "collaboration_list",
+  "origin": { "pane": "%12", "socket": "default" },
+  "mailbox": "sent" }
+
 { "protocol": 3, "kind": "collaboration_reply",
   "origin": { "pane": "%18", "socket": "default" },
   "request_id": "req_...", "status": "completed", "body": "looks good",
@@ -320,12 +324,20 @@ other agent occupies the same stable tmux window.
 { "protocol": 3, "kind": "collaboration_get",
   "origin": { "pane": "%12", "socket": "default" },
   "request_id": "req_..." }
+
+{ "protocol": 3, "kind": "collaboration_cancel",
+  "origin": { "pane": "%12", "socket": "default" },
+  "request_id": "req_..." }
 ```
 
 Responses use `room`, `collaboration_requests`, or `collaboration_request`.
 Requests are pinned to both the target pane and its current agent session id;
 a process that later reuses the pane is not a valid recipient. Messages are
 persisted before an optional idle-only wake prompt is injected.
+`collaboration_list` is non-claiming and accepts `incoming`, `sent`, or `all`.
+`collaboration_cancel` succeeds only while the request is still `queued`.
+Terminal replies also receive an idle-only wake; a sender-side
+`collaboration_get` acknowledges the reply so it is not woken again.
 
 #### `subscribe`
 

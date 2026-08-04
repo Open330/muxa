@@ -57,6 +57,13 @@ muxa msg reply req_... "검토 완료: ..." --status completed
 
 # 발신 agent
 muxa msg wait req_... --timeout-secs 300
+
+# claim하지 않고 request/reply lifecycle 확인
+muxa msg list --mailbox sent
+muxa msg list --mailbox incoming --json
+
+# 아직 상대가 claim하지 않은 요청 취소
+muxa msg cancel req_...
 ```
 
 ## MCP tools
@@ -66,8 +73,10 @@ muxa msg wait req_... --timeout-secs 300
 | `muxa_room_context` | self, same-window peers, unread count 조회 |
 | `muxa_send_message` | durable request 생성 |
 | `muxa_inbox` | 현재 agent session의 요청 claim/read |
+| `muxa_list_messages` | incoming/sent/all request 상태 조회(미claim) |
 | `muxa_reply` | completed/blocked/declined/failed 구조화 응답 |
 | `muxa_wait_reply` | 요청의 terminal reply 대기 |
+| `muxa_cancel_message` | 아직 queued인 발신 요청 취소 |
 
 일반적인 흐름:
 
@@ -79,13 +88,17 @@ Agent A: muxa_wait_reply(request_id="req_...", timeout_secs=300)
 Agent B: idle 상태에서 짧은 mailbox wake prompt 수신
 Agent B: muxa_inbox
 Agent B: muxa_reply(request_id="req_...", status="completed", ...)
+
+Agent A: wait 중이 아니고 Idle이면 짧은 reply wake prompt 수신
+Agent A: muxa_wait_reply(request_id="req_...")
 ```
 
 ## 전달 안전성
 
-메시지 본문은 `$XDG_DATA_HOME/muxa/collaboration.json`에 먼저 저장됩니다.
-`idle_only` wake는 다음 조건을 모두 만족할 때만 짧은 notification prompt를
-pane에 넣습니다.
+메시지와 응답 본문은 `$XDG_DATA_HOME/muxa/collaboration.json`에 먼저
+저장됩니다. `idle_only` wake는 새 요청뿐 아니라 아직 발신자가 읽지 않은 terminal
+응답에도 적용됩니다. 다음 조건을 모두 만족할 때만 짧은 notification prompt를
+pane에 넣으며 본문은 terminal에 주입하지 않습니다.
 
 - hook 기반의 실제 agent session
 - state가 `Idle`
@@ -98,6 +111,19 @@ pane에 넣습니다.
 
 요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다. wake prompt가 중복돼도
 동일 request id의 작업을 새 요청으로 만들지 않습니다.
+
+발신자가 `muxa_wait_reply`/`muxa msg wait`로 terminal 응답을 읽으면 이를 확인한
+것으로 기록해 이후 reply wake를 생략합니다. 먼저 reply wake가 전달된 경우에도
+본문은 mailbox에 그대로 남아 있어 `wait` 또는 `list`로 조회할 수 있습니다.
+
+## Request lifecycle
+
+`muxa msg list`와 `muxa_list_messages`는 메시지를 claim하지 않고 현재 agent
+session의 incoming/sent/all 이력을 보여줍니다. `room_context`는 새 incoming
+request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
+
+발신자는 요청이 `queued`인 동안만 취소할 수 있습니다. 수신자가 inbox를 읽어
+`claimed`가 된 뒤에는 이미 작업이 시작됐을 수 있으므로 취소를 거부합니다.
 
 ## 작업공간 규칙
 

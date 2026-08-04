@@ -37,6 +37,8 @@ muxa msg send peer "review the auth change" --kind review
 muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
 muxa msg wait req_... --timeout-secs 300
+muxa msg list --mailbox sent
+muxa msg cancel req_... # queued requests only
 ```
 
 `question` and `review` are read-only contracts by default. Use `--execute`
@@ -51,15 +53,22 @@ worktrees remain the safest choice for concurrent edits.
 | `muxa_room_context` | Identify self, list same-window peers, and show unread count. |
 | `muxa_send_message` | Create a durable peer request. |
 | `muxa_inbox` | Claim/read requests for this exact agent session. |
+| `muxa_list_messages` | List incoming, sent, or all requests without claiming. |
 | `muxa_reply` | Return a completed/blocked/declined/failed response. |
 | `muxa_wait_reply` | Wait for the structured terminal response. |
+| `muxa_cancel_message` | Cancel a sent request while it is still queued. |
 
 ## Wake-up safety
 
 The mailbox is persisted to `$XDG_DATA_HOME/muxa/collaboration.json` before
-delivery. With `idle_only`, muxad injects only a short inbox notification, and
-only when the exact hook-authoritative recipient is `Idle`. It never injects
-into `Working`, `WaitingInput`, `WaitingChoice`, or `Error` panes, and never
-auto-wakes synthetic screen-detected agents. The recipient reads the body and
-atomically claims it through `muxa_inbox`, making repeated wake notifications
-idempotent at the request level.
+delivery. With `idle_only`, muxad injects a short notification for new requests
+and terminal replies, and only when the exact hook-authoritative participant
+is `Idle`. Message bodies never enter the terminal. It never injects into
+`Working`, `WaitingInput`, `WaitingChoice`, or `Error` panes, and never
+auto-wakes synthetic screen-detected agents.
+
+Reading a terminal result through `muxa_wait_reply` acknowledges it and
+prevents a later reply wake. Room context reports incoming unread requests and
+unacknowledged replies separately. `muxa_list_messages` is non-claiming history;
+the sender may cancel only while a request remains `queued`, before the
+recipient has claimed it.

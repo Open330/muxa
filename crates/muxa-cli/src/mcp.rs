@@ -24,7 +24,9 @@
 //! control plane.
 
 use anyhow::{bail, Result};
-use muxa::collaboration::{CollaborationOrigin, NewRequest, RequestKind, RequestStatus, WorkMode};
+use muxa::collaboration::{
+    CollaborationOrigin, NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
+};
 use muxa::event::AgentState;
 use muxa::ipc::Client;
 use muxa::state::{Agent, Transition};
@@ -246,7 +248,8 @@ fn initialize_result() -> Value {
         },
         "instructions": "muxa control plane. Use muxa_room_context to discover \
             same-window peers, muxa_send_message/muxa_inbox/muxa_reply for durable \
-            peer collaboration, and muxa_wait_reply for a structured result. Use \
+            peer collaboration, muxa_list_messages for lifecycle visibility, and \
+            muxa_wait_reply for a structured result. Use \
             muxa_status to see what agents \
             are doing, muxa_send_prompt to drive one, muxa_capture_pane to read \
             its screen, and muxa_wait_for_change to block until an agent changes \
@@ -327,7 +330,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_room_context",
-            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request count. Call this before addressing a peer.",
+            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Call this before addressing a peer.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
@@ -353,6 +356,17 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
+            "name": "muxa_list_messages",
+            "description": "List incoming, sent, or all collaboration requests for this exact agent session without claiming them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mailbox": { "type": "string", "enum": ["incoming", "sent", "all"], "description": "Default all." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
             "name": "muxa_reply",
             "description": "Finish a claimed request with a structured response. The response returns directly to the sender; do not type into its pane.",
             "inputSchema": {
@@ -376,6 +390,16 @@ fn tool_definitions() -> Vec<Value> {
                     "request_id": { "type": "string" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
                 },
+                "required": ["request_id"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_cancel_message",
+            "description": "Cancel a sent request only while it is still queued. A request already claimed by its recipient cannot be cancelled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "request_id": { "type": "string" } },
                 "required": ["request_id"],
                 "additionalProperties": false
             },
@@ -506,6 +530,20 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 Err(error) => error_result(&format!("inbox failed: {error}")),
             })
         }
+        "muxa_list_messages" => {
+            let mailbox = match parse_mailbox(args.get("mailbox").and_then(Value::as_str)) {
+                Ok(mailbox) => mailbox,
+                Err(error) => return Ok(error_result(error)),
+            };
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(match client.collaboration_list(&origin, mailbox).await {
+                Ok(requests) => json_result(&json!({ "requests": requests })),
+                Err(error) => error_result(&format!("list_messages failed: {error}")),
+            })
+        }
         "muxa_reply" => {
             let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
                 return Ok(error_result("reply requires a `request_id` argument"));
@@ -533,6 +571,23 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
             )
         }
         "muxa_wait_reply" => Ok(wait_for_reply(client, &args).await),
+        "muxa_cancel_message" => {
+            let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+                return Ok(error_result(
+                    "cancel_message requires a `request_id` argument",
+                ));
+            };
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client.collaboration_cancel(&origin, request_id).await {
+                    Ok(request) => json_result(&json!(request)),
+                    Err(error) => error_result(&format!("cancel_message failed: {error}")),
+                },
+            )
+        }
         other => Ok(error_result(&format!("unknown tool: {other}"))),
     }
 }
@@ -576,6 +631,15 @@ fn parse_reply_status(value: Option<&str>) -> std::result::Result<RequestStatus,
         Some("declined") => Ok(RequestStatus::Declined),
         Some("failed") => Ok(RequestStatus::Failed),
         _ => Err("status must be completed, blocked, declined, or failed"),
+    }
+}
+
+fn parse_mailbox(value: Option<&str>) -> std::result::Result<RequestMailbox, &'static str> {
+    match value.unwrap_or("all") {
+        "incoming" => Ok(RequestMailbox::Incoming),
+        "sent" => Ok(RequestMailbox::Sent),
+        "all" => Ok(RequestMailbox::All),
+        _ => Err("mailbox must be incoming, sent, or all"),
     }
 }
 
@@ -957,8 +1021,10 @@ mod tests {
                 "muxa_room_context",
                 "muxa_send_message",
                 "muxa_inbox",
+                "muxa_list_messages",
                 "muxa_reply",
                 "muxa_wait_reply",
+                "muxa_cancel_message",
             ],
         );
 
