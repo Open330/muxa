@@ -2532,6 +2532,28 @@ impl App {
         }
     }
 
+    /// Toggle the wide-screen inspector, and say which way it went.
+    ///
+    /// The hint carries real information here. The inspector is on by
+    /// default, so the first `Alt-I` *hides* a panel rather than
+    /// summoning one — and on a terminal under 120 columns nothing
+    /// visibly changes either way, because the panel had no room to
+    /// render. Both cases read as a dead key without a word from the
+    /// footer, which is how a working binding gets reported as broken.
+    fn toggle_inspector(&mut self) {
+        self.inspector_enabled = !self.inspector_enabled;
+        self.inspector_visible = false;
+        self.pane_capture = None;
+        self.set_hint(
+            if self.inspector_enabled {
+                "inspector enabled"
+            } else {
+                "inspector disabled"
+            },
+            HintLevel::Ok,
+        );
+    }
+
     /// Pre-format the pane label the way the user would read it in the
     /// table — `session:window.pane` when resolvable, raw `%id`
     /// otherwise. Lives on `App` because the panes inventory is here;
@@ -5189,17 +5211,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
             Action::None
         }
         "inspector" => {
-            app.inspector_enabled = !app.inspector_enabled;
-            app.inspector_visible = false;
-            app.pane_capture = None;
-            app.set_hint(
-                if app.inspector_enabled {
-                    "inspector enabled"
-                } else {
-                    "inspector disabled"
-                },
-                HintLevel::Ok,
-            );
+            app.toggle_inspector();
             Action::None
         }
         "sort latest" => Action::SetSort(WatchSortPreset::Latest),
@@ -5355,9 +5367,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 Action::None
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'i') => {
-                app.inspector_enabled = !app.inspector_enabled;
-                app.inspector_visible = false;
-                app.pane_capture = None;
+                app.toggle_inspector();
                 Action::None
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => {
@@ -14402,6 +14412,30 @@ sort = ["state"]
             alt_key_action(&mut app, 'k'),
             Action::AskConfirm(_)
         ));
+    }
+
+    #[test]
+    fn alt_i_says_which_way_the_inspector_went() {
+        // The inspector starts enabled, so the first Alt-I hides a panel
+        // instead of summoning one — and under 120 columns neither state
+        // renders anything. Silence made a working binding get reported
+        // as "only works on the second press".
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        assert!(app.inspector_enabled, "inspector is on by default");
+
+        assert!(matches!(alt_key_action(&mut app, 'i'), Action::None));
+        assert!(!app.inspector_enabled);
+        assert_eq!(
+            app.footer_hint.as_ref().map(|h| h.message.as_str()),
+            Some("inspector disabled")
+        );
+
+        assert!(matches!(alt_key_action(&mut app, 'i'), Action::None));
+        assert!(app.inspector_enabled);
+        assert_eq!(
+            app.footer_hint.as_ref().map(|h| h.message.as_str()),
+            Some("inspector enabled")
+        );
     }
 
     #[test]
