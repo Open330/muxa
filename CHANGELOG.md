@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.26] - 2026-08-05
+
+### Fixed
+
+- **`Alt-I` now says which way it toggled the inspector.** `:inspector` set a
+  footer hint; `Alt-I` ran the same toggle and said nothing. That silence is
+  what makes the binding look broken — the inspector is enabled by default, so
+  the first press *hides* a panel rather than summoning one, and below 120
+  columns neither state renders anything at all. It reads as "`Alt-I` only
+  works if I press it twice", when in fact the first press worked and turned
+  it off.
+
 ## [0.8.25] - 2026-08-05
 
 ### Fixed
@@ -1629,7 +1641,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.25...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.26...HEAD
+[0.8.26]: https://github.com/Open330/muxa/compare/v0.8.25...v0.8.26
 [0.8.25]: https://github.com/Open330/muxa/compare/v0.8.24...v0.8.25
 [0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24
 [0.8.23]: https://github.com/Open330/muxa/releases/tag/v0.8.23
