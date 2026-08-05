@@ -137,7 +137,7 @@ set -g status-right "#(muxa status-line --pane #{pane_id}) | %H:%M"
 Optional popups:
 
 ```tmux
-bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
 

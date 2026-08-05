@@ -70,7 +70,11 @@ selected children; process-tree detail shares the same secondary row when
 available.
 
 At 120 columns or wider, the selected pane's live capture stays visible in a
-right-hand inspector. `Alt-I` toggles it. Completion, error, and input/choice
+right-hand inspector. `Alt-I` toggles it. That 120 is the width `muxa watch`
+itself receives, not your terminal's: an inset `display-popup` subtracts its
+own inset *and* its border, so a 134-column terminal hands a `-w 90%` popup
+only 118. This is why the bundled `prefix + s` binding is borderless and
+full-client (`-B -w 100% -h 100%`). Completion, error, and input/choice
 transitions remain in a 50-entry in-process inbox opened with `Alt-E`; the
 header shows the unread count.
 
@@ -131,7 +135,7 @@ the current position, such as `2/3`, when more than one agent is available.
 ## tmux Popup Binding
 
 ```tmux
-bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
 

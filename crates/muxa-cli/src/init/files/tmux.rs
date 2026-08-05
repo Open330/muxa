@@ -18,8 +18,18 @@ use std::path::Path;
 pub const ENV_BLOCK_ID: &str = "tmux-env";
 
 /// The body that goes inside the `tmux-popup` marker block.
+///
+/// `muxa watch` gets the borderless full-client treatment (`-B`, `100%`,
+/// origin `0,0`) rather than an inset box, because its own wide-screen
+/// inspector needs 120 columns of *inner* width. An inset popup spends
+/// that budget twice over — `-w 90%` of a 134-column terminal is 120,
+/// and the border takes 2 more, landing at 118. The feature was
+/// unreachable on any terminal under ~136 columns, which is most of
+/// them. The dashboard has no such threshold and stays inset.
 pub const POPUP_BODY: &str = r#"# Muxa popups: watch all agents, or collaborate as the focused agent.
-bind-key s display-popup -E -w 90% -h 85% "muxa watch"
+# `muxa watch` is borderless and full-client so its wide-screen inspector
+# (120-column minimum, Alt-I) has the room to open.
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.

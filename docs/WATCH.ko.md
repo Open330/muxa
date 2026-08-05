@@ -79,6 +79,11 @@ session으로 이동하면 이전 session은 접히고 새 session이 펼쳐집�
 상시 표시됩니다. `Alt-I`로 끌 수 있으며 좁은 화면에서는 기존 preview popup을
 사용합니다.
 
+여기서 120은 터미널 폭이 아니라 `muxa watch`가 실제로 받는 폭입니다. inset
+`display-popup`은 inset과 테두리를 모두 깎기 때문에, 134 column 터미널에서
+`-w 90%` popup의 내부 폭은 118에 그칩니다. 기본 `prefix + s` 바인딩이
+테두리 없는 전체 화면(`-B -w 100% -h 100%`)인 이유입니다.
+
 working agent의 완료, error 진입, input/choice 대기는 watch 실행 중 event inbox에
 최대 50개까지 남습니다. header의 `◆ N new`가 아직 확인하지 않은 수이고 `Alt-E`로
 inbox를 열면 확인 처리됩니다.
@@ -139,7 +144,7 @@ agent pane이 여러 개 있으면 `]`로 다음 agent, `[`로 이전 agent를 �
 ## tmux Popup Binding
 
 ```tmux
-bind-key s display-popup -E -w 90% -h 80% "muxa watch"
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
 
