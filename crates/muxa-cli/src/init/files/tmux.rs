@@ -12,6 +12,9 @@ use std::path::Path;
 /// Not exposed in the user-facing component catalog — it's auto-managed
 /// alongside any other tmux block so users can't get the popup or
 /// statusline without socket propagation.
+///
+/// Written only for a socket that differs from `paths::default_socket()`;
+/// see `plan::needs_socket_pin` for why the default earns no pin.
 pub const ENV_BLOCK_ID: &str = "tmux-env";
 
 /// The body that goes inside the `tmux-popup` marker block.
@@ -52,6 +55,10 @@ set -g status-right "#(muxa status-line --needs-attention) #(muxa status-line --
 /// reboots — the runtime-only `tmux set-environment` we issue at init
 /// time is otherwise lost the moment the tmux server dies, which leaves
 /// every freshly-spawned pane unable to find muxad.
+///
+/// Reached only for a non-default socket. A pane resolves the default on
+/// its own, so pinning it would write this host's uid into a file that is
+/// often symlinked out of a dotfiles repo and shared across machines.
 pub fn env_body(socket: &std::path::Path) -> String {
     // Quote the path so a shell-special character in $XDG_RUNTIME_DIR
     // (rare but possible) doesn't break tmux's parser. Embedded `"` in

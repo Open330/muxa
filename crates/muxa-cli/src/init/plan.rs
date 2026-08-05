@@ -144,13 +144,16 @@ pub fn build(
         }
     }
 
-    // Whenever any tmux component is selected, also upsert/remove the
-    // auto-managed `tmux-env` block that pins MUXA_SOCKET. This is the
-    // only path that survives `tmux kill-server` — without it, the
-    // runtime `set-environment` issued at init time is lost the next time
-    // the tmux server restarts and every fresh pane ends up unable to
-    // find muxad. We always include SourceTmuxConf here because the env
-    // block may be brand-new even when popup/statusline are unchanged.
+    // Whenever any tmux component is selected, reconcile the auto-managed
+    // `tmux-env` block that pins MUXA_SOCKET. A *custom* socket needs the
+    // pin: it's the only path that survives `tmux kill-server`, and
+    // without it the runtime `set-environment` issued at init time is
+    // lost the next time the tmux server restarts. The default socket
+    // needs no pin at all — see `needs_socket_pin` — so this reconciles
+    // in both directions and will scrub a stale pin left by an earlier
+    // muxa. We always include SourceTmuxConf here because the env block
+    // may be brand-new (or newly removed) even when popup/statusline are
+    // unchanged.
     if tmux_selected {
         if let Some(path) = tmux_path {
             plan_tmux_env(direction, &path, socket, &mut actions)?;
@@ -238,6 +241,9 @@ fn plan_tmux_env(
         }
     }
     let (after, outcome) = match direction {
+        Direction::Install if !needs_socket_pin(socket, &muxa::paths::default_socket()) => {
+            files::tmux::remove_env(&latest)
+        }
         Direction::Install => files::tmux::upsert_env(&latest, socket),
         Direction::Uninstall => files::tmux::remove_env(&latest),
     };
@@ -251,6 +257,31 @@ fn plan_tmux_env(
         outcome,
     });
     Ok(())
+}
+
+/// Whether the resolved socket is worth writing into `~/.tmux.conf`.
+///
+/// Only a socket that differs from [`muxa::paths::default_socket`] is.
+/// Every muxa binary a pane runs calls that same function when
+/// `MUXA_SOCKET` is unset, so pinning the default tells a pane something
+/// it was going to compute anyway — while baking this host's uid
+/// (`/tmp/muxa-<uid>.sock`, `/run/user/<uid>/muxa.sock`) into a file
+/// people commonly symlink out of a dotfiles repo and share across
+/// machines. On the next machine the pin is simply wrong, and it wins
+/// over the correct value the binary would have derived.
+///
+/// A custom socket — `muxad`'s `config.toml` pointing somewhere else —
+/// is unguessable, so it still gets pinned. That is the case the block
+/// was added for.
+///
+/// This does not regress the cold-start story the pin was meant to cover.
+/// `muxad` injects its own socket into a running tmux server's global
+/// environment at startup (`should_heal_tmux_socket_env` in muxad), which
+/// handles a tmux server whose environment diverges from the one `muxa
+/// init` ran in. Between that heal and the pane's own `default_socket()`,
+/// a default-socket pin has no remaining job.
+fn needs_socket_pin(socket: &Path, default_socket: &Path) -> bool {
+    socket != default_socket
 }
 
 fn plan_tmux(
@@ -459,6 +490,10 @@ mod tests {
     use super::*;
     use crate::init::components::Component;
 
+    /// A socket `default_socket()` can never produce — its fallback form
+    /// is `/tmp/muxa-<uid>.sock`, always numeric after the dash. Tests
+    /// that want the pin planned must use a path like this, or they'd
+    /// silently depend on the uid of whoever runs them.
     fn fake_socket() -> PathBuf {
         PathBuf::from("/tmp/muxa-test.sock")
     }
@@ -484,8 +519,8 @@ mod tests {
         .unwrap();
 
         // Expected action order: popup edit → tmux-env edit → source.
-        // The env edit guarantees socket propagation lands in conf even
-        // when only the popup component was selected.
+        // A custom socket's propagation lands in conf even when only the
+        // popup component was selected.
         assert!(
             matches!(plan.actions.first(), Some(Action::EditFile { .. })),
             "first action must be the popup EditFile"
@@ -497,7 +532,7 @@ mod tests {
             .any(|a| matches!(a, Action::EditFile { after, .. } if after.contains("MUXA_SOCKET")));
         assert!(
             env_after,
-            "tmux-env block must be auto-included with any tmux component"
+            "a custom socket's tmux-env block must be auto-included with any tmux component"
         );
 
         assert!(
@@ -525,6 +560,64 @@ mod tests {
             )
         });
         assert!(pinned, "env block must pin the resolved socket path");
+    }
+
+    #[test]
+    fn default_socket_is_never_pinned_into_tmux_conf() {
+        // The pin's whole value is telling a pane something it can't
+        // derive. For the default socket it can, and writing it anyway
+        // bakes this host's uid into a file that is routinely symlinked
+        // out of a dotfiles repo onto other machines.
+        let d = Detection::default();
+        let plan = build(
+            Direction::Install,
+            &[Component::TmuxStatusLine, Component::TmuxPopup],
+            &d,
+            &muxa::paths::default_socket(),
+        )
+        .unwrap();
+        // Asserted as a delta, not as absence: these tests read the real
+        // `~/.tmux.conf`, so whoever runs them may well have the word
+        // MUXA_SOCKET in the file already (a stale pin, or a comment
+        // about one). "Never adds a pin, may remove one" is the actual
+        // contract, and it holds whatever the developer's file contains.
+        let pin = "set-environment -g MUXA_SOCKET";
+        for action in &plan.actions {
+            if let Action::EditFile { before, after, .. } = action {
+                let was = before.as_deref().unwrap_or_default().matches(pin).count();
+                let now = after.matches(pin).count();
+                assert!(
+                    now <= was,
+                    "planning the default socket must never add a pin (had {was}, planned {now})"
+                );
+            }
+        }
+
+        // The reconcile still has to run and still has to be sourced —
+        // that is what scrubs a pin an older muxa already wrote.
+        assert!(
+            matches!(plan.actions.last(), Some(Action::SourceTmuxConf { .. })),
+            "removal must still be sourced so the stale pin stops applying"
+        );
+    }
+
+    #[test]
+    fn only_a_socket_off_the_default_earns_a_pin() {
+        let default = PathBuf::from("/run/user/1044/muxa.sock");
+        assert!(
+            !needs_socket_pin(&default, &default),
+            "a pane derives the default itself"
+        );
+        assert!(
+            needs_socket_pin(&PathBuf::from("/var/run/muxa-custom.sock"), &default),
+            "a config-overridden socket is unguessable and must be pinned"
+        );
+        // `Path`'s comparison walks components, so a redundant `.` is not
+        // mistaken for a custom socket and does not earn a spurious pin.
+        assert!(!needs_socket_pin(
+            &PathBuf::from("/run/user/1044/./muxa.sock"),
+            &default
+        ));
     }
 
     #[test]
