@@ -601,15 +601,17 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect) {
     // Right-aligned on the same border row as the header. A box too
     // narrow to hold both would render them overlapping, so the stamp
     // yields to the identity that makes the pane jumpable.
+    //
+    // Plain `Gray`, deliberately: the box has a legibility ladder —
+    // summary (Cyan+BOLD) → prompt (White) → response (Gray+DIM) →
+    // backdrop (DarkGray+DIM, the tier that means "ignore me"). The
+    // stamp used to carry that last style, so the one number telling you
+    // whether a prompt landed a minute or a day ago read as noise. It
+    // belongs a notch under the prompt it annotates, not under the
+    // dimmed capture.
     let block = match age_stamp(cell) {
         Some(stamp) if fits_alongside_header(&header, &stamp, rect.width) => block.title_top(
-            Line::from(Span::styled(
-                stamp,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            ))
-            .right_aligned(),
+            Line::from(Span::styled(stamp, Style::default().fg(Color::Gray))).right_aligned(),
         ),
         _ => block,
     };
