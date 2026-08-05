@@ -47,6 +47,29 @@ row per pane.
 | `f` | Toggle popup/fullscreen preview. |
 | `Alt-L/D/S/T` | Sort by latest / duration / session / attention state. |
 
+### If `Alt` does nothing on macOS
+
+macOS treats Option as a compose key unless the terminal is told otherwise, so
+`Alt-I` arrives as `ˆ` and `Alt-E` as `´` — the keystroke never reaches watch.
+Whether you hit this depends on the terminal and the active keyboard layout;
+Ghostty, for one, only enables Alt by default on the U.S. Standard and U.S.
+International layouts.
+
+- **Ghostty** — `macos-option-as-alt = left` in
+  `~/Library/Application Support/com.mitchellh.ghostty/config` (that path
+  overrides `~/.config/ghostty/config` on macOS), then `cmd+shift+,` to reload.
+  `left` keeps the right Option free for composing characters; `true` claims
+  both.
+- **iTerm2** — Settings → Profiles → Keys → *Left Option key* → **Esc+**.
+- **Terminal.app** — Settings → Profiles → Keyboard → *Use Option as Meta key*.
+
+To check: run `cat -v` and press `Alt-I`. `^[i` means it works, `ˆ` means it
+does not.
+
+Every `Alt` binding also has an `Alt`-free equivalent in the command palette
+(`:inspector`, `:events`, `:preview`, …), which works regardless of terminal
+configuration.
+
 ## Filter, Inspector, and Events
 
 Printable characters immediately narrow the table case-insensitively. While

@@ -50,6 +50,26 @@ muxa watch --include-paneless
 | `Alt-S` | session grouping 정렬. |
 | `Alt-T` | attention state 우선 정렬. |
 
+### macOS에서 `Alt`가 안 먹을 때
+
+macOS는 터미널이 따로 지정하지 않는 한 Option을 조합(compose) 키로 처리합니다.
+그래서 `Alt-I`는 `ˆ`, `Alt-E`는 `´`로 입력되고 keystroke 자체가 watch까지
+오지 않습니다. 터미널과 활성 키보드 레이아웃에 따라 다른데, Ghostty의 경우
+U.S. Standard / U.S. International 레이아웃에서만 기본으로 Alt가 켜집니다.
+
+- **Ghostty** — `~/Library/Application Support/com.mitchellh.ghostty/config`에
+  `macos-option-as-alt = left` (macOS에서는 이 경로가
+  `~/.config/ghostty/config`를 덮어씁니다). 저장 후 `cmd+shift+,`로 reload.
+  `left`면 오른쪽 Option은 특수문자 입력용으로 남고, `true`면 양쪽 다 Alt가
+  됩니다.
+- **iTerm2** — Settings → Profiles → Keys → *Left Option key* → **Esc+**.
+- **Terminal.app** — Settings → Profiles → Keyboard → *Use Option as Meta key*.
+
+확인 방법: `cat -v` 실행 후 `Alt-I`. `^[i`가 찍히면 정상, `ˆ`면 아직 안 된 것.
+
+모든 `Alt` 바인딩은 command palette에 `Alt` 없는 대체 경로가 있습니다
+(`:inspector`, `:events`, `:preview` 등). 터미널 설정과 무관하게 동작합니다.
+
 ## 검색과 Attention
 
 table에서 일반 문자를 입력하면 즉시 대소문자 구분 없는 필터가 적용됩니다. 검색어가
