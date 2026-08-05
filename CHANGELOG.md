@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.25] - 2026-08-05
+
+### Fixed
+
+- **`muxa watch`'s popup is wide enough for its own inspector.** The
+  `prefix + s` binding opened watch in a `-w 90%` popup, but the wide-screen
+  inspector needs 120 columns of *inner* width and an inset popup spends that
+  budget twice — 90% of a 134-column terminal is 120, then the border takes 2
+  more, handing watch 118. The cutoff sat at roughly a 136-column terminal, so
+  on most displays `Alt-I` appeared to do nothing. watch now gets the same
+  borderless full-client popup peek already uses. Existing installs pick this
+  up on the next `muxa init`.
+
+### Documentation
+
+- `docs/WATCH.md` explains why `Alt` bindings do nothing on macOS (Option is a
+  compose key until the terminal opts out), with the fix for Ghostty, iTerm2,
+  and Terminal.app, and a pointer to the command palette — which covers every
+  `Alt` binding without any terminal configuration.
+
 ## [0.8.24] - 2026-08-05
 
 ### Added
@@ -1609,7 +1629,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.24...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.25...HEAD
+[0.8.25]: https://github.com/Open330/muxa/compare/v0.8.24...v0.8.25
 [0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24
 [0.8.23]: https://github.com/Open330/muxa/releases/tag/v0.8.23
 [0.8.22]: https://github.com/Open330/muxa/releases/tag/v0.8.22
