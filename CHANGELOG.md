@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.24] - 2026-08-05
+
 ### Added
 
 - **`muxa peek` — `display-panes` with context.** Takes over `prefix + q`
@@ -23,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `muxa init --component tmux-peek` (uninstall restores stock
   `display-panes`); `muxa peek --plain` prints the same per-pane lines as
   text.
+
+### Fixed
+
+- **`muxa init` no longer writes this host's socket path into
+  `~/.tmux.conf`.** The `tmux-env` block pinned
+  `MUXA_SOCKET=/tmp/muxa-<uid>.sock` on every install, which is wrong on any
+  other machine that shares the file through a dotfiles repo — and redundant
+  on this one, since every muxa binary derives that same path itself. Only a
+  socket that muxad's config points somewhere custom still gets pinned.
+  Existing installs have their stale pin scrubbed on the next `muxa init`.
+- **`muxa peek`'s prompt age is legible.** The timestamp on the box border
+  carried the exact style the overlay uses for the dimmed pane capture
+  behind it, so the one number telling you whether a prompt landed a minute
+  or a day ago read as background noise.
 
 ## [0.8.23] - 2026-08-03
 
@@ -1593,7 +1609,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.23...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.24...HEAD
+[0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24
 [0.8.23]: https://github.com/Open330/muxa/releases/tag/v0.8.23
 [0.8.22]: https://github.com/Open330/muxa/releases/tag/v0.8.22
 [0.8.21]: https://github.com/Open330/muxa/releases/tag/v0.8.21
