@@ -628,13 +628,25 @@ pub(crate) fn resolve_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
 fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
     let mut columns = resolve_columns(cfg);
     if cfg.view == WatchView::Session && !columns.contains(&WatchColumn::SessionTime) {
+        // The default layout carries STATE (glyph + state + age). In session
+        // view the leftmost cluster of the SESSION cell already shows every
+        // state as icon-with-count, so a STATE column is the same fact
+        // twice — and 12 columns wide. Swap it for DUR rather than keeping
+        // both; DUR + ACT is the whole timing story.
         if columns.as_slice()
             == [
                 WatchColumn::Pane,
-                WatchColumn::State,
+                WatchColumn::StateAge,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
             ]
+            || columns.as_slice()
+                == [
+                    WatchColumn::Pane,
+                    WatchColumn::State,
+                    WatchColumn::Activity,
+                    WatchColumn::Prompt,
+                ]
         {
             columns = vec![
                 WatchColumn::Pane,
@@ -1329,6 +1341,37 @@ struct CollaborationMailboxState {
     open: bool,
     tab: CollaborationMailboxTab,
     selected: usize,
+    /// Extra rows for the selected-request detail, cycled with `|`:
+    /// compact → half → most of the popup. Long request bodies are the
+    /// point of opening the mailbox at all.
+    detail_expand: MailboxDetail,
+}
+
+/// Detail-pane sizing steps inside the collaboration mailbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum MailboxDetail {
+    #[default]
+    Compact,
+    Half,
+    Most,
+}
+
+impl MailboxDetail {
+    fn next(self) -> Self {
+        match self {
+            Self::Compact => Self::Half,
+            Self::Half => Self::Most,
+            Self::Most => Self::Compact,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Half => "half",
+            Self::Most => "expanded",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5863,6 +5906,13 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
             move_collaboration_mailbox(app, -1);
             Action::None
         }
+        KeyCode::Char('|') => {
+            app.collaboration_mailbox.detail_expand =
+                app.collaboration_mailbox.detail_expand.next();
+            let label = app.collaboration_mailbox.detail_expand.label();
+            app.set_hint(format!("mailbox detail: {label}"), HintLevel::Ok);
+            Action::None
+        }
         KeyCode::Char('i') => Action::ClaimCollaborationInbox,
         KeyCode::Char('e') => {
             open_watch_collaboration_reply_composer(app);
@@ -6590,7 +6640,20 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
                 .as_ref()
                 .is_some_and(|reply| !reply.air_artifacts.is_empty())
     });
-    let detail_height = if has_air { 8 } else { 6 };
+    let detail_height = match app.collaboration_mailbox.detail_expand {
+        MailboxDetail::Compact => {
+            if has_air {
+                8
+            } else {
+                6
+            }
+        }
+        MailboxDetail::Half => inner.height / 2,
+        // Leave the list three rows: enough to keep selection context
+        // without stealing the reading space the user just asked for.
+        MailboxDetail::Most => inner.height.saturating_sub(3),
+    }
+    .max(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
@@ -7629,10 +7692,41 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
+/// Below this table width the SUMMARY column folds away entirely.
+///
+/// Squeezing every column keeps SUMMARY alive as a four-character scrap
+/// while truncating the one column that identifies the row — at the 30/70
+/// inspector split the session *names* were the casualty. Names are why
+/// the table exists; a summary that narrow was already unreadable.
+const SUMMARY_MIN_TABLE_WIDTH: u16 = 60;
+
+/// Below this width even the activity column goes: name, state and
+/// duration are the irreducible row identity.
+const ACTIVITY_MIN_TABLE_WIDTH: u16 = 48;
+
+/// The columns the table actually renders at `table_width`.
+fn effective_columns(columns: &[WatchColumn], table_width: u16) -> Vec<WatchColumn> {
+    if table_width >= SUMMARY_MIN_TABLE_WIDTH || columns.len() <= 1 {
+        return columns.to_vec();
+    }
+    let trimmed: Vec<WatchColumn> = columns
+        .iter()
+        .copied()
+        .filter(|c| !matches!(c, WatchColumn::Prompt))
+        .filter(|c| table_width >= ACTIVITY_MIN_TABLE_WIDTH || !matches!(c, WatchColumn::Activity))
+        .collect();
+    if trimmed.is_empty() {
+        columns.to_vec()
+    } else {
+        trimmed
+    }
+}
+
 #[allow(clippy::too_many_lines)] // column resolution + per-row cell/badge/pulse
                                  // assembly reads better inline than split across helpers
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let columns = effective_columns(&app.columns, area.width);
     let visible_targets = app.visible_targets();
 
     // Empty grid reads as "muxa is broken" rather than "nothing is
@@ -7644,7 +7738,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let header_cells = app.columns.iter().map(|c| {
+    let header_cells = columns.iter().map(|c| {
         let header = if app.watch_cfg.view == WatchView::Session && matches!(c, WatchColumn::Pane) {
             "SESSION"
         } else if matches!(c, WatchColumn::Prompt) && app.watch_cfg.summary != WatchSummary::Prompt
@@ -7662,8 +7756,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 
     let now = OffsetDateTime::now_utc();
     let selected = app.table_state.selected();
-    let detail_host = detail_host_column(&app.columns);
-    let status_host = status_host_column(&app.columns);
+    let detail_host = detail_host_column(&columns);
+    let status_host = status_host_column(&columns);
     let spin = Spinner {
         frame: app.anim_frame,
         enabled: app.watch_cfg.spinner && icons_unicode(),
@@ -7673,18 +7767,14 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // *fields* — calling an `&self` method inside it would capture all of
     // `app` and clash with the `&mut app.table_state` render below.
     let anim_frame = app.anim_frame;
-    let state_col = app
-        .columns
+    let state_col = columns
         .iter()
         .position(|c| matches!(c, WatchColumn::State | WatchColumn::StateAge));
     // Host badges: only when the row set spans >1 host (the cross-
     // multiplexer console) do we tag each row's SESSION/PANE cell, so a
     // single-host user sees no change. The Pane column is the natural
     // host-identifying slot in both the session and pane views.
-    let pane_col = app
-        .columns
-        .iter()
-        .position(|c| matches!(c, WatchColumn::Pane));
+    let pane_col = columns.iter().position(|c| matches!(c, WatchColumn::Pane));
     let multi_host = rows_multi_host(&app.rows);
     let row_pulses = resolve_row_pulses(app);
     let target_pulses: Vec<Option<PulseKind>> = visible_targets
@@ -7712,7 +7802,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 _ => None,
             };
             let mut texts: Vec<Text> = if let Some(agent) = child_agent {
-                app.columns
+                columns
                     .iter()
                     .map(|c| {
                         c.agent_text(agent, now, &app.panes, theme, spin, app.watch_cfg.summary)
@@ -7720,16 +7810,14 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                     .collect()
             } else {
                 match r {
-                    WatchRow::Agent(a) => app
-                        .columns
+                    WatchRow::Agent(a) => columns
                         .iter()
                         .map(|c| {
                             c.agent_text(a, now, &app.panes, theme, spin, app.watch_cfg.summary)
                         })
                         .collect(),
-                    WatchRow::BarePane(p) => app.columns.iter().map(|c| c.bare_text(p)).collect(),
-                    WatchRow::Session(s) => app
-                        .columns
+                    WatchRow::BarePane(p) => columns.iter().map(|c| c.bare_text(p)).collect(),
+                    WatchRow::Session(s) => columns
                         .iter()
                         .map(|c| {
                             c.session_text(s, now, &app.panes, theme, spin, app.watch_cfg.summary)
@@ -7806,10 +7894,20 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let widths: Vec<Constraint> = app
-        .columns
+    // When SUMMARY folded away, its width has to land somewhere useful:
+    // promote the name column from its fixed length to a Min so it absorbs
+    // the slack instead of leaving it as dead space next to truncated names
+    // — the truncation was the whole reason to fold.
+    let summary_folded = columns.len() != app.columns.len();
+    let widths: Vec<Constraint> = columns
         .iter()
-        .map(|c| resolve_width(*c, &app.watch_cfg))
+        .map(|c| {
+            if summary_folded && matches!(c, WatchColumn::Pane) {
+                Constraint::Min(12)
+            } else {
+                resolve_width(*c, &app.watch_cfg)
+            }
+        })
         .collect();
 
     let table = Table::new(rows, widths)
@@ -8605,6 +8703,8 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw("claim  "),
             Span::styled(" e ", theme.action_badge()),
             Span::raw("reply  "),
+            Span::styled(" | ", theme.key_badge()),
+            Span::raw("detail size  "),
             Span::styled(" Esc/b ", theme.key_badge()),
             Span::raw("close"),
         ];
@@ -9189,6 +9289,33 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn narrow_tables_fold_the_summary_column_before_the_name() {
+        let cols = vec![
+            WatchColumn::Pane,
+            WatchColumn::SessionTime,
+            WatchColumn::Activity,
+            WatchColumn::Prompt,
+        ];
+        // Wide enough: everything stays.
+        assert_eq!(effective_columns(&cols, 60), cols);
+        // Narrow: SUMMARY folds, the identifying columns survive intact.
+        assert_eq!(
+            effective_columns(&cols, 59),
+            vec![
+                WatchColumn::Pane,
+                WatchColumn::SessionTime,
+                WatchColumn::Activity,
+            ]
+        );
+        // A prompt-only layout keeps its one column rather than rendering
+        // an empty table.
+        assert_eq!(
+            effective_columns(&[WatchColumn::Prompt], 10),
+            vec![WatchColumn::Prompt]
+        );
     }
 
     #[test]
@@ -10661,11 +10788,14 @@ mod tests {
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
+        // STATE is deliberately absent: the SESSION cell's leftmost cluster
+        // already shows every state as icon-with-count, so the column said
+        // the same thing twice at twelve columns' cost. DUR + ACT carry the
+        // timing story.
         assert_eq!(
             app.columns,
             vec![
                 WatchColumn::Pane,
-                WatchColumn::StateAge,
                 WatchColumn::SessionTime,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,

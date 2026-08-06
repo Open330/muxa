@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Narrow tables fold SUMMARY (then ACT) instead of truncating names.**
+  At the 30/70 split every column got squeezed and the session *names* were
+  the casualty — four-character scraps identifying nothing, next to a
+  summary column that was itself unreadable at that width. Below 60 table
+  columns SUMMARY folds away and the name column absorbs the slack; below
+  48, ACT follows. Names are why the table exists.
+- **Session view drops the STATE column: DUR + ACT tell the timing story.**
+  The SESSION cell's leftmost cluster already shows every state as
+  icon-with-count, so a 12-column STATE said the same thing twice while
+  SUMMARY starved. (The old default-swap matched `state` but the shipped
+  default is `state_age` — the swap never fired, which is how both columns
+  ended up on screen.) Configured column lists are untouched.
+- **`|` in the mailbox cycles the selected-request detail: compact → half →
+  expanded.** Long request bodies are the point of opening the mailbox;
+  six fixed rows made anything substantial unreadable.
 - **`|` cycles the watch list/inspector split: 50/50 → 70/30 → 30/70.** The
   split was hard-coded at roughly half-and-half; reading a long prompt in the
   inspector or scanning a wide table both wanted the other bias. Presets over
