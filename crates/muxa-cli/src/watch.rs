@@ -935,6 +935,15 @@ pub(crate) enum QuickAction {
     SendPrompt { pane_id: String, text: String },
     /// Toggle the `?` help overlay. Pure UI — no side-effects.
     ShowHelp,
+    /// Create a detached tmux session at `dir` and start an agent in it
+    /// with its first prompt already on the command line. The launch
+    /// string is fully assembled (and shell-quoted) by the spawn form so
+    /// the dispatcher stays a dumb pipe.
+    SpawnSession {
+        dir: String,
+        agent_label: &'static str,
+        launch: String,
+    },
 }
 
 /// Outcome of running a [`QuickAction`] — surfaced to the run loop
@@ -974,6 +983,11 @@ pub(crate) trait Effects {
     /// Enter after a short grace delay. Return Ok only if both tmux
     /// calls succeed.
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String>;
+    /// Create a detached tmux session rooted at `dir` and type `launch`
+    /// into it. Returns the session name actually created — derived from
+    /// the directory, deduplicated, never reusing or replacing an
+    /// existing session.
+    fn spawn_session(&mut self, dir: &str, launch: &str) -> std::result::Result<String, String>;
 }
 
 /// Real-world `Effects` impl — shells out to tmux and the system
@@ -997,6 +1011,25 @@ impl Effects for RealEffects {
             |args| run_status("tmux", args),
             std::thread::sleep,
         )
+    }
+
+    fn spawn_session(&mut self, dir: &str, launch: &str) -> std::result::Result<String, String> {
+        let existing: Vec<String> = muxa::tmux::tmux_command()
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let name = unique_session_name(session_base_name(dir), |candidate| {
+            existing.iter().any(|s| s == candidate)
+        });
+        run_status("tmux", &["new-session", "-d", "-s", &name, "-c", dir])?;
+        run_status("tmux", &["send-keys", "-t", &name, "--", launch, "Enter"])?;
+        Ok(name)
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String> {
@@ -1177,6 +1210,16 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             Ok(via) => ActionOutcome::Ok(format!("✔ copied prompt via {via}")),
             Err(e) => ActionOutcome::Err(format!("✗ copy failed: {e}")),
         },
+        QuickAction::SpawnSession {
+            dir,
+            agent_label,
+            launch,
+        } => match fx.spawn_session(&dir, &launch) {
+            Ok(name) => ActionOutcome::Ok(format!(
+                "spawned {agent_label} in session {name} — Enter on its row to attach"
+            )),
+            Err(e) => ActionOutcome::Err(format!("spawn failed: {e}")),
+        },
         QuickAction::SendPrompt { pane_id, text } => match fx.send_prompt(&pane_id, &text) {
             Ok(()) => ActionOutcome::Ok(format!("✔ sent prompt to {pane_id}")),
             Err(e) => ActionOutcome::Err(format!("✗ send failed: {e}")),
@@ -1215,6 +1258,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach to selected pane",
+        "  n              new agent session (dir · agent · first prompt)",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
@@ -1273,6 +1317,130 @@ pub(crate) struct ConfirmPopup {
 /// Inline prompt composer opened from the table with Enter. It pins the
 /// target pane at open time so background refreshes or resorting cannot
 /// redirect a typed prompt to a different row.
+/// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SpawnAgent {
+    #[default]
+    Claude,
+    Codex,
+    Gemini,
+    Opencode,
+}
+
+impl SpawnAgent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Opencode => "opencode",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::Gemini,
+            Self::Gemini => Self::Opencode,
+            Self::Opencode => Self::Claude,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Claude => Self::Opencode,
+            Self::Codex => Self::Claude,
+            Self::Gemini => Self::Codex,
+            Self::Opencode => Self::Gemini,
+        }
+    }
+
+    /// The interactive launch line, first prompt included, so the agent
+    /// boots already working — no fragile "wait for the REPL, then type"
+    /// timing. Mirrors callabo-resolve's launcher matrix, bypass flags
+    /// included: a spawned session is fire-and-forget by construction, and
+    /// an agent parked on its first permission prompt in a window nobody
+    /// is watching never runs the command it was created for.
+    fn launch_command(self, prompt: &str) -> String {
+        let quoted = shell_single_quote(prompt);
+        match self {
+            Self::Claude => format!("claude --dangerously-skip-permissions {quoted}"),
+            Self::Codex => {
+                format!("codex --dangerously-bypass-approvals-and-sandbox {quoted}")
+            }
+            Self::Gemini => format!("gemini --approval-mode yolo --skip-trust -i {quoted}"),
+            Self::Opencode => format!("opencode --prompt {quoted}"),
+        }
+    }
+}
+
+/// POSIX-safe single quoting: close, escape the quote, reopen.
+fn shell_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// tmux session names cannot contain `.` or `:`; everything else from a
+/// directory basename passes through.
+fn session_base_name(dir: &str) -> String {
+    let base = std::path::Path::new(dir)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("agent");
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c == '.' || c == ':' { '-' } else { c })
+        .collect();
+    if cleaned.is_empty() {
+        "agent".into()
+    } else {
+        cleaned
+    }
+}
+
+/// First free name among `base`, `base-2`, `base-3`, … — spawning must
+/// never reuse or replace a session someone is working in.
+fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
+    if !exists(&base) {
+        return base;
+    }
+    (2..10_000)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !exists(candidate))
+        .unwrap_or_else(|| format!("{base}-overflow"))
+}
+
+/// Fields of the spawn form, in Tab order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SpawnField {
+    Dir,
+    Agent,
+    #[default]
+    Prompt,
+}
+
+/// `n` — launch a brand-new agent session from inside watch: where
+/// (cwd), what (agent CLI), and its first prompt, delivered on the
+/// launch command line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SpawnComposer {
+    dir: String,
+    dir_cursor: usize,
+    agent: SpawnAgent,
+    prompt: String,
+    prompt_cursor: usize,
+    focus: SpawnField,
+}
+
+impl SpawnComposer {
+    fn field_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+        match self.focus {
+            SpawnField::Dir => Some((&mut self.dir, &mut self.dir_cursor)),
+            SpawnField::Prompt => Some((&mut self.prompt, &mut self.prompt_cursor)),
+            SpawnField::Agent => None,
+        }
+    }
+}
+
 /// The three table/inspector splits `|` cycles through. Presets rather
 /// than free resize: two keystrokes reach any of them, and a TUI resize
 /// mode would cost a modal state for a knob that has three useful values.
@@ -1308,6 +1476,47 @@ impl InspectorSplit {
             Self::InspectorWide => "30/70",
         }
     }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "50/50" => Some(Self::Balanced),
+            "70/30" => Some(Self::ListWide),
+            "30/70" => Some(Self::InspectorWide),
+            _ => None,
+        }
+    }
+}
+
+/// Persist the cycled split next to the persisted sort, so the divider a
+/// user drags into place survives the popup closing.
+fn persist_watch_inspector_split(path: &Path, label: &str) -> std::result::Result<(), String> {
+    let original = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut doc = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    };
+    match doc.get("watch") {
+        Some(toml_edit::Item::Table(_)) | None => {}
+        Some(_) => return Err("[watch] is not a table".to_string()),
+    }
+    if doc.get("watch").is_none() {
+        doc["watch"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let watch = doc["watch"]
+        .as_table_mut()
+        .ok_or_else(|| "[watch] is not a table".to_string())?;
+    watch["inspector_split"] = toml_edit::value(label);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1709,6 +1918,8 @@ pub(crate) struct App {
     inspector_split: InspectorSplit,
     collaboration_mailbox: CollaborationMailboxState,
     collaboration_composer: Option<CollaborationComposer>,
+    /// `Some` while the `n` spawn form is open.
+    spawn: Option<SpawnComposer>,
     /// Editable `:` command palette. Like other overlays it owns keyboard
     /// input until Enter executes or Esc cancels.
     pub command_palette: Option<CommandPalette>,
@@ -1804,6 +2015,11 @@ impl App {
 
     pub(crate) fn with_config(cfg: WatchConfig) -> Self {
         let columns = resolve_display_columns(&cfg);
+        let inspector_split = cfg
+            .inspector_split
+            .as_deref()
+            .and_then(InspectorSplit::from_label)
+            .unwrap_or_default();
         Self {
             rows: Vec::new(),
             table_state: TableState::default(),
@@ -1837,9 +2053,10 @@ impl App {
             confirm: None,
             collaboration: WatchCollaboration::default(),
             collaboration_scope: muxa::config::CollaborationScope::default(),
-            inspector_split: InspectorSplit::default(),
+            inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
+            spawn: None,
             command_palette: None,
             help_open: false,
             footer_hint: None,
@@ -4398,6 +4615,26 @@ pub async fn run(
                         }
                     }
                 }
+                Action::InspectorSplitChanged => {
+                    let label = app.inspector_split.label();
+                    let saved = sort_persist_path
+                        .as_deref()
+                        .map(|path| persist_watch_inspector_split(path, label));
+                    match saved {
+                        Some(Ok(())) => {
+                            app.set_hint(format!("list/inspector {label} (saved)"), HintLevel::Ok);
+                        }
+                        Some(Err(e)) => {
+                            app.set_hint(
+                                format!("list/inspector {label} (save failed: {e})"),
+                                HintLevel::Warn,
+                            );
+                        }
+                        None => {
+                            app.set_hint(format!("list/inspector {label}"), HintLevel::Ok);
+                        }
+                    }
+                }
                 Action::SetSort(preset) => {
                     app.apply_sort_preset(preset);
                     match sort_persist_path.as_deref() {
@@ -5181,6 +5418,9 @@ pub(crate) enum Action {
     SubmitCollaboration,
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
+    /// `|` moved the list/inspector divider; the run loop persists the new
+    /// ratio next to the persisted sort and reports it in one hint.
+    InspectorSplitChanged,
     /// Atomically claim the current agent's pending inbox.
     ClaimCollaborationInbox,
     /// Open a confirm popup for a destructive [`QuickAction`]. The
@@ -5307,11 +5547,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "m" | "message" => Action::OpenCollaborationMessage,
         "split" => {
             app.inspector_split = app.inspector_split.next();
-            app.set_hint(
-                format!("list/inspector {}", app.inspector_split.label()),
-                HintLevel::Ok,
-            );
-            Action::None
+            Action::InspectorSplitChanged
         }
         "b" | "mailbox" => Action::OpenCollaborationMailbox,
         "copy" | "yank" => quick_copy_action(app),
@@ -5416,6 +5652,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if app.collaboration_composer.is_some() {
         return handle_collaboration_composer_event(code, modifiers, app);
+    }
+
+    if app.spawn.is_some() {
+        return handle_spawn_event(code, modifiers, app);
     }
 
     if app.command_palette.is_some() {
@@ -5588,13 +5828,23 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
         KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
         KeyCode::Char('m') if app.browse_keys_active() => Action::OpenCollaborationMessage,
+        KeyCode::Char('n') if app.browse_keys_active() => {
+            let dir =
+                std::env::current_dir().map_or_else(|_| "~".into(), |p| p.display().to_string());
+            // Cursor at the end of the prefill — editing a path means
+            // appending or trimming, and a cursor at column zero turns the
+            // first keystroke into a prefix splice.
+            let dir_cursor = dir.chars().count();
+            app.spawn = Some(SpawnComposer {
+                dir,
+                dir_cursor,
+                ..SpawnComposer::default()
+            });
+            Action::None
+        }
         KeyCode::Char('|') if app.browse_keys_active() => {
             app.inspector_split = app.inspector_split.next();
-            app.set_hint(
-                format!("list/inspector {}", app.inspector_split.label()),
-                HintLevel::Ok,
-            );
-            Action::None
+            Action::InspectorSplitChanged
         }
         KeyCode::Char('b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('h') if app.browse_keys_active() => {
@@ -5727,6 +5977,106 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
             Action::None
         }
         _ => Action::None,
+    }
+}
+
+/// The spawn form: three fields, Tab-ordered; `Left`/`Right` cycle the
+/// agent when it has focus and move the text cursor otherwise. Enter
+/// launches from any field so a finished thought never needs a Tab first.
+fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    let Some(spawn) = app.spawn.as_mut() else {
+        return Action::None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.spawn = None;
+            Action::None
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            spawn.focus = match spawn.focus {
+                SpawnField::Dir => SpawnField::Agent,
+                SpawnField::Agent => SpawnField::Prompt,
+                SpawnField::Prompt => SpawnField::Dir,
+            };
+            Action::None
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            spawn.focus = match spawn.focus {
+                SpawnField::Dir => SpawnField::Prompt,
+                SpawnField::Agent => SpawnField::Dir,
+                SpawnField::Prompt => SpawnField::Agent,
+            };
+            Action::None
+        }
+        KeyCode::Left if spawn.focus == SpawnField::Agent => {
+            spawn.agent = spawn.agent.prev();
+            Action::None
+        }
+        KeyCode::Right if spawn.focus == SpawnField::Agent => {
+            spawn.agent = spawn.agent.next();
+            Action::None
+        }
+        KeyCode::Enter => {
+            let dir = spawn.dir.trim().to_string();
+            let prompt = spawn.prompt.trim().to_string();
+            if dir.is_empty() || prompt.is_empty() {
+                app.set_hint(
+                    "spawn needs a directory and a first prompt",
+                    HintLevel::Warn,
+                );
+                return Action::None;
+            }
+            let dir = if let Some(rest) = dir.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest).display().to_string())
+                    .unwrap_or(dir)
+            } else if dir == "~" {
+                dirs::home_dir()
+                    .map(|h| h.display().to_string())
+                    .unwrap_or(dir)
+            } else {
+                dir
+            };
+            if !std::path::Path::new(&dir).is_dir() {
+                app.set_hint(format!("not a directory: {dir}"), HintLevel::Err);
+                return Action::None;
+            }
+            let agent = spawn.agent;
+            app.spawn = None;
+            Action::Quick(QuickAction::SpawnSession {
+                launch: agent.launch_command(&prompt),
+                agent_label: agent.label(),
+                dir,
+            })
+        }
+        other => {
+            if let Some((text, cursor)) = spawn.field_mut() {
+                spawn_edit_text(other, modifiers, text, cursor);
+            }
+            Action::None
+        }
+    }
+}
+
+/// UTF-8-safe single-line editing shared by the spawn form's text fields.
+fn spawn_edit_text(code: KeyCode, modifiers: KeyModifiers, text: &mut String, cursor: &mut usize) {
+    match code {
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            let idx = char_to_byte_idx(text, *cursor);
+            text.insert(idx, c);
+            *cursor += 1;
+        }
+        KeyCode::Backspace if *cursor > 0 => {
+            let start = char_to_byte_idx(text, *cursor - 1);
+            let end = char_to_byte_idx(text, *cursor);
+            text.replace_range(start..end, "");
+            *cursor -= 1;
+        }
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(text.chars().count()),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = text.chars().count(),
+        _ => {}
     }
 }
 
@@ -6261,6 +6611,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
+    if app.spawn.is_some() {
+        let popup_area = spawn_popup_rect(chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_spawn(f, popup_area, app);
+    }
     if app.command_palette.is_some() {
         let popup_area = command_popup_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
@@ -6479,6 +6834,80 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
     ];
     let paragraph = Paragraph::new(body).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Five rows anchored to the bottom: three fields plus the border pair.
+fn spawn_popup_rect(r: Rect) -> Rect {
+    let height = 5.min(r.height);
+    Rect {
+        x: r.x,
+        y: r.y + r.height - height,
+        width: r.width,
+        height,
+    }
+}
+
+fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(spawn) = app.spawn.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " new agent session ",
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let focus_marker = |field: SpawnField| {
+        if spawn.focus == field {
+            Span::styled("> ", theme.action_badge())
+        } else {
+            Span::raw("  ")
+        }
+    };
+    let agent_line = Line::from(vec![
+        focus_marker(SpawnField::Agent),
+        Span::styled("agent  ", theme.dim_style()),
+        Span::raw("◂ "),
+        Span::styled(format!(" {} ", spawn.agent.label()), theme.action_badge()),
+        Span::raw(" ▸"),
+    ]);
+    let lines = vec![
+        Line::from(vec![
+            focus_marker(SpawnField::Dir),
+            Span::styled("dir    ", theme.dim_style()),
+            Span::raw(spawn.dir.clone()),
+        ]),
+        agent_line,
+        Line::from(vec![
+            focus_marker(SpawnField::Prompt),
+            Span::styled("prompt ", theme.dim_style()),
+            Span::raw(spawn.prompt.clone()),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    // Cursor on the focused text field. The agent field is a picker, not
+    // text — no cursor there.
+    let (row, text, cursor) = match spawn.focus {
+        SpawnField::Dir => (0, &spawn.dir, spawn.dir_cursor),
+        SpawnField::Prompt => (2, &spawn.prompt, spawn.prompt_cursor),
+        SpawnField::Agent => return,
+    };
+    let before: String = text.chars().take(cursor).collect();
+    let x = inner
+        .x
+        .saturating_add(9)
+        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
+    let y = inner.y.saturating_add(row);
+    if x < inner.x + inner.width && y < inner.y + inner.height {
+        f.set_cursor_position((x, y));
+    }
 }
 
 fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
@@ -8727,6 +9156,21 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
         return true;
     }
 
+    if app.spawn.is_some() {
+        let spans = vec![
+            Span::styled(" Enter ", theme.action_badge()),
+            Span::raw("launch  "),
+            Span::styled(" Tab ", theme.key_badge()),
+            Span::raw("field  "),
+            Span::styled(" ←/→ ", theme.key_badge()),
+            Span::raw("agent  "),
+            Span::styled(" Esc ", theme.key_badge()),
+            Span::raw("cancel"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
     if app.collaboration_composer.is_some() {
         render_collaboration_composer_footer(f, area, app, theme);
         return true;
@@ -9331,6 +9775,79 @@ mod tests {
     }
 
     #[test]
+    fn n_opens_the_spawn_form_and_enter_launches_with_the_prompt_inline() {
+        let mut app = app_with_paneless_and_pane();
+        assert!(matches!(key_action(&mut app, 'n'), Action::None));
+        let spawn = app.spawn.as_mut().expect("n must open the spawn form");
+        // Point at a directory that certainly exists.
+        spawn.dir = "/tmp".into();
+        spawn.dir_cursor = spawn.dir.chars().count();
+        for c in "리뷰해줘".chars() {
+            spawn.prompt.push(c);
+        }
+        spawn.prompt_cursor = spawn.prompt.chars().count();
+
+        // Focus the agent field and cycle to codex.
+        let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        assert_eq!(app.spawn.as_ref().unwrap().focus, SpawnField::Agent);
+        let _ = handle_spawn_event(KeyCode::Right, KeyModifiers::NONE, &mut app);
+        assert_eq!(app.spawn.as_ref().unwrap().agent, SpawnAgent::Codex);
+
+        let action = handle_spawn_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(app.spawn.is_none(), "a successful launch closes the form");
+        match action {
+            Action::Quick(QuickAction::SpawnSession {
+                dir,
+                agent_label,
+                launch,
+            }) => {
+                assert_eq!(dir, "/tmp");
+                assert_eq!(agent_label, "codex");
+                assert_eq!(
+                    launch,
+                    "codex --dangerously-bypass-approvals-and-sandbox '리뷰해줘'"
+                );
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_refuses_an_empty_prompt_and_a_bogus_directory() {
+        let mut app = app_with_paneless_and_pane();
+        let _ = key_action(&mut app, 'n');
+        app.spawn.as_mut().unwrap().dir = "/tmp".into();
+        let action = handle_spawn_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(
+            app.spawn.is_some(),
+            "the form must survive a validation miss"
+        );
+
+        app.spawn.as_mut().unwrap().prompt = "go".into();
+        app.spawn.as_mut().unwrap().dir = "/definitely/not/a/dir".into();
+        let action = handle_spawn_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(app.spawn.is_some());
+    }
+
+    #[test]
+    fn session_names_never_collide_or_contain_tmux_separators() {
+        assert_eq!(session_base_name("/home/june/my.project:x"), "my-project-x");
+        let taken = ["demo".to_string(), "demo-2".to_string()];
+        assert_eq!(
+            unique_session_name("demo".into(), |n| taken.iter().any(|t| t == n)),
+            "demo-3"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_survives_embedded_quotes() {
+        assert_eq!(shell_single_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
     fn detail_body_wraps_to_the_given_height_instead_of_one_line() {
         let rows = wrap_detail_text("body: ", "가 나 다 라 마 바 사 아 자 차", 10, 3);
         assert!(rows.len() > 1, "a long body must wrap: {rows:?}");
@@ -9379,7 +9896,10 @@ mod tests {
             InspectorSplit::InspectorWide,
             InspectorSplit::Balanced,
         ] {
-            assert!(matches!(key_action(&mut app, '|'), Action::None));
+            assert!(matches!(
+                key_action(&mut app, '|'),
+                Action::InspectorSplitChanged
+            ));
             assert_eq!(app.inspector_split, expected);
         }
         // The percentages are the contract the render uses.
@@ -11054,6 +11574,29 @@ mod tests {
             );
             assert!(matches!(action, Action::SetSort(p) if p == preset));
         }
+    }
+
+    #[test]
+    fn inspector_split_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        persist_watch_inspector_split(&path, "70/30").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("inspector_split = \"70/30\""), "{text}");
+
+        // The saved label round-trips into the enum the renderer uses.
+        assert_eq!(
+            InspectorSplit::from_label("70/30"),
+            Some(InspectorSplit::ListWide)
+        );
+
+        // Re-persisting another value updates in place without clobbering
+        // sibling keys.
+        persist_watch_sort(&path, &[WatchSortKey::Activity]).unwrap();
+        persist_watch_inspector_split(&path, "30/70").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("inspector_split = \"30/70\""));
+        assert!(text.contains("sort"), "sort must survive: {text}");
     }
 
     #[test]
@@ -13543,6 +14086,7 @@ sort = ["state"]
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
             | Action::CancelCollaborationComposer
+            | Action::InspectorSplitChanged
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes
@@ -14256,6 +14800,7 @@ sort = ["state"]
         ctrl_c_calls: Vec<String>,
         copy_calls: Vec<String>,
         send_prompt_calls: Vec<(String, String)>,
+        spawn_calls: Vec<(String, String)>,
         kill_result: Option<std::result::Result<(), String>>,
         ctrl_c_result: Option<std::result::Result<(), String>>,
         copy_result: Option<std::result::Result<String, String>>,
@@ -14263,6 +14808,15 @@ sort = ["state"]
     }
 
     impl Effects for RecorderEffects {
+        fn spawn_session(
+            &mut self,
+            dir: &str,
+            launch: &str,
+        ) -> std::result::Result<String, String> {
+            self.spawn_calls.push((dir.to_string(), launch.to_string()));
+            Ok("spawned-test".into())
+        }
+
         fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String> {
             self.kill_calls.push(pane_id.to_string());
             self.kill_result.clone().unwrap_or(Ok(()))

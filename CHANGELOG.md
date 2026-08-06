@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`n` spawns a new agent session from inside watch.** The console could
+  observe, attach, message and collaborate — but starting work still meant
+  leaving it to hand-build a session. `n` opens a three-field form (working
+  directory, agent, first prompt); Enter creates a detached tmux session
+  named after the directory (deduplicated, never reusing an existing one)
+  and launches the agent with the prompt already on its command line, so it
+  boots working instead of waiting for someone to type. Launch flags mirror
+  callabo-resolve's, permission bypass included: a fire-and-forget session
+  parked on its first permission prompt never runs the command it was
+  created for. muxa's hooks pick the new session up within seconds and it
+  appears as a row like any other.
+- **The `|` split is saved.** Cycling list/inspector writes
+  `watch.inspector_split` to config.toml the same way runtime sort changes
+  are saved, so the divider a user put in place survives the popup closing.
 - **Narrow tables fold SUMMARY instead of truncating names.** At the 30/70
   split every column got squeezed and the session *names* were the casualty
   — four-character scraps identifying nothing, next to a summary column

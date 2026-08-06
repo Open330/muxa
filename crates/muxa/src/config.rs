@@ -962,6 +962,11 @@ pub struct WatchConfig {
     /// a TOML integer (fixed length) or a string of the form `min:N` /
     /// `pct:N`. Missing keys fall back to the column's built-in default.
     pub widths: HashMap<String, WidthSpec>,
+    /// Table/inspector split for `muxa watch`, persisted when `|` cycles
+    /// it: `"50/50"`, `"70/30"` or `"30/70"`. Unknown values fall back to
+    /// the default.
+    #[serde(default)]
+    pub inspector_split: Option<String>,
     /// Row granularity for `muxa watch`. Defaults to `session`.
     ///
     /// `session` (default) collapses all panes in the same tmux session into
@@ -1173,6 +1178,7 @@ impl Default for WatchConfig {
         Self {
             theme: None,
             columns,
+            inspector_split: None,
             widths,
             view: WatchView::Session,
             summary: WatchSummary::default(),
