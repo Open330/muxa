@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[collaboration] scope = "host"` lets `m` send a request to the row under
+  the cursor, any window.** The default keeps the same-window rule — putting
+  agents in one window is the consent that lets them talk — but a watch user
+  driving a whole host reads the cursor as the recipient, and being told to
+  attach to each session first makes the console pointless. Under host scope
+  an explicit `pane:%N` target may address any tracked agent; the origin (and
+  the reply's destination — this watch's `b` mailbox) remains the launch
+  agent, so sender identity is never forged. `peer`, `@alias` and `role:`
+  stay window-scoped: a pane id is unique on the host, an alias is only
+  unique within one room, and host-wide alias matching would invite
+  misdelivery.
+
 ### Fixed
 
 - **Attach landed in the right session but the wrong window.**
