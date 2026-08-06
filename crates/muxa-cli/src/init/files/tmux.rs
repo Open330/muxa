@@ -28,11 +28,15 @@ pub const ENV_BLOCK_ID: &str = "tmux-env";
 /// them. The dashboard has no such threshold and stays inset.
 pub const POPUP_BODY: &str = r#"# Muxa popups: watch all agents, or collaborate as the focused agent.
 # `muxa watch` is borderless and full-client so its wide-screen inspector
-# (120-column minimum, Alt-I) has the room to open. The binding expands
-# #{client_name}/#{pane_id} at the keypress, in the pressing client's
-# context — the only moment that identity is unambiguous; from inside the
-# popup every unpinned tmux query can answer for another terminal.
-bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'"
+# (120-column minimum, Alt-I) has the room to open. The run-shell wrapper
+# is what expands #{client_name}/#{pane_id} — display-popup itself passes
+# its command string through verbatim (measured on tmux 3.4), and an
+# unexpanded '#{client_name}' reaching muxa means every switch-client
+# quietly fails against a client that does not exist. run-shell expands
+# at the keypress, in the pressing client's context — the only moment
+# that identity is unambiguous; from inside the popup every unpinned
+# tmux query can answer for another terminal.
+bind-key s run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 \"muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.

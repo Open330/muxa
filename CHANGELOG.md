@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the reason the contract modes are missing shown as a hint. `Tab` and
   `Ctrl-E` explain instead of cycling: what this form cannot do is dress
   keystrokes up as a request.
+- **The caller flags never arrived: `display-popup` does not expand formats.**
+  The previous fix passed `#{client_name}`/`#{pane_id}` in the popup command,
+  but tmux hands that string through verbatim (measured on 3.4) — so muxa
+  received the literal text, aimed `switch-client -c` at a client named
+  `#{client_name}`, and every Enter became a silent no-op: nothing moved at
+  all. The managed binding now goes through `run-shell`, which does expand at
+  the keypress, and the popup itself is pinned with `display-popup -c` so it
+  opens on the pressing client too. Watch additionally drops caller values
+  that still contain `#{` — a stale binding degrades to the old guess instead
+  of a dead Enter. End-to-end verified: the argv reaching the popup command is
+  the real `/dev/pts/N` and `%N`.
 - **The client that pressed the key is now named by the key binding itself.**
   Even with `switch-client -c`, the pin was filled in by asking tmux for "the
   current client" — an activity-based guess a popup cannot make reliably, so

@@ -897,6 +897,17 @@ mod tests {
     /// What tmux actually prints for the managed binding: short flags
     /// arrive merged (`-BE`) and the percentages come back quoted.
     const LIVE_MANAGED: &str = r#"bind-key    -T prefix s       display-popup -BE -h "100%" -w "100%" -x 0 -y 0 "muxa watch""#;
+    /// What tmux prints for the run-shell-wrapped managed binding: the
+    /// popup flags live inside the escaped inner string, but they are
+    /// still whitespace-separated tokens of the one list-keys line.
+    const LIVE_WRAPPED: &str = r#"bind-key    -T prefix s       run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'"""#;
+
+    #[test]
+    fn the_wrapped_binding_still_reads_as_full_client() {
+        assert!(popup_binding_is_full_client(LIVE_WRAPPED));
+        assert_eq!(watch_popup_binding(LIVE_WRAPPED), Some(LIVE_WRAPPED));
+    }
+
     /// The pre-0.8.25 hand-written binding this check exists to catch.
     const LIVE_INSET: &str =
         r#"bind-key    -T prefix s       display-popup -E -h "85%" -w "90%" "muxa watch""#;

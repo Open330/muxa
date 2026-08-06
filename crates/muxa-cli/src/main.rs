@@ -470,7 +470,14 @@ async fn main() -> Result<()> {
         } => {
             // Pin every later focus-moving tmux command to the client that
             // actually asked. Set-once; jump_to_pane_tmux reads it.
-            if let Some(client_name) = caller_client {
+            //
+            // A value still containing `#{` is a binding that never expanded
+            // its formats (plain `display-popup` does not expand; only the
+            // `run-shell` wrapper does). Passing it on would aim every
+            // switch-client at a client named `#{client_name}` — a silent
+            // no-op that presents as "Enter does nothing". Drop it and fall
+            // back instead.
+            if let Some(client_name) = caller_client.filter(|c| !c.contains("#{")) {
                 let _ = CALLER_CLIENT.set(client_name);
             }
             cmd_watch(
@@ -482,7 +489,10 @@ async fn main() -> Result<()> {
                     view,
                     sort,
                     theme,
-                    caller_pane,
+                    // Same unexpanded-format guard as the client: a literal
+                    // `#{pane_id}` would seed the room and cursor with a
+                    // pane that matches nothing.
+                    caller_pane: caller_pane.filter(|p| p.starts_with('%')),
                 },
             )
             .await
