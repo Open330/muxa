@@ -4759,6 +4759,26 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
     clamp_collaboration_mailbox(app);
 }
 
+/// Name the rows that can actually receive a request.
+///
+/// Kept short enough to survive the single-line hint area: past three
+/// peers the list is trimmed and the remainder counted, because a hint
+/// that wraps off-screen helps nobody. `muxa peers` prints the full set.
+fn peer_choice_hint(peers: &[Participant]) -> String {
+    const SHOWN: usize = 3;
+    let mut names = peers
+        .iter()
+        .take(SHOWN)
+        .map(Participant::label)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if peers.len() > SHOWN {
+        use std::fmt::Write as _;
+        let _ = write!(names, " +{} more", peers.len() - SHOWN);
+    }
+    format!("select one of these rows, then press m: {names}")
+}
+
 fn open_watch_collaboration_composer(app: &mut App) {
     let Some(room) = app.collaboration.room.as_ref() else {
         let message = app
@@ -4782,10 +4802,12 @@ fn open_watch_collaboration_composer(app: &mut App) {
         .and_then(|pane| app.collaboration.peer_for_pane(pane))
         .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]));
     let Some(peer) = peer else {
-        app.set_hint(
-            "choose an agent in this tmux window, then press m",
-            HintLevel::Err,
-        );
+        // The table lists every tracked agent on the host — dozens of them
+        // — while only the handful in this window can receive a request.
+        // "choose an agent in this tmux window" is true and useless: it
+        // does not say which rows those are, and nothing on screen marks
+        // them. Name them instead.
+        app.set_hint(peer_choice_hint(&room.peers), HintLevel::Err);
         return;
     };
     let Some(origin) = app.collaboration.origin.clone() else {
@@ -9173,6 +9195,31 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn the_peer_hint_names_the_rows_that_can_receive() {
+        // The table lists every agent on the host; without names the user
+        // has no way to tell which handful of rows qualify.
+        let hint = peer_choice_hint(&[
+            fake_collaboration_participant("%747", "s1", Some("reviewer")),
+            fake_collaboration_participant("%751", "s2", None),
+        ]);
+        assert!(hint.contains("reviewer@%747"), "{hint}");
+        assert!(hint.contains("%751"), "{hint}");
+    }
+
+    #[test]
+    fn the_peer_hint_stays_on_one_line_when_the_room_is_crowded() {
+        let peers: Vec<_> = (1..=6)
+            .map(|n| fake_collaboration_participant(&format!("%{n}"), "s", None))
+            .collect();
+        let hint = peer_choice_hint(&peers);
+        assert!(hint.contains("+3 more"), "{hint}");
+        assert!(
+            !hint.contains("%6"),
+            "trimmed peers must not be listed: {hint}"
+        );
     }
 
     #[test]
