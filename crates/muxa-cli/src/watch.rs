@@ -6667,10 +6667,12 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::TOP)
         .border_style(theme.border_style())
         .title(Span::styled(" selected request ", theme.dim_style()));
-    let detail_width = usize::from(detail_block.inner(chunks[1]).width).max(1);
+    let detail_inner = detail_block.inner(chunks[1]);
+    let detail_width = usize::from(detail_inner.width).max(1);
+    let detail_height = usize::from(detail_inner.height).max(1);
     let detail = selected_collaboration_request(app).map_or_else(
         || vec![Line::from(Span::styled("-", theme.dim_style()))],
-        |request| collaboration_request_detail_lines(request, detail_width, theme),
+        |request| collaboration_request_detail_lines(request, detail_width, detail_height, theme),
     );
     f.render_widget(Paragraph::new(detail).block(detail_block), chunks[1]);
 }
@@ -6777,16 +6779,41 @@ fn collaboration_mailbox_request_lines(
     lines
 }
 
+/// Wrap `prefix + text` into at most `max_lines` rows of `width` chars,
+/// ellipsizing the last row when the text goes on. Hard char-chunking, not
+/// word wrap: request bodies are prose in any language and a `fold`-style
+/// break is predictable, cheap, and never loses a row to a long token.
+/// Char-counted like `truncate_chars`; the pane's other rows already
+/// accept that approximation for wide glyphs.
+fn wrap_detail_text(prefix: &str, text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(8);
+    let max_lines = max_lines.max(1);
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let full = format!("{prefix}{normalized}");
+    let chars: Vec<char> = full.chars().collect();
+    let mut rows: Vec<String> = chars
+        .chunks(width)
+        .take(max_lines)
+        .map(|chunk| chunk.iter().collect())
+        .collect();
+    if chars.len() > width * max_lines {
+        if let Some(last) = rows.last_mut() {
+            last.pop();
+            last.push('…');
+        }
+    }
+    if rows.is_empty() {
+        rows.push(prefix.trim_end().to_string());
+    }
+    rows
+}
+
 fn collaboration_request_detail_lines(
     request: &CollaborationRequest,
     width: usize,
+    height: usize,
     theme: WatchThemeSpec,
 ) -> Vec<Line<'static>> {
-    let body = request
-        .body
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
     let mut lines = vec![
         Line::from(truncate_chars(
             &format!(
@@ -6813,19 +6840,33 @@ fn collaboration_request_detail_lines(
             .iter()
             .map(|reference| air_artifact_detail_line("input", reference, width)),
     );
-    lines.push(Line::from(truncate_chars(&format!("body: {body}"), width)));
+    // Everything after the fixed header shares the remaining height between
+    // body and reply. The body was previously one truncated line under a
+    // hard seven-row cap, which turned the expanded detail pane into a
+    // field of blank rows under an ellipsis.
+    let reply_air = request
+        .reply
+        .as_ref()
+        .map_or(0, |reply| reply.air_artifacts.len());
+    let remaining = height.saturating_sub(lines.len() + reply_air).max(2);
+    let (body_budget, reply_budget) = if request.reply.is_some() {
+        let body = remaining.div_ceil(2);
+        (body, remaining - body)
+    } else {
+        (remaining, 0)
+    };
+    lines.extend(
+        wrap_detail_text("body: ", &request.body, width, body_budget)
+            .into_iter()
+            .map(Line::from),
+    );
     if let Some(reply) = request.reply.as_ref() {
-        let reply_body = reply.body.split_whitespace().collect::<Vec<_>>().join(" ");
-        lines.push(Line::from(Span::styled(
-            truncate_chars(
-                &format!(
-                    "reply [{}]: {reply_body}",
-                    request_status_label(reply.status)
-                ),
-                width,
-            ),
-            Style::default().fg(Color::Green),
-        )));
+        let prefix = format!("reply [{}]: ", request_status_label(reply.status));
+        lines.extend(
+            wrap_detail_text(&prefix, &reply.body, width, reply_budget.max(1))
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, Style::default().fg(Color::Green)))),
+        );
         lines.extend(
             reply
                 .air_artifacts
@@ -6833,7 +6874,7 @@ fn collaboration_request_detail_lines(
                 .map(|reference| air_artifact_detail_line("output", reference, width)),
         );
     }
-    lines.truncate(7);
+    lines.truncate(height.max(1));
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("-", theme.dim_style())));
     }
@@ -7700,11 +7741,9 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
 /// the table exists; a summary that narrow was already unreadable.
 const SUMMARY_MIN_TABLE_WIDTH: u16 = 60;
 
-/// Below this width even the activity column goes: name, state and
-/// duration are the irreducible row identity.
-const ACTIVITY_MIN_TABLE_WIDTH: u16 = 48;
-
-/// The columns the table actually renders at `table_width`.
+/// The columns the table actually renders at `table_width`. Only SUMMARY
+/// folds: DUR and ACT are six columns each and part of the row identity,
+/// so there is no width at which dropping them beats keeping them.
 fn effective_columns(columns: &[WatchColumn], table_width: u16) -> Vec<WatchColumn> {
     if table_width >= SUMMARY_MIN_TABLE_WIDTH || columns.len() <= 1 {
         return columns.to_vec();
@@ -7713,7 +7752,6 @@ fn effective_columns(columns: &[WatchColumn], table_width: u16) -> Vec<WatchColu
         .iter()
         .copied()
         .filter(|c| !matches!(c, WatchColumn::Prompt))
-        .filter(|c| table_width >= ACTIVITY_MIN_TABLE_WIDTH || !matches!(c, WatchColumn::Activity))
         .collect();
     if trimmed.is_empty() {
         columns.to_vec()
@@ -7894,16 +7932,17 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // When SUMMARY folded away, its width has to land somewhere useful:
-    // promote the name column from its fixed length to a Min so it absorbs
-    // the slack instead of leaving it as dead space next to truncated names
-    // — the truncation was the whole reason to fold.
+    // When SUMMARY folded away, let the name column grow into the slack —
+    // truncated names were the whole reason to fold — but with a ceiling:
+    // a name column that swallows every freed column just trades an
+    // unreadable summary for a field of trailing blanks. 30 covers the
+    // 8-cell status gutter plus a 22-character session name.
     let summary_folded = columns.len() != app.columns.len();
     let widths: Vec<Constraint> = columns
         .iter()
         .map(|c| {
             if summary_folded && matches!(c, WatchColumn::Pane) {
-                Constraint::Min(12)
+                Constraint::Max(30)
             } else {
                 resolve_width(*c, &app.watch_cfg)
             }
@@ -9292,6 +9331,17 @@ mod tests {
     }
 
     #[test]
+    fn detail_body_wraps_to_the_given_height_instead_of_one_line() {
+        let rows = wrap_detail_text("body: ", "가 나 다 라 마 바 사 아 자 차", 10, 3);
+        assert!(rows.len() > 1, "a long body must wrap: {rows:?}");
+        assert!(rows[0].starts_with("body: "));
+        assert!(rows.len() <= 3);
+        // Ellipsis only when text actually overflows the budget.
+        let short = wrap_detail_text("body: ", "hi", 40, 3);
+        assert_eq!(short, vec!["body: hi".to_string()]);
+    }
+
+    #[test]
     fn narrow_tables_fold_the_summary_column_before_the_name() {
         let cols = vec![
             WatchColumn::Pane,
@@ -9301,7 +9351,8 @@ mod tests {
         ];
         // Wide enough: everything stays.
         assert_eq!(effective_columns(&cols, 60), cols);
-        // Narrow: SUMMARY folds, the identifying columns survive intact.
+        // Narrow: SUMMARY folds; DUR and ACT survive at any width — six
+        // columns each, and part of the row identity.
         assert_eq!(
             effective_columns(&cols, 59),
             vec![
@@ -9310,6 +9361,7 @@ mod tests {
                 WatchColumn::Activity,
             ]
         );
+        assert_eq!(effective_columns(&cols, 30), effective_columns(&cols, 59));
         // A prompt-only layout keeps its one column rather than rendering
         // an empty table.
         assert_eq!(

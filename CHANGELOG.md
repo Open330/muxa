@@ -9,12 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Narrow tables fold SUMMARY (then ACT) instead of truncating names.**
-  At the 30/70 split every column got squeezed and the session *names* were
-  the casualty — four-character scraps identifying nothing, next to a
-  summary column that was itself unreadable at that width. Below 60 table
-  columns SUMMARY folds away and the name column absorbs the slack; below
-  48, ACT follows. Names are why the table exists.
+- **Narrow tables fold SUMMARY instead of truncating names.** At the 30/70
+  split every column got squeezed and the session *names* were the casualty
+  — four-character scraps identifying nothing, next to a summary column
+  that was itself unreadable at that width. Below 60 table columns SUMMARY
+  folds away and the name column grows into the slack, capped at 30 so it
+  does not trade an unreadable summary for a field of trailing blanks. DUR
+  and ACT survive at any width: six columns each, and part of the row
+  identity.
+- **Mailbox request bodies wrap.** The detail pane rendered the body as one
+  truncated line under a hard seven-row cap, so expanding it just added
+  blank rows under an ellipsis. Body and reply now share the pane's actual
+  height, fold-style.
 - **Session view drops the STATE column: DUR + ACT tell the timing story.**
   The SESSION cell's leftmost cluster already shows every state as
   icon-with-count, so a 12-column STATE said the same thing twice while
