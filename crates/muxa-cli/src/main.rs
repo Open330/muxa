@@ -1344,27 +1344,38 @@ fn jump_to_pane_tmux(pane_id: &str) {
         eprintln!("muxa: pane {pane_id} not found in tmux — it may have closed");
         return;
     };
-    let target_window = format!("{}:{}", info.session, info.window_index);
-
-    // Pre-position so whichever path we take below lands on the right pane.
-    run_tmux(&["select-window", "-t", &target_window]);
-    run_tmux(&["select-pane", "-t", pane_id]);
-
     if tmux::inside_tmux() {
-        // Already attached — switch *this* client's session.
+        // One command, addressed by pane id, pinned to the asking client.
         //
-        // `-c` is not optional here. Without it tmux picks "the current
-        // client" itself, which with two terminals attached is whichever
-        // one it last saw activity on, not necessarily the one that asked.
-        // The user then watches their other tab jump to the target while
-        // the tab they pressed Enter in goes somewhere else entirely.
-        match tmux::current_client() {
-            Some(client) => run_tmux(&["switch-client", "-c", &client, "-t", &info.session]),
-            // No client name resolved — a lone client cannot be
-            // mis-selected, so the unpinned form is still correct.
-            None => run_tmux(&["switch-client", "-t", &info.session]),
+        // Each of those three matters, and the previous version had none
+        // of them. It pre-positioned with `select-window -t "<name>:<idx>"`
+        // *before* switching anyone: that mutates the target session's
+        // current window immediately, so any other terminal already
+        // attached to that session jumped on the spot — a window the user
+        // never asked to move, in a terminal they were not even looking at.
+        // The name-based target is its own hazard, because tmux matches
+        // session names by prefix unless anchored with `=`, and real
+        // session sets collide (`callabo` against `callabo-set`). And
+        // without `-c`, tmux picks "the current client" from recent
+        // activity, which with two terminals attached is routinely the
+        // other one.
+        //
+        // `switch-client -t <pane-id>` resolves session, window and pane
+        // together from an identifier that cannot be ambiguous, and only
+        // for the client we name.
+        // No client to pin means nothing can be mis-selected; the pane-id
+        // target keeps prefix matching out of it either way.
+        if let Some(client) = tmux::current_client() {
+            run_tmux(&["switch-client", "-c", &client, "-t", pane_id]);
+        } else {
+            run_tmux(&["switch-client", "-t", pane_id]);
         }
+        run_tmux(&["select-pane", "-t", pane_id]);
     } else {
+        // Pre-position for the fresh attach below; there is no client of
+        // ours yet to pin, and the session is about to become ours.
+        run_tmux(&["select-window", "-t", pane_id]);
+        run_tmux(&["select-pane", "-t", pane_id]);
         // Bare shell — hand our terminal to a fresh tmux attach-session.
         // `.status()` waits for tmux to exit; on detach the user is back at
         // this shell prompt, which is the least-surprising behaviour.

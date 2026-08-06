@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Enter in `muxa watch` moved a terminal the user was not looking at.** The
+  jump pre-positioned with `select-window -t "<session>:<index>"` *before*
+  switching anyone, and a session's current window is shared state — so any
+  other terminal already attached to that session jumped on the spot, to a
+  window nobody asked it to show. The name-based target was a second hazard:
+  tmux matches session names by prefix unless anchored with `=`, and real
+  session sets collide (`callabo` against `callabo-set`; 16 such pairs on the
+  host this was found on). Address the pane id instead, which cannot be
+  ambiguous, and let one `switch-client -c <client> -t <pane>` resolve session,
+  window and pane for the asking client only.
 - **`muxa watch` acted on the wrong terminal when two were attached.** Enter
   jumped the user's *other* tab to the target while the tab they pressed it in
   went somewhere else, and `m` reported no peers in a window that plainly had
