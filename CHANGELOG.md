@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`|` cycles the watch list/inspector split: 50/50 → 70/30 → 30/70.** The
+  split was hard-coded at roughly half-and-half; reading a long prompt in the
+  inspector or scanning a wide table both wanted the other bias. Presets over
+  free resize: two keystrokes reach any of them, and a resize mode would cost
+  a modal state for a knob with three useful values. Also in the palette as
+  `:split`. Session-local — a glance preference, not configuration.
 - **`[collaboration] scope = "host"` lets `m` send a request to the row under
   the cursor, any window.** The default keeps the same-window rule — putting
   agents in one window is the consent that lets them talk — but a watch user

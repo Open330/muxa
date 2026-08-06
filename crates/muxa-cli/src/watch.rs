@@ -1202,13 +1202,13 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  ←/→ · h/l       return to parent / enter first child agent",
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
-        "  Enter          compose prompt for selected pane",
-        "  empty Enter    attach to selected pane",
+        "  Enter          attach to selected pane",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
         "  o / Alt-P      open preview overlay",
         "  Alt-I / Alt-E  inspector / persistent event inbox",
+        "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) compose prompt",
@@ -1261,6 +1261,43 @@ pub(crate) struct ConfirmPopup {
 /// Inline prompt composer opened from the table with Enter. It pins the
 /// target pane at open time so background refreshes or resorting cannot
 /// redirect a typed prompt to a different row.
+/// The three table/inspector splits `|` cycles through. Presets rather
+/// than free resize: two keystrokes reach any of them, and a TUI resize
+/// mode would cost a modal state for a knob that has three useful values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum InspectorSplit {
+    #[default]
+    Balanced,
+    ListWide,
+    InspectorWide,
+}
+
+impl InspectorSplit {
+    fn list_pct(self) -> u16 {
+        match self {
+            Self::Balanced => 50,
+            Self::ListWide => 70,
+            Self::InspectorWide => 30,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Balanced => Self::ListWide,
+            Self::ListWide => Self::InspectorWide,
+            Self::InspectorWide => Self::Balanced,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Balanced => "50/50",
+            Self::ListWide => "70/30",
+            Self::InspectorWide => "30/70",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -1624,6 +1661,9 @@ pub(crate) struct App {
     /// the tracked agent under the cursor in any window; `window` keeps the
     /// classic same-room contract.
     collaboration_scope: muxa::config::CollaborationScope,
+    /// Table/inspector width split, cycled with `|`. Session-local: a
+    /// glance preference, not configuration.
+    inspector_split: InspectorSplit,
     collaboration_mailbox: CollaborationMailboxState,
     collaboration_composer: Option<CollaborationComposer>,
     /// Editable `:` command palette. Like other overlays it owns keyboard
@@ -1754,6 +1794,7 @@ impl App {
             confirm: None,
             collaboration: WatchCollaboration::default(),
             collaboration_scope: muxa::config::CollaborationScope::default(),
+            inspector_split: InspectorSplit::default(),
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
             command_palette: None,
@@ -5221,6 +5262,14 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "r" | "refresh" => Action::Refresh,
         "o" | "open" | "preview" => Action::OpenPreview,
         "m" | "message" => Action::OpenCollaborationMessage,
+        "split" => {
+            app.inspector_split = app.inspector_split.next();
+            app.set_hint(
+                format!("list/inspector {}", app.inspector_split.label()),
+                HintLevel::Ok,
+            );
+            Action::None
+        }
         "b" | "mailbox" => Action::OpenCollaborationMailbox,
         "copy" | "yank" => quick_copy_action(app),
         "kill" => quick_kill_action(app),
@@ -5496,6 +5545,14 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
         KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
         KeyCode::Char('m') if app.browse_keys_active() => Action::OpenCollaborationMessage,
+        KeyCode::Char('|') if app.browse_keys_active() => {
+            app.inspector_split = app.inspector_split.next();
+            app.set_hint(
+                format!("list/inspector {}", app.inspector_split.label()),
+                HintLevel::Ok,
+            );
+            Action::None
+        }
         KeyCode::Char('b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_session_parent();
@@ -7248,7 +7305,10 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
     if split_inspector {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .constraints([
+                Constraint::Percentage(app.inspector_split.list_pct()),
+                Constraint::Percentage(100 - app.inspector_split.list_pct()),
+            ])
             .split(area);
         render_primary_body(f, columns[0], app);
         render_inspector(f, columns[1], app);
@@ -9129,6 +9189,23 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn pipe_cycles_the_inspector_split_and_wraps() {
+        let mut app = app_with_paneless_and_pane();
+        assert_eq!(app.inspector_split, InspectorSplit::Balanced);
+        for expected in [
+            InspectorSplit::ListWide,
+            InspectorSplit::InspectorWide,
+            InspectorSplit::Balanced,
+        ] {
+            assert!(matches!(key_action(&mut app, '|'), Action::None));
+            assert_eq!(app.inspector_split, expected);
+        }
+        // The percentages are the contract the render uses.
+        assert_eq!(InspectorSplit::ListWide.list_pct(), 70);
+        assert_eq!(InspectorSplit::InspectorWide.list_pct(), 30);
     }
 
     #[test]

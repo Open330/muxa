@@ -32,6 +32,7 @@ row per pane.
 | `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
+| `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `m` | Message the selected same-window agent. |
 | `b` | Open incoming/sent mailbox; `i` claims and `e` replies. |
 | `o` / `Alt-P` | Open live preview. |

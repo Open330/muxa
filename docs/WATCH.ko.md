@@ -32,6 +32,7 @@ muxa watch --include-paneless
 | `gg` / `G`, `Home` / `End` | 첫 번째 / 마지막 선택 가능 행으로 이동. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane에 바로 attach. |
+| `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `m` | 선택한 same-window agent에게 durable request 보내기. |
 | `b` | incoming/sent mailbox 열기. `i`는 claim, `e`는 reply. |
 | `o` / `Alt-P` | live preview 열기. |
