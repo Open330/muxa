@@ -52,6 +52,13 @@ impl Detection {
             out.push(Component::TmuxPopup);
             out.push(Component::TmuxStatusLine);
             out.push(Component::TmuxPeek);
+            // A collaboration room *is* a tmux window, so tmux is the only
+            // prerequisite. Pre-checked rather than opt-in: leaving it dark
+            // is what made `m`/`b` answer "collaboration is disabled" on
+            // every fresh install with nothing pointing at the fix. The
+            // grant stays informed — the picker shows what it does, and the
+            // plan is confirmed before anything is written.
+            out.push(Component::Collaboration);
         }
         if self.claude_settings.is_some() {
             out.push(Component::ClaudeHooks);
@@ -202,6 +209,17 @@ mod tests {
         let d = Detection::default();
         let sel = d.default_selection();
         assert_eq!(sel, vec![Component::MuxadShellrc]);
+    }
+
+    #[test]
+    fn collaboration_is_pre_checked_whenever_tmux_exists() {
+        // The wizard's ticks come from here, not from `Component::preset`,
+        // so a component missing from this list ships dark even when its
+        // preset includes it.
+        let mut d = Detection::default();
+        assert!(!d.default_selection().contains(&Component::Collaboration));
+        d.tmux = Some("tmux 3.4".into());
+        assert!(d.default_selection().contains(&Component::Collaboration));
     }
 
     #[test]
