@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod collaboration;
 pub mod dashboard;
 pub mod gemini;
 pub mod launchd;

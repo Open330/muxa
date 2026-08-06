@@ -33,6 +33,8 @@ pub enum Component {
     MuxadShellrc,
     /// Web dashboard: generate token, enable in config
     Dashboard,
+    /// Same-window agent mailbox: enable `[collaboration]` in config
+    Collaboration,
 }
 
 impl Component {
@@ -48,6 +50,7 @@ impl Component {
         Component::MuxadLaunchd,
         Component::MuxadShellrc,
         Component::Dashboard,
+        Component::Collaboration,
     ];
 
     /// Stable kebab-case id used in CLI flags and marker blocks.
@@ -64,6 +67,7 @@ impl Component {
             Component::MuxadLaunchd => "muxad-launchd",
             Component::MuxadShellrc => "muxad-shellrc",
             Component::Dashboard => "dashboard",
+            Component::Collaboration => "collaboration",
         }
     }
 
@@ -85,6 +89,7 @@ impl Component {
             Component::MuxadLaunchd => "muxad: launchd LaunchAgent (auto-start on login)",
             Component::MuxadShellrc => "muxad: shellrc autostart hook (no service manager)",
             Component::Dashboard => "Web dashboard: generate token + enable",
+            Component::Collaboration => "Collaboration: same-window agent request/reply mailbox",
         }
     }
 
@@ -102,6 +107,7 @@ impl Component {
             Component::MuxadLaunchd => "macOS only; skipped on Linux / systemd hosts",
             Component::MuxadShellrc => "appends to ~/.zshrc or ~/.bashrc; cross-platform",
             Component::Dashboard => "loopback :7878 by default; token in config",
+            Component::Collaboration => "lets a peer's request type a wake prompt into your pane",
         }
     }
 
@@ -147,6 +153,7 @@ impl Component {
                 Component::CodexHooks,
                 Component::GeminiHooks,
                 Component::OpencodeHooks,
+                Component::Collaboration,
                 dm,
             ],
             Preset::Full => {

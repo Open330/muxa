@@ -17,11 +17,25 @@ not an agent and cannot be the sender. The Dashboard is optional.
 
 ## Enable
 
+Collaboration is off until you grant it, because an incoming request can wake a
+peer by typing a short prompt into its pane. `muxa init` asks for that grant
+along with everything else it touches, and the `standard` preset includes it:
+
+```bash
+muxa init --component collaboration
+```
+
+That writes the block below to `config.toml` (`muxa init --component
+collaboration --uninstall` removes it). Hand-editing works just as well:
+
 ```toml
 [collaboration]
 enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
 ```
+
+An existing `wake` is never overwritten — a deliberate `never` means "give me
+the mailbox but stay out of my panes", and re-running `muxa init` respects it.
 
 Restart `muxad` and register `muxa mcp` with each agent host:
 

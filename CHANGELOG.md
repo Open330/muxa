@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`muxa init --component collaboration` turns the agent mailbox on.** Enabling
+  collaboration means a peer's request may type a wake prompt into your pane, so
+  it stays a grant rather than a compiled default — but the only way to give that
+  grant was to know `[collaboration]` exists and hand-write it into a
+  `config.toml` that `muxa init` never creates. Nothing surfaced the option, so
+  `m` and `b` in `muxa watch` answered "agent collaboration is disabled" on every
+  fresh machine with no hint about where to go next. The component asks for the
+  grant where the user is already deciding what muxa may touch, and ships in the
+  `standard` preset. An existing `wake` is preserved: a deliberate `never` means
+  "mailbox, but stay out of my panes", and re-running init must not re-arm it.
+
 ## [0.8.26] - 2026-08-05
 
 ### Fixed

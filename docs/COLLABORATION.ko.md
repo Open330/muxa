@@ -16,13 +16,27 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 
 ## 활성화
 
-`~/.config/muxa/config.toml`에 다음을 추가하고 daemon을 재시작합니다.
+협업은 명시적으로 켜야 합니다. 요청이 도착하면 상대 pane에 짧은 prompt를 넣어
+깨우기 때문입니다. `muxa init`이 다른 항목과 함께 이 권한을 묻고, `standard`
+preset에 포함돼 있습니다.
+
+```bash
+muxa init --component collaboration
+```
+
+아래 블록을 `config.toml`에 씁니다. 해제는 `muxa init --component collaboration
+--uninstall`입니다. 직접 편집해도 동일합니다.
 
 ```toml
 [collaboration]
 enabled = true
 wake = "idle_only"
 ```
+
+이미 있는 `wake` 값은 덮어쓰지 않습니다. `never`는 "mailbox는 쓰되 내 pane은
+건드리지 말라"는 의도적 선택이므로 `muxa init`을 다시 실행해도 유지됩니다.
+
+설정 후 daemon을 재시작합니다.
 
 각 agent에 `muxa mcp`가 등록돼 있어야 합니다. Claude Code와 Codex에는 다음처럼
 등록합니다.

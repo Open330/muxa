@@ -141,6 +141,26 @@ pub fn build(
                     }
                 }
             }
+            Component::Collaboration => {
+                let Some(path) = files::collaboration::default_path() else {
+                    continue;
+                };
+                let before = read_to_string_opt(&path)?;
+                let original = before.clone().unwrap_or_default();
+                let (after, outcome) = match direction {
+                    Direction::Install => files::collaboration::upsert(&original)
+                        .context("enabling collaboration in config.toml")?,
+                    Direction::Uninstall => files::collaboration::remove(&original)
+                        .context("disabling collaboration in config.toml")?,
+                };
+                actions.push(Action::EditFile {
+                    component: *c,
+                    path,
+                    before,
+                    after,
+                    outcome,
+                });
+            }
         }
     }
 
