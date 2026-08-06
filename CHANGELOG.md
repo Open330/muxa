@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Shift-Tab` crosses between a prompt and a request without retyping.**
+  `Enter` types keystrokes into a pane; `m` sends a durable request with a kind,
+  a work mode and a reply. They look alike from the composer and are not alike
+  at all, and keeping them on separate keys meant memorising which key produced
+  which. Merging them was the wrong fix — it would hide *which one is being
+  sent*, and "I thought that carried `read_only`" is not a mistake worth
+  enabling. So: one surface, one key to cross between the two, and the draft
+  comes along. `Tab` still cycles request kind and `Ctrl-E` still toggles work
+  mode; transport is its own axis.
+- **`muxa doctor` checks the tmux binding that will actually run, and prints
+  where `config.toml` lives.** The marker-block check proves the managed
+  `prefix+s` is *in* `~/.tmux.conf`, not that tmux would run it: duplicate
+  `bind-key` definitions resolve last-one-wins, and a running server keeps what
+  it read at startup. Either way doctor stayed green while `prefix+s` opened an
+  inset popup too narrow for the watch inspector's 120-column minimum — which
+  reads as "the inspector is on but I never see it". The config line is one
+  more line of output and removes a guessing game: `dirs::config_dir()` is
+  `~/Library/Application Support` on macOS and `~/.config` on Linux, so advice
+  to edit `~/.config/muxa/config.toml` is wrong half the time and the edit
+  lands in a file nothing reads.
+
 - **`muxa init --component collaboration` turns the agent mailbox on.** Enabling
   collaboration means a peer's request may type a wake prompt into your pane, so
   it stays a grant rather than a compiled default — but the only way to give that

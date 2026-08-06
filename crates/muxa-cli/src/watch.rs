@@ -1328,6 +1328,13 @@ struct CollaborationComposer {
 }
 
 impl CollaborationComposer {
+    /// Adopt a draft typed in the other composer. The cursor goes to the
+    /// end so the user keeps typing where they left off.
+    fn set_input(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.input = text;
+    }
+
     fn new(target: CollaborationComposeTarget, label: String) -> Self {
         Self {
             target,
@@ -1380,6 +1387,13 @@ impl CollaborationComposer {
 }
 
 impl PromptPopup {
+    /// Adopt a draft typed in the request composer. The cursor goes to
+    /// the end so the user keeps typing where they left off.
+    fn set_input(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.input = text;
+    }
+
     fn new(pane_id: String, label: String) -> Self {
         Self {
             pane_id,
@@ -4454,6 +4468,45 @@ pub async fn run(
                 Action::CancelCollaborationComposer => {
                     app.collaboration_composer = None;
                 }
+                // Two ways to put text in front of another agent that look
+                // alike and are not: a prompt is keystrokes typed into a
+                // pane, with no sender identity, no contract and no reply;
+                // a request is durable, addressed to a room peer, and
+                // carries kind + work_mode. Keeping them on separate keys
+                // (`Enter` vs `m`) made the user memorise which; folding
+                // them into one action would hide *which one is being
+                // sent*, which is the part that must never be ambiguous.
+                // So: one surface, one key to cross between them, and the
+                // draft comes along.
+                Action::SwitchComposeTransport => {
+                    if let Some(popup) = app.prompt.take() {
+                        prompt_started_at = None;
+                        refresh_watch_collaboration(client, &mut app).await;
+                        open_watch_collaboration_composer(&mut app);
+                        if let Some(composer) = app.collaboration_composer.as_mut() {
+                            composer.set_input(popup.input);
+                        } else {
+                            // No room, no peer, or the row is not one —
+                            // `open_watch_collaboration_composer` has already
+                            // set the hint explaining which. Put the draft
+                            // back rather than eating it.
+                            prompt_started_at =
+                                Some((OffsetDateTime::now_utc(), popup.pane_id.clone()));
+                            app.prompt = Some(popup);
+                        }
+                    } else if let Some(composer) = app.collaboration_composer.take() {
+                        if let Some(pane_id) = app.selected_pane() {
+                            let mut popup =
+                                PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id));
+                            popup.set_input(composer.input);
+                            prompt_started_at = Some((OffsetDateTime::now_utc(), pane_id.clone()));
+                            app.prompt = Some(popup);
+                        } else {
+                            app.set_hint("send: no tmux pane on this row", HintLevel::Err);
+                            app.collaboration_composer = Some(composer);
+                        }
+                    }
+                }
                 Action::ClaimCollaborationInbox => {
                     let outcome = match app.collaboration.origin.clone() {
                         Some(origin) => match client.collaboration_inbox(&origin).await {
@@ -5065,6 +5118,11 @@ pub(crate) enum Action {
     SubmitCollaboration,
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
+    /// `Shift-Tab` in one composer reopens the other one on the same
+    /// pane, carrying the text across. Transport and contract are
+    /// separate axes, so they get separate keys — `Tab` still cycles
+    /// request kind.
+    SwitchComposeTransport,
     /// Atomically claim the current agent's pending inbox.
     ClaimCollaborationInbox,
     /// Open a confirm popup for a destructive [`QuickAction`]. The
@@ -5611,6 +5669,7 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
 fn handle_prompt_event(code: KeyCode, modifiers: KeyModifiers, prompt: &mut PromptPopup) -> Action {
     match code {
         KeyCode::Esc => Action::CancelPrompt,
+        KeyCode::BackTab => Action::SwitchComposeTransport,
         KeyCode::Enter => {
             if prompt.input.trim().is_empty() {
                 Action::AttachPane(prompt.pane_id.clone())
@@ -5669,7 +5728,8 @@ fn handle_collaboration_composer_event(
                 Action::SubmitCollaboration
             }
         }
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::BackTab => Action::SwitchComposeTransport,
+        KeyCode::Tab => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
                 match &mut composer.target {
                     CollaborationComposeTarget::Send { kind, .. } => {
@@ -8567,6 +8627,8 @@ fn render_prompt_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
         Span::raw(" send  "),
         Span::styled(" empty Enter ", theme.key_badge()),
         Span::raw(" attach  "),
+        Span::styled(" S-Tab ", theme.key_badge()),
+        Span::raw(" request instead  "),
         Span::styled(" Esc ", theme.key_badge()),
         Span::raw(" cancel"),
     ];
@@ -8598,6 +8660,11 @@ fn render_collaboration_composer_footer(
         spans.extend([
             Span::styled(" Ctrl-E ", theme.key_badge()),
             Span::raw("read-only/execute  "),
+            // Advertised only on the Send path: a reply is answering a
+            // request that already exists, and there is no prompt
+            // equivalent of that to cross over to.
+            Span::styled(" S-Tab ", theme.key_badge()),
+            Span::raw("prompt instead  "),
         ]);
     }
     spans.extend([
@@ -9106,6 +9173,67 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn shift_tab_leaves_kind_cycling_to_tab_alone() {
+        // Tab and Shift-Tab used to share an arm. Splitting them must not
+        // cost Tab its job — the two are different axes, not one list.
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(matches!(
+            app.collaboration_composer.as_ref().unwrap().target,
+            CollaborationComposeTarget::Send {
+                kind: RequestKind::Review,
+                ..
+            }
+        ));
+
+        // Shift-Tab crosses transports instead of advancing the kind.
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::NONE, &mut app),
+            Action::SwitchComposeTransport
+        ));
+        assert!(matches!(
+            app.collaboration_composer.as_ref().unwrap().target,
+            CollaborationComposeTarget::Send {
+                kind: RequestKind::Review,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shift_tab_in_the_prompt_popup_asks_for_the_request_composer() {
+        let mut popup = PromptPopup::new("%1".into(), "peer".into());
+        assert!(matches!(
+            handle_prompt_event(KeyCode::BackTab, KeyModifiers::NONE, &mut popup),
+            Action::SwitchComposeTransport
+        ));
+    }
+
+    #[test]
+    fn a_carried_draft_puts_the_cursor_at_the_end() {
+        // Crossing transports mid-sentence must not drop the user back to
+        // column 0 — non-ASCII included, since the cursor counts chars.
+        let mut popup = PromptPopup::new("%1".into(), "peer".into());
+        popup.set_input("검토해 주세요".into());
+        assert_eq!(popup.cursor, "검토해 주세요".chars().count());
+        popup.insert('!');
+        assert_eq!(popup.input, "검토해 주세요!");
+
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        let composer = app.collaboration_composer.as_mut().unwrap();
+        composer.set_input("검토해 주세요".into());
+        assert_eq!(composer.cursor, "검토해 주세요".chars().count());
+        composer.insert('!');
+        assert_eq!(composer.input, "검토해 주세요!");
     }
 
     #[test]
@@ -13040,6 +13168,7 @@ sort = ["state"]
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
             | Action::CancelCollaborationComposer
+            | Action::SwitchComposeTransport
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes

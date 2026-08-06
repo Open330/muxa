@@ -109,6 +109,13 @@ selected room peer, `b` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. `muxa dashboard` provides the richer session-card form
 of the same controls.
 
+Inside the composer, `Shift-Tab` switches the transport itself. A request is
+durable, addressed to a room peer, and carries a contract and a reply; a prompt
+is keystrokes typed into a pane, with neither. Those are separate axes from
+`Tab` (request kind) and `Ctrl-E` (work mode), so they get a separate key. The
+draft comes across unchanged. On a row that is not a same-window peer the
+request side is unavailable, and the composer says why.
+
 The watch composer gives `? QUESTION`, `◆ REVIEW`, `▶ TASK`, and `! NOTICE`
 distinct colors. `○ READ-ONLY` delegates investigation and an answer only;
 `● EXECUTE` authorizes commands and file changes. These modes are contracts
