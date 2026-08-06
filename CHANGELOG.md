@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host this was found on). Address the pane id instead, which cannot be
   ambiguous, and let one `switch-client -c <client> -t <pane>` resolve session,
   window and pane for the asking client only.
+- **The collaboration room could be resolved from another terminal's session.**
+  Asking tmux for "the current client's pane" resolves against whichever client
+  it last saw activity on, so with two terminals attached it answers for the
+  other one. Measured inside a popup on `callabo-set`, the unpinned query named
+  `%771 callabo-recorder` while `$TMUX` correctly named `%691 callabo-set`.
+  That pane seeds the room, so `m` reported peers for a window the user was not
+  in. `$TMUX` is rewritten by tmux to the popup's own session and is the
+  authority; the client query is not a usable fallback and is gone.
 - **`muxa watch` acted on the wrong terminal when two were attached.** Enter
   jumped the user's *other* tab to the target while the tab they pressed it in
   went somewhere else, and `m` reported no peers in a window that plainly had

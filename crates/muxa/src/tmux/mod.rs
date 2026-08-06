@@ -886,14 +886,19 @@ pub fn current_pane() -> Option<String> {
         return Some(p);
     }
     // `display-popup` runs its command with an empty `TMUX_PANE`, so watch
-    // launched from `prefix+s` always lands here. Ask the client what it is
-    // looking at before falling back to `$TMUX`: `$TMUX` carries the
-    // *target* session of the popup, which is not always the session the
-    // client is displaying, and guessing wrong sends the room — and the
-    // opening cursor — to a different window than the user is in.
-    if let Some(pane) = client_active_pane() {
-        return Some(pane);
-    }
+    // launched from `prefix+s` always lands here — and `$TMUX` is the
+    // answer, not a fallback. tmux rewrites its session field to the
+    // popup's own session, so it names where the popup actually is.
+    //
+    // The tempting alternative — asking tmux for the current client's pane
+    // — is wrong precisely when it matters. An unpinned `display-message`
+    // resolves against whichever client tmux last saw activity on, so with
+    // two terminals attached it answers for the other one. Measured inside
+    // a single popup on one session, `$TMUX` gave that session's pane while
+    // the unpinned query gave a pane from an unrelated session the other
+    // terminal happened to be showing. This pane seeds the collaboration
+    // room and the opening cursor, so the wrong answer moves the user's
+    // entire frame of reference to a window they are not in.
     let target = parse_tmux_session_target(&std::env::var("TMUX").ok()?)?;
     let out = tmux_output(&["display-message", "-p", "-t", &target, "#{pane_id}"]).ok()?;
     if !out.status.success() {
@@ -906,19 +911,6 @@ pub fn current_pane() -> Option<String> {
     } else {
         Some(pane.to_string())
     }
-}
-
-/// The pane the calling client currently displays, asked without a `-t`
-/// target so tmux answers for the client rather than for a session id we
-/// supplied. `None` when there is no client (a detached `muxa` command).
-fn client_active_pane() -> Option<String> {
-    let out = tmux_output(&["display-message", "-p", "#{pane_id}"]).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(out.stdout).ok()?;
-    let pane = stdout.lines().next().unwrap_or("").trim();
-    (pane.starts_with('%')).then(|| pane.to_string())
 }
 
 /// Parse a tmux target spec for the session this client is attached to,
