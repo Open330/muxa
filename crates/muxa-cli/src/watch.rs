@@ -1311,6 +1311,12 @@ enum CollaborationComposeTarget {
         request_id: String,
         status: RequestStatus,
     },
+    /// Keystrokes-only composer for a pane that cannot receive a request —
+    /// collaboration disabled, no room, no peer, or a row outside this
+    /// window. `m` still owes the user a way to type at the agent they are
+    /// pointing at; what it cannot do is dress those keystrokes up as a
+    /// contract, so `Tab`/`Ctrl-E` explain instead of cycling.
+    Prompt { pane: String },
 }
 
 /// What Ctrl-E cycles: how the composed text leaves the composer.
@@ -4594,6 +4600,24 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
     clamp_collaboration_mailbox(app);
 }
 
+/// A request needs a peer; keystrokes only need a pane. When the full
+/// composer cannot open, `m` degrades to the keystrokes-only form against
+/// the selected pane instead of refusing outright, and the reason the
+/// contract modes are missing rides along as a warning hint.
+fn open_prompt_only_composer(app: &mut App, reason: String) {
+    let Some(pane) = app.selected_pane() else {
+        app.set_hint("no tmux pane on this row", HintLevel::Err);
+        return;
+    };
+    let label = app.pane_label(&pane);
+    app.collaboration_mailbox.open = false;
+    app.collaboration_composer = Some(CollaborationComposer::new(
+        CollaborationComposeTarget::Prompt { pane },
+        label,
+    ));
+    app.set_hint(format!("keystrokes only — {reason}"), HintLevel::Warn);
+}
+
 /// The one room peer the selected row contains, if it contains exactly
 /// one.
 ///
@@ -4655,7 +4679,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
             .unavailable
             .clone()
             .unwrap_or_else(|| collaboration_open_hint().into());
-        app.set_hint(message, HintLevel::Err);
+        open_prompt_only_composer(app, message);
         return;
     };
     if room.peers.is_empty() {
@@ -4665,7 +4689,8 @@ fn open_watch_collaboration_composer(app: &mut App) {
         // that *does* have two agents reads "no peer here" as plainly
         // false and moves the cursor, which changes nothing. Name the
         // room and say the cursor is not the lever.
-        app.set_hint(empty_room_hint(&room.current), HintLevel::Err);
+        let reason = empty_room_hint(&room.current);
+        open_prompt_only_composer(app, reason);
         return;
     }
     let selected_pane = app.selected_pane();
@@ -4696,7 +4721,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
             .map(|p| format!("{} · {}", p.label(), app.pane_label(&p.pane)))
             .collect::<Vec<_>>();
         let hint = peer_choice_hint(&labels);
-        app.set_hint(hint, HintLevel::Err);
+        open_prompt_only_composer(app, hint);
         return;
     };
     let Some(origin) = app.collaboration.origin.clone() else {
@@ -4762,6 +4787,9 @@ async fn run_watch_collaboration_composer(
                 Err(error) => ActionOutcome::Err(format!("collaboration send failed: {error}")),
             }
         }
+        CollaborationComposeTarget::Prompt { .. } => ActionOutcome::Err(
+            "keystrokes go to the pane directly and cannot become a request".into(),
+        ),
         CollaborationComposeTarget::Reply {
             origin,
             request_id,
@@ -5574,6 +5602,50 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
     }
 }
 
+/// Resolve Tab inside the composer: cycle the per-target option, or say
+/// why there is nothing to cycle.
+fn composer_cycle_option(app: &mut App) {
+    let Some(composer) = app.collaboration_composer.as_mut() else {
+        return;
+    };
+    match &mut composer.target {
+        // Kind is a request concept; in `just send` mode there is no
+        // request, and silently cycling a hidden badge would surprise
+        // whoever switches back.
+        CollaborationComposeTarget::Send {
+            mode: ComposeSendMode::JustSend,
+            ..
+        } => {
+            app.set_hint(
+                "kind applies to requests — Ctrl-E to leave just-send",
+                HintLevel::Warn,
+            );
+        }
+        CollaborationComposeTarget::Send { kind, .. } => {
+            *kind = match *kind {
+                RequestKind::Question => RequestKind::Review,
+                RequestKind::Review => RequestKind::Task,
+                RequestKind::Task => RequestKind::Notice,
+                RequestKind::Notice => RequestKind::Question,
+            };
+        }
+        CollaborationComposeTarget::Reply { status, .. } => {
+            *status = match *status {
+                RequestStatus::Completed => RequestStatus::Blocked,
+                RequestStatus::Blocked => RequestStatus::Declined,
+                RequestStatus::Declined => RequestStatus::Failed,
+                _ => RequestStatus::Completed,
+            };
+        }
+        CollaborationComposeTarget::Prompt { .. } => {
+            app.set_hint(
+                "requests need a same-window peer — keystrokes only here",
+                HintLevel::Warn,
+            );
+        }
+    }
+}
+
 /// Resolve Enter inside the composer.
 ///
 /// `just send` bypasses the mailbox entirely: the text goes into the pane
@@ -5589,23 +5661,26 @@ fn composer_submit_action(app: &mut App) -> Action {
         app.set_hint("message cannot be empty", HintLevel::Warn);
         return Action::None;
     }
-    if let Some(CollaborationComposer {
-        target:
-            CollaborationComposeTarget::Send {
-                pane,
-                mode: ComposeSendMode::JustSend,
-                ..
-            },
-        input,
-        ..
-    }) = app.collaboration_composer.take()
-    {
-        return Action::Quick(QuickAction::SendPrompt {
+    match app.collaboration_composer.take() {
+        Some(CollaborationComposer {
+            target:
+                CollaborationComposeTarget::Send {
+                    pane,
+                    mode: ComposeSendMode::JustSend,
+                    ..
+                }
+                | CollaborationComposeTarget::Prompt { pane },
+            input,
+            ..
+        }) => Action::Quick(QuickAction::SendPrompt {
             pane_id: pane,
             text: input,
-        });
+        }),
+        other => {
+            app.collaboration_composer = other;
+            Action::SubmitCollaboration
+        }
     }
-    Action::SubmitCollaboration
 }
 
 fn handle_collaboration_composer_event(
@@ -5617,51 +5692,25 @@ fn handle_collaboration_composer_event(
         KeyCode::Esc => Action::CancelCollaborationComposer,
         KeyCode::Enter => composer_submit_action(app),
         KeyCode::Tab => {
-            if let Some(composer) = app.collaboration_composer.as_mut() {
-                match &mut composer.target {
-                    // Kind is a request concept; in `just send` mode there
-                    // is no request, and silently cycling a hidden badge
-                    // would surprise whoever switches back.
-                    CollaborationComposeTarget::Send {
-                        mode: ComposeSendMode::JustSend,
-                        ..
-                    } => {
-                        app.set_hint(
-                            "kind applies to requests — Ctrl-E to leave just-send",
-                            HintLevel::Warn,
-                        );
-                    }
-                    CollaborationComposeTarget::Send { kind, .. } => {
-                        *kind = match *kind {
-                            RequestKind::Question => RequestKind::Review,
-                            RequestKind::Review => RequestKind::Task,
-                            RequestKind::Task => RequestKind::Notice,
-                            RequestKind::Notice => RequestKind::Question,
-                        };
-                    }
-                    CollaborationComposeTarget::Reply { status, .. } => {
-                        *status = match *status {
-                            RequestStatus::Completed => RequestStatus::Blocked,
-                            RequestStatus::Blocked => RequestStatus::Declined,
-                            RequestStatus::Declined => RequestStatus::Failed,
-                            _ => RequestStatus::Completed,
-                        };
-                    }
-                }
-            }
+            composer_cycle_option(app);
             Action::None
         }
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(CollaborationComposer {
-                target: CollaborationComposeTarget::Send { mode, .. },
-                ..
-            }) = app.collaboration_composer.as_mut()
-            {
-                *mode = match *mode {
-                    ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
-                    ComposeSendMode::Execute => ComposeSendMode::JustSend,
-                    ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
-                };
+            match app.collaboration_composer.as_mut().map(|c| &mut c.target) {
+                Some(CollaborationComposeTarget::Send { mode, .. }) => {
+                    *mode = match *mode {
+                        ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
+                        ComposeSendMode::Execute => ComposeSendMode::JustSend,
+                        ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
+                    };
+                }
+                Some(CollaborationComposeTarget::Prompt { .. }) => {
+                    app.set_hint(
+                        "requests need a same-window peer — keystrokes only here",
+                        HintLevel::Warn,
+                    );
+                }
+                _ => {}
             }
             Action::None
         }
@@ -6341,11 +6390,13 @@ fn collaboration_composer_title(
     match composer.target {
         // just-send drops the kind and mode badges: there is no request,
         // so showing a QUESTION badge over raw keystrokes would claim a
-        // contract that does not exist.
+        // contract that does not exist. The peerless Prompt form is the
+        // same thing with the contract modes locked out.
         CollaborationComposeTarget::Send {
             mode: ComposeSendMode::JustSend,
             ..
-        } => (
+        }
+        | CollaborationComposeTarget::Prompt { .. } => (
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
@@ -8516,17 +8567,28 @@ fn render_collaboration_composer_footer(
         .collaboration_composer
         .as_ref()
         .map(|composer| &composer.target);
-    let option = match target {
-        Some(CollaborationComposeTarget::Send { .. }) => "kind",
-        Some(CollaborationComposeTarget::Reply { .. }) => "status",
-        None => "option",
-    };
+    // The peerless prompt form advertises no Tab/Ctrl-E: both keys only
+    // explain why they do nothing, and a footer that lists dead keys
+    // teaches the user to stop reading footers.
     let mut spans = vec![
         Span::styled(" Enter ", theme.action_badge()),
         Span::raw("send  "),
-        Span::styled(" Tab ", theme.key_badge()),
-        Span::raw(format!("{option}  ")),
     ];
+    match target {
+        Some(CollaborationComposeTarget::Send { .. }) => {
+            spans.extend([
+                Span::styled(" Tab ", theme.key_badge()),
+                Span::raw("kind  "),
+            ]);
+        }
+        Some(CollaborationComposeTarget::Reply { .. }) => {
+            spans.extend([
+                Span::styled(" Tab ", theme.key_badge()),
+                Span::raw("status  "),
+            ]);
+        }
+        Some(CollaborationComposeTarget::Prompt { .. }) | None => {}
+    }
     if matches!(target, Some(CollaborationComposeTarget::Send { .. })) {
         spans.extend([
             Span::styled(" Ctrl-E ", theme.key_badge()),
@@ -9042,12 +9104,75 @@ mod tests {
     }
 
     #[test]
+    fn m_without_a_room_still_opens_a_keystrokes_composer() {
+        // Collaboration being unavailable must not take `m` away — the
+        // user is pointing at a pane and typing at it needs no contract.
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .expect("fixture has a pane-bearing row");
+        app.table_state.select(Some(pane_idx));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            app.collaboration_composer.as_ref().map(|c| &c.target),
+            Some(CollaborationComposeTarget::Prompt { pane }) if pane == "%42"
+        ));
+
+        app.collaboration_composer.as_mut().unwrap().insert('하');
+        let action =
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(
+            matches!(
+                action,
+                Action::Quick(QuickAction::SendPrompt { ref pane_id, ref text })
+                    if pane_id == "%42" && text == "하"
+            ),
+            "got {action:?}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_only_composer_refuses_to_invent_a_contract() {
+        let mut app = app_with_paneless_and_pane();
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .unwrap();
+        app.table_state.select(Some(pane_idx));
+        open_watch_collaboration_composer(&mut app);
+
+        for key in [KeyCode::Tab, KeyCode::Char('e')] {
+            let modifiers = if key == KeyCode::Char('e') {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            assert!(matches!(
+                handle_collaboration_composer_event(key, modifiers, &mut app),
+                Action::None
+            ));
+            assert!(
+                matches!(
+                    app.collaboration_composer.as_ref().map(|c| &c.target),
+                    Some(CollaborationComposeTarget::Prompt { .. })
+                ),
+                "{key:?} must not conjure a request out of a peerless composer"
+            );
+        }
+    }
+
+    #[test]
     fn ctrl_e_cycles_through_just_send_and_back() {
         let mut app = collaboration_watch_app();
         open_watch_collaboration_composer(&mut app);
         let mode_of = |app: &App| match app.collaboration_composer.as_ref().unwrap().target {
             CollaborationComposeTarget::Send { mode, .. } => mode,
-            CollaborationComposeTarget::Reply { .. } => unreachable!(),
+            _ => unreachable!(),
         };
         assert_eq!(mode_of(&app), ComposeSendMode::ReadOnly);
         for expected in [

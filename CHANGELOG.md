@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Attach landed in the right session but the wrong window.**
+  `switch-client -t <pane>` resolves only the session; the client arrives on
+  whatever window that session had current. The pane's window has to be
+  selected *after* the switch — after, so the shared current-window mutation
+  is confined to the session being entered instead of rearranging a bystander
+  the way the old pre-switch `select-window` did.
+- **`m` no longer refuses to type when collaboration is unavailable.** No
+  room, no peer, collaboration disabled, or a row outside this window — the
+  composer still opens, in a keystrokes-only form against the selected pane,
+  with the reason the contract modes are missing shown as a hint. `Tab` and
+  `Ctrl-E` explain instead of cycling: what this form cannot do is dress
+  keystrokes up as a request.
 - **The client that pressed the key is now named by the key binding itself.**
   Even with `switch-client -c`, the pin was filled in by asking tmux for "the
   current client" — an activity-based guess a popup cannot make reliably, so

@@ -1421,6 +1421,14 @@ fn jump_to_pane_tmux(pane_id: &str) {
         } else {
             run_tmux(&["switch-client", "-t", pane_id]);
         }
+        // `switch-client -t <pane>` resolves only the *session*: the client
+        // lands on whatever window that session had current, which in a
+        // multi-window session is not the pane's window. Selecting the
+        // window *after* the switch confines the shared-state mutation to
+        // the session we are entering — clients attached to it follow, which
+        // is tmux's model for a session's current window, but no bystander
+        // session is touched the way the old pre-switch select-window did.
+        run_tmux(&["select-window", "-t", pane_id]);
         run_tmux(&["select-pane", "-t", pane_id]);
     } else {
         // Pre-position for the fresh attach below; there is no client of
