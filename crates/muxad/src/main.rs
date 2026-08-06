@@ -431,6 +431,7 @@ async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::Joi
 async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {
     let options = CollaborationOptions {
         enabled: cfg.collaboration.enabled,
+        scope: cfg.collaboration.scope,
         path: cfg
             .collaboration
             .enabled

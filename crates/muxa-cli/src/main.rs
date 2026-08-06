@@ -1146,6 +1146,8 @@ struct WatchInvocation {
     caller_pane: Option<String>,
 }
 
+use muxa::config::CollaborationScope;
+
 async fn cmd_watch(
     client: &Client,
     cfg: Config,
@@ -1201,6 +1203,7 @@ async fn cmd_watch(
                 .or_else(paths::default_session_activity_file)
         })
         .flatten();
+    let collaboration_scope: CollaborationScope = cfg.collaboration.scope;
     if let Some(pane_id) = watch::run(
         client,
         watch_cfg,
@@ -1208,6 +1211,7 @@ async fn cmd_watch(
         activity_path.clone(),
         config_path,
         caller_pane,
+        collaboration_scope,
     )
     .await?
     {

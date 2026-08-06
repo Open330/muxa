@@ -1620,6 +1620,10 @@ pub(crate) struct App {
     /// interpreted.
     pub confirm: Option<ConfirmPopup>,
     collaboration: WatchCollaboration,
+    /// `[collaboration] scope` from config: `host` lets the composer target
+    /// the tracked agent under the cursor in any window; `window` keeps the
+    /// classic same-room contract.
+    collaboration_scope: muxa::config::CollaborationScope,
     collaboration_mailbox: CollaborationMailboxState,
     collaboration_composer: Option<CollaborationComposer>,
     /// Editable `:` command palette. Like other overlays it owns keyboard
@@ -1749,6 +1753,7 @@ impl App {
             pane_capture: None,
             confirm: None,
             collaboration: WatchCollaboration::default(),
+            collaboration_scope: muxa::config::CollaborationScope::default(),
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
             command_palette: None,
@@ -4089,6 +4094,7 @@ pub async fn run(
     activity_path: Option<PathBuf>,
     sort_persist_path: Option<PathBuf>,
     caller_pane: Option<String>,
+    collaboration_scope: muxa::config::CollaborationScope,
 ) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
@@ -4112,6 +4118,7 @@ pub async fn run(
     let initial_pane = caller_pane.or_else(|| backends.iter().find_map(|b| b.current_pane()));
     app.set_initial_pane(initial_pane.clone());
     app.collaboration.origin = watch_collaboration_origin(initial_pane.clone());
+    app.collaboration_scope = collaboration_scope;
     let watch_started_at = OffsetDateTime::now_utc();
 
     // Paint the first frame **before** any IPC. The popup
@@ -4679,56 +4686,70 @@ fn peer_choice_hint(labels: &[String]) -> String {
     format!("select one of these rows, then press m: {names}")
 }
 
+/// The recipient under host scope: whatever tracked agent the cursor is
+/// on, in any window. The origin — and thus where the reply lands, this
+/// watch's `b` mailbox — stays the launch agent; only the *target* leaves
+/// the room. `None` under window scope or on a non-agent row.
+fn host_scope_target(app: &App) -> Option<(String, String)> {
+    if app.collaboration_scope != muxa::config::CollaborationScope::Host {
+        return None;
+    }
+    let agent = app.selected_agent()?;
+    let pane = agent.pane.clone()?;
+    let label = format!("{}@{} · {}", agent.kind, pane, app.pane_label(&pane));
+    Some((pane, label))
+}
+
 fn open_watch_collaboration_composer(app: &mut App) {
-    let Some(room) = app.collaboration.room.as_ref() else {
-        let message = app
+    let same_room = match app.collaboration.room.as_ref() {
+        None => Err(app
             .collaboration
             .unavailable
             .clone()
-            .unwrap_or_else(|| collaboration_open_hint().into());
-        open_prompt_only_composer(app, message);
-        return;
-    };
-    if room.peers.is_empty() {
+            .unwrap_or_else(|| collaboration_open_hint().into())),
         // "here" is the window `muxa watch` was launched from, fixed at
-        // startup — not the row under the cursor. The table spans every
-        // session on the host, so a user looking at a row from a session
-        // that *does* have two agents reads "no peer here" as plainly
-        // false and moves the cursor, which changes nothing. Name the
-        // room and say the cursor is not the lever.
-        let reason = empty_room_hint(&room.current);
-        open_prompt_only_composer(app, reason);
-        return;
-    }
-    let selected_pane = app.selected_pane();
-    let peer = selected_pane
-        .as_deref()
-        .and_then(|pane| app.collaboration.peer_for_pane(pane))
-        // A session row is a whole tmux session, and the pane it resolves
-        // to is whichever of its agents moved last. Requiring that drifting
-        // pane to be the peer made `m` fail on a row that plainly contains
-        // one — the user is pointing at the right session and being told to
-        // point at it. Accept the row when exactly one peer lives in it;
-        // more than one is genuinely ambiguous and still asks.
-        .or_else(|| peer_inside_selected_row(app, room))
-        .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]))
-        // Take what the composer needs by value: everything below mutates
-        // `app`, and holding a borrow into `app.collaboration` across that
-        // is what the borrow checker is for.
-        .map(|peer| (peer.pane.clone(), peer.label()));
+        // startup — not the row under the cursor. Name the room and say
+        // the cursor is not the lever, because the table spans every
+        // session on the host and an unqualified "no peer here" reads as
+        // plainly false to someone pointing at a two-agent session.
+        Some(room) if room.peers.is_empty() => Err(empty_room_hint(&room.current)),
+        Some(room) => {
+            let selected_pane = app.selected_pane();
+            selected_pane
+                .as_deref()
+                .and_then(|pane| app.collaboration.peer_for_pane(pane))
+                // A session row is a whole tmux session, and the pane it
+                // resolves to drifts with agent activity. Accept the row
+                // when exactly one peer lives in it; more than one is
+                // genuinely ambiguous and still asks.
+                .or_else(|| peer_inside_selected_row(app, room))
+                .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]))
+                .map(|peer| (peer.pane.clone(), peer.label()))
+                .ok_or_else(|| {
+                    let labels = room
+                        .peers
+                        .iter()
+                        .map(|p| format!("{} · {}", p.label(), app.pane_label(&p.pane)))
+                        .collect::<Vec<_>>();
+                    peer_choice_hint(&labels)
+                })
+        }
+    };
+    // Whatever kept the same-room path from producing a recipient — no
+    // room, no peers, ambiguous row — host scope may still name one: the
+    // agent under the cursor.
+    let peer = match same_room {
+        Ok(peer) => Some(peer),
+        Err(reason) => {
+            let host = host_scope_target(app);
+            if host.is_none() {
+                open_prompt_only_composer(app, reason);
+                return;
+            }
+            host
+        }
+    };
     let Some((peer_pane, peer_label)) = peer else {
-        // The table lists every tracked agent on the host — dozens of them
-        // — while only the handful in this window can receive a request.
-        // "choose an agent in this tmux window" is true and useless: it
-        // does not say which rows those are, and nothing on screen marks
-        // them. Name them instead.
-        let labels = room
-            .peers
-            .iter()
-            .map(|p| format!("{} · {}", p.label(), app.pane_label(&p.pane)))
-            .collect::<Vec<_>>();
-        let hint = peer_choice_hint(&labels);
-        open_prompt_only_composer(app, hint);
         return;
     };
     let Some(origin) = app.collaboration.origin.clone() else {
@@ -9108,6 +9129,34 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn host_scope_lets_m_target_the_agent_under_the_cursor() {
+        // No room at all — but scope=host says the cursor names the
+        // recipient, so the contract composer opens against that agent.
+        let mut app = app_with_paneless_and_pane();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "%42".into(),
+            socket: None,
+        });
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .unwrap();
+        app.table_state.select(Some(pane_idx));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(
+            matches!(
+                app.collaboration_composer.as_ref().map(|c| &c.target),
+                Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%42"
+            ),
+            "host scope must open the contract composer for the cursor's agent"
+        );
     }
 
     #[test]

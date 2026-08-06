@@ -131,6 +131,14 @@ pub struct CollaborationConfig {
     /// `never` keeps delivery pull-only; `idle_only` wakes hook-authoritative
     /// agents only at their top-level idle prompt.
     pub wake: CollaborationWake,
+    /// How far an explicit `pane:%N` target may reach. `window` (default)
+    /// keeps requests inside the sender's tmux window — co-locating agents
+    /// in a window is the consent to let them talk. `host` lets a request
+    /// address any tracked agent pane on this host, which is what makes
+    /// `muxa watch`'s composer work against whatever row the cursor is on.
+    /// `peer` / `@alias` / `role:` stay window-scoped either way: they are
+    /// room concepts, and host-wide alias matching would invite misdelivery.
+    pub scope: CollaborationScope,
     #[serde(default = "default_collaboration_max_message_bytes")]
     pub max_message_bytes: usize,
 }
@@ -141,9 +149,18 @@ impl Default for CollaborationConfig {
             enabled: false,
             path: None,
             wake: CollaborationWake::IdleOnly,
+            scope: CollaborationScope::default(),
             max_message_bytes: default_collaboration_max_message_bytes(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationScope {
+    #[default]
+    Window,
+    Host,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

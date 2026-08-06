@@ -26,6 +26,7 @@ pub struct CollaborationOptions {
     pub enabled: bool,
     pub path: Option<PathBuf>,
     pub max_message_bytes: usize,
+    pub scope: crate::config::CollaborationScope,
 }
 
 impl Default for CollaborationOptions {
@@ -34,6 +35,7 @@ impl Default for CollaborationOptions {
             enabled: true,
             path: None,
             max_message_bytes: 16 * 1024,
+            scope: crate::config::CollaborationScope::default(),
         }
     }
 }
@@ -386,6 +388,12 @@ pub struct CollaborationStore {
 }
 
 impl CollaborationStore {
+    /// The configured reach of explicit pane targets. Read by the IPC send
+    /// handler; everything else stays window-scoped regardless.
+    pub fn scope(&self) -> crate::config::CollaborationScope {
+        self.opts.scope
+    }
+
     pub fn in_memory(options: CollaborationOptions) -> Arc<Self> {
         Arc::new(Self {
             opts: CollaborationOptions {
@@ -983,7 +991,27 @@ pub fn resolve_target(
     sender: &Participant,
     selector: &str,
     participants: &[Participant],
+    scope: crate::config::CollaborationScope,
 ) -> Result<Participant, CollaborationError> {
+    // Host scope widens *explicit pane* targets only. `peer`, `@alias` and
+    // `role:` remain room concepts: a pane id is unique on the host, but an
+    // alias is only unique among live peers of one room, and matching it
+    // host-wide would deliver to whichever unrelated agent happens to share
+    // the name.
+    if scope == crate::config::CollaborationScope::Host {
+        let pane = selector.strip_prefix("pane:").unwrap_or(selector);
+        if pane.starts_with('%') {
+            let matches: Vec<_> = participants
+                .iter()
+                .filter(|candidate| candidate.pane == pane && !candidate.same_endpoint(sender))
+                .collect();
+            return match matches.as_slice() {
+                [participant] => Ok((*participant).clone()),
+                [] => Err(CollaborationError::UnknownTarget(selector.to_string())),
+                _ => Err(CollaborationError::AmbiguousTarget(selector.to_string())),
+            };
+        }
+    }
     let peers: Vec<_> = participants
         .iter()
         .filter(|candidate| candidate.room == sender.room && !candidate.same_endpoint(sender))
@@ -1168,6 +1196,7 @@ fn valid_identity_token(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CollaborationScope;
 
     fn participant(pane: &str, session: &str) -> Participant {
         Participant {
@@ -1529,10 +1558,40 @@ mod tests {
             participant("%3", "three"),
         ];
         assert!(matches!(
-            resolve_target(&sender, "peer", &peers),
+            resolve_target(&sender, "peer", &peers, CollaborationScope::Window),
             Err(CollaborationError::AmbiguousTarget(_))
         ));
-        assert_eq!(resolve_target(&sender, "%2", &peers).unwrap().pane, "%2");
+        assert_eq!(
+            resolve_target(&sender, "%2", &peers, CollaborationScope::Window)
+                .unwrap()
+                .pane,
+            "%2"
+        );
+    }
+
+    #[test]
+    fn host_scope_reaches_panes_in_other_rooms_but_room_selectors_do_not() {
+        let sender = participant("%1", "s1");
+        let mut peers = vec![participant("%2", "s2")];
+        let mut other_room = participant("%99", "s99");
+        other_room.room.window_id = "@other".into();
+        peers.push(other_room);
+
+        assert_eq!(
+            resolve_target(&sender, "%99", &peers, CollaborationScope::Host)
+                .unwrap()
+                .pane,
+            "%99"
+        );
+        // Same target, default scope: refused — co-location is the consent.
+        assert!(resolve_target(&sender, "%99", &peers, CollaborationScope::Window).is_err());
+        // `peer` stays a room concept even under host scope.
+        assert_eq!(
+            resolve_target(&sender, "peer", &peers, CollaborationScope::Host)
+                .unwrap()
+                .pane,
+            "%2"
+        );
     }
 
     #[tokio::test]
@@ -1575,19 +1634,34 @@ mod tests {
             .find(|participant| participant.pane == "%1")
             .unwrap();
         assert_eq!(
-            resolve_target(enriched_sender, "@REVIEWER", &enriched)
-                .unwrap()
-                .pane,
+            resolve_target(
+                enriched_sender,
+                "@REVIEWER",
+                &enriched,
+                CollaborationScope::Window
+            )
+            .unwrap()
+            .pane,
             "%2"
         );
         assert_eq!(
-            resolve_target(enriched_sender, "role:rust", &enriched)
-                .unwrap()
-                .pane,
+            resolve_target(
+                enriched_sender,
+                "role:rust",
+                &enriched,
+                CollaborationScope::Window
+            )
+            .unwrap()
+            .pane,
             "%2"
         );
         assert!(matches!(
-            resolve_target(enriched_sender, "role:review", &enriched),
+            resolve_target(
+                enriched_sender,
+                "role:review",
+                &enriched,
+                CollaborationScope::Window
+            ),
             Err(CollaborationError::AmbiguousTarget(_))
         ));
 

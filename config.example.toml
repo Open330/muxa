@@ -75,6 +75,12 @@
 # NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`
 # even after the live agent record has been reaped (daemon restart, pane
 # close, etc.). Default path lives in $XDG_DATA_HOME.
+# window (default): requests stay inside the sender's tmux window.
+# host: an explicit pane target may address any tracked agent on this host
+# — this is what lets `muxa watch`'s composer send to the row under the
+# cursor. peer/@alias/role: selectors stay window-scoped either way.
+# scope = "window"
+
 [history]
 # enabled               = true
 # path                  = "/home/$USER/.local/share/muxa/prompts.ndjson"

@@ -1310,8 +1310,13 @@ async fn handle(
                         collaboration_participants(&store, &backends, &collaboration).await;
                     let result =
                         collaboration::resolve_origin(&origin, &participants).and_then(|sender| {
-                            collaboration::resolve_target(&sender, &target, &participants)
-                                .map(|recipient| (sender, recipient))
+                            collaboration::resolve_target(
+                                &sender,
+                                &target,
+                                &participants,
+                                collaboration.scope(),
+                            )
+                            .map(|recipient| (sender, recipient))
                         });
                     match result {
                         Ok((sender, recipient)) => {
