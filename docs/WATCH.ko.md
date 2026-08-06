@@ -1,7 +1,7 @@
 # Live TUI
 
 `muxa watch`는 주요 interactive surface입니다. 추적 중인 agent와 일반 tmux
-pane을 보여주고, pane attach, live preview, prompt composer, 같은 window의
+pane을 보여주고, pane attach, live preview, 같은 window의
 agent 협업을 제공합니다.
 
 TUI 안에 머문 채 prompt 전송, turn abort, live capture 확인까지 하는
@@ -31,7 +31,7 @@ muxa watch --include-paneless
 | `h` / `l`, `←` / `→` | 부모 session으로 복귀 / 첫 번째 자식 agent 선택. |
 | `gg` / `G`, `Home` / `End` | 첫 번째 / 마지막 선택 가능 행으로 이동. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
-| `Enter` | 선택한 pane의 prompt composer 열기. 빈 `Enter`는 attach. |
+| `Enter` | 선택한 pane에 바로 attach. |
 | `m` | 선택한 same-window agent에게 durable request 보내기. |
 | `b` | incoming/sent mailbox 열기. `i`는 claim, `e`는 reply. |
 | `o` / `Alt-P` | live preview 열기. |
@@ -117,21 +117,17 @@ inbox를 열면 확인 처리됩니다.
 동일하게 확인 popup을 거칩니다. `view` 변경은 cached snapshot에 즉시 반영되며
 현재 watch process의 이후 refresh에도 유지됩니다.
 
-## Prompt Composer
-
-pane이 있는 row에서 `Enter`를 누르면 prompt composer가 열립니다. 내용을 입력한
-뒤 `Enter`를 누르면 해당 pane으로 보냅니다. `Esc`는 취소입니다. composer가
-비어 있으면 `Enter`는 prompt 전송 대신 pane attach로 동작합니다.
-
-activity logging이 켜져 있으면 prompt input 시간은 `activity.ndjson`에 human
-interaction interval로 기록됩니다.
 
 ## Agent 협업
 
 메시지를 보낼 agent pane을 선택하고 `prefix+s`로 watch를 엽니다. 같은 tmux
 window의 상대 agent를 선택한 뒤 `m`을 누릅니다. room에 peer가 하나뿐이면 watch가
-자동으로 선택합니다. composer에서 `Tab`은 request kind, `Ctrl-E`는
-`read-only`/`execute`를 바꾸고 `Enter`는 전송합니다.
+자동으로 선택합니다. composer에서 `Tab`은 request kind를 바꾸고 `Enter`는
+전송합니다.
+
+`Ctrl-E`는 전송 방식을 순환합니다. `read-only`와 `execute`는 request에 실리는
+계약이고, `just send`는 본문을 계약도 응답도 없는 키스트로크로 pane에 그대로
+입력합니다 — `Enter`가 바로 attach하게 된 지금, 일반 prompt는 이 모드로 보냅니다.
 
 - `? QUESTION`(청록): 답을 요청합니다.
 - `◆ REVIEW`(자홍): 코드나 판단의 검토 결과를 요청합니다.

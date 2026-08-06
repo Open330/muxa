@@ -144,11 +144,12 @@ tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle�
 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. `muxa dashboard`는
 같은 기능을 더 상세한 session-card 화면으로 제공합니다.
 
-composer 안에서 `Shift-Tab`은 전달 방식 자체를 바꿉니다. request(mailbox, 계약과
-응답이 있음)와 prompt(pane에 키스트로크 주입, 계약도 응답도 없음)는 서로 다른 축이라
-`Tab`(kind 순환)이나 `Ctrl-E`(work mode)와 섞지 않습니다. 작성 중이던 본문은 그대로
-넘어갑니다. 같은 window의 peer가 아닌 행에서는 request로 넘어갈 수 없고 이유를
-표시합니다.
+composer 안에서 `Ctrl-E`는 전달 방식을 순환합니다. `read-only`와 `execute`는
+durable request에 실리는 계약이고, `just send`는 본문을 키스트로크로 pane에 그대로
+입력합니다 — request도 응답도 계약도 없습니다. 차이는 화면에 그대로 드러납니다.
+계약 모드는 kind·mode 배지를 보여주고, just-send는 `▷ SEND · keystrokes`만
+보여줍니다. 키스트로크 위에 QUESTION 배지를 띄우면 존재하지 않는 계약을 주장하는
+셈이기 때문입니다.
 
 watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 다른
 색상으로 표시합니다. `○ READ-ONLY`는 조사·답변만 위임하고 `● EXECUTE`는 명령과

@@ -31,7 +31,7 @@ row per pane.
 | `h` / `l`, `←` / `→` | Return to the parent session / select the first child agent. |
 | `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
-| `Enter` | Open prompt composer for the selected pane. Empty `Enter` attaches. |
+| `Enter` | Attach to the selected pane. |
 | `m` | Message the selected same-window agent. |
 | `b` | Open incoming/sent mailbox; `i` claims and `e` replies. |
 | `o` / `Alt-P` | Open live preview. |
@@ -111,21 +111,17 @@ commands include `refresh`, `preview`, `copy`, `attention`, `events`,
 Runtime `view` changes use the cached snapshot immediately and remain active
 for subsequent refreshes in the current watch process.
 
-## Prompt Composer
-
-Press `Enter` on a pane-bearing row to open the prompt composer. Type the
-prompt and press `Enter` to send it to that pane. Press `Esc` to cancel.
-If the composer is empty, `Enter` attaches to the pane instead.
-
-Prompt input time is recorded as a human interaction interval in
-`activity.ndjson` when activity logging is enabled.
-
 ## Agent collaboration
 
 Focus the sending agent pane and open watch with `prefix+s`. Select another
 agent in the same tmux window and press `m`. When the room has exactly one
-peer, watch selects it automatically. `Tab` changes request kind and `Ctrl-E`
-switches between `read-only` and `execute`; `Enter` sends.
+peer, watch selects it automatically. `Tab` changes request kind; `Enter`
+sends; `Esc` cancels.
+
+`Ctrl-E` cycles what leaves the composer: `read-only` and `execute` are the
+request contract, and `just send` types the text into the pane as raw
+keystrokes — no request, no reply, no contract — which is also how you send a
+plain prompt now that `Enter` attaches directly.
 
 - `? QUESTION` (cyan) asks for an answer.
 - `◆ REVIEW` (magenta) asks for review findings.

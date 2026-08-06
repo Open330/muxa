@@ -862,15 +862,15 @@ pub fn capture_pane_on(socket: Option<&str>, pane_id: &str) -> Result<String, Tm
 /// multiple attached clients we still return the active pane of the
 /// session that triggered the binding (rather than tmux's most-recently-
 /// active client, which `display-message` defaults to).
-/// The client this process is talking through, e.g. `/dev/pts/87`.
+/// The client tmux considers "current", e.g. `/dev/pts/87`.
 ///
-/// tmux commands that move focus (`switch-client`) act on "the current
-/// client" when not told otherwise, and tmux resolves that from recent
-/// activity — so with two terminals attached the wrong one can move.
-/// Anything that steers the user's view must pin the client with `-c`.
-///
-/// Resolves correctly from inside a `display-popup`, which is where
-/// `muxa watch` usually runs.
+/// This is a guess, not an identity: tmux resolves the current client
+/// from recent activity, so with two terminals attached the answer is
+/// routinely the *other* one — especially from inside a `display-popup`,
+/// which runs detached from the client that opened it. The only reliable
+/// identity is `#{client_name}` expanded by the key binding at the
+/// keypress and passed in (see `muxa watch --caller-client`); use this
+/// fallback only when no such value exists.
 pub fn current_client() -> Option<String> {
     let out = tmux_output(&["display-message", "-p", "#{client_name}"]).ok()?;
     if !out.status.success() {

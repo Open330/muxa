@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The client that pressed the key is now named by the key binding itself.**
+  Even with `switch-client -c`, the pin was filled in by asking tmux for "the
+  current client" — an activity-based guess a popup cannot make reliably, so
+  with two terminals attached the *other* one could still be moved. Measured
+  live: a popup opened from `/dev/pts/67` answered `/dev/pts/87`. The managed
+  `prefix+s` binding now expands `#{client_name}` and `#{pane_id}` at the
+  keypress — the one moment that identity is unambiguous — and passes them to
+  `muxa watch --caller-client/--caller-pane`, which pins every later focus
+  move and seeds the collaboration room and opening cursor. Re-run
+  `muxa init --component tmux-popup` and source `~/.tmux.conf` to pick the
+  binding up; without the flags watch falls back to the previous behaviour.
 - **Enter in `muxa watch` moved a terminal the user was not looking at.** The
   jump pre-positioned with `select-window -t "<session>:<index>"` *before*
   switching anyone, and a session's current window is shared state — so any

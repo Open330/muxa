@@ -163,6 +163,18 @@ enum Cmd {
         /// One-shot visual theme override.
         #[arg(long, value_enum)]
         theme: Option<ThemeArg>,
+        /// tmux client that pressed the key, expanded by the binding
+        /// (`#{client_name}`). Inside a `display-popup` every unpinned
+        /// tmux query resolves against whichever client was last active —
+        /// with two terminals attached, routinely the wrong one — so the
+        /// binding passes the answer in at keypress time.
+        #[arg(long, value_name = "CLIENT")]
+        caller_client: Option<String>,
+        /// Pane the key was pressed in, expanded by the binding
+        /// (`#{pane_id}`). Seeds the collaboration room and the opening
+        /// cursor; same rationale as `--caller-client`.
+        #[arg(long, value_name = "PANE")]
+        caller_pane: Option<String>,
     },
     /// Run a command in a muxa-owned PTY session.
     Run {
@@ -453,15 +465,25 @@ async fn main() -> Result<()> {
             view,
             sort,
             theme,
+            caller_client,
+            caller_pane,
         } => {
+            // Pin every later focus-moving tmux command to the client that
+            // actually asked. Set-once; jump_to_pane_tmux reads it.
+            if let Some(client_name) = caller_client {
+                let _ = CALLER_CLIENT.set(client_name);
+            }
             cmd_watch(
                 &client,
                 cfg,
                 config_path.clone(),
-                include_paneless,
-                view,
-                sort,
-                theme,
+                WatchInvocation {
+                    include_paneless,
+                    view,
+                    sort,
+                    theme,
+                    caller_pane,
+                },
             )
             .await
         }
@@ -1103,15 +1125,30 @@ async fn cmd_sync(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_watch(
-    client: &Client,
-    cfg: Config,
-    config_path: Option<PathBuf>,
+/// One-shot per-invocation overrides for `muxa watch`, bundled so the
+/// argument list stays a description of *this run* rather than a flat
+/// parade of options.
+struct WatchInvocation {
     include_paneless: bool,
     view: Option<WatchViewArg>,
     sort: Option<WatchSortArg>,
     theme: Option<ThemeArg>,
+    caller_pane: Option<String>,
+}
+
+async fn cmd_watch(
+    client: &Client,
+    cfg: Config,
+    config_path: Option<PathBuf>,
+    invocation: WatchInvocation,
 ) -> Result<()> {
+    let WatchInvocation {
+        include_paneless,
+        view,
+        sort,
+        theme,
+        caller_pane,
+    } = invocation;
     // watch::run restores the terminal before returning, so by the time we
     // get here it's safe to exec tmux commands that mutate the client's
     // attached session / pane.
@@ -1160,6 +1197,7 @@ async fn cmd_watch(
         session_activity_path,
         activity_path.clone(),
         config_path,
+        caller_pane,
     )
     .await?
     {
@@ -1339,6 +1377,16 @@ pub(crate) async fn all_panes() -> Vec<muxa::tmux::PaneInfo> {
     panes
 }
 
+/// The tmux client that invoked this process, as expanded by the key
+/// binding (`#{client_name}`) at the moment the key was pressed.
+///
+/// This is the only trustworthy client identity a popup-launched process
+/// has: any `display-message` it runs resolves "current client" from
+/// recent activity, which with two terminals attached is routinely the
+/// other one — measured live, a popup opened from `/dev/pts/67` answered
+/// `/dev/pts/87`. Empty when launched outside a managed binding.
+static CALLER_CLIENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn jump_to_pane_tmux(pane_id: &str) {
     let Some(info) = tmux::resolve_pane(pane_id) else {
         eprintln!("muxa: pane {pane_id} not found in tmux — it may have closed");
@@ -1363,9 +1411,12 @@ fn jump_to_pane_tmux(pane_id: &str) {
         // `switch-client -t <pane-id>` resolves session, window and pane
         // together from an identifier that cannot be ambiguous, and only
         // for the client we name.
-        // No client to pin means nothing can be mis-selected; the pane-id
-        // target keeps prefix matching out of it either way.
-        if let Some(client) = tmux::current_client() {
+        // Prefer the binding-expanded client: it names who pressed the key.
+        // `current_client()` is an activity-based guess and only acceptable
+        // when nothing better exists (an old binding without the flag);
+        // unpinned is last, safe only when a single client is attached.
+        let pinned = CALLER_CLIENT.get().cloned().or_else(tmux::current_client);
+        if let Some(client) = pinned {
             run_tmux(&["switch-client", "-c", &client, "-t", pane_id]);
         } else {
             run_tmux(&["switch-client", "-t", pane_id]);

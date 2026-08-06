@@ -1261,16 +1261,6 @@ pub(crate) struct ConfirmPopup {
 /// Inline prompt composer opened from the table with Enter. It pins the
 /// target pane at open time so background refreshes or resorting cannot
 /// redirect a typed prompt to a different row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PromptPopup {
-    pub pane_id: String,
-    pub label: String,
-    pub input: String,
-    /// Cursor position in chars, not bytes, so editing non-ASCII prompt
-    /// text stays safe.
-    pub cursor: usize,
-}
-
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -1308,15 +1298,35 @@ struct CollaborationMailboxState {
 enum CollaborationComposeTarget {
     Send {
         origin: CollaborationOrigin,
+        /// Raw pane id of the recipient. `target` is the wire form
+        /// (`pane:%N`); this copy exists so `just send` mode can type
+        /// into the pane without re-parsing its own address.
+        pane: String,
         target: String,
         kind: RequestKind,
-        work_mode: WorkMode,
+        mode: ComposeSendMode,
     },
     Reply {
         origin: CollaborationOrigin,
         request_id: String,
         status: RequestStatus,
     },
+}
+
+/// What Ctrl-E cycles: how the composed text leaves the composer.
+///
+/// The first two are the wire `WorkMode` contract on a durable request.
+/// `JustSend` is watch-local — plain keystrokes typed into the pane, no
+/// request, no reply, no contract. It lives here and not in `WorkMode`
+/// because that enum is wire format (PROTOCOL.md, the MCP schema,
+/// `collaboration.json`), and a variant that by construction never
+/// appears on the wire would burden every consumer with a case that
+/// cannot happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeSendMode {
+    ReadOnly,
+    Execute,
+    JustSend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1328,13 +1338,6 @@ struct CollaborationComposer {
 }
 
 impl CollaborationComposer {
-    /// Adopt a draft typed in the other composer. The cursor goes to the
-    /// end so the user keeps typing where they left off.
-    fn set_input(&mut self, text: String) {
-        self.cursor = text.chars().count();
-        self.input = text;
-    }
-
     fn new(target: CollaborationComposeTarget, label: String) -> Self {
         Self {
             target,
@@ -1386,67 +1389,8 @@ impl CollaborationComposer {
     }
 }
 
-impl PromptPopup {
-    /// Adopt a draft typed in the request composer. The cursor goes to
-    /// the end so the user keeps typing where they left off.
-    fn set_input(&mut self, text: String) {
-        self.cursor = text.chars().count();
-        self.input = text;
-    }
-
-    fn new(pane_id: String, label: String) -> Self {
-        Self {
-            pane_id,
-            label,
-            input: String::new(),
-            cursor: 0,
-        }
-    }
-
-    fn insert(&mut self, c: char) {
-        let idx = char_to_byte_idx(&self.input, self.cursor);
-        self.input.insert(idx, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = char_to_byte_idx(&self.input, self.cursor - 1);
-        let end = char_to_byte_idx(&self.input, self.cursor);
-        self.input.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.input.chars().count() {
-            return;
-        }
-        let start = char_to_byte_idx(&self.input, self.cursor);
-        let end = char_to_byte_idx(&self.input, self.cursor + 1);
-        self.input.replace_range(start..end, "");
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.input.chars().count());
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.input.chars().count();
-    }
-}
-
-/// Editable `:` command line. It deliberately mirrors the prompt composer's
-/// UTF-8-safe cursor behavior without carrying pane-specific fields.
+/// Editable `:` command line, with the same UTF-8-safe cursor behavior
+/// as the request composer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommandPalette {
     pub input: String,
@@ -1669,9 +1613,6 @@ pub(crate) struct App {
     /// the input handler resolves the popup before any other key is
     /// interpreted.
     pub confirm: Option<ConfirmPopup>,
-    /// `Some` while the user is composing a prompt to send directly to
-    /// the selected pane. Steals table input until submitted or canceled.
-    pub prompt: Option<PromptPopup>,
     collaboration: WatchCollaboration,
     collaboration_mailbox: CollaborationMailboxState,
     collaboration_composer: Option<CollaborationComposer>,
@@ -1801,7 +1742,6 @@ impl App {
             paneless_attention: 0,
             pane_capture: None,
             confirm: None,
-            prompt: None,
             collaboration: WatchCollaboration::default(),
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
@@ -4142,6 +4082,7 @@ pub async fn run(
     session_activity_path: Option<PathBuf>,
     activity_path: Option<PathBuf>,
     sort_persist_path: Option<PathBuf>,
+    caller_pane: Option<String>,
 ) -> Result<Option<String>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
@@ -4159,11 +4100,13 @@ pub async fn run(
     // is ordered by env preference (`backends[0]` = the env-preferred host), so
     // we resolve in set order and take the first `Some` — env preference breaks
     // the tie. Single-host: identical (the one backend answers or doesn't).
-    let initial_pane = backends.iter().find_map(|b| b.current_pane());
+    // The binding-expanded pane beats anything derived in-process: it was
+    // resolved by tmux at the keypress, in the pressing client's context,
+    // which no query made from inside a popup can reproduce.
+    let initial_pane = caller_pane.or_else(|| backends.iter().find_map(|b| b.current_pane()));
     app.set_initial_pane(initial_pane.clone());
     app.collaboration.origin = watch_collaboration_origin(initial_pane.clone());
     let watch_started_at = OffsetDateTime::now_utc();
-    let mut prompt_started_at: Option<(OffsetDateTime, String)> = None;
 
     // Paint the first frame **before** any IPC. The popup
     // (`prefix + s` → `display-popup -E muxa watch`) becomes visible
@@ -4297,18 +4240,6 @@ pub async fn run(
                     break;
                 }
                 Action::AttachPane(pane) => {
-                    if let Some((started_at, prompt_pane)) = prompt_started_at.take() {
-                        append_human_interaction(
-                            activity_path.as_deref(),
-                            HumanInteractionKind::MuxaPromptInput,
-                            &app,
-                            Some(&prompt_pane),
-                            started_at,
-                            OffsetDateTime::now_utc(),
-                        )
-                        .await;
-                    }
-                    app.prompt = None;
                     jump_target = Some(pane);
                     quit = true;
                     break;
@@ -4404,51 +4335,6 @@ pub async fn run(
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
                 }
-                Action::OpenPrompt(popup) => {
-                    prompt_started_at = Some((OffsetDateTime::now_utc(), popup.pane_id.clone()));
-                    app.prompt = Some(popup);
-                }
-                Action::SubmitPrompt => {
-                    if let Some(popup) = app.prompt.take() {
-                        if let Some((started_at, pane_id)) = prompt_started_at.take() {
-                            append_human_interaction(
-                                activity_path.as_deref(),
-                                HumanInteractionKind::MuxaPromptInput,
-                                &app,
-                                Some(&pane_id),
-                                started_at,
-                                OffsetDateTime::now_utc(),
-                            )
-                            .await;
-                        }
-                        // Don't inject keystrokes+Enter into a live pane on a
-                        // single Enter — route the send through the same
-                        // confirm popup `K`/`R` use so it takes a deliberate
-                        // `y`. The confirm's default focus is "No", so a
-                        // fat-fingered Enter cancels rather than sends.
-                        app.confirm = Some(ConfirmPopup {
-                            message: format!("Send to {}?", popup.label),
-                            on_confirm: QuickAction::SendPrompt {
-                                pane_id: popup.pane_id,
-                                text: popup.input,
-                            },
-                        });
-                    }
-                }
-                Action::CancelPrompt => {
-                    if let Some((started_at, pane_id)) = prompt_started_at.take() {
-                        append_human_interaction(
-                            activity_path.as_deref(),
-                            HumanInteractionKind::MuxaPromptInput,
-                            &app,
-                            Some(&pane_id),
-                            started_at,
-                            OffsetDateTime::now_utc(),
-                        )
-                        .await;
-                    }
-                    app.prompt = None;
-                }
                 Action::OpenCollaborationMessage => {
                     refresh_watch_collaboration(client, &mut app).await;
                     open_watch_collaboration_composer(&mut app);
@@ -4467,45 +4353,6 @@ pub async fn run(
                 }
                 Action::CancelCollaborationComposer => {
                     app.collaboration_composer = None;
-                }
-                // Two ways to put text in front of another agent that look
-                // alike and are not: a prompt is keystrokes typed into a
-                // pane, with no sender identity, no contract and no reply;
-                // a request is durable, addressed to a room peer, and
-                // carries kind + work_mode. Keeping them on separate keys
-                // (`Enter` vs `m`) made the user memorise which; folding
-                // them into one action would hide *which one is being
-                // sent*, which is the part that must never be ambiguous.
-                // So: one surface, one key to cross between them, and the
-                // draft comes along.
-                Action::SwitchComposeTransport => {
-                    if let Some(popup) = app.prompt.take() {
-                        prompt_started_at = None;
-                        refresh_watch_collaboration(client, &mut app).await;
-                        open_watch_collaboration_composer(&mut app);
-                        if let Some(composer) = app.collaboration_composer.as_mut() {
-                            composer.set_input(popup.input);
-                        } else {
-                            // No room, no peer, or the row is not one —
-                            // `open_watch_collaboration_composer` has already
-                            // set the hint explaining which. Put the draft
-                            // back rather than eating it.
-                            prompt_started_at =
-                                Some((OffsetDateTime::now_utc(), popup.pane_id.clone()));
-                            app.prompt = Some(popup);
-                        }
-                    } else if let Some(composer) = app.collaboration_composer.take() {
-                        if let Some(pane_id) = app.selected_pane() {
-                            let mut popup =
-                                PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id));
-                            popup.set_input(composer.input);
-                            prompt_started_at = Some((OffsetDateTime::now_utc(), pane_id.clone()));
-                            app.prompt = Some(popup);
-                        } else {
-                            app.set_hint("send: no tmux pane on this row", HintLevel::Err);
-                            app.collaboration_composer = Some(composer);
-                        }
-                    }
                 }
                 Action::ClaimCollaborationInbox => {
                     let outcome = match app.collaboration.origin.clone() {
@@ -4634,18 +4481,6 @@ pub async fn run(
         if quit {
             break;
         }
-    }
-
-    if let Some((started_at, pane_id)) = prompt_started_at.take() {
-        append_human_interaction(
-            activity_path.as_deref(),
-            HumanInteractionKind::MuxaPromptInput,
-            &app,
-            Some(&pane_id),
-            started_at,
-            OffsetDateTime::now_utc(),
-        )
-        .await;
     }
 
     let watch_pane = app.selected_pane().or(initial_pane);
@@ -4798,17 +4633,17 @@ fn empty_room_hint(current: &Participant) -> String {
 /// Kept short enough to survive the single-line hint area: past three
 /// peers the list is trimmed and the remainder counted, because a hint
 /// that wraps off-screen helps nobody. `muxa peers` prints the full set.
-fn peer_choice_hint(peers: &[Participant]) -> String {
+fn peer_choice_hint(labels: &[String]) -> String {
     const SHOWN: usize = 3;
-    let mut names = peers
+    let mut names = labels
         .iter()
         .take(SHOWN)
-        .map(Participant::label)
+        .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    if peers.len() > SHOWN {
+    if labels.len() > SHOWN {
         use std::fmt::Write as _;
-        let _ = write!(names, " +{} more", peers.len() - SHOWN);
+        let _ = write!(names, " +{} more", labels.len() - SHOWN);
     }
     format!("select one of these rows, then press m: {names}")
 }
@@ -4855,7 +4690,13 @@ fn open_watch_collaboration_composer(app: &mut App) {
         // "choose an agent in this tmux window" is true and useless: it
         // does not say which rows those are, and nothing on screen marks
         // them. Name them instead.
-        app.set_hint(peer_choice_hint(&room.peers), HintLevel::Err);
+        let labels = room
+            .peers
+            .iter()
+            .map(|p| format!("{} · {}", p.label(), app.pane_label(&p.pane)))
+            .collect::<Vec<_>>();
+        let hint = peer_choice_hint(&labels);
+        app.set_hint(hint, HintLevel::Err);
         return;
     };
     let Some(origin) = app.collaboration.origin.clone() else {
@@ -4863,14 +4704,19 @@ fn open_watch_collaboration_composer(app: &mut App) {
         return;
     };
     app.collaboration_mailbox.open = false;
+    // `codex@%469` says who; the pane position says where to look for
+    // them on screen. Both, because pane ids are stable and meaningless
+    // while positions are legible and drift.
+    let label = format!("{peer_label} · {}", app.pane_label(&peer_pane));
     app.collaboration_composer = Some(CollaborationComposer::new(
         CollaborationComposeTarget::Send {
             origin,
             target: format!("pane:{peer_pane}"),
+            pane: peer_pane,
             kind: RequestKind::Question,
-            work_mode: WorkMode::ReadOnly,
+            mode: ComposeSendMode::ReadOnly,
         },
-        peer_label,
+        label,
     ));
 }
 
@@ -4883,8 +4729,21 @@ async fn run_watch_collaboration_composer(
             origin,
             target,
             kind,
-            work_mode,
+            mode,
+            ..
         } => {
+            let work_mode = match mode {
+                ComposeSendMode::ReadOnly => WorkMode::ReadOnly,
+                ComposeSendMode::Execute => WorkMode::Execute,
+                // Enter converts just-send into a Quick(SendPrompt) before
+                // anything reaches this runner; refuse loudly rather than
+                // invent a contract for keystrokes.
+                ComposeSendMode::JustSend => {
+                    return ActionOutcome::Err(
+                        "just-send types into the pane and cannot become a request".into(),
+                    )
+                }
+            };
             let request = NewRequest {
                 kind,
                 body: composer.input,
@@ -5173,12 +5032,6 @@ pub(crate) enum Action {
     SetSort(WatchSortPreset),
     /// Change table granularity from the command palette.
     SetView(WatchView),
-    /// Open the inline prompt composer for the selected pane.
-    OpenPrompt(PromptPopup),
-    /// Submit the active inline prompt.
-    SubmitPrompt,
-    /// Cancel the active inline prompt and return to the table.
-    CancelPrompt,
     /// Resolve the selected row as a same-window collaboration peer and open
     /// the durable request composer.
     OpenCollaborationMessage,
@@ -5188,11 +5041,6 @@ pub(crate) enum Action {
     SubmitCollaboration,
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
-    /// `Shift-Tab` in one composer reopens the other one on the same
-    /// pane, carrying the text across. Transport and contract are
-    /// separate axes, so they get separate keys — `Tab` still cycles
-    /// request kind.
-    SwitchComposeTransport,
     /// Atomically claim the current agent's pending inbox.
     ClaimCollaborationInbox,
     /// Open a confirm popup for a destructive [`QuickAction`]. The
@@ -5370,10 +5218,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             for c in pasted.chars() {
                 composer.insert(c);
             }
-        } else if let Some(prompt) = app.prompt.as_mut() {
-            for c in pasted.chars() {
-                prompt.insert(c);
-            }
         } else if let Some(command) = app.command_palette.as_mut() {
             command.insert_str(&pasted.replace(['\r', '\n'], " "));
         } else if app.preview.is_none()
@@ -5424,10 +5268,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if app.collaboration_composer.is_some() {
         return handle_collaboration_composer_event(code, modifiers, app);
-    }
-
-    if let Some(prompt) = app.prompt.as_mut() {
-        return handle_prompt_event(code, modifiers, prompt);
     }
 
     if app.command_palette.is_some() {
@@ -5734,49 +5574,38 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
     }
 }
 
-/// Prompt composer steals table input until submitted or canceled. An
-/// empty Enter is the intentional "Enter twice to attach" path.
-fn handle_prompt_event(code: KeyCode, modifiers: KeyModifiers, prompt: &mut PromptPopup) -> Action {
-    match code {
-        KeyCode::Esc => Action::CancelPrompt,
-        KeyCode::BackTab => Action::SwitchComposeTransport,
-        KeyCode::Enter => {
-            if prompt.input.trim().is_empty() {
-                Action::AttachPane(prompt.pane_id.clone())
-            } else {
-                Action::SubmitPrompt
-            }
-        }
-        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-            prompt.insert(c);
-            Action::None
-        }
-        KeyCode::Backspace => {
-            prompt.backspace();
-            Action::None
-        }
-        KeyCode::Delete => {
-            prompt.delete();
-            Action::None
-        }
-        KeyCode::Left => {
-            prompt.move_left();
-            Action::None
-        }
-        KeyCode::Right => {
-            prompt.move_right();
-            Action::None
-        }
-        KeyCode::Home => {
-            prompt.move_home();
-            Action::None
-        }
-        KeyCode::End => {
-            prompt.move_end();
-            Action::None
-        }
-        _ => Action::None,
+/// Resolve Enter inside the composer.
+///
+/// `just send` bypasses the mailbox entirely: the text goes into the pane
+/// as keystrokes, through the same Quick dispatch the old prompt popup
+/// used. The composer is taken here (rather than in a run-loop arm) so
+/// submit stays a single code path per mode.
+fn composer_submit_action(app: &mut App) -> Action {
+    let empty = app
+        .collaboration_composer
+        .as_ref()
+        .is_none_or(|composer| composer.input.trim().is_empty());
+    if empty {
+        app.set_hint("message cannot be empty", HintLevel::Warn);
+        return Action::None;
     }
+    if let Some(CollaborationComposer {
+        target:
+            CollaborationComposeTarget::Send {
+                pane,
+                mode: ComposeSendMode::JustSend,
+                ..
+            },
+        input,
+        ..
+    }) = app.collaboration_composer.take()
+    {
+        return Action::Quick(QuickAction::SendPrompt {
+            pane_id: pane,
+            text: input,
+        });
+    }
+    Action::SubmitCollaboration
 }
 
 fn handle_collaboration_composer_event(
@@ -5786,22 +5615,22 @@ fn handle_collaboration_composer_event(
 ) -> Action {
     match code {
         KeyCode::Esc => Action::CancelCollaborationComposer,
-        KeyCode::Enter => {
-            let empty = app
-                .collaboration_composer
-                .as_ref()
-                .is_none_or(|composer| composer.input.trim().is_empty());
-            if empty {
-                app.set_hint("message cannot be empty", HintLevel::Warn);
-                Action::None
-            } else {
-                Action::SubmitCollaboration
-            }
-        }
-        KeyCode::BackTab => Action::SwitchComposeTransport,
+        KeyCode::Enter => composer_submit_action(app),
         KeyCode::Tab => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
                 match &mut composer.target {
+                    // Kind is a request concept; in `just send` mode there
+                    // is no request, and silently cycling a hidden badge
+                    // would surprise whoever switches back.
+                    CollaborationComposeTarget::Send {
+                        mode: ComposeSendMode::JustSend,
+                        ..
+                    } => {
+                        app.set_hint(
+                            "kind applies to requests — Ctrl-E to leave just-send",
+                            HintLevel::Warn,
+                        );
+                    }
                     CollaborationComposeTarget::Send { kind, .. } => {
                         *kind = match *kind {
                             RequestKind::Question => RequestKind::Review,
@@ -5824,13 +5653,14 @@ fn handle_collaboration_composer_event(
         }
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(CollaborationComposer {
-                target: CollaborationComposeTarget::Send { work_mode, .. },
+                target: CollaborationComposeTarget::Send { mode, .. },
                 ..
             }) = app.collaboration_composer.as_mut()
             {
-                *work_mode = match *work_mode {
-                    WorkMode::ReadOnly => WorkMode::Execute,
-                    WorkMode::Execute => WorkMode::ReadOnly,
+                *mode = match *mode {
+                    ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
+                    ComposeSendMode::Execute => ComposeSendMode::JustSend,
+                    ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
                 };
             }
             Action::None
@@ -6036,7 +5866,7 @@ fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
             .expect("preview present")
             .pane_id
             .clone();
-        return Action::OpenPrompt(PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id)));
+        return Action::AttachPane(pane_id);
     }
 
     match code {
@@ -6150,14 +5980,16 @@ pub(crate) fn quick_abort_action(app: &App) -> Action {
     }
 }
 
-/// Resolve table-mode Enter. First Enter opens the inline composer; a
-/// second Enter inside that empty composer attaches to this pinned pane.
+/// Resolve table-mode Enter: attach to the selected pane, immediately.
+///
+/// This used to open an inline prompt first, with an empty second Enter
+/// meaning "attach after all" — a two-step riddle for the most common
+/// action in the TUI. Typing at an agent now lives in the `m` composer,
+/// whose Ctrl-E `just send` mode does what the prompt popup did.
 pub(crate) fn quick_prompt_action(app: &App) -> Action {
     match app.selected_pane() {
-        Some(pane_id) => {
-            Action::OpenPrompt(PromptPopup::new(pane_id.clone(), app.pane_label(&pane_id)))
-        }
-        None => Action::NotApplicable("send: no tmux pane on this row"),
+        Some(pane_id) => Action::AttachPane(pane_id),
+        None => Action::NotApplicable("attach: no tmux pane on this row"),
     }
 }
 
@@ -6239,11 +6071,6 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         let popup_area = centered_rect(50, 30, chunks[1]);
         f.render_widget(Clear, popup_area);
         render_confirm(f, popup_area, app);
-    }
-    if app.prompt.is_some() {
-        let popup_area = bottom_prompt_rect(chunks[1]);
-        f.render_widget(Clear, popup_area);
-        render_prompt(f, popup_area, app);
     }
     if app.collaboration_composer.is_some() {
         let popup_area = bottom_prompt_rect(chunks[1]);
@@ -6470,47 +6297,6 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-/// Render the inline prompt composer as a compact bottom bar. The cursor
-/// is placed on the input line rather than drawn as text, so wide and
-/// non-ASCII characters keep their normal terminal behavior.
-fn render_prompt(f: &mut Frame, area: Rect, app: &App) {
-    use unicode_width::UnicodeWidthStr;
-
-    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
-    let popup = app.prompt.as_ref().expect("render_prompt without prompt");
-    let title = format!(" send · {} ", popup.label);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.action))
-        .border_type(theme.border_type)
-        .title(Span::styled(
-            title,
-            theme.action_badge().add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    let visible_input = truncate_prompt_input(&popup.input, inner.width.saturating_sub(2) as usize);
-    let body = vec![Line::from(vec![
-        Span::raw("> "),
-        Span::raw(visible_input.text.clone()),
-    ])];
-    let paragraph = Paragraph::new(body).block(block);
-    f.render_widget(paragraph, area);
-
-    let cursor_visible = popup.cursor.saturating_sub(visible_input.skipped_chars);
-    let before_cursor: String = visible_input.text.chars().take(cursor_visible).collect();
-    let before_cursor_width = u16::try_from(before_cursor.width()).unwrap_or(u16::MAX);
-    let cursor_x = inner
-        .x
-        .saturating_add(2)
-        .saturating_add(before_cursor_width);
-    let cursor_y = inner.y;
-    if cursor_x < inner.x.saturating_add(inner.width)
-        && cursor_y < inner.y.saturating_add(inner.height)
-    {
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
-}
-
 fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
     use unicode_width::UnicodeWidthStr;
 
@@ -6553,9 +6339,37 @@ fn collaboration_composer_title(
     theme: WatchThemeSpec,
 ) -> (Line<'static>, Color) {
     match composer.target {
+        // just-send drops the kind and mode badges: there is no request,
+        // so showing a QUESTION badge over raw keystrokes would claim a
+        // contract that does not exist.
         CollaborationComposeTarget::Send {
-            kind, work_mode, ..
-        } => {
+            mode: ComposeSendMode::JustSend,
+            ..
+        } => (
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    " ▷ SEND ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" keystrokes · no contract, no reply ", theme.dim_style()),
+                Span::styled(
+                    format!(" → {}  ", composer.label),
+                    theme.table_header_style(),
+                ),
+                Span::styled(" Ctrl-E ", theme.key_badge()),
+                Span::raw("mode "),
+            ]),
+            Color::Gray,
+        ),
+        CollaborationComposeTarget::Send { kind, mode, .. } => {
+            let work_mode = match mode {
+                ComposeSendMode::Execute => WorkMode::Execute,
+                _ => WorkMode::ReadOnly,
+            };
             let kind_badge = request_kind_badge(kind);
             let mode_badge = work_mode_badge(work_mode);
             let border = if work_mode == WorkMode::Execute {
@@ -7343,8 +7157,14 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
         && app.preview.is_none()
         && !app.help_open
         && !app.event_inbox_open
-        && !app.collaboration_mailbox.open
-        && app.collaboration_composer.is_none();
+        && !app.collaboration_mailbox.open;
+    // The composer is deliberately absent from that list. It is a two-line
+    // overlay, exactly like the prompt popup, which never hid the inspector
+    // — so `Enter` kept the peer's state on screen while `m` blanked it,
+    // for no reason a user could infer. The inspector is *most* wanted
+    // while composing: it is where you check what the peer is doing before
+    // asking it for something. The mailbox and help stay in the list
+    // because those are full-height panels that need the width.
     app.inspector_visible = split_inspector;
     if split_inspector {
         let columns = Layout::default()
@@ -8631,11 +8451,6 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
         return true;
     }
 
-    if app.prompt.is_some() {
-        render_prompt_footer(f, area, theme);
-        return true;
-    }
-
     if app.collaboration_composer.is_some() {
         render_collaboration_composer_footer(f, area, app, theme);
         return true;
@@ -8691,20 +8506,6 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
     false
 }
 
-fn render_prompt_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
-    let spans = vec![
-        Span::styled(" Enter ", theme.action_badge()),
-        Span::raw(" send  "),
-        Span::styled(" empty Enter ", theme.key_badge()),
-        Span::raw(" attach  "),
-        Span::styled(" S-Tab ", theme.key_badge()),
-        Span::raw(" request instead  "),
-        Span::styled(" Esc ", theme.key_badge()),
-        Span::raw(" cancel"),
-    ];
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
 fn render_collaboration_composer_footer(
     f: &mut Frame,
     area: Rect,
@@ -8729,12 +8530,7 @@ fn render_collaboration_composer_footer(
     if matches!(target, Some(CollaborationComposeTarget::Send { .. })) {
         spans.extend([
             Span::styled(" Ctrl-E ", theme.key_badge()),
-            Span::raw("read-only/execute  "),
-            // Advertised only on the Send path: a reply is answering a
-            // request that already exists, and there is no prompt
-            // equivalent of that to cross over to.
-            Span::styled(" S-Tab ", theme.key_badge()),
-            Span::raw("prompt instead  "),
+            Span::raw("read-only/execute/just-send  "),
         ]);
     }
     spans.extend([
@@ -9233,7 +9029,7 @@ mod tests {
             composer.target,
             CollaborationComposeTarget::Send {
                 kind: RequestKind::Review,
-                work_mode: WorkMode::Execute,
+                mode: ComposeSendMode::Execute,
                 ..
             }
         ));
@@ -9243,6 +9039,56 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn ctrl_e_cycles_through_just_send_and_back() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        let mode_of = |app: &App| match app.collaboration_composer.as_ref().unwrap().target {
+            CollaborationComposeTarget::Send { mode, .. } => mode,
+            CollaborationComposeTarget::Reply { .. } => unreachable!(),
+        };
+        assert_eq!(mode_of(&app), ComposeSendMode::ReadOnly);
+        for expected in [
+            ComposeSendMode::Execute,
+            ComposeSendMode::JustSend,
+            ComposeSendMode::ReadOnly,
+        ] {
+            handle_collaboration_composer_event(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut app,
+            );
+            assert_eq!(mode_of(&app), expected);
+        }
+    }
+
+    #[test]
+    fn enter_in_just_send_mode_becomes_keystrokes_not_a_request() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        // ReadOnly -> Execute -> JustSend
+        for _ in 0..2 {
+            handle_collaboration_composer_event(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut app,
+            );
+        }
+        app.collaboration_composer.as_mut().unwrap().insert('안');
+        let action =
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(
+            matches!(
+                action,
+                Action::Quick(QuickAction::SendPrompt { ref pane_id, ref text })
+                    if pane_id == "%2" && text == "안"
+            ),
+            "got {action:?}"
+        );
+        // The composer is consumed — nothing left to double-submit.
+        assert!(app.collaboration_composer.is_none());
     }
 
     #[test]
@@ -9290,18 +9136,16 @@ mod tests {
         // The table lists every agent on the host; without names the user
         // has no way to tell which handful of rows qualify.
         let hint = peer_choice_hint(&[
-            fake_collaboration_participant("%747", "s1", Some("reviewer")),
-            fake_collaboration_participant("%751", "s2", None),
+            "reviewer@%747 · callabo-set:0.1".to_string(),
+            "codex@%751 · callabo-set:0.2".to_string(),
         ]);
-        assert!(hint.contains("reviewer@%747"), "{hint}");
-        assert!(hint.contains("%751"), "{hint}");
+        assert!(hint.contains("reviewer@%747 · callabo-set:0.1"), "{hint}");
+        assert!(hint.contains("codex@%751 · callabo-set:0.2"), "{hint}");
     }
 
     #[test]
     fn the_peer_hint_stays_on_one_line_when_the_room_is_crowded() {
-        let peers: Vec<_> = (1..=6)
-            .map(|n| fake_collaboration_participant(&format!("%{n}"), "s", None))
-            .collect();
+        let peers: Vec<String> = (1..=6).map(|n| format!("agent@%{n}")).collect();
         let hint = peer_choice_hint(&peers);
         assert!(hint.contains("+3 more"), "{hint}");
         assert!(
@@ -9328,47 +9172,6 @@ mod tests {
                 ..
             }
         ));
-
-        // Shift-Tab crosses transports instead of advancing the kind.
-        assert!(matches!(
-            handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::NONE, &mut app),
-            Action::SwitchComposeTransport
-        ));
-        assert!(matches!(
-            app.collaboration_composer.as_ref().unwrap().target,
-            CollaborationComposeTarget::Send {
-                kind: RequestKind::Review,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn shift_tab_in_the_prompt_popup_asks_for_the_request_composer() {
-        let mut popup = PromptPopup::new("%1".into(), "peer".into());
-        assert!(matches!(
-            handle_prompt_event(KeyCode::BackTab, KeyModifiers::NONE, &mut popup),
-            Action::SwitchComposeTransport
-        ));
-    }
-
-    #[test]
-    fn a_carried_draft_puts_the_cursor_at_the_end() {
-        // Crossing transports mid-sentence must not drop the user back to
-        // column 0 — non-ASCII included, since the cursor counts chars.
-        let mut popup = PromptPopup::new("%1".into(), "peer".into());
-        popup.set_input("검토해 주세요".into());
-        assert_eq!(popup.cursor, "검토해 주세요".chars().count());
-        popup.insert('!');
-        assert_eq!(popup.input, "검토해 주세요!");
-
-        let mut app = collaboration_watch_app();
-        open_watch_collaboration_composer(&mut app);
-        let composer = app.collaboration_composer.as_mut().unwrap();
-        composer.set_input("검토해 주세요".into());
-        assert_eq!(composer.cursor, "검토해 주세요".chars().count());
-        composer.insert('!');
-        assert_eq!(composer.input, "검토해 주세요!");
     }
 
     #[test]
@@ -9930,9 +9733,9 @@ mod tests {
         assert_eq!(session_names(&app), vec!["amux", "muxa"]);
         assert_eq!(app.table_state.selected(), Some(1));
         assert_eq!(app.selected_pane().as_deref(), Some("%2"));
-        // …and Enter therefore composes against the pane the user is looking at.
+        // …and Enter therefore attaches to the pane the user is looking at.
         assert!(
-            matches!(quick_prompt_action(&app), Action::OpenPrompt(p) if p.pane_id == "%2"),
+            matches!(quick_prompt_action(&app), Action::AttachPane(p) if p == "%2"),
             "Enter must target the highlighted session's pane"
         );
     }
@@ -13296,14 +13099,10 @@ sort = ["state"]
             | Action::Quit
             | Action::Refresh
             | Action::AttachPane(_)
-            | Action::OpenPrompt(_)
-            | Action::SubmitPrompt
-            | Action::CancelPrompt
             | Action::OpenCollaborationMessage
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
             | Action::CancelCollaborationComposer
-            | Action::SwitchComposeTransport
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes
@@ -13382,13 +13181,10 @@ sort = ["state"]
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &mut app,
         );
-        match action {
-            Action::OpenPrompt(popup) => {
-                assert_eq!(popup.pane_id, "%1");
-                assert_eq!(popup.label, "alpha:0.0");
-            }
-            other => panic!("expected OpenPrompt, got {other:?}"),
-        }
+        assert!(
+            matches!(action, Action::AttachPane(ref pane) if pane == "%1"),
+            "preview Enter must attach to the pinned pane, got {action:?}"
+        );
     }
 
     #[test]
@@ -14174,7 +13970,7 @@ sort = ["state"]
     }
 
     #[test]
-    fn enter_opens_prompt_composer_for_selected_pane() {
+    fn enter_attaches_to_the_selected_pane() {
         let mut app = app_with_paneless_and_pane();
         let pane_idx = app
             .rows
@@ -14187,14 +13983,10 @@ sort = ["state"]
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &mut app,
         );
-        match action {
-            Action::OpenPrompt(popup) => {
-                assert_eq!(popup.pane_id, "%42");
-                assert_eq!(popup.label, "main:2.0");
-                assert!(popup.input.is_empty());
-            }
-            other => panic!("expected OpenPrompt, got {other:?}"),
-        }
+        assert!(
+            matches!(action, Action::AttachPane(ref p) if p == "%42"),
+            "Enter must attach without an intermediate composer, got {action:?}"
+        );
     }
 
     #[test]
@@ -14218,57 +14010,26 @@ sort = ["state"]
     }
 
     #[test]
-    fn prompt_composer_edits_and_submits_prompt() {
-        let mut app = app_with_paneless_and_pane();
-        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
-
-        for c in ['h', 'e', 'l', 'o'] {
-            assert!(matches!(key_action(&mut app, c), Action::None));
-        }
-        let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            &mut app,
-        );
-        assert!(matches!(action, Action::None));
-        assert!(matches!(key_action(&mut app, 'l'), Action::None));
-        assert_eq!(app.prompt.as_ref().unwrap().input, "hello");
-
-        let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &mut app,
-        );
-        assert!(matches!(action, Action::SubmitPrompt));
-        let popup = app.prompt.take().unwrap();
-        let mut fx = RecorderEffects::default();
-        let outcome = dispatch_quick_action(
-            QuickAction::SendPrompt {
-                pane_id: popup.pane_id,
-                text: popup.input,
-            },
-            &mut fx,
-        );
-        assert_eq!(fx.send_prompt_calls, vec![("%42".into(), "hello".into())]);
-        assert!(matches!(outcome, ActionOutcome::Ok(msg) if msg.contains("sent prompt")));
-    }
-
-    #[test]
     fn pasted_text_with_newline_goes_to_buffer_not_submit() {
         // Bracketed paste delivers the whole payload — newlines and all —
         // as one `Event::Paste`. It must land in the composer buffer, not
         // submit at the embedded `\n` the way a stream of key events would.
-        let mut app = app_with_paneless_and_pane();
-        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
 
         let action = handle_event(Event::Paste("line one\nline two".into()), &mut app);
         assert!(matches!(action, Action::None));
-        assert_eq!(app.prompt.as_ref().unwrap().input, "line one\nline two");
+        assert_eq!(
+            app.collaboration_composer.as_ref().unwrap().input,
+            "line one\nline two"
+        );
 
         // A subsequent real Enter is what submits.
         let action = handle_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &mut app,
         );
-        assert!(matches!(action, Action::SubmitPrompt));
+        assert!(matches!(action, Action::SubmitCollaboration));
     }
 
     #[test]
@@ -14276,66 +14037,7 @@ sort = ["state"]
         let mut app = app_with_paneless_and_pane();
         let action = handle_event(Event::Paste("junk".into()), &mut app);
         assert!(matches!(action, Action::None));
-        assert!(app.prompt.is_none());
         assert_eq!(app.search_query, "junk");
-    }
-
-    #[test]
-    fn empty_prompt_enter_attaches_pinned_pane() {
-        let mut app = app_with_paneless_and_pane();
-        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
-
-        let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &mut app,
-        );
-        assert!(matches!(action, Action::AttachPane(pane) if pane == "%42"));
-    }
-
-    #[test]
-    fn prompt_escape_cancels_composer() {
-        let mut app = app_with_paneless_and_pane();
-        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
-
-        let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            &mut app,
-        );
-        assert!(matches!(action, Action::CancelPrompt));
-    }
-
-    #[test]
-    fn prompt_composer_renders_as_compact_bottom_bar() {
-        let backend = TestBackend::new(120, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = app_with_paneless_and_pane();
-        app.prompt = Some(PromptPopup::new("%42".into(), "main:2.0".into()));
-        if let Some(prompt) = app.prompt.as_mut() {
-            prompt.input = "hello".into();
-            prompt.cursor = prompt.input.chars().count();
-        }
-
-        terminal.draw(|f| render(f, &mut app)).unwrap();
-        terminal.backend_mut().assert_cursor_position((8, 9));
-        let buf = terminal.backend().buffer();
-
-        assert!(
-            row_text(buf, 8).contains("send · main:2.0"),
-            "prompt title must sit at the bottom edge of the content area"
-        );
-        assert!(
-            row_text(buf, 9).contains("> hello"),
-            "prompt input should be a single compact editable line"
-        );
-        let dump: String = buf
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(
-            !dump.contains("target:"),
-            "old multi-line prompt body must not come back"
-        );
     }
 
     #[test]
