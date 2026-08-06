@@ -4613,9 +4613,16 @@ fn open_prompt_only_composer(app: &mut App, reason: String) {
     app.collaboration_mailbox.open = false;
     app.collaboration_composer = Some(CollaborationComposer::new(
         CollaborationComposeTarget::Prompt { pane },
-        label,
+        label.clone(),
     ));
-    app.set_hint(format!("keystrokes only — {reason}"), HintLevel::Warn);
+    // Lead with what *works* — this composer sends, to exactly the pane the
+    // user pointed at. A hint that opens with "only —" plus a warning color
+    // reads as a refusal, and users reported it as "m doesn't work" while
+    // the composer sat there fully functional.
+    app.set_hint(
+        format!("▷ typing to {label} as keystrokes ({reason})"),
+        HintLevel::Ok,
+    );
 }
 
 /// The one room peer the selected row contains, if it contains exactly
