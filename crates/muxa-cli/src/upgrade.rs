@@ -20,12 +20,18 @@
 //! binary itself, and the planner/dry-run path is the same shape as
 //! `muxa init` so users get a consistent UX between the two.
 //!
-//! **Why we require running from the source repo**: this command is the
-//! source-checkout updater. Release archives already exist, but muxa does
-//! not yet have a managed self-update channel that can safely identify and
-//! atomically replace every installation style. Keeping this path explicit
-//! avoids guessing whether a binary came from cargo, an archive, or a future
-//! package manager.
+//! **Channel awareness**: most users have no source clone, and telling
+//! them to get one is a dead end. `upgrade` resolves its own install
+//! channel and does the right thing per channel:
+//!
+//! - inside a muxa source checkout → the git-pull + cargo-install flow above;
+//! - a Homebrew-managed binary → delegate to `brew upgrade muxa`;
+//! - anything else (release-archive or hand-copied binary) → self-update
+//!   from the GitHub release matching this platform: download the target
+//!   archive and its `.sha256` sidecar, verify, atomically swap `muxa` and
+//!   `muxad` in place (previous binaries kept as `.bak`), restart.
+//!
+//! The daemon restart + socket verification tail is shared by all three.
 
 use crate::init::util::wait_for_muxad;
 use anyhow::{anyhow, Context, Result};
@@ -72,12 +78,11 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     // crate dir, the docs/ folder, …) without having to cd to the
     // root first.
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let repo = find_repo_root(&cwd).ok_or_else(|| {
-        anyhow!(
-            "muxa upgrade requires running from the muxa source repo; \
-             clone https://github.com/Open330/muxa first or use `cargo install` manually"
-        )
-    })?;
+    let Some(repo) = find_repo_root(&cwd) else {
+        // No checkout in sight — most users. Resolve the channel from the
+        // running binary instead of sending them off to clone a repo.
+        return run_without_repo(&args, &socket);
+    };
     let _ = cliclack::log::info(format!("repo: {}", repo.display()));
 
     let plan = Plan {
@@ -147,6 +152,281 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Upgrade without a source checkout: Homebrew delegation or GitHub
+/// release self-update, chosen from where the running binary lives.
+fn run_without_repo(args: &Args, socket: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving current executable")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+
+    if is_homebrew_managed(&exe) {
+        let _ = cliclack::log::info(format!("channel: homebrew ({})", exe.display()));
+        if args.dry_run {
+            let _ = cliclack::note(
+                "Plan",
+                "brew upgrade muxa
+restart muxad
+verify IPC socket",
+            );
+            let _ = cliclack::outro("Dry run — no changes made.");
+            return Ok(());
+        }
+        let _ = cliclack::log::step("brew upgrade muxa");
+        run_streaming(Command::new("brew").args(["upgrade", "muxa"]))
+            .context("brew upgrade muxa")?;
+        finish_with_restart(args, socket, &format!("v{}", latest_installed_version()));
+        return Ok(());
+    }
+
+    let triple = release_target_triple(std::env::consts::OS, std::env::consts::ARCH)
+        .ok_or_else(|| {
+            anyhow!(
+                "no prebuilt release for {}-{} — clone https://github.com/Open330/muxa and run `muxa upgrade` inside it",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        })?;
+    let install_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("executable has no parent directory"))?
+        .to_path_buf();
+    let _ = cliclack::log::info(format!(
+        "channel: release binary ({} · {triple})",
+        install_dir.display()
+    ));
+
+    let _ = cliclack::log::step("checking latest release");
+    let latest = latest_release_tag().context("querying the latest GitHub release")?;
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    if latest == current {
+        let _ = cliclack::outro(format!("already up to date ({current})"));
+        return Ok(());
+    }
+    let _ = cliclack::log::info(format!("{current} → {latest}"));
+
+    if args.dry_run {
+        let _ = cliclack::note(
+            "Plan",
+            format!(
+                "download muxa-{latest}-{triple}.tar.gz + .sha256
+verify checksum
+replace muxa + muxad in {}
+restart muxad
+verify IPC socket",
+                install_dir.display()
+            ),
+        );
+        let _ = cliclack::outro("Dry run — no changes made.");
+        return Ok(());
+    }
+
+    let staging = std::env::temp_dir().join(format!("muxa-upgrade-{}", std::process::id()));
+    std::fs::create_dir_all(&staging).context("creating staging dir")?;
+    // Release asset naming, measured against v0.8.27: the archive is
+    // `muxa-<tag>-<triple>.tar.gz`, its sidecar is `muxa-<tag>-<triple>.sha256`
+    // (no `.tar.gz` in the sidecar name), and the archive unpacks into a
+    // `muxa-<tag>-<triple>/` directory containing the binaries.
+    let stem = format!("muxa-{latest}-{triple}");
+    let archive = format!("{stem}.tar.gz");
+    let base = format!("https://github.com/Open330/muxa/releases/download/{latest}");
+
+    let _ = cliclack::log::step("downloading");
+    download(&format!("{base}/{archive}"), &staging.join(&archive))?;
+    download(
+        &format!("{base}/{stem}.sha256"),
+        &staging.join(format!("{stem}.sha256")),
+    )?;
+
+    let _ = cliclack::log::step("verifying checksum");
+    verify_sha256(&staging, &archive, &format!("{stem}.sha256"))?;
+
+    let _ = cliclack::log::step("extracting");
+    run_streaming(
+        Command::new("tar")
+            .args(["-xzf", &archive])
+            .current_dir(&staging),
+    )
+    .context("extracting release archive")?;
+
+    let _ = cliclack::log::step(format!("installing into {}", install_dir.display()));
+    for bin in ["muxa", "muxad"] {
+        let fresh = staging.join(&stem).join(bin);
+        if !fresh.is_file() {
+            return Err(anyhow!("release archive is missing `{bin}`"));
+        }
+        replace_binary(&fresh, &install_dir.join(bin))
+            .with_context(|| format!("installing {bin}"))?;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+
+    finish_with_restart(args, socket, &latest);
+    Ok(())
+}
+
+/// Shared tail: restart the daemon (unless opted out), verify the
+/// socket, and close the flow with the version we ended on.
+fn finish_with_restart(args: &Args, socket: &Path, version: &str) {
+    let restart_completed = if args.no_restart {
+        let _ = cliclack::log::info("daemon restart skipped (--no-restart)");
+        false
+    } else {
+        let _ = cliclack::log::step("restarting daemon");
+        match restart_daemon() {
+            RestartOutcome::Restarted => true,
+            RestartOutcome::ManualRequired(reason) => {
+                let _ = cliclack::log::warning(format!(
+                    "{reason}; restart muxad manually to load the upgraded daemon"
+                ));
+                false
+            }
+        }
+    };
+    if restart_completed {
+        let _ = cliclack::log::step("verifying");
+        if wait_for_muxad(socket, Duration::from_secs(3)) {
+            let _ = cliclack::log::success(format!("muxad responsive on {}", socket.display()));
+        } else {
+            let _ = cliclack::log::warning(format!(
+                "muxad did not respond on {} within 3s — check /tmp/muxad.log",
+                socket.display()
+            ));
+        }
+        let _ = cliclack::outro(format!(
+            "Upgraded to {version} — try `muxa doctor` for a health check."
+        ));
+    } else {
+        let _ = cliclack::outro(format!(
+            "Upgraded to {version} — manual muxad restart required."
+        ));
+    }
+}
+
+/// A brew-owned binary lives under the Cellar (the `bin/` entries are
+/// symlinks into it, which canonicalization resolves). Managing it
+/// ourselves would fight the package manager — delegate instead.
+fn is_homebrew_managed(exe: &Path) -> bool {
+    exe.components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case("Cellar"))
+}
+
+/// The release-archive target triple for this host, `None` when the
+/// release matrix does not build for it.
+pub(crate) fn release_target_triple(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// `vX.Y.Z` of the latest published release, straight from the GitHub
+/// API. curl keeps us off an HTTP client dependency; it is present on
+/// every platform the release matrix builds for.
+fn latest_release_tag() -> Result<String> {
+    let out = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--retry",
+            "2",
+            "https://api.github.com/repos/Open330/muxa/releases/latest",
+        ])
+        .output()
+        .context("spawning curl (is curl installed?)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "GitHub API request failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing GitHub release JSON")?;
+    body.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("release JSON has no tag_name"))
+}
+
+fn download(url: &str, dest: &Path) -> Result<()> {
+    run_streaming(Command::new("curl").args([
+        "-fL",
+        "--retry",
+        "2",
+        "-o",
+        &dest.display().to_string(),
+        url,
+    ]))
+    .with_context(|| format!("downloading {url}"))
+}
+
+/// Check the archive against its sidecar. The sidecar's first field is
+/// the digest; the local digest comes from whichever of `sha256sum` /
+/// `shasum -a 256` this host has.
+fn verify_sha256(dir: &Path, archive: &str, sidecar_name: &str) -> Result<()> {
+    let sidecar =
+        std::fs::read_to_string(dir.join(sidecar_name)).context("reading .sha256 sidecar")?;
+    let expected = sidecar
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("empty .sha256 sidecar"))?
+        .to_ascii_lowercase();
+
+    let out = Command::new("sha256sum")
+        .arg(archive)
+        .current_dir(dir)
+        .output()
+        .or_else(|_| {
+            Command::new("shasum")
+                .args(["-a", "256", archive])
+                .current_dir(dir)
+                .output()
+        })
+        .context("spawning sha256sum/shasum")?;
+    if !out.status.success() {
+        return Err(anyhow!("checksum tool failed"));
+    }
+    let actual = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if actual != expected {
+        return Err(anyhow!(
+            "checksum mismatch: expected {expected}, downloaded file hashes to {actual}"
+        ));
+    }
+    Ok(())
+}
+
+/// Swap `fresh` into `target`'s place: previous binary parked as
+/// `.bak`, new one renamed in atomically. A running process keeps its
+/// old inode, so replacing a live `muxa`/`muxad` is safe on unix.
+fn replace_binary(fresh: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fresh, std::fs::Permissions::from_mode(0o755))
+            .context("chmod new binary")?;
+    }
+    let backup = target.with_extension("bak");
+    if target.exists() {
+        std::fs::rename(target, &backup).context("parking previous binary as .bak")?;
+    }
+    if let Err(e) = std::fs::rename(fresh, target) {
+        // Cross-device rename (temp on another filesystem) falls back to
+        // copy; restore the backup if even that fails.
+        if std::fs::copy(fresh, target).is_err() {
+            let _ = std::fs::rename(&backup, target);
+            return Err(anyhow!("installing binary: {e}"));
+        }
+    }
+    Ok(())
+}
+
+fn latest_installed_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 /// Concrete upgrade plan. Pulled out of `Args` so the dry-run
@@ -342,6 +622,31 @@ fn current_head(repo: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn release_triples_cover_the_build_matrix_and_nothing_else() {
+        assert_eq!(
+            release_target_triple("macos", "aarch64"),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            release_target_triple("linux", "x86_64"),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(release_target_triple("windows", "x86_64"), None);
+        assert_eq!(release_target_triple("linux", "riscv64"), None);
+    }
+
+    #[test]
+    fn homebrew_detection_keys_on_the_cellar() {
+        assert!(is_homebrew_managed(Path::new(
+            "/opt/homebrew/Cellar/muxa/0.8.27/bin/muxa"
+        )));
+        assert!(!is_homebrew_managed(Path::new(
+            "/home/june/.cargo/bin/muxa"
+        )));
+    }
+
     use super::*;
     use std::fs;
     use tempfile::tempdir;

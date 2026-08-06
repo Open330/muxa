@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`muxa upgrade` works without a source clone.** Most users have no
+  checkout, and "clone the repo first" is a dead end from a release binary.
+  The command now resolves its own install channel: inside a source tree it
+  keeps the git-pull + cargo-install flow; a Homebrew-managed binary (Cellar
+  in the canonical path) delegates to `brew upgrade muxa`; anything else
+  self-updates from the GitHub release for this platform — download the
+  target archive and its `.sha256` sidecar, verify, swap `muxa`/`muxad` in
+  place atomically with the previous binaries parked as `.bak`, restart the
+  daemon, verify the socket. Asset naming and archive layout were measured
+  against the real v0.8.27 release, which is how the sidecar's
+  `muxa-<tag>-<triple>.sha256` name (no `.tar.gz`) and the nested
+  `muxa-<tag>-<triple>/` directory were caught before shipping.
+
 ## [0.8.27] - 2026-08-06
 
 ### Added
