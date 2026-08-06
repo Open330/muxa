@@ -4759,6 +4759,23 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
     clamp_collaboration_mailbox(app);
 }
 
+/// The one room peer the selected row contains, if it contains exactly
+/// one.
+///
+/// Lets `m` work at session granularity: the user points at the session
+/// their peer is in without first expanding it to the exact pane. Two
+/// peers in the same row stays ambiguous — picking one for the user
+/// would silently address the wrong agent.
+fn peer_inside_selected_row<'a>(app: &'a App, room: &'a RoomContext) -> Option<&'a Participant> {
+    let row = app.selected_row()?;
+    let mut inside = room
+        .peers
+        .iter()
+        .filter(|peer| row.contains_pane(&peer.pane));
+    let first = inside.next()?;
+    inside.next().is_none().then_some(first)
+}
+
 /// Name the room, so "no peer here" points somewhere.
 ///
 /// The room is the window `muxa watch` was opened from and is fixed for
@@ -4820,8 +4837,19 @@ fn open_watch_collaboration_composer(app: &mut App) {
     let peer = selected_pane
         .as_deref()
         .and_then(|pane| app.collaboration.peer_for_pane(pane))
-        .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]));
-    let Some(peer) = peer else {
+        // A session row is a whole tmux session, and the pane it resolves
+        // to is whichever of its agents moved last. Requiring that drifting
+        // pane to be the peer made `m` fail on a row that plainly contains
+        // one — the user is pointing at the right session and being told to
+        // point at it. Accept the row when exactly one peer lives in it;
+        // more than one is genuinely ambiguous and still asks.
+        .or_else(|| peer_inside_selected_row(app, room))
+        .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]))
+        // Take what the composer needs by value: everything below mutates
+        // `app`, and holding a borrow into `app.collaboration` across that
+        // is what the borrow checker is for.
+        .map(|peer| (peer.pane.clone(), peer.label()));
+    let Some((peer_pane, peer_label)) = peer else {
         // The table lists every tracked agent on the host — dozens of them
         // — while only the handful in this window can receive a request.
         // "choose an agent in this tmux window" is true and useless: it
@@ -4838,11 +4866,11 @@ fn open_watch_collaboration_composer(app: &mut App) {
     app.collaboration_composer = Some(CollaborationComposer::new(
         CollaborationComposeTarget::Send {
             origin,
-            target: format!("pane:{}", peer.pane),
+            target: format!("pane:{peer_pane}"),
             kind: RequestKind::Question,
             work_mode: WorkMode::ReadOnly,
         },
-        peer.label(),
+        peer_label,
     ));
 }
 
@@ -9215,6 +9243,27 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn m_resolves_a_peer_from_the_session_row_that_holds_it() {
+        // Pointing at the session the peer lives in is enough; the user
+        // should not have to expand it to the exact pane first.
+        let mut app = collaboration_watch_app();
+        app.apply_view(WatchView::Session);
+        app.table_state.select(Some(0));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(
+            matches!(
+                app.collaboration_composer
+                    .as_ref()
+                    .map(|composer| &composer.target),
+                Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%2"
+            ),
+            "expected the peer inside the selected session row"
+        );
     }
 
     #[test]
