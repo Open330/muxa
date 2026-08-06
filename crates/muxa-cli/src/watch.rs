@@ -4759,6 +4759,23 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
     clamp_collaboration_mailbox(app);
 }
 
+/// Name the room, so "no peer here" points somewhere.
+///
+/// The room is the window `muxa watch` was opened from and is fixed for
+/// the lifetime of the process. Selecting a different row cannot change
+/// it, and the message has to say so — otherwise the obvious reading of
+/// "here" is "the row I am looking at".
+fn empty_room_hint(current: &Participant) -> String {
+    let where_ = match (&current.tmux_session_name, &current.window_name) {
+        (Some(session), Some(window)) => format!("{session}:{window}"),
+        (Some(session), None) => session.clone(),
+        _ => current.room.window_id.clone(),
+    };
+    format!(
+        "no peer in {where_} — the room is the window watch was opened from, not the selected row; start another agent there"
+    )
+}
+
 /// Name the rows that can actually receive a request.
 ///
 /// Kept short enough to survive the single-line hint area: past three
@@ -4790,10 +4807,13 @@ fn open_watch_collaboration_composer(app: &mut App) {
         return;
     };
     if room.peers.is_empty() {
-        app.set_hint(
-            "no peer here yet — run another agent in this tmux window",
-            HintLevel::Err,
-        );
+        // "here" is the window `muxa watch` was launched from, fixed at
+        // startup — not the row under the cursor. The table spans every
+        // session on the host, so a user looking at a row from a session
+        // that *does* have two agents reads "no peer here" as plainly
+        // false and moves the cursor, which changes nothing. Name the
+        // room and say the cursor is not the lever.
+        app.set_hint(empty_room_hint(&room.current), HintLevel::Err);
         return;
     }
     let selected_pane = app.selected_pane();
@@ -9195,6 +9215,25 @@ mod tests {
             handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::SubmitCollaboration
         ));
+    }
+
+    #[test]
+    fn the_empty_room_hint_names_the_window_and_denies_the_cursor() {
+        // The table spans every session on the host, so an unqualified
+        // "here" reads as "the row I am on" and sends the user moving a
+        // cursor that cannot affect the room.
+        let hint = empty_room_hint(&fake_collaboration_participant("%1", "s1", None));
+        assert!(hint.contains("main:agents"), "{hint}");
+        assert!(hint.contains("not the selected row"), "{hint}");
+    }
+
+    #[test]
+    fn the_empty_room_hint_falls_back_to_the_window_id() {
+        let mut current = fake_collaboration_participant("%1", "s1", None);
+        current.tmux_session_name = None;
+        current.window_name = None;
+        let hint = empty_room_hint(&current);
+        assert!(hint.contains("@1"), "{hint}");
     }
 
     #[test]
