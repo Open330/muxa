@@ -1351,8 +1351,19 @@ fn jump_to_pane_tmux(pane_id: &str) {
     run_tmux(&["select-pane", "-t", pane_id]);
 
     if tmux::inside_tmux() {
-        // Already attached — just switch this client's session.
-        run_tmux(&["switch-client", "-t", &info.session]);
+        // Already attached — switch *this* client's session.
+        //
+        // `-c` is not optional here. Without it tmux picks "the current
+        // client" itself, which with two terminals attached is whichever
+        // one it last saw activity on, not necessarily the one that asked.
+        // The user then watches their other tab jump to the target while
+        // the tab they pressed Enter in goes somewhere else entirely.
+        match tmux::current_client() {
+            Some(client) => run_tmux(&["switch-client", "-c", &client, "-t", &info.session]),
+            // No client name resolved — a lone client cannot be
+            // mis-selected, so the unpinned form is still correct.
+            None => run_tmux(&["switch-client", "-t", &info.session]),
+        }
     } else {
         // Bare shell — hand our terminal to a fresh tmux attach-session.
         // `.status()` waits for tmux to exit; on detach the user is back at

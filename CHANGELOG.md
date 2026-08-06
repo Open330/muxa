@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa watch` acted on the wrong terminal when two were attached.** Enter
+  jumped the user's *other* tab to the target while the tab they pressed it in
+  went somewhere else, and `m` reported no peers in a window that plainly had
+  them. One cause behind both: `prefix+s` runs watch inside a `display-popup`,
+  where tmux leaves `TMUX_PANE` empty, so pane resolution fell back to the
+  session id parsed out of `$TMUX` — the popup's *target* session, which is not
+  always the session the client is displaying. Measured inside one popup, the
+  two paths named different panes (`%771` vs `%773`). Ask the client what it is
+  looking at first. `switch-client` now also pins `-c`: without it tmux picks
+  the current client from recent activity, which is how the wrong tab moved.
+
 ### Added
 
 - **`Shift-Tab` crosses between a prompt and a request without retyping.**
