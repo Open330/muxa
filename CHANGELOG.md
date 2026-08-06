@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The spawn form takes a session name.** Empty derives one from the
+  directory, shown as an `(auto: …)` placeholder instead of guessed behind
+  the user's back; a typed name is sanitized the same way (`.`/`:` → `-`)
+  and still deduplicated against live sessions.
+- **`Ctrl-V` pastes in every input surface.** Terminals that deliver it as
+  a plain keypress got nothing before; the composer, spawn form, and
+  command palette now read the system clipboard through the same backend
+  cascade the copy path uses (tmux buffer, pbpaste, wl-paste, xclip, xsel).
+
+### Fixed
+
+- **Pasting into the spawn form filtered the table instead.** The
+  bracketed-paste handler covered the composer and the palette but not the
+  spawn form, so a paste while `n` was open fell through to the search
+  fallback and the table started filtering underneath the form.
+- **Long spawn prompts wrap downward instead of clipping at the border.**
+  The form grows a row at a time (capped at half the body), width-aware so
+  wide glyphs never overflow; dir and name keep a single scrolling line.
+
 ## [0.8.28] - 2026-08-06
 
 ### Added

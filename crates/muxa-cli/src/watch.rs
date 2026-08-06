@@ -943,6 +943,9 @@ pub(crate) enum QuickAction {
         dir: String,
         agent_label: &'static str,
         launch: String,
+        /// Explicit session name (already sanitized); `None` derives one
+        /// from the directory.
+        session: Option<String>,
     },
 }
 
@@ -987,7 +990,12 @@ pub(crate) trait Effects {
     /// into it. Returns the session name actually created — derived from
     /// the directory, deduplicated, never reusing or replacing an
     /// existing session.
-    fn spawn_session(&mut self, dir: &str, launch: &str) -> std::result::Result<String, String>;
+    fn spawn_session(
+        &mut self,
+        dir: &str,
+        launch: &str,
+        session: Option<&str>,
+    ) -> std::result::Result<String, String>;
 }
 
 /// Real-world `Effects` impl — shells out to tmux and the system
@@ -1013,7 +1021,12 @@ impl Effects for RealEffects {
         )
     }
 
-    fn spawn_session(&mut self, dir: &str, launch: &str) -> std::result::Result<String, String> {
+    fn spawn_session(
+        &mut self,
+        dir: &str,
+        launch: &str,
+        session: Option<&str>,
+    ) -> std::result::Result<String, String> {
         let existing: Vec<String> = muxa::tmux::tmux_command()
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()
@@ -1024,9 +1037,8 @@ impl Effects for RealEffects {
                     .collect()
             })
             .unwrap_or_default();
-        let name = unique_session_name(session_base_name(dir), |candidate| {
-            existing.iter().any(|s| s == candidate)
-        });
+        let base = session.map_or_else(|| session_base_name(dir), str::to_string);
+        let name = unique_session_name(base, |candidate| existing.iter().any(|s| s == candidate));
         run_status("tmux", &["new-session", "-d", "-s", &name, "-c", dir])?;
         run_status("tmux", &["send-keys", "-t", &name, "--", launch, "Enter"])?;
         Ok(name)
@@ -1214,7 +1226,8 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             dir,
             agent_label,
             launch,
-        } => match fx.spawn_session(&dir, &launch) {
+            session,
+        } => match fx.spawn_session(&dir, &launch, session.as_deref()) {
             Ok(name) => ActionOutcome::Ok(format!(
                 "spawned {agent_label} in session {name} — Enter on its row to attach"
             )),
@@ -1374,6 +1387,71 @@ impl SpawnAgent {
     }
 }
 
+/// Cursor-aware multi-char insertion shared by paste paths.
+fn insert_str_at(text: &mut String, cursor: &mut usize, pasted: &str) {
+    let idx = char_to_byte_idx(text, *cursor);
+    text.insert_str(idx, pasted);
+    *cursor += pasted.chars().count();
+}
+
+/// Best-effort system clipboard read for terminals where `Ctrl-V` reaches
+/// us as a plain keypress instead of a bracketed paste. Mirrors
+/// `copy_to_clipboard`'s backend cascade in reverse; first non-empty
+/// answer wins.
+fn system_clipboard_text() -> Option<String> {
+    let in_tmux = std::env::var_os("TMUX").is_some();
+    let in_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let in_x11 = std::env::var_os("DISPLAY").is_some();
+    let candidates: [(&str, &[&str], bool); 5] = [
+        ("tmux", &["save-buffer", "-"], in_tmux),
+        ("pbpaste", &[], cfg!(target_os = "macos")),
+        ("wl-paste", &["--no-newline"], in_wayland),
+        ("xclip", &["-selection", "clipboard", "-o"], in_x11),
+        ("xsel", &["-b", "-o"], in_x11),
+    ];
+    for (bin, args, applicable) in candidates {
+        if !applicable {
+            continue;
+        }
+        let Ok(out) = std::process::Command::new(bin).args(args).output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Wrap `text` into display rows of at most `avail` terminal cells,
+/// width-aware so wide glyphs (Korean, CJK) never overflow a row the way
+/// char-counted chunking would. Returns each row with the char index it
+/// starts at, which is what maps a cursor to (row, column).
+fn wrap_input_rows(text: &str, avail: usize) -> Vec<(String, usize)> {
+    use unicode_width::UnicodeWidthChar;
+    let avail = avail.max(4);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_start = 0usize;
+    let mut row_width = 0usize;
+    for (i, c) in text.chars().enumerate() {
+        let w = c.width().unwrap_or(0);
+        if row_width + w > avail && !row.is_empty() {
+            rows.push((std::mem::take(&mut row), row_start));
+            row_start = i;
+            row_width = 0;
+        }
+        row.push(c);
+        row_width += w;
+    }
+    rows.push((row, row_start));
+    rows
+}
+
 /// POSIX-safe single quoting: close, escape the quote, reopen.
 fn shell_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -1413,6 +1491,7 @@ fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SpawnField {
     Dir,
+    Name,
     Agent,
     #[default]
     Prompt,
@@ -1425,6 +1504,11 @@ enum SpawnField {
 struct SpawnComposer {
     dir: String,
     dir_cursor: usize,
+    /// Session name override. Empty means "derive from the directory",
+    /// which the form shows as a placeholder rather than guessing behind
+    /// the user's back.
+    name: String,
+    name_cursor: usize,
     agent: SpawnAgent,
     prompt: String,
     prompt_cursor: usize,
@@ -1435,6 +1519,7 @@ impl SpawnComposer {
     fn field_mut(&mut self) -> Option<(&mut String, &mut usize)> {
         match self.focus {
             SpawnField::Dir => Some((&mut self.dir, &mut self.dir_cursor)),
+            SpawnField::Name => Some((&mut self.name, &mut self.name_cursor)),
             SpawnField::Prompt => Some((&mut self.prompt, &mut self.prompt_cursor)),
             SpawnField::Agent => None,
         }
@@ -5602,6 +5687,13 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             for c in pasted.chars() {
                 composer.insert(c);
             }
+        } else if let Some(spawn) = app.spawn.as_mut() {
+            // The spawn form was the one input surface missing here, so a
+            // paste while it was open fell through to the search fallback
+            // and started filtering the table under the form.
+            if let Some((text, cursor)) = spawn.field_mut() {
+                insert_str_at(text, cursor, &pasted);
+            }
         } else if let Some(command) = app.command_palette.as_mut() {
             command.insert_str(&pasted.replace(['\r', '\n'], " "));
         } else if app.preview.is_none()
@@ -5994,7 +6086,8 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
         }
         KeyCode::Tab | KeyCode::Down => {
             spawn.focus = match spawn.focus {
-                SpawnField::Dir => SpawnField::Agent,
+                SpawnField::Dir => SpawnField::Name,
+                SpawnField::Name => SpawnField::Agent,
                 SpawnField::Agent => SpawnField::Prompt,
                 SpawnField::Prompt => SpawnField::Dir,
             };
@@ -6003,9 +6096,18 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
         KeyCode::BackTab | KeyCode::Up => {
             spawn.focus = match spawn.focus {
                 SpawnField::Dir => SpawnField::Prompt,
-                SpawnField::Agent => SpawnField::Dir,
+                SpawnField::Name => SpawnField::Dir,
+                SpawnField::Agent => SpawnField::Name,
                 SpawnField::Prompt => SpawnField::Agent,
             };
+            Action::None
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(pasted) = system_clipboard_text() {
+                if let Some((text, cursor)) = spawn.field_mut() {
+                    insert_str_at(text, cursor, &pasted);
+                }
+            }
             Action::None
         }
         KeyCode::Left if spawn.focus == SpawnField::Agent => {
@@ -6042,11 +6144,14 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
                 return Action::None;
             }
             let agent = spawn.agent;
+            let name = spawn.name.trim().to_string();
+            let session = (!name.is_empty()).then(|| session_base_name(&name));
             app.spawn = None;
             Action::Quick(QuickAction::SpawnSession {
                 launch: agent.launch_command(&prompt),
                 agent_label: agent.label(),
                 dir,
+                session,
             })
         }
         other => {
@@ -6171,6 +6276,16 @@ fn handle_collaboration_composer_event(
         KeyCode::Enter => composer_submit_action(app),
         KeyCode::Tab => {
             composer_cycle_option(app);
+            Action::None
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let (Some(pasted), Some(composer)) =
+                (system_clipboard_text(), app.collaboration_composer.as_mut())
+            {
+                for c in pasted.chars() {
+                    composer.insert(c);
+                }
+            }
             Action::None
         }
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -6611,8 +6726,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
-    if app.spawn.is_some() {
-        let popup_area = spawn_popup_rect(chunks[1]);
+    if let Some(spawn) = app.spawn.as_ref() {
+        let popup_area = spawn_popup_rect(chunks[1], spawn);
         f.render_widget(Clear, popup_area);
         render_spawn(f, popup_area, app);
     }
@@ -6836,9 +6951,16 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-/// Five rows anchored to the bottom: three fields plus the border pair.
-fn spawn_popup_rect(r: Rect) -> Rect {
-    let height = 5.min(r.height);
+/// Bottom-anchored form: dir/name/agent rows plus however many rows the
+/// prompt currently wraps to (capped at half the body so the table never
+/// disappears under a long brief).
+fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
+    let avail = usize::from(r.width.saturating_sub(2 + 9)).max(4);
+    let prompt_rows = u16::try_from(wrap_input_rows(&spawn.prompt, avail).len())
+        .unwrap_or(1)
+        .max(1);
+    let cap = (r.height / 2).max(6);
+    let height = (5 + prompt_rows).min(cap).min(r.height);
     Rect {
         x: r.x,
         y: r.y + r.height - height,
@@ -6848,8 +6970,6 @@ fn spawn_popup_rect(r: Rect) -> Rect {
 }
 
 fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
-    use unicode_width::UnicodeWidthStr;
-
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let Some(spawn) = app.spawn.as_ref() else {
         return;
@@ -6863,6 +6983,7 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
             theme.action_badge().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
+    let avail = usize::from(inner.width.saturating_sub(9)).max(4);
     let focus_marker = |field: SpawnField| {
         if spawn.focus == field {
             Span::styled("> ", theme.action_badge())
@@ -6870,41 +6991,112 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
             Span::raw("  ")
         }
     };
-    let agent_line = Line::from(vec![
-        focus_marker(SpawnField::Agent),
-        Span::styled("agent  ", theme.dim_style()),
-        Span::raw("◂ "),
-        Span::styled(format!(" {} ", spawn.agent.label()), theme.action_badge()),
-        Span::raw(" ▸"),
-    ]);
-    let lines = vec![
+    // dir and name stay single-line with a scrolling window; the prompt is
+    // the field that grows, and it wraps *down* instead of clipping right —
+    // a brief is a sentence or three, not a filename.
+    let dir_view = truncate_prompt_input(&spawn.dir, avail);
+    let name_line: Line = if spawn.name.is_empty() && spawn.focus != SpawnField::Name {
+        Line::from(vec![
+            focus_marker(SpawnField::Name),
+            Span::styled("name   ", theme.dim_style()),
+            Span::styled(
+                format!("(auto: {})", session_base_name(&spawn.dir)),
+                theme.dim_style(),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            focus_marker(SpawnField::Name),
+            Span::styled("name   ", theme.dim_style()),
+            Span::raw(truncate_prompt_input(&spawn.name, avail).text),
+        ])
+    };
+    let mut lines = vec![
         Line::from(vec![
             focus_marker(SpawnField::Dir),
             Span::styled("dir    ", theme.dim_style()),
-            Span::raw(spawn.dir.clone()),
+            Span::raw(dir_view.text.clone()),
         ]),
-        agent_line,
+        name_line,
         Line::from(vec![
-            focus_marker(SpawnField::Prompt),
-            Span::styled("prompt ", theme.dim_style()),
-            Span::raw(spawn.prompt.clone()),
+            focus_marker(SpawnField::Agent),
+            Span::styled("agent  ", theme.dim_style()),
+            Span::raw("◂ "),
+            Span::styled(format!(" {} ", spawn.agent.label()), theme.action_badge()),
+            Span::raw(" ▸"),
         ]),
     ];
+    let prompt_rows = wrap_input_rows(&spawn.prompt, avail);
+    for (i, (row, _)) in prompt_rows.iter().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                focus_marker(SpawnField::Prompt),
+                Span::styled("prompt ", theme.dim_style()),
+                Span::raw(row.clone()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("         "),
+                Span::raw(row.clone()),
+            ]));
+        }
+    }
     f.render_widget(Paragraph::new(lines).block(block), area);
+    place_spawn_cursor(f, inner, spawn, &dir_view, &prompt_rows, avail);
+}
 
-    // Cursor on the focused text field. The agent field is a picker, not
-    // text — no cursor there.
-    let (row, text, cursor) = match spawn.focus {
-        SpawnField::Dir => (0, &spawn.dir, spawn.dir_cursor),
-        SpawnField::Prompt => (2, &spawn.prompt, spawn.prompt_cursor),
+/// Cursor for the focused spawn field, prompt rows included.
+fn place_spawn_cursor(
+    f: &mut Frame,
+    inner: Rect,
+    spawn: &SpawnComposer,
+    dir_view: &VisiblePromptInput,
+    prompt_rows: &[(String, usize)],
+    avail: usize,
+) {
+    use unicode_width::UnicodeWidthStr;
+    let (y, x) = match spawn.focus {
         SpawnField::Agent => return,
+        SpawnField::Dir => {
+            let before: String = dir_view
+                .text
+                .chars()
+                .take(spawn.dir_cursor.saturating_sub(dir_view.skipped_chars))
+                .collect();
+            (
+                inner.y,
+                inner.x + 9 + u16::try_from(before.width()).unwrap_or(u16::MAX),
+            )
+        }
+        SpawnField::Name => {
+            let view = truncate_prompt_input(&spawn.name, avail);
+            let before: String = view
+                .text
+                .chars()
+                .take(spawn.name_cursor.saturating_sub(view.skipped_chars))
+                .collect();
+            (
+                inner.y + 1,
+                inner.x + 9 + u16::try_from(before.width()).unwrap_or(u16::MAX),
+            )
+        }
+        SpawnField::Prompt => {
+            // Locate the wrapped row containing the cursor.
+            let mut y = inner.y + 3;
+            let mut x = inner.x + 9;
+            for (i, (row, start)) in prompt_rows.iter().enumerate() {
+                let end = start + row.chars().count();
+                let last = i + 1 == prompt_rows.len();
+                if spawn.prompt_cursor >= *start && (spawn.prompt_cursor < end || last) {
+                    let before: String = row.chars().take(spawn.prompt_cursor - start).collect();
+                    y = inner.y + 3 + u16::try_from(i).unwrap_or(0);
+                    x = inner.x + 9 + u16::try_from(before.width()).unwrap_or(u16::MAX);
+                    break;
+                }
+            }
+            (y, x)
+        }
     };
-    let before: String = text.chars().take(cursor).collect();
-    let x = inner
-        .x
-        .saturating_add(9)
-        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
-    let y = inner.y.saturating_add(row);
     if x < inner.x + inner.width && y < inner.y + inner.height {
         f.set_cursor_position((x, y));
     }
@@ -9787,9 +9979,11 @@ mod tests {
         }
         spawn.prompt_cursor = spawn.prompt.chars().count();
 
-        // Focus the agent field and cycle to codex.
-        let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
-        let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        // Focus the agent field (Prompt → Dir → Name → Agent) and cycle
+        // to codex.
+        for _ in 0..3 {
+            let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        }
         assert_eq!(app.spawn.as_ref().unwrap().focus, SpawnField::Agent);
         let _ = handle_spawn_event(KeyCode::Right, KeyModifiers::NONE, &mut app);
         assert_eq!(app.spawn.as_ref().unwrap().agent, SpawnAgent::Codex);
@@ -9801,7 +9995,9 @@ mod tests {
                 dir,
                 agent_label,
                 launch,
+                session,
             }) => {
+                assert_eq!(session, None, "no name typed — derive from dir");
                 assert_eq!(dir, "/tmp");
                 assert_eq!(agent_label, "codex");
                 assert_eq!(
@@ -9811,6 +10007,49 @@ mod tests {
             }
             other => panic!("expected SpawnSession, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn paste_while_the_spawn_form_is_open_lands_in_its_field_not_the_filter() {
+        let mut app = app_with_paneless_and_pane();
+        let _ = key_action(&mut app, 'n');
+        let action = handle_event(Event::Paste("/tmp/pasted".into()), &mut app);
+        assert!(matches!(action, Action::None));
+        assert_eq!(app.spawn.as_ref().unwrap().prompt, "/tmp/pasted");
+        assert!(
+            app.search_query.is_empty(),
+            "paste must not leak into the table filter"
+        );
+    }
+
+    #[test]
+    fn a_typed_session_name_overrides_the_derived_one() {
+        let mut app = app_with_paneless_and_pane();
+        let _ = key_action(&mut app, 'n');
+        let spawn = app.spawn.as_mut().unwrap();
+        spawn.dir = "/tmp".into();
+        spawn.name = "my.review:run".into();
+        spawn.prompt = "go".into();
+        let action = handle_spawn_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(
+            action,
+            Action::Quick(QuickAction::SpawnSession { session: Some(ref s), .. })
+                if s == "my-review-run"
+        ));
+    }
+
+    #[test]
+    fn wrapped_input_rows_respect_wide_glyph_widths() {
+        // Six Korean chars at width 2 fill a 6-cell row three at a time —
+        // char-counted chunking would cram six and overflow the border.
+        let rows = wrap_input_rows("가나다라마바", 6);
+        assert_eq!(
+            rows,
+            vec![("가나다".to_string(), 0), ("라마바".to_string(), 3)]
+        );
+        let rows = wrap_input_rows("abcdef", 4);
+        assert_eq!(rows, vec![("abcd".to_string(), 0), ("ef".to_string(), 4)]);
+        assert_eq!(wrap_input_rows("", 10), vec![(String::new(), 0)]);
     }
 
     #[test]
@@ -14812,8 +15051,10 @@ sort = ["state"]
             &mut self,
             dir: &str,
             launch: &str,
+            session: Option<&str>,
         ) -> std::result::Result<String, String> {
             self.spawn_calls.push((dir.to_string(), launch.to_string()));
+            let _ = session;
             Ok("spawned-test".into())
         }
 
