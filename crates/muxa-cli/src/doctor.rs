@@ -87,9 +87,19 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     // 5. tmux marker blocks.
     tally(check_tmux_blocks(), &mut issues);
 
+    // 5¼. …and whether the binding tmux would actually run is the one
+    // those blocks describe. A duplicate `bind-key` later in the file,
+    // or a server that never re-read the file, leaves the block present
+    // and the behaviour stale.
+    tally(check_tmux_watch_binding(), &mut issues);
+
     // 5½. MUXA_SOCKET env — the variable that lets every pane agree
     // on the daemon socket path after a restart.
     tally(check_muxa_socket_env(&socket), &mut issues);
+
+    // 5¾. Where config.toml is expected to live. Informational, but the
+    // path differs per OS and nothing else prints it.
+    tally(check_config_file(), &mut issues);
 
     // 6. Recent muxad errors. These are surfaced as warnings (not
     //    failures) — a stale ERROR line from yesterday shouldn't make
@@ -495,6 +505,91 @@ fn entry_has_command(entry: &serde_json::Value, prefix: &str) -> bool {
     })
 }
 
+/// Report where muxa reads `config.toml` from, and whether it is there.
+///
+/// A missing file is not a problem — every setting has a compiled default
+/// and `muxa init` only writes the file for the components that need it.
+/// The problem is *finding* it: `dirs::config_dir()` is
+/// `~/Library/Application Support` on macOS and `~/.config` on Linux, so
+/// "add `[collaboration]` to `~/.config/muxa/config.toml`" is wrong half
+/// the time and the edit lands in a file nothing reads. Printing the
+/// resolved path costs one line and removes the guesswork.
+fn check_config_file() -> CheckResult {
+    let Some(path) = muxa::paths::default_config_file() else {
+        return CheckResult::Warn("config: could not resolve the config directory".into());
+    };
+    let shown = path.display();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match text.parse::<toml_edit::DocumentMut>() {
+            Ok(_) => CheckResult::Ok(format!("config: {shown}")),
+            // A malformed config is silently ignored by some readers and
+            // fatal to others; either way the user's edits are not taking
+            // effect and they deserve to hear it here.
+            Err(e) => CheckResult::Fail(format!("config: {shown} is not valid TOML — {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            CheckResult::Ok(format!("config: {shown} (absent — using defaults)"))
+        }
+        Err(e) => CheckResult::Warn(format!("config: {shown} unreadable — {e}")),
+    }
+}
+
+/// Confirm the `prefix+s` binding tmux will actually run is the managed
+/// one.
+///
+/// `check_tmux_blocks` only proves the marker block exists in the file.
+/// tmux resolves duplicate `bind-key` definitions last-one-wins, so a
+/// hand-written binding further down `~/.tmux.conf` silently overrides
+/// the block — and the server keeps whatever it read at startup until
+/// someone sources the file again. Both cases leave the marker block
+/// intact and doctor green while `prefix+s` opens an inset popup, whose
+/// inner width cannot reach the 120 columns the watch inspector needs.
+fn check_tmux_watch_binding() -> CheckResult {
+    let out = muxa::tmux::tmux_command()
+        .args(["list-keys", "-T", "prefix"])
+        .output();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        // No server running yet is not a misconfiguration — there is
+        // simply nothing to compare against.
+        Ok(_) => {
+            return CheckResult::Ok("tmux: no running server to check bindings against".into())
+        }
+        Err(e) => return CheckResult::Warn(format!("tmux: could not list keys ({e})")),
+    };
+    match watch_popup_binding(&text) {
+        None => CheckResult::Warn(
+            "tmux: no prefix key runs `muxa watch` — run `muxa init --component tmux-popup`, then `tmux source-file ~/.tmux.conf`".into(),
+        ),
+        Some(binding) if popup_binding_is_full_client(binding) => {
+            CheckResult::Ok("tmux: prefix+s opens muxa watch full-client".into())
+        }
+        Some(_) => CheckResult::Fail(
+            "tmux: the live `muxa watch` binding is an inset popup, so the inspector's 120-column minimum is unreachable — a later `bind-key` in ~/.tmux.conf is overriding the managed block, or the server has not re-read it. Remove the stray binding, then `tmux source-file ~/.tmux.conf`".into(),
+        ),
+    }
+}
+
+/// First `list-keys` line that launches `muxa watch`, if any.
+fn watch_popup_binding(list_keys_output: &str) -> Option<&str> {
+    list_keys_output
+        .lines()
+        .find(|line| line.contains("muxa watch"))
+}
+
+/// True when the binding gives the popup the whole client with no border.
+/// Both matter: `-w 90%` of a 134-column terminal is 120, and the border
+/// takes 2 more, landing at 118 — one column short of the inspector for
+/// the entire reason the managed block uses `-B` and `100%`.
+fn popup_binding_is_full_client(binding: &str) -> bool {
+    let width_full = binding.contains("-w \"100%\"") || binding.contains("-w 100%");
+    // tmux prints merged short flags, so `-B -E` comes back as `-BE`.
+    let borderless = binding
+        .split_whitespace()
+        .any(|tok| tok.starts_with('-') && !tok.starts_with("--") && tok.contains('B'));
+    width_full && borderless
+}
+
 /// Confirm both tmux marker blocks (popup + statusline) exist in
 /// `~/.tmux.conf`. We bundle the result so the user sees one tmux
 /// line in the doctor output rather than two redundant ones.
@@ -797,6 +892,51 @@ mod tests {
   hooks = [{ type = "command", command = "echo unrelated" }]
 "#;
         assert!(!codex_hook_configured(toml));
+    }
+
+    /// What tmux actually prints for the managed binding: short flags
+    /// arrive merged (`-BE`) and the percentages come back quoted.
+    const LIVE_MANAGED: &str = r#"bind-key    -T prefix s       display-popup -BE -h "100%" -w "100%" -x 0 -y 0 "muxa watch""#;
+    /// The pre-0.8.25 hand-written binding this check exists to catch.
+    const LIVE_INSET: &str =
+        r#"bind-key    -T prefix s       display-popup -E -h "85%" -w "90%" "muxa watch""#;
+
+    #[test]
+    fn full_client_popup_binding_is_accepted() {
+        assert!(popup_binding_is_full_client(LIVE_MANAGED));
+    }
+
+    #[test]
+    fn inset_popup_binding_is_rejected() {
+        // 90% of 134 columns is 120, and the border spends 2 more — one
+        // short of the inspector, which is the whole bug.
+        assert!(!popup_binding_is_full_client(LIVE_INSET));
+    }
+
+    #[test]
+    fn full_width_without_borderless_is_still_rejected() {
+        let bordered = r#"bind-key -T prefix s display-popup -E -h "100%" -w "100%" "muxa watch""#;
+        assert!(!popup_binding_is_full_client(bordered));
+    }
+
+    #[test]
+    fn borderless_without_full_width_is_still_rejected() {
+        let narrow = r#"bind-key -T prefix s display-popup -BE -h "100%" -w "90%" "muxa watch""#;
+        assert!(!popup_binding_is_full_client(narrow));
+    }
+
+    #[test]
+    fn watch_binding_is_found_among_other_keys() {
+        let listing = format!(
+            "bind-key -T prefix D display-popup -E -w \"95%\" \"muxa dashboard\"\n{LIVE_MANAGED}\nbind-key -T prefix q display-popup -BE \"muxa peek\"\n"
+        );
+        assert_eq!(watch_popup_binding(&listing), Some(LIVE_MANAGED));
+    }
+
+    #[test]
+    fn watch_binding_absent_when_nothing_runs_watch() {
+        let listing = "bind-key -T prefix c new-window\nbind-key -T prefix D display-popup -E \"muxa dashboard\"\n";
+        assert_eq!(watch_popup_binding(listing), None);
     }
 
     #[test]
