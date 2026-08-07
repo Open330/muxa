@@ -50,6 +50,27 @@ interval_secs = 5
 This tmux foreground sampler remains as a compatibility source and helps
 stats while newer activity ledger intervals are accumulating.
 
+## Ask
+
+```toml
+[ask]
+enabled = true
+agent = "claude"     # claude | codex
+cwd = "~"            # where the headless process runs; defaults to $HOME
+timeout_secs = 180
+keep = 200           # answers retained before the oldest are dropped
+```
+
+Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
+the answers. muxad runs the agent in print mode and captures the reply, so
+there is no session to manage and completion is an exit code rather than a
+guess. Each agent keeps its own conversation and every question after the
+first resumes it, reusing the cached context the first one paid for; `n` in
+the panel starts a fresh thread. `path` defaults to
+`$XDG_DATA_HOME/muxa/ask.json` and holds both the history and the per-agent
+thread ids. Off by default because enabling it lets the daemon spawn a CLI
+that bills your account. See [WATCH.md](WATCH.md).
+
 ## Collaboration
 
 ```toml

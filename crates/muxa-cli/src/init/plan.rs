@@ -141,6 +141,7 @@ pub fn build(
                     }
                 }
             }
+            Component::Ask => plan_ask(direction, *c, &mut actions)?,
             Component::Collaboration => {
                 let Some(path) = files::collaboration::default_path() else {
                     continue;
@@ -321,6 +322,32 @@ fn plan_tmux(
     };
     actions.push(Action::EditFile {
         component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+/// `[ask]` in config.toml. Same shape as the collaboration planner —
+/// both are a single grant toggled in one table.
+fn plan_ask(direction: Direction, component: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::ask::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            files::ask::upsert(&original).context("enabling ask in config.toml")?
+        }
+        Direction::Uninstall => {
+            files::ask::remove(&original).context("disabling ask in config.toml")?
+        }
+    };
+    actions.push(Action::EditFile {
+        component,
         path,
         before,
         after,

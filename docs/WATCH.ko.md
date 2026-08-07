@@ -33,6 +33,7 @@ muxa watch --include-paneless
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane에 바로 attach. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
+| `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
 | `m` | 선택한 same-window agent에게 durable request 보내기. |
 | `b` | incoming/sent mailbox 열기. `i`는 claim, `e`는 reply. |
 | `o` / `Alt-P` | live preview 열기. |
@@ -118,6 +119,21 @@ inbox를 열면 확인 처리됩니다.
 동일하게 확인 popup을 거칩니다. `view` 변경은 cached snapshot에 즉시 반영되며
 현재 watch process의 이후 refresh에도 유지됩니다.
 
+
+## Ask
+
+`a`는 컴포저 제목에 표시된 agent에게 보낼 headless 질의를 작성합니다. `Tab`으로
+claude ↔ codex를 바꾸고, `Ctrl-V`로 붙여넣고, `Enter`로 보냅니다. muxad가 agent를
+print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 관리할 세션도 없습니다.
+
+`A`는 이력을 엽니다. `j`/`k` 선택, `|` 상세 영역 확대, `Tab` agent 필터(all →
+claude → codex), `n` 새 대화. `n` 전까지는 하나의 대화라 질문마다 직전 대화를
+resume하며, 두 번째부터는 첫 질문이 지불한 캐시 컨텍스트를 재사용합니다. 대화는
+agent별로 분리돼 있어 되돌아오면 그 대화가 이어집니다.
+
+실행 주체는 daemon입니다. 팝업을 닫아도 답변이 이력에 도착하고, 이력은
+`$XDG_DATA_HOME/muxa/ask.json`에 남아 재시작 후에도 조회됩니다. `[ask] enabled =
+true`가 필요합니다 — [CONFIGURATION.ko.md](CONFIGURATION.ko.md) 참고.
 
 ## Agent 협업
 

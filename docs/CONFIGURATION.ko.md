@@ -49,6 +49,26 @@ interval_secs = 5
 tmux foreground sampler입니다. 새 activity ledger interval이 쌓이기 전까지
 compatibility source이자 stats fallback으로 사용됩니다.
 
+## Ask
+
+```toml
+[ask]
+enabled = true
+agent = "claude"     # claude | codex
+cwd = "~"            # headless 프로세스가 실행될 위치. 기본값 $HOME
+timeout_secs = 180
+keep = 200           # 보관할 답변 수. 넘으면 오래된 것부터 버립니다
+```
+
+`muxa watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
+muxad가 agent를 print 모드로 실행해 답변을 수집하므로 관리할 세션이 없고, 완료
+여부가 추측이 아니라 exit code로 정해집니다. agent마다 별도 대화를 유지하며 두
+번째 질문부터는 그 대화를 resume해 첫 질문이 지불한 캐시 컨텍스트를 재사용합니다.
+패널에서 `n`을 누르면 새 대화를 시작합니다. `path` 기본값은
+`$XDG_DATA_HOME/muxa/ask.json`이고 이력과 agent별 thread id를 함께 저장합니다.
+daemon이 회원님 계정으로 과금되는 CLI를 띄우는 권한이라 기본은 꺼짐입니다.
+[WATCH.ko.md](WATCH.ko.md)를 참고하세요.
+
 ## Collaboration
 
 ```toml

@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switching has to switch threads rather than corrupt one — and switching
   back resumes where that agent left off. `n` resets only the current
   thread.
+- **`muxa init --component ask` turns it on, and the wizard offers it.**
+  Same grant shape as collaboration: enabling ask lets muxad spawn an
+  agent CLI that bills your account, so it is asked for where the user is
+  already deciding what muxa may touch rather than compiled in. Ships in
+  the `standard` preset and pre-checked in the picker — leaving it dark is
+  what makes `a` answer "ask is disabled" with nothing pointing at the
+  fix. A configured `agent` is preserved: choosing codex was deliberate,
+  and re-running init must not quietly repoint your questions.
 - **`a` asks the configured agent a headless question; `A` browses the
   answers.** Spinning up a whole session to ask one thing was the only
   option, and it is a heavy one. `a` sends the question to muxad, which

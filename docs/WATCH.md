@@ -33,6 +33,7 @@ row per pane.
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
+| `a` / `A` | Ask the configured agent a headless question / browse the answers. |
 | `m` | Message the selected same-window agent. |
 | `b` | Open incoming/sent mailbox; `i` claims and `e` replies. |
 | `o` / `Alt-P` | Open live preview. |
@@ -111,6 +112,25 @@ commands include `refresh`, `preview`, `copy`, `attention`, `events`,
 `help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
 Runtime `view` changes use the cached snapshot immediately and remain active
 for subsequent refreshes in the current watch process.
+
+## Ask
+
+`a` composes a headless question for the agent named in the composer title;
+`Tab` switches between claude and codex, `Ctrl-V` pastes, `Enter` sends.
+muxad runs the agent in print mode and captures the answer, so nothing is
+typed into a pane and no session has to be managed.
+
+`A` opens the history: `j`/`k` selects, `|` grows the detail pane, `Tab`
+filters by agent (all → claude → codex), and `n` starts a fresh
+conversation. Everything before that `n` is one thread — each question
+resumes the last, so the second onward reuses the cached context the first
+paid for. Threads are per agent, so switching back picks that conversation
+up where it left off.
+
+The daemon owns execution: an answer lands in the history whether or not
+the popup is still open, and the history outlives restarts in
+`$XDG_DATA_HOME/muxa/ask.json`. Requires `[ask] enabled = true` — see
+[CONFIGURATION.md](CONFIGURATION.md).
 
 ## Agent collaboration
 

@@ -35,6 +35,8 @@ pub enum Component {
     Dashboard,
     /// Same-window agent mailbox: enable `[collaboration]` in config
     Collaboration,
+    /// Headless questions from watch: enable `[ask]` in config
+    Ask,
 }
 
 impl Component {
@@ -51,6 +53,7 @@ impl Component {
         Component::MuxadShellrc,
         Component::Dashboard,
         Component::Collaboration,
+        Component::Ask,
     ];
 
     /// Stable kebab-case id used in CLI flags and marker blocks.
@@ -68,6 +71,7 @@ impl Component {
             Component::MuxadShellrc => "muxad-shellrc",
             Component::Dashboard => "dashboard",
             Component::Collaboration => "collaboration",
+            Component::Ask => "ask",
         }
     }
 
@@ -90,6 +94,7 @@ impl Component {
             Component::MuxadShellrc => "muxad: shellrc autostart hook (no service manager)",
             Component::Dashboard => "Web dashboard: generate token + enable",
             Component::Collaboration => "Collaboration: same-window agent request/reply mailbox",
+            Component::Ask => "Ask: headless questions to an agent from watch",
         }
     }
 
@@ -108,6 +113,7 @@ impl Component {
             Component::MuxadShellrc => "appends to ~/.zshrc or ~/.bashrc; cross-platform",
             Component::Dashboard => "loopback :7878 by default; token in config",
             Component::Collaboration => "lets a peer's request type a wake prompt into your pane",
+            Component::Ask => "a/A in watch; muxad spawns an agent CLI that bills your account",
         }
     }
 
@@ -154,6 +160,7 @@ impl Component {
                 Component::GeminiHooks,
                 Component::OpencodeHooks,
                 Component::Collaboration,
+                Component::Ask,
                 dm,
             ],
             Preset::Full => {

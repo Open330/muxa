@@ -59,6 +59,11 @@ impl Detection {
             // grant stays informed — the picker shows what it does, and the
             // plan is confirmed before anything is written.
             out.push(Component::Collaboration);
+            // Same reasoning as collaboration: watch is where `a`/`A`
+            // live, so tmux is the only prerequisite worth gating on.
+            // Pre-checked so the feature is not invisible; the picker
+            // states the cost before anything is written.
+            out.push(Component::Ask);
         }
         if self.claude_settings.is_some() {
             out.push(Component::ClaudeHooks);
@@ -209,6 +214,16 @@ mod tests {
         let d = Detection::default();
         let sel = d.default_selection();
         assert_eq!(sel, vec![Component::MuxadShellrc]);
+    }
+
+    #[test]
+    fn ask_is_pre_checked_whenever_tmux_exists() {
+        // Same trap as collaboration: shipping it unticked leaves `a`/`A`
+        // answering "ask is disabled" with nothing pointing at the fix.
+        let mut d = Detection::default();
+        assert!(!d.default_selection().contains(&Component::Ask));
+        d.tmux = Some("tmux 3.4".into());
+        assert!(d.default_selection().contains(&Component::Ask));
     }
 
     #[test]
