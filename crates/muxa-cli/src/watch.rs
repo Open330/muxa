@@ -1303,7 +1303,6 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Alt-K          kill the pane (confirm popup)",
         "  Alt-X          abort current turn (confirm popup)",
         "  r/Ctrl-R/Alt-R force refresh while browsing",
-        "  ?/F1/Alt-?     toggle help; q/Ctrl-C quits",
     ]
 }
 
@@ -6988,8 +6987,12 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
+        // The exit keys live in the border, not in the matrix: the body
+        // is sized to its line count and clipped by the terminal, so a
+        // row added here could push "how to leave" off a short screen —
+        // which is exactly what adding the ask bindings did.
         .title(Span::styled(
-            " help · F1/Esc to close ",
+            " help · ?/F1/Esc closes · q/Ctrl-C quits watch ",
             theme.accent_badge(),
         ));
     let lines: Vec<Line> = help_overlay_text()
@@ -15787,7 +15790,11 @@ sort = ["state"]
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / b          message selected room peer / mailbox"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
-        assert!(body.contains("toggle help; q/Ctrl-C quits"));
+        assert!(body.contains("a / A          ask the configured agent / ask history"));
+        // The exit keys deliberately live in the overlay's border rather
+        // than the matrix — the body is clipped by terminal height, and
+        // "how to leave" must not be the row that falls off.
+        assert!(!body.contains("q/Ctrl-C quits"));
     }
 
     #[test]
