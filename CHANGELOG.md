@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Detail panes keep the author's line breaks.** The wrapper collapsed
+  every newline into a space, so a bulleted answer, a quoted block or a
+  multi-paragraph reply all arrived as one grey wall — in the ask panel,
+  the collaboration mailbox, and anywhere else the shared wrapper renders
+  a body. Line breaks are content: they survive now, runs of blank lines
+  collapse to one so shape does not cost the whole pane, and continuation
+  rows align under the `body:` / `ask:` gutter. Wrapping is measured in
+  display cells, so wide glyphs stop one short of the border instead of
+  spilling past it.
+
 ### Added
 
 - **`Tab` picks the agent in the ask composer, and filters the history in

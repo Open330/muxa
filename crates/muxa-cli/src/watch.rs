@@ -7874,17 +7874,65 @@ fn collaboration_mailbox_request_lines(
 /// Char-counted like `truncate_chars`; the pane's other rows already
 /// accept that approximation for wide glyphs.
 fn wrap_detail_text(prefix: &str, text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
     let width = width.max(8);
     let max_lines = max_lines.max(1);
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let full = format!("{prefix}{normalized}");
-    let chars: Vec<char> = full.chars().collect();
-    let mut rows: Vec<String> = chars
-        .chunks(width)
-        .take(max_lines)
-        .map(|chunk| chunk.iter().collect())
-        .collect();
-    if chars.len() > width * max_lines {
+
+    // The author's line breaks are content. Collapsing them into spaces —
+    // which this did — turns a bulleted answer or a code block into one
+    // grey wall, which is precisely the thing the detail pane exists to
+    // let you read. Only *runs* of blank lines collapse, to a single one,
+    // so a markdown reply keeps its shape without spending the pane on
+    // vertical whitespace.
+    let mut rows: Vec<String> = Vec::new();
+    let mut truncated = false;
+    let mut blank_run = false;
+    'outer: for (i, source_line) in text.split('\n').enumerate() {
+        let source_line = source_line.trim_end();
+        if source_line.trim().is_empty() {
+            if blank_run || rows.is_empty() {
+                continue;
+            }
+            blank_run = true;
+            if rows.len() == max_lines {
+                truncated = true;
+                break;
+            }
+            rows.push(String::new());
+            continue;
+        }
+        blank_run = false;
+        // The prefix belongs to the first visual row only; continuation
+        // rows align under it so the label reads as a gutter, not as part
+        // of the text.
+        let mut pending: String = if i == 0 {
+            format!("{prefix}{source_line}")
+        } else {
+            format!("{}{source_line}", " ".repeat(prefix.chars().count()))
+        };
+        while !pending.is_empty() {
+            if rows.len() == max_lines {
+                truncated = true;
+                break 'outer;
+            }
+            let mut taken = String::new();
+            let mut used = 0usize;
+            let mut rest = String::new();
+            for c in pending.chars() {
+                let w = c.width().unwrap_or(0);
+                if !rest.is_empty() || used + w > width {
+                    rest.push(c);
+                } else {
+                    used += w;
+                    taken.push(c);
+                }
+            }
+            rows.push(taken);
+            pending = rest;
+        }
+    }
+
+    if truncated {
         if let Some(last) = rows.last_mut() {
             last.pop();
             last.push('…');
@@ -10596,9 +10644,47 @@ mod tests {
         assert!(rows.len() > 1, "a long body must wrap: {rows:?}");
         assert!(rows[0].starts_with("body: "));
         assert!(rows.len() <= 3);
-        // Ellipsis only when text actually overflows the budget.
+        // Every row must fit the width in *display cells*, not chars —
+        // wide glyphs would otherwise spill past the border.
+        for row in &rows {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(row.as_str()) <= 10,
+                "row overflows: {row:?}"
+            );
+        }
         let short = wrap_detail_text("body: ", "hi", 40, 3);
         assert_eq!(short, vec!["body: hi".to_string()]);
+    }
+
+    #[test]
+    fn detail_text_keeps_the_authors_line_breaks() {
+        // A bulleted answer must stay bulleted: collapsing newlines into
+        // spaces is what turned every markdown reply into one grey wall.
+        let rows = wrap_detail_text("", "- one\n- two\n- three", 40, 6);
+        assert_eq!(
+            rows,
+            vec![
+                "- one".to_string(),
+                "- two".to_string(),
+                "- three".to_string()
+            ]
+        );
+
+        // Continuation rows align under the prefix so it reads as a gutter.
+        let rows = wrap_detail_text("ask: ", "alpha\nbravo", 40, 6);
+        assert_eq!(
+            rows,
+            vec!["ask: alpha".to_string(), "     bravo".to_string()]
+        );
+
+        // Runs of blank lines collapse to one — shape without wasting the pane.
+        let rows = wrap_detail_text("", "a\n\n\n\nb", 40, 6);
+        assert_eq!(rows, vec!["a".to_string(), String::new(), "b".to_string()]);
+
+        // Overflow still ellipsizes the final row.
+        let rows = wrap_detail_text("", "1\n2\n3\n4\n5", 40, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[2].ends_with('…'), "{rows:?}");
     }
 
     #[test]
