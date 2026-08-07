@@ -57,6 +57,40 @@ for the deferred stub.
   preferred (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:`).
 - Body explains **why**, not **what** — the diff shows the what.
 
+## Releasing
+
+1. Bump `version` in the workspace `Cargo.toml`, run a build so `Cargo.lock`
+   follows, and open a `## [X.Y.Z] - date` section in `CHANGELOG.md`.
+2. Reinstall locally first (`cargo install --path crates/muxa-cli --force
+   --locked`, same for `crates/muxad`, then restart muxad) — shipping a
+   version you have not run is how a broken release gets tagged.
+3. Commit as `release: vX.Y.Z`, push `main`, then push the annotated tag.
+
+Pushing the tag is the whole trigger. **Do not run `gh release create`**:
+the workflow creates the draft itself and the build matrix uploads four
+archives into it. Creating the release by hand publishes it before the
+archives exist, and `tap-bump` — which fires on *published* — dies with
+"no assets to download".
+
+4. When the build finishes, publish the draft with the changelog section
+   as its notes:
+
+   ```bash
+   gh release edit vX.Y.Z --draft=false --notes-file <(awk '/## \[X.Y.Z\]/{f=1;next}/^## \[/{f=0}f' CHANGELOG.md)
+   ```
+
+5. Bump the Homebrew tap:
+
+   ```bash
+   scripts/bump-tap.sh vX.Y.Z
+   ```
+
+   The `tap-bump` workflow does this automatically only when the
+   `TAP_GITHUB_TOKEN` secret is set; without it the job succeeds with a
+   "skipping" notice and the formula quietly stays behind. The script is
+   idempotent — running it on an already-current tap prints "nothing to
+   push" and exits.
+
 ## Project layout
 
 - `crates/muxa-core`     — types, state, config, paths, errors (no I/O)
