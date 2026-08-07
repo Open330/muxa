@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.30] - 2026-08-07
+
 ### Fixed
 
 - **Detail panes keep the author's line breaks.** The wrapper collapsed
