@@ -1338,14 +1338,55 @@ struct AskComposer {
     cursor: usize,
 }
 
+/// History filter. Reading past answers and choosing the next agent are
+/// different jobs, so the panel filters rather than switching: `All` is
+/// the common case, and the per-agent views answer "what did codex say
+/// about this" without disturbing who the next question goes to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AskFilter {
+    #[default]
+    All,
+    Claude,
+    Codex,
+}
+
+impl AskFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Claude,
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn matches(self, agent: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Claude => agent == "claude",
+            Self::Codex => agent == "codex",
+        }
+    }
+}
+
 /// `A` — the ask history panel. Same shape as the collaboration mailbox
 /// because it answers the same question ("what did I send, what came
 /// back"), down to `|` cycling the detail height.
 #[derive(Debug, Clone, Default)]
 struct AskPanelState {
     open: bool,
+    /// Index into the *filtered* list, not the raw history — the cursor
+    /// should stay on a row the user can see.
     selected: usize,
     detail: MailboxDetail,
+    filter: AskFilter,
 }
 
 /// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
@@ -4798,7 +4839,10 @@ pub async fn run(
                                 );
                                 refresh_ask_entries(client, &mut app).await;
                                 app.ask_panel.open = true;
-                                app.ask_panel.selected = app.ask_entries.len().saturating_sub(1);
+                                // Land on the question just asked, whatever
+                                // the filter currently shows.
+                                app.ask_panel.selected =
+                                    visible_ask_entries(&app).len().saturating_sub(1);
                             }
                             Err(e) => {
                                 app.set_hint(format!("ask failed: {e}"), HintLevel::Err);
@@ -4809,10 +4853,7 @@ pub async fn run(
                 Action::OpenAskPanel => {
                     refresh_ask_entries(client, &mut app).await;
                     app.ask_panel.open = true;
-                    app.ask_panel.selected = app
-                        .ask_panel
-                        .selected
-                        .min(app.ask_entries.len().saturating_sub(1));
+                    app.ask_panel.selected = visible_ask_entries(&app).len().saturating_sub(1);
                 }
                 Action::CycleAskAgent => {
                     // Two agents, so "cycle" is a swap. Naming the next one
@@ -5194,6 +5235,14 @@ fn host_scope_target(app: &App) -> Option<(String, String)> {
     Some((pane, label))
 }
 
+/// The entries the panel currently shows, oldest first.
+fn visible_ask_entries(app: &App) -> Vec<&muxa::ask::AskEntry> {
+    app.ask_entries
+        .iter()
+        .filter(|e| app.ask_panel.filter.matches(&e.agent))
+        .collect()
+}
+
 fn is_ask_running(entry: &muxa::ask::AskEntry) -> bool {
     entry.status == muxa::ask::AskStatus::Running
 }
@@ -5205,10 +5254,8 @@ async fn refresh_ask_entries(client: &Client, app: &mut App) {
     match client.ask_list().await {
         Ok(entries) => {
             app.ask_entries = entries;
-            app.ask_panel.selected = app
-                .ask_panel
-                .selected
-                .min(app.ask_entries.len().saturating_sub(1));
+            let visible = visible_ask_entries(app).len();
+            app.ask_panel.selected = app.ask_panel.selected.min(visible.saturating_sub(1));
         }
         Err(error) => {
             app.set_hint(format!("ask history unavailable: {error}"), HintLevel::Err);
@@ -6223,6 +6270,10 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
                 Action::SubmitAsk
             }
         }
+        // Deciding who to ask belongs here, next to the question — the
+        // composer title names the agent, so Tab changes what the title
+        // says before Enter commits to it.
+        KeyCode::Tab | KeyCode::BackTab => Action::CycleAskAgent,
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(pasted) = system_clipboard_text() {
                 insert_str_at(&mut ask.input, &mut ask.cursor, &pasted);
@@ -6250,7 +6301,17 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         // as "cycle the option" (mailbox tabs, request kind, spawn
         // fields), while arrows read as list movement — which is what
         // j/k and Up/Down do in this very handler.
-        KeyCode::Tab | KeyCode::BackTab => Action::CycleAskAgent,
+        // Tab filters here rather than switching the target agent: the
+        // panel is for reading, and silently repointing the next question
+        // from a history view is the kind of side effect nobody predicts.
+        // The composer owns that choice, with its own Tab.
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.ask_panel.filter = app.ask_panel.filter.next();
+            app.ask_panel.selected = 0;
+            let label = app.ask_panel.filter.label();
+            app.set_hint(format!("ask history: {label}"), HintLevel::Ok);
+            Action::None
+        }
         KeyCode::Char('|') => {
             app.ask_panel.detail = app.ask_panel.detail.next();
             let label = app.ask_panel.detail.label();
@@ -6258,7 +6319,7 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let last = app.ask_entries.len().saturating_sub(1);
+            let last = visible_ask_entries(app).len().saturating_sub(1);
             app.ask_panel.selected = (app.ask_panel.selected + 1).min(last);
             Action::None
         }
@@ -7239,17 +7300,19 @@ fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
         .border_type(theme.border_type)
         .title(Line::from(vec![
             Span::styled(" ask ", theme.accent_badge()),
-            Span::raw(" ◂ "),
-            Span::styled(format!(" {} ", app.ask_agent), theme.action_badge()),
-            Span::raw(" ▸ "),
             Span::styled(
-                format!(" {} ", app.ask_entries.len()),
+                format!(" {} ", app.ask_panel.filter.label()),
+                theme.action_badge(),
+            ),
+            Span::styled(
+                format!(" {} ", visible_ask_entries(app).len()),
                 theme.table_header_style(),
             ),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if app.ask_entries.is_empty() {
+    let visible = visible_ask_entries(app);
+    if visible.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
@@ -7287,8 +7350,7 @@ fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
         .ask_panel
         .selected
         .saturating_sub(rows.saturating_sub(1));
-    let lines: Vec<Line> = app
-        .ask_entries
+    let lines: Vec<Line> = visible
         .iter()
         .enumerate()
         .skip(start)
@@ -7316,7 +7378,7 @@ fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(" answer ", theme.dim_style()));
     let dw = usize::from(detail_block.inner(chunks[1]).width).max(1);
     let dh = usize::from(detail_block.inner(chunks[1]).height).max(1);
-    let detail = app.ask_entries.get(app.ask_panel.selected).map_or_else(
+    let detail = visible.get(app.ask_panel.selected).map_or_else(
         || vec![Line::from(Span::styled("-", theme.dim_style()))],
         |entry| ask_detail_lines(entry, dw, dh, theme),
     );
@@ -9760,6 +9822,8 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
         let spans = vec![
             Span::styled(" Enter ", theme.action_badge()),
             Span::raw("ask  "),
+            Span::styled(" Tab ", theme.key_badge()),
+            Span::raw("agent  "),
             Span::styled(" Ctrl-V ", theme.key_badge()),
             Span::raw("paste  "),
             Span::styled(" Esc ", theme.key_badge()),
@@ -9778,7 +9842,7 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::styled(" | ", theme.key_badge()),
             Span::raw("detail size  "),
             Span::styled(" Tab ", theme.key_badge()),
-            Span::raw("agent  "),
+            Span::raw("filter  "),
             Span::styled(" n ", theme.key_badge()),
             Span::raw("new thread  "),
             Span::styled(" Esc/A ", theme.key_badge()),
@@ -10567,22 +10631,58 @@ mod tests {
     }
 
     #[test]
-    fn tab_in_the_ask_panel_cycles_the_agent_and_j_still_selects() {
+    fn tab_filters_the_history_and_switches_the_agent_in_the_composer() {
         let mut app = app_with_paneless_and_pane();
+
+        // Panel: Tab cycles the view, and never repoints the next question.
         app.ask_panel.open = true;
-        for key in [KeyCode::Tab, KeyCode::BackTab] {
-            let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
-            assert!(
-                matches!(action, Action::CycleAskAgent),
-                "{key:?} must reach the panel, got {action:?}"
+        assert_eq!(app.ask_panel.filter, AskFilter::All);
+        for expected in [AskFilter::Claude, AskFilter::Codex, AskFilter::All] {
+            let action = handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut app,
             );
+            assert!(matches!(action, Action::None), "got {action:?}");
+            assert_eq!(app.ask_panel.filter, expected);
         }
-        // j/k stay list movement — the reason Tab took over the switch.
+        app.ask_panel.open = false;
+
+        // Composer: Tab is where the target agent is chosen.
+        app.ask_composer = Some(AskComposer::default());
         let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             &mut app,
         );
-        assert!(matches!(action, Action::None));
+        assert!(matches!(action, Action::CycleAskAgent), "got {action:?}");
+    }
+
+    #[test]
+    fn the_history_filter_selects_by_agent() {
+        let mut app = app_with_paneless_and_pane();
+        let mk = |agent: &str, prompt: &str| muxa::ask::AskEntry {
+            id: format!("ask_{prompt}"),
+            prompt: prompt.into(),
+            answer: String::new(),
+            status: muxa::ask::AskStatus::Answered,
+            agent: agent.into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: OffsetDateTime::now_utc(),
+            answered_at: Some(OffsetDateTime::now_utc()),
+            cost_usd: None,
+            error: None,
+        };
+        app.ask_entries = vec![mk("claude", "a"), mk("codex", "b"), mk("claude", "c")];
+
+        assert_eq!(visible_ask_entries(&app).len(), 3);
+        app.ask_panel.filter = AskFilter::Claude;
+        let claude: Vec<_> = visible_ask_entries(&app)
+            .iter()
+            .map(|e| e.prompt.clone())
+            .collect();
+        assert_eq!(claude, vec!["a".to_string(), "c".to_string()]);
+        app.ask_panel.filter = AskFilter::Codex;
+        assert_eq!(visible_ask_entries(&app).len(), 1);
     }
 
     #[test]
