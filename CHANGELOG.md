@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`←`/`→` in the ask panel switches between claude and codex.** Each
+  agent keeps its own conversation, because a claude session id means
+  nothing to codex — switching has to switch threads, not corrupt one.
+  Switching back resumes where that agent left off, and `n` resets only
+  the current one. The panel and composer titles name who is about to be
+  asked.
 - **`a` asks the configured agent a headless question; `A` browses the
   answers.** Spinning up a whole session to ask one thing was the only
   option, and it is a heavy one. `a` sends the question to muxad, which

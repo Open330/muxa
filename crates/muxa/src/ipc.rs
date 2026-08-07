@@ -211,6 +211,12 @@ enum RequestBody {
         prompt: String,
     },
     AskList {},
+    /// Point the next question at a different agent, or read back which
+    /// one is selected when `agent` is omitted.
+    AskAgent {
+        #[serde(default)]
+        agent: Option<String>,
+    },
     /// Start a fresh conversation. History is untouched.
     AskReset {},
     CollaborationInbox {
@@ -395,6 +401,8 @@ pub struct Response {
     pub ask_entries: Option<Vec<AskEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_entry: Option<AskEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -428,6 +436,7 @@ impl Response {
             collaboration_request: None,
             ask_entries: None,
             ask_entry: None,
+            ask_agent: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -512,6 +521,11 @@ impl Response {
     fn with_ask_entries(entries: Vec<AskEntry>) -> Self {
         let mut r = Self::ok();
         r.ask_entries = Some(entries);
+        r
+    }
+    fn with_ask_agent(agent: String) -> Self {
+        let mut r = Self::ok();
+        r.ask_agent = Some(agent);
         r
     }
     fn with_ask_entry(entry: AskEntry) -> Self {
@@ -1347,6 +1361,16 @@ async fn handle(
                     kind = "ask_list";
                     Response::with_ask_entries(ask.list().await)
                 }
+                RequestBody::AskAgent { agent } => {
+                    kind = "ask_agent";
+                    match agent {
+                        Some(name) => match ask.set_agent(&name).await {
+                            Ok(label) => Response::with_ask_agent(label),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        None => Response::with_ask_agent(ask.agent().await),
+                    }
+                }
                 RequestBody::AskReset {} => {
                     kind = "ask_reset";
                     ask.reset_thread().await;
@@ -1846,6 +1870,17 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_list" });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["ask_entries"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Read the selected agent (`None`) or switch to another (`Some`).
+    pub async fn ask_agent(&self, agent: Option<&str>) -> Result<String, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_agent",
+            "agent": agent,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_agent"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn ask_reset(&self) -> Result<(), RuntimeError> {

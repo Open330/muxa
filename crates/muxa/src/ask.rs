@@ -115,9 +115,11 @@ impl AskEntry {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AskSnapshot {
-    /// Conversation the next question resumes. `None` starts fresh.
+    /// Conversation the next question resumes, per agent. Keyed rather
+    /// than single because a claude session id means nothing to codex —
+    /// switching agents has to switch threads, not corrupt one.
     #[serde(default)]
-    thread: Option<String>,
+    threads: std::collections::HashMap<String, String>,
     #[serde(default)]
     entries: Vec<AskEntry>,
 }
@@ -126,7 +128,10 @@ struct AskSnapshot {
 pub struct AskStore {
     opts: AskOptions,
     entries: RwLock<Vec<AskEntry>>,
-    thread: RwLock<Option<String>>,
+    threads: RwLock<std::collections::HashMap<String, String>>,
+    /// Agent the next question goes to. Starts at the configured one and
+    /// follows whatever the user picks in the panel.
+    agent: RwLock<String>,
     /// Serializes each mutation with its snapshot write, so a reader
     /// never sees an entry the file does not have.
     write_lock: Mutex<()>,
@@ -135,10 +140,12 @@ pub struct AskStore {
 impl AskStore {
     #[must_use]
     pub fn in_memory(opts: AskOptions) -> Arc<Self> {
+        let agent = opts.agent.clone();
         Arc::new(Self {
             opts: AskOptions { path: None, ..opts },
             entries: RwLock::new(Vec::new()),
-            thread: RwLock::new(None),
+            threads: RwLock::new(std::collections::HashMap::new()),
+            agent: RwLock::new(agent),
             write_lock: Mutex::new(()),
         })
     }
@@ -162,10 +169,12 @@ impl AskStore {
                 entry.answered_at = Some(OffsetDateTime::now_utc());
             }
         }
+        let agent = opts.agent.clone();
         Arc::new(Self {
             opts,
             entries: RwLock::new(snapshot.entries),
-            thread: RwLock::new(snapshot.thread),
+            threads: RwLock::new(snapshot.threads),
+            agent: RwLock::new(agent),
             write_lock: Mutex::new(()),
         })
     }
@@ -179,11 +188,29 @@ impl AskStore {
         self.entries.read().await.clone()
     }
 
-    /// Drop the conversation id so the next question starts a fresh
-    /// thread. History is kept — resetting the thread is not forgetting.
+    /// Agent the next question goes to.
+    pub async fn agent(&self) -> String {
+        self.agent.read().await.clone()
+    }
+
+    /// Point the next question at a different agent. Each agent keeps its
+    /// own thread, so switching back resumes where that one left off
+    /// rather than starting over.
+    pub async fn set_agent(&self, agent: &str) -> Result<String, AskError> {
+        let parsed =
+            AskAgent::parse(agent).ok_or_else(|| AskError::UnsupportedAgent(agent.to_string()))?;
+        let label = parsed.label().to_string();
+        *self.agent.write().await = label.clone();
+        Ok(label)
+    }
+
+    /// Drop the current agent's conversation id so its next question
+    /// starts fresh. History is kept — resetting a thread is not
+    /// forgetting — and the other agent's thread is left alone.
     pub async fn reset_thread(&self) {
         let _guard = self.write_lock.lock().await;
-        *self.thread.write().await = None;
+        let agent = self.agent.read().await.clone();
+        self.threads.write().await.remove(&agent);
         self.persist().await;
     }
 
@@ -198,10 +225,12 @@ impl AskStore {
         if prompt.is_empty() {
             return Err(AskError::EmptyPrompt);
         }
-        let agent = AskAgent::parse(&self.opts.agent)
-            .ok_or_else(|| AskError::UnsupportedAgent(self.opts.agent.clone()))?;
+        let selected = self.agent.read().await.clone();
+        let Some(agent) = AskAgent::parse(&selected) else {
+            return Err(AskError::UnsupportedAgent(selected));
+        };
 
-        let resume = self.thread.read().await.clone();
+        let resume = self.threads.read().await.get(agent.label()).cloned();
         let entry = AskEntry {
             id: format!("ask_{:x}", next_id()),
             prompt: prompt.to_string(),
@@ -277,10 +306,10 @@ impl AskStore {
                 .iter()
                 .find(|e| e.id == id)
                 .filter(|e| e.status == AskStatus::Answered)
-                .and_then(|e| e.agent_session_id.clone())
+                .and_then(|e| e.agent_session_id.clone().map(|s| (e.agent.clone(), s)))
         };
-        if let Some(session) = advanced {
-            *self.thread.write().await = Some(session);
+        if let Some((agent, session)) = advanced {
+            self.threads.write().await.insert(agent, session);
         }
         self.persist().await;
     }
@@ -292,7 +321,7 @@ impl AskStore {
             return;
         };
         let snapshot = AskSnapshot {
-            thread: self.thread.read().await.clone(),
+            threads: self.threads.read().await.clone(),
             entries: self.entries.read().await.clone(),
         };
         let Ok(text) = serde_json::to_string_pretty(&snapshot) else {
@@ -528,6 +557,43 @@ mod tests {
         let (_, resumed) = AskAgent::Claude.argv("hi", Some("s-9"));
         let at = resumed.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(resumed[at + 1], "s-9");
+    }
+
+    #[tokio::test]
+    async fn switching_agents_keeps_each_thread_separate() {
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            ..AskOptions::default()
+        });
+        assert_eq!(store.agent().await, "claude");
+        store
+            .threads
+            .write()
+            .await
+            .insert("claude".into(), "c-1".into());
+
+        assert_eq!(store.set_agent("codex").await.unwrap(), "codex");
+        // codex must not inherit claude's session id — it means nothing
+        // to the other CLI.
+        assert!(store.threads.read().await.get("codex").is_none());
+        store
+            .threads
+            .write()
+            .await
+            .insert("codex".into(), "x-1".into());
+
+        // Resetting the current agent leaves the other thread intact.
+        store.reset_thread().await;
+        let threads = store.threads.read().await;
+        assert!(threads.get("codex").is_none());
+        assert_eq!(threads.get("claude").map(String::as_str), Some("c-1"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_agent_is_refused() {
+        let store = AskStore::in_memory(AskOptions::default());
+        assert!(store.set_agent("gemini").await.is_err());
+        assert_eq!(store.agent().await, "claude");
     }
 
     #[tokio::test]

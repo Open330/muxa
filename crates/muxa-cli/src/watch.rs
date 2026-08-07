@@ -2027,6 +2027,8 @@ pub(crate) struct App {
     ask_composer: Option<AskComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
+    /// Agent the next question goes to, as the daemon reports it.
+    ask_agent: String,
     /// Editable `:` command palette. Like other overlays it owns keyboard
     /// input until Enter executes or Esc cancels.
     pub command_palette: Option<CommandPalette>,
@@ -2167,6 +2169,7 @@ impl App {
             ask_composer: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
+            ask_agent: "claude".into(),
             command_palette: None,
             help_open: false,
             footer_hint: None,
@@ -4780,6 +4783,9 @@ pub async fn run(
                     app.confirm = Some(popup);
                 }
                 Action::OpenAsk => {
+                    if let Ok(agent) = client.ask_agent(None).await {
+                        app.ask_agent = agent;
+                    }
                     app.ask_composer = Some(AskComposer::default());
                 }
                 Action::SubmitAsk => {
@@ -4807,6 +4813,23 @@ pub async fn run(
                         .ask_panel
                         .selected
                         .min(app.ask_entries.len().saturating_sub(1));
+                }
+                Action::CycleAskAgent => {
+                    // Two agents, so "cycle" is a swap. Naming the next one
+                    // explicitly (rather than sending "toggle") keeps the
+                    // daemon the single source of truth for what is valid.
+                    let next = if app.ask_agent == "claude" {
+                        "codex"
+                    } else {
+                        "claude"
+                    };
+                    match client.ask_agent(Some(next)).await {
+                        Ok(agent) => {
+                            app.set_hint(format!("ask agent: {agent}"), HintLevel::Ok);
+                            app.ask_agent = agent;
+                        }
+                        Err(e) => app.set_hint(format!("ask agent failed: {e}"), HintLevel::Err),
+                    }
                 }
                 Action::ResetAskThread => match client.ask_reset().await {
                     Ok(()) => app.set_hint("ask: new conversation", HintLevel::Ok),
@@ -5176,6 +5199,9 @@ fn is_ask_running(entry: &muxa::ask::AskEntry) -> bool {
 }
 
 async fn refresh_ask_entries(client: &Client, app: &mut App) {
+    if let Ok(agent) = client.ask_agent(None).await {
+        app.ask_agent = agent;
+    }
     match client.ask_list().await {
         Ok(entries) => {
             app.ask_entries = entries;
@@ -5595,6 +5621,8 @@ pub(crate) enum Action {
     OpenAskPanel,
     /// Start a fresh ask conversation; history is kept.
     ResetAskThread,
+    /// Point the next question at the other agent.
+    CycleAskAgent,
     /// `|` moved the list/inspector divider; the run loop persists the new
     /// ratio next to the persisted sort and reports it in one hint.
     InspectorSplitChanged,
@@ -6218,6 +6246,7 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         }
         KeyCode::Char('a') => Action::OpenAsk,
         KeyCode::Char('n') => Action::ResetAskThread,
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => Action::CycleAskAgent,
         KeyCode::Char('|') => {
             app.ask_panel.detail = app.ask_panel.detail.next();
             let label = app.ask_panel.detail.label();
@@ -7159,7 +7188,7 @@ fn render_ask_composer(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(theme.action))
         .border_type(theme.border_type)
         .title(Span::styled(
-            " ask ",
+            format!(" ask · {} ", app.ask_agent),
             theme.action_badge().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -7206,6 +7235,9 @@ fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
         .border_type(theme.border_type)
         .title(Line::from(vec![
             Span::styled(" ask ", theme.accent_badge()),
+            Span::raw(" ◂ "),
+            Span::styled(format!(" {} ", app.ask_agent), theme.action_badge()),
+            Span::raw(" ▸ "),
             Span::styled(
                 format!(" {} ", app.ask_entries.len()),
                 theme.table_header_style(),
@@ -9741,6 +9773,8 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw("select  "),
             Span::styled(" | ", theme.key_badge()),
             Span::raw("detail size  "),
+            Span::styled(" ←/→ ", theme.key_badge()),
+            Span::raw("agent  "),
             Span::styled(" n ", theme.key_badge()),
             Span::raw("new thread  "),
             Span::styled(" Esc/A ", theme.key_badge()),
@@ -14732,6 +14766,7 @@ sort = ["state"]
             | Action::SubmitAsk
             | Action::OpenAskPanel
             | Action::ResetAskThread
+            | Action::CycleAskAgent
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes

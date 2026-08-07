@@ -70,7 +70,7 @@
 # your account.
 # [ask]
 # enabled = true
-# agent = "claude"          # claude | codex
+# agent = "claude"          # claude | codex; ←/→ switches at runtime
 # cwd = "~"                 # where the headless process runs; defaults to $HOME
 # timeout_secs = 180
 # keep = 200                # answers retained before the oldest are dropped
