@@ -10,6 +10,7 @@ pub const ACTIVITY_FILENAME: &str = "activity.ndjson";
 pub const STATE_FILENAME: &str = "state.json";
 pub const SESSION_ACTIVITY_FILENAME: &str = "session-activity.json";
 pub const COLLABORATION_FILENAME: &str = "collaboration.json";
+pub const ASK_FILENAME: &str = "ask.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -56,6 +57,12 @@ pub fn default_session_activity_file() -> Option<PathBuf> {
 }
 
 /// Default durable collaboration mailbox snapshot.
+/// Ask history: `$XDG_DATA_HOME/muxa/ask.json`, beside the
+/// collaboration mailbox it mirrors.
+pub fn default_ask_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(ASK_FILENAME))
+}
+
 pub fn default_collaboration_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_FILENAME))
 }

@@ -65,6 +65,16 @@
 # into a hook-authoritative agent only when muxa observes its top-level Idle
 # state. Working / waiting / choice / error panes and synthetic screen-detected
 # agents are never auto-woken. The message body itself stays in the mailbox.
+# Headless one-shot questions from `muxa watch` (`a` asks, `A` browses).
+# Off by default: enabling it lets muxad spawn an agent CLI that bills
+# your account.
+# [ask]
+# enabled = true
+# agent = "claude"          # claude | codex
+# cwd = "~"                 # where the headless process runs; defaults to $HOME
+# timeout_secs = 180
+# keep = 200                # answers retained before the oldest are dropped
+
 [collaboration]
 # enabled           = true
 # wake              = "idle_only"  # idle_only | never (pull-only)

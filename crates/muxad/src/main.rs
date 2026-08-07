@@ -10,6 +10,7 @@ use clap::Parser;
 use muxa::activity::{
     ActivityEntry, ActivityLog, ActivityOptions, StateTransitionEntry, StateTransitionInput,
 };
+use muxa::ask::{AskOptions, AskStore};
 use muxa::collaboration::{CollaborationOptions, CollaborationStore};
 use muxa::config::CollaborationWake;
 use muxa::config::{DashboardAuthMode, NotifierBackend};
@@ -146,6 +147,7 @@ async fn main() -> Result<()> {
         build_history(&cfg, &writer_shutdown_tx, pane_session_cache.clone()).await;
     let store = Store::shared_with_history(history.clone());
     let collaboration = build_collaboration(&cfg).await;
+    let ask = build_ask(&cfg).await;
 
     // The set of backends this daemon observes simultaneously — tmux + herdr
     // during a migration (see `docs/MULTI_HOST.md`). Resolution honors
@@ -342,7 +344,8 @@ async fn main() -> Result<()> {
         // fallback for unclassifiable ids.
         .with_backends(backends.clone())
         .with_sessions(sessions)
-        .with_collaboration(collaboration);
+        .with_collaboration(collaboration)
+        .with_ask(ask);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
     // Harden socket permissions once the listener exists. We poll briefly
@@ -426,6 +429,29 @@ async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::Joi
             let _ = handle.await;
         }
     }
+}
+
+/// Resolve `[ask]` into a live store. Mirrors `build_collaboration`:
+/// the history path is only materialized when the feature is on, so a
+/// disabled ask never creates a file.
+async fn build_ask(cfg: &Config) -> Arc<AskStore> {
+    let options = AskOptions {
+        enabled: cfg.ask.enabled,
+        agent: cfg.ask.agent.clone(),
+        cwd: cfg
+            .ask
+            .cwd
+            .clone()
+            .unwrap_or_else(|| AskOptions::default().cwd),
+        timeout_secs: cfg.ask.timeout_secs,
+        path: cfg
+            .ask
+            .enabled
+            .then(|| cfg.ask.path.clone().or_else(muxa::paths::default_ask_file))
+            .flatten(),
+        keep: cfg.ask.keep,
+    };
+    AskStore::load(options).await
 }
 
 async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {

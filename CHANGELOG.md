@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`a` asks the configured agent a headless question; `A` browses the
+  answers.** Spinning up a whole session to ask one thing was the only
+  option, and it is a heavy one. `a` sends the question to muxad, which
+  runs the agent in print mode and captures the answer; `A` opens a
+  mailbox-shaped history (`j`/`k` to select, `|` to grow the detail pane,
+  `n` for a fresh conversation) that survives restarts in
+  `$XDG_DATA_HOME/muxa/ask.json`.
+
+  Print mode rather than a parked interactive session, because a TUI gives
+  no machine-readable "the answer ends here" — reading a reply back would
+  mean scraping a moving target. It is not the slower choice either: both
+  CLIs resume a conversation by id, so every question after the first
+  reuses the cached context the first one paid for, which is exactly what
+  a parked session was meant to buy. The thread continues until `n`.
+
+  muxad owns execution so an answer survives the watch popup closing, and
+  a `running` entry left by a daemon that died is re-labelled failed at
+  load rather than hanging forever. Configure under `[ask]`; off by
+  default, since enabling it lets the daemon spawn a CLI that bills the
+  user's account.
+
 ## [0.8.29] - 2026-08-06
 
 ### Added

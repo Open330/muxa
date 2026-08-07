@@ -1272,6 +1272,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach to selected pane",
         "  n              new agent session (dir · agent · first prompt)",
+        "  a / A          ask the configured agent / ask history",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
@@ -1330,6 +1331,24 @@ pub(crate) struct ConfirmPopup {
 /// Inline prompt composer opened from the table with Enter. It pins the
 /// target pane at open time so background refreshes or resorting cannot
 /// redirect a typed prompt to a different row.
+/// `a` — a headless question to the configured agent. One text field;
+/// the contract lives in config, not in the composer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AskComposer {
+    input: String,
+    cursor: usize,
+}
+
+/// `A` — the ask history panel. Same shape as the collaboration mailbox
+/// because it answers the same question ("what did I send, what came
+/// back"), down to `|` cycling the detail height.
+#[derive(Debug, Clone, Default)]
+struct AskPanelState {
+    open: bool,
+    selected: usize,
+    detail: MailboxDetail,
+}
+
 /// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SpawnAgent {
@@ -2005,6 +2024,10 @@ pub(crate) struct App {
     collaboration_composer: Option<CollaborationComposer>,
     /// `Some` while the `n` spawn form is open.
     spawn: Option<SpawnComposer>,
+    /// `Some` while the `a` ask composer is open.
+    ask_composer: Option<AskComposer>,
+    ask_panel: AskPanelState,
+    ask_entries: Vec<muxa::ask::AskEntry>,
     /// Editable `:` command palette. Like other overlays it owns keyboard
     /// input until Enter executes or Esc cancels.
     pub command_palette: Option<CommandPalette>,
@@ -2142,6 +2165,9 @@ impl App {
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
             spawn: None,
+            ask_composer: None,
+            ask_panel: AskPanelState::default(),
+            ask_entries: Vec::new(),
             command_palette: None,
             help_open: false,
             footer_hint: None,
@@ -4754,6 +4780,39 @@ pub async fn run(
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
                 }
+                Action::OpenAsk => {
+                    app.ask_composer = Some(AskComposer::default());
+                }
+                Action::SubmitAsk => {
+                    if let Some(ask) = app.ask_composer.take() {
+                        match client.ask_send(&ask.input).await {
+                            Ok(entry) => {
+                                app.set_hint(
+                                    format!("asked {} — answer lands in A", entry.agent),
+                                    HintLevel::Ok,
+                                );
+                                refresh_ask_entries(client, &mut app).await;
+                                app.ask_panel.open = true;
+                                app.ask_panel.selected = app.ask_entries.len().saturating_sub(1);
+                            }
+                            Err(e) => {
+                                app.set_hint(format!("ask failed: {e}"), HintLevel::Err);
+                            }
+                        }
+                    }
+                }
+                Action::OpenAskPanel => {
+                    refresh_ask_entries(client, &mut app).await;
+                    app.ask_panel.open = true;
+                    app.ask_panel.selected = app
+                        .ask_panel
+                        .selected
+                        .min(app.ask_entries.len().saturating_sub(1));
+                }
+                Action::ResetAskThread => match client.ask_reset().await {
+                    Ok(()) => app.set_hint("ask: new conversation", HintLevel::Ok),
+                    Err(e) => app.set_hint(format!("ask reset failed: {e}"), HintLevel::Err),
+                },
                 Action::OpenCollaborationMessage => {
                     refresh_watch_collaboration(client, &mut app).await;
                     open_watch_collaboration_composer(&mut app);
@@ -4895,6 +4954,13 @@ pub async fn run(
         if received_outcome {
             app.refresh_pending = false;
             needs_render = true;
+            // A pending answer arrives on the daemon's clock, not ours.
+            // Piggyback on the refresh the table already does, and only
+            // while the panel is open — nobody needs ask polling to run
+            // behind a screen that is not showing it.
+            if app.ask_panel.open && app.ask_entries.iter().any(is_ask_running) {
+                refresh_ask_entries(client, &mut app).await;
+            }
         }
 
         if quit {
@@ -5104,6 +5170,25 @@ fn host_scope_target(app: &App) -> Option<(String, String)> {
     let pane = agent.pane.clone()?;
     let label = format!("{}@{} · {}", agent.kind, pane, app.pane_label(&pane));
     Some((pane, label))
+}
+
+fn is_ask_running(entry: &muxa::ask::AskEntry) -> bool {
+    entry.status == muxa::ask::AskStatus::Running
+}
+
+async fn refresh_ask_entries(client: &Client, app: &mut App) {
+    match client.ask_list().await {
+        Ok(entries) => {
+            app.ask_entries = entries;
+            app.ask_panel.selected = app
+                .ask_panel
+                .selected
+                .min(app.ask_entries.len().saturating_sub(1));
+        }
+        Err(error) => {
+            app.set_hint(format!("ask history unavailable: {error}"), HintLevel::Err);
+        }
+    }
 }
 
 fn open_watch_collaboration_composer(app: &mut App) {
@@ -5503,6 +5588,14 @@ pub(crate) enum Action {
     SubmitCollaboration,
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
+    /// `a` — open the headless-question composer.
+    OpenAsk,
+    /// Submit the composed question to the daemon.
+    SubmitAsk,
+    /// `A` — refresh and open the ask history panel.
+    OpenAskPanel,
+    /// Start a fresh ask conversation; history is kept.
+    ResetAskThread,
     /// `|` moved the list/inspector divider; the run loop persists the new
     /// ratio next to the persisted sort and reports it in one hint.
     InspectorSplitChanged,
@@ -5687,6 +5780,8 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             for c in pasted.chars() {
                 composer.insert(c);
             }
+        } else if let Some(ask) = app.ask_composer.as_mut() {
+            insert_str_at(&mut ask.input, &mut ask.cursor, &pasted);
         } else if let Some(spawn) = app.spawn.as_mut() {
             // The spawn form was the one input surface missing here, so a
             // paste while it was open fell through to the search fallback
@@ -5748,6 +5843,14 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if app.spawn.is_some() {
         return handle_spawn_event(code, modifiers, app);
+    }
+
+    if app.ask_composer.is_some() {
+        return handle_ask_composer_event(code, modifiers, app);
+    }
+
+    if app.ask_panel.open {
+        return handle_ask_panel_event(code, app);
     }
 
     if app.command_palette.is_some() {
@@ -5939,6 +6042,8 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::InspectorSplitChanged
         }
         KeyCode::Char('b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
+        KeyCode::Char('a') if app.browse_keys_active() => Action::OpenAsk,
+        KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_session_parent();
             Action::None
@@ -6066,6 +6171,67 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
             if let Some(command) = app.command_palette.as_mut() {
                 command.move_end();
             }
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+/// Ask composer: one field, Enter submits, `Ctrl-V` pastes. No contract
+/// row — which agent and where it runs are config, decided once.
+fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    let Some(ask) = app.ask_composer.as_mut() else {
+        return Action::None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.ask_composer = None;
+            Action::None
+        }
+        KeyCode::Enter => {
+            if ask.input.trim().is_empty() {
+                app.set_hint("ask needs a question", HintLevel::Warn);
+                Action::None
+            } else {
+                Action::SubmitAsk
+            }
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(pasted) = system_clipboard_text() {
+                insert_str_at(&mut ask.input, &mut ask.cursor, &pasted);
+            }
+            Action::None
+        }
+        other => {
+            spawn_edit_text(other, modifiers, &mut ask.input, &mut ask.cursor);
+            Action::None
+        }
+    }
+}
+
+/// Ask history panel. `n` starts a new conversation rather than `r`,
+/// which is the global refresh everywhere else in the TUI.
+fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q' | 'A') => {
+            app.ask_panel.open = false;
+            Action::None
+        }
+        KeyCode::Char('a') => Action::OpenAsk,
+        KeyCode::Char('n') => Action::ResetAskThread,
+        KeyCode::Char('|') => {
+            app.ask_panel.detail = app.ask_panel.detail.next();
+            let label = app.ask_panel.detail.label();
+            app.set_hint(format!("ask detail: {label}"), HintLevel::Ok);
+            Action::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let last = app.ask_entries.len().saturating_sub(1);
+            app.ask_panel.selected = (app.ask_panel.selected + 1).min(last);
+            Action::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.ask_panel.selected = app.ask_panel.selected.saturating_sub(1);
             Action::None
         }
         _ => Action::None,
@@ -6726,6 +6892,16 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
+    if app.ask_panel.open {
+        let popup_area = centered_rect(86, 78, chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_ask_panel(f, popup_area, app);
+    }
+    if app.ask_composer.is_some() {
+        let popup_area = bottom_prompt_rect(chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_ask_composer(f, popup_area, app);
+    }
     if let Some(spawn) = app.spawn.as_ref() {
         let popup_area = spawn_popup_rect(chunks[1], spawn);
         f.render_widget(Clear, popup_area);
@@ -6967,6 +7143,196 @@ fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
         width: r.width,
         height,
     }
+}
+
+fn render_ask_composer(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(ask) = app.ask_composer.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " ask ",
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let view = truncate_prompt_input(&ask.input, usize::from(inner.width.saturating_sub(2)));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("> "),
+            Span::raw(view.text.clone()),
+        ]))
+        .block(block),
+        area,
+    );
+    let before: String = view
+        .text
+        .chars()
+        .take(ask.cursor.saturating_sub(view.skipped_chars))
+        .collect();
+    let x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
+    if x < inner.x + inner.width {
+        f.set_cursor_position((x, inner.y));
+    }
+}
+
+fn ask_status_badge(entry: &muxa::ask::AskEntry, theme: WatchThemeSpec) -> Span<'static> {
+    match entry.status {
+        muxa::ask::AskStatus::Running => Span::styled(" … ", theme.key_badge()),
+        muxa::ask::AskStatus::Answered => {
+            Span::styled(" ✓ ", Style::default().fg(Color::Black).bg(Color::Green))
+        }
+        muxa::ask::AskStatus::Failed => {
+            Span::styled(" ✗ ", Style::default().fg(Color::White).bg(Color::Red))
+        }
+    }
+}
+
+fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Line::from(vec![
+            Span::styled(" ask ", theme.accent_badge()),
+            Span::styled(
+                format!(" {} ", app.ask_entries.len()),
+                theme.table_header_style(),
+            ),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if app.ask_entries.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "no questions yet — press a to ask one",
+                    theme.dim_style(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "(needs [ask] enabled = true in config.toml)",
+                    theme.dim_style(),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    let detail_height = match app.ask_panel.detail {
+        MailboxDetail::Compact => inner.height / 3,
+        MailboxDetail::Half => inner.height / 2,
+        MailboxDetail::Most => inner.height.saturating_sub(3),
+    }
+    .max(3);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
+        .split(inner);
+
+    // Newest last matches how the conversation reads; the selection
+    // starts there after every ask.
+    let rows = usize::from(chunks[0].height).max(1);
+    let width = usize::from(chunks[0].width).saturating_sub(2);
+    let start = app
+        .ask_panel
+        .selected
+        .saturating_sub(rows.saturating_sub(1));
+    let lines: Vec<Line> = app
+        .ask_entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, entry)| {
+            let marker = if i == app.ask_panel.selected {
+                Span::styled("> ", theme.action_badge())
+            } else {
+                Span::raw("  ")
+            };
+            let head = entry.prompt.replace('\n', " ");
+            Line::from(vec![
+                marker,
+                ask_status_badge(entry, theme),
+                Span::raw(" "),
+                Span::raw(truncate_chars(&head, width.saturating_sub(6))),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let detail_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(theme.border_style())
+        .title(Span::styled(" answer ", theme.dim_style()));
+    let dw = usize::from(detail_block.inner(chunks[1]).width).max(1);
+    let dh = usize::from(detail_block.inner(chunks[1]).height).max(1);
+    let detail = app.ask_entries.get(app.ask_panel.selected).map_or_else(
+        || vec![Line::from(Span::styled("-", theme.dim_style()))],
+        |entry| ask_detail_lines(entry, dw, dh, theme),
+    );
+    f.render_widget(Paragraph::new(detail).block(detail_block), chunks[1]);
+}
+
+fn ask_detail_lines(
+    entry: &muxa::ask::AskEntry,
+    width: usize,
+    height: usize,
+    theme: WatchThemeSpec,
+) -> Vec<Line<'static>> {
+    use std::fmt::Write as _;
+    let mut meta = format!("{} · {}", entry.agent, entry.cwd);
+    if let Some(d) = entry.duration() {
+        let _ = write!(meta, " · {}s", d.as_secs());
+    }
+    if let Some(cost) = entry.cost_usd {
+        let _ = write!(meta, " · ${cost:.4}");
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        truncate_chars(&meta, width),
+        theme.dim_style(),
+    ))];
+    // Question first, then the answer — the pane reads top-down like the
+    // exchange happened. Both wrap; a truncated answer is the reason to
+    // open this panel at all.
+    let remaining = height.saturating_sub(1).max(2);
+    let q_budget = remaining.clamp(1, 3);
+    lines.extend(
+        wrap_detail_text("ask: ", &entry.prompt, width, q_budget)
+            .into_iter()
+            .map(Line::from),
+    );
+    let body = match entry.status {
+        muxa::ask::AskStatus::Running => "…waiting for the agent".to_string(),
+        muxa::ask::AskStatus::Failed => entry
+            .error
+            .clone()
+            .unwrap_or_else(|| "failed with no detail".into()),
+        muxa::ask::AskStatus::Answered => entry.answer.clone(),
+    };
+    let style = match entry.status {
+        muxa::ask::AskStatus::Failed => Style::default().fg(Color::Red),
+        muxa::ask::AskStatus::Running => theme.dim_style(),
+        muxa::ask::AskStatus::Answered => Style::default().fg(Color::Green),
+    };
+    let a_budget = remaining.saturating_sub(q_budget).max(1);
+    lines.extend(
+        wrap_detail_text("", &body, width, a_budget)
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, style))),
+    );
+    lines.truncate(height.max(1));
+    lines
 }
 
 fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
@@ -8018,7 +8384,8 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
         && app.preview.is_none()
         && !app.help_open
         && !app.event_inbox_open
-        && !app.collaboration_mailbox.open;
+        && !app.collaboration_mailbox.open
+        && !app.ask_panel.open;
     // The composer is deliberately absent from that list. It is a two-line
     // overlay, exactly like the prompt popup, which never hid the inspector
     // — so `Enter` kept the peer's state on screen while `m` blanked it,
@@ -9332,6 +9699,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+#[allow(clippy::too_many_lines)] // one arm per overlay; a dispatch table
+                                 // of closures would hide which key set wins
 fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) -> bool {
     if app.command_palette.is_some() {
         let spans = vec![
@@ -9343,6 +9712,36 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw(" delete word  "),
             Span::styled(" Esc ", theme.key_badge()),
             Span::raw(" cancel"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
+    if app.ask_composer.is_some() {
+        let spans = vec![
+            Span::styled(" Enter ", theme.action_badge()),
+            Span::raw("ask  "),
+            Span::styled(" Ctrl-V ", theme.key_badge()),
+            Span::raw("paste  "),
+            Span::styled(" Esc ", theme.key_badge()),
+            Span::raw("cancel"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
+    if app.ask_panel.open {
+        let spans = vec![
+            Span::styled(" a ", theme.action_badge()),
+            Span::raw("ask  "),
+            Span::styled(" j/k ", theme.key_badge()),
+            Span::raw("select  "),
+            Span::styled(" | ", theme.key_badge()),
+            Span::raw("detail size  "),
+            Span::styled(" n ", theme.key_badge()),
+            Span::raw("new thread  "),
+            Span::styled(" Esc/A ", theme.key_badge()),
+            Span::raw("close"),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         return true;
@@ -14326,6 +14725,10 @@ sort = ["state"]
             | Action::SubmitCollaboration
             | Action::CancelCollaborationComposer
             | Action::InspectorSplitChanged
+            | Action::OpenAsk
+            | Action::SubmitAsk
+            | Action::OpenAskPanel
+            | Action::ResetAskThread
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes

@@ -1,0 +1,547 @@
+//! `muxa ask` — headless one-shot queries to an agent CLI, with the
+//! answer captured instead of typed into a pane.
+//!
+//! **Why headless rather than a parked interactive session.** Keeping a
+//! `claude`/`codex` TUI alive and typing into it is the obvious shape, and
+//! it does not work: a TUI gives no machine-readable "the answer ends
+//! here", so reading a reply back means screen-scraping a moving target.
+//! Print mode (`claude -p --output-format json`, `codex exec --json`)
+//! answers with structured output and an exit code — completion is a fact,
+//! not a guess.
+//!
+//! **And it is not slower.** Both CLIs resume a prior conversation by id,
+//! so the second question onward reuses the cached system context the
+//! first one paid for, which is the efficiency a parked session was meant
+//! to buy. The thread continues until the user resets it, and the entries
+//! outlive the daemon because they live in the same durable-JSON shape the
+//! collaboration mailbox uses.
+//!
+//! The daemon owns execution so a query survives the watch popup closing:
+//! the answer lands in the store either way, and the next `muxa watch`
+//! shows it.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use time::OffsetDateTime;
+use tokio::sync::{Mutex, RwLock};
+
+/// How many entries the store keeps. Old answers are worth re-reading;
+/// unbounded growth is not.
+const DEFAULT_KEEP: usize = 200;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AskError {
+    #[error("ask is disabled; enable [ask].enabled")]
+    Disabled,
+    #[error("ask prompt is empty")]
+    EmptyPrompt,
+    #[error("ask agent {0:?} is not supported (use claude or codex)")]
+    UnsupportedAgent(String),
+    #[error("{0}")]
+    Io(String),
+}
+
+/// Runtime knobs, resolved from `[ask]` by the daemon.
+#[derive(Debug, Clone)]
+pub struct AskOptions {
+    pub enabled: bool,
+    pub agent: String,
+    /// Working directory the headless process runs in. Answers are
+    /// read-only queries, but the agent still resolves files relative to
+    /// somewhere, and "somewhere" should be the user's choice.
+    pub cwd: PathBuf,
+    pub timeout_secs: u64,
+    pub path: Option<PathBuf>,
+    pub keep: usize,
+}
+
+impl Default for AskOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agent: "claude".into(),
+            cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+            timeout_secs: 180,
+            path: None,
+            keep: DEFAULT_KEEP,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskStatus {
+    /// Spawned, no answer yet. A `running` entry left behind by a daemon
+    /// that died is re-labelled `failed` at load — a query cannot outlive
+    /// the process that owns its child.
+    Running,
+    Answered,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskEntry {
+    pub id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub answer: String,
+    pub status: AskStatus,
+    pub agent: String,
+    /// The agent CLI's own conversation id, kept so the next question can
+    /// resume this thread.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
+    pub cwd: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub asked_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub answered_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl AskEntry {
+    /// Wall-clock the query took, once it has finished.
+    #[must_use]
+    pub fn duration(&self) -> Option<Duration> {
+        let end = self.answered_at?;
+        (end - self.asked_at).try_into().ok()
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AskSnapshot {
+    /// Conversation the next question resumes. `None` starts fresh.
+    #[serde(default)]
+    thread: Option<String>,
+    #[serde(default)]
+    entries: Vec<AskEntry>,
+}
+
+/// Durable ask history plus the id of the conversation still in progress.
+pub struct AskStore {
+    opts: AskOptions,
+    entries: RwLock<Vec<AskEntry>>,
+    thread: RwLock<Option<String>>,
+    /// Serializes each mutation with its snapshot write, so a reader
+    /// never sees an entry the file does not have.
+    write_lock: Mutex<()>,
+}
+
+impl AskStore {
+    #[must_use]
+    pub fn in_memory(opts: AskOptions) -> Arc<Self> {
+        Arc::new(Self {
+            opts: AskOptions { path: None, ..opts },
+            entries: RwLock::new(Vec::new()),
+            thread: RwLock::new(None),
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    /// Read the snapshot back, converting any `running` leftovers into
+    /// failures: their child process died with the previous daemon.
+    // `async` for symmetry with `CollaborationStore::load` and so the
+    // daemon's startup path reads the same for both stores.
+    #[allow(clippy::unused_async)]
+    pub async fn load(opts: AskOptions) -> Arc<Self> {
+        let mut snapshot = opts
+            .path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<AskSnapshot>(&text).ok())
+            .unwrap_or_default();
+        for entry in &mut snapshot.entries {
+            if entry.status == AskStatus::Running {
+                entry.status = AskStatus::Failed;
+                entry.error = Some("muxad restarted before the answer arrived".into());
+                entry.answered_at = Some(OffsetDateTime::now_utc());
+            }
+        }
+        Arc::new(Self {
+            opts,
+            entries: RwLock::new(snapshot.entries),
+            thread: RwLock::new(snapshot.thread),
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.opts.enabled
+    }
+
+    pub async fn list(&self) -> Vec<AskEntry> {
+        self.entries.read().await.clone()
+    }
+
+    /// Drop the conversation id so the next question starts a fresh
+    /// thread. History is kept — resetting the thread is not forgetting.
+    pub async fn reset_thread(&self) {
+        let _guard = self.write_lock.lock().await;
+        *self.thread.write().await = None;
+        self.persist().await;
+    }
+
+    /// Record the question, spawn the agent, and return the pending entry
+    /// immediately. The caller gets an id to watch; the answer arrives in
+    /// the store when the child exits.
+    pub async fn ask(self: &Arc<Self>, prompt: &str) -> Result<AskEntry, AskError> {
+        if !self.opts.enabled {
+            return Err(AskError::Disabled);
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(AskError::EmptyPrompt);
+        }
+        let agent = AskAgent::parse(&self.opts.agent)
+            .ok_or_else(|| AskError::UnsupportedAgent(self.opts.agent.clone()))?;
+
+        let resume = self.thread.read().await.clone();
+        let entry = AskEntry {
+            id: format!("ask_{:x}", next_id()),
+            prompt: prompt.to_string(),
+            answer: String::new(),
+            status: AskStatus::Running,
+            agent: agent.label().to_string(),
+            agent_session_id: resume.clone(),
+            cwd: self.opts.cwd.display().to_string(),
+            asked_at: OffsetDateTime::now_utc(),
+            answered_at: None,
+            cost_usd: None,
+            error: None,
+        };
+
+        {
+            let _guard = self.write_lock.lock().await;
+            let mut entries = self.entries.write().await;
+            entries.push(entry.clone());
+            let keep = self.opts.keep.max(1);
+            let excess = entries.len().saturating_sub(keep);
+            entries.drain(..excess);
+            drop(entries);
+            self.persist().await;
+        }
+
+        let store = Arc::clone(self);
+        let id = entry.id.clone();
+        let prompt = prompt.to_string();
+        tokio::spawn(async move {
+            let outcome = agent
+                .run(
+                    &prompt,
+                    resume.as_deref(),
+                    &store.opts.cwd,
+                    Duration::from_secs(store.opts.timeout_secs.max(5)),
+                )
+                .await;
+            store.finish(&id, outcome).await;
+        });
+
+        Ok(entry)
+    }
+
+    async fn finish(&self, id: &str, outcome: Result<AskAnswer, String>) {
+        let _guard = self.write_lock.lock().await;
+        {
+            let mut entries = self.entries.write().await;
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return;
+            };
+            entry.answered_at = Some(OffsetDateTime::now_utc());
+            match outcome {
+                Ok(answer) => {
+                    entry.status = AskStatus::Answered;
+                    entry.answer = answer.text;
+                    entry.cost_usd = answer.cost_usd;
+                    if answer.session_id.is_some() {
+                        entry.agent_session_id.clone_from(&answer.session_id);
+                    }
+                }
+                Err(error) => {
+                    entry.status = AskStatus::Failed;
+                    entry.error = Some(error);
+                }
+            }
+        }
+        // Continue the thread from whatever the agent just answered with.
+        // Only a successful turn advances it: resuming a session that
+        // errored out mid-turn is how a broken thread becomes permanent.
+        let advanced = {
+            let entries = self.entries.read().await;
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .filter(|e| e.status == AskStatus::Answered)
+                .and_then(|e| e.agent_session_id.clone())
+        };
+        if let Some(session) = advanced {
+            *self.thread.write().await = Some(session);
+        }
+        self.persist().await;
+    }
+
+    /// Snapshot to disk. Best-effort: an unwritable path degrades to an
+    /// in-memory history rather than failing the query the user asked for.
+    async fn persist(&self) {
+        let Some(path) = self.opts.path.as_ref() else {
+            return;
+        };
+        let snapshot = AskSnapshot {
+            thread: self.thread.read().await.clone(),
+            entries: self.entries.read().await.clone(),
+        };
+        let Ok(text) = serde_json::to_string_pretty(&snapshot) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Write-then-rename so a reader never catches a half-written file.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+fn next_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Nanos truncated to 64 bits is fine: this is an opaque handle, not a
+    // clock, and the counter breaks ties inside the same nanosecond.
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0);
+    now.rotate_left(8) ^ seq
+}
+
+struct AskAnswer {
+    text: String,
+    session_id: Option<String>,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AskAgent {
+    Claude,
+    Codex,
+}
+
+impl AskAgent {
+    fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Argv for one headless turn. `resume` continues an existing
+    /// conversation; `None` starts a new one.
+    fn argv(self, prompt: &str, resume: Option<&str>) -> (&'static str, Vec<String>) {
+        match self {
+            Self::Claude => {
+                let mut args = vec!["-p".to_string(), "--output-format".into(), "json".into()];
+                if let Some(id) = resume {
+                    args.push("--resume".into());
+                    args.push(id.to_string());
+                }
+                args.push(prompt.to_string());
+                ("claude", args)
+            }
+            Self::Codex => {
+                // `exec` is codex's print mode; `exec resume <id>` continues
+                // one. Both take the prompt as a trailing argument.
+                let mut args = vec!["exec".to_string()];
+                if let Some(id) = resume {
+                    args.push("resume".into());
+                    args.push(id.to_string());
+                }
+                args.push("--json".into());
+                args.push(prompt.to_string());
+                ("codex", args)
+            }
+        }
+    }
+
+    async fn run(
+        self,
+        prompt: &str,
+        resume: Option<&str>,
+        cwd: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<AskAnswer, String> {
+        let (bin, args) = self.argv(prompt, resume);
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(&args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| format!("{bin} did not answer within {}s", timeout.as_secs()))?
+            .map_err(|e| format!("spawning {bin}: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
+            return Err(format!("{bin} exited non-zero: {detail}"));
+        }
+        match self {
+            Self::Claude => parse_claude_json(&stdout),
+            Self::Codex => parse_codex_jsonl(&stdout),
+        }
+    }
+}
+
+/// `claude -p --output-format json` answers with one object carrying the
+/// text, the conversation id to resume, and the turn's cost.
+fn parse_claude_json(stdout: &str) -> Result<AskAnswer, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("parsing claude JSON: {e}"))?;
+    if value.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+        let detail = value
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("claude reported an error");
+        return Err(detail.to_string());
+    }
+    let text = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("claude JSON has no result field")?
+        .to_string();
+    Ok(AskAnswer {
+        text,
+        session_id: value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        cost_usd: value
+            .get("total_cost_usd")
+            .and_then(serde_json::Value::as_f64),
+    })
+}
+
+/// `codex exec --json` streams one JSON event per line. The answer is the
+/// last agent message; the session id appears in a configured/session
+/// event near the top.
+fn parse_codex_jsonl(stdout: &str) -> Result<AskAnswer, String> {
+    let mut text: Option<String> = None;
+    let mut session_id: Option<String> = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        for key in ["session_id", "conversation_id", "thread_id"] {
+            if session_id.is_none() {
+                session_id = find_str(&value, key);
+            }
+        }
+        // Codex has moved this field around across versions; take the last
+        // message-shaped payload rather than pinning one event name.
+        for key in ["last_agent_message", "agent_message", "message", "text"] {
+            if let Some(found) = find_str(&value, key) {
+                if !found.trim().is_empty() {
+                    text = Some(found);
+                }
+            }
+        }
+    }
+    let text = text.ok_or("codex produced no agent message")?;
+    Ok(AskAnswer {
+        text,
+        session_id,
+        cost_usd: None,
+    })
+}
+
+/// First string value for `key` anywhere in `value`. Codex nests its
+/// payloads differently per event, and a recursive lookup is cheaper than
+/// tracking every shape.
+fn find_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(s)) = map.get(key) {
+                return Some(s.clone());
+            }
+            map.values().find_map(|v| find_str(v, key))
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(|v| find_str(v, key)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_json_yields_text_session_and_cost() {
+        let raw =
+            r#"{"is_error":false,"result":"PONG","session_id":"abc-123","total_cost_usd":0.09}"#;
+        let answer = parse_claude_json(raw).unwrap();
+        assert_eq!(answer.text, "PONG");
+        assert_eq!(answer.session_id.as_deref(), Some("abc-123"));
+        assert!((answer.cost_usd.unwrap() - 0.09).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn claude_error_turns_into_an_error_not_an_answer() {
+        let raw = r#"{"is_error":true,"result":"rate limited","session_id":"abc"}"#;
+        assert!(parse_claude_json(raw).is_err());
+    }
+
+    #[test]
+    fn codex_jsonl_takes_the_last_message_and_finds_the_session() {
+        let raw = concat!(
+            r#"{"type":"session.created","payload":{"session_id":"s-1"}}"#,
+            "\n",
+            r#"{"type":"item","payload":{"message":"first"}}"#,
+            "\n",
+            r#"{"type":"item","payload":{"message":"final answer"}}"#,
+            "\n",
+        );
+        let answer = parse_codex_jsonl(raw).unwrap();
+        assert_eq!(answer.text, "final answer");
+        assert_eq!(answer.session_id.as_deref(), Some("s-1"));
+    }
+
+    #[test]
+    fn claude_argv_only_resumes_when_there_is_a_thread() {
+        let (bin, fresh) = AskAgent::Claude.argv("hi", None);
+        assert_eq!(bin, "claude");
+        assert!(!fresh.contains(&"--resume".to_string()));
+        assert_eq!(fresh.last().unwrap(), "hi");
+
+        let (_, resumed) = AskAgent::Claude.argv("hi", Some("s-9"));
+        let at = resumed.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(resumed[at + 1], "s-9");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_store_refuses_before_spawning_anything() {
+        let store = AskStore::in_memory(AskOptions::default());
+        assert!(matches!(store.ask("hi").await, Err(AskError::Disabled)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_prompt_is_refused() {
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            ..AskOptions::default()
+        });
+        assert!(matches!(store.ask("   ").await, Err(AskError::EmptyPrompt)));
+    }
+}

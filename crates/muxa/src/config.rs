@@ -110,12 +110,49 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
     pub collaboration: CollaborationConfig,
+    #[serde(default)]
+    pub ask: AskConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
     pub stats: StatsConfig,
+}
+
+/// `[ask]` config — headless one-shot queries from `muxa watch`.
+///
+/// Disabled by default: enabling it lets the daemon spawn an agent CLI
+/// that bills the user's account. That is a grant, like collaboration's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AskConfig {
+    pub enabled: bool,
+    /// `claude` or `codex`.
+    pub agent: String,
+    /// Directory the headless process runs in. Defaults to `$HOME` —
+    /// answers are queries, not edits, and a neutral cwd keeps a stray
+    /// question away from a working tree.
+    pub cwd: Option<PathBuf>,
+    /// Wall-clock ceiling per question.
+    pub timeout_secs: u64,
+    /// History snapshot. Defaults to `$XDG_DATA_HOME/muxa/ask.json`.
+    pub path: Option<PathBuf>,
+    /// Answers retained before the oldest are dropped.
+    pub keep: usize,
+}
+
+impl Default for AskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agent: "claude".into(),
+            cwd: None,
+            timeout_secs: 180,
+            path: None,
+            keep: 200,
+        }
+    }
 }
 
 /// `[collaboration]` config — same-window durable agent request/reply.

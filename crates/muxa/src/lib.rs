@@ -35,6 +35,7 @@
 
 pub mod activity;
 pub mod adapters;
+pub mod ask;
 pub mod backend;
 pub mod collaboration;
 pub mod config;

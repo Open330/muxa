@@ -19,6 +19,7 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
+use crate::ask::{AskEntry, AskStore};
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
     self, AirArtifactReference, CollaborationOptions, CollaborationOrigin, CollaborationRequest,
@@ -204,6 +205,14 @@ enum RequestBody {
         target: String,
         request: NewRequest,
     },
+    /// Queue a headless question. Returns the pending entry immediately;
+    /// the answer lands in the store when the agent exits.
+    AskSend {
+        prompt: String,
+    },
+    AskList {},
+    /// Start a fresh conversation. History is untouched.
+    AskReset {},
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -382,6 +391,10 @@ pub struct Response {
     pub collaboration_requests: Option<Vec<CollaborationRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_entries: Option<Vec<AskEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_entry: Option<AskEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,6 +426,8 @@ impl Response {
             room: None,
             collaboration_requests: None,
             collaboration_request: None,
+            ask_entries: None,
+            ask_entry: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -494,6 +509,16 @@ impl Response {
         r.collaboration_request = Some(request);
         r
     }
+    fn with_ask_entries(entries: Vec<AskEntry>) -> Self {
+        let mut r = Self::ok();
+        r.ask_entries = Some(entries);
+        r
+    }
+    fn with_ask_entry(entry: AskEntry) -> Self {
+        let mut r = Self::ok();
+        r.ask_entry = Some(entry);
+        r
+    }
     fn hello() -> Self {
         let mut r = Self::ok();
         r.min_protocol = Some(MIN_PROTOCOL_VERSION);
@@ -517,6 +542,7 @@ pub struct Server {
     backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
     collaboration: Arc<CollaborationStore>,
+    ask: Arc<AskStore>,
     handler_limit: usize,
 }
 
@@ -530,6 +556,7 @@ impl Server {
             backends: vec![backend],
             sessions: PtySessionBackend::shared(),
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
+            ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -563,6 +590,12 @@ impl Server {
     #[must_use]
     pub fn with_sessions(mut self, sessions: SharedSessionBackend) -> Self {
         self.sessions = sessions;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ask(mut self, ask: Arc<AskStore>) -> Self {
+        self.ask = ask;
         self
     }
 
@@ -661,11 +694,13 @@ impl Server {
                     let backends = self.backends.clone();
                     let sessions = self.sessions.clone();
                     let collaboration = self.collaboration.clone();
+                    let ask = self.ask.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
                         if let Err(e) =
-                            handle(stream, store, backend, backends, sessions, collaboration).await
+                            handle(stream, store, backend, backends, sessions, collaboration, ask)
+                                .await
                         {
                             if e.is_client_disconnect() {
                                 tracing::debug!(error = %e, "client disconnected");
@@ -969,7 +1004,7 @@ async fn collaboration_participants(
 
 #[tracing::instrument(
     level = "debug",
-    skip(stream, store, backend, backends, sessions, collaboration)
+    skip(stream, store, backend, backends, sessions, collaboration, ask)
 )]
 #[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
 async fn handle(
@@ -979,6 +1014,7 @@ async fn handle(
     backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
     collaboration: Arc<CollaborationStore>,
+    ask: Arc<AskStore>,
 ) -> Result<(), RuntimeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -1299,6 +1335,22 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     }
+                }
+                RequestBody::AskSend { prompt } => {
+                    kind = "ask_send";
+                    match ask.ask(&prompt).await {
+                        Ok(entry) => Response::with_ask_entry(entry),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskList {} => {
+                    kind = "ask_list";
+                    Response::with_ask_entries(ask.list().await)
+                }
+                RequestBody::AskReset {} => {
+                    kind = "ask_reset";
+                    ask.reset_thread().await;
+                    Response::ok()
                 }
                 RequestBody::CollaborationSend {
                     origin,
@@ -1777,6 +1829,28 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Queue a headless question; the returned entry is `Running`.
+    pub async fn ask_send(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_send",
+            "prompt": prompt,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_entry"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn ask_list(&self) -> Result<Vec<AskEntry>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_list" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_entries"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn ask_reset(&self) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_reset" });
+        self.call_checked(&req).await.map(|_| ())
     }
 
     pub async fn collaboration_send(
@@ -2796,6 +2870,7 @@ mod tests {
             vec![default_backend()],
             PtySessionBackend::shared(),
             CollaborationStore::in_memory(CollaborationOptions::default()),
+            crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
         ));
 
         let req = serde_json::json!({
