@@ -6246,7 +6246,11 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         }
         KeyCode::Char('a') => Action::OpenAsk,
         KeyCode::Char('n') => Action::ResetAskThread,
-        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => Action::CycleAskAgent,
+        // Tab, not the arrows: every other overlay here already reads Tab
+        // as "cycle the option" (mailbox tabs, request kind, spawn
+        // fields), while arrows read as list movement — which is what
+        // j/k and Up/Down do in this very handler.
+        KeyCode::Tab | KeyCode::BackTab => Action::CycleAskAgent,
         KeyCode::Char('|') => {
             app.ask_panel.detail = app.ask_panel.detail.next();
             let label = app.ask_panel.detail.label();
@@ -9773,7 +9777,7 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw("select  "),
             Span::styled(" | ", theme.key_badge()),
             Span::raw("detail size  "),
-            Span::styled(" ←/→ ", theme.key_badge()),
+            Span::styled(" Tab ", theme.key_badge()),
             Span::raw("agent  "),
             Span::styled(" n ", theme.key_badge()),
             Span::raw("new thread  "),
@@ -10560,6 +10564,25 @@ mod tests {
             effective_columns(&[WatchColumn::Prompt], 10),
             vec![WatchColumn::Prompt]
         );
+    }
+
+    #[test]
+    fn tab_in_the_ask_panel_cycles_the_agent_and_j_still_selects() {
+        let mut app = app_with_paneless_and_pane();
+        app.ask_panel.open = true;
+        for key in [KeyCode::Tab, KeyCode::BackTab] {
+            let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
+            assert!(
+                matches!(action, Action::CycleAskAgent),
+                "{key:?} must reach the panel, got {action:?}"
+            );
+        }
+        // j/k stay list movement — the reason Tab took over the switch.
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
     }
 
     #[test]
