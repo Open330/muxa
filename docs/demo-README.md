@@ -13,8 +13,9 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo-setup.sh`      | Builds the whole fixture: config, PATH shims, tmux server, `muxad`, the seeded fleet, the mailbox, and the ask history. |
 | `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
 | `docs/demo-teardown.sh`   | Removes all of it. Safe to run at any time, including after a half-finished render.        |
-| `docs/demo.gif`           | Hero output. 1320 × 620.                                                                   |
-| `docs/demo-collab.gif`    | Collaboration output. 1320 × 720.                                                          |
+| `docs/demo-optimize.sh`   | Rebuilds a rendered GIF on a 64-colour palette. Run it after `vhs`, before committing.     |
+| `docs/demo.gif`           | Hero output. 1320 × 620, ~1.6 MB after optimizing.                                          |
+| `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.5 MB after optimizing.                                 |
 
 ## What the two recordings cover
 
@@ -68,7 +69,14 @@ differently on every render.
 cd /path/to/muxa
 vhs docs/demo.tape
 vhs docs/demo-collab.tape
+docs/demo-optimize.sh docs/demo.gif docs/demo-collab.gif
 ```
+
+The optimize pass is not optional housekeeping — VHS emits a 256-colour
+GIF and these recordings use maybe forty of them, so rebuilding on a
+64-colour palette takes ~21% off each file with no visible difference on
+terminal content. Skip it and you commit a fifth of a megabyte of unused
+palette to a README people load on phones.
 
 VHS spins up `ttyd`, points headless Chrome at it, records the rendered
 terminal, and encodes the GIF. Each tape runs `demo-setup.sh` in its
@@ -108,6 +116,9 @@ Set `VHS_NO_SANDBOX=true` and record again.
   tape does, and what a user does anyway.
 * **Pacing**: `Sleep` is in milliseconds. ~1500 ms after a key gives the
   viewer time to read; ~500 ms is right between consecutive keystrokes.
+* **`Set Framerate` is not a size lever.** VHS 0.11 emitted 25 fps for
+  these tapes whether or not it was set; asking for 24 changed the file
+  by 0.02%. Palette size is where the bytes are — see the optimize step.
 * **State glyphs render as dashes**: make sure the tape exports a UTF-8
   locale and the demo tmux server starts with `tmux -u`; otherwise tmux
   degrades `●` / `▶` / `○` before VHS ever sees them.
