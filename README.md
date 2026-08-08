@@ -31,7 +31,9 @@ It does not fork the multiplexer or modify agent binaries. tmux and
 same time; zellij has a CLI baseline. See the Hosts table below.
 
 <div align="center">
-  <img src="docs/demo.gif" alt="muxa demo" width="900" />
+  <img src="docs/demo.gif" alt="muxa watch: sixteen agent sessions on one screen, the inspector, the swarm view, and muxa attend jumping to the agent that needs you" width="900" />
+  <br />
+  <sub><code>muxa watch</code> — the fleet, the inspector, the swarm view, and <code>muxa attend</code>.</sub>
 </div>
 
 > [!IMPORTANT]
@@ -90,6 +92,12 @@ muxa watch
 ```
 
 ### Collaborate from `muxa watch`
+
+<div align="center">
+  <img src="docs/demo-collab.gif" alt="muxa watch: the collaboration mailbox, messaging the session under the cursor, and asking claude a headless question" width="900" />
+  <br />
+  <sub><code>b</code> mailbox · <code>m</code> message the row under the cursor · <code>a</code>/<code>A</code> headless ask.</sub>
+</div>
 
 The model is simple: **one tmux window is one room**. The agent pane that is
 focused when `muxa watch` opens is the sender.

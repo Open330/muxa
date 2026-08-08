@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The README recordings show what muxa actually does now.** The old GIF
+  predated a month of work: it was rendered before the demo fixture was
+  last enlarged, so it showed three sessions in a small popup with a
+  footer of keys that no longer exist, and nothing of the inspector,
+  mailbox, ask, split cycling, or the swarm view. There are now two —
+  `docs/demo.gif` for triage (sixteen sessions, `|`, the swarm, `muxa
+  attend`) and `docs/demo-collab.gif` for collaboration (`b`, `m`,
+  `a`/`A`) — because one recording covering both ran 45 seconds.
+
+  The fixture behind them was rebuilt to match: ~18 agents across every
+  state muxa renders including rate-limited and error, several sessions
+  carrying two agents, live Task subagents, a seeded mailbox sent through
+  the real `muxa msg` path, and stubbed agent CLIs so the ask feature
+  answers instantly, for free, and identically on every render. Every
+  pane is painted with a frame matching the prompt it was seeded with, so
+  the inspector and preview show an agent rather than an empty box.
+  `docs/demo-teardown.sh` is new, `docs/demo-seed.sh` is gone, and
+  `docs/demo-README.md` documents the parts that are load-bearing rather
+  than the story arc from four releases ago.
+
 ## [0.8.30] - 2026-08-07
 
 ### Fixed

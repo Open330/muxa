@@ -1,67 +1,88 @@
-# `docs/demo.gif` — how to regenerate
+# `docs/demo.gif` / `docs/demo-collab.gif` — how to regenerate
 
-The hero GIF embedded in the project README is checked into the repo
-rather than generated at build time. Whenever you change the visible
-flow (new keybinds, layout shifts, a renamed subcommand) you'll want
-to re-record it.
+Both GIFs in the project README are checked into the repo rather than
+generated at build time. Re-record whenever you change the visible flow:
+new keybinds, layout shifts, a renamed subcommand, a new panel.
 
 ## Files
 
-| File                   | Role                                                                                  |
-| ---------------------- | ------------------------------------------------------------------------------------- |
-| `docs/demo.tape`       | [VHS](https://github.com/charmbracelet/vhs) script — the recording itself.            |
-| `docs/demo-setup.sh`   | Bootstraps an isolated `tmux -L muxa-demo` server with a few seeded panes + windows.  |
-| `docs/demo-paint.sh`   | Paints believable static agent frames (claude/codex/gemini) into the demo panes so `muxa attend` / attach land on real-looking content instead of an empty `cat`. |
-| `docs/demo-seed.sh`    | Older pane-seed script (kept for reference; the live setup script does this inline).  |
-| `docs/demo.gif`        | The output. 1200 × 720; the status → stats → watch → attend story arc.                |
+| File                      | Role                                                                                     |
+| ------------------------- | ---------------------------------------------------------------------------------------- |
+| `docs/demo.tape`          | [VHS](https://github.com/charmbracelet/vhs) script for the hero GIF.                      |
+| `docs/demo-collab.tape`   | VHS script for the collaboration GIF.                                                     |
+| `docs/demo-setup.sh`      | Builds the whole fixture: config, PATH shims, tmux server, `muxad`, the seeded fleet, the mailbox, and the ask history. |
+| `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
+| `docs/demo-teardown.sh`   | Removes all of it. Safe to run at any time, including after a half-finished render.        |
+| `docs/demo.gif`           | Hero output. 1320 × 620.                                                                   |
+| `docs/demo-collab.gif`    | Collaboration output. 1320 × 720.                                                          |
 
-## Story arc
+## What the two recordings cover
 
-The recording is a four-beat narrative, not a feature tour — the point is
-to make "which of my agents needs me?" felt, then answered:
+They are split because one GIF covering everything ran 45 seconds, which
+nobody watches to the end of.
 
-1. **Overwhelm** — `muxa status`: claude working, codex blocked on an
-   approval, gemini waiting.
-2. **The accountant** — `muxa stats`: where the day actually went
-   (WORK / WAIT / TMUX / ACT / THINK).
-3. **The god view** — `prefix + s` → `muxa watch`, every agent on one
-   screen, with the real prompt + response in the preview popup.
-4. **The finale** — `muxa attend` teleports the tmux client straight to
-   the longest-blocked agent (codex, mid shell-approval). Strongest note
-   to end on, so it comes last: attend moves us off the shell pane.
+**`demo.tape` — triage.** Sixteen sessions on one screen with the state
+sort floating the ones that need you; `|` cycling the list/inspector
+split, with the inspector carrying the selected agent's live screen; the
+k9s-style swarm view with its subagent trees; `muxa attend` teleporting
+the tmux client to the agent blocked longest.
 
-The tape's prelude (`Hide` block) does the boring setup so the visible
-recording stays focused on the muxa UI:
+**`demo-collab.tape` — talking to the fleet.** `b` for the durable
+request/reply mailbox; `m` addressing whatever row the cursor is on; `a`
+asking claude a headless question and `A` browsing the answers.
 
-1. Spawns a fresh `muxad` against `MUXA_SOCKET=/tmp/muxa-demo.sock`.
-2. Writes a demo-local `MUXA_CONFIG` and `XDG_DATA_HOME` so local watch
-   defaults and real activity ledgers do not leak into the recording.
-3. Runs `docs/demo-setup.sh`, which stands up the labelled tmux server
-   with a multi-agent `main` session, a single-agent `ops` session, and
-   a bare `lab` session, writes sample activity intervals for
-   stats/activity, and binds `prefix + s` to the watch popup.
-4. `exec`s into `tmux -L muxa-demo attach -t main:0` so the recording
-   opens already inside the demo session.
+## The fixture
 
-## Happy path — when Chrome can sandbox
+`demo-setup.sh` is the whole story. It stands up a tmux server labelled
+`muxa-demo`, seeds ~18 agents across every state muxa can render
+(working, waiting on input, waiting on a choice, error, rate-limited,
+idle) plus live Task subagents, then feeds the mailbox through the real
+`muxa msg` path. Nothing in the recording is a mock-up of muxa itself —
+only the agents are fixtures.
 
-If you're on a desktop or any environment where headless Chrome can
-create a user namespace:
+Four details in there are load-bearing, and each one cost a take to find:
+
+* **The daemon and its paths are hardcoded, not inherited.** The script
+  starts a `muxad` and feeds it a fabricated fleet. If it honoured a
+  `MUXA_SOCKET` from your shell it would inject that fleet into your real
+  registry.
+* **`MUXA_TMUX_SOCKET` is pinned before any session is created.** Panes
+  inherit their environment at creation time, and a pane without the pin
+  enumerates every tmux server on the host. The first take showed 59
+  sessions, most of them the author's.
+* **Every seeding call claims the demo tmux server explicitly.** A hook
+  client stamps events with `$TMUX`; run the script from inside your own
+  tmux and every event is silently dropped as out-of-scope.
+* **`ctl` is the operator's session, and the recording types there.** The
+  inspector renders the selected pane's live screen, so running the TUI
+  from a pane the cursor might land on makes muxa draw a mirror of
+  itself, which reads as a bug.
+
+`claude` and `codex` are shimmed onto `PATH` for the ask feature. A real
+`a` bills the user, takes an unpredictable 10-40 s, and answers
+differently on every render.
+
+## Recording
 
 ```bash
 cd /path/to/muxa
 vhs docs/demo.tape
+vhs docs/demo-collab.tape
 ```
 
-VHS handles the rest: spins up `ttyd`, points headless Chrome at it,
-records the rendered terminal, encodes the GIF. Drop the resulting
-`docs/demo.gif` straight into the commit.
+VHS spins up `ttyd`, points headless Chrome at it, records the rendered
+terminal, and encodes the GIF. Each tape runs `demo-setup.sh` in its
+prelude and `demo-teardown.sh` in its postlude, so no state is left
+behind — and setup tears down before it builds, so an interrupted render
+does not poison the next one.
 
-## Fallback — when Chrome can't sandbox
+You need [JetBrains Mono Nerd Font](https://github.com/ryanoasis/nerd-fonts)
+installed. Without it the terminal falls back to a font with different
+metrics: glyphs render at roughly double width, the column count
+collapses, and `muxa watch` silently drops the inspector.
 
-In sandboxed dev environments (some container-in-container setups,
-restricted user namespaces, locked-down CI runners), Chrome bails with
-something like:
+If Chrome cannot create a user namespace — containers, restricted
+runners — it bails with:
 
 ```
 could not launch browser: Failed to move to new namespace:
@@ -69,84 +90,35 @@ PID namespaces supported, Network namespace supported, but failed:
 errno = Operation not permitted
 ```
 
-VHS doesn't expose `--no-sandbox` to the user, so the workaround is to
-record inside the upstream VHS Docker image where Chrome's namespace
-needs are met:
+Set `VHS_NO_SANDBOX=true` and record again.
 
-```bash
-# 1) Bring up a long-lived shell container off the official image.
-CID=$(docker create --entrypoint sh ghcr.io/charmbracelet/vhs:latest \
-        -c "mkdir -p /work/docs && sleep 600")
-docker start "$CID"
+## Tweaking the tapes
 
-# 2) Install tmux — the image ships vhs/chromium/ttyd/ffmpeg but not tmux.
-docker exec "$CID" sh -c \
-  "apt-get update -qq >/dev/null && apt-get install -y -qq tmux >/dev/null"
-
-# 3) Inject the host's muxa binaries + the demo files. Bind mounts are
-#    unreliable when the docker daemon itself is containerized, so use
-#    `docker cp` instead.
-docker cp ~/.cargo/bin/muxa  "$CID":/usr/local/bin/muxa
-docker cp ~/.cargo/bin/muxad "$CID":/usr/local/bin/muxad
-docker cp docs/demo.tape       "$CID":/work/docs/demo.tape
-docker cp docs/demo-setup.sh   "$CID":/work/docs/demo-setup.sh
-docker cp docs/demo-paint.sh   "$CID":/work/docs/demo-paint.sh
-docker cp docs/demo-seed.sh    "$CID":/work/docs/demo-seed.sh
-
-# 4) Record. The visible flow shows status, stats, watch, and attend.
-docker exec -w /work "$CID" vhs docs/demo.tape
-
-# 5) Pull the resulting GIF out and tear the container down.
-docker cp "$CID":/work/docs/demo.gif docs/demo.gif
-docker rm -f "$CID"
-```
-
-The host muxa binaries need to be ABI-compatible with the container
-(Debian Trixie / glibc 2.40-ish). A release build from this repo on a
-recent Ubuntu / Debian works out of the box; if you're on an older
-distro, build inside the container instead:
-
-```bash
-# inside the container, before step 4
-docker exec "$CID" sh -c \
-  "apt-get install -y -qq curl build-essential >/dev/null && \
-   curl -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null"
-docker cp . "$CID":/src
-docker exec -w /src "$CID" sh -c \
-  ". $HOME/.cargo/env && \
-   cargo install --path crates/muxa-cli --locked && \
-   cargo install --path crates/muxad --locked"
-```
-
-## Tweaking the tape
-
-A few patterns that come up:
-
-* **Pacing**: the visible flow targets ~19 s. `Sleep` durations are in
-  milliseconds; ~1500 ms after a key gives the viewer time to read,
-  ~500 ms is right between consecutive keystrokes.
-* **New key in muxa watch**: add the keystroke after `Type "p"` /
-  `Type "j"` blocks. Keep the prelude untouched — it's already
-  carrying `prefix + s` keybind, status bar wiring, and the
-  session-view seed.
-* **Higher resolution**: bump `Set Width` / `Set Height`. The README
-  embed scales to its container width; 1200 × 720 lands cleanly on
-  most monitors and keeps the file under 1 MB.
-* **Theme/font**: `Set Theme "GitHub Dark"` and the demo-local
-  `high-contrast` muxa theme keep text readable after GitHub scales the
-  README GIF down. `Set FontFamily "JetBrainsMono Nerd Font Mono"` keeps
-  single-cell state glyphs (`●`, `▶`, `○`) readable. See `vhs themes`
-  for theme alternatives.
+* **Terminal size is not cosmetic.** `muxa watch` only splits out the
+  inspector at ≥ 120 columns, and VHS reserves enough padding that the
+  obvious `1200 × 760` at font 14 lands at **117** — wide enough to look
+  deliberate, narrow enough to look broken. Verify with a throwaway tape
+  that runs `tput cols` before trusting new numbers.
+* **Move the cursor from `gg`, never relatively.** The cursor opens on
+  whichever session the TUI is running in, so a bare `Down` is measured
+  from a position that shifts with the fixture.
+* **Submitting an ask opens the history panel by itself**, showing the
+  question in flight. The panel snapshots on open and does not poll, so
+  the answer only appears if you close and reopen it — which is what the
+  tape does, and what a user does anyway.
+* **Pacing**: `Sleep` is in milliseconds. ~1500 ms after a key gives the
+  viewer time to read; ~500 ms is right between consecutive keystrokes.
 * **State glyphs render as dashes**: make sure the tape exports a UTF-8
   locale and the demo tmux server starts with `tmux -u`; otherwise tmux
-  can degrade `●` / `▶` / `○` before VHS ever sees them.
+  degrades `●` / `▶` / `○` before VHS ever sees them.
 
 ## Troubleshooting
 
-| Symptom                                                                  | Cause                                                          | Fix                                                                  |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `Failed to move to new namespace: Operation not permitted`               | Chrome's sandbox can't run in the current env.                 | Use the Docker fallback above.                                       |
-| `tmux: command not found` inside the recording                           | The container doesn't have tmux installed.                     | Step 2 of the fallback (`apt-get install tmux`).                     |
-| `muxa: command not found` inside the recording                           | The container can't see the host's muxa binaries.              | Step 3 of the fallback (`docker cp` muxa + muxad to `/usr/local/bin`). |
-| Gif is generated but the agent rows are empty                            | `docs/demo-setup.sh` failed silently — usually muxad isn't up. | Re-run with the prelude's `>/dev/null` removed and read the output.  |
-| `parser: N error(s)` from VHS                                            | A typo in the tape — usually a stray paren or an absolute path treated as a command. | `vhs validate docs/demo.tape` and read the highlighted spans.        |
+| Symptom                                                    | Cause                                                                    | Fix                                                                 |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `Failed to move to new namespace: Operation not permitted` | Chrome's sandbox can't run here.                                         | `VHS_NO_SANDBOX=true vhs docs/demo.tape`                            |
+| Characters double-width, no inspector                      | JetBrains Mono Nerd Font is missing and the terminal fell back.          | Install the font, `fc-cache -f`.                                    |
+| "daemon not reachable" flashes mid-recording               | A `muxad` from an earlier run is still holding the demo socket.          | `docs/demo-teardown.sh` — it sweeps by config path, not by name.    |
+| Sessions from your own machine appear in the list          | `MUXA_TMUX_SOCKET` was not inherited by the demo panes.                  | Check it is exported before `new-session`, not after.               |
+| Agent rows are empty                                       | Seeded events were dropped as out-of-scope, usually the `$TMUX` stamp.   | Re-run setup without `>/dev/null` and read the output.              |
+| `parser: N error(s)` from VHS                              | A typo in the tape — often an absolute path treated as a command.        | `vhs validate docs/demo.tape` and read the highlighted spans.       |
