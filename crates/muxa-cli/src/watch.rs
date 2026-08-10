@@ -944,8 +944,7 @@ pub(crate) enum QuickAction {
         dir: String,
         agent_label: &'static str,
         launch: String,
-        /// Explicit session name (already sanitized); `None` derives one
-        /// from the directory.
+        /// Explicit work/ticket id; `None` derives one from the directory.
         session: Option<String>,
     },
 }
@@ -997,10 +996,8 @@ pub(crate) trait Effects {
     /// Enter after a short grace delay. Return Ok only if both tmux
     /// calls succeed.
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String>;
-    /// Create a detached tmux session rooted at `dir` and type `launch`
-    /// into it. Returns the session name actually created — derived from
-    /// the directory, deduplicated, never reusing or replacing an
-    /// existing session.
+    /// Create or reuse one managed work session and start an agent pane.
+    /// The explicit name is the work/ticket id; otherwise cwd derives it.
     fn spawn_session(
         &mut self,
         dir: &str,
@@ -1038,20 +1035,82 @@ impl Effects for RealEffects {
         launch: &str,
         session: Option<&str>,
     ) -> std::result::Result<String, String> {
-        let existing: Vec<String> = muxa::tmux::tmux_command()
-            .args(["list-sessions", "-F", "#{session_name}"])
-            .output()
-            .map(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
         let base = session.map_or_else(|| session_base_name(dir), str::to_string);
-        let name = unique_session_name(base, |candidate| existing.iter().any(|s| s == candidate));
-        run_status("tmux", &["new-session", "-d", "-s", &name, "-c", dir])?;
-        run_status("tmux", &["send-keys", "-t", &name, "--", launch, "Enter"])?;
+        let work = crate::tmux_work::normalize_work_id(&base).map_err(|error| error.to_string())?;
+        let cwd = std::fs::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
+        let existing = crate::tmux_work::find_work(&work).map_err(|error| error.to_string())?;
+        let (name, created, args) = if let Some(existing) = existing {
+            let existing_cwd = std::fs::canonicalize(&existing.cwd)
+                .map_err(|error| format!("resolve {}: {error}", existing.cwd.display()))?;
+            if existing_cwd != cwd {
+                return Err(format!(
+                    "work {} already uses {}; requested {}",
+                    existing.work,
+                    existing_cwd.display(),
+                    cwd.display()
+                ));
+            }
+            (
+                existing.session.clone(),
+                false,
+                vec![
+                    "split-window".to_string(),
+                    "-h".into(),
+                    "-d".into(),
+                    "-P".into(),
+                    "-F".into(),
+                    "#{pane_id}".into(),
+                    "-t".into(),
+                    existing.session,
+                    "-c".into(),
+                    cwd.display().to_string(),
+                    launch.to_string(),
+                ],
+            )
+        } else {
+            let name = crate::tmux_work::session_name_for_work(&work)
+                .map_err(|error| error.to_string())?;
+            (
+                name.clone(),
+                true,
+                vec![
+                    "new-session".to_string(),
+                    "-d".into(),
+                    "-P".into(),
+                    "-F".into(),
+                    "#{pane_id}".into(),
+                    "-s".into(),
+                    name,
+                    "-c".into(),
+                    cwd.display().to_string(),
+                    launch.to_string(),
+                ],
+            )
+        };
+        let output = muxa::tmux::tmux_command()
+            .args(&args)
+            .output()
+            .map_err(|error| format!("tmux: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let pane = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with('%'))
+            .ok_or_else(|| "tmux returned no pane id".to_string())?
+            .to_string();
+        let agent = launch.split_whitespace().next().unwrap_or("unknown");
+        let marked = if created {
+            crate::tmux_work::mark_work(&name, &work, &cwd)
+                .and_then(|()| crate::tmux_work::mark_agent(&pane, agent, Some(&work), None, None))
+        } else {
+            crate::tmux_work::mark_agent(&pane, agent, Some(&work), None, None)
+        };
+        if let Err(error) = marked {
+            crate::tmux_work::cleanup_pane(&pane);
+            return Err(format!("record muxa tmux metadata: {error}"));
+        }
         Ok(name)
     }
 
@@ -1240,7 +1299,7 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             session,
         } => match fx.spawn_session(&dir, &launch, session.as_deref()) {
             Ok(name) => ActionOutcome::Ok(format!(
-                "spawned {agent_label} in session {name} — Enter on its row to attach"
+                "started {agent_label} in work/session {name} — Enter on its row to attach"
             )),
             Err(e) => ActionOutcome::Err(format!("spawn failed: {e}")),
         },
@@ -1282,7 +1341,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach to selected pane",
-        "  n              new agent session (dir · agent · first prompt)",
+        "  n              new/reused work session + agent (dir · ticket · prompt)",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -1546,18 +1605,6 @@ fn session_base_name(dir: &str) -> String {
     }
 }
 
-/// First free name among `base`, `base-2`, `base-3`, … — spawning must
-/// never reuse or replace a session someone is working in.
-fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
-    if !exists(&base) {
-        return base;
-    }
-    (2..10_000)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !exists(candidate))
-        .unwrap_or_else(|| format!("{base}-overflow"))
-}
-
 /// Fields of the spawn form, in Tab order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SpawnField {
@@ -1568,16 +1615,12 @@ enum SpawnField {
     Prompt,
 }
 
-/// `n` — launch a brand-new agent session from inside watch: where
-/// (cwd), what (agent CLI), and its first prompt, delivered on the
-/// launch command line.
+/// `n` launches or reuses one work/ticket session and adds an agent pane.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SpawnComposer {
     dir: String,
     dir_cursor: usize,
-    /// Session name override. Empty means "derive from the directory",
-    /// which the form shows as a placeholder rather than guessing behind
-    /// the user's back.
+    /// Work/ticket id. Empty means derive it from the directory.
     name: String,
     name_cursor: usize,
     agent: SpawnAgent,
@@ -6646,7 +6689,7 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
             }
             let agent = spawn.agent;
             let name = spawn.name.trim().to_string();
-            let session = (!name.is_empty()).then(|| session_base_name(&name));
+            let session = (!name.is_empty()).then_some(name);
             app.spawn = None;
             Action::Quick(QuickAction::SpawnSession {
                 launch: agent.launch_command(&prompt),
@@ -7732,7 +7775,7 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(theme.action))
         .border_type(theme.border_type)
         .title(Span::styled(
-            " new agent session ",
+            " new work + agent ",
             theme.action_badge().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -7751,7 +7794,7 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
     let name_line: Line = if spawn.name.is_empty() && spawn.focus != SpawnField::Name {
         Line::from(vec![
             focus_marker(SpawnField::Name),
-            Span::styled("name   ", theme.dim_style()),
+            Span::styled("ticket ", theme.dim_style()),
             Span::styled(
                 format!("(auto: {})", session_base_name(&spawn.dir)),
                 theme.dim_style(),
@@ -7760,7 +7803,7 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Line::from(vec![
             focus_marker(SpawnField::Name),
-            Span::styled("name   ", theme.dim_style()),
+            Span::styled("ticket ", theme.dim_style()),
             Span::raw(truncate_prompt_input(&spawn.name, avail).text),
         ])
     };
@@ -10905,7 +10948,7 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_session_name_overrides_the_derived_one() {
+    fn a_typed_work_id_is_preserved_for_tmux_metadata() {
         let mut app = app_with_paneless_and_pane();
         let _ = key_action(&mut app, 'n');
         let spawn = app.spawn.as_mut().unwrap();
@@ -10916,7 +10959,7 @@ mod tests {
         assert!(matches!(
             action,
             Action::Quick(QuickAction::SpawnSession { session: Some(ref s), .. })
-                if s == "my-review-run"
+                if s == "my.review:run"
         ));
     }
 
@@ -10954,13 +10997,8 @@ mod tests {
     }
 
     #[test]
-    fn session_names_never_collide_or_contain_tmux_separators() {
+    fn derived_work_names_do_not_contain_tmux_separators() {
         assert_eq!(session_base_name("/home/june/my.project:x"), "my-project-x");
-        let taken = ["demo".to_string(), "demo-2".to_string()];
-        assert_eq!(
-            unique_session_name("demo".into(), |n| taken.iter().any(|t| t == n)),
-            "demo-3"
-        );
     }
 
     #[test]

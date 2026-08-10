@@ -49,7 +49,7 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list fifteen tools). Other MCP
+or `codex mcp list` (the `muxa` server should list sixteen tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
 At initialization muxa tells the agent how to use same-window peers as a
@@ -93,12 +93,13 @@ it:
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `muxa_status` | — | Snapshot of every tracked agent: state, pane, session, model, last prompt, last notification. |
+| `muxa_status` | `pane?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Snapshot all agents, or observe one pane with its screen and recent prompts in one call. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
-| `muxa_start_agent` | `agent`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Start an allowlisted agent in a detached pane, window, or session and return its exact pane id. |
+| `muxa_start_agent` | `agent`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a work session or start an allowlisted agent in a detached tmux surface. |
+| `muxa_manage_tmux` | `action`, `pane?`, `work?`, `confirm?` | List/show managed work, interrupt/terminate an agent pane, or close a work session. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
-| `muxa_wait_for_change` | `timeout_secs?`, `pane?` | Block until an agent's state changes (or timeout); returns the transition. |
+| `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
 | `muxa_collaboration_guide` | — | Show the recommended reviewer, question, delegated-subagent, incoming-work, and AIR handoff contracts. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
@@ -127,20 +128,32 @@ returns the new pane id for later `muxa_capture_pane`, `muxa_send_prompt`, and
 ```text
 muxa_start_agent {
   "agent": "codex",
-  "placement": "pane",
-  "target": "%18",
+  "work": "CAL-7041",
+  "role": "reviewer",
   "cwd": "/home/june/personal/muxa",
   "prompt": "Review the current changes and report findings only"
 }
-→ { "pane": "%24", "agent": "codex", "placement": "pane", ... }
+→ { "pane": "%24", "work": "CAL-7041", "created_work": false, ... }
 ```
 
-`placement` defaults to a detached right-hand split; set `direction` to
-`down` for a lower split. `window` and `session` are also detached. Pane and
-window launches use `target`, falling back to `TMUX_PANE`; a session does not
-accept a target. Session names that already exist receive the first free
-numeric suffix, and the selected name is returned with the pane id. `cwd` must
-already exist.
+The managed policy is **tmux session = work/ticket, pane = agent, window =
+layout only**. With `work`, muxa creates the session once and stores the exact
+work id and cwd in tmux user options. Later calls reuse that session and add an
+agent pane; a conflicting cwd is refused. `role` and `task` become durable pane
+metadata. Without `work`, `placement` retains the lower-level detached
+pane/window/session behavior. `cwd` must already exist.
+
+Lifecycle operations stay in this same MCP server:
+
+```text
+muxa_manage_tmux(action="list_work")
+muxa_manage_tmux(action="interrupt_agent", pane="%24")
+muxa_manage_tmux(action="terminate_agent", pane="%24", confirm=true)
+muxa_manage_tmux(action="close_work", work="CAL-7041", confirm=true)
+```
+
+Terminate and close refuse unconfirmed or unmanaged targets. Muxa does not
+expose arbitrary shell or generic tmux commands.
 
 Profiles are allowlisted (`claude`, `codex`, `gemini`, `opencode`) rather than
 accepting an arbitrary shell command. They intentionally use each CLI's
@@ -222,17 +235,22 @@ muxa_send_prompt { "pane": "%12", "text": "yes, proceed", "submit": true }
 
 ```
 muxa_send_prompt   { "pane": "%18", "text": "run the test suite", "submit": true }
-muxa_wait_for_change { "pane": "%18", "timeout_secs": 120 }
-→ { "changed": true, "from": "working", "to": "waiting_input", "agent": { ... } }
-muxa_capture_pane  { "pane": "%18" }        # read the result on screen
+muxa_wait_for_change { "pane": "%18", "until": "settled",
+                       "include_capture": true, "timeout_secs": 120 }
+→ { "changed": true, "matched": true, "to": "idle", "capture": "..." }
 ```
 
 `muxa_wait_for_change` returns `{ "changed": false, "reason": "timeout" }`
 when nothing matching happened in the window, so a polling loop stays cheap and
 bounded (default 30 s, max 600 s).
 
-**Semantics:** it returns on the **first observed change OR a reconciled
-post-lag state match.** Two signals race under the deadline: the daemon's
+With `until=settled`, intermediate starting/working transitions are skipped;
+the tool returns only for idle, waiting-input/choice, error, or stopped after
+at least one state transition. `idle`, `blocked`, and `stopped` select narrower
+targets. Non-`any` targets and `include_capture` require a pane.
+
+With the default `until=any`, it returns on the **first observed change OR a
+reconciled post-lag state match.** Two signals race under the deadline: the daemon's
 push transition stream, and a periodic snapshot **reconcile** (every 2 s) that
 compares the target pane's current state against a baseline captured when the
 wait began. The reconcile is a backstop for a daemon-side broadcast *lag*: a
@@ -253,7 +271,9 @@ submitted") so the caller doesn't assume the agent started working.
 `muxa_send_prompt` is a **control action** — it types into another agent's
 pane. `muxa_start_agent` is also a control action: it creates a tmux surface
 and starts an allowlisted CLI in bypass/yolo mode. It does not accept arbitrary
-commands, but callers should still provide trusted paths and prompts. The IPC
+commands, but callers should still provide trusted paths and prompts.
+`muxa_manage_tmux` accepts exact managed identities only; terminating a pane or
+closing a whole work session additionally requires `confirm=true`. The IPC
 socket is owner-only (`0600`), so only your user can reach it and there is no
 network exposure; treat socket and MCP access as equivalent to shell access.
 The server never starts against an absent daemon. See `PROTOCOL.md` (Control

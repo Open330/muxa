@@ -8,11 +8,13 @@ mod doctor;
 mod init;
 mod logs;
 mod mcp;
+mod onboarding;
 mod peek;
 mod stats;
 mod theme;
 mod time_range;
 mod timeline;
+mod tmux_work;
 mod upgrade;
 mod watch;
 
@@ -120,6 +122,11 @@ enum Cmd {
     Agent {
         #[command(subcommand)]
         action: AgentCmd,
+    },
+    /// Manage work/ticket tmux sessions.
+    Work {
+        #[command(subcommand)]
+        action: WorkCmd,
     },
     /// Register a room-local alias and roles for this exact agent session.
     Identity {
@@ -239,6 +246,8 @@ enum Cmd {
     Init(init::Args),
     /// Run end-to-end diagnostics and report any setup issues.
     Doctor,
+    /// Learn the work/session, agent/pane policy, normal workflow, and watch shortcuts.
+    Onboard(onboarding::Args),
     /// Run a Model Context Protocol (MCP) stdio server so a coding agent
     /// can orchestrate muxa — inspect other agents, send them prompts,
     /// capture panes, and wait for state changes. Wire it into Claude Code
@@ -331,6 +340,20 @@ enum MsgCmd {
 enum AgentCmd {
     /// Start an allowlisted agent in a detached pane, window, or session.
     Start(agent_launch::StartArgs),
+    /// Interrupt or terminate one muxa-managed agent pane.
+    Control(tmux_work::AgentControlArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkCmd {
+    /// Create a work session with its first agent, or add an agent when it exists.
+    Start(agent_launch::WorkStartArgs),
+    /// List muxa-managed work sessions.
+    List(tmux_work::WorkListArgs),
+    /// Show one work session and its agent panes.
+    Show(tmux_work::WorkShowArgs),
+    /// Close a work session and every agent pane in it.
+    Close(tmux_work::WorkCloseArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -431,6 +454,22 @@ impl WatchSortArg {
     }
 }
 
+fn run_agent_cmd(action: AgentCmd) -> Result<()> {
+    match action {
+        AgentCmd::Start(args) => agent_launch::run(args),
+        AgentCmd::Control(args) => tmux_work::run_agent_control(args),
+    }
+}
+
+fn run_work_cmd(action: WorkCmd) -> Result<()> {
+    match action {
+        WorkCmd::Start(args) => agent_launch::run_work_start(args),
+        WorkCmd::List(args) => tmux_work::run_work_list(args),
+        WorkCmd::Show(args) => tmux_work::run_work_show(args),
+        WorkCmd::Close(args) => tmux_work::run_work_close(args),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -442,6 +481,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // Onboarding must remain available even when config.toml is malformed;
+    // it is a recovery/learning surface and does not need daemon state.
+    if let Cmd::Onboard(onboard_args) = &args.cmd {
+        return onboarding::run(onboard_args.clone());
+    }
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
     set_icon_set(cfg.ui.icons);
@@ -460,9 +504,8 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
-        Cmd::Agent { action } => match action {
-            AgentCmd::Start(start_args) => agent_launch::run(start_args),
-        },
+        Cmd::Agent { action } => run_agent_cmd(action),
+        Cmd::Work { action } => run_work_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
@@ -531,6 +574,7 @@ async fn main() -> Result<()> {
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
+        Cmd::Onboard(onboard_args) => onboarding::run(onboard_args),
         Cmd::Mcp => mcp::run(client).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
@@ -2423,6 +2467,61 @@ mod tests {
         assert_eq!(start.target.as_deref(), Some("%42"));
         assert_eq!(start.direction, agent_launch::SplitDirection::Down);
         assert!(start.json);
+    }
+
+    #[test]
+    fn work_start_cli_pins_ticket_agent_and_role() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "work",
+            "start",
+            "cal-7041",
+            "--agent",
+            "codex",
+            "--cwd",
+            "/tmp",
+            "--role",
+            "reviewer",
+            "--prompt",
+            "review it",
+        ])
+        .unwrap();
+        let Cmd::Work {
+            action: WorkCmd::Start(start),
+        } = args.cmd
+        else {
+            panic!("expected work start");
+        };
+        assert_eq!(start.work, "cal-7041");
+        assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
+        assert_eq!(start.role.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn agent_control_and_printable_onboarding_parse() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "agent",
+            "control",
+            "--pane",
+            "%42",
+            "--action",
+            "interrupt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Agent {
+                action: AgentCmd::Control(_)
+            }
+        ));
+
+        let args = Args::try_parse_from(["muxa", "onboard", "--print", "--no-quiz"]).unwrap();
+        let Cmd::Onboard(onboard) = args.cmd else {
+            panic!("expected onboard");
+        };
+        assert!(onboard.print);
+        assert!(onboard.no_quiz);
     }
 
     #[test]

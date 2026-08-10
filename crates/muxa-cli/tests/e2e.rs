@@ -165,6 +165,25 @@ impl Drop for Daemon {
 }
 
 #[test]
+fn onboarding_prints_even_when_config_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("invalid.toml");
+    std::fs::write(&config, "[unknown]\nvalue = true\n").unwrap();
+    let output = Command::new(bin("muxa"))
+        .args(["--config", config.to_str().unwrap(), "onboard", "--print"])
+        .output()
+        .expect("run onboarding");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("session = work/ticket"));
+    assert!(stdout.contains("muxa watch shortcuts"));
+}
+
+#[test]
 fn claude_hook_round_trip() {
     let d = Daemon::spawn();
 

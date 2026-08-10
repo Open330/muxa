@@ -157,6 +157,10 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Core Commands
 
+Managed tmux policy: one session is one work/ticket, each pane is one agent,
+and windows are layout only. Run `muxa onboard` to learn this workflow and the
+current `muxa watch` shortcuts interactively.
+
 | Command | Purpose |
 | --- | --- |
 | `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
@@ -174,7 +178,11 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
-| `muxa agent start --agent codex ...` | Deterministically start an allowlisted agent in a detached tmux pane, window, or session and return its pane id; also exposed as MCP `muxa_start_agent`. |
+| `muxa work start CAL-7041 --agent codex ...` | Create one managed tmux session per work/ticket, or reuse it and add another agent pane. |
+| `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
+| `muxa agent start --work CAL-7041 ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
+| `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
+| `muxa onboard` | Interactive policy, normal workflow, MCP pattern, and live `muxa watch` shortcut training; use `--print` for a static guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
@@ -247,6 +255,7 @@ simultaneously.
 | Topic | Doc |
 | --- | --- |
 | Install and wiring | [docs/INSTALL.md](docs/INSTALL.md) |
+| Onboarding and work/agent policy (한국어) | [docs/ONBOARDING.ko.md](docs/ONBOARDING.ko.md) |
 | MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
 | herdr host support | [docs/HERDR.md](docs/HERDR.md) |
 | Multi-host observation | [docs/MULTI_HOST.md](docs/MULTI_HOST.md) |

@@ -17,8 +17,9 @@
 //! ## Transport
 //!
 //! Newline-delimited JSON-RPC 2.0 over stdio: read one request object per
-//! line from stdin, write one response object per line to stdout. Every
-//! tool proxies the daemon over the existing unix-socket [`Client`]. The
+//! line from stdin, write one response object per line to stdout. Observation
+//! and collaboration tools proxy the daemon through [`Client`]; deterministic
+//! managed-tmux lifecycle tools invoke same-user tmux locally. The
 //! server refuses to start when the daemon socket is unreachable (a clear
 //! stderr message + non-zero exit) so an agent never talks to a dead
 //! control plane.
@@ -57,8 +58,10 @@ const MAX_WAIT_SECS: u64 = 600;
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    Use muxa_start_agent for deterministic pane/window/session creation instead \
-    of delegating tmux setup to another model. \
+    For managed tmux work, treat one session as one work/ticket, one pane as one \
+    agent, and windows as layout only. Use muxa_start_agent with a work id instead \
+    of delegating tmux setup to another model; use muxa_manage_tmux for lifecycle \
+    control and never invent raw tmux commands. \
     At the start of substantial work, call muxa_collaboration_guide (or \
     muxa_room_context) to discover available peer agents. Improve important work \
     with a peer when useful: use review + read_only after implementation and tests \
@@ -317,11 +320,20 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "muxa_status",
-            "description": "Snapshot of every agent muxa tracks: state \
-                (working/idle/waiting_input/…), pane id, session, model, last \
-                prompt, and last notification. Call this first to see what other \
-                agents are doing.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "description": "Focused observation of muxa agents. With no arguments, \
+                snapshot every agent. Set pane to avoid loading the whole fleet; \
+                optionally include its visible screen and recent prompt history in \
+                the same result to save MCP round trips and model context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "string", "description": "Optional exact pane id." },
+                    "include_capture": { "type": "boolean", "description": "Include the pane's visible screen; requires pane." },
+                    "history_limit": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Recent prompts for this pane. Default 0; requires pane." },
+                    "max_capture_lines": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Trim capture to the newest N lines. Default 120." }
+                },
+                "additionalProperties": false
+            },
         }),
         json!({
             "name": "muxa_recent_prompts",
@@ -352,9 +364,33 @@ fn tool_definitions() -> Vec<Value> {
                     "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
                     "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
                     "name": { "type": "string", "description": "Optional window/session name." },
+                    "work": { "type": "string", "description": "Managed work/ticket id. Reuses its tmux session or creates it once; conflicts with placement/target/name." },
+                    "role": { "type": "string", "description": "Optional pane role such as implementer or reviewer." },
+                    "task": { "type": "string", "description": "Optional short pane task label." },
                     "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Default right." }
                 },
                 "required": ["agent"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_manage_tmux",
+            "description": "Manage Muxa's tmux lifecycle using the policy session=work/ticket \
+                and pane=agent. List/show managed work, interrupt an agent turn, or explicitly \
+                terminate an agent pane/close a whole work session. Destructive actions require \
+                confirm=true and refuse unmanaged panes/sessions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list_work", "show_work", "interrupt_agent", "terminate_agent", "close_work"]
+                    },
+                    "pane": { "type": "string", "description": "Exact pane id for agent actions, for example %42." },
+                    "work": { "type": "string", "description": "Work/ticket id for work actions, for example CAL-7041." },
+                    "confirm": { "type": "boolean", "description": "Must be true for terminate_agent and close_work." }
+                },
+                "required": ["action"],
                 "additionalProperties": false
             },
         }),
@@ -390,15 +426,18 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_wait_for_change",
-            "description": "Block until an agent's state changes (or a timeout), \
-                then return the transition (from/to state, agent, pane). Optionally \
-                wait only for changes on a specific pane. Use after muxa_send_prompt \
-                to know when the agent finished or needs input.",
+            "description": "Block until an agent changes state. Set until=settled \
+                to ignore intermediate working transitions and return only when the \
+                agent is idle, blocked, errored, or stopped. A focused wait can also \
+                include the final pane capture, avoiding polling loops and extra calls.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "timeout_secs": { "type": "integer", "minimum": 1, "description": "Max seconds to wait. Default 30, max 600." },
                     "pane": { "type": "string", "description": "Only report changes on this pane id. Omit for any pane." },
+                    "until": { "type": "string", "enum": ["any", "settled", "idle", "blocked", "stopped"], "description": "Target after at least one state change. Default any; non-any values require pane." },
+                    "include_capture": { "type": "boolean", "description": "Include the newest visible pane screen when returning; requires pane." },
+                    "max_capture_lines": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Trim included capture to newest N lines. Default 120." }
                 },
                 "additionalProperties": false,
             },
@@ -528,10 +567,59 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
         .unwrap_or_else(|| json!({}));
 
     match name {
-        "muxa_status" => Ok(match client.snapshot().await {
-            Ok(agents) => json_result(&json!({ "agents": agents })),
-            Err(e) => error_result(&format!("status failed: {e}")),
-        }),
+        "muxa_status" => {
+            let pane = args.get("pane").and_then(Value::as_str);
+            let include_capture = args
+                .get("include_capture")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let history_limit = args
+                .get("history_limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(20) as usize;
+            if pane.is_none() && (include_capture || history_limit > 0) {
+                return Ok(error_result(
+                    "status include_capture/history_limit requires pane",
+                ));
+            }
+            let agents = match pane {
+                Some(pane) => client.by_pane(pane).await,
+                None => client.snapshot().await,
+            };
+            let agents = match agents {
+                Ok(agents) => agents,
+                Err(error) => {
+                    return Ok(error_result(&format!("status failed: {error}")));
+                }
+            };
+            let mut payload = json!({ "agents": agents });
+            if let Some(pane) = pane {
+                if include_capture {
+                    let max_lines = args
+                        .get("max_capture_lines")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(120)
+                        .clamp(1, 400) as usize;
+                    match client.capture(pane).await {
+                        Ok(capture) => {
+                            payload["capture"] =
+                                json!(capture.map(|text| newest_lines(&text, max_lines)));
+                        }
+                        Err(error) => {
+                            payload["capture_error"] = json!(error.to_string());
+                        }
+                    }
+                }
+                if history_limit > 0 {
+                    match client.recent_prompts(Some(pane), Some(history_limit)).await {
+                        Ok(prompts) => payload["prompts"] = json!(prompts),
+                        Err(error) => payload["history_error"] = json!(error.to_string()),
+                    }
+                }
+            }
+            Ok(json_result(&payload))
+        }
         "muxa_recent_prompts" => {
             let pane = args.get("pane").and_then(Value::as_str);
             let limit = args
@@ -579,6 +667,9 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 name: args.get("name").and_then(Value::as_str).map(str::to_string),
+                work: args.get("work").and_then(Value::as_str).map(str::to_string),
+                role: args.get("role").and_then(Value::as_str).map(str::to_string),
+                task: args.get("task").and_then(Value::as_str).map(str::to_string),
                 direction,
             };
             Ok(
@@ -587,6 +678,31 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                     Ok(Ok(result)) => json_result(&json!(result)),
                     Ok(Err(error)) => error_result(&format!("start_agent failed: {error}")),
                     Err(error) => error_result(&format!("start_agent worker failed: {error}")),
+                },
+            )
+        }
+        "muxa_manage_tmux" => {
+            let Some(action) = args.get("action").and_then(Value::as_str) else {
+                return Ok(error_result("manage_tmux requires an action argument"));
+            };
+            let action = match crate::tmux_work::ManageAction::parse(action) {
+                Ok(action) => action,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let request = crate::tmux_work::ManageRequest {
+                action,
+                pane: args.get("pane").and_then(Value::as_str).map(str::to_string),
+                work: args.get("work").and_then(Value::as_str).map(str::to_string),
+                confirm: args
+                    .get("confirm")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            Ok(
+                match tokio::task::spawn_blocking(move || crate::tmux_work::manage(request)).await {
+                    Ok(Ok(result)) => json_result(&json!(result)),
+                    Ok(Err(error)) => error_result(&format!("manage_tmux failed: {error}")),
+                    Err(error) => error_result(&format!("manage_tmux worker failed: {error}")),
                 },
             )
         }
@@ -1030,6 +1146,54 @@ fn render_send_result(text_len: usize, pane: &str, submit: bool, submitted: Opti
 
 /// Terminal outcome of a `muxa_wait_for_change` race, before it's rendered
 /// into a tool result.
+fn newest_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitUntil {
+    Any,
+    Settled,
+    Idle,
+    Blocked,
+    Stopped,
+}
+
+impl WaitUntil {
+    fn parse(value: Option<&str>) -> std::result::Result<Self, &'static str> {
+        match value.unwrap_or("any") {
+            "any" => Ok(Self::Any),
+            "settled" => Ok(Self::Settled),
+            "idle" => Ok(Self::Idle),
+            "blocked" => Ok(Self::Blocked),
+            "stopped" => Ok(Self::Stopped),
+            _ => Err("until must be any, settled, idle, blocked, or stopped"),
+        }
+    }
+
+    fn matches(self, state: AgentState) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Settled => matches!(
+                state,
+                AgentState::Idle
+                    | AgentState::WaitingInput
+                    | AgentState::WaitingChoice
+                    | AgentState::Error
+                    | AgentState::Stopped
+            ),
+            Self::Idle => state == AgentState::Idle,
+            Self::Blocked => matches!(
+                state,
+                AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error
+            ),
+            Self::Stopped => state == AgentState::Stopped,
+        }
+    }
+}
+
 enum WaitOutcome {
     /// A live transition arrived on the stream and matched the pane filter.
     Observed(Transition),
@@ -1065,6 +1229,28 @@ async fn wait_for_change(client: &Client, args: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_WAIT_SECS)
         .clamp(1, MAX_WAIT_SECS);
+    let until = match WaitUntil::parse(args.get("until").and_then(Value::as_str)) {
+        Ok(until) => until,
+        Err(error) => return error_result(error),
+    };
+    let include_capture = args
+        .get("include_capture")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if pane.is_none() && (until != WaitUntil::Any || include_capture) {
+        return error_result("wait until/include_capture requires pane");
+    }
+    if until != WaitUntil::Any {
+        return wait_for_state(
+            client,
+            pane.expect("non-any wait has pane"),
+            until,
+            timeout_secs,
+            include_capture,
+            capture_line_limit(args),
+        )
+        .await;
+    }
 
     // Baseline pane→state map so a reconcile can tell whether the target moved
     // even if the stream never delivered the transition.
@@ -1109,7 +1295,7 @@ async fn wait_for_change(client: &Client, args: &Value) -> Value {
     })
     .await;
 
-    match outcome {
+    let result = match outcome {
         Ok(WaitOutcome::Observed(t)) => json_result(&json!({
             "changed": true,
             "from": t.from,
@@ -1130,13 +1316,167 @@ async fn wait_for_change(client: &Client, args: &Value) -> Value {
                 "timeout_secs": timeout_secs,
             }))
         }),
-    }
+    };
+    add_wait_capture(
+        client,
+        pane,
+        include_capture,
+        capture_line_limit(args),
+        result,
+    )
+    .await
 }
 
 /// Snapshot the current `pane → state` map for the reconcile baseline and
 /// polls, scoped to one pane when the caller asked for one, else the whole
 /// fleet. A daemon error yields an empty map — the reconcile then simply
 /// can't detect a change, degrading to the stream/timeout path.
+async fn wait_for_state(
+    client: &Client,
+    pane: &str,
+    until: WaitUntil,
+    timeout_secs: u64,
+    include_capture: bool,
+    max_capture_lines: usize,
+) -> Value {
+    let baseline_agent = current_agent(fetch_agents(client, Some(pane)).await);
+    let mut last_state = baseline_agent.as_ref().map(|agent| agent.state);
+    let mut changed = false;
+    let mut stream = match client.subscribe().await {
+        Ok(stream) => stream,
+        Err(error) => return error_result(&format!("subscribe failed: {error}")),
+    };
+    let mut poll = tokio::time::interval(RECONCILE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            tokio::select! {
+                recv = stream.recv() => match recv {
+                    Ok(Some(transition))
+                        if transition.agent.pane.as_deref() == Some(pane) =>
+                    {
+                        changed |= transition.from != transition.to;
+                        last_state = Some(transition.to);
+                        if changed && until.matches(transition.to) {
+                            return json_result(&json!({
+                                "changed": true,
+                                "matched": true,
+                                "until": wait_until_label(until),
+                                "from": transition.from,
+                                "to": transition.to,
+                                "agent": &*transition.agent,
+                            }));
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        return json_result(&json!({
+                            "changed": changed,
+                            "matched": false,
+                            "reason": "stream closed before target state",
+                            "until": wait_until_label(until),
+                            "last_state": last_state,
+                        }));
+                    }
+                },
+                _ = poll.tick() => {
+                    let agent = current_agent(fetch_agents(client, Some(pane)).await);
+                    let state = agent.as_ref().map(|agent| agent.state);
+                    if state != last_state {
+                        changed = true;
+                        last_state = state;
+                    }
+                    if let (true, Some(state), Some(agent)) = (changed, state, agent) {
+                        if until.matches(state) {
+                            return json_result(&json!({
+                                "changed": true,
+                                "matched": true,
+                                "reconciled": true,
+                                "until": wait_until_label(until),
+                                "to": state,
+                                "agent": agent,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        json_result(&json!({
+            "changed": changed,
+            "matched": false,
+            "reason": "timeout",
+            "until": wait_until_label(until),
+            "last_state": last_state,
+            "timeout_secs": timeout_secs,
+        }))
+    });
+
+    add_wait_capture(
+        client,
+        Some(pane),
+        include_capture,
+        max_capture_lines,
+        outcome,
+    )
+    .await
+}
+
+fn current_agent(agents: Vec<Agent>) -> Option<Agent> {
+    agents
+        .into_iter()
+        .max_by_key(|agent| (agent.state != AgentState::Stopped, agent.last_activity_at))
+}
+
+fn wait_until_label(until: WaitUntil) -> &'static str {
+    match until {
+        WaitUntil::Any => "any",
+        WaitUntil::Settled => "settled",
+        WaitUntil::Idle => "idle",
+        WaitUntil::Blocked => "blocked",
+        WaitUntil::Stopped => "stopped",
+    }
+}
+
+fn capture_line_limit(args: &Value) -> usize {
+    args.get("max_capture_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .clamp(1, 400) as usize
+}
+
+async fn add_wait_capture(
+    client: &Client,
+    pane: Option<&str>,
+    include_capture: bool,
+    max_lines: usize,
+    result: Value,
+) -> Value {
+    if !include_capture {
+        return result;
+    }
+    let Some(pane) = pane else {
+        return result;
+    };
+    let Some(text) = result["content"][0]["text"].as_str() else {
+        return result;
+    };
+    let Ok(mut payload) = serde_json::from_str::<Value>(text) else {
+        return result;
+    };
+    match client.capture(pane).await {
+        Ok(capture) => {
+            payload["capture"] = json!(capture.map(|text| newest_lines(&text, max_lines)));
+        }
+        Err(error) => payload["capture_error"] = json!(error.to_string()),
+    }
+    json_result(&payload)
+}
+
 async fn pane_states(client: &Client, pane: Option<&str>) -> HashMap<String, AgentState> {
     fetch_agents(client, pane)
         .await
@@ -1319,6 +1659,8 @@ mod tests {
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
         assert!(instructions.contains("start of substantial work"));
+        assert!(instructions.contains("one session as one work/ticket"));
+        assert!(instructions.contains("muxa_manage_tmux"));
         assert!(instructions.contains("review + read_only"));
         assert!(instructions.contains("task + execute + narrow paths"));
         assert!(instructions.contains("verify and integrate the result yourself"));
@@ -1337,6 +1679,7 @@ mod tests {
                 "muxa_status",
                 "muxa_recent_prompts",
                 "muxa_start_agent",
+                "muxa_manage_tmux",
                 "muxa_send_prompt",
                 "muxa_capture_pane",
                 "muxa_wait_for_change",
@@ -1360,6 +1703,12 @@ mod tests {
             start_agent["inputSchema"]["properties"]["agent"]["enum"],
             json!(["claude", "codex", "gemini", "opencode"])
         );
+        assert!(start_agent["inputSchema"]["properties"]["work"].is_object());
+        let manage_tmux = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_manage_tmux")
+            .unwrap();
+        assert_eq!(manage_tmux["inputSchema"]["required"], json!(["action"]));
         let guide = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_collaboration_guide")
@@ -1483,6 +1832,47 @@ mod tests {
         let text = status["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"agents\""), "status text: {text}");
 
+        let focused = dispatch(
+            &client,
+            &json!({
+                "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+                "params": {
+                    "name": "muxa_status",
+                    "arguments": {
+                        "pane": "%1",
+                        "include_capture": true,
+                        "history_limit": 1
+                    }
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let focused_text = focused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(focused_text.contains("\"capture\": \"screen of %1\""));
+        assert!(focused_text.contains("\"prompts\""));
+
+        let refused_terminate = dispatch(
+            &client,
+            &json!({
+                "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+                "params": {
+                    "name": "muxa_manage_tmux",
+                    "arguments": {
+                        "action": "terminate_agent",
+                        "pane": "%1"
+                    }
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused_terminate["result"]["isError"], true);
+        assert!(refused_terminate["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("confirm=true"));
+
         // muxa_send_prompt routes through to the backend with a submit CR.
         let send = dispatch(
             &client,
@@ -1522,6 +1912,12 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn focused_status_capture_keeps_only_newest_lines() {
+        assert_eq!(newest_lines("one\ntwo\nthree", 2), "two\nthree");
+        assert_eq!(newest_lines("one", 20), "one");
     }
 
     #[tokio::test]
@@ -1566,6 +1962,56 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn settled_wait_matches_only_terminal_turn_states() {
+        for state in [
+            AgentState::Idle,
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+            AgentState::Stopped,
+        ] {
+            assert!(WaitUntil::Settled.matches(state), "{state:?}");
+        }
+        assert!(!WaitUntil::Settled.matches(AgentState::Starting));
+        assert!(!WaitUntil::Settled.matches(AgentState::Working));
+        assert!(WaitUntil::Blocked.matches(AgentState::WaitingChoice));
+        assert!(!WaitUntil::Blocked.matches(AgentState::Idle));
+    }
+
+    #[tokio::test]
+    async fn settled_wait_skips_working_and_returns_with_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-settled.sock");
+        let (client, _sends, tx, daemon) = spawn_daemon(&sock).await;
+        ingest(&client, "%1", "prompt_submitted", json!({ "prompt": "go" })).await;
+
+        let waiting_client = client.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_change(
+                &waiting_client,
+                &json!({
+                    "pane": "%1",
+                    "until": "settled",
+                    "include_capture": true,
+                    "timeout_secs": 2
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ingest(&client, "%1", "turn_stopped", json!({})).await;
+
+        let result = waiter.await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"matched\": true"), "{text}");
+        assert!(text.contains("\"to\": \"idle\""), "{text}");
+        assert!(text.contains("\"capture\": \"screen of %1\""), "{text}");
+
+        tx.send(()).unwrap();
+        daemon.await.unwrap();
     }
 
     /// Ingest one synthetic hook event so a pane appears in the store with a

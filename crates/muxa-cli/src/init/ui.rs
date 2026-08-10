@@ -206,6 +206,7 @@ pub fn final_summary(
         body.push("Token also stored in your config.toml.".into());
     }
     body.push("Use `prefix+s` to watch and collaborate; `prefix+D` opens the dashboard.".into());
+    body.push("Learn the workflow and shortcuts with `muxa onboard`.".into());
     body.push("Roll back with `muxa init --uninstall`.".into());
     note(mode, "Done", &body.join("\n"));
 }

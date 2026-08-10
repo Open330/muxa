@@ -129,7 +129,43 @@ pub struct StartArgs {
     /// Window/session name. Session placement derives it from cwd when omitted.
     #[arg(long)]
     pub name: Option<String>,
+    /// Managed work/ticket. Reuses its tmux session or creates it once.
+    #[arg(long)]
+    pub work: Option<String>,
+    /// Optional agent role stored on the pane, for example reviewer.
+    #[arg(long)]
+    pub role: Option<String>,
+    /// Optional short task label stored on the pane.
+    #[arg(long)]
+    pub task: Option<String>,
     /// Split to the right (default) or below the target pane.
+    #[arg(long, value_enum, default_value = "right")]
+    pub direction: SplitDirection,
+    /// Emit the structured result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkStartArgs {
+    /// Work/ticket id. One managed tmux session is created per id.
+    pub work: String,
+    /// First allowlisted agent, or another agent to add when the work exists.
+    #[arg(long, value_enum)]
+    pub agent: AgentProgram,
+    /// Work directory. Defaults to current directory; checked on reuse.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Initial task.
+    #[arg(long)]
+    pub prompt: Option<String>,
+    /// Optional agent role, for example implementer or reviewer.
+    #[arg(long)]
+    pub role: Option<String>,
+    /// Optional short task label.
+    #[arg(long)]
+    pub task: Option<String>,
+    /// Split a reused work session to the right or below.
     #[arg(long, value_enum, default_value = "right")]
     pub direction: SplitDirection,
     /// Emit the structured result as JSON.
@@ -145,6 +181,9 @@ pub struct StartRequest {
     pub cwd: Option<PathBuf>,
     pub prompt: Option<String>,
     pub name: Option<String>,
+    pub work: Option<String>,
+    pub role: Option<String>,
+    pub task: Option<String>,
     pub direction: SplitDirection,
 }
 
@@ -157,6 +196,9 @@ impl From<&StartArgs> for StartRequest {
             cwd: args.cwd.clone(),
             prompt: args.prompt.clone(),
             name: args.name.clone(),
+            work: args.work.clone(),
+            role: args.role.clone(),
+            task: args.task.clone(),
             direction: args.direction,
         }
     }
@@ -168,6 +210,13 @@ pub struct StartResult {
     pub agent: AgentProgram,
     pub placement: Placement,
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work: Option<String>,
+    pub created_work: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     pub cwd: PathBuf,
     pub prompt_supplied: bool,
 }
@@ -193,19 +242,177 @@ pub fn run(args: StartArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
+    let json = args.json;
+    let result = start(StartRequest {
+        agent: args.agent,
+        placement: Placement::Pane,
+        target: None,
+        cwd: args.cwd,
+        prompt: args.prompt,
+        name: None,
+        work: Some(args.work),
+        role: args.role,
+        task: args.task,
+        direction: args.direction,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "{} agent {} in work {} (session {}, cwd {})",
+            if result.created_work {
+                "created"
+            } else {
+                "added"
+            },
+            result.pane,
+            result.work.as_deref().unwrap_or("-"),
+            result.name.as_deref().unwrap_or("-"),
+            result.cwd.display()
+        );
+    }
+    Ok(())
+}
+
 /// Start one allowlisted agent in a detached tmux surface and return its exact
 /// pane id. The operation is synchronous and should be wrapped in
 /// `spawn_blocking` by async callers.
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
-    let cwd = request
-        .cwd
-        .take()
-        .map_or_else(std::env::current_dir, Ok)
+    let PreparedLaunch {
+        cwd,
+        work,
+        created_work,
+    } = prepare_launch(&mut request)?;
+    let prompt = request
+        .prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty());
+    let command = request.agent.launch_command(prompt);
+    let args = tmux_args(&request, &cwd, &command)?;
+    let output = muxa::tmux::tmux_command()
+        .args(&args)
+        .output()
+        .context("run tmux agent launcher")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "tmux {} failed{}",
+            args.first().map_or("command", String::as_str),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+    let pane = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('%'))
+        .ok_or_else(|| anyhow::anyhow!("tmux created the surface but returned no pane id"))?
+        .to_string();
+
+    let mark = (|| {
+        if created_work {
+            let session = request
+                .name
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("created work has no tmux session name"))?;
+            crate::tmux_work::mark_work(
+                session,
+                work.as_deref().expect("created work has id"),
+                &cwd,
+            )?;
+        }
+        crate::tmux_work::mark_agent(
+            &pane,
+            request.agent.label(),
+            work.as_deref(),
+            request.role.as_deref(),
+            request.task.as_deref(),
+        )
+    })();
+    if let Err(error) = mark {
+        crate::tmux_work::cleanup_pane(&pane);
+        return Err(error).context("record muxa tmux metadata");
+    }
+
+    Ok(StartResult {
+        pane,
+        agent: request.agent,
+        placement: request.placement,
+        name: request.name,
+        work,
+        created_work,
+        role: request.role,
+        task: request.task,
+        cwd,
+        prompt_supplied: prompt.is_some(),
+    })
+}
+
+struct PreparedLaunch {
+    cwd: PathBuf,
+    work: Option<String>,
+    created_work: bool,
+}
+
+fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
+    let work = request
+        .work
+        .as_deref()
+        .map(crate::tmux_work::normalize_work_id)
+        .transpose()?;
+    let existing_work = work
+        .as_deref()
+        .map(crate::tmux_work::find_work)
+        .transpose()?
+        .flatten();
+
+    if work.is_some()
+        && (request.placement != Placement::Pane
+            || request.target.is_some()
+            || request.name.is_some())
+    {
+        bail!("--work uses its managed session; do not combine it with --placement, --target, or --name");
+    }
+
+    let requested_cwd = request.cwd.take();
+    let cwd_source = existing_work
+        .as_ref()
+        .map_or_else(
+            || requested_cwd.clone().map_or_else(std::env::current_dir, Ok),
+            |existing| Ok(existing.cwd.clone()),
+        )
         .context("resolve current directory")?;
-    let cwd =
-        std::fs::canonicalize(&cwd).with_context(|| format!("resolve cwd {}", cwd.display()))?;
+    let cwd = std::fs::canonicalize(&cwd_source)
+        .with_context(|| format!("resolve cwd {}", cwd_source.display()))?;
     if !cwd.is_dir() {
         bail!("cwd is not a directory: {}", cwd.display());
+    }
+    if let (Some(existing), Some(requested)) = (&existing_work, requested_cwd) {
+        let requested = std::fs::canonicalize(&requested)
+            .with_context(|| format!("resolve cwd {}", requested.display()))?;
+        if requested != cwd {
+            bail!(
+                "work {} already uses cwd {}; requested {}",
+                existing.work,
+                cwd.display(),
+                requested.display()
+            );
+        }
+    }
+
+    let created_work = work.is_some() && existing_work.is_none();
+    if let Some(existing) = &existing_work {
+        request.placement = Placement::Pane;
+        request.target = Some(existing.session.clone());
+        request.name = Some(existing.session.clone());
+    } else if let Some(work) = work.as_deref() {
+        request.placement = Placement::Session;
+        request.target = None;
+        request.name = Some(crate::tmux_work::session_name_for_work(work)?);
     }
 
     // new-window rejects a pane id even though pane ids are the stable target
@@ -237,43 +444,10 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             existing.iter().any(|name| name == candidate)
         }));
     }
-
-    let prompt = request
-        .prompt
-        .as_deref()
-        .filter(|prompt| !prompt.trim().is_empty());
-    let command = request.agent.launch_command(prompt);
-    let args = tmux_args(&request, &cwd, &command)?;
-    let output = muxa::tmux::tmux_command()
-        .args(&args)
-        .output()
-        .context("run tmux agent launcher")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "tmux {} failed{}",
-            args.first().map_or("command", String::as_str),
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
-    }
-    let pane = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('%'))
-        .ok_or_else(|| anyhow::anyhow!("tmux created the surface but returned no pane id"))?
-        .to_string();
-
-    Ok(StartResult {
-        pane,
-        agent: request.agent,
-        placement: request.placement,
-        name: request.name,
+    Ok(PreparedLaunch {
         cwd,
-        prompt_supplied: prompt.is_some(),
+        work,
+        created_work,
     })
 }
 
@@ -449,6 +623,9 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             prompt: Some("review June's changes; don't edit".into()),
             name: None,
+            work: None,
+            role: None,
+            task: None,
             direction: SplitDirection::Right,
         }
     }

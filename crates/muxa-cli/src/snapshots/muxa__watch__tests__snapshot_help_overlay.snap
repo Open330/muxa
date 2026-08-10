@@ -15,7 +15,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  gg/G · Home/End first / last selectable row                                     │                           │
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
 │                           │  Enter          attach to selected pane                                          │                           │
-│                           │  n              new agent session (dir · agent · first prompt)                   │                           │
+│                           │  n              new/reused work session + agent (dir · ticket · prompt)          │                           │
 │                           │  a / A          ask / history; d deletes one · D clears all in A                 │                           │
 │                           │                                                                                  │                           │
 │                           │Commands & inspection                                                             │                           │

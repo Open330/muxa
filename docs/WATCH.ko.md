@@ -17,8 +17,9 @@ muxa watch --view pane
 muxa watch --include-paneless
 ```
 
-`view = "session"`은 tmux session 기준으로 묶고, `view = "pane"`은 pane별로
-한 줄씩 보여줍니다.
+`view = "session"`은 tmux session 기준으로 묶습니다. managed tmux work에서는
+session 하나가 work/ticket 하나이고 child pane 하나가 agent 하나입니다.
+window는 layout 용도만 가집니다. `view = "pane"`은 pane별로 한 줄씩 보여줍니다.
 
 ## 주요 키
 
@@ -32,6 +33,7 @@ muxa watch --include-paneless
 | `gg` / `G`, `Home` / `End` | 첫 번째 / 마지막 선택 가능 행으로 이동. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane에 바로 attach. |
+| `n` | work와 첫 agent를 생성. 같은 work가 있으면 그 session에 agent pane 추가. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
 | `m` / `M` | 선택한 agent에게 request 보내기 / incoming·sent mailbox 열기. |

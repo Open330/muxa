@@ -17,8 +17,9 @@ muxa watch --view pane
 muxa watch --include-paneless
 ```
 
-`view = "session"` groups panes by tmux session. `view = "pane"` shows one
-row per pane.
+`view = "session"` groups panes by tmux session. For managed tmux work, one
+session is one work/ticket and each child pane is one agent; windows are layout
+only. `view = "pane"` shows one row per pane.
 
 ## Common Keys
 
@@ -32,6 +33,7 @@ row per pane.
 | `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
+| `n` | Create a work session with its first agent, or add an agent pane when that work already exists. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
 | `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
