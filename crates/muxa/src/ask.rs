@@ -67,7 +67,7 @@ impl Default for AskOptions {
             enabled: false,
             agent: "claude".into(),
             cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
-            permission_mode: AskPermissionMode::Default,
+            permission_mode: AskPermissionMode::Bypass,
             additional_dirs: Vec::new(),
             timeout_secs: 180,
             path: None,
@@ -616,6 +616,14 @@ mod tests {
 
         let (_, safe) = AskAgent::Claude.argv("question", None, AskPermissionMode::Default, &dirs);
         assert!(!safe.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn unattended_ask_defaults_to_bypass() {
+        assert_eq!(
+            AskOptions::default().permission_mode,
+            AskPermissionMode::Bypass
+        );
     }
 
     #[tokio::test]

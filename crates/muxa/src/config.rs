@@ -134,10 +134,10 @@ pub struct AskConfig {
     /// cwd keeps default-mode questions away from a working tree. Explicit
     /// `edit`/`bypass` automation can select its roots separately.
     pub cwd: Option<PathBuf>,
-    /// Permission policy passed to the headless agent. `default` preserves
-    /// the agent CLI's normal policy; `edit` allows workspace edits while
-    /// retaining its sandbox/review layer; `bypass` disables approval and
-    /// sandbox checks and must be opted into explicitly.
+    /// Permission policy passed to the headless agent. `bypass` is the
+    /// default because ask runs unattended and cannot answer approval
+    /// prompts; `default` preserves the agent CLI's normal policy, while
+    /// `edit` retains its sandbox/review layer.
     pub permission_mode: AskPermissionMode,
     /// Extra workspace roots exposed to the headless agent. This is required
     /// when a path below `cwd` is a symlink whose real path lives elsewhere.
@@ -156,7 +156,7 @@ impl Default for AskConfig {
             enabled: false,
             agent: "claude".into(),
             cwd: None,
-            permission_mode: AskPermissionMode::Default,
+            permission_mode: AskPermissionMode::Bypass,
             additional_dirs: Vec::new(),
             timeout_secs: 180,
             path: None,
@@ -169,11 +169,11 @@ impl Default for AskConfig {
 #[serde(rename_all = "snake_case")]
 pub enum AskPermissionMode {
     /// Preserve the selected agent CLI's normal permission behavior.
-    #[default]
     Default,
     /// Permit workspace edits while retaining sandbox/review protection.
     Edit,
     /// Disable approval and sandbox checks for unattended automation.
+    #[default]
     Bypass,
 }
 
@@ -1392,6 +1392,7 @@ mod tests {
         assert!(!cfg.notifier.enabled);
         // Discovery defaults on so users get backfill out of the box.
         assert!(cfg.discovery.enabled);
+        assert_eq!(cfg.ask.permission_mode, AskPermissionMode::Bypass);
     }
 
     #[test]

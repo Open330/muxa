@@ -135,10 +135,11 @@ agent별로 분리돼 있어 되돌아오면 그 대화가 이어집니다.
 `$XDG_DATA_HOME/muxa/ask.json`에 남아 재시작 후에도 조회됩니다. `[ask] enabled =
 true`가 필요합니다 — [CONFIGURATION.ko.md](CONFIGURATION.ko.md) 참고.
 
-Ask는 기본적으로 agent의 기존 권한을 바꾸지 않습니다. 파일 편집·명령 실행·배포를
-수행하는 무인 skill은 `[ask].permission_mode`를 `edit` 또는 `bypass`로 명시해야
-합니다. headless session은 승인 prompt에 응답할 수 없습니다. 또한 `cwd` 밖의
-symlink target은 `[ask].additional_dirs`에 real path를 추가해야 합니다.
+Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill 실행을 목적으로
+하므로 `[ask].permission_mode = "bypass"`가 기본값입니다. 파일 편집·명령 실행·배포가
+확인 없이 가능하므로 신뢰하는 prompt만 보내세요. 더 엄격한 agent 제어가 필요하면
+`edit` 또는 `default`를 선택할 수 있습니다. 또한 `cwd` 밖의 symlink target은
+`[ask].additional_dirs`에 real path를 추가해야 합니다.
 
 ## Agent 협업
 

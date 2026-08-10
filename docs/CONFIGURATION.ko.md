@@ -56,7 +56,7 @@ compatibility source이자 stats fallback으로 사용됩니다.
 enabled = true
 agent = "claude"     # claude | codex
 cwd = "~"            # headless 프로세스가 실행될 위치. 기본값 $HOME
-permission_mode = "default" # default | edit | bypass
+permission_mode = "bypass" # bypass(기본값) | edit | default
 additional_dirs = [] # 추가 real path. 예: ["/nfs/home/june"]
 timeout_secs = 180
 keep = 200           # 보관할 답변 수. 넘으면 오래된 것부터 버립니다
@@ -71,11 +71,12 @@ muxad가 agent를 print 모드로 실행해 답변을 수집하므로 관리할 
 daemon이 회원님 계정으로 과금되는 CLI를 띄우는 권한이라 기본은 꺼짐입니다.
 [WATCH.ko.md](WATCH.ko.md)를 참고하세요.
 
-`permission_mode = "default"`는 agent CLI의 기본 권한 정책을 유지합니다. `edit`은
-sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `bypass`는 전체 issue
-resolver 같은 무인 작업을 위해 승인과 sandbox를 비활성화합니다. 신뢰하는 prompt와
-경로에서만 사용하세요. `additional_dirs`도 agent CLI에 전달됩니다. `cwd` 아래 파일이
-외부 경로를 가리키는 symlink라면 real path를 추가해야 합니다. 예를 들어
+`permission_mode = "bypass"`가 기본값입니다. headless agent는 승인 prompt에 응답할
+수 없으므로 전체 issue resolver 같은 무인 작업을 위해 승인과 sandbox를
+비활성화합니다. 신뢰하는 prompt와 경로에서만 ask를 사용하세요. `edit`은
+sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `default`는 agent CLI의
+기본 권한 정책을 유지합니다. `additional_dirs`도 agent CLI에 전달됩니다. `cwd` 아래
+파일이 외부 경로를 가리키는 symlink라면 real path를 추가해야 합니다. 예를 들어
 `/home/june/workspace`가 NFS를 가리키면 `["/nfs/home/june"]`를 사용합니다.
 
 ## Collaboration
