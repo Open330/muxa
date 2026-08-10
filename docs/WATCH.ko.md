@@ -152,7 +152,15 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 window의 상대 agent를 선택한 뒤 `m`을 누릅니다. room에 peer가 하나뿐이면 watch가
 자동으로 선택합니다. composer에서 `Tab`은 request kind를 바꾸고 `Enter`는
 전송합니다. `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수
-있습니다.
+있습니다. 마지막 kind와 mode는 즉시 저장되어 다음 `m`과 watch 재실행 후에도
+복원됩니다.
+
+`[collaboration].scope = "host"`이면 선택한 agent가 watch를 연 window의 유일한
+peer보다 우선합니다. origin 자신을 제외한 agent가 하나인 접힌 session도 바로
+지정할 수 있으므로 해당 session을 선택하고 `m`을 누르면 펼치지 않아도 그 agent가
+대상이 됩니다. “`cx` alias로 새 pane에서 codex를 시작한 뒤 변경사항을
+리뷰해줘” 같은 요청은 `TASK`와 `EXECUTE`를 선택해 보내면 raw keystroke가 아니라
+실행 권한이 명시된 작업 계약으로 전달됩니다.
 
 `Ctrl-E`는 전송 방식을 순환합니다. `read-only`와 `execute`는 request에 실리는
 계약이고, `just send`는 본문을 계약도 응답도 없는 키스트로크로 pane에 그대로

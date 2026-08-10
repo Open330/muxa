@@ -91,6 +91,7 @@ wall-clock safety limit, not an inactivity detector.
 [collaboration]
 enabled = true
 wake = "idle_only" # idle_only | never
+scope = "window"   # window | host
 max_message_bytes = 16384
 ```
 
@@ -99,6 +100,8 @@ The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json` and
 stores both mailbox state and exact-session aliases/roles.
 `idle_only` injects short request/reply notifications only at a
 hook-authoritative top-level Idle prompt; message bodies stay in the mailbox.
+`scope = "host"` lets watch address the selected tracked agent in another
+tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).
 
 ## Watch
@@ -109,6 +112,8 @@ view = "session"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
 sort = ["state", "session", "latest"]
 hide_paneless = true
+collaboration_kind = "question"   # question | review | task | notice
+collaboration_mode = "read_only"  # read_only | execute | just_send
 
 [watch.widths]
 prompt = "min:20"
@@ -119,6 +124,10 @@ activity = 6
 enabled = true
 template = "{last_response || last_prompt || last_notification}"
 ```
+
+Watch rewrites `collaboration_kind` and `collaboration_mode` when `Tab` or
+`Ctrl-E` changes the `m` composer badges. The last selection therefore
+survives both closing the composer and restarting watch.
 
 See [WATCH.md](WATCH.md) for TUI behavior, columns, sort, and keybindings.
 

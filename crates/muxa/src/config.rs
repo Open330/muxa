@@ -3,6 +3,7 @@
 //! Loaded from TOML. CLI/env-var overrides happen at the binary layer — this
 //! module only parses.
 
+use crate::collaboration::RequestKind;
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1009,6 +1010,18 @@ fn unknown_detail_placeholders(template: &str) -> Vec<String> {
     out
 }
 
+/// Last delivery mode selected in the `muxa watch` collaboration composer.
+/// Unlike [`crate::collaboration::WorkMode`], this includes `just_send`,
+/// which is a watch-only keystroke path rather than a durable request.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchCollaborationMode {
+    #[default]
+    ReadOnly,
+    Execute,
+    JustSend,
+}
+
 /// `[watch]` config — controls the `muxa watch` TUI columns.
 ///
 /// Validation of column keys and width specs happens lazily at render time
@@ -1031,6 +1044,15 @@ pub struct WatchConfig {
     /// the default.
     #[serde(default)]
     pub inspector_split: Option<String>,
+    /// Last request kind selected in the `m` composer. Written by watch when
+    /// `Tab` changes the badge so the next composer (and next watch process)
+    /// starts from the same contract.
+    #[serde(default)]
+    pub collaboration_kind: Option<RequestKind>,
+    /// Last delivery mode selected in the `m` composer. Written by watch when
+    /// `Ctrl-E` changes the badge.
+    #[serde(default)]
+    pub collaboration_mode: Option<WatchCollaborationMode>,
     /// Row granularity for `muxa watch`. Defaults to `session`.
     ///
     /// `session` (default) collapses all panes in the same tmux session into
@@ -1243,6 +1265,8 @@ impl Default for WatchConfig {
             theme: None,
             columns,
             inspector_split: None,
+            collaboration_kind: None,
+            collaboration_mode: None,
             widths,
             view: WatchView::Session,
             summary: WatchSummary::default(),

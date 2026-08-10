@@ -151,6 +151,16 @@ Focus the sending agent pane and open watch with `prefix+s`. Select another
 agent in the same tmux window and press `m`. When the room has exactly one
 peer, watch selects it automatically. `Tab` changes request kind; `Enter`
 sends; `Esc` cancels. Backspace also cancels when the input is already empty.
+The last kind and mode are saved immediately and restored by the next `m`,
+including after watch restarts.
+
+With `[collaboration].scope = "host"`, the selected agent takes precedence
+over the launch window's only peer. A collapsed session containing one
+non-origin agent is directly addressable, so selecting it and pressing `m`
+targets that agent without expanding the session. For a request such as
+“create a new pane, start codex with the `cx` alias, then review our changes”,
+choose `TASK` and `EXECUTE`; the receiving agent gets an explicit executable
+work contract rather than raw keystrokes.
 
 `Ctrl-E` cycles what leaves the composer: `read-only` and `execute` are the
 request contract, and `just send` types the text into the pane as raw

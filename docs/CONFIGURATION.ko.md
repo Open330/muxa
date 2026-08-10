@@ -88,6 +88,7 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 [collaboration]
 enabled = true
 wake = "idle_only" # idle_only | never
+scope = "window"   # window | host
 max_message_bytes = 16384
 ```
 
@@ -96,6 +97,8 @@ optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`이며 mail
 exact-session alias/role을 함께 저장합니다.
 `idle_only`는 hook 기반 top-level agent가 Idle일 때만 짧은 request/reply
 notification을 입력하며 본문은 mailbox에 둡니다.
+`scope = "host"`이면 watch에서 다른 tmux window나 session의 선택된 tracked
+agent를 정확한 pane id로 지정할 수 있습니다.
 [COLLABORATION.ko.md](COLLABORATION.ko.md)를 참고하세요.
 
 ## Watch
@@ -106,6 +109,8 @@ view = "session"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
 sort = ["state", "session", "latest"]
 hide_paneless = true
+collaboration_kind = "question"   # question | review | task | notice
+collaboration_mode = "read_only"  # read_only | execute | just_send
 
 [watch.widths]
 prompt = "min:20"
@@ -116,6 +121,10 @@ activity = 6
 enabled = true
 template = "{last_response || last_prompt || last_notification}"
 ```
+
+`m` composer에서 `Tab`이나 `Ctrl-E`로 badge를 바꾸면 watch가
+`collaboration_kind`와 `collaboration_mode`를 갱신합니다. 마지막 선택은 composer를
+닫거나 watch를 다시 실행한 뒤에도 유지됩니다.
 
 TUI 동작, column, sort, keybinding은 [WATCH.ko.md](WATCH.ko.md)에 있습니다.
 

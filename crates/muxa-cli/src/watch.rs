@@ -40,7 +40,8 @@ use muxa::collaboration::{
     NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use muxa::config::{
-    IconSet, WatchConfig, WatchSortKey, WatchSummary, WatchTheme, WatchView, WidthSpec,
+    IconSet, WatchCollaborationMode, WatchConfig, WatchSortKey, WatchSummary, WatchTheme,
+    WatchView, WidthSpec,
 };
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
@@ -1674,6 +1675,54 @@ fn persist_watch_inspector_split(path: &Path, label: &str) -> std::result::Resul
     std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+/// Persist the last request badges as watch preferences. They belong in the
+/// existing `[watch]` table because they are composer UI state, not daemon
+/// collaboration policy.
+fn persist_watch_collaboration_defaults(
+    path: &Path,
+    defaults: CollaborationComposeDefaults,
+) -> std::result::Result<(), String> {
+    let original = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut doc = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    };
+    match doc.get("watch") {
+        Some(toml_edit::Item::Table(_)) | None => {}
+        Some(_) => return Err("[watch] is not a table".to_string()),
+    }
+    if doc.get("watch").is_none() {
+        doc["watch"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let watch = doc["watch"]
+        .as_table_mut()
+        .ok_or_else(|| "[watch] is not a table".to_string())?;
+    let kind = match defaults.kind {
+        RequestKind::Question => "question",
+        RequestKind::Review => "review",
+        RequestKind::Task => "task",
+        RequestKind::Notice => "notice",
+    };
+    let mode = match defaults.mode {
+        ComposeSendMode::ReadOnly => "read_only",
+        ComposeSendMode::Execute => "execute",
+        ComposeSendMode::JustSend => "just_send",
+    };
+    watch["collaboration_kind"] = toml_edit::value(kind);
+    watch["collaboration_mode"] = toml_edit::value(mode);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -1777,6 +1826,41 @@ enum ComposeSendMode {
     ReadOnly,
     Execute,
     JustSend,
+}
+
+impl From<WatchCollaborationMode> for ComposeSendMode {
+    fn from(mode: WatchCollaborationMode) -> Self {
+        match mode {
+            WatchCollaborationMode::ReadOnly => Self::ReadOnly,
+            WatchCollaborationMode::Execute => Self::Execute,
+            WatchCollaborationMode::JustSend => Self::JustSend,
+        }
+    }
+}
+
+impl From<ComposeSendMode> for WatchCollaborationMode {
+    fn from(mode: ComposeSendMode) -> Self {
+        match mode {
+            ComposeSendMode::ReadOnly => Self::ReadOnly,
+            ComposeSendMode::Execute => Self::Execute,
+            ComposeSendMode::JustSend => Self::JustSend,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollaborationComposeDefaults {
+    kind: RequestKind,
+    mode: ComposeSendMode,
+}
+
+impl Default for CollaborationComposeDefaults {
+    fn default() -> Self {
+        Self {
+            kind: RequestKind::Question,
+            mode: ComposeSendMode::ReadOnly,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2073,6 +2157,9 @@ pub(crate) struct App {
     inspector_split: InspectorSplit,
     collaboration_mailbox: CollaborationMailboxState,
     collaboration_composer: Option<CollaborationComposer>,
+    /// Last kind/mode chosen in a request composer. Seeded from `[watch]`
+    /// and updated immediately as its badges cycle.
+    collaboration_compose_defaults: CollaborationComposeDefaults,
     /// `Some` while the `n` spawn form is open.
     spawn: Option<SpawnComposer>,
     /// `Some` while the `a` ask composer is open.
@@ -2181,6 +2268,10 @@ impl App {
             .as_deref()
             .and_then(InspectorSplit::from_label)
             .unwrap_or_default();
+        let collaboration_compose_defaults = CollaborationComposeDefaults {
+            kind: cfg.collaboration_kind.unwrap_or(RequestKind::Question),
+            mode: cfg.collaboration_mode.unwrap_or_default().into(),
+        };
         Self {
             rows: Vec::new(),
             table_state: TableState::default(),
@@ -2217,6 +2308,7 @@ impl App {
             inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
+            collaboration_compose_defaults,
             spawn: None,
             ask_composer: None,
             ask_panel: AskPanelState::default(),
@@ -4906,6 +4998,19 @@ pub async fn run(
                 Action::CancelCollaborationComposer => {
                     app.collaboration_composer = None;
                 }
+                Action::CollaborationDefaultsChanged => {
+                    if let Some(Err(error)) = sort_persist_path.as_deref().map(|path| {
+                        persist_watch_collaboration_defaults(
+                            path,
+                            app.collaboration_compose_defaults,
+                        )
+                    }) {
+                        app.set_hint(
+                            format!("message kind/mode save failed: {error}"),
+                            HintLevel::Warn,
+                        );
+                    }
+                }
                 Action::ClaimCollaborationInbox => {
                     let outcome = match app.collaboration.origin.clone() {
                         Some(origin) => match client.collaboration_inbox(&origin).await {
@@ -5270,16 +5375,41 @@ fn peer_choice_hint(labels: &[String]) -> String {
     format!("select one of these rows, then press m: {names}")
 }
 
-/// The recipient under host scope: whatever tracked agent the cursor is
-/// on, in any window. The origin — and thus where the reply lands, this
-/// watch's `b` mailbox — stays the launch agent; only the *target* leaves
-/// the room. `None` under window scope or on a non-agent row.
+/// The recipient under host scope: the tracked agent selected in any window.
+/// On a collapsed session row, prefer its sole non-origin agent; that makes a
+/// one-agent session addressable without expanding it.
+/// The origin — and thus where the reply lands, this watch's `b` mailbox —
+/// stays the launch agent; only the target leaves the room.
 fn host_scope_target(app: &App) -> Option<(String, String)> {
     if app.collaboration_scope != muxa::config::CollaborationScope::Host {
         return None;
     }
-    let agent = app.selected_agent()?;
+    let selected = app.selected_target()?;
+    let origin_pane = app
+        .collaboration
+        .origin
+        .as_ref()
+        .map(|origin| origin.pane.as_str());
+    let agent = match app.rows.get(selected.row_idx)? {
+        WatchRow::Agent(agent) => Some(agent.as_ref()),
+        WatchRow::Session(session) => selected
+            .agent_idx
+            .and_then(|index| session.agents.get(index))
+            .or_else(|| {
+                let mut candidates = session
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.pane.as_deref() != origin_pane);
+                let only = candidates.next()?;
+                candidates.next().is_none().then_some(only)
+            })
+            .or(session.latest_agent.as_ref()),
+        WatchRow::BarePane(_) => None,
+    }?;
     let pane = agent.pane.clone()?;
+    if origin_pane == Some(pane.as_str()) {
+        return None;
+    }
     let label = format!("{}@{} · {}", agent.kind, pane, app.pane_label(&pane));
     Some((pane, label))
 }
@@ -5347,20 +5477,18 @@ fn open_watch_collaboration_composer(app: &mut App) {
                 })
         }
     };
-    // Whatever kept the same-room path from producing a recipient — no
-    // room, no peers, ambiguous row — host scope may still name one: the
-    // agent under the cursor.
-    let peer = match same_room {
+    // In host scope the selected tracked agent/session is the explicit
+    // recipient and must win over a singleton peer in the launch window.
+    // Otherwise `m` on an external session could silently address the one
+    // unrelated agent beside the watch pane. Window scope retains the room
+    // behavior.
+    let peer = host_scope_target(app).or_else(|| match same_room {
         Ok(peer) => Some(peer),
         Err(reason) => {
-            let host = host_scope_target(app);
-            if host.is_none() {
-                open_prompt_only_composer(app, reason);
-                return;
-            }
-            host
+            open_prompt_only_composer(app, reason);
+            None
         }
-    };
+    });
     let Some((peer_pane, peer_label)) = peer else {
         return;
     };
@@ -5373,13 +5501,14 @@ fn open_watch_collaboration_composer(app: &mut App) {
     // them on screen. Both, because pane ids are stable and meaningless
     // while positions are legible and drift.
     let label = format!("{peer_label} · {}", app.pane_label(&peer_pane));
+    let defaults = app.collaboration_compose_defaults;
     app.collaboration_composer = Some(CollaborationComposer::new(
         CollaborationComposeTarget::Send {
             origin,
             target: format!("pane:{peer_pane}"),
             pane: peer_pane,
-            kind: RequestKind::Question,
-            mode: ComposeSendMode::ReadOnly,
+            kind: defaults.kind,
+            mode: defaults.mode,
         },
         label,
     ));
@@ -5709,6 +5838,9 @@ pub(crate) enum Action {
     SubmitCollaboration,
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
+    /// `Tab` / `Ctrl-E` changed the request defaults; persist them next to
+    /// the other watch UI preferences.
+    CollaborationDefaultsChanged,
     /// `a` — open the headless-question composer.
     OpenAsk,
     /// Submit the composed question to the daemon.
@@ -6553,13 +6685,14 @@ fn spawn_edit_text(code: KeyCode, modifiers: KeyModifiers, text: &mut String, cu
     }
 }
 
-/// Resolve Tab inside the composer: cycle the per-target option, or say
-/// why there is nothing to cycle.
-fn composer_cycle_option(app: &mut App) {
+/// Resolve Tab inside the composer: cycle the per-target option, or say why
+/// there is nothing to cycle. Returns whether persisted send defaults changed.
+fn composer_cycle_option(app: &mut App) -> bool {
     let Some(composer) = app.collaboration_composer.as_mut() else {
-        return;
+        return false;
     };
-    match &mut composer.target {
+    let mut hint = None;
+    let changed = match &mut composer.target {
         // Kind is a request concept; in `just send` mode there is no
         // request, and silently cycling a hidden badge would surprise
         // whoever switches back.
@@ -6567,18 +6700,20 @@ fn composer_cycle_option(app: &mut App) {
             mode: ComposeSendMode::JustSend,
             ..
         } => {
-            app.set_hint(
-                "kind applies to requests — Ctrl-E to leave just-send",
-                HintLevel::Warn,
-            );
+            hint = Some("kind applies to requests — Ctrl-E to leave just-send");
+            None
         }
-        CollaborationComposeTarget::Send { kind, .. } => {
+        CollaborationComposeTarget::Send { kind, mode, .. } => {
             *kind = match *kind {
                 RequestKind::Question => RequestKind::Review,
                 RequestKind::Review => RequestKind::Task,
                 RequestKind::Task => RequestKind::Notice,
                 RequestKind::Notice => RequestKind::Question,
             };
+            Some(CollaborationComposeDefaults {
+                kind: *kind,
+                mode: *mode,
+            })
         }
         CollaborationComposeTarget::Reply { status, .. } => {
             *status = match *status {
@@ -6587,13 +6722,56 @@ fn composer_cycle_option(app: &mut App) {
                 RequestStatus::Declined => RequestStatus::Failed,
                 _ => RequestStatus::Completed,
             };
+            None
         }
         CollaborationComposeTarget::Prompt { .. } => {
+            hint = Some("requests need a same-window peer — keystrokes only here");
+            None
+        }
+    };
+    if let Some(message) = hint {
+        app.set_hint(message, HintLevel::Warn);
+    }
+    if let Some(defaults) = changed {
+        app.collaboration_compose_defaults = defaults;
+        app.watch_cfg.collaboration_kind = Some(defaults.kind);
+        app.watch_cfg.collaboration_mode = Some(defaults.mode.into());
+        true
+    } else {
+        false
+    }
+}
+
+/// Cycle Ctrl-E's delivery mode and remember it for the next composer.
+fn composer_cycle_mode(app: &mut App) -> bool {
+    let changed = match app.collaboration_composer.as_mut().map(|c| &mut c.target) {
+        Some(CollaborationComposeTarget::Send { kind, mode, .. }) => {
+            *mode = match *mode {
+                ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
+                ComposeSendMode::Execute => ComposeSendMode::JustSend,
+                ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
+            };
+            Some(CollaborationComposeDefaults {
+                kind: *kind,
+                mode: *mode,
+            })
+        }
+        Some(CollaborationComposeTarget::Prompt { .. }) => {
             app.set_hint(
                 "requests need a same-window peer — keystrokes only here",
                 HintLevel::Warn,
             );
+            None
         }
+        _ => None,
+    };
+    if let Some(defaults) = changed {
+        app.collaboration_compose_defaults = defaults;
+        app.watch_cfg.collaboration_kind = Some(defaults.kind);
+        app.watch_cfg.collaboration_mode = Some(defaults.mode.into());
+        true
+    } else {
+        false
     }
 }
 
@@ -6651,8 +6829,11 @@ fn handle_collaboration_composer_event(
         }
         KeyCode::Enter => composer_submit_action(app),
         KeyCode::Tab => {
-            composer_cycle_option(app);
-            Action::None
+            if composer_cycle_option(app) {
+                Action::CollaborationDefaultsChanged
+            } else {
+                Action::None
+            }
         }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let (Some(pasted), Some(composer)) =
@@ -6665,23 +6846,11 @@ fn handle_collaboration_composer_event(
             Action::None
         }
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-            match app.collaboration_composer.as_mut().map(|c| &mut c.target) {
-                Some(CollaborationComposeTarget::Send { mode, .. }) => {
-                    *mode = match *mode {
-                        ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
-                        ComposeSendMode::Execute => ComposeSendMode::JustSend,
-                        ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
-                    };
-                }
-                Some(CollaborationComposeTarget::Prompt { .. }) => {
-                    app.set_hint(
-                        "requests need a same-window peer — keystrokes only here",
-                        HintLevel::Warn,
-                    );
-                }
-                _ => {}
+            if composer_cycle_mode(app) {
+                Action::CollaborationDefaultsChanged
+            } else {
+                Action::None
             }
-            Action::None
         }
         KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
@@ -10606,7 +10775,7 @@ mod tests {
 
         assert!(matches!(
             handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app),
-            Action::None
+            Action::CollaborationDefaultsChanged
         ));
         assert!(matches!(
             handle_collaboration_composer_event(
@@ -10614,7 +10783,7 @@ mod tests {
                 KeyModifiers::CONTROL,
                 &mut app
             ),
-            Action::None
+            Action::CollaborationDefaultsChanged
         ));
         let composer = app.collaboration_composer.as_ref().unwrap();
         assert!(matches!(
@@ -11018,7 +11187,7 @@ mod tests {
         let mut app = app_with_paneless_and_pane();
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.collaboration.origin = Some(CollaborationOrigin {
-            pane: "%42".into(),
+            pane: "%1".into(),
             socket: None,
         });
         let pane_idx = app
@@ -11037,6 +11206,72 @@ mod tests {
             ),
             "host scope must open the contract composer for the cursor's agent"
         );
+    }
+
+    #[test]
+    fn host_scope_selected_session_beats_the_only_launch_window_peer() {
+        let mut app = collaboration_watch_app();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.set_data(
+            vec![
+                fake_agent(
+                    "self",
+                    Some("%1"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "peer",
+                    Some("%2"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "cal-7041",
+                    Some("%913"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![
+                fake_pane("%1", "main", 0, 0, "codex"),
+                fake_pane("%2", "main", 0, 1, "codex"),
+                fake_pane("%913", "cal-7041", 0, 0, "claude"),
+            ],
+        );
+        app.apply_view(WatchView::Session);
+        let row_index = app
+            .rows
+            .iter()
+            .position(
+                |row| matches!(row, WatchRow::Session(session) if session.session == "cal-7041"),
+            )
+            .unwrap();
+        let visible_index = app
+            .visible_targets()
+            .iter()
+            .position(|target| target.row_idx == row_index && target.agent_idx.is_none())
+            .unwrap();
+        app.table_state.select(Some(visible_index));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            app.collaboration_composer.as_ref().map(|composer| &composer.target),
+            Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%913"
+        ));
     }
 
     #[test]
@@ -11123,6 +11358,41 @@ mod tests {
             );
             assert_eq!(mode_of(&app), expected);
         }
+    }
+
+    #[test]
+    fn request_kind_and_mode_survive_closing_and_reopening_the_composer() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app),
+                Action::CollaborationDefaultsChanged
+            ));
+        }
+        assert!(matches!(
+            handle_collaboration_composer_event(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut app
+            ),
+            Action::CollaborationDefaultsChanged
+        ));
+        app.collaboration_composer = None;
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            app.collaboration_composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(CollaborationComposeTarget::Send {
+                kind: RequestKind::Task,
+                mode: ComposeSendMode::Execute,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -11224,7 +11494,7 @@ mod tests {
 
         assert!(matches!(
             handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app),
-            Action::None
+            Action::CollaborationDefaultsChanged
         ));
         assert!(matches!(
             app.collaboration_composer.as_ref().unwrap().target,
@@ -12701,6 +12971,48 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("inspector_split = \"30/70\""));
         assert!(text.contains("sort"), "sort must survive: {text}");
+    }
+
+    #[test]
+    fn collaboration_composer_defaults_persist_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n[collaboration]\nenabled = true\nscope = \"host\"\n",
+        )
+        .unwrap();
+
+        persist_watch_collaboration_defaults(
+            &path,
+            CollaborationComposeDefaults {
+                kind: RequestKind::Task,
+                mode: ComposeSendMode::Execute,
+            },
+        )
+        .unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"), "{saved}");
+        assert!(saved.contains("collaboration_kind = \"task\""), "{saved}");
+        assert!(
+            saved.contains("collaboration_mode = \"execute\""),
+            "{saved}"
+        );
+        let cfg = muxa::config::Config::load_or_default(Some(&path)).unwrap();
+        assert_eq!(cfg.watch.collaboration_kind, Some(RequestKind::Task));
+        assert_eq!(
+            cfg.watch.collaboration_mode,
+            Some(WatchCollaborationMode::Execute)
+        );
+        let app = App::with_config(cfg.watch);
+        assert_eq!(
+            app.collaboration_compose_defaults,
+            CollaborationComposeDefaults {
+                kind: RequestKind::Task,
+                mode: ComposeSendMode::Execute,
+            }
+        );
     }
 
     #[test]
@@ -15190,6 +15502,7 @@ sort = ["state"]
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
             | Action::CancelCollaborationComposer
+            | Action::CollaborationDefaultsChanged
             | Action::InspectorSplitChanged
             | Action::OpenAsk
             | Action::SubmitAsk
