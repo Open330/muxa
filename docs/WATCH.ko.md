@@ -125,6 +125,7 @@ inbox를 열면 확인 처리됩니다.
 `a`는 컴포저 제목에 표시된 agent에게 보낼 headless 질의를 작성합니다. `Tab`으로
 claude ↔ codex를 바꾸고, `Ctrl-V`로 붙여넣고, `Enter`로 보냅니다. muxad가 agent를
 print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 관리할 세션도 없습니다.
+`Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수 있습니다.
 
 `A`는 이력을 엽니다. `j`/`k` 선택, `|` 상세 영역 확대, `Tab` agent 필터(all →
 claude → codex), `n` 새 대화. `n` 전까지는 하나의 대화라 질문마다 직전 대화를
@@ -150,7 +151,8 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 메시지를 보낼 agent pane을 선택하고 `prefix+s`로 watch를 엽니다. 같은 tmux
 window의 상대 agent를 선택한 뒤 `m`을 누릅니다. room에 peer가 하나뿐이면 watch가
 자동으로 선택합니다. composer에서 `Tab`은 request kind를 바꾸고 `Enter`는
-전송합니다.
+전송합니다. `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수
+있습니다.
 
 `Ctrl-E`는 전송 방식을 순환합니다. `read-only`와 `execute`는 request에 실리는
 계약이고, `just send`는 본문을 계약도 응답도 없는 키스트로크로 pane에 그대로

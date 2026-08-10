@@ -118,7 +118,8 @@ for subsequent refreshes in the current watch process.
 `a` composes a headless question for the agent named in the composer title;
 `Tab` switches between claude and codex, `Ctrl-V` pastes, `Enter` sends.
 muxad runs the agent in print mode and captures the answer, so nothing is
-typed into a pane and no session has to be managed.
+typed into a pane and no session has to be managed. `Esc` cancels; Backspace
+also cancels when the input is already empty.
 
 `A` opens the history: `j`/`k` selects, `|` grows the detail pane, `Tab`
 filters by agent (all → claude → codex), and `n` starts a fresh
@@ -149,7 +150,7 @@ controls. Symlink targets outside the configured `cwd` must also be listed in
 Focus the sending agent pane and open watch with `prefix+s`. Select another
 agent in the same tmux window and press `m`. When the room has exactly one
 peer, watch selects it automatically. `Tab` changes request kind; `Enter`
-sends; `Esc` cancels.
+sends; `Esc` cancels. Backspace also cancels when the input is already empty.
 
 `Ctrl-E` cycles what leaves the composer: `read-only` and `execute` are the
 request contract, and `just send` types the text into the pane as raw

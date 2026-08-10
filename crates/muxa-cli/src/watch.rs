@@ -6303,6 +6303,15 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
 /// Ask composer: one field, Enter submits, `Ctrl-V` pastes. No contract
 /// row — which agent and where it runs are config, decided once.
 fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    if code == KeyCode::Backspace
+        && app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.input.is_empty())
+    {
+        app.ask_composer = None;
+        return Action::None;
+    }
     let Some(ask) = app.ask_composer.as_mut() else {
         return Action::None;
     };
@@ -6632,6 +6641,14 @@ fn handle_collaboration_composer_event(
 ) -> Action {
     match code {
         KeyCode::Esc => Action::CancelCollaborationComposer,
+        KeyCode::Backspace
+            if app
+                .collaboration_composer
+                .as_ref()
+                .is_some_and(|composer| composer.input.is_empty()) =>
+        {
+            Action::CancelCollaborationComposer
+        }
         KeyCode::Enter => composer_submit_action(app),
         KeyCode::Tab => {
             composer_cycle_option(app);
@@ -9972,7 +9989,7 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw("agent  "),
             Span::styled(" Ctrl-V ", theme.key_badge()),
             Span::raw("paste  "),
-            Span::styled(" Esc ", theme.key_badge()),
+            Span::styled(" Esc/empty ⌫ ", theme.key_badge()),
             Span::raw("cancel"),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -10109,7 +10126,7 @@ fn render_collaboration_composer_footer(
         ]);
     }
     spans.extend([
-        Span::styled(" Esc ", theme.key_badge()),
+        Span::styled(" Esc/empty ⌫ ", theme.key_badge()),
         Span::raw("cancel"),
     ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -10617,6 +10634,27 @@ mod tests {
     }
 
     #[test]
+    fn backspace_cancels_the_message_composer_only_when_already_empty() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        app.collaboration_composer.as_mut().unwrap().insert('x');
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.input.is_empty()));
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::CancelCollaborationComposer
+        ));
+    }
+
+    #[test]
     fn n_opens_the_spawn_form_and_enter_launches_with_the_prompt_inline() {
         let mut app = app_with_paneless_and_pane();
         assert!(matches!(key_action(&mut app, 'n'), Action::None));
@@ -10838,6 +10876,31 @@ mod tests {
             &mut app,
         );
         assert!(matches!(action, Action::CycleAskAgent), "got {action:?}");
+    }
+
+    #[test]
+    fn backspace_closes_the_ask_composer_only_when_already_empty() {
+        let mut app = app_with_paneless_and_pane();
+        app.ask_composer = Some(AskComposer::default());
+
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Char('x'), KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.input.is_empty()));
+
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app.ask_composer.is_none());
     }
 
     #[test]
