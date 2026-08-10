@@ -7,9 +7,10 @@ the *other* agents are doing, send one of them a prompt, read its screen, and
 block until it changes state — the orchestration primitives that close the gap
 with agent-native multiplexers whose socket API agents can drive.
 
-Every tool proxies the daemon over its existing owner-only unix socket, so the
-MCP server adds no new surface area: it can only do what a shell on the same
-machine could already do through `muxa`.
+Most tools proxy the daemon over its existing owner-only unix socket. The
+deterministic agent launcher invokes same-user tmux locally, using the same
+socket routing as the CLI. The MCP server adds no network listener: it can only
+do what a shell on the same machine could already do through `muxa` and tmux.
 
 ## Wire it into Claude Code and Codex
 
@@ -48,7 +49,7 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list fourteen tools). Other MCP
+or `codex mcp list` (the `muxa` server should list fifteen tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
 At initialization muxa tells the agent how to use same-window peers as a
@@ -94,6 +95,7 @@ it:
 | --- | --- | --- |
 | `muxa_status` | — | Snapshot of every tracked agent: state, pane, session, model, last prompt, last notification. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
+| `muxa_start_agent` | `agent`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Start an allowlisted agent in a detached pane, window, or session and return its exact pane id. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?` | Block until an agent's state changes (or timeout); returns the transition. |
@@ -113,6 +115,38 @@ only reaches the focused pane. tmux and herdr support it.
 
 Pane ids carry their host namespace: tmux `%12`, herdr `herdr:p1`. Use the
 `pane` field from `muxa_status` verbatim.
+
+### Deterministic agent launch
+
+Use `muxa_start_agent` when creating the tmux surface is the deterministic
+part of a larger task. The calling model supplies only the agent profile,
+location, and optional first task; muxa handles the exact tmux invocation and
+returns the new pane id for later `muxa_capture_pane`, `muxa_send_prompt`, and
+`muxa_wait_for_change` calls.
+
+```text
+muxa_start_agent {
+  "agent": "codex",
+  "placement": "pane",
+  "target": "%18",
+  "cwd": "/home/june/personal/muxa",
+  "prompt": "Review the current changes and report findings only"
+}
+→ { "pane": "%24", "agent": "codex", "placement": "pane", ... }
+```
+
+`placement` defaults to a detached right-hand split; set `direction` to
+`down` for a lower split. `window` and `session` are also detached. Pane and
+window launches use `target`, falling back to `TMUX_PANE`; a session does not
+accept a target. Session names that already exist receive the first free
+numeric suffix, and the selected name is returned with the pane id. `cwd` must
+already exist.
+
+Profiles are allowlisted (`claude`, `codex`, `gemini`, `opencode`) rather than
+accepting an arbitrary shell command. They intentionally use each CLI's
+bypass/yolo mode. In particular, `codex` expands the local `cx` behavior to
+`codex --yolo` directly, so it does not depend on an interactive shell loading
+aliases.
 
 The collaboration tools are higher-level than `muxa_send_prompt`: muxad pins
 each request to the target's current agent session, persists it before wake-up,
@@ -217,8 +251,10 @@ submitted") so the caller doesn't assume the agent started working.
 ## Safety
 
 `muxa_send_prompt` is a **control action** — it types into another agent's
-pane. The IPC socket is owner-only (`0600`), so only your user can reach it and
-there is no network exposure; treat socket access as equivalent to shell
-access. The server never starts against an absent daemon. See `PROTOCOL.md`
-(Control methods) for the underlying `send_prompt` / `capture` / `subscribe`
-IPC.
+pane. `muxa_start_agent` is also a control action: it creates a tmux surface
+and starts an allowlisted CLI in bypass/yolo mode. It does not accept arbitrary
+commands, but callers should still provide trusted paths and prompts. The IPC
+socket is owner-only (`0600`), so only your user can reach it and there is no
+network exposure; treat socket and MCP access as equivalent to shell access.
+The server never starts against an absent daemon. See `PROTOCOL.md` (Control
+methods) for the underlying `send_prompt` / `capture` / `subscribe` IPC.

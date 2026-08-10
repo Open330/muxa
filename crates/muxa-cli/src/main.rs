@@ -1,6 +1,7 @@
 //! muxa CLI — user-facing entry point.
 
 mod activity_query;
+mod agent_launch;
 mod attend;
 mod dashboard_tui;
 mod doctor;
@@ -114,6 +115,11 @@ enum Cmd {
     Msg {
         #[command(subcommand)]
         action: MsgCmd,
+    },
+    /// Deterministic tmux agent lifecycle operations.
+    Agent {
+        #[command(subcommand)]
+        action: AgentCmd,
     },
     /// Register a room-local alias and roles for this exact agent session.
     Identity {
@@ -322,6 +328,12 @@ enum MsgCmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum AgentCmd {
+    /// Start an allowlisted agent in a detached pane, window, or session.
+    Start(agent_launch::StartArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum IdentityCmd {
     /// Show this agent's current identity and room peers.
     Show {
@@ -448,6 +460,9 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
+        Cmd::Agent { action } => match action {
+            AgentCmd::Start(start_args) => agent_launch::run(start_args),
+        },
         Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
@@ -2376,6 +2391,38 @@ mod tests {
             };
             assert_eq!(sort.keys(), expected);
         }
+    }
+
+    #[test]
+    fn agent_start_cli_parses_a_structured_pane_launch() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "agent",
+            "start",
+            "--agent",
+            "codex",
+            "--target",
+            "%42",
+            "--cwd",
+            "/tmp",
+            "--prompt",
+            "review the changes",
+            "--direction",
+            "down",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Agent {
+            action: AgentCmd::Start(start),
+        } = args.cmd
+        else {
+            panic!("expected agent start");
+        };
+        assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
+        assert_eq!(start.placement, agent_launch::Placement::Pane);
+        assert_eq!(start.target.as_deref(), Some("%42"));
+        assert_eq!(start.direction, agent_launch::SplitDirection::Down);
+        assert!(start.json);
     }
 
     #[test]

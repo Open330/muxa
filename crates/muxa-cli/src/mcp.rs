@@ -57,6 +57,8 @@ const MAX_WAIT_SECS: u64 = 600;
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
+    Use muxa_start_agent for deterministic pane/window/session creation instead \
+    of delegating tmux setup to another model. \
     At the start of substantial work, call muxa_collaboration_guide (or \
     muxa_room_context) to discover available peer agents. Improve important work \
     with a peer when useful: use review + read_only after implementation and tests \
@@ -335,6 +337,28 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_start_agent",
+            "description": "Create a detached tmux pane, window, or session and \
+                start one allowlisted coding agent in it. Use this deterministic \
+                tool instead of spending another agent turn on tmux setup. The \
+                codex profile expands the local cx behavior to codex --yolo. \
+                Returns the exact new pane id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode"] },
+                    "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Default pane." },
+                    "target": { "type": "string", "description": "tmux target for pane/window placement. Defaults to TMUX_PANE." },
+                    "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
+                    "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
+                    "name": { "type": "string", "description": "Optional window/session name." },
+                    "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Default right." }
+                },
+                "required": ["agent"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
             "name": "muxa_send_prompt",
             "description": "Inject text into an agent's pane as keystrokes. With \
                 submit=true (the default), a trailing Enter commits the line so the \
@@ -518,6 +542,53 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 Ok(prompts) => json_result(&json!({ "prompts": prompts })),
                 Err(e) => error_result(&format!("recent_prompts failed: {e}")),
             })
+        }
+        "muxa_start_agent" => {
+            let Some(agent) = args.get("agent").and_then(Value::as_str) else {
+                return Ok(error_result("start_agent requires an agent argument"));
+            };
+            let agent = match crate::agent_launch::AgentProgram::parse(agent) {
+                Ok(agent) => agent,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let placement = match crate::agent_launch::Placement::parse(
+                args.get("placement").and_then(Value::as_str),
+            ) {
+                Ok(placement) => placement,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let direction = match crate::agent_launch::SplitDirection::parse(
+                args.get("direction").and_then(Value::as_str),
+            ) {
+                Ok(direction) => direction,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let request = crate::agent_launch::StartRequest {
+                agent,
+                placement,
+                target: args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                cwd: args
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from),
+                prompt: args
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                name: args.get("name").and_then(Value::as_str).map(str::to_string),
+                direction,
+            };
+            Ok(
+                match tokio::task::spawn_blocking(move || crate::agent_launch::start(request)).await
+                {
+                    Ok(Ok(result)) => json_result(&json!(result)),
+                    Ok(Err(error)) => error_result(&format!("start_agent failed: {error}")),
+                    Err(error) => error_result(&format!("start_agent worker failed: {error}")),
+                },
+            )
         }
         "muxa_send_prompt" => {
             let Some(pane) = args.get("pane").and_then(Value::as_str) else {
@@ -1265,6 +1336,7 @@ mod tests {
             vec![
                 "muxa_status",
                 "muxa_recent_prompts",
+                "muxa_start_agent",
                 "muxa_send_prompt",
                 "muxa_capture_pane",
                 "muxa_wait_for_change",
@@ -1278,6 +1350,15 @@ mod tests {
                 "muxa_wait_reply",
                 "muxa_cancel_message",
             ],
+        );
+        let start_agent = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_start_agent")
+            .unwrap();
+        assert_eq!(start_agent["inputSchema"]["required"], json!(["agent"]));
+        assert_eq!(
+            start_agent["inputSchema"]["properties"]["agent"]["enum"],
+            json!(["claude", "codex", "gemini", "opencode"])
         );
         let guide = tools
             .iter()

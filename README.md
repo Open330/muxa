@@ -174,6 +174,7 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
+| `muxa agent start --agent codex ...` | Deterministically start an allowlisted agent in a detached tmux pane, window, or session and return its pane id; also exposed as MCP `muxa_start_agent`. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
