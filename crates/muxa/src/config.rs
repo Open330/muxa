@@ -383,13 +383,12 @@ pub struct DashboardTomlConfig {
     pub enabled: Option<bool>,
     /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
     pub bind: Option<String>,
-    /// API authentication mode. Default keeps the existing behavior:
-    /// bearer-token auth is used when a token is configured, and public
-    /// non-loopback binds require one. Set to `"none"` to explicitly
-    /// expose the dashboard API without auth.
+    /// API authentication mode. `"token"` protects reads and writes,
+    /// `"public_read"` exposes reads while requiring the token for control
+    /// actions, and `"none"` exposes reads with control actions disabled.
     pub auth: Option<DashboardAuthMode>,
-    /// Bearer token. Empty string is treated as "unset". Required when
-    /// `bind` is non-loopback unless `auth = "none"` is explicitly set.
+    /// Bearer token / browser PAT. Empty string is treated as "unset".
+    /// Required by both `auth = "token"` and `auth = "public_read"`.
     pub token: Option<String>,
     /// Required to be `true` for non-loopback `bind` values. Acts as an
     /// explicit acknowledgement that the operator means to expose the
@@ -403,6 +402,7 @@ pub struct DashboardTomlConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DashboardAuthMode {
     Token,
+    PublicRead,
     None,
 }
 
@@ -899,7 +899,8 @@ fn validate_dashboard(cfg: &DashboardTomlConfig) -> std::result::Result<(), Conf
 
     // Non-loopback path mirrors `DashboardConfig::resolve`: allow_public
     // plus either a non-empty token or explicit `auth = "none"` is
-    // required. We honor the env var here because `muxad` reads it via
+    // required. `public_read` still needs a token for control actions.
+    // We honor the env var here because `muxad` reads it via
     // clap; without it we'd emit false positives for users whose only
     // token source is the env.
     if !cfg.allow_public.unwrap_or(false) {

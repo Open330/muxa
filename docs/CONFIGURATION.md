@@ -173,8 +173,9 @@ allow_public = false
 ```
 
 The dashboard is loopback-only unless public binding is explicitly
-allowed. Public API without a token requires the additional explicit
-`auth = "none"` opt-in. See [DASHBOARD.md](DASHBOARD.md).
+allowed. Use `auth = "public_read"` with a token to expose anonymous reads
+while keeping browser control actions PAT-gated. `auth = "none"` exposes reads
+and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 
 ## External Sinks
 

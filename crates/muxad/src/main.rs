@@ -3,7 +3,8 @@
 //! Listens on a unix socket, ingests normalized `AgentEvent`s from adapters,
 //! exposes query endpoints to the CLI and tmux status line, and — when
 //! opted in via `[dashboard] enabled = true` or `--dashboard` — serves a
-//! read-only HTTP dashboard alongside the unix socket.
+//! HTTP dashboard alongside the unix socket, with independently configurable
+//! read and PAT-gated control access.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -53,7 +54,7 @@ struct Args {
     config: Option<PathBuf>,
 
     /// Enable the HTTP dashboard. Requires a bearer token unless dashboard
-    /// auth is explicitly set to `none`.
+    /// auth is explicitly set to read-only `none`.
     #[arg(long, conflicts_with = "no_dashboard")]
     dashboard: bool,
 
@@ -65,11 +66,12 @@ struct Args {
     #[arg(long, value_name = "ADDR", env = "MUXA_DASHBOARD_BIND")]
     dashboard_bind: Option<String>,
 
-    /// Dashboard bearer token. Required whenever token auth is enabled.
+    /// Dashboard bearer token / browser PAT. Required by `token` and
+    /// `public_read` auth modes.
     #[arg(long, value_name = "TOKEN", env = "MUXA_DASHBOARD_TOKEN")]
     dashboard_token: Option<String>,
 
-    /// Dashboard API auth mode: `token` or `none`.
+    /// Dashboard API auth mode: `token`, `public_read`, or `none`.
     #[arg(long, value_name = "MODE", env = "MUXA_DASHBOARD_AUTH")]
     dashboard_auth: Option<String>,
 
@@ -287,17 +289,10 @@ async fn main() -> Result<()> {
             })
             .flatten();
         let sessions_for_dash = sessions.clone();
-        // The web dashboard's pane scanner stays single-backend this pass —
-        // merging it with the backend set is an explicit non-goal in
-        // `docs/MULTI_HOST.md` (the scanner is dashboard-only plumbing, tracked
-        // as a follow-up). It must observe the *env-preferred* host — exactly
-        // what the old single-backend daemon detected from env. `active_backends`
-        // is ordered by env preference (`backends[0]` = the env-preferred host,
-        // e.g. herdr-inside-herdr), so `primary` IS that backend and the
-        // dashboard behaves identically to the pre-multi-host daemon. On a
-        // multi-host daemon the dashboard shows the env-preferred host only
-        // until the scanner-set merge follow-up lands.
-        let backend_for_dash = primary.clone();
+        // Reads use the env-preferred backend as their primary scanner source;
+        // PAT-gated control actions retain the full set so pane-id namespaces
+        // route to the correct host during mixed-host migrations.
+        let backends_for_dash = backends.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
@@ -309,7 +304,7 @@ async fn main() -> Result<()> {
                 store_for_dash,
                 pane_cache,
                 sessions_for_dash,
-                backend_for_dash,
+                backends_for_dash,
                 dashboard_runtime,
                 shutdown_rx,
             )
@@ -1358,8 +1353,13 @@ fn resolve_dashboard_config(cfg: &Config, args: &Args) -> Result<DashboardConfig
 fn parse_dashboard_auth(s: &str) -> Result<DashboardAuthMode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "token" | "bearer" => Ok(DashboardAuthMode::Token),
+        "public_read" | "public-read" | "read_only" | "read-only" => {
+            Ok(DashboardAuthMode::PublicRead)
+        }
         "none" | "off" | "public" => Ok(DashboardAuthMode::None),
-        _ => anyhow::bail!("invalid dashboard auth mode {s:?}; expected `token` or `none`"),
+        _ => anyhow::bail!(
+            "invalid dashboard auth mode {s:?}; expected `token`, `public_read`, or `none`"
+        ),
     }
 }
 
@@ -1652,6 +1652,18 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
+
+    #[test]
+    fn dashboard_auth_parser_accepts_public_read_aliases() {
+        assert_eq!(
+            parse_dashboard_auth("public_read").unwrap(),
+            DashboardAuthMode::PublicRead
+        );
+        assert_eq!(
+            parse_dashboard_auth("read-only").unwrap(),
+            DashboardAuthMode::PublicRead
+        );
+    }
 
     struct CollaborationWakeBackend {
         panes: Vec<PaneInfo>,

@@ -168,7 +168,9 @@ allow_public = false
 ```
 
 dashboard는 명시적으로 public binding을 허용하기 전까지 loopback-only입니다.
-token 없는 public API는 추가로 `auth = "none"`을 명시해야 합니다.
+익명 조회를 공개하되 browser 제어 기능만 PAT로 보호하려면 token과 함께
+`auth = "public_read"`를 사용합니다. `auth = "none"`은 조회만 공개하고 모든
+제어 요청을 비활성화합니다.
 자세한 내용은 [DASHBOARD.md](DASHBOARD.md).
 
 ## External Sinks

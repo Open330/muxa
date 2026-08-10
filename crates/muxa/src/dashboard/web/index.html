@@ -16,7 +16,8 @@
       <span class="version" id="version" title="protocol version"></span>
     </div>
     <div class="status">
-      <span class="mode-badge">read-only public</span>
+      <span class="mode-badge" id="access-mode">checking access…</span>
+      <button class="access-btn" type="button" id="edit-access" hidden>unlock edit</button>
       <span class="conn" id="conn">●</span>
       <span class="conn-label" id="conn-label">connecting…</span>
       <span class="counts" id="counts"></span>
@@ -146,10 +147,11 @@
                   <th>LIMITS</th>
                   <th>LAST PROMPT</th>
                   <th>ACTIVITY</th>
+                  <th>CONTROL</th>
                 </tr>
               </thead>
               <tbody id="agents-tbody">
-                <tr class="empty"><td colspan="9">loading…</td></tr>
+                <tr class="empty"><td colspan="10">loading…</td></tr>
               </tbody>
             </table>
           </div>
@@ -173,7 +175,7 @@
                   <th>PANE</th>
                   <th>COMMAND</th>
                   <th>TITLE</th>
-                  <th>ATTACH</th>
+                  <th>ACTIONS</th>
                 </tr>
               </thead>
               <tbody id="panes-tbody">
@@ -197,7 +199,7 @@
                   <th>CWD</th>
                   <th>CLIENTS</th>
                   <th>STATE</th>
-                  <th>CAPTURE</th>
+                  <th>ACTIONS</th>
                 </tr>
               </thead>
               <tbody id="terminals-tbody">

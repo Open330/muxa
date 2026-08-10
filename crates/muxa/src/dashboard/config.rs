@@ -6,7 +6,8 @@
 //! which applies precedence (env > flag > toml > default) per-field and
 //! validates the security invariants:
 //!
-//! 1. An enabled dashboard using token auth requires an explicit token.
+//! 1. An enabled dashboard using token or public-read auth requires an
+//!    explicit token. In public-read mode that token protects writes only.
 //! 2. A non-loopback `bind` is rejected unless `allow_public = true`.
 //! 3. A non-loopback `bind` is rejected unless either a non-empty token
 //!    is set or `auth = "none"` is explicitly configured. `allow_public`
@@ -34,7 +35,7 @@ pub struct DashboardConfig {
     pub enabled: bool,
     pub bind: SocketAddr,
     pub auth: DashboardAuthMode,
-    /// `None` = no auth required.
+    /// `None` = control routes are disabled (`auth = "none"`).
     pub token: Option<String>,
     pub allow_public: bool,
     pub pane_cache_ttl: Duration,
@@ -66,9 +67,10 @@ pub enum DashboardConfigError {
     },
 
     #[error(
-        "dashboard is enabled with token authentication, but no bearer token is configured; \
+        "dashboard is enabled with an authentication mode that requires a control token, \
+         but no bearer token is configured; \
          set dashboard.token, --dashboard-token, or MUXA_DASHBOARD_TOKEN; \
-         or set dashboard.auth=\"none\" (or --dashboard-auth none) to disable authentication"
+         or set dashboard.auth=\"none\" (or --dashboard-auth none) to expose reads and disable control"
     )]
     MissingToken,
 
@@ -117,8 +119,8 @@ impl DashboardConfig {
             .or_else(|| toml.token.clone())
             .filter(|s| !s.trim().is_empty()); // empty/whitespace treated as unset
         let token = if matches!(auth, DashboardAuthMode::None) {
-            // Explicit opt-out: run the read-only API with no auth. This is
-            // the escape hatch for a trusted single-user box.
+            // Explicit read-only opt-out: run the read API with no token and
+            // leave control routes disabled.
             None
         } else {
             token
@@ -130,7 +132,7 @@ impl DashboardConfig {
             .pane_cache_ttl_ms
             .map_or(DEFAULT_PANE_CACHE_TTL, Duration::from_millis);
 
-        if enabled && matches!(auth, DashboardAuthMode::Token) && token.is_none() {
+        if enabled && !matches!(auth, DashboardAuthMode::None) && token.is_none() {
             return Err(DashboardConfigError::MissingToken);
         }
 
@@ -247,6 +249,32 @@ mod tests {
         assert!(cfg.allow_public);
         assert_eq!(cfg.auth, DashboardAuthMode::None);
         assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn non_loopback_public_read_requires_and_preserves_control_token() {
+        let toml = DashboardTomlConfig {
+            bind: Some("0.0.0.0:7878".into()),
+            allow_public: Some(true),
+            auth: Some(DashboardAuthMode::PublicRead),
+            token: Some("edit-pat".into()),
+            ..DashboardTomlConfig::default()
+        };
+        let cfg = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap();
+        assert_eq!(cfg.auth, DashboardAuthMode::PublicRead);
+        assert_eq!(cfg.token.as_deref(), Some("edit-pat"));
+        assert!(cfg.allow_public);
+    }
+
+    #[test]
+    fn enabled_public_read_without_control_token_errors() {
+        let toml = DashboardTomlConfig {
+            enabled: Some(true),
+            auth: Some(DashboardAuthMode::PublicRead),
+            ..DashboardTomlConfig::default()
+        };
+        let err = DashboardConfig::resolve(&toml, &DashboardOverrides::default()).unwrap_err();
+        assert!(matches!(err, DashboardConfigError::MissingToken));
     }
 
     #[test]

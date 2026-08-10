@@ -1,17 +1,17 @@
 //! HTTP dashboard for the muxa daemon.
 //!
-//! The dashboard exposes the daemon's read-only state — agents, panes
-//! across every tmux server, and (in a later commit) a live event stream
-//! — over a small `axum`-based HTTP API alongside the existing
-//! Unix-socket IPC.
+//! The dashboard exposes daemon state over a small `axum`-based HTTP API
+//! alongside the existing Unix-socket IPC. Optional control routes are
+//! isolated from reads and always require a bearer token.
 //!
 //! ## Security model
 //!
 //! Default-secure: opt-in via `[dashboard] enabled = true`, bound to
 //! `127.0.0.1` only. Non-loopback binds require both `allow_public =
 //! true` (an explicit acknowledgement) and either a non-empty bearer
-//! token or the explicit `auth = "none"` public-API opt-in. Token
-//! comparison is constant-time when token auth is enabled.
+//! token or the explicit `auth = "none"` public-read-only opt-in.
+//! `auth = "public_read"` keeps reads public while treating that token as
+//! a browser PAT for control actions. Token comparison is constant-time.
 //!
 //! ## Layout
 //!

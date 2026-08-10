@@ -10,8 +10,9 @@
 //     Referer header. A legacy ?token=... query param is still accepted
 //     for compatibility but is scrubbed immediately. localStorage persists
 //     across tab close and browser restart, so the user pastes it once.
-//   * Fetch /api/health to populate the version string and confirm the
-//     token is good before opening the SSE.
+//   * Fetch /api/health and /api/access. In `public_read` mode reads and SSE
+//     work anonymously while the same bearer token acts as a browser PAT for
+//     the separate control routes.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
 //   * Open a streaming POST-less fetch on /api/events and parse SSE
 //     manually (EventSource can't carry an Authorization header).
@@ -98,6 +99,32 @@ async function jsonFetch(path, options = {}) {
   return resp.json();
 }
 
+async function controlFetch(path, options = {}) {
+  const resp = await fetch(path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(),
+      ...(options.headers || {}),
+    },
+  });
+  let payload = null;
+  try {
+    payload = await resp.json();
+  } catch (_) {
+    // Status-only middleware rejections have an empty body.
+  }
+  if (resp.status === 401 || resp.status === 403) {
+    store.access.writeAuthorized = false;
+    renderAccess();
+    throw new Error(resp.status === 401 ? "invalid or missing edit PAT" : "dashboard is read-only");
+  }
+  if (!resp.ok) {
+    throw new Error(payload?.error || `${path} → ${resp.status}`);
+  }
+  return payload || { ok: true };
+}
+
 // ── SSE parser (manual; EventSource can't set headers) ────────────
 
 async function streamEvents(onEvent, onLagged) {
@@ -169,6 +196,8 @@ async function streamEvents(onEvent, onLagged) {
 // ── Connection indicator ──────────────────────────────────────────
 
 const dom = {
+  accessMode: document.getElementById("access-mode"),
+  editAccess: document.getElementById("edit-access"),
   conn: document.getElementById("conn"),
   connLabel: document.getElementById("conn-label"),
   counts: document.getElementById("counts"),
@@ -223,6 +252,68 @@ function showToast(msg) {
   }, 1800);
 }
 
+function renderAccess() {
+  const access = store.access;
+  const editing = access.writeAuthorized;
+  dom.accessMode.textContent = editing
+    ? "edit unlocked"
+    : access.mode === "public_read"
+      ? "public read-only"
+      : access.mode === "token"
+        ? "private"
+        : "read-only";
+  dom.accessMode.classList.toggle("edit", editing);
+  dom.editAccess.hidden = !access.writeAvailable;
+  dom.editAccess.disabled = access.mode === "token" && editing;
+  dom.editAccess.textContent = editing
+    ? access.mode === "public_read" ? "lock edit" : "PAT active"
+    : "unlock edit";
+  if (store.agents.size > 0) renderAgents();
+  if (store.panes.length > 0) renderPanes();
+  if (store.terminalSessions.length > 0) renderTerminals();
+}
+
+async function fetchAccess() {
+  const data = await jsonFetch("/api/access");
+  store.access = {
+    mode: data.mode || "read_only",
+    readRequiresToken: Boolean(data.read_requires_token),
+    writeAvailable: Boolean(data.write_available),
+    writeAuthorized: Boolean(data.write_authorized),
+  };
+  renderAccess();
+  return store.access;
+}
+
+function initAccessControl() {
+  dom.editAccess.addEventListener("click", async () => {
+    if (store.access.writeAuthorized && store.access.mode === "public_read") {
+      localStorage.removeItem(TOKEN_KEY);
+      await fetchAccess().catch(() => {});
+      showToast("edit locked · public read-only");
+      return;
+    }
+    if (store.access.writeAuthorized) return;
+
+    const token = window.prompt("Muxa edit PAT");
+    if (!token) return;
+    localStorage.setItem(TOKEN_KEY, token.trim());
+    try {
+      const access = await fetchAccess();
+      if (!access.writeAuthorized) {
+        localStorage.removeItem(TOKEN_KEY);
+        await fetchAccess().catch(() => {});
+        showToast("invalid edit PAT");
+        return;
+      }
+      showToast("edit unlocked");
+    } catch (_) {
+      localStorage.removeItem(TOKEN_KEY);
+      showToast("invalid edit PAT");
+    }
+  });
+}
+
 function loadSet(key) {
   try {
     const raw = localStorage.getItem(key);
@@ -260,6 +351,12 @@ function saveValue(key, value) {
 // ── State ─────────────────────────────────────────────────────────
 
 const store = {
+  access: {
+    mode: "read_only",
+    readRequiresToken: false,
+    writeAvailable: false,
+    writeAuthorized: false,
+  },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
   terminalSessions: [], // SessionRef[]
@@ -1256,7 +1353,7 @@ function renderAgents() {
   renderDataMeta();
 
   if (rows.length === 0) {
-    dom.agentsBody.innerHTML = `<tr class="empty"><td colspan="9">no matching agents</td></tr>`;
+    dom.agentsBody.innerHTML = `<tr class="empty"><td colspan="10">no matching agents</td></tr>`;
     return;
   }
 
@@ -1279,10 +1376,19 @@ function renderAgents() {
         <td class="${limits.cls}" title="${esc(limits.title)}">${esc(limits.text)}</td>
         <td>${esc(prompt)}</td>
         <td>${esc(activity)}</td>
+        <td>${paneControlButtons(a.pane, a.tmux_socket)}</td>
       </tr>`;
     })
     .join("");
   dom.agentsBody.innerHTML = html;
+}
+
+function paneControlButtons(pane, socket = "") {
+  if (!store.access.writeAuthorized || !pane) return "—";
+  return `<span class="control-actions">
+    <button class="control-btn" type="button" data-pane-action="prompt" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">prompt</button>
+    <button class="control-btn danger" type="button" data-pane-action="abort" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">abort</button>
+  </span>`;
 }
 
 /// Build the LIMITS cell for one agent row. Mirrors the CLI watch
@@ -1387,7 +1493,10 @@ function renderPanes() {
         <td>${esc(p.pane_id)}</td>
         <td>${esc(p.current_command)}</td>
         <td>${esc(p.title)}</td>
-        <td><button class="attach-btn" data-cmd="${esc(p.attach_command)}">copy attach</button></td>
+        <td><span class="control-actions">
+          <button class="attach-btn" data-cmd="${esc(p.attach_command)}">copy attach</button>
+          ${paneControlButtons(p.pane_id, p.socket)}
+        </span></td>
       </tr>`;
     })
     .join("");
@@ -1416,7 +1525,13 @@ function renderTerminals() {
       <td title="${esc(s.cwd || "")}">${esc(shortPath(s.cwd || "—"))}</td>
       <td class="num">${esc(String(s.attached_clients || 0))}</td>
       <td>${s.exited ? `exited ${esc(String(s.exit_status ?? ""))}` : "running"}</td>
-      <td><button class="attach-btn" data-session="${esc(s.id)}">capture</button></td>
+      <td><span class="control-actions">
+        <button class="attach-btn" data-terminal-action="capture" data-session="${esc(s.id)}">capture</button>
+        ${store.access.writeAuthorized && !s.exited
+          ? `<button class="control-btn" data-terminal-action="input" data-session="${esc(s.id)}">input</button>
+             <button class="control-btn danger" data-terminal-action="terminate" data-session="${esc(s.id)}">terminate</button>`
+          : ""}
+      </span></td>
     </tr>`)
     .join("");
 }
@@ -1426,6 +1541,62 @@ async function showTerminalCapture(id) {
   store.ui.selectedSegment = null;
   store.ui.terminalCapture = { id, snapshot: snap };
   renderInspector();
+}
+
+async function runPaneControl(button) {
+  const action = button.getAttribute("data-pane-action");
+  const pane = button.getAttribute("data-pane");
+  const socket = button.getAttribute("data-pane-socket") || null;
+  if (!action || !pane) return;
+
+  if (action === "prompt") {
+    const text = window.prompt(`Send prompt to ${pane}`);
+    if (!text) return;
+    await controlFetch(`/api/panes/${encodeURIComponent(pane)}/prompt`, {
+      method: "POST",
+      body: JSON.stringify({ text, submit: true, socket }),
+    });
+    showToast(`prompt sent to ${pane}`);
+    return;
+  }
+
+  if (action === "abort") {
+    if (!window.confirm(`Send Ctrl-C to ${pane}?`)) return;
+    await controlFetch(`/api/panes/${encodeURIComponent(pane)}/abort`, {
+      method: "POST",
+      body: JSON.stringify({ socket }),
+    });
+    showToast(`abort sent to ${pane}`);
+  }
+}
+
+async function runTerminalControl(button) {
+  const action = button.getAttribute("data-terminal-action");
+  const id = button.getAttribute("data-session");
+  if (!action || !id) return;
+
+  if (action === "capture") {
+    await showTerminalCapture(id);
+    return;
+  }
+  if (action === "input") {
+    const data = window.prompt(`Send input to ${id}`);
+    if (data == null) return;
+    await controlFetch(`/api/terminal-sessions/${encodeURIComponent(id)}/input`, {
+      method: "POST",
+      body: JSON.stringify({ data: `${data}\r` }),
+    });
+    showToast(`input sent to ${id}`);
+    return;
+  }
+  if (action === "terminate") {
+    if (!window.confirm(`Terminate terminal ${id}?`)) return;
+    await controlFetch(`/api/terminal-sessions/${encodeURIComponent(id)}/terminate`, {
+      method: "POST",
+    });
+    showToast(`terminated ${id}`);
+    await fetchTerminalSessions();
+  }
 }
 
 function renderTerminalCapture(capture) {
@@ -1612,17 +1783,26 @@ function initDynamicEventDelegation() {
     renderTimeline();
   });
 
+  dom.agentsBody.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-pane-action]");
+    if (button) runPaneControl(button).catch((error) => showToast(error.message));
+  });
+
   dom.panesBody.addEventListener("click", async (event) => {
-    const button = event.target.closest("[data-cmd]");
-    if (!button) return;
-    const ok = await copyToClipboard(button.getAttribute("data-cmd") || "");
+    const control = event.target.closest("[data-pane-action]");
+    if (control) {
+      await runPaneControl(control).catch((error) => showToast(error.message));
+      return;
+    }
+    const copy = event.target.closest("[data-cmd]");
+    if (!copy) return;
+    const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
     showToast(ok ? "copied attach command" : "clipboard blocked — copy manually");
   });
 
   dom.terminalsBody.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-session]");
-    const id = button?.getAttribute("data-session");
-    if (id) showTerminalCapture(id).catch(() => {});
+    const button = event.target.closest("[data-terminal-action]");
+    if (button) runTerminalControl(button).catch((error) => showToast(error.message));
   });
 
   dom.paneSocketChips.addEventListener("click", (event) => {
@@ -1995,6 +2175,7 @@ function scheduleTimelineRefresh() {
 
 async function main() {
   bootstrapToken();
+  initAccessControl();
   initCollapseControls();
   initDataTabs();
   initSessionControls();
@@ -2004,6 +2185,7 @@ async function main() {
 
   try {
     await fetchHealth();
+    await fetchAccess();
   } catch (_) {
     return; // setConnectionStatus already showed the error
   }

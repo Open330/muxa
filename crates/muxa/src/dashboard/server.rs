@@ -1,11 +1,11 @@
 //! axum HTTP server for the dashboard.
 //!
-//! The router exposes three read-only endpoints — `/api/health`,
-//! `/api/agents`, `/api/panes` — gated by [`auth_middleware`] when a
-//! token is configured. Everything is read-only by design (no write
-//! API), so cross-site request forgery is not a concern; we use bearer
-//! tokens instead of cookies so the same router serves CLI and browser
-//! clients with the same primitive.
+//! Read routes can be private, public-read, or fully public depending on
+//! [`DashboardAuthMode`](crate::config::DashboardAuthMode). Control routes
+//! are separate and always require the configured bearer token; `auth =
+//! "none"` disables them rather than making them public. Bearer tokens are
+//! sent in `Authorization`, never cookies, so cross-site forms cannot trigger
+//! a control action and browser clients can treat the token like a PAT.
 //!
 //! [`serve`] composes the router with the lifecycle plumbing the daemon
 //! needs: TCP bind, graceful shutdown wired to the daemon's existing
@@ -13,14 +13,14 @@
 
 use axum::{
     body::Body,
-    extract::{Query, State},
-    http::{header, Request, StatusCode},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use futures::stream::{self, Stream, StreamExt};
@@ -39,7 +39,7 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
 use crate::backend::{HostKind, SharedBackend};
-use crate::config::StatsConfig;
+use crate::config::{DashboardAuthMode, StatsConfig};
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::metrics::Metrics;
@@ -71,6 +71,7 @@ const AGENTS_BY_STATE_CACHE_TTL: Duration = Duration::from_secs(1);
 
 const TIMELINE_SUMMARY_CACHE_TTL: Duration = Duration::from_secs(15);
 const TIMELINE_SUMMARY_CACHE_CAPACITY: usize = 16;
+const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 
 /// Cached `agents_by_state` histogram with the wall-clock instant it
 /// was computed. Lives inside [`AppState`] behind a `tokio::sync::Mutex`
@@ -104,6 +105,9 @@ pub struct AppState {
     /// historical tmux-scanner path — the default for tests and any caller
     /// that doesn't supply one (behaviour is byte-identical to before).
     pub backend: Option<SharedBackend>,
+    /// Every active backend, used to route PAT-gated pane control actions by
+    /// pane-id namespace. `backend` above remains the primary scan source.
+    pub backends: Arc<Vec<SharedBackend>>,
     /// Lock-free runtime counters surfaced via `/api/metrics`. Cloned
     /// from the [`Store`](crate::state::Store)'s metrics so SSE
     /// connect/disconnect bumps live alongside event-apply bumps.
@@ -151,6 +155,7 @@ impl AppState {
             pane_cache,
             sessions,
             backend: None,
+            backends: Arc::new(Vec::new()),
             metrics,
             activity_path: None,
             session_activity_path: None,
@@ -184,7 +189,15 @@ impl AppState {
 
     #[must_use]
     pub fn with_backend(mut self, backend: SharedBackend) -> Self {
-        self.backend = Some(backend);
+        self.backend = Some(backend.clone());
+        self.backends = Arc::new(vec![backend]);
+        self
+    }
+
+    #[must_use]
+    pub fn with_backends(mut self, backends: Vec<SharedBackend>) -> Self {
+        self.backend = backends.first().cloned();
+        self.backends = Arc::new(backends);
         self
     }
 
@@ -244,9 +257,11 @@ fn merge_pane_scans(
 /// touching this file.
 pub fn router(state: AppState) -> Router {
     let host_layer = middleware::from_fn_with_state(state.clone(), host_guard_middleware);
-    let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);
-    let api = Router::new()
+    let read_auth_layer = middleware::from_fn_with_state(state.clone(), read_auth_middleware);
+    let write_auth_layer = middleware::from_fn_with_state(state.clone(), write_auth_middleware);
+    let read_api = Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/access", get(access_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/panes", get(panes_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
@@ -256,9 +271,26 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/timeline", get(timeline_handler))
         .route("/api/events", get(events_handler))
-        .route("/api/metrics", get(metrics_handler))
-        .layer(auth_layer)
-        .with_state(state.clone());
+        .route("/api/metrics", get(metrics_handler));
+    let read_api = if matches!(state.config.auth, DashboardAuthMode::Token) {
+        read_api.layer(read_auth_layer)
+    } else {
+        read_api
+    };
+    let write_api = Router::new()
+        .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
+        .route("/api/panes/{pane}/abort", post(pane_abort_handler))
+        .route(
+            "/api/terminal-sessions/{id}/input",
+            post(terminal_input_handler),
+        )
+        .route(
+            "/api/terminal-sessions/{id}/terminate",
+            post(terminal_terminate_handler),
+        )
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
+        .layer(write_auth_layer);
+    let api = read_api.merge(write_api).with_state(state.clone());
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
     // rationale (token bootstrap in the browser). The DNS-rebinding host
     // guard, by contrast, wraps *everything* (API + assets). The
@@ -310,12 +342,12 @@ pub async fn serve(
     store: SharedStore,
     pane_cache: Arc<PaneCache>,
     sessions: SharedSessionBackend,
-    backend: SharedBackend,
+    backends: Vec<SharedBackend>,
     runtime: DashboardRuntimeConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
     let state = AppState::new(store, config.clone(), pane_cache, sessions)
-        .with_backend(backend)
+        .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
         .with_stats_config(runtime.stats_config);
     let app = router(state);
@@ -421,12 +453,9 @@ fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
     }
 }
 
-/// Auth middleware. When a token is configured on the resolved config,
-/// every request must carry a matching `Authorization: Bearer <tok>`.
-/// Requests pass through unchallenged only under the explicit
-/// `dashboard.auth = "none"` opt-out; the resolver rejects an enabled
-/// token-auth dashboard without an explicit token.
-async fn auth_middleware(
+/// Read authentication for `auth = "token"`. Public-read and none modes do
+/// not install this layer on their GET/SSE router.
+async fn read_auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
@@ -445,11 +474,63 @@ async fn auth_middleware(
     }
 }
 
+/// Control authentication. This layer always wraps mutation routes. A
+/// missing configured token means control is intentionally unavailable
+/// (`auth = "none"`), never anonymously writable.
+async fn write_auth_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let Some(expected) = state.config.token.as_deref() else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let header_value = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+    if auth::check_bearer(header_value, expected) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
     version: &'static str,
     protocol: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessResponse {
+    mode: &'static str,
+    read_requires_token: bool,
+    write_available: bool,
+    write_authorized: bool,
+}
+
+async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let header_value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+    let write_authorized = state
+        .config
+        .token
+        .as_deref()
+        .is_some_and(|expected| auth::check_bearer(header_value, expected));
+    let mode = match state.config.auth {
+        DashboardAuthMode::Token => "token",
+        DashboardAuthMode::PublicRead => "public_read",
+        DashboardAuthMode::None => "read_only",
+    };
+    Json(AccessResponse {
+        mode,
+        read_requires_token: matches!(state.config.auth, DashboardAuthMode::Token),
+        write_available: state.config.token.is_some(),
+        write_authorized,
+    })
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -501,7 +582,7 @@ async fn terminal_sessions_handler(State(state): State<AppState>) -> impl IntoRe
 
 async fn terminal_capture_handler(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    Path(id): Path<String>,
 ) -> Response {
     match state.sessions.capture(&id) {
         Ok(snapshot) => Json(snapshot).into_response(),
@@ -510,6 +591,267 @@ async fn terminal_capture_handler(
             Json(json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneControlTarget {
+    /// Optional tmux socket name/path. Required only when the same `%N` pane
+    /// id exists on more than one tmux server.
+    socket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PanePromptRequest {
+    text: String,
+    #[serde(default = "default_true")]
+    submit: bool,
+    socket: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalInputRequest {
+    data: String,
+}
+
+fn control_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({ "ok": false, "error": message.into() })),
+    )
+        .into_response()
+}
+
+struct ControlFailure {
+    status: StatusCode,
+    message: String,
+}
+
+impl ControlFailure {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn into_response(self) -> Response {
+        control_error(self.status, self.message)
+    }
+}
+
+fn control_backend(state: &AppState, pane: &str) -> Result<SharedBackend, ControlFailure> {
+    let Some(primary) = state.backends.first() else {
+        return Err(ControlFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no pane backend is available",
+        ));
+    };
+    match crate::backend::pane_id_host_kind(pane) {
+        Some(kind) => state
+            .backends
+            .iter()
+            .find(|backend| backend.kind() == kind)
+            .cloned()
+            .ok_or_else(|| {
+                ControlFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no active {kind} backend for pane {pane}"),
+                )
+            }),
+        None => Ok(primary.clone()),
+    }
+}
+
+fn socket_basename(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
+async fn control_socket(
+    state: &AppState,
+    backend: &SharedBackend,
+    pane: &str,
+    requested: Option<&str>,
+) -> Result<Option<String>, ControlFailure> {
+    if backend.kind() != HostKind::Tmux {
+        return Ok(None);
+    }
+
+    let mut candidates = state
+        .store
+        .by_pane(pane)
+        .await
+        .into_iter()
+        .filter_map(|agent| agent.tmux_socket)
+        .filter_map(|socket| socket_basename(&socket))
+        .collect::<Vec<_>>();
+    let scan = state.refresh_pane_scan().await;
+    candidates.extend(
+        scan.panes
+            .into_iter()
+            .filter(|candidate| candidate.pane_id == pane)
+            .filter_map(|candidate| {
+                candidate
+                    .socket
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            }),
+    );
+    candidates.sort();
+    candidates.dedup();
+
+    if let Some(requested) = requested.and_then(socket_basename) {
+        if candidates.iter().any(|candidate| candidate == &requested) {
+            return Ok(Some(requested));
+        }
+        return Err(ControlFailure::new(
+            StatusCode::BAD_REQUEST,
+            format!("pane {pane} is not present on tmux socket {requested}"),
+        ));
+    }
+
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => Err(ControlFailure::new(
+            StatusCode::CONFLICT,
+            format!("pane {pane} exists on multiple tmux sockets; specify socket"),
+        )),
+    }
+}
+
+async fn pane_prompt_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Json(input): Json<PanePromptRequest>,
+) -> Response {
+    if input.text.trim().is_empty() {
+        return control_error(StatusCode::BAD_REQUEST, "prompt text is empty");
+    }
+    let backend = match control_backend(&state, &pane) {
+        Ok(backend) if backend.caps().send_text => backend,
+        Ok(backend) => {
+            return control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane input", backend.kind()),
+            );
+        }
+        Err(failure) => return failure.into_response(),
+    };
+    let socket = match control_socket(&state, &backend, &pane, input.socket.as_deref()).await {
+        Ok(socket) => socket,
+        Err(failure) => return failure.into_response(),
+    };
+    let text = input.text;
+    let submit = input.submit;
+    let pane_for_send = pane.clone();
+    let (sent, submitted) = tokio::task::spawn_blocking(move || {
+        let socket = socket.as_deref();
+        let sent = backend.send_text_on(socket, &pane_for_send, &text);
+        let submitted = if sent && submit {
+            std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+            backend.send_text_on(socket, &pane_for_send, "\r")
+        } else {
+            false
+        };
+        (sent, submitted)
+    })
+    .await
+    .unwrap_or((false, false));
+
+    if !sent {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "pane input failed: pane gone or backend unreachable",
+        );
+    }
+    Json(json!({
+        "ok": true,
+        "pane": pane,
+        "sent": sent,
+        "submitted": submitted,
+    }))
+    .into_response()
+}
+
+async fn pane_abort_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Json(input): Json<PaneControlTarget>,
+) -> Response {
+    let backend = match control_backend(&state, &pane) {
+        Ok(backend) if backend.caps().send_text => backend,
+        Ok(backend) => {
+            return control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane input", backend.kind()),
+            );
+        }
+        Err(failure) => return failure.into_response(),
+    };
+    let socket = match control_socket(&state, &backend, &pane, input.socket.as_deref()).await {
+        Ok(socket) => socket,
+        Err(failure) => return failure.into_response(),
+    };
+    let pane_for_send = pane.clone();
+    let sent = tokio::task::spawn_blocking(move || {
+        backend.send_text_on(socket.as_deref(), &pane_for_send, "\u{3}")
+    })
+    .await
+    .unwrap_or(false);
+    if !sent {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "abort failed: pane gone or backend unreachable",
+        );
+    }
+    Json(json!({ "ok": true, "pane": pane, "aborted": true })).into_response()
+}
+
+async fn terminal_input_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<TerminalInputRequest>,
+) -> Response {
+    match state.sessions.send_input(&id, input.data.as_bytes()) {
+        Ok(()) => Json(json!({ "ok": true, "session_id": id })).into_response(),
+        Err(crate::session::SessionError::NotFound(_)) => {
+            control_error(StatusCode::NOT_FOUND, format!("session not found: {id}"))
+        }
+        Err(crate::session::SessionError::Exited(_)) => control_error(
+            StatusCode::CONFLICT,
+            format!("session already exited: {id}"),
+        ),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn terminal_terminate_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.sessions.terminate(&id) {
+        Ok(()) => Json(json!({ "ok": true, "session_id": id })).into_response(),
+        Err(crate::session::SessionError::NotFound(_)) => {
+            control_error(StatusCode::NOT_FOUND, format!("session not found: {id}"))
+        }
+        Err(crate::session::SessionError::Exited(_)) => control_error(
+            StatusCode::CONFLICT,
+            format!("session already exited: {id}"),
+        ),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
 
@@ -1170,13 +1512,63 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendCaps, PaneBackend};
     use crate::event::{AgentEvent, AgentId, AgentKind};
     use crate::state::Store;
+    use crate::tmux::PaneInfo;
     use axum::body::to_bytes;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use tower::ServiceExt;
+
+    struct RecordingControlBackend {
+        sent: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl PaneBackend for RecordingControlBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Herdr
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            Vec::new()
+        }
+
+        fn resolve_pane(&self, _pane_id: &str) -> Option<PaneInfo> {
+            None
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, pane_id: &str, text: &str) -> bool {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            true
+        }
+
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
 
     fn fresh_state() -> AppState {
         AppState::new(
@@ -1196,6 +1588,13 @@ mod tests {
             Arc::new(PaneCache::new(Duration::from_secs(60))),
             crate::session::PtySessionBackend::shared(),
         )
+    }
+
+    fn public_read_state(token: &str) -> AppState {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::PublicRead;
+        cfg.token = Some(token.to_string());
+        state_from(cfg)
     }
 
     fn state_from(cfg: DashboardConfig) -> AppState {
@@ -1609,6 +2008,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_read_allows_anonymous_reads_and_reports_locked_control() {
+        let app = router(public_read_state("edit-pat"));
+        let agents = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agents.status(), StatusCode::OK);
+
+        let access = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/access")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(access.status(), StatusCode::OK);
+        let access = body_json(access).await;
+        assert_eq!(access["mode"], "public_read");
+        assert_eq!(access["read_requires_token"], false);
+        assert_eq!(access["write_available"], true);
+        assert_eq!(access["write_authorized"], false);
+
+        let unlocked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/access")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unlocked = body_json(unlocked).await;
+        assert_eq!(unlocked["write_authorized"], true);
+    }
+
+    #[tokio::test]
+    async fn public_read_mutations_require_the_control_pat() {
+        let app = router(public_read_state("edit-pat"));
+        let locked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminal-sessions/missing/terminate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+
+        let unlocked = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminal-sessions/missing/terminate")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlocked.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_read_pat_can_send_and_submit_a_pane_prompt() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let backend: SharedBackend = Arc::new(RecordingControlBackend { sent: sent.clone() });
+        let app = router(public_read_state("edit-pat").with_backend(backend));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/panes/herdr%3Ap1/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"review this","submit":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                ("herdr:p1".to_string(), "review this".to_string()),
+                ("herdr:p1".to_string(), "\r".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_none_is_read_only_not_anonymously_writable() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        cfg.token = None;
+        let app = router(state_from(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminal-sessions/missing/terminate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     /// A persisted explicit token (the path used by `muxa init`) gates the API.

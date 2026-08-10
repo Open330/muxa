@@ -57,8 +57,9 @@ Paths are configurable; defaults live under `$XDG_DATA_HOME/muxa`.
 
 - IPC socket is hardened to owner-only permissions where supported.
 - Dashboard is loopback-only by default.
-- Public dashboard binding requires explicit `allow_public`; unauthenticated
-  public API requires the additional `dashboard.auth = "none"` opt-in.
+- Public dashboard binding requires explicit `allow_public`. `public_read`
+  exposes anonymous reads while requiring a PAT for mutations; `none` exposes
+  reads with mutations disabled.
 - External sinks are opt-in.
 - The codebase forbids unsafe Rust.
 

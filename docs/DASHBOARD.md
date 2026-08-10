@@ -1,9 +1,10 @@
 # muxa dashboard
 
-A small read-only HTTP UI bolted onto the daemon. Same agents you see on the
+A small HTTP UI bolted onto the daemon. It shows the same agents you see on the
 tmux status line, a timeline graph of work/wait/error intervals, plus
 **every tmux pane on the box** (across all running servers), updated live
-over Server-Sent Events.
+over Server-Sent Events. Optional control actions are protected by a bearer
+token that can be pasted into the browser like a PAT.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
 Token authentication is the default auth mode, and an enabled dashboard must
@@ -17,13 +18,21 @@ machine without explicit public-bind acknowledgement.
 | `GET /`             | The dashboard HTML (loads the JS bundle).                                      |
 | `GET /static/*`     | Embedded JS/CSS assets.                                                        |
 | `GET /api/health`   | `{ ok, version, protocol }`                                                    |
+| `GET /api/access`   | Current read/control access mode and whether the supplied PAT can edit.        |
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
 | `GET /api/panes`    | Global tmux pane list (every readable socket), with per-socket scan errors.   |
+| `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
+| `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
+| `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
+| `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
+| `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
 
-`/api/*` endpoints require a Bearer token when token auth is enabled. The
-static routes do not — see "Why the HTML is public" below.
+`auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
+GET/SSE endpoints public but always requires the bearer token for POST control
+actions. `auth = "none"` leaves reads public and disables POST control entirely.
+Static routes are public in every mode — see "Why the HTML is public" below.
 
 ## Quick start
 
@@ -77,7 +86,37 @@ muxad --dashboard --dashboard-auth none
 
 Open <http://127.0.0.1:7878/>.
 
-### Public bind with a token (LAN / VPN)
+### Public read-only dashboard with PAT editing (LAN / VPN)
+
+This is the mode for a dashboard that anyone on the reachable network may
+view, while only a browser with the PAT can display and use edit controls:
+
+```toml
+[dashboard]
+enabled = true
+bind = "0.0.0.0:7878"
+allow_public = true
+auth = "public_read"
+token = "replace-with-a-long-random-token"
+```
+
+Open `http://<host>:7878/` for anonymous read-only access. Select **unlock
+edit** and paste the token to enable prompt, abort, input, and terminate
+controls. The browser stores it in `localStorage`; selecting **lock edit**
+removes it again.
+
+The equivalent CLI invocation is:
+
+```sh
+TOK=$(openssl rand -hex 32)
+muxad --dashboard \
+      --dashboard-bind 0.0.0.0:7878 \
+      --dashboard-auth public_read \
+      --dashboard-token "$TOK" \
+      --allow-public
+```
+
+### Public bind with fully token-protected reads (LAN / VPN)
 
 You must opt in to *both* a non-loopback bind *and* a token. Either alone
 fails at startup:
@@ -95,7 +134,7 @@ Open `http://<host>:7878/#token=$TOK` in the browser.
 If you skip `--allow-public` or `--dashboard-token`, `muxad` refuses to start
 with a clear message — same applies to TOML configs.
 
-### Public bind without API auth
+### Public bind without API auth or editing
 
 For a trusted private network, you can intentionally expose the read-only API
 without a bearer token:
@@ -117,9 +156,9 @@ muxad --dashboard \
       --dashboard-auth none
 ```
 
-This exposes `/api/agents`, `/api/panes`, `/api/timeline`, `/api/events`, and
-`/api/metrics` to anyone who can reach the port. Use it only on a network you
-already trust.
+This exposes all GET/SSE data to anyone who can reach the port. POST control
+routes return `403 Forbidden`, so this mode cannot become anonymously writable.
+Use it only on a network you already trust.
 
 > ⚠️ **TLS is out of scope.** Use a reverse proxy (nginx, Caddy, Traefik) to
 > terminate TLS in front of the dashboard. Set `proxy_buffering off;` for the
@@ -135,8 +174,8 @@ already enforces env-beats-flag for the fields it covers).
 | -------------------- | ------- | ------------------ | --------------------------------------------------------------- |
 | `enabled`            | bool    | `false`            | `--dashboard` / `--no-dashboard` / `MUXA_DASHBOARD_ENABLED`     |
 | `bind`               | string  | `"127.0.0.1:7878"` | `--dashboard-bind` / `MUXA_DASHBOARD_BIND`                      |
-| `auth`               | string  | `"token"`          | `--dashboard-auth` / `MUXA_DASHBOARD_AUTH` (`token` or `none`)  |
-| `token`              | string  | unset (required with token auth) | `--dashboard-token` / `MUXA_DASHBOARD_TOKEN`          |
+| `auth`               | string  | `"token"`          | `--dashboard-auth` / `MUXA_DASHBOARD_AUTH` (`token`, `public_read`, or `none`) |
+| `token`              | string  | unset (required with `token`/`public_read`) | `--dashboard-token` / `MUXA_DASHBOARD_TOKEN` |
 | `allow_public`       | bool    | `false`            | `--allow-public` / `MUXA_DASHBOARD_ALLOW_PUBLIC`                |
 | `pane_cache_ttl_ms`  | u64     | `2000`             | (TOML only)                                                     |
 
@@ -211,8 +250,9 @@ Three reasons:
 1. **Bootstrap.** Browsers can't inject custom headers on top-level
    navigation. The first GET has to succeed unauthenticated for the JS to
    start, read `#token=...`, and persist it in `localStorage`.
-2. **No data.** The bundle holds no agent state. It's a thin client that
-   asks `/api/*` for everything. Those endpoints stay gated.
+2. **No embedded data.** The bundle holds no agent state. It's a thin client
+   that asks `/api/*` for everything. API access follows the selected auth
+   mode.
 3. **The cost is bounded.** An unauthenticated GET to `/` returns the same
    bytes for everyone. There's nothing to leak.
 
@@ -224,8 +264,9 @@ that strips the carve-out (or use mTLS).
 - No dashboard-specific database. The daemon rehydrates live state from
   `state.json`, while prompt and activity history use the configured local
   NDJSON files.
-- No write API. Read-only dashboard. CSRF moot, but also no "stop this agent"
-  button.
+- Control is intentionally narrow: pane prompt/abort and Muxa-owned PTY
+  input/terminate. Configuration, files, and arbitrary commands are not
+  writable through the dashboard.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.
 - No multi-user auth. One token = one bearer.
 
