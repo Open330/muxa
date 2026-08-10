@@ -182,7 +182,7 @@ current `muxa watch` shortcuts interactively.
 | `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
 | `muxa agent start --work CAL-7041 ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
-| `muxa onboard` | Interactive policy, normal workflow, MCP pattern, and live `muxa watch` shortcut training; use `--print` for a static guide. |
+| `muxa onboard` | Fullscreen mock-dashboard walkthrough for the policy, normal workflow, MCP pattern, and live `muxa watch` shortcuts; use `--print` for a static guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
