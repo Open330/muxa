@@ -19,27 +19,40 @@ dialog로 work row, agent pane, 상태, inspector, footer 단축키의 위치를
 직접 보여줍니다. 이 화면은 설명용이므로 실제 tmux session을 변경하지
 않습니다.
 
-mock의 상태 열도 실제 watch와 같은 단일-cell icon을 사용합니다.
-기본 Unicode 설정에서는 `●` working, `▶` waiting-input, `◆` choice,
-`○` idle, `■` error이며 `[ui] icons = "ascii"` 환경에서는 대응하는 ASCII
-marker가 사용됩니다.
+mock은 실제 session view처럼 `SESSION · DUR · ACT · SUMMARY` 열을 사용하고,
+상태를 별도 오른쪽 열에 두지 않습니다. 각 session 이름 왼쪽의 고정 gutter에
+상태를 모아 표시합니다. 기본 Unicode 설정에서는 `●` working, `▶`
+waiting-input, `◆` choice, `○` idle, `■` error이며 `[ui] icons = "ascii"`
+환경에서는 대응하는 ASCII marker가 사용됩니다. 120열 이상에서는 실제
+watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
 
     muxa onboard
 
 ![Muxa onboarding: watch mock 위의 위치별 dialog, 실제 상태 icon, 명령 입력 실습](demo-onboard.gif)
 
-일반 설명에서는 `Enter` 또는 `→`로 다음 단계, `←` 또는 `Backspace`로
-이전 단계로 이동하고 `Esc`/`q`로 닫습니다. 핵심 실습에서는 단순히
-Enter를 누르는 대신 다음 실제 명령을 mock prompt에 직접 입력합니다.
+첫 안내만 `Enter`로 시작합니다. 이후 기능 단계는 설명을 읽고 Enter를 누르는
+방식이 아니라 실제 watch 키를 눌러야 진행됩니다.
+
+- `j`/`↓`: 다음 session으로 이동
+- `l`/`→`: 선택한 session의 child agent로 진입
+- `Alt-T`: state/attention 순으로 정렬
+- `o`: pane preview 열기와 닫기
+- `?`/`F1`: 전체 단축키 도움말 열기와 닫기
+- `n`: new work + agent form 열기, `Esc`로 안전하게 닫기
+- `m`: 선택한 peer의 composer 열기, 빈 입력에서 `Backspace`로 닫기
+- `M`: mailbox 열기와 닫기
+
+shell에서 사용하는 다음 실제 명령도 mock prompt에 직접 입력합니다.
 
     muxa work start CAL-7041 --agent codex
     muxa watch
 
-입력한 명령은 검증만 하며 실행하지 않습니다. collaboration 단계에서는
-`m`/`M`을 눌러 message composer와 mailbox를 mock으로 열어볼 수 있습니다.
-빈 command prompt에서 `Backspace`를 누르면 이전 단계로 돌아갑니다.
+입력한 명령은 검증만 하며 실행하지 않습니다. 빈 command prompt에서
+`Backspace`를 누르면 이전 단계로 돌아갑니다. `Esc`는 실제 watch와 마찬가지로
+열려 있는 preview/help/form/composer를 먼저 닫고, modal이 없을 때 tour를
+종료합니다.
 
-모든 화면 설명은 보되 명령 입력 gate를 건너뛰려면 다음을 사용합니다.
+모든 화면 설명은 보되 단축키와 명령 입력 gate를 건너뛰려면 다음을 사용합니다.
 
     muxa onboard --no-quiz
 

@@ -135,8 +135,10 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 기본 tmux 운영 정책은 session 하나가 work/ticket 하나, pane 하나가 agent
 하나이며 window는 화면 배치에만 사용한다는 것입니다. `muxa onboard`는 이
 정책과 현재 `muxa watch` 단축키를 안전한 mock 화면에서 안내합니다. watch와
-같은 상태 icon을 보여주고, 실제로 실행하지는 않으면서 `muxa work start`와
-`muxa watch` 명령을 직접 입력하게 합니다.
+같은 왼쪽 session-state gutter, 열, 50/50 inspector, overlay, 한 줄 footer를
+보여줍니다. `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`, `M`을 실제로
+눌러 진행하며, 실행하지는 않으면서 `muxa work start`와 `muxa watch` 명령도
+직접 입력하게 합니다.
 
 <div align="center">
   <img src="docs/demo-onboard.gif" alt="Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon, 명령 입력 실습" width="900" />

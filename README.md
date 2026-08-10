@@ -159,9 +159,11 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
 Managed tmux policy: one session is one work/ticket, each pane is one agent,
 and windows are layout only. Run `muxa onboard` to learn this workflow and the
-current `muxa watch` shortcuts interactively. Its safe mock uses the same state
-icons as watch and asks you to type the real `muxa work start` / `muxa watch`
-commands without executing them.
+current `muxa watch` shortcuts interactively. Its safe mock mirrors watch's
+left-edge session-state gutter, columns, 50/50 inspector, overlays, and footer.
+You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`,
+and `M` actions, then type the real `muxa work start` / `muxa watch` commands
+without executing them.
 
 <div align="center">
   <img src="docs/demo-onboard.gif" alt="muxa onboarding: location-aware dialogs over a safe watch mock, canonical state icons, and simulated real-command practice" width="900" />

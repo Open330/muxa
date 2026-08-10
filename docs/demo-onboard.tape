@@ -8,11 +8,11 @@
 # session.
 #
 # Arc:
-#   0–7s    map the UI       — work/session, agent/pane, canonical state icons
-#   7–12s   inspect & keys   — pane preview and contextual footer shortcuts
-#   12–18s  type the command — real `muxa work start`, validated but not run
-#   18–23s  collaborate/MCP — message/mailbox and compact agent-side tools
-#   23–25s  launch           — type `muxa watch` to finish
+#   0–6s    navigate & sort — j/l and Alt-T over the real session-state gutter
+#   6–12s   inspect & help  — o and ? open/close watch-shaped overlays
+#   12–18s  create work     — n form, Esc, then validated CLI equivalent
+#   18–23s  collaborate     — m, empty Backspace, M mailbox toggle, MCP
+#   23–26s  launch          — type `muxa watch`, then recall q
 
 Output docs/demo-onboard.gif
 
@@ -40,48 +40,60 @@ Type "muxa onboard"
 Enter
 Sleep 1800ms
 
-# session = work, pane = agent
+# Start once with Enter; every feature lesson after this uses its live key.
 Enter
-Sleep 1400ms
-Enter
-Sleep 1400ms
-Enter
-Sleep 1400ms
+Sleep 1100ms
 
-# The state lesson now shows the exact ● / ▶ / ○ / ■ visual language.
-Enter
+# Move from CAL-7088 to CAL-7041, then enter its first child agent.
+Type "j"
+Sleep 1100ms
+Type "l"
+Sleep 1200ms
+
+# State is the left gutter of SESSION; Alt-T applies the real state sort.
+Alt+t
 Sleep 1800ms
 
-# Inspector and contextual footer.
-Enter
+# Open and close preview, then do the same with full shortcut help.
+Type "o"
 Sleep 1400ms
-Enter
+Type "o"
+Sleep 900ms
+Type "?"
 Sleep 1400ms
+Type "?"
+Sleep 1000ms
+
+# n opens the real-shaped bottom form; Esc closes it safely.
+Type "n"
+Sleep 1400ms
+Escape
+Sleep 900ms
 
 # A real command is typed, but onboarding only validates it.
 Type "muxa work start CAL-7041 --agent codex"
 Sleep 800ms
 Enter
-Sleep 1800ms
-Enter
+Sleep 1400ms
+
+# Message composer closes with empty Backspace; M toggles the mailbox.
+Type "m"
+Sleep 1100ms
+Backspace
+Sleep 800ms
+Type "M"
+Sleep 1200ms
+Type "M"
 Sleep 1000ms
 
-# Message and mailbox are still hands-on shortcut previews.
-Type "m"
-Sleep 1300ms
-Type "M"
-Sleep 1300ms
-Enter
-Sleep 1500ms
-
 # Agent-side MCP pattern.
-Enter
-Sleep 1400ms
+Right
+Sleep 1200ms
 
 # Finish by recalling the command that opens the real dashboard.
 Type "muxa watch"
 Sleep 700ms
 Enter
-Sleep 1400ms
-Enter
+Sleep 1200ms
+Type "q"
 Sleep 800ms
