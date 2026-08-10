@@ -27,6 +27,8 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::config::AskPermissionMode;
+
 /// How many entries the store keeps. Old answers are worth re-reading;
 /// unbounded growth is not.
 const DEFAULT_KEEP: usize = 200;
@@ -48,10 +50,12 @@ pub enum AskError {
 pub struct AskOptions {
     pub enabled: bool,
     pub agent: String,
-    /// Working directory the headless process runs in. Answers are
-    /// read-only queries, but the agent still resolves files relative to
-    /// somewhere, and "somewhere" should be the user's choice.
+    /// Working directory the headless process runs in. Default-mode asks are
+    /// intended as queries; edit/bypass automation still resolves its files
+    /// relative to this operator-selected root.
     pub cwd: PathBuf,
+    pub permission_mode: AskPermissionMode,
+    pub additional_dirs: Vec<PathBuf>,
     pub timeout_secs: u64,
     pub path: Option<PathBuf>,
     pub keep: usize,
@@ -63,6 +67,8 @@ impl Default for AskOptions {
             enabled: false,
             agent: "claude".into(),
             cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+            permission_mode: AskPermissionMode::Default,
+            additional_dirs: Vec::new(),
             timeout_secs: 180,
             path: None,
             keep: DEFAULT_KEEP,
@@ -265,6 +271,8 @@ impl AskStore {
                     &prompt,
                     resume.as_deref(),
                     &store.opts.cwd,
+                    store.opts.permission_mode,
+                    &store.opts.additional_dirs,
                     Duration::from_secs(store.opts.timeout_secs.max(5)),
                 )
                 .await;
@@ -378,10 +386,28 @@ impl AskAgent {
 
     /// Argv for one headless turn. `resume` continues an existing
     /// conversation; `None` starts a new one.
-    fn argv(self, prompt: &str, resume: Option<&str>) -> (&'static str, Vec<String>) {
+    fn argv(
+        self,
+        prompt: &str,
+        resume: Option<&str>,
+        permission_mode: AskPermissionMode,
+        additional_dirs: &[PathBuf],
+    ) -> (&'static str, Vec<String>) {
         match self {
             Self::Claude => {
                 let mut args = vec!["-p".to_string(), "--output-format".into(), "json".into()];
+                match permission_mode {
+                    AskPermissionMode::Default => {}
+                    AskPermissionMode::Edit => args.push("--permission-mode=acceptEdits".into()),
+                    AskPermissionMode::Bypass => {
+                        args.push("--dangerously-skip-permissions".into());
+                    }
+                }
+                args.extend(
+                    additional_dirs
+                        .iter()
+                        .map(|dir| format!("--add-dir={}", dir.display())),
+                );
                 if let Some(id) = resume {
                     args.push("--resume".into());
                     args.push(id.to_string());
@@ -397,6 +423,21 @@ impl AskAgent {
                     args.push("resume".into());
                     args.push(id.to_string());
                 }
+                match permission_mode {
+                    AskPermissionMode::Default => {}
+                    AskPermissionMode::Edit => {
+                        args.push("--sandbox=workspace-write".into());
+                        args.push("--approve-for-me".into());
+                    }
+                    AskPermissionMode::Bypass => {
+                        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+                    }
+                }
+                args.extend(
+                    additional_dirs
+                        .iter()
+                        .map(|dir| format!("--add-dir={}", dir.display())),
+                );
                 args.push("--json".into());
                 args.push(prompt.to_string());
                 ("codex", args)
@@ -409,9 +450,11 @@ impl AskAgent {
         prompt: &str,
         resume: Option<&str>,
         cwd: &std::path::Path,
+        permission_mode: AskPermissionMode,
+        additional_dirs: &[PathBuf],
         timeout: Duration,
     ) -> Result<AskAnswer, String> {
-        let (bin, args) = self.argv(prompt, resume);
+        let (bin, args) = self.argv(prompt, resume, permission_mode, additional_dirs);
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(&args)
             .current_dir(cwd)
@@ -549,14 +592,30 @@ mod tests {
 
     #[test]
     fn claude_argv_only_resumes_when_there_is_a_thread() {
-        let (bin, fresh) = AskAgent::Claude.argv("hi", None);
+        let (bin, fresh) = AskAgent::Claude.argv("hi", None, AskPermissionMode::Default, &[]);
         assert_eq!(bin, "claude");
         assert!(!fresh.contains(&"--resume".to_string()));
         assert_eq!(fresh.last().unwrap(), "hi");
 
-        let (_, resumed) = AskAgent::Claude.argv("hi", Some("s-9"));
+        let (_, resumed) =
+            AskAgent::Claude.argv("hi", Some("s-9"), AskPermissionMode::Default, &[]);
         let at = resumed.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(resumed[at + 1], "s-9");
+    }
+
+    #[test]
+    fn execution_controls_are_explicit_in_agent_argv() {
+        let dirs = [PathBuf::from("/nfs/home/june")];
+        let (_, claude) = AskAgent::Claude.argv("resolve", None, AskPermissionMode::Bypass, &dirs);
+        assert!(claude.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(claude.contains(&"--add-dir=/nfs/home/june".to_string()));
+
+        let (_, codex) = AskAgent::Codex.argv("resolve", None, AskPermissionMode::Bypass, &dirs);
+        assert!(codex.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(codex.contains(&"--add-dir=/nfs/home/june".to_string()));
+
+        let (_, safe) = AskAgent::Claude.argv("question", None, AskPermissionMode::Default, &dirs);
+        assert!(!safe.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[tokio::test]

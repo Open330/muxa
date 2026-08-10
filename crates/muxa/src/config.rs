@@ -130,10 +130,18 @@ pub struct AskConfig {
     pub enabled: bool,
     /// `claude` or `codex`.
     pub agent: String,
-    /// Directory the headless process runs in. Defaults to `$HOME` —
-    /// answers are queries, not edits, and a neutral cwd keeps a stray
-    /// question away from a working tree.
+    /// Directory the headless process runs in. Defaults to `$HOME`; a neutral
+    /// cwd keeps default-mode questions away from a working tree. Explicit
+    /// `edit`/`bypass` automation can select its roots separately.
     pub cwd: Option<PathBuf>,
+    /// Permission policy passed to the headless agent. `default` preserves
+    /// the agent CLI's normal policy; `edit` allows workspace edits while
+    /// retaining its sandbox/review layer; `bypass` disables approval and
+    /// sandbox checks and must be opted into explicitly.
+    pub permission_mode: AskPermissionMode,
+    /// Extra workspace roots exposed to the headless agent. This is required
+    /// when a path below `cwd` is a symlink whose real path lives elsewhere.
+    pub additional_dirs: Vec<PathBuf>,
     /// Wall-clock ceiling per question.
     pub timeout_secs: u64,
     /// History snapshot. Defaults to `$XDG_DATA_HOME/muxa/ask.json`.
@@ -148,11 +156,25 @@ impl Default for AskConfig {
             enabled: false,
             agent: "claude".into(),
             cwd: None,
+            permission_mode: AskPermissionMode::Default,
+            additional_dirs: Vec::new(),
             timeout_secs: 180,
             path: None,
             keep: 200,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskPermissionMode {
+    /// Preserve the selected agent CLI's normal permission behavior.
+    #[default]
+    Default,
+    /// Permit workspace edits while retaining sandbox/review protection.
+    Edit,
+    /// Disable approval and sandbox checks for unattended automation.
+    Bypass,
 }
 
 /// `[collaboration]` config — same-window durable agent request/reply.
@@ -1370,6 +1392,27 @@ mod tests {
         assert!(!cfg.notifier.enabled);
         // Discovery defaults on so users get backfill out of the box.
         assert!(cfg.discovery.enabled);
+    }
+
+    #[test]
+    fn parses_ask_permission_mode_and_additional_dirs() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ask]
+enabled = true
+permission_mode = "bypass"
+additional_dirs = ["/nfs/home/june", "/srv/shared"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ask.permission_mode, AskPermissionMode::Bypass);
+        assert_eq!(
+            cfg.ask.additional_dirs,
+            vec![
+                PathBuf::from("/nfs/home/june"),
+                PathBuf::from("/srv/shared")
+            ]
+        );
     }
 
     #[test]

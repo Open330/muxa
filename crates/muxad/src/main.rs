@@ -438,6 +438,8 @@ async fn build_ask(cfg: &Config) -> Arc<AskStore> {
             .cwd
             .clone()
             .unwrap_or_else(|| AskOptions::default().cwd),
+        permission_mode: cfg.ask.permission_mode,
+        additional_dirs: cfg.ask.additional_dirs.clone(),
         timeout_secs: cfg.ask.timeout_secs,
         path: cfg
             .ask
@@ -446,7 +448,17 @@ async fn build_ask(cfg: &Config) -> Arc<AskStore> {
             .flatten(),
         keep: cfg.ask.keep,
     };
-    AskStore::load(options).await
+    let store = AskStore::load(options).await;
+    if cfg.ask.enabled {
+        tracing::info!(
+            agent = %cfg.ask.agent,
+            cwd = %cfg.ask.cwd.as_deref().unwrap_or_else(|| std::path::Path::new("$HOME")).display(),
+            permission_mode = ?cfg.ask.permission_mode,
+            additional_dirs = ?cfg.ask.additional_dirs,
+            "headless ask enabled",
+        );
+    }
+    store
 }
 
 async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {

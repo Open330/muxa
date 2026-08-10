@@ -57,6 +57,8 @@ stats while newer activity ledger intervals are accumulating.
 enabled = true
 agent = "claude"     # claude | codex
 cwd = "~"            # where the headless process runs; defaults to $HOME
+permission_mode = "default" # default | edit | bypass
+additional_dirs = [] # extra real paths, e.g. ["/nfs/home/june"]
 timeout_secs = 180
 keep = 200           # answers retained before the oldest are dropped
 ```
@@ -70,6 +72,14 @@ the panel starts a fresh thread. `path` defaults to
 `$XDG_DATA_HOME/muxa/ask.json` and holds both the history and the per-agent
 thread ids. Off by default because enabling it lets the daemon spawn a CLI
 that bills your account. See [WATCH.md](WATCH.md).
+
+`permission_mode = "default"` preserves the agent CLI's normal permissions.
+`edit` enables workspace edits while retaining its sandbox or automated
+review layer. `bypass` is intended for unattended workflows such as a full
+issue resolver and disables approvals/sandboxing; use it only for prompts and
+directories you trust. `additional_dirs` is also passed to the agent CLI. Add
+the resolved target when files under `cwd` are symlinks outside it—for example
+`["/nfs/home/june"]` when `/home/june/workspace` points there.
 
 ## Collaboration
 

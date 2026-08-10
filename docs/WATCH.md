@@ -132,6 +132,12 @@ the popup is still open, and the history outlives restarts in
 `$XDG_DATA_HOME/muxa/ask.json`. Requires `[ask] enabled = true` — see
 [CONFIGURATION.md](CONFIGURATION.md).
 
+Ask is safe-by-default: agent permissions are unchanged unless `[ask]
+permission_mode` explicitly selects `edit` or `bypass`. Headless sessions
+cannot answer an approval prompt, so unattended skills that edit files, run
+commands, or publish changes need an appropriate mode. Symlink targets outside
+the configured `cwd` must also be listed in `[ask].additional_dirs`.
+
 ## Agent collaboration
 
 Focus the sending agent pane and open watch with `prefix+s`. Select another
