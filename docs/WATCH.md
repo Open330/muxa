@@ -132,6 +132,10 @@ the popup is still open, and the history outlives restarts in
 `$XDG_DATA_HOME/muxa/ask.json`. Requires `[ask] enabled = true` — see
 [CONFIGURATION.md](CONFIGURATION.md).
 
+Inside ask history, `n` starts a fresh conversation without deleting entries.
+`D` opens a confirmation and clears completed history across all agent filters;
+running asks and conversation ids are preserved.
+
 Ask defaults to `[ask].permission_mode = "bypass"` because headless sessions
 cannot answer approval prompts and ask is designed to run unattended skills.
 This allows file edits, commands, and publishing without confirmation, so only

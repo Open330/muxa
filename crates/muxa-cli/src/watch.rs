@@ -949,6 +949,15 @@ pub(crate) enum QuickAction {
     },
 }
 
+/// Payload behind the shared y/N confirmation popup. Most confirmations are
+/// synchronous quick actions; clearing ask history is daemon-owned and must be
+/// dispatched asynchronously by the run loop instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfirmAction {
+    Quick(QuickAction),
+    ClearAskHistory,
+}
+
 /// Outcome of running a [`QuickAction`] — surfaced to the run loop
 /// which then turns it into a transient footer hint or a state mutation.
 ///
@@ -1272,7 +1281,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach to selected pane",
         "  n              new agent session (dir · agent · first prompt)",
-        "  a / A          ask the configured agent / ask history",
+        "  a / A          ask / history; D clears completed history in A",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
@@ -1311,8 +1320,9 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
 /// instead of scrollable content.
 ///
 /// **Why default focus is "No"**: the actions this gates (`K` kills the
-/// pane, `R` aborts the agent's turn) are destructive enough that we
-/// want the user to deliberately type `y` rather than fat-finger Enter.
+/// pane, `R` aborts the agent's turn, `D` clears ask history) are destructive
+/// enough that we want the user to deliberately type `y` rather than
+/// fat-finger Enter.
 /// Anything other than `y` / `Y` cancels — including Esc, `n`, `q`,
 /// arrow keys, Tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1324,7 +1334,7 @@ pub(crate) struct ConfirmPopup {
     /// here so the input handler can complete the round-trip without
     /// re-resolving the selected row (which might have moved between
     /// the popup opening and the user's reply).
-    pub on_confirm: QuickAction,
+    pub on_confirm: ConfirmAction,
 }
 
 /// Inline prompt composer opened from the table with Enter. It pins the
@@ -4917,21 +4927,37 @@ pub async fn run(
                 }
                 Action::ConfirmYes => {
                     if let Some(popup) = app.confirm.take() {
-                        // The confirmed action (kill-pane, abort-turn, or a
-                        // prompt send) shells out to tmux synchronously —
-                        // and the send path also grace-sleeps between the
-                        // text and the Enter. Run the whole thing on a
-                        // blocking worker so neither the tmux fork nor the
-                        // sleep stalls the input/render loop.
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            let mut fx = RealEffects;
-                            dispatch_quick_action(popup.on_confirm, &mut fx)
-                        })
-                        .await
-                        .unwrap_or_else(|e| {
-                            ActionOutcome::Err(format!("✗ action task failed: {e}"))
-                        });
-                        apply_outcome_to_app(&mut app, outcome);
+                        match popup.on_confirm {
+                            ConfirmAction::Quick(action) => {
+                                // Pane and clipboard actions shell out
+                                // synchronously. Keep them off the input loop.
+                                let outcome = tokio::task::spawn_blocking(move || {
+                                    let mut fx = RealEffects;
+                                    dispatch_quick_action(action, &mut fx)
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    ActionOutcome::Err(format!("✗ action task failed: {e}"))
+                                });
+                                apply_outcome_to_app(&mut app, outcome);
+                            }
+                            ConfirmAction::ClearAskHistory => match client.ask_clear().await {
+                                Ok(removed) => {
+                                    refresh_ask_entries(client, &mut app).await;
+                                    app.set_hint(
+                                        format!(
+                                            "cleared {removed} completed ask entr{}",
+                                            if removed == 1 { "y" } else { "ies" }
+                                        ),
+                                        HintLevel::Ok,
+                                    );
+                                }
+                                Err(error) => app.set_hint(
+                                    format!("ask history clear failed: {error}"),
+                                    HintLevel::Err,
+                                ),
+                            },
+                        }
                     }
                 }
                 Action::ConfirmCancel => {
@@ -5675,9 +5701,9 @@ pub(crate) enum Action {
     InspectorSplitChanged,
     /// Atomically claim the current agent's pending inbox.
     ClaimCollaborationInbox,
-    /// Open a confirm popup for a destructive [`QuickAction`]. The
-    /// popup itself is interpreted by the input loop; the action only
-    /// dispatches when the user answers `y`.
+    /// Open a confirm popup for a destructive action. The popup itself is
+    /// interpreted by the input loop; the action only dispatches when the
+    /// user answers `y`.
     AskConfirm(ConfirmPopup),
     /// User answered `y` to the active confirm popup — dispatch the
     /// payload and clear the popup.
@@ -6287,8 +6313,8 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
     }
 }
 
-/// Ask history panel. `n` starts a new conversation rather than `r`,
-/// which is the global refresh everywhere else in the TUI.
+/// Ask history panel. `n` starts a new conversation, while uppercase `D`
+/// confirms clearing completed history. `r` remains the global refresh.
 fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
     match code {
         KeyCode::Esc | KeyCode::Char('q' | 'A') => {
@@ -6297,6 +6323,28 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         }
         KeyCode::Char('a') => Action::OpenAsk,
         KeyCode::Char('n') => Action::ResetAskThread,
+        KeyCode::Char('D') => {
+            let completed = app
+                .ask_entries
+                .iter()
+                .filter(|entry| !is_ask_running(entry))
+                .count();
+            if completed == 0 {
+                app.set_hint(
+                    "ask history: no completed entries to clear",
+                    HintLevel::Warn,
+                );
+                Action::None
+            } else {
+                Action::AskConfirm(ConfirmPopup {
+                    message: format!(
+                        "Clear all {completed} completed ask history entr{}? Running asks and conversation threads will be kept.",
+                        if completed == 1 { "y" } else { "ies" }
+                    ),
+                    on_confirm: ConfirmAction::ClearAskHistory,
+                })
+            }
+        }
         // Tab, not the arrows: every other overlay here already reads Tab
         // as "cycle the option" (mailbox tabs, request kind, spawn
         // fields), while arrows read as list movement — which is what
@@ -6832,7 +6880,7 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
         return match app.selected_agent().and_then(|agent| agent.pane.as_deref()) {
             Some(pane_id) => Action::AskConfirm(ConfirmPopup {
                 message: format!("Kill pane {}?", app.pane_label(pane_id)),
-                on_confirm: QuickAction::KillPane(pane_id.to_string()),
+                on_confirm: ConfirmAction::Quick(QuickAction::KillPane(pane_id.to_string())),
             }),
             None => Action::NotApplicable("kill: no tmux pane on this row"),
         };
@@ -6841,7 +6889,7 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
         Some(WatchRow::Agent(a)) => match a.pane.as_deref() {
             Some(pane_id) => Action::AskConfirm(ConfirmPopup {
                 message: format!("Kill pane {}?", app.pane_label(pane_id)),
-                on_confirm: QuickAction::KillPane(pane_id.to_string()),
+                on_confirm: ConfirmAction::Quick(QuickAction::KillPane(pane_id.to_string())),
             }),
             // Agent with no pane (Claude SDK sub-process whose
             // ancestry walk failed). `K` would be a no-op — surface
@@ -6853,12 +6901,12 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
                 "Kill pane {}:{}.{}?",
                 p.session, p.window_index, p.pane_index
             ),
-            on_confirm: QuickAction::KillPane(p.pane_id.clone()),
+            on_confirm: ConfirmAction::Quick(QuickAction::KillPane(p.pane_id.clone())),
         }),
         Some(WatchRow::Session(s)) => match s.representative_pane.as_deref() {
             Some(pane_id) => Action::AskConfirm(ConfirmPopup {
                 message: format!("Kill pane {}?", app.pane_label(pane_id)),
-                on_confirm: QuickAction::KillPane(pane_id.to_string()),
+                on_confirm: ConfirmAction::Quick(QuickAction::KillPane(pane_id.to_string())),
             }),
             None => Action::NotApplicable("kill: no tmux pane on this row"),
         },
@@ -6874,7 +6922,7 @@ pub(crate) fn quick_abort_action(app: &App) -> Action {
             match app.selected_agent().and_then(|agent| agent.pane.as_deref()) {
                 Some(pane_id) => Action::AskConfirm(ConfirmPopup {
                     message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
-                    on_confirm: QuickAction::AbortTurn(pane_id.to_string()),
+                    on_confirm: ConfirmAction::Quick(QuickAction::AbortTurn(pane_id.to_string())),
                 }),
                 None => Action::NotApplicable("abort: not a tracked agent"),
             }
@@ -6970,16 +7018,6 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_collaboration_mailbox(f, popup_area, app);
     }
-    if app.confirm.is_some() {
-        // 50 × 30 % keeps the popup small enough that the table
-        // behind stays scannable, but still leaves room for the
-        // borders + message line + spacer + y/N hint line on a
-        // typical 24-row terminal. Smaller (20 %) clips the hint
-        // line on shorter screens.
-        let popup_area = centered_rect(50, 30, chunks[1]);
-        f.render_widget(Clear, popup_area);
-        render_confirm(f, popup_area, app);
-    }
     if app.collaboration_composer.is_some() {
         let popup_area = bottom_prompt_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
@@ -7004,6 +7042,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         let popup_area = command_popup_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
         render_command_palette(f, popup_area, app);
+    }
+    if app.confirm.is_some() {
+        // Confirmation is always the top-most overlay, including when it was
+        // opened from ask history. 50 × 30 % keeps the popup small enough that
+        // the context behind stays scannable while retaining the y/N hint.
+        let popup_area = centered_rect(50, 30, chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_confirm(f, popup_area, app);
     }
     render_footer(f, chunks[2], app);
 }
@@ -10769,6 +10815,41 @@ mod tests {
         assert_eq!(claude, vec!["a".to_string(), "c".to_string()]);
         app.ask_panel.filter = AskFilter::Codex;
         assert_eq!(visible_ask_entries(&app).len(), 1);
+    }
+
+    #[test]
+    fn uppercase_d_in_ask_history_confirms_completed_history_clear() {
+        let mut app = app_with_paneless_and_pane();
+        let now = OffsetDateTime::now_utc();
+        let entry = |id: &str, status: muxa::ask::AskStatus| muxa::ask::AskEntry {
+            id: id.into(),
+            prompt: id.into(),
+            answer: String::new(),
+            status,
+            agent: "claude".into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: now,
+            answered_at: (status != muxa::ask::AskStatus::Running).then_some(now),
+            cost_usd: None,
+            error: None,
+        };
+        app.ask_entries = vec![
+            entry("done", muxa::ask::AskStatus::Answered),
+            entry("active", muxa::ask::AskStatus::Running),
+        ];
+        app.ask_panel.open = true;
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            &mut app,
+        );
+        let Action::AskConfirm(popup) = action else {
+            panic!("D must open a confirmation, got {action:?}");
+        };
+        assert_eq!(popup.on_confirm, ConfirmAction::ClearAskHistory);
+        assert!(popup.message.contains("1 completed"));
+        assert!(popup.message.contains("Running asks"));
     }
 
     #[test]
@@ -15803,7 +15884,10 @@ sort = ["state"]
         let action = quick_kill_action(&app);
         match action {
             Action::AskConfirm(popup) => {
-                assert_eq!(popup.on_confirm, QuickAction::KillPane("%42".into()));
+                assert_eq!(
+                    popup.on_confirm,
+                    ConfirmAction::Quick(QuickAction::KillPane("%42".into()))
+                );
                 // Pane label resolved against the inventory — should
                 // be the human-readable form, not the raw `%42`.
                 assert!(
@@ -15953,7 +16037,9 @@ sort = ["state"]
 
         // Mirror the run-loop dispatch: take the popup's payload and
         // route it through dispatch_quick_action.
-        let payload = app.confirm.take().unwrap().on_confirm;
+        let ConfirmAction::Quick(payload) = app.confirm.take().unwrap().on_confirm else {
+            panic!("expected a quick confirmation payload");
+        };
         let mut fx = RecorderEffects::default();
         let outcome = dispatch_quick_action(payload, &mut fx);
         assert_eq!(fx.kill_calls, vec!["%42"]);
@@ -15965,7 +16051,7 @@ sort = ["state"]
         let mut app = app_with_paneless_and_pane();
         app.confirm = Some(ConfirmPopup {
             message: "Kill pane main:2.0?".into(),
-            on_confirm: QuickAction::KillPane("%42".into()),
+            on_confirm: ConfirmAction::Quick(QuickAction::KillPane("%42".into())),
         });
 
         // `n` is one of "anything that isn't y/Y/Enter" — must cancel.
@@ -15992,7 +16078,7 @@ sort = ["state"]
             let mut app = app_with_paneless_and_pane();
             app.confirm = Some(ConfirmPopup {
                 message: "Kill pane?".into(),
-                on_confirm: QuickAction::KillPane("%42".into()),
+                on_confirm: ConfirmAction::Quick(QuickAction::KillPane("%42".into())),
             });
             let action = handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), &mut app);
             assert!(
@@ -16010,7 +16096,7 @@ sort = ["state"]
         let mut app = app_with_paneless_and_pane();
         app.confirm = Some(ConfirmPopup {
             message: "Kill pane?".into(),
-            on_confirm: QuickAction::KillPane("%42".into()),
+            on_confirm: ConfirmAction::Quick(QuickAction::KillPane("%42".into())),
         });
         let action = handle_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -16034,7 +16120,7 @@ sort = ["state"]
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / b          message selected room peer / mailbox"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
-        assert!(body.contains("a / A          ask the configured agent / ask history"));
+        assert!(body.contains("a / A          ask / history; D clears completed history in A"));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.
@@ -16577,7 +16663,7 @@ sort = ["state"]
         };
         assert_eq!(
             popup.on_confirm,
-            QuickAction::KillPane(app.selected_pane().unwrap())
+            ConfirmAction::Quick(QuickAction::KillPane(app.selected_pane().unwrap()))
         );
 
         let _ = key_action(&mut app, 'h');
@@ -16819,9 +16905,10 @@ sort = ["state"]
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app_with_paneless_and_pane();
+        app.ask_panel.open = true;
         app.confirm = Some(ConfirmPopup {
             message: "Kill pane main:2.0?".into(),
-            on_confirm: QuickAction::KillPane("%42".into()),
+            on_confirm: ConfirmAction::Quick(QuickAction::KillPane("%42".into())),
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let dump: String = terminal
@@ -17254,7 +17341,7 @@ sort = ["state"]
         );
         app.confirm = Some(ConfirmPopup {
             message: "Kill pane main:2.0?".into(),
-            on_confirm: QuickAction::KillPane("%42".into()),
+            on_confirm: ConfirmAction::Quick(QuickAction::KillPane("%42".into())),
         });
         terminal.draw(|f| render(f, &mut app)).unwrap();
         insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));

@@ -219,6 +219,8 @@ enum RequestBody {
     },
     /// Start a fresh conversation. History is untouched.
     AskReset {},
+    /// Remove completed ask history. Running asks and conversation ids stay.
+    AskClear {},
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -1376,6 +1378,10 @@ async fn handle(
                     ask.reset_thread().await;
                     Response::ok()
                 }
+                RequestBody::AskClear {} => {
+                    kind = "ask_clear";
+                    Response::with_pruned(ask.clear_history().await)
+                }
                 RequestBody::CollaborationSend {
                     origin,
                     target,
@@ -1886,6 +1892,14 @@ impl Client {
     pub async fn ask_reset(&self) -> Result<(), RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_reset" });
         self.call_checked(&req).await.map(|_| ())
+    }
+
+    /// Delete completed ask history while leaving active work and the current
+    /// per-agent conversation ids intact. Returns the number removed.
+    pub async fn ask_clear(&self) -> Result<usize, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_clear" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["pruned"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn collaboration_send(

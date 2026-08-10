@@ -1,6 +1,6 @@
 ---
 source: crates/muxa-cli/src/watch.rs
-assertion_line: 16986
+assertion_line: 17321
 expression: "snapshot_helpers::buffer_string(&terminal)"
 ---
  muxa watch   1 agent  + 0 panes   sort PANE ID   <clock>
@@ -17,7 +17,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
 │                           │  Enter          attach to selected pane                                          │                           │
 │                           │  n              new agent session (dir · agent · first prompt)                   │                           │
-│                           │  a / A          ask the configured agent / ask history                           │                           │
+│                           │  a / A          ask / history; D clears completed history in A                   │                           │
 │                           │                                                                                  │                           │
 │                           │Commands & inspection                                                             │                           │
 │                           │  :              command palette (Tab completes)                                  │                           │

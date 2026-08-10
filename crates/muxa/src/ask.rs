@@ -220,6 +220,21 @@ impl AskStore {
         self.persist().await;
     }
 
+    /// Remove completed history while preserving active asks and conversation
+    /// ids. A running child still needs its entry so [`Self::finish`] can
+    /// publish the answer when it exits; starting a fresh conversation remains
+    /// the separate responsibility of [`Self::reset_thread`].
+    pub async fn clear_history(&self) -> usize {
+        let _guard = self.write_lock.lock().await;
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|entry| entry.status == AskStatus::Running);
+        let removed = before.saturating_sub(entries.len());
+        drop(entries);
+        self.persist().await;
+        removed
+    }
+
     /// Record the question, spawn the agent, and return the pending entry
     /// immediately. The caller gets an id to watch; the answer arrives in
     /// the store when the child exits.
@@ -660,6 +675,44 @@ mod tests {
         let threads = store.threads.read().await;
         assert!(threads.get("codex").is_none());
         assert_eq!(threads.get("claude").map(String::as_str), Some("c-1"));
+    }
+
+    #[tokio::test]
+    async fn clearing_history_keeps_running_asks_and_conversation_ids() {
+        let store = AskStore::in_memory(AskOptions::default());
+        store
+            .threads
+            .write()
+            .await
+            .insert("claude".into(), "c-1".into());
+        let now = OffsetDateTime::now_utc();
+        let entry = |id: &str, status: AskStatus| AskEntry {
+            id: id.into(),
+            prompt: id.into(),
+            answer: String::new(),
+            status,
+            agent: "claude".into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: now,
+            answered_at: (status != AskStatus::Running).then_some(now),
+            cost_usd: None,
+            error: None,
+        };
+        *store.entries.write().await = vec![
+            entry("answered", AskStatus::Answered),
+            entry("failed", AskStatus::Failed),
+            entry("running", AskStatus::Running),
+        ];
+
+        assert_eq!(store.clear_history().await, 2);
+        let entries = store.list().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "running");
+        assert_eq!(
+            store.threads.read().await.get("claude").map(String::as_str),
+            Some("c-1")
+        );
     }
 
     #[tokio::test]
