@@ -58,7 +58,7 @@ agent = "claude"     # claude | codex
 cwd = "~"            # headless 프로세스가 실행될 위치. 기본값 $HOME
 permission_mode = "bypass" # bypass(기본값) | edit | default
 additional_dirs = [] # 추가 real path. 예: ["/nfs/home/june"]
-timeout_secs = 180
+timeout_secs = 1800    # wall-clock 제한 30분
 keep = 200           # 보관할 답변 수. 넘으면 오래된 것부터 버립니다
 ```
 
@@ -78,6 +78,9 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 기본 권한 정책을 유지합니다. `additional_dirs`도 agent CLI에 전달됩니다. `cwd` 아래
 파일이 외부 경로를 가리키는 symlink라면 real path를 추가해야 합니다. 예를 들어
 `/home/june/workspace`가 NFS를 가리키면 `["/nfs/home/june"]`를 사용합니다.
+`timeout_secs` 기본값은 persistent worker를 준비하는 skill을 고려해 30분입니다.
+이 제한에 도달하면 headless agent 프로세스가 종료됩니다. inactivity timeout이 아닌
+전체 wall-clock 안전 제한입니다.
 
 ## Collaboration
 

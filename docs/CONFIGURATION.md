@@ -59,7 +59,7 @@ agent = "claude"     # claude | codex
 cwd = "~"            # where the headless process runs; defaults to $HOME
 permission_mode = "bypass" # bypass (default) | edit | default
 additional_dirs = [] # extra real paths, e.g. ["/nfs/home/june"]
-timeout_secs = 180
+timeout_secs = 1800    # 30-minute wall-clock limit
 keep = 200           # answers retained before the oldest are dropped
 ```
 
@@ -81,6 +81,9 @@ agent's sandbox or automated review layer, and `default` preserves the agent
 CLI's normal permissions. `additional_dirs` is also passed to the agent CLI.
 Add the resolved target when files under `cwd` are symlinks outside it—for
 example `["/nfs/home/june"]` when `/home/june/workspace` points there.
+`timeout_secs` defaults to 30 minutes so skills have time to prepare a
+persistent worker. Reaching it terminates the headless agent process; it is a
+wall-clock safety limit, not an inactivity detector.
 
 ## Collaboration
 

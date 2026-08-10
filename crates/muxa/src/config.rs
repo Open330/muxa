@@ -120,6 +120,9 @@ pub struct Config {
     pub stats: StatsConfig,
 }
 
+/// Default wall-clock ceiling for one headless ask turn.
+pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
+
 /// `[ask]` config — headless one-shot queries from `muxa watch`.
 ///
 /// Disabled by default: enabling it lets the daemon spawn an agent CLI
@@ -142,7 +145,8 @@ pub struct AskConfig {
     /// Extra workspace roots exposed to the headless agent. This is required
     /// when a path below `cwd` is a symlink whose real path lives elsewhere.
     pub additional_dirs: Vec<PathBuf>,
-    /// Wall-clock ceiling per question.
+    /// Wall-clock ceiling per question. Long-running skills often spend
+    /// several minutes preparing a persistent worker before they answer.
     pub timeout_secs: u64,
     /// History snapshot. Defaults to `$XDG_DATA_HOME/muxa/ask.json`.
     pub path: Option<PathBuf>,
@@ -158,7 +162,7 @@ impl Default for AskConfig {
             cwd: None,
             permission_mode: AskPermissionMode::Bypass,
             additional_dirs: Vec::new(),
-            timeout_secs: 180,
+            timeout_secs: DEFAULT_ASK_TIMEOUT_SECS,
             path: None,
             keep: 200,
         }
@@ -1393,6 +1397,7 @@ mod tests {
         // Discovery defaults on so users get backfill out of the box.
         assert!(cfg.discovery.enabled);
         assert_eq!(cfg.ask.permission_mode, AskPermissionMode::Bypass);
+        assert_eq!(cfg.ask.timeout_secs, DEFAULT_ASK_TIMEOUT_SECS);
     }
 
     #[test]

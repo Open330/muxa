@@ -27,7 +27,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::AskPermissionMode;
+use crate::config::{AskPermissionMode, DEFAULT_ASK_TIMEOUT_SECS};
 
 /// How many entries the store keeps. Old answers are worth re-reading;
 /// unbounded growth is not.
@@ -69,7 +69,7 @@ impl Default for AskOptions {
             cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
             permission_mode: AskPermissionMode::Bypass,
             additional_dirs: Vec::new(),
-            timeout_secs: 180,
+            timeout_secs: DEFAULT_ASK_TIMEOUT_SECS,
             path: None,
             keep: DEFAULT_KEEP,
         }
@@ -462,7 +462,12 @@ impl AskAgent {
             .kill_on_drop(true);
         let output = tokio::time::timeout(timeout, cmd.output())
             .await
-            .map_err(|_| format!("{bin} did not answer within {}s", timeout.as_secs()))?
+            .map_err(|_| {
+                format!(
+                    "{bin} exceeded the ask timeout after {}s; it may still have been working — increase [ask].timeout_secs for long-running tasks",
+                    timeout.as_secs()
+                )
+            })?
             .map_err(|e| format!("spawning {bin}: {e}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
@@ -619,11 +624,12 @@ mod tests {
     }
 
     #[test]
-    fn unattended_ask_defaults_to_bypass() {
+    fn unattended_ask_defaults_support_resolver_workflows() {
         assert_eq!(
             AskOptions::default().permission_mode,
             AskPermissionMode::Bypass
         );
+        assert_eq!(AskOptions::default().timeout_secs, DEFAULT_ASK_TIMEOUT_SECS);
     }
 
     #[tokio::test]

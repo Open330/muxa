@@ -455,6 +455,7 @@ async fn build_ask(cfg: &Config) -> Arc<AskStore> {
             cwd = %cfg.ask.cwd.as_deref().unwrap_or_else(|| std::path::Path::new("$HOME")).display(),
             permission_mode = ?cfg.ask.permission_mode,
             additional_dirs = ?cfg.ask.additional_dirs,
+            timeout_secs = cfg.ask.timeout_secs,
             "headless ask enabled",
         );
     }
