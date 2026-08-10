@@ -1293,7 +1293,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) compose prompt",
-        "  m / b          message selected room peer / mailbox",
+        "  m / M          message selected agent / mailbox (b alias)",
         "  i / e          (in mailbox) claim inbox / reply",
         "",
         "Sorting",
@@ -5378,7 +5378,7 @@ fn peer_choice_hint(labels: &[String]) -> String {
 /// The recipient under host scope: the tracked agent selected in any window.
 /// On a collapsed session row, prefer its sole non-origin agent; that makes a
 /// one-agent session addressable without expanding it.
-/// The origin — and thus where the reply lands, this watch's `b` mailbox —
+/// The origin — and thus where the reply lands, this watch's `M` mailbox —
 /// stays the launch agent; only the target leaves the room.
 fn host_scope_target(app: &App) -> Option<(String, String)> {
     if app.collaboration_scope != muxa::config::CollaborationScope::Host {
@@ -6278,6 +6278,8 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
         KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
         KeyCode::Char('m') if app.browse_keys_active() => Action::OpenCollaborationMessage,
+        // `b` is the legacy alias retained after the pair became m/M.
+        KeyCode::Char('M' | 'b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('n') if app.browse_keys_active() => {
             let dir =
                 std::env::current_dir().map_or_else(|_| "~".into(), |p| p.display().to_string());
@@ -6296,7 +6298,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             app.inspector_split = app.inspector_split.next();
             Action::InspectorSplitChanged
         }
-        KeyCode::Char('b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('a') if app.browse_keys_active() => Action::OpenAsk,
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
@@ -6900,10 +6901,11 @@ fn handle_collaboration_composer_event(
 
 fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
     match code {
-        KeyCode::Esc | KeyCode::Char('q' | 'b') => {
+        KeyCode::Esc | KeyCode::Char('q' | 'M' | 'b') => {
             app.collaboration_mailbox.open = false;
             Action::None
         }
+        KeyCode::Char('m') => Action::OpenCollaborationMessage,
         KeyCode::Tab | KeyCode::BackTab => {
             toggle_collaboration_mailbox(app);
             Action::None
@@ -7998,7 +8000,7 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(Span::styled("Esc/b closes", theme.dim_style())),
+                Line::from(Span::styled("Esc/M closes · b alias", theme.dim_style())),
             ]),
             inner,
         );
@@ -10124,7 +10126,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" preview  "),
         Span::styled(" m ", theme.action_badge()),
         Span::raw(" message  "),
-        Span::styled(" b ", theme.key_badge()),
+        Span::styled(" M ", theme.action_badge()),
         Span::raw(" mailbox  "),
         Span::styled(" ? ", theme.key_badge()),
         Span::raw(" help"),
@@ -10216,7 +10218,9 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw("reply  "),
             Span::styled(" | ", theme.key_badge()),
             Span::raw("detail size  "),
-            Span::styled(" Esc/b ", theme.key_badge()),
+            Span::styled(" m ", theme.action_badge()),
+            Span::raw("message  "),
+            Span::styled(" Esc/M ", theme.key_badge()),
             Span::raw("close"),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -10755,7 +10759,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_m_and_b_are_browse_actions() {
+    fn watch_m_and_uppercase_m_are_browse_actions_with_b_as_an_alias() {
         let mut app = collaboration_watch_app();
 
         assert!(matches!(
@@ -10763,9 +10767,30 @@ mod tests {
             Action::OpenCollaborationMessage
         ));
         assert!(matches!(
+            key_action(&mut app, 'M'),
+            Action::OpenCollaborationMailbox
+        ));
+        assert!(matches!(
             key_action(&mut app, 'b'),
             Action::OpenCollaborationMailbox
         ));
+    }
+
+    #[test]
+    fn mailbox_uppercase_m_closes_and_lowercase_m_composes() {
+        let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.open = true;
+
+        assert!(matches!(
+            handle_collaboration_mailbox_event(KeyCode::Char('m'), &mut app),
+            Action::OpenCollaborationMessage
+        ));
+
+        assert!(matches!(
+            handle_collaboration_mailbox_event(KeyCode::Char('M'), &mut app),
+            Action::None
+        ));
+        assert!(!app.collaboration_mailbox.open);
     }
 
     #[test]
@@ -16570,7 +16595,7 @@ sort = ["state"]
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    session / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / b          message selected room peer / mailbox"));
+        assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
         // The exit keys deliberately live in the overlay's border rather

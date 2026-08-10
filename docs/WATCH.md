@@ -34,8 +34,8 @@ row per pane.
 | `Enter` | Attach to the selected pane. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
-| `m` | Message the selected same-window agent. |
-| `b` | Open incoming/sent mailbox; `i` claims and `e` replies. |
+| `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
+| `b` | Legacy alias for `M`; `i` claims and `e` replies inside the mailbox. |
 | `o` / `Alt-P` | Open live preview. |
 | `:` | Open the command palette; `Tab` completes the first match. |
 | `r` / `Ctrl-R` / `Alt-R` | Refresh while browsing. |
@@ -178,7 +178,8 @@ file changes. This is a contract delivered to the receiving agent, not a
 command that muxa executes immediately. Watch has no separate path-scope
 field, so include the intended edit scope in an execute request's body.
 
-Press `b` for incoming/sent history. In the mailbox, `Tab` switches mailbox,
+Press `M` for incoming/sent history (`b` remains an alias). In the mailbox,
+`m` opens a new message and `M` closes the mailbox. `Tab` switches mailbox,
 `j`/`k` selects a request, `i` claims pending incoming work, and `e` replies.
 If watch was opened from a normal shell, observation still works and the UI
 explains that collaboration requires opening `prefix+s` from an agent pane.

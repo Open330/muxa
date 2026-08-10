@@ -34,8 +34,8 @@ muxa watch --include-paneless
 | `Enter` | 선택한 pane에 바로 attach. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
-| `m` | 선택한 same-window agent에게 durable request 보내기. |
-| `b` | incoming/sent mailbox 열기. `i`는 claim, `e`는 reply. |
+| `m` / `M` | 선택한 agent에게 request 보내기 / incoming·sent mailbox 열기. |
+| `b` | `M`의 이전 alias. mailbox 안에서 `i`는 claim, `e`는 reply. |
 | `o` / `Alt-P` | live preview 열기. |
 | `:` | 명령 팔레트 열기. `Tab`은 첫 번째 일치 명령 완성. |
 | `r` / `Ctrl-R` / `Alt-R` | 탐색 중 refresh. |
@@ -177,8 +177,9 @@ peer보다 우선합니다. origin 자신을 제외한 agent가 하나인 접힌
 계약입니다. watch는 별도 path scope 입력을 제공하지 않으므로 execute 요청에는
 메시지 본문에 수정 범위를 함께 적는 것이 좋습니다.
 
-`b`는 incoming/sent mailbox를 엽니다. `Tab`으로 mailbox를 전환하고 `j`/`k`로
-request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다. 일반
+`M`은 incoming/sent mailbox를 엽니다(`b`도 alias로 유지됩니다). mailbox 안에서
+`m`은 새 메시지를 작성하고 `M`은 mailbox를 닫습니다. `Tab`으로 mailbox를 전환하고
+`j`/`k`로 request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다. 일반
 shell에서 watch를 열었다면 조회는 가능하지만, 협업하려면 agent pane에서
 `prefix+s`로 다시 열라는 안내가 표시됩니다.
 
