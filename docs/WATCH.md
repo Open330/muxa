@@ -133,8 +133,9 @@ the popup is still open, and the history outlives restarts in
 [CONFIGURATION.md](CONFIGURATION.md).
 
 Inside ask history, `n` starts a fresh conversation without deleting entries.
-`D` opens a confirmation and clears completed history across all agent filters;
-running asks and conversation ids are preserved.
+`d` confirms deletion of the selected completed entry. `D` confirms clearing
+completed history across all agent filters. Running asks and conversation ids
+are preserved by both operations.
 
 Ask defaults to `[ask].permission_mode = "bypass"` because headless sessions
 cannot answer approval prompts and ask is designed to run unattended skills.

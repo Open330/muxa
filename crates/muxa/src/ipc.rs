@@ -221,6 +221,10 @@ enum RequestBody {
     AskReset {},
     /// Remove completed ask history. Running asks and conversation ids stay.
     AskClear {},
+    /// Remove one completed ask history entry by opaque id.
+    AskDelete {
+        id: String,
+    },
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -1382,6 +1386,10 @@ async fn handle(
                     kind = "ask_clear";
                     Response::with_pruned(ask.clear_history().await)
                 }
+                RequestBody::AskDelete { id } => {
+                    kind = "ask_delete";
+                    Response::with_pruned(usize::from(ask.delete_history_entry(&id).await))
+                }
                 RequestBody::CollaborationSend {
                     origin,
                     target,
@@ -1900,6 +1908,20 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_clear" });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["pruned"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Delete one completed ask history entry. Returns whether an entry was
+    /// removed; running and unknown ids return `false`.
+    pub async fn ask_delete(&self, id: &str) -> Result<bool, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_delete",
+            "id": id,
+        });
+        let resp = self.call_checked(&req).await?;
+        let removed: usize =
+            serde_json::from_value(resp["pruned"].clone()).map_err(RuntimeError::Json)?;
+        Ok(removed == 1)
     }
 
     pub async fn collaboration_send(

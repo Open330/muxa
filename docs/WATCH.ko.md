@@ -136,8 +136,8 @@ agent별로 분리돼 있어 되돌아오면 그 대화가 이어집니다.
 true`가 필요합니다 — [CONFIGURATION.ko.md](CONFIGURATION.ko.md) 참고.
 
 Ask 이력 안에서 `n`은 이력을 지우지 않고 새 대화를 시작합니다. `D`는 확인창을 연
-뒤 모든 agent filter의 완료 이력을 지웁니다. 실행 중인 ask와 conversation id는
-보존합니다.
+뒤 모든 agent filter의 완료 이력을 지웁니다. 소문자 `d`는 선택한 완료 이력 하나만
+확인 후 지웁니다. 두 동작 모두 실행 중인 ask와 conversation id를 보존합니다.
 
 Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill 실행을 목적으로
 하므로 `[ask].permission_mode = "bypass"`가 기본값입니다. 파일 편집·명령 실행·배포가

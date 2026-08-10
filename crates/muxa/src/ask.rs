@@ -235,6 +235,24 @@ impl AskStore {
         removed
     }
 
+    /// Remove one completed history entry by id. Running entries are protected
+    /// for the same reason as in [`Self::clear_history`]: their worker still
+    /// needs a destination for its eventual result.
+    pub async fn delete_history_entry(&self, id: &str) -> bool {
+        let _guard = self.write_lock.lock().await;
+        let mut entries = self.entries.write().await;
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.id == id && entry.status != AskStatus::Running)
+        else {
+            return false;
+        };
+        entries.remove(index);
+        drop(entries);
+        self.persist().await;
+        true
+    }
+
     /// Record the question, spawn the agent, and return the pending entry
     /// immediately. The caller gets an id to watch; the answer arrives in
     /// the store when the child exits.
@@ -712,6 +730,52 @@ mod tests {
         assert_eq!(
             store.threads.read().await.get("claude").map(String::as_str),
             Some("c-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_one_history_entry_refuses_running_work() {
+        let store = AskStore::in_memory(AskOptions::default());
+        let now = OffsetDateTime::now_utc();
+        *store.entries.write().await = vec![
+            AskEntry {
+                id: "done".into(),
+                prompt: "done".into(),
+                answer: String::new(),
+                status: AskStatus::Answered,
+                agent: "claude".into(),
+                agent_session_id: None,
+                cwd: "/tmp".into(),
+                asked_at: now,
+                answered_at: Some(now),
+                cost_usd: None,
+                error: None,
+            },
+            AskEntry {
+                id: "running".into(),
+                prompt: "running".into(),
+                answer: String::new(),
+                status: AskStatus::Running,
+                agent: "claude".into(),
+                agent_session_id: None,
+                cwd: "/tmp".into(),
+                asked_at: now,
+                answered_at: None,
+                cost_usd: None,
+                error: None,
+            },
+        ];
+
+        assert!(!store.delete_history_entry("running").await);
+        assert!(store.delete_history_entry("done").await);
+        assert_eq!(
+            store
+                .list()
+                .await
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["running"]
         );
     }
 

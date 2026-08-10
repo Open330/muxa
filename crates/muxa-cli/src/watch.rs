@@ -955,6 +955,7 @@ pub(crate) enum QuickAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfirmAction {
     Quick(QuickAction),
+    DeleteAskHistory(String),
     ClearAskHistory,
 }
 
@@ -1281,7 +1282,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach to selected pane",
         "  n              new agent session (dir · agent · first prompt)",
-        "  a / A          ask / history; D clears completed history in A",
+        "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
@@ -4957,6 +4958,28 @@ pub async fn run(
                                     HintLevel::Err,
                                 ),
                             },
+                            ConfirmAction::DeleteAskHistory(id) => {
+                                match client.ask_delete(&id).await {
+                                    Ok(true) => {
+                                        refresh_ask_entries(client, &mut app).await;
+                                        app.set_hint(
+                                            "deleted one ask history entry",
+                                            HintLevel::Ok,
+                                        );
+                                    }
+                                    Ok(false) => {
+                                        refresh_ask_entries(client, &mut app).await;
+                                        app.set_hint(
+                                            "ask entry was running or no longer exists",
+                                            HintLevel::Warn,
+                                        );
+                                    }
+                                    Err(error) => app.set_hint(
+                                        format!("ask history delete failed: {error}"),
+                                        HintLevel::Err,
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
@@ -6313,8 +6336,9 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
     }
 }
 
-/// Ask history panel. `n` starts a new conversation, while uppercase `D`
-/// confirms clearing completed history. `r` remains the global refresh.
+/// Ask history panel. `n` starts a new conversation, `d` confirms deleting the
+/// selected completed entry, and uppercase `D` confirms clearing all completed
+/// history. `r` remains the global refresh.
 fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
     match code {
         KeyCode::Esc | KeyCode::Char('q' | 'A') => {
@@ -6323,6 +6347,34 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         }
         KeyCode::Char('a') => Action::OpenAsk,
         KeyCode::Char('n') => Action::ResetAskThread,
+        KeyCode::Char('d') => {
+            let selected = visible_ask_entries(app)
+                .get(app.ask_panel.selected)
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        entry.prompt.replace('\n', " "),
+                        is_ask_running(entry),
+                    )
+                });
+            match selected {
+                None => {
+                    app.set_hint("ask history: no entry selected", HintLevel::Warn);
+                    Action::None
+                }
+                Some((_, _, true)) => {
+                    app.set_hint("running ask history cannot be deleted", HintLevel::Warn);
+                    Action::None
+                }
+                Some((id, prompt, false)) => Action::AskConfirm(ConfirmPopup {
+                    message: format!(
+                        "Delete this ask history entry? {}",
+                        truncate_chars(&prompt, 72)
+                    ),
+                    on_confirm: ConfirmAction::DeleteAskHistory(id),
+                }),
+            }
+        }
         KeyCode::Char('D') => {
             let completed = app
                 .ask_entries
@@ -10818,7 +10870,7 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_d_in_ask_history_confirms_completed_history_clear() {
+    fn ask_history_delete_keys_distinguish_one_from_all() {
         let mut app = app_with_paneless_and_pane();
         let now = OffsetDateTime::now_utc();
         let entry = |id: &str, status: muxa::ask::AskStatus| muxa::ask::AskEntry {
@@ -10839,6 +10891,30 @@ mod tests {
             entry("active", muxa::ask::AskStatus::Running),
         ];
         app.ask_panel.open = true;
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        let Action::AskConfirm(popup) = action else {
+            panic!("d must open a confirmation, got {action:?}");
+        };
+        assert_eq!(
+            popup.on_confirm,
+            ConfirmAction::DeleteAskHistory("done".into())
+        );
+        assert!(popup.message.contains("done"));
+
+        app.ask_panel.selected = 1;
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("running")));
 
         let action = handle_event(
             Event::Key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
@@ -16120,7 +16196,7 @@ sort = ["state"]
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / b          message selected room peer / mailbox"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
-        assert!(body.contains("a / A          ask / history; D clears completed history in A"));
+        assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.
