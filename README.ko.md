@@ -132,6 +132,18 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 
 ## 핵심 명령어
 
+기본 tmux 운영 정책은 session 하나가 work/ticket 하나, pane 하나가 agent
+하나이며 window는 화면 배치에만 사용한다는 것입니다. `muxa onboard`는 이
+정책과 현재 `muxa watch` 단축키를 안전한 mock 화면에서 안내합니다. watch와
+같은 상태 icon을 보여주고, 실제로 실행하지는 않으면서 `muxa work start`와
+`muxa watch` 명령을 직접 입력하게 합니다.
+
+<div align="center">
+  <img src="docs/demo-onboard.gif" alt="Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon, 명령 입력 실습" width="900" />
+  <br />
+  <sub><code>muxa onboard</code> — 안전한 interactive watch mock에서 운영 모델을 익힙니다.</sub>
+</div>
+
 | Command | 목적 |
 | --- | --- |
 | `muxa status [--json]` | 추적 중인 agent 테이블 또는 desktop integration용 versioned JSON snapshot. |
@@ -147,6 +159,12 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
+| `muxa work start CAL-7041 --agent codex ...` | work/ticket마다 managed tmux session 하나를 만들거나 재사용하고 agent pane을 추가. |
+| `muxa work list/show/close` | managed work session을 조회하고 명시적으로 종료. |
+| `muxa agent start --work CAL-7041 ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
+| `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
+| `muxa onboard` | 실제 watch 상태 icon과 명령 입력 실습을 제공하는 fullscreen walkthrough. `--no-quiz`로 입력 gate를 건너뛰거나 `--print`로 정적 guide 출력. |
+| `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |
 
@@ -212,6 +230,8 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | Topic | Doc |
 | --- | --- |
 | 설치와 wiring | [docs/INSTALL.ko.md](docs/INSTALL.ko.md) |
+| 온보딩과 work/agent 운영 정책 | [docs/ONBOARDING.ko.md](docs/ONBOARDING.ko.md) |
+| MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
 | Live TUI와 prompt composer | [docs/WATCH.ko.md](docs/WATCH.ko.md) |
 | CLI dashboard | [docs/DASHBOARD_CLI.ko.md](docs/DASHBOARD_CLI.ko.md) |
 | Stats, report, activity ledger | [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md) |

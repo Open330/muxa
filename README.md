@@ -159,7 +159,15 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
 Managed tmux policy: one session is one work/ticket, each pane is one agent,
 and windows are layout only. Run `muxa onboard` to learn this workflow and the
-current `muxa watch` shortcuts interactively.
+current `muxa watch` shortcuts interactively. Its safe mock uses the same state
+icons as watch and asks you to type the real `muxa work start` / `muxa watch`
+commands without executing them.
+
+<div align="center">
+  <img src="docs/demo-onboard.gif" alt="muxa onboarding: location-aware dialogs over a safe watch mock, canonical state icons, and simulated real-command practice" width="900" />
+  <br />
+  <sub><code>muxa onboard</code> — learn the model on a safe, interactive watch mock.</sub>
+</div>
 
 | Command | Purpose |
 | --- | --- |
@@ -182,7 +190,7 @@ current `muxa watch` shortcuts interactively.
 | `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
 | `muxa agent start --work CAL-7041 ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
-| `muxa onboard` | Fullscreen mock-dashboard walkthrough for the policy, normal workflow, MCP pattern, and live `muxa watch` shortcuts; use `--print` for a static guide. |
+| `muxa onboard` | Fullscreen mock-dashboard walkthrough with canonical watch state icons and simulated real-command practice; use `--no-quiz` to skip input gates or `--print` for a static guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |

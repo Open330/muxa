@@ -6,11 +6,15 @@
 //! live sessions. `--print` remains available for scripts and accessibility.
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use muxa::AgentState;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -91,6 +95,9 @@ Muxa deliberately does not expose arbitrary shell or generic tmux commands.\n\
 Use exact pane ids for agent control. Destructive actions require confirmation.\n\
 Use collaboration review + read_only by default; grant execute only with narrow paths.";
 
+const WORK_START_COMMAND: &str = "muxa work start CAL-7041 --agent codex";
+const WATCH_COMMAND: &str = "muxa watch";
+
 const SECTIONS: &[Section] = &[
     Section {
         title: "1 · Mental model",
@@ -111,12 +118,24 @@ const SECTIONS: &[Section] = &[
 ];
 
 pub fn run(args: Args) -> Result<()> {
+    apply_icon_preference();
     let mode = Mode::detect(args.print);
     match mode {
         Mode::Print => print_guide(),
         Mode::Interactive => interactive_guide(args.no_quiz)?,
     }
     Ok(())
+}
+
+/// Onboarding stays available when config parsing fails, but a valid config
+/// should still make its state glyphs match live watch (`unicode` vs `ascii`).
+fn apply_icon_preference() {
+    let path = std::env::var_os("MUXA_CONFIG")
+        .map(std::path::PathBuf::from)
+        .or_else(muxa::paths::default_config_file);
+    if let Ok(config) = muxa::config::Config::load_or_default(path.as_deref()) {
+        crate::set_icon_set(config.ui.icons);
+    }
 }
 
 fn print_guide() {
@@ -143,8 +162,10 @@ fn interactive_guide(no_quiz: bool) -> Result<()> {
         guard
             .terminal_mut()
             .draw(|frame| render_tour(frame, &app))?;
-        if let Event::Key(key) = event::read().context("reading onboarding input")? {
-            handle_key(&mut app, key);
+        match event::read().context("reading onboarding input")? {
+            Event::Key(key) => handle_key(&mut app, key),
+            Event::Paste(text) => handle_paste(&mut app, &text),
+            _ => {}
         }
     }
     Ok(())
@@ -190,7 +211,8 @@ enum MockOverlay {
 #[derive(Debug)]
 struct TourApp {
     step: usize,
-    new_work_opened: bool,
+    work_command: CommandExercise,
+    watch_command: CommandExercise,
     collaboration_overlay: MockOverlay,
     blocked_hint: bool,
     done: bool,
@@ -200,7 +222,8 @@ impl TourApp {
     fn new(no_quiz: bool) -> Self {
         Self {
             step: 0,
-            new_work_opened: no_quiz,
+            work_command: CommandExercise::new(no_quiz),
+            watch_command: CommandExercise::new(no_quiz),
             collaboration_overlay: MockOverlay::None,
             blocked_hint: false,
             done: false,
@@ -212,7 +235,7 @@ impl TourApp {
     }
 
     fn next(&mut self) {
-        if self.current() == TourStep::NewWork && !self.new_work_opened {
+        if self.command_gate().is_some() {
             self.blocked_hint = true;
             return;
         }
@@ -228,22 +251,102 @@ impl TourApp {
         self.blocked_hint = false;
         self.step = self.step.saturating_sub(1);
     }
+
+    fn command_gate(&self) -> Option<CommandPractice> {
+        match self.current() {
+            TourStep::NewWork if !self.work_command.is_complete() => {
+                Some(CommandPractice::StartWork)
+            }
+            TourStep::Finish if !self.watch_command.is_complete() => Some(CommandPractice::Watch),
+            _ => None,
+        }
+    }
+
+    fn command_input(&self, practice: CommandPractice) -> &str {
+        &self.command_exercise(practice).input
+    }
+
+    fn command_input_mut(&mut self, practice: CommandPractice) -> &mut String {
+        &mut self.command_exercise_mut(practice).input
+    }
+
+    fn command_exercise(&self, practice: CommandPractice) -> &CommandExercise {
+        match practice {
+            CommandPractice::StartWork => &self.work_command,
+            CommandPractice::Watch => &self.watch_command,
+        }
+    }
+
+    fn command_exercise_mut(&mut self, practice: CommandPractice) -> &mut CommandExercise {
+        match practice {
+            CommandPractice::StartWork => &mut self.work_command,
+            CommandPractice::Watch => &mut self.watch_command,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CommandExercise {
+    input: String,
+    state: CommandState,
+}
+
+impl CommandExercise {
+    fn new(skipped: bool) -> Self {
+        Self {
+            input: String::new(),
+            state: if skipped {
+                CommandState::Complete
+            } else {
+                CommandState::Editing
+            },
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state == CommandState::Complete
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandState {
+    Editing,
+    Error,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPractice {
+    StartWork,
+    Watch,
+}
+
+impl CommandPractice {
+    fn expected(self) -> &'static str {
+        match self {
+            Self::StartWork => WORK_START_COMMAND,
+            Self::Watch => WATCH_COMMAND,
+        }
+    }
 }
 
 fn handle_key(app: &mut TourApp, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
     }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.done = true;
+        return;
+    }
+    if let Some(practice) = app.command_gate() {
+        handle_command_key(app, practice, key);
+        return;
+    }
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.done = true,
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.previous(),
         KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => app.next(),
         KeyCode::Home => app.step = 0,
         KeyCode::End => app.step = TourStep::ALL.len() - 1,
-        KeyCode::Char('n') if app.current() == TourStep::NewWork => {
-            app.new_work_opened = true;
-            app.blocked_hint = false;
-        }
         KeyCode::Char('m') if app.current() == TourStep::Collaboration => {
             app.collaboration_overlay = MockOverlay::Message;
         }
@@ -251,6 +354,61 @@ fn handle_key(app: &mut TourApp, key: KeyEvent) {
             app.collaboration_overlay = MockOverlay::Mailbox;
         }
         _ => {}
+    }
+}
+
+fn handle_command_key(app: &mut TourApp, practice: CommandPractice, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => submit_command(app, practice),
+        KeyCode::Right => app.blocked_hint = true,
+        KeyCode::Backspace => {
+            if app.command_input(practice).is_empty() {
+                app.previous();
+            } else {
+                app.command_input_mut(practice).pop();
+                app.command_exercise_mut(practice).state = CommandState::Editing;
+                app.blocked_hint = false;
+            }
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && app.command_input(practice).chars().count() < 160 =>
+        {
+            app.command_input_mut(practice).push(ch);
+            app.command_exercise_mut(practice).state = CommandState::Editing;
+            app.blocked_hint = false;
+        }
+        _ => {}
+    }
+}
+
+fn handle_paste(app: &mut TourApp, text: &str) {
+    let Some(practice) = app.command_gate() else {
+        return;
+    };
+    for ch in text.chars().filter(|ch| !matches!(ch, '\n' | '\r' | '\t')) {
+        if app.command_input(practice).chars().count() >= 160 {
+            break;
+        }
+        app.command_input_mut(practice).push(ch);
+    }
+    app.command_exercise_mut(practice).state = CommandState::Editing;
+    app.blocked_hint = false;
+}
+
+fn submit_command(app: &mut TourApp, practice: CommandPractice) {
+    let actual = app
+        .command_input(practice)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if actual == practice.expected() {
+        app.command_exercise_mut(practice).state = CommandState::Complete;
+        app.blocked_hint = false;
+    } else {
+        app.command_exercise_mut(practice).state = CommandState::Error;
     }
 }
 
@@ -292,7 +450,7 @@ fn render_tour(frame: &mut Frame<'_>, app: &TourApp) {
     render_mock_footer(frame, rows[2], app.current());
 
     let overlay = match app.current() {
-        TourStep::NewWork if app.new_work_opened => MockOverlay::NewWork,
+        TourStep::NewWork if app.work_command.is_complete() => MockOverlay::NewWork,
         TourStep::Collaboration => app.collaboration_overlay,
         _ => MockOverlay::None,
     };
@@ -370,30 +528,37 @@ fn render_mock_work(frame: &mut Frame<'_>, area: Rect, step: TourStep) {
     } else {
         Color::Reset
     };
+    let work_bg = if step == TourStep::Work {
+        Color::Rgb(18, 83, 108)
+    } else {
+        Color::Reset
+    };
     let lines = vec![
         Line::from(Span::styled(
             "WORK / SESSION                AGENTS  STATE",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(vec![
-            Span::styled("▾ CAL-7041  checkout-hardening     2     ", work_style),
-            Span::styled("ACTIVE", work_style.fg(Color::Cyan)),
+            Span::styled("▾ CAL-7041  checkout-hardening     2    ", work_style),
+            mock_state_span(AgentState::Working, work_bg),
+            Span::styled(" ", work_style),
+            mock_state_span(AgentState::WaitingInput, work_bg),
         ]),
         Line::from(vec![
-            Span::styled("  ├─ %42  codex   implementer       ", agent_style),
-            Span::styled("WORKING", Style::default().fg(Color::Green).bg(state_bg)),
+            Span::styled("  ├─ %42  codex   implementer          ", agent_style),
+            mock_state_span(AgentState::Working, state_bg),
         ]),
         Line::from(vec![
-            Span::styled("  └─ %43  claude  reviewer          ", agent_style),
-            Span::styled("WAITING", Style::default().fg(Color::Yellow).bg(state_bg)),
+            Span::styled("  └─ %43  claude  reviewer             ", agent_style),
+            mock_state_span(AgentState::WaitingInput, state_bg),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "▸ CAL-7088  dashboard-auth         1     ",
+                "▸ CAL-7088  dashboard-auth         1    ",
                 Style::default().fg(Color::Gray),
             ),
-            Span::styled("IDLE", Style::default().fg(Color::Blue)),
+            mock_state_span(AgentState::Idle, Color::Reset),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -416,6 +581,25 @@ fn render_mock_work(frame: &mut Frame<'_>, area: Rect, step: TourStep) {
         ),
         area,
     );
+}
+
+/// Use the same canonical glyph source as `muxa watch` and its Classic state
+/// palette. The mock deliberately avoids spelling out WORKING/WAITING in the
+/// state column so the tutorial teaches the actual one-cell visual language.
+fn mock_state_span(state: AgentState, background: Color) -> Span<'static> {
+    let foreground = match state {
+        AgentState::Idle => Color::Green,
+        AgentState::Working | AgentState::WaitingInput => Color::Yellow,
+        AgentState::WaitingChoice => Color::LightYellow,
+        AgentState::Error => Color::Red,
+        AgentState::Starting => Color::Cyan,
+        AgentState::Stopped => Color::DarkGray,
+    };
+    let mut style = Style::default().fg(foreground).add_modifier(Modifier::BOLD);
+    if background != Color::Reset {
+        style = style.bg(background);
+    }
+    Span::styled(crate::state_icon(state), style)
 }
 
 fn render_mock_inspector(frame: &mut Frame<'_>, area: Rect, step: TourStep) {
@@ -527,28 +711,33 @@ fn render_mock_overlay(frame: &mut Frame<'_>, area: Rect, overlay: MockOverlay) 
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
                     Line::from(vec![
-                        Span::styled("cwd     ", Style::default().fg(Color::DarkGray)),
-                        Span::raw("/home/june/personal/muxa"),
+                        Span::styled("✓ ", Style::default().fg(Color::Green)),
+                        Span::styled(
+                            "managed work created",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
                     ]),
+                    Line::from(""),
                     Line::from(vec![
-                        Span::styled("ticket  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("work     ", Style::default().fg(Color::DarkGray)),
                         Span::styled("CAL-7041", Style::default().fg(Color::Cyan)),
                     ]),
                     Line::from(vec![
-                        Span::styled("agent   ", Style::default().fg(Color::DarkGray)),
-                        Span::raw("codex"),
+                        Span::styled("session  ", Style::default().fg(Color::DarkGray)),
+                        Span::raw("cal-7041"),
                     ]),
                     Line::from(vec![
-                        Span::styled("prompt  ", Style::default().fg(Color::DarkGray)),
-                        Span::raw("Implement checkout hardening"),
+                        Span::styled("pane     ", Style::default().fg(Color::DarkGray)),
+                        Span::raw("%42  codex  "),
+                        mock_state_span(AgentState::Working, Color::Reset),
                     ]),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "Tab fields · Enter start · Esc close",
+                        "Simulation only · no tmux session was changed",
                         Style::default().fg(Color::Yellow),
                     )),
                 ]))
-                .block(dialog_block(" new work + agent ", Color::Cyan)),
+                .block(dialog_block(" command result ", Color::Cyan)),
                 popup,
             );
         }
@@ -593,9 +782,9 @@ fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
         step_title(step)
     );
     let body = step_body(app);
-    let footer = match step {
-        TourStep::Finish => " Enter finish · ← back · Esc quit ",
-        TourStep::NewWork if !app.new_work_opened => " press n here · ← back · Esc quit ",
+    let footer = match (step, app.command_gate()) {
+        (_, Some(_)) => " type command · Enter check · empty Backspace back · Esc quit ",
+        (TourStep::Finish, None) => " Enter finish · ← back · Esc quit ",
         _ => " ←/Backspace back · Enter/→ next · Esc quit ",
     };
     frame.render_widget(
@@ -615,10 +804,10 @@ fn step_title(step: TourStep) -> &'static str {
         TourStep::States => "state tells you what to do",
         TourStep::Preview => "inspect without attaching",
         TourStep::Shortcuts => "actions stay at the bottom",
-        TourStep::NewWork => "try n: new work + agent",
+        TourStep::NewWork => "type the real work command",
         TourStep::Collaboration => "message one exact peer",
         TourStep::Mcp => "agents use the same control plane",
-        TourStep::Finish => "ready for the live dashboard",
+        TourStep::Finish => "launch the live dashboard",
     }
 }
 
@@ -627,8 +816,17 @@ fn step_body(app: &TourApp) -> Text<'static> {
     if app.blocked_hint {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Press n once to continue.",
+            "Type the shown command and press Enter.",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if app
+        .command_gate()
+        .is_some_and(|practice| app.command_exercise(practice).state == CommandState::Error)
+    {
+        lines.push(Line::from(Span::styled(
+            "Not quite. Match the example; extra spaces are fine.",
+            Style::default().fg(Color::Red),
         )));
     }
     Text::from(lines)
@@ -663,8 +861,10 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::States => vec![
             callout_label("← READ STATE BEFORE SENDING"),
             Line::from(""),
-            Line::from("WORKING: leave it alone.  WAITING: it needs input."),
-            Line::from("IDLE: its turn settled.  ERROR: inspect the pane."),
+            state_legend_line(AgentState::Working, "working — leave it alone"),
+            state_legend_line(AgentState::WaitingInput, "waiting — it needs input"),
+            state_legend_line(AgentState::Idle, "idle — its turn settled"),
+            state_legend_line(AgentState::Error, "error — inspect the pane"),
             Line::from("Muxa can wait until settled instead of polling."),
         ],
         TourStep::Preview => vec![
@@ -681,22 +881,18 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             Line::from("a ask  ·  A history  ·  ? complete help"),
             Line::from("Alt-K terminates only after confirmation."),
         ],
-        TourStep::NewWork if !app.new_work_opened => vec![
-            callout_label("↓ YOUR TURN"),
+        TourStep::NewWork if !app.work_command.is_complete() => vec![
+            callout_label("↓ TYPE A REAL MUXA COMMAND"),
             Line::from(""),
-            Line::from(Span::styled(
-                "Press n to open the mock work form.",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from("The exercise is local to this tutorial."),
+            example_command_line(WORK_START_COMMAND),
+            command_input_line(&app.work_command.input),
+            Line::from("Enter checks it. The command is not executed here."),
         ],
         TourStep::NewWork => vec![
-            callout_label("↑ THIS IS WHAT n OPENS"),
+            callout_label("↑ COMMAND ACCEPTED"),
             Line::from(""),
-            Line::from("Choose cwd, ticket, agent, and the first prompt."),
-            Line::from("An existing ticket adds a pane to its session."),
+            Line::from("This creates CAL-7041 once, then reuses its session."),
+            Line::from("Inside watch, n opens the equivalent guided form."),
             Line::from("Press Enter or → to continue the tour."),
         ],
         TourStep::Collaboration => vec![
@@ -713,6 +909,14 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             Line::from("settled + capture returns the useful final screen."),
             Line::from("No separate tmux MCP or model-written tmux script."),
         ],
+        TourStep::Finish if !app.watch_command.is_complete() => vec![
+            callout_label("ONE LAST COMMAND"),
+            Line::from(""),
+            Line::from("Type the command that opens the real dashboard:"),
+            example_command_line(WATCH_COMMAND),
+            command_input_line(&app.watch_command.input),
+            Line::from("This is still simulated; Enter only checks it."),
+        ],
         TourStep::Finish => vec![
             callout_label("THE MODEL TO REMEMBER"),
             Line::from(""),
@@ -721,7 +925,7 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             policy_line("WINDOW", "layout only"),
             Line::from(""),
             Line::from(Span::styled(
-                "Next: muxa watch  (or tmux prefix+s)",
+                "✓ muxa watch — press Enter to finish",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -749,6 +953,35 @@ fn policy_line(label: &'static str, value: &'static str) -> Line<'static> {
         ),
         Span::raw("= "),
         Span::styled(value, Style::default().fg(Color::White)),
+    ])
+}
+
+fn state_legend_line(state: AgentState, meaning: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        mock_state_span(state, Color::Reset),
+        Span::raw("  "),
+        Span::styled(meaning, Style::default().fg(Color::White)),
+    ])
+}
+
+fn example_command_line(command: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("copy  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            command,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn command_input_line(input: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("$ ", Style::default().fg(Color::Green)),
+        Span::styled(input.to_string(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Cyan)),
     ])
 }
 
@@ -840,7 +1073,11 @@ impl<B: Backend + Write> Drop for TerminalGuard<B> {
     fn drop(&mut self) {
         if let Some(mut terminal) = self.terminal.take() {
             let _ = disable_raw_mode();
-            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            let _ = execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableBracketedPaste
+            );
             let _ = terminal.show_cursor();
         }
     }
@@ -849,15 +1086,16 @@ impl<B: Backend + Write> Drop for TerminalGuard<B> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("enabling raw terminal mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
         .inspect_err(|_| {
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
             let _ = disable_raw_mode();
         })
         .context("entering alternate terminal screen")?;
     Terminal::new(CrosstermBackend::new(stdout))
         .inspect_err(|_| {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
             let _ = disable_raw_mode();
         })
         .context("initializing onboarding terminal")
@@ -929,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn n_practice_opens_a_mock_work_form_before_advancing() {
+    fn work_practice_requires_the_real_command_before_advancing() {
         let mut app = TourApp::new(false);
         app.step = TourStep::ALL
             .iter()
@@ -944,14 +1182,22 @@ mod tests {
         assert_eq!(app.step, original);
         assert!(app.blocked_hint);
 
+        handle_paste(&mut app, "muxa work nope");
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
         );
-        assert!(app.new_work_opened);
+        assert_eq!(app.work_command.state, CommandState::Error);
+        app.work_command.input.clear();
+        handle_paste(&mut app, WORK_START_COMMAND);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        );
+        assert!(app.work_command.is_complete());
         let screen = rendered(&app, 120, 34);
-        assert!(screen.contains("new work + agent"));
-        assert!(screen.contains("ticket"));
+        assert!(screen.contains("command result"));
+        assert!(screen.contains("managed work created"));
         assert!(screen.contains("CAL-7041"));
 
         handle_key(
@@ -959,6 +1205,51 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
         );
         assert_eq!(app.current(), TourStep::Collaboration);
+    }
+
+    #[test]
+    fn final_practice_types_muxa_watch_and_empty_backspace_goes_back() {
+        let mut app = TourApp::new(false);
+        app.step = TourStep::ALL.len() - 1;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(app.current(), TourStep::Mcp);
+
+        app.step = TourStep::ALL.len() - 1;
+        handle_paste(&mut app, WATCH_COMMAND);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        );
+        assert!(app.watch_command.is_complete());
+        assert!(!app.done);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        );
+        assert!(app.done);
+    }
+
+    #[test]
+    fn mock_state_column_uses_the_canonical_watch_icons() {
+        let mut app = TourApp::new(true);
+        app.step = TourStep::ALL
+            .iter()
+            .position(|step| *step == TourStep::States)
+            .unwrap();
+        let screen = rendered(&app, 120, 34);
+        for state in [
+            AgentState::Working,
+            AgentState::WaitingInput,
+            AgentState::Idle,
+            AgentState::Error,
+        ] {
+            assert!(screen.contains(crate::state_icon(state)));
+        }
+        assert!(!screen.contains("WORKING"));
+        assert!(!screen.contains("WAITING"));
     }
 
     #[test]
