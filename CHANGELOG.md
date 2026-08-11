@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.31] - 2026-08-11
+
+### Added
+
+- **The onboarding tour can run before Muxa is installed.** The new
+  `scripts/onboard.sh` curl entrypoint selects the latest pre-built CLI for
+  x86_64/arm64 Linux or macOS, verifies its published SHA-256 checksum, runs
+  `muxa onboard` from a temporary directory, and removes it on exit. It does
+  not install binaries, edit config, start the daemon, or require a live tmux
+  session.
+
 ### Changed
 
 - **The README recordings show what muxa actually does now.** The old GIF

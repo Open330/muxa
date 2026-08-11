@@ -9,6 +9,25 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 - Unix-like OS
 - Claude Code, OpenAI Codex, Google Gemini CLI 중 하나
 
+## 설치 전 체험
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+```
+
+이 경로에는 위 필요 조건이 적용되지 않습니다. 최신 프리빌트 `muxa` CLI만 임시
+디렉터리에 내려받고 release checksum을 검증한 뒤 안전한 onboarding simulation을
+실행합니다. `muxa`나 `muxad`를 설치하지 않고, config 수정, daemon 시작, 실제 tmux
+session 조작도 하지 않습니다. tour를 종료하면 임시 파일도 삭제됩니다.
+
+x86_64/arm64 Linux와 macOS를 지원합니다. 일반 onboarding flag는 `sh -s --`
+뒤에 전달할 수 있습니다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
+```
+
 ## One-Shot 설치
 
 ```bash

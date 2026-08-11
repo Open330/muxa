@@ -87,6 +87,20 @@ Nothing in the tour mutates a live tmux session.
 
 ## Quick Start
 
+Try the complete interactive tour before installing anything:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+```
+
+This downloads the latest pre-built CLI to a temporary directory, verifies its
+SHA-256 checksum, runs the inert `muxa onboard` simulation, and removes the
+binary when you leave. It does not install `muxa`/`muxad`, edit config, or
+require Rust, Git, a running daemon, or even tmux. Linux and macOS on x86_64 or
+arm64 are supported. To force Korean, append `| sh -s -- --lang ko` instead.
+
+If you decide to keep Muxa, install it with one of the following methods.
+
 Requires tmux 3.x (or herdr) and a Unix-like OS.
 
 Homebrew (pre-built binaries, no Rust toolchain needed):

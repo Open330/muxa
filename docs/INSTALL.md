@@ -9,6 +9,26 @@ This page keeps the detailed install and wiring notes out of the README.
 - Unix-like OS
 - One supported agent CLI: Claude Code, OpenAI Codex, or Google Gemini CLI
 
+## Try Before Installing
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+```
+
+This path needs none of the requirements above. It downloads only the latest
+pre-built `muxa` CLI into a temporary directory, verifies the release checksum,
+and runs the safe onboarding simulation. It does not install `muxa` or `muxad`,
+change config, start a daemon, or operate a real tmux session. The temporary
+files are removed when the tour exits.
+
+The supported trial platforms are x86_64/arm64 Linux and macOS. Forward normal
+onboarding flags after `sh -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
+```
+
 ## One-Shot Install
 
 ```bash
