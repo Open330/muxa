@@ -32,21 +32,21 @@ Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 
 
 | tmux 객체 | Muxa에서의 의미 | 사용 방식 |
 | --- | --- | --- |
-| **session** | 하나의 work 또는 ticket | 안정적인 작업 identity, cwd, managed lifecycle. 같은 work를 다시 시작하면 이 session을 재사용합니다. |
-| **pane** | 하나의 agent | 해당 work 안에서 일하는 implementer, reviewer 또는 helper agent입니다. |
-| **window** | 화면 배치와 collaboration room | pane을 시각적으로 배치하고 가까운 협업 범위를 정하지만 별도 work identity를 만들지는 않습니다. |
+| **session** | 하나의 workspace 또는 project | 여러 독립 work window를 담는 지속적인 project context입니다. |
+| **window** | 하나의 work 또는 ticket | 안정적인 work identity와 cwd. 같은 work를 다시 시작하면 이 window를 재사용합니다. |
+| **pane** | 하나의 agent | 해당 work window에서 일하는 implementer, reviewer 또는 helper입니다. |
 
 권장 workflow도 이 모델을 그대로 따릅니다.
 
-1. work ID를 한 번 시작하면 Muxa가 managed tmux session을 생성하거나 재사용하고
-   첫 agent pane을 시작합니다.
-2. 같은 session에 implementer, reviewer, helper agent를 pane으로 추가합니다.
+1. work ID를 시작하면 Muxa가 workspace session을 생성하거나 재사용하고 work
+   window와 첫 agent pane을 만듭니다.
+2. 같은 work window에 agent pane을 추가하며 다른 ticket은 sibling window가 됩니다.
 3. `muxa watch`에서 상태 확인, preview, 메시지, 제어를 수행하거나 agent가
    `muxa mcp`를 통해 같은 정책으로 다른 agent를 관리합니다.
-4. 작업이 끝나면 pane 또는 work를 명시적으로 닫습니다. Muxa는 하나의 ticket을
-   suffix session으로 조용히 분리하거나 unmanaged tmux 객체를 종료하지 않습니다.
+4. 작업이 끝나면 agent pane, work window 또는 workspace session을 명시적으로
+   닫습니다. Muxa는 unmanaged tmux 객체를 종료하지 않습니다.
 
-요약하면 **work/ticket → session → agent pane들 → 관측·협업 → 명시적 종료**입니다.
+요약하면 **workspace/session → work/window → agent/pane → 관측·협업 → 명시적 종료**입니다.
 `muxa onboard` 하나에서 가상 shell의 `tmux new-session`부터 tmux 계층과 조작,
 detach/attach, Muxa prefix binding, watch workflow까지 연속해서 익힐 수 있습니다.
 실제 tmux session은 변경하지 않습니다.
@@ -66,7 +66,7 @@ detach/attach, Muxa prefix binding, watch workflow까지 연속해서 익힐 수
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
 | `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답과 마지막으로 프롬프트를 보낸 시점을 얹음. 숫자 키로 이동. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
-| `muxa dashboard` | pane 조작과 같은 tmux window의 agent 협업을 제공하는 session-card TUI. |
+| `muxa dashboard` | pane 조작과 같은 work window의 agent 협업을 제공하는 workspace-card TUI. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
@@ -146,7 +146,7 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 1. 같은 tmux window의 두 pane에서 agent를 각각 실행합니다.
 2. 메시지를 보낼 agent pane을 선택하고 `prefix+s`를 누릅니다.
 3. watch에서 상대 agent를 선택하고 `m`을 눌러 메시지를 보냅니다. 받은 메시지와
-   응답은 `b` mailbox에서 확인합니다.
+   응답은 `M` mailbox에서 확인합니다(`b`는 alias로 유지됩니다).
 
 일반 shell pane에서 watch를 열면 그 shell은 agent가 아니므로 협업할 수 없습니다.
 `muxa dashboard`는 더 상세한 운영 화면이 필요할 때만 선택적으로 사용합니다.
@@ -158,15 +158,16 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 
 ## 핵심 명령어
 
-기본 tmux 운영 정책은 session 하나가 work/ticket 하나, pane 하나가 agent
-하나이며 window는 화면 배치에만 사용한다는 것입니다. `muxa onboard`는 가상
+기본 tmux 운영 정책은 session 하나가 workspace/project, window 하나가
+work/ticket, pane 하나가 agent라는 것입니다. `muxa onboard`는 Muxa를 소개하기
+전까지 tmux 자체의 기본 개념과 조작에 집중합니다. 가상
 기본 shell에서 시작해 `tmux new-session -s muxa-onboarding`을 직접 입력하게 하고,
 window/pane 조작과 detach 뒤에는 `tmux attach -t muxa-onboarding`도 직접 입력하게
 합니다. 이어서 같은 fullscreen 화면에서 현재 `muxa watch` workflow로
 전환합니다. watch와 같은 왼쪽 session-state gutter, 열, 50/50 inspector,
 overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 `Backspace`, `M`을 실제로 누르고 마지막에는 `q`로 마칩니다. 전체 과정은 하나의
-20단계 진행률을 사용하며 managed prefix binding 11단계에서 session 이동
+20단계 진행률을 사용하며 managed prefix binding 11단계에서 work 이동
 12단계로 바로 이어집니다. 한국어 locale에서는 한글을 자동으로 선택하며 `--lang ko`로
 명시하거나 온보딩 도중 `F2`로 한/영을 전환할 수 있습니다.
 
@@ -179,8 +180,8 @@ overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 | Command | 목적 |
 | --- | --- |
 | `muxa status [--json]` | 추적 중인 agent 테이블 또는 desktop integration용 versioned JSON snapshot. |
-| `muxa watch [--view pane\|session]` | live TUI picker/dashboard. |
-| `muxa dashboard [--since today]` | live capture, prompt composer, abort/terminate action, ACT/WACT total을 보여주는 session-card TUI console. |
+| `muxa watch [--view pane\|work]` | workspace → work → agent live TUI picker/dashboard. |
+| `muxa dashboard [--since today]` | live capture, prompt composer, abort/terminate action, ACT/WACT total을 보여주는 workspace-card TUI console. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. |
@@ -191,9 +192,10 @@ overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
-| `muxa work start muxa-onboarding --agent codex ...` | work/ticket마다 managed tmux session 하나를 만들거나 재사용하고 agent pane을 추가. |
-| `muxa work list/show/close` | managed work session을 조회하고 명시적으로 종료. |
-| `muxa agent start --work muxa-onboarding ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
+| `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | workspace session과 work window를 만들거나 재사용하고 agent pane을 추가. |
+| `muxa workspace list/show/close` | workspace/project session을 조회하거나 명시적으로 종료. |
+| `muxa work list/show/close [--workspace muxa]` | work/ticket window를 조회하거나 명시적으로 종료. |
+| `muxa agent start --workspace muxa --work muxa-onboarding ...` | allowlist agent pane을 work window에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
 | `muxa onboard [--lang auto\|en\|ko]` | shell → tmux → Muxa 통합 fullscreen walkthrough. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 통합 guide 출력 지원. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |

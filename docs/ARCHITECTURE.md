@@ -9,14 +9,15 @@ Muxa is optimized around a work-oriented tmux model:
 
 | tmux object | Domain identity | Invariant |
 | --- | --- | --- |
-| Session | Work/ticket | One managed session is created or reused for one work ID and cwd. |
-| Pane | Agent | Every managed agent is placed in its own pane inside the work session. |
-| Window | Layout/collaboration room | Windows arrange agents and scope nearby collaboration; they do not identify work. |
+| Session | Workspace/project | One managed session contains the project's work windows. |
+| Window | Work/ticket | One managed window is created or reused for a work ID and cwd. It is also the collaboration room. |
+| Pane | Agent | Every managed agent is placed in its own pane inside the work window. |
 
 This mapping is shared by the CLI, `muxa watch`, the daemon registry, and
-`muxa mcp`. Starting the same work must reuse its session or fail on an
-incompatible cwd; adding an agent must add a pane; destructive controls must
-refuse unmanaged panes and sessions.
+`muxa mcp`. Starting the same work in a workspace must reuse its window or fail
+on an incompatible cwd; adding an agent must add a pane; closing work kills the
+window, while closing a workspace kills the session. Destructive controls refuse
+unmanaged targets.
 
 ## Flow
 

@@ -47,6 +47,106 @@ pub struct CollaborationOrigin {
     pub socket: Option<String>,
 }
 
+/// Local IPC surface that initiated a collaboration call. This describes the
+/// transport actor, not the agent session represented by `from`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationClientKind {
+    Cli,
+    Watch,
+    Mcp,
+    Dashboard,
+    #[default]
+    Unknown,
+}
+
+impl CollaborationClientKind {
+    pub fn hello_label(self) -> String {
+        let surface = match self {
+            Self::Cli => "cli",
+            Self::Watch => "watch",
+            Self::Mcp => "mcp",
+            Self::Dashboard => "dashboard",
+            Self::Unknown => "unknown",
+        };
+        format!("muxa/{surface}/{}", env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn from_hello_label(label: &str) -> Self {
+        let mut parts = label.split('/');
+        if parts.next() != Some("muxa") {
+            return Self::Unknown;
+        }
+        match parts.next() {
+            Some("cli") => Self::Cli,
+            Some("watch") => Self::Watch,
+            Some("mcp") => Self::Mcp,
+            Some("dashboard") => Self::Dashboard,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for CollaborationClientKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Cli => "cli",
+            Self::Watch => "watch",
+            Self::Mcp => "mcp",
+            Self::Dashboard => "dashboard",
+            Self::Unknown => "unknown",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationOriginMatch {
+    Matched,
+    Mismatched,
+    Unverifiable,
+}
+
+impl std::fmt::Display for CollaborationOriginMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Matched => "matched",
+            Self::Mismatched => "mismatched",
+            Self::Unverifiable => "unverifiable",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationPaneEvidence {
+    ProcessEnvironment,
+    ProcessAncestry,
+}
+
+/// OS-observed provenance for a collaboration call. It is audit evidence,
+/// not an authorization gate: callers retain the existing ability to act on
+/// behalf of any resolvable pane agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollaborationProvenance {
+    pub client_kind: CollaborationClientKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_gid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_evidence: Option<CollaborationPaneEvidence>,
+    pub origin_match: CollaborationOriginMatch,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RoomId {
     pub host: String,
@@ -252,6 +352,10 @@ pub struct CollaborationRequest {
     pub id: String,
     pub from: Participant,
     pub to: Participant,
+    /// How the request entered muxad. `from` remains the represented agent;
+    /// this field identifies the local caller that exercised that authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CollaborationProvenance>,
     pub kind: RequestKind,
     pub body: String,
     pub expects_reply: bool,
@@ -510,6 +614,16 @@ impl CollaborationStore {
         to: Participant,
         input: NewRequest,
     ) -> Result<CollaborationRequest, CollaborationError> {
+        self.create_with_provenance(from, to, input, None).await
+    }
+
+    pub async fn create_with_provenance(
+        &self,
+        from: Participant,
+        to: Participant,
+        input: NewRequest,
+        provenance: Option<CollaborationProvenance>,
+    ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let body = input.body.trim();
         if body.is_empty() {
@@ -528,6 +642,7 @@ impl CollaborationStore {
             id: next_request_id(now),
             from,
             to,
+            provenance,
             kind: input.kind,
             body: body.to_string(),
             expects_reply: input.expects_reply,
@@ -1699,5 +1814,24 @@ mod tests {
         assert_eq!(participants[0].alias.as_deref(), Some("builder"));
         assert_eq!(participants[0].roles, vec!["implementation"]);
         assert!(participants[1].alias.is_none());
+    }
+
+    #[test]
+    fn collaboration_client_hello_labels_round_trip_without_granting_authority() {
+        for kind in [
+            CollaborationClientKind::Cli,
+            CollaborationClientKind::Watch,
+            CollaborationClientKind::Mcp,
+            CollaborationClientKind::Dashboard,
+        ] {
+            assert_eq!(
+                CollaborationClientKind::from_hello_label(&kind.hello_label()),
+                kind
+            );
+        }
+        assert_eq!(
+            CollaborationClientKind::from_hello_label("muxa/0.8.29"),
+            CollaborationClientKind::Unknown
+        );
     }
 }

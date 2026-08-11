@@ -1,10 +1,10 @@
 # CLI dashboard
 
-`muxa dashboard`는 session-card 기반 TUI console입니다. 여러 agent session을
-tmux에 먼저 attach하지 않고 한 화면에서 확인하고 조작하는 용도입니다.
+`muxa dashboard`는 workspace-card 기반 TUI console입니다. tmux card 하나는
+workspace session이고 pane에는 work window 위치가 함께 표시됩니다.
 
 작고 빠른 picker/table이 필요하면 `muxa watch`를 쓰고, card, inspector, live
-terminal capture, prompt composer, session 단위 ACT/WACT total이 필요한
+terminal capture, prompt composer, workspace 단위 ACT/WACT total이 필요한
 운영 화면은 `muxa dashboard`를 씁니다.
 tracked tmux agent pane 안에서 실행하면 현재 agent의 collaboration room
 console 역할도 함께 수행합니다.
@@ -30,17 +30,17 @@ muxa dashboard --include-paneless
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` / `←` / `→`, `h` / `j` / `k` / `l` | card 선택 이동. |
-| `Tab`, `[` / `]` | 선택 session card 안의 action target 전환. |
+| `Tab`, `[` / `]` | 선택 workspace card 안의 action target 전환. |
 | `PageUp` / `PageDown` | live capture history scroll. |
 | `G` / `End` | capture를 최신 output으로 이동. |
 | `f` | capture fullscreen toggle. |
 | `n` | 진단 note가 있을 때 notes popup 열기. |
-| `Enter` | 선택 session inspector toggle. |
+| `Enter` | 선택 workspace inspector toggle. |
 | `p` | 선택 pane 또는 muxa PTY session에 prompt composer 열기. |
 | `m` | 선택한 same-room agent에게 구조화 요청 작성. |
 | `b` | request를 claim하지 않고 incoming/sent collaboration mailbox 열기. |
 | `i` | pending collaboration request를 claim하고 incoming mailbox 열기. |
-| `c` | 선택 session의 최신 prompt 복사. |
+| `c` | 선택 workspace의 최신 prompt 복사. |
 | `R` | 확인 후 선택 pane 또는 PTY session에 Ctrl-C 전송. |
 | `K` | 확인 후 선택 pane 또는 PTY session 종료. |
 | `o` | 선택 pane/session을 명시적으로 열기. |

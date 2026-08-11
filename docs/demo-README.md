@@ -15,8 +15,8 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
 | `docs/demo-teardown.sh`   | Removes all of it. Safe to run at any time, including after a half-finished render.        |
 | `docs/demo-optimize.sh`   | Rebuilds a rendered GIF on a 64-colour palette. Run it after `vhs`, before committing.     |
-| `docs/demo.gif`           | Hero output. 1320 × 620, ~1.6 MB after optimizing.                                          |
-| `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.5 MB after optimizing.                                 |
+| `docs/demo.gif`           | Hero output. 1320 × 620, ~1.7 MB after optimizing.                                          |
+| `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.7 MB after optimizing.                                 |
 | `docs/demo-onboard.gif`   | Korean unified onboarding output. 1320 × 720, ~1.5 MB after optimizing.                    |
 
 ## What the recordings cover
@@ -25,13 +25,13 @@ The two fleet recordings are split because one GIF covering everything ran
 45 seconds, which nobody watches to the end of. Onboarding is separate because
 it is a self-contained lesson and deliberately needs no live fixture.
 
-**`demo.tape` — triage.** Sixteen sessions on one screen with the state
+**`demo.tape` — triage.** Twenty workspace/work rows on one screen with the state
 sort floating the ones that need you; `|` cycling the list/inspector
 split, with the inspector carrying the selected agent's live screen; the
 k9s-style swarm view with its subagent trees; `muxa attend` teleporting
 the tmux client to the agent blocked longest.
 
-**`demo-collab.tape` — talking to the fleet.** `b` for the durable
+**`demo-collab.tape` — talking to the fleet.** `M` for the durable
 request/reply mailbox; `m` addressing whatever row the cursor is on; `a`
 asking claude a headless question and `A` browsing the answers.
 
@@ -39,7 +39,7 @@ asking claude a headless question and `A` browsing the answers.
 accepts real `tmux new-session` and `tmux attach` input, preserves the visible
 window, pane, detach, and reattach transitions, demonstrates the managed `s`,
 `q`, and `D` surfaces as step 11, then continues directly at step 12 through
-watch's session-state gutter, inspector, overlays, collaboration, and footer.
+watch's workspace/work state gutter, inspector, overlays, collaboration, and footer.
 One 20-step counter covers the scenario; there is no second welcome or phase
 completion screen. It does not use `demo-setup.sh` because onboarding must not
 touch real sessions.
@@ -79,7 +79,7 @@ differently on every render.
 
 ```bash
 cd /path/to/muxa
-cargo build -p muxa-cli  # demo-onboard.tape prefers target/debug/muxa
+cargo build --workspace  # fleet tapes use target/debug/muxa and target/debug/muxad
 vhs docs/demo.tape
 vhs docs/demo-collab.tape
 vhs docs/demo-onboard.tape
@@ -96,7 +96,7 @@ VHS spins up `ttyd`, points headless Chrome at it, records the rendered
 terminal, and encodes the GIF. The fleet tapes run `demo-setup.sh` in their
 prelude and `demo-teardown.sh` in their postlude, so no state is left behind —
 and setup tears down before it builds, so an interrupted render does not poison
-the next one. Both onboarding tapes run inert mocks directly and do not need
+the next one. The unified onboarding tape runs inert mocks directly and does not need
 teardown.
 
 You need [JetBrains Mono Nerd Font](https://github.com/ryanoasis/nerd-fonts)

@@ -10,6 +10,7 @@ pub const ACTIVITY_FILENAME: &str = "activity.ndjson";
 pub const STATE_FILENAME: &str = "state.json";
 pub const SESSION_ACTIVITY_FILENAME: &str = "session-activity.json";
 pub const COLLABORATION_FILENAME: &str = "collaboration.json";
+pub const COLLABORATION_AUDIT_FILENAME: &str = "collaboration-audit.ndjson";
 pub const ASK_FILENAME: &str = "ask.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
@@ -65,6 +66,11 @@ pub fn default_ask_file() -> Option<PathBuf> {
 
 pub fn default_collaboration_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_FILENAME))
+}
+
+/// Default append-only collaboration caller audit ledger.
+pub fn default_collaboration_audit_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_AUDIT_FILENAME))
 }
 
 fn posix_uid() -> u32 {

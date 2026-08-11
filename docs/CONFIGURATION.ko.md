@@ -105,9 +105,9 @@ agent를 정확한 pane id로 지정할 수 있습니다.
 
 ```toml
 [watch]
-view = "session"
+view = "work"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
-sort = ["state", "session", "latest"]
+sort = ["state", "workspace", "latest"]
 hide_paneless = true
 collaboration_kind = "question"   # question | review | task | notice
 collaboration_mode = "read_only"  # read_only | execute | just_send

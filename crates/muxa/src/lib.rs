@@ -38,6 +38,7 @@ pub mod adapters;
 pub mod ask;
 pub mod backend;
 pub mod collaboration;
+pub mod collaboration_audit;
 pub mod config;
 pub mod dashboard;
 pub mod discovery;

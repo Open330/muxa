@@ -413,7 +413,7 @@ pub(crate) fn herdr_focused_workspace(socket_path: &Path) -> Option<FocusedWorks
         })
 }
 
-/// A herdr workspace as the watch/session view needs it: the stable
+/// A herdr workspace as the watch work view needs it: the stable
 /// `workspace_id` (session id, matching [`to_pane_info`]'s `session` mapping
 /// and the `session_activity` ledger key) plus the mutable human-facing
 /// `label` (display name, falling back to the id when herdr reports none).
@@ -426,15 +426,15 @@ pub struct WorkspaceSummary {
 }
 
 /// List every herdr workspace as a [`WorkspaceSummary`], so the watch
-/// session view can source "sessions" on herdr hosts (the tmux
+/// work view can source workspace-level rows on herdr hosts (the tmux
 /// `list_sessions` analog). Uses `workspace.list` — the same cheap call
 /// [`herdr_focused_workspace`] uses, but returns *all* workspaces rather
 /// than only the focused one.
 ///
 /// Returns an empty `Vec` when the server is unreachable/absent, reports no
 /// workspaces, or the reply is malformed — every failure degrades to "no
-/// sessions this refresh", mirroring `list_sessions().unwrap_or_default()`
-/// on tmux (a downed tmux server likewise yields no session rows).
+/// workspace rows this refresh", mirroring `list_sessions().unwrap_or_default()`
+/// on tmux (a downed tmux server likewise yields no workspace/work rows).
 pub fn herdr_list_workspaces(socket_path: &Path) -> Vec<WorkspaceSummary> {
     let backend = HerdrBackend::with_socket_path(socket_path.to_path_buf());
     let Ok(result) = backend.request("workspace.list", json!({})) else {

@@ -6,7 +6,7 @@
 # needs you; this one is about saying something once you have.
 #
 # Arc:
-#   0–7s     the mailbox   — `b`: durable request/reply between agents,
+#   0–7s     the mailbox   — `M`: durable request/reply between agents,
 #                            incoming and sent, with the full body
 #   7–15s    messaging     — `m`: address whatever row the cursor is on,
 #                            pick the contract, send
@@ -43,7 +43,7 @@ Hide
 Set TypingSpeed 1ms
 Type "export MUXA_DEMO_TMUX=$(command -v tmux)"
 Enter
-Type "export PATH=$HOME/.cargo/bin:$PATH"
+Type "export PATH=$PWD/target/debug:$HOME/.cargo/bin:$PATH"
 Enter
 Type "export LANG=C.UTF-8"
 Enter
@@ -65,9 +65,9 @@ Show
 
 # ── 1. The mailbox (0–7s) ────────────────────────────────────────────────
 # Agents leave each other durable requests: a kind, a work mode, a body,
-# and a reply that has to come back. `b` is that mailbox — three queued
+# and a reply that has to come back. `M` is that mailbox — three queued
 # from other agents, one this session sent out.
-Type "b"
+Type "M"
 Sleep 2500ms
 Down@800ms 2
 Sleep 2500ms
@@ -75,7 +75,7 @@ Escape
 Sleep 800ms
 
 # ── 2. Messaging the cursor row (7–15s) ──────────────────────────────────
-# `m` addresses whichever session the cursor is on — not the window muxa
+# `m` addresses whichever work/agent row the cursor is on — not the window muxa
 # watch happens to be running in. Tab picks the contract kind, Ctrl-E the
 # work mode, and the agent gets a request it must answer.
 # `gg` first: the cursor is wherever the mailbox left it, and the row this

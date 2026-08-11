@@ -1,9 +1,9 @@
-//! Managed tmux work/session and agent/pane lifecycle.
+//! Managed tmux workspace/session, work/window, and agent/pane lifecycle.
 //!
 //! Muxa's tmux policy is deliberately narrow:
-//! - one managed session represents one work item (normally a ticket);
+//! - one managed session represents one workspace or project;
+//! - one managed window represents one work item (normally a ticket);
 //! - one managed pane represents one coding agent;
-//! - windows are layout only and carry no work identity.
 //!
 //! Identity is stored in tmux user options so it survives muxad and MCP
 //! process restarts without adding another database.
@@ -14,6 +14,9 @@ use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+const WORKSPACE_ID_OPTION: &str = "@muxa_workspace_id";
+const WORKSPACE_CWD_OPTION: &str = "@muxa_workspace_cwd";
+const MANAGED_WORKSPACE_OPTION: &str = "@muxa_managed_workspace";
 const WORK_ID_OPTION: &str = "@muxa_work_id";
 const WORK_CWD_OPTION: &str = "@muxa_work_cwd";
 const MANAGED_WORK_OPTION: &str = "@muxa_managed_work";
@@ -21,10 +24,12 @@ const MANAGED_AGENT_OPTION: &str = "@muxa_managed_agent";
 const AGENT_OPTION: &str = "@muxa_agent";
 const AGENT_ROLE_OPTION: &str = "@muxa_agent_role";
 const AGENT_TASK_OPTION: &str = "@muxa_agent_task";
+const PANE_WORKSPACE_OPTION: &str = "@muxa_agent_workspace_id";
 const PANE_WORK_OPTION: &str = "@muxa_agent_work_id";
 
-const SESSION_FORMAT: &str = "#{session_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{session_attached}\t#{session_windows}";
-const PANE_FORMAT: &str = "#{session_name}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_work_id}";
+const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
+const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}";
+const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ManagedAgentPane {
@@ -41,11 +46,23 @@ pub struct ManagedAgentPane {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkInfo {
     pub work: String,
+    pub workspace: String,
+    pub session: String,
+    pub window: String,
+    pub window_index: u32,
+    pub window_name: String,
+    pub cwd: PathBuf,
+    pub agents: Vec<ManagedAgentPane>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    pub workspace: String,
     pub session: String,
     pub cwd: PathBuf,
     pub attached_clients: u32,
     pub windows: u32,
-    pub agents: Vec<ManagedAgentPane>,
+    pub works: Vec<WorkInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -57,24 +74,31 @@ pub enum AgentControlAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManageAction {
+    ListWorkspace,
+    ShowWorkspace,
     ListWork,
     ShowWork,
     InterruptAgent,
     TerminateAgent,
     CloseWork,
+    CloseWorkspace,
 }
 
 impl ManageAction {
     pub fn parse(value: &str) -> std::result::Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "list_workspace" | "list_workspaces" => Ok(Self::ListWorkspace),
+            "show_workspace" => Ok(Self::ShowWorkspace),
             "list_work" | "list" => Ok(Self::ListWork),
             "show_work" | "show" => Ok(Self::ShowWork),
             "interrupt_agent" | "interrupt" | "abort" => Ok(Self::InterruptAgent),
             "terminate_agent" | "terminate" | "kill" => Ok(Self::TerminateAgent),
             "close_work" | "close" => Ok(Self::CloseWork),
+            "close_workspace" => Ok(Self::CloseWorkspace),
             other => Err(format!(
-                "unknown tmux action {other:?}; expected list_work, show_work, \
-                 interrupt_agent, terminate_agent, or close_work"
+                "unknown tmux action {other:?}; expected list_workspace, show_workspace, \
+                 list_work, show_work, interrupt_agent, terminate_agent, close_work, \
+                 or close_workspace"
             )),
         }
     }
@@ -84,6 +108,7 @@ impl ManageAction {
 pub struct ManageRequest {
     pub action: ManageAction,
     pub pane: Option<String>,
+    pub workspace: Option<String>,
     pub work: Option<String>,
     pub confirm: bool,
 }
@@ -91,6 +116,12 @@ pub struct ManageRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ManageResult {
+    Workspaces {
+        workspaces: Vec<WorkspaceInfo>,
+    },
+    Workspace {
+        workspace: WorkspaceInfo,
+    },
     Works {
         works: Vec<WorkInfo>,
     },
@@ -103,6 +134,12 @@ pub enum ManageResult {
     },
     WorkClosed {
         work: String,
+        workspace: String,
+        session: String,
+        window: String,
+    },
+    WorkspaceClosed {
+        workspace: String,
         session: String,
     },
 }
@@ -125,6 +162,9 @@ pub struct AgentControlArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkListArgs {
+    /// Limit work windows to one managed workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -132,8 +172,11 @@ pub struct WorkListArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkShowArgs {
-    /// Ticket/work id, for example CAL-7041.
+    /// Ticket/work id, for example TEST-0001.
     pub work: String,
+    /// Workspace id when the same work id exists in more than one workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -141,8 +184,39 @@ pub struct WorkShowArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkCloseArgs {
-    /// Ticket/work id, for example CAL-7041.
+    /// Ticket/work id, for example TEST-0001.
     pub work: String,
+    /// Workspace id when the same work id exists in more than one workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceListArgs {
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceShowArgs {
+    /// Managed workspace/project id.
+    pub workspace: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceCloseArgs {
+    /// Managed workspace/project id.
+    pub workspace: String,
     /// Skip the confirmation prompt.
     #[arg(long, short = 'y')]
     pub yes: bool,
@@ -166,17 +240,24 @@ pub fn run_agent_control(args: AgentControlArgs) -> Result<()> {
 }
 
 pub fn run_work_list(args: WorkListArgs) -> Result<()> {
-    let works = list_works()?;
+    let works = match args.workspace.as_deref() {
+        Some(workspace) => find_workspace(workspace)?
+            .map(|workspace| workspace.works)
+            .unwrap_or_default(),
+        None => list_works()?,
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&json_works(&works))?);
     } else if works.is_empty() {
-        println!("no muxa-managed work sessions");
+        println!("no muxa-managed work windows");
     } else {
         for work in works {
             println!(
-                "{}  session={}  agents={}  cwd={}",
+                "{}  workspace={}  session={}  window={}  agents={}  cwd={}",
                 work.work,
+                work.workspace,
                 work.session,
+                work.window,
                 work.agents.len(),
                 work.cwd.display()
             );
@@ -186,15 +267,17 @@ pub fn run_work_list(args: WorkListArgs) -> Result<()> {
 }
 
 pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
-    let work = find_work(&args.work)?
+    let work = find_work_in(&args.work, args.workspace.as_deref())?
         .ok_or_else(|| anyhow::anyhow!("managed work {:?} not found", args.work))?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&work)?);
     } else {
         println!(
-            "{}  session={}  cwd={}",
+            "{}  workspace={}  session={}  window={}  cwd={}",
             work.work,
+            work.workspace,
             work.session,
+            work.window,
             work.cwd.display()
         );
         for agent in &work.agents {
@@ -224,19 +307,100 @@ pub fn run_work_close(args: WorkCloseArgs) -> Result<()> {
         println!("cancelled");
         return Ok(());
     }
-    let result = close_work(&args.work, args.yes)?;
+    let result = close_work(&args.work, args.workspace.as_deref(), args.yes)?;
+    print_result(&result, args.json)
+}
+
+pub fn run_workspace_list(args: WorkspaceListArgs) -> Result<()> {
+    let workspaces = list_workspaces()?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_workspaces(&workspaces))?
+        );
+    } else if workspaces.is_empty() {
+        println!("no muxa-managed workspaces");
+    } else {
+        for workspace in workspaces {
+            println!(
+                "{}  session={}  works={}  cwd={}",
+                workspace.workspace,
+                workspace.session,
+                workspace.works.len(),
+                workspace.cwd.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_workspace_show(args: WorkspaceShowArgs) -> Result<()> {
+    let workspace = find_workspace(&args.workspace)?
+        .ok_or_else(|| anyhow::anyhow!("managed workspace {:?} not found", args.workspace))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&workspace)?);
+    } else {
+        println!(
+            "{}  session={}  works={}  cwd={}",
+            workspace.workspace,
+            workspace.session,
+            workspace.works.len(),
+            workspace.cwd.display()
+        );
+        for work in &workspace.works {
+            println!(
+                "  {}  window={}  agents={}  cwd={}",
+                work.work,
+                work.window,
+                work.agents.len(),
+                work.cwd.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_workspace_close(args: WorkspaceCloseArgs) -> Result<()> {
+    if !confirm_destructive(
+        args.yes,
+        &format!(
+            "Close workspace {} and every work window and agent pane?",
+            args.workspace
+        ),
+    )? {
+        println!("cancelled");
+        return Ok(());
+    }
+    let result = close_workspace(&args.workspace, args.yes)?;
     print_result(&result, args.json)
 }
 
 pub fn manage(request: ManageRequest) -> Result<ManageResult> {
     match request.action {
+        ManageAction::ListWorkspace => Ok(ManageResult::Workspaces {
+            workspaces: list_workspaces()?,
+        }),
+        ManageAction::ShowWorkspace => {
+            let raw = required(
+                request.workspace.as_deref(),
+                "show_workspace requires workspace",
+            )?;
+            let workspace = find_workspace(raw)?
+                .ok_or_else(|| anyhow::anyhow!("managed workspace {raw:?} not found"))?;
+            Ok(ManageResult::Workspace { workspace })
+        }
         ManageAction::ListWork => Ok(ManageResult::Works {
-            works: list_works()?,
+            works: match request.workspace.as_deref() {
+                Some(workspace) => find_workspace(workspace)?
+                    .map(|workspace| workspace.works)
+                    .unwrap_or_default(),
+                None => list_works()?,
+            },
         }),
         ManageAction::ShowWork => {
             let raw = required(request.work.as_deref(), "show_work requires work")?;
-            let work =
-                find_work(raw)?.ok_or_else(|| anyhow::anyhow!("managed work {raw:?} not found"))?;
+            let work = find_work_in(raw, request.workspace.as_deref())?
+                .ok_or_else(|| anyhow::anyhow!("managed work {raw:?} not found"))?;
             Ok(ManageResult::Work { work })
         }
         ManageAction::InterruptAgent => {
@@ -249,7 +413,14 @@ pub fn manage(request: ManageRequest) -> Result<ManageResult> {
         }
         ManageAction::CloseWork => {
             let work = required(request.work.as_deref(), "close_work requires work")?;
-            close_work(work, request.confirm)
+            close_work(work, request.workspace.as_deref(), request.confirm)
+        }
+        ManageAction::CloseWorkspace => {
+            let workspace = required(
+                request.workspace.as_deref(),
+                "close_workspace requires workspace",
+            )?;
+            close_workspace(workspace, request.confirm)
         }
     }
 }
@@ -271,19 +442,73 @@ pub fn normalize_work_id(raw: &str) -> Result<String> {
     Ok(work)
 }
 
-pub fn find_work(raw: &str) -> Result<Option<WorkInfo>> {
+pub fn normalize_workspace_id(raw: &str) -> Result<String> {
+    let workspace = raw.trim().to_ascii_lowercase();
+    if workspace.is_empty() {
+        bail!("workspace id cannot be empty");
+    }
+    if workspace.len() > 128 {
+        bail!("workspace id is too long (max 128 bytes)");
+    }
+    if workspace
+        .chars()
+        .any(|ch| ch == '\t' || ch == '\n' || ch == '\r')
+    {
+        bail!("workspace id cannot contain tabs or newlines");
+    }
+    Ok(workspace)
+}
+
+pub fn workspace_id_for_cwd(cwd: &Path) -> Result<String> {
+    let name = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("workspace");
+    normalize_workspace_id(name)
+}
+
+pub fn find_work_in(raw: &str, workspace: Option<&str>) -> Result<Option<WorkInfo>> {
     let wanted = normalize_work_id(raw)?;
-    Ok(list_works()?.into_iter().find(|work| work.work == wanted))
+    let workspace = workspace.map(normalize_workspace_id).transpose()?;
+    let mut matches = list_works()?
+        .into_iter()
+        .filter(|work| {
+            work.work == wanted
+                && workspace
+                    .as_deref()
+                    .is_none_or(|workspace| work.workspace == workspace)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        bail!("work {wanted} exists in multiple workspaces; specify --workspace");
+    }
+    Ok(matches.pop())
+}
+
+pub fn find_workspace(raw: &str) -> Result<Option<WorkspaceInfo>> {
+    let wanted = normalize_workspace_id(raw)?;
+    Ok(list_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.workspace == wanted))
 }
 
 pub fn list_works() -> Result<Vec<WorkInfo>> {
-    let sessions = tmux_output_allow_no_server(&["list-sessions", "-F", SESSION_FORMAT])?;
-    let panes = tmux_output_allow_no_server(&["list-panes", "-a", "-F", PANE_FORMAT])?;
-    Ok(parse_works(&sessions, &panes))
+    Ok(list_workspaces()?
+        .into_iter()
+        .flat_map(|workspace| workspace.works)
+        .collect())
 }
 
-pub fn session_name_for_work(work: &str) -> Result<String> {
-    let normalized = normalize_work_id(work)?;
+pub fn list_workspaces() -> Result<Vec<WorkspaceInfo>> {
+    let sessions = tmux_output_allow_no_server(&["list-sessions", "-F", SESSION_FORMAT])?;
+    let windows = tmux_output_allow_no_server(&["list-windows", "-a", "-F", WINDOW_FORMAT])?;
+    let panes = tmux_output_allow_no_server(&["list-panes", "-a", "-F", PANE_FORMAT])?;
+    Ok(parse_workspaces(&sessions, &windows, &panes))
+}
+
+pub fn session_name_for_workspace(workspace: &str) -> Result<String> {
+    let normalized = normalize_workspace_id(workspace)?;
     let base = sanitize_session_name(&normalized.to_ascii_lowercase());
     let existing = all_session_names()?;
     Ok(unique_name(base, |candidate| {
@@ -291,42 +516,110 @@ pub fn session_name_for_work(work: &str) -> Result<String> {
     }))
 }
 
-pub fn mark_work(session: &str, work: &str, cwd: &Path) -> Result<()> {
+pub fn window_name_for_work(work: &str) -> Result<String> {
+    Ok(sanitize_window_name(
+        &normalize_work_id(work)?.to_ascii_lowercase(),
+    ))
+}
+
+pub fn mark_workspace(session: &str, workspace: &str, cwd: &Path) -> Result<()> {
+    let workspace = normalize_workspace_id(workspace)?;
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("workspace cwd is not valid UTF-8: {}", cwd.display()))?;
+    set_option(
+        OptionScope::Session,
+        session,
+        WORKSPACE_ID_OPTION,
+        &workspace,
+    )?;
+    set_option(OptionScope::Session, session, WORKSPACE_CWD_OPTION, cwd)?;
+    set_option(OptionScope::Session, session, MANAGED_WORKSPACE_OPTION, "1")?;
+    Ok(())
+}
+
+pub fn mark_work(window: &str, workspace: &str, work: &str, cwd: &Path) -> Result<()> {
+    let workspace = normalize_workspace_id(workspace)?;
     let work = normalize_work_id(work)?;
     let cwd = cwd
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("work cwd is not valid UTF-8: {}", cwd.display()))?;
-    set_option(false, session, WORK_ID_OPTION, &work)?;
-    set_option(false, session, WORK_CWD_OPTION, cwd)?;
-    set_option(false, session, MANAGED_WORK_OPTION, "1")?;
+    set_option(OptionScope::Window, window, WORK_ID_OPTION, &work)?;
+    set_option(OptionScope::Window, window, WORK_CWD_OPTION, cwd)?;
+    set_option(OptionScope::Window, window, MANAGED_WORK_OPTION, "1")?;
+    set_option(OptionScope::Window, window, WORKSPACE_ID_OPTION, &workspace)?;
     Ok(())
 }
 
 pub fn mark_agent(
     pane: &str,
     agent: &str,
+    workspace: Option<&str>,
     work: Option<&str>,
     role: Option<&str>,
     task: Option<&str>,
 ) -> Result<()> {
     validate_pane_id(pane)?;
-    set_option(true, pane, AGENT_OPTION, &metadata(agent, 64)?)?;
-    set_option(true, pane, MANAGED_AGENT_OPTION, "1")?;
+    set_option(OptionScope::Pane, pane, AGENT_OPTION, &metadata(agent, 64)?)?;
+    set_option(OptionScope::Pane, pane, MANAGED_AGENT_OPTION, "1")?;
+    if let Some(workspace) = workspace {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            PANE_WORKSPACE_OPTION,
+            &normalize_workspace_id(workspace)?,
+        )?;
+    }
     if let Some(work) = work {
-        set_option(true, pane, PANE_WORK_OPTION, &normalize_work_id(work)?)?;
+        set_option(
+            OptionScope::Pane,
+            pane,
+            PANE_WORK_OPTION,
+            &normalize_work_id(work)?,
+        )?;
     }
     if let Some(role) = role.filter(|value| !value.trim().is_empty()) {
-        set_option(true, pane, AGENT_ROLE_OPTION, &metadata(role, 64)?)?;
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_ROLE_OPTION,
+            &metadata(role, 64)?,
+        )?;
     }
     if let Some(task) = task.filter(|value| !value.trim().is_empty()) {
-        set_option(true, pane, AGENT_TASK_OPTION, &metadata(task, 256)?)?;
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_TASK_OPTION,
+            &metadata(task, 256)?,
+        )?;
     }
     Ok(())
 }
 
+pub fn window_id_for_pane(pane: &str) -> Result<String> {
+    validate_pane_id(pane)?;
+    let window = tmux_output(&["display-message", "-p", "-t", pane, "#{window_id}"])?;
+    let window = window.trim();
+    if !window.starts_with('@') {
+        bail!("pane {pane} resolved to an invalid window id {window:?}");
+    }
+    Ok(window.to_string())
+}
+
+pub fn session_name_for_pane(pane: &str) -> Result<String> {
+    validate_pane_id(pane)?;
+    let session = tmux_output(&["display-message", "-p", "-t", pane, "#{session_name}"])?;
+    let session = session.trim();
+    if session.is_empty() {
+        bail!("pane {pane} resolved to an empty session name");
+    }
+    Ok(session.to_string())
+}
+
 pub fn cleanup_pane(pane: &str) {
     if validate_pane_id(pane).is_ok() {
-        let _ = muxa::tmux::tmux_command()
+        let _ = muxa::tmux::tmux_command_scoped()
             .args(["kill-pane", "-t", pane])
             .status();
     }
@@ -349,15 +642,31 @@ fn control_agent(pane: &str, action: AgentControlAction, confirm: bool) -> Resul
     })
 }
 
-fn close_work(raw: &str, confirm: bool) -> Result<ManageResult> {
+fn close_work(raw: &str, workspace: Option<&str>, confirm: bool) -> Result<ManageResult> {
     if !confirm {
         bail!("close_work requires confirm=true");
     }
-    let work = find_work(raw)?.ok_or_else(|| anyhow::anyhow!("managed work {raw:?} not found"))?;
-    tmux_status(&["kill-session", "-t", &format!("={}", work.session)])?;
+    let work = find_work_in(raw, workspace)?
+        .ok_or_else(|| anyhow::anyhow!("managed work {raw:?} not found"))?;
+    tmux_status(&["kill-window", "-t", &work.window])?;
     Ok(ManageResult::WorkClosed {
         work: work.work,
+        workspace: work.workspace,
         session: work.session,
+        window: work.window,
+    })
+}
+
+fn close_workspace(raw: &str, confirm: bool) -> Result<ManageResult> {
+    if !confirm {
+        bail!("close_workspace requires confirm=true");
+    }
+    let workspace = find_workspace(raw)?
+        .ok_or_else(|| anyhow::anyhow!("managed workspace {raw:?} not found"))?;
+    tmux_status(&["kill-session", "-t", &format!("={}", workspace.session)])?;
+    Ok(ManageResult::WorkspaceClosed {
+        workspace: workspace.workspace,
+        session: workspace.session,
     })
 }
 
@@ -404,49 +713,89 @@ fn metadata(raw: &str, max: usize) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn parse_works(sessions: &str, panes: &str) -> Vec<WorkInfo> {
-    let mut works = Vec::new();
+fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<WorkspaceInfo> {
+    let mut workspaces = Vec::new();
     for line in sessions.lines() {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 6 || fields[1].trim().is_empty() || fields[3] != "1" {
+        if fields.len() < 7 || fields[2].trim().is_empty() || fields[4] != "1" {
             continue;
         }
         let session = fields[0].to_string();
-        let work = fields[1].trim().to_ascii_uppercase();
-        let agents = panes
+        let session_id = fields[1];
+        let workspace = fields[2].trim().to_ascii_lowercase();
+        let mut works = windows
             .lines()
-            .filter_map(|line| parse_agent_pane(line, &session, &work))
-            .collect();
-        works.push(WorkInfo {
-            work,
+            .filter_map(|line| parse_work_window(line, session_id, &workspace, panes))
+            .collect::<Vec<_>>();
+        works.sort_by(|left, right| left.work.cmp(&right.work));
+        workspaces.push(WorkspaceInfo {
+            workspace,
             session,
-            cwd: PathBuf::from(fields[2]),
-            attached_clients: fields[4].parse().unwrap_or(0),
-            windows: fields[5].parse().unwrap_or(0),
-            agents,
+            cwd: PathBuf::from(fields[3]),
+            attached_clients: fields[5].parse().unwrap_or(0),
+            windows: fields[6].parse().unwrap_or(0),
+            works,
         });
     }
-    works.sort_by(|left, right| left.work.cmp(&right.work));
-    works
+    workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+    workspaces
 }
 
-fn parse_agent_pane(line: &str, session: &str, work: &str) -> Option<ManagedAgentPane> {
+fn parse_work_window(
+    line: &str,
+    session_id: &str,
+    workspace: &str,
+    panes: &str,
+) -> Option<WorkInfo> {
     let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() < 9
-        || fields[0] != session
-        || fields[2].trim().is_empty()
+    if fields.len() < 8
+        || fields[1] != session_id
+        || fields[5].trim().is_empty()
         || fields[7] != "1"
-        || !fields[8].eq_ignore_ascii_case(work)
+    {
+        return None;
+    }
+    let work = fields[5].trim().to_ascii_uppercase();
+    let window = fields[2].to_string();
+    let agents = panes
+        .lines()
+        .filter_map(|line| parse_agent_pane(line, &window, workspace, &work))
+        .collect();
+    Some(WorkInfo {
+        work,
+        workspace: workspace.to_string(),
+        session: fields[0].to_string(),
+        window,
+        window_index: fields[3].parse().unwrap_or(0),
+        window_name: fields[4].to_string(),
+        cwd: PathBuf::from(fields[6]),
+        agents,
+    })
+}
+
+fn parse_agent_pane(
+    line: &str,
+    window: &str,
+    workspace: &str,
+    work: &str,
+) -> Option<ManagedAgentPane> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() < 11
+        || fields[1] != window
+        || fields[3].trim().is_empty()
+        || fields[8] != "1"
+        || !fields[9].eq_ignore_ascii_case(workspace)
+        || !fields[10].eq_ignore_ascii_case(work)
     {
         return None;
     }
     Some(ManagedAgentPane {
-        pane: fields[1].to_string(),
-        agent: fields[2].to_string(),
-        role: option(fields[3]),
-        task: option(fields[4]),
-        command: fields[5].to_string(),
-        cwd: PathBuf::from(fields[6]),
+        pane: fields[2].to_string(),
+        agent: fields[3].to_string(),
+        role: option(fields[4]),
+        task: option(fields[5]),
+        command: fields[6].to_string(),
+        cwd: PathBuf::from(fields[7]),
     })
 }
 
@@ -477,10 +826,14 @@ fn sanitize_session_name(name: &str) -> String {
     }
     let cleaned = cleaned.trim_matches('-').to_string();
     if cleaned.is_empty() {
-        "work".into()
+        "workspace".into()
     } else {
         cleaned
     }
+}
+
+fn sanitize_window_name(name: &str) -> String {
+    sanitize_session_name(name)
 }
 
 fn unique_name(base: String, exists: impl Fn(&str) -> bool) -> String {
@@ -493,17 +846,26 @@ fn unique_name(base: String, exists: impl Fn(&str) -> bool) -> String {
         .unwrap_or_else(|| format!("{base}-overflow"))
 }
 
-fn set_option(pane: bool, target: &str, key: &str, value: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+enum OptionScope {
+    Session,
+    Window,
+    Pane,
+}
+
+fn set_option(scope: OptionScope, target: &str, key: &str, value: &str) -> Result<()> {
     let mut args = vec!["set-option"];
-    if pane {
-        args.push("-p");
+    match scope {
+        OptionScope::Session => {}
+        OptionScope::Window => args.push("-w"),
+        OptionScope::Pane => args.push("-p"),
     }
     args.extend(["-t", target, key, value]);
     tmux_status(&args)
 }
 
 fn tmux_status(args: &[&str]) -> Result<()> {
-    let output = muxa::tmux::tmux_command()
+    let output = muxa::tmux::tmux_command_scoped()
         .args(args)
         .output()
         .with_context(|| format!("run tmux {}", args.first().unwrap_or(&"command")))?;
@@ -523,7 +885,7 @@ fn tmux_status(args: &[&str]) -> Result<()> {
 }
 
 fn tmux_output(args: &[&str]) -> Result<String> {
-    let output = muxa::tmux::tmux_command()
+    let output = muxa::tmux::tmux_command_scoped()
         .args(args)
         .output()
         .with_context(|| format!("run tmux {}", args.first().unwrap_or(&"command")))?;
@@ -575,6 +937,10 @@ fn json_works(works: &[WorkInfo]) -> serde_json::Value {
     serde_json::json!({ "works": works })
 }
 
+fn json_workspaces(workspaces: &[WorkspaceInfo]) -> serde_json::Value {
+    serde_json::json!({ "workspaces": workspaces })
+}
+
 fn print_result(result: &ManageResult, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(result)?);
@@ -583,10 +949,23 @@ fn print_result(result: &ManageResult, json: bool) -> Result<()> {
             ManageResult::AgentControl { action, pane } => {
                 println!("{action:?} agent pane {pane}");
             }
-            ManageResult::WorkClosed { work, session } => {
-                println!("closed work {work} (session {session})");
+            ManageResult::WorkClosed {
+                work,
+                workspace,
+                session,
+                window,
+            } => {
+                println!(
+                    "closed work {work} (workspace {workspace}, session {session}, window {window})"
+                );
             }
-            ManageResult::Works { .. } | ManageResult::Work { .. } => {
+            ManageResult::WorkspaceClosed { workspace, session } => {
+                println!("closed workspace {workspace} (session {session})");
+            }
+            ManageResult::Workspaces { .. }
+            | ManageResult::Workspace { .. }
+            | ManageResult::Works { .. }
+            | ManageResult::Work { .. } => {
                 println!("{}", serde_json::to_string_pretty(result)?);
             }
         }
@@ -599,32 +978,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn work_ids_are_case_normalized_and_tmux_safe() {
-        assert_eq!(normalize_work_id(" cal-7041 ").unwrap(), "CAL-7041");
+    fn workspace_and_work_ids_are_normalized_and_tmux_safe() {
+        assert_eq!(normalize_workspace_id(" Muxa ").unwrap(), "muxa");
+        assert_eq!(normalize_work_id(" test-0001 ").unwrap(), "TEST-0001");
         assert!(normalize_work_id("bad\nid").is_err());
         assert_eq!(
-            sanitize_session_name(
-                &normalize_work_id("CAL.7041: Review")
+            sanitize_window_name(
+                &normalize_work_id("TEST.0001: Review")
                     .unwrap()
                     .to_lowercase()
             ),
-            "cal-7041-review"
+            "test-0001-review"
         );
     }
 
     #[test]
-    fn parser_keeps_only_managed_sessions_and_agent_panes() {
-        let sessions = "cal-7041\tCAL-7041\t/repo\t1\t1\t2\n\
-                        spoofed\tCAL-0000\t/tmp\t\t0\t1\n\
-                        plain\t\t/tmp\t\t0\t1\n";
-        let panes = "cal-7041\t%1\tcodex\timplementer\tmain\tcodex\t/repo\t1\tCAL-7041\n\
-                     cal-7041\t%2\tcodex\treviewer\twrong\tcodex\t/repo\t1\tCAL-9999\n\
-                     cal-7041\t%3\tcodex\treviewer\tunmanaged\tcodex\t/repo\t\tCAL-7041\n";
-        let works = parse_works(sessions, panes);
-        assert_eq!(works.len(), 1);
-        assert_eq!(works[0].work, "CAL-7041");
-        assert_eq!(works[0].agents.len(), 1);
-        assert_eq!(works[0].agents[0].pane, "%1");
+    fn parser_keeps_only_managed_workspace_work_and_agent_hierarchy() {
+        let sessions = "muxa\t$1\tmuxa\t/repo\t1\t1\t2\n\
+                        legacy\t$2\t\t/tmp\t\t0\t1\n";
+        let windows = "muxa\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\n\
+                       muxa\t$1\t@2\t1\tplain\t\t/repo\t\n\
+                       legacy\t$2\t@3\t0\tlegacy\tOLD-1\t/tmp\t1\n";
+        let panes = "muxa\t@1\t%1\tcodex\timplementer\tmain\tcodex\t/repo/wt\t1\tmuxa\tTEST-0001\n\
+                     muxa\t@1\t%2\tcodex\treviewer\twrong\tcodex\t/repo/wt\t1\tmuxa\tTEST-9999\n\
+                     muxa\t@1\t%3\tcodex\treviewer\tunmanaged\tcodex\t/repo/wt\t\tmuxa\tTEST-0001\n";
+        let workspaces = parse_workspaces(sessions, windows, panes);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace, "muxa");
+        assert_eq!(workspaces[0].works.len(), 1);
+        assert_eq!(workspaces[0].works[0].work, "TEST-0001");
+        assert_eq!(workspaces[0].works[0].window, "@1");
+        assert_eq!(workspaces[0].works[0].agents.len(), 1);
+        assert_eq!(workspaces[0].works[0].agents[0].pane, "%1");
     }
 
     #[test]
@@ -632,6 +1017,7 @@ mod tests {
         let request = ManageRequest {
             action: ManageAction::TerminateAgent,
             pane: Some("%42".into()),
+            workspace: None,
             work: None,
             confirm: false,
         };

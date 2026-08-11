@@ -129,7 +129,10 @@ pub struct StartArgs {
     /// Window/session name. Session placement derives it from cwd when omitted.
     #[arg(long)]
     pub name: Option<String>,
-    /// Managed work/ticket. Reuses its tmux session or creates it once.
+    /// Managed workspace/project. Valid only together with --work.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Managed work/ticket. Reuses its tmux window or creates it once.
     #[arg(long)]
     pub work: Option<String>,
     /// Optional agent role stored on the pane, for example reviewer.
@@ -148,12 +151,15 @@ pub struct StartArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkStartArgs {
-    /// Work/ticket id. One managed tmux session is created per id.
+    /// Work/ticket id. One managed tmux window is created per id.
     pub work: String,
+    /// Workspace/project session. Defaults to the work directory name.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// First allowlisted agent, or another agent to add when the work exists.
     #[arg(long, value_enum)]
     pub agent: AgentProgram,
-    /// Work directory. Defaults to current directory; checked on reuse.
+    /// Work directory. Defaults to current directory; checked when the work window is reused.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
     /// Initial task.
@@ -165,7 +171,7 @@ pub struct WorkStartArgs {
     /// Optional short task label.
     #[arg(long)]
     pub task: Option<String>,
-    /// Split a reused work session to the right or below.
+    /// Split a reused work window to the right or below.
     #[arg(long, value_enum, default_value = "right")]
     pub direction: SplitDirection,
     /// Emit the structured result as JSON.
@@ -181,6 +187,7 @@ pub struct StartRequest {
     pub cwd: Option<PathBuf>,
     pub prompt: Option<String>,
     pub name: Option<String>,
+    pub workspace: Option<String>,
     pub work: Option<String>,
     pub role: Option<String>,
     pub task: Option<String>,
@@ -196,6 +203,7 @@ impl From<&StartArgs> for StartRequest {
             cwd: args.cwd.clone(),
             prompt: args.prompt.clone(),
             name: args.name.clone(),
+            workspace: args.workspace.clone(),
             work: args.work.clone(),
             role: args.role.clone(),
             task: args.task.clone(),
@@ -211,8 +219,15 @@ pub struct StartResult {
     pub placement: Placement,
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub work: Option<String>,
+    pub created_workspace: bool,
     pub created_work: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +266,7 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
         cwd: args.cwd,
         prompt: args.prompt,
         name: None,
+        workspace: args.workspace,
         work: Some(args.work),
         role: args.role,
         task: args.task,
@@ -260,15 +276,17 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!(
-            "{} agent {} in work {} (session {}, cwd {})",
+            "{} agent {} in workspace {} work {} (session {}, window {}, cwd {})",
             if result.created_work {
                 "created"
             } else {
                 "added"
             },
             result.pane,
+            result.workspace.as_deref().unwrap_or("-"),
             result.work.as_deref().unwrap_or("-"),
-            result.name.as_deref().unwrap_or("-"),
+            result.session.as_deref().unwrap_or("-"),
+            result.window.as_deref().unwrap_or("-"),
             result.cwd.display()
         );
     }
@@ -281,7 +299,9 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let PreparedLaunch {
         cwd,
+        workspace,
         work,
+        created_workspace,
         created_work,
     } = prepare_launch(&mut request)?;
     let prompt = request
@@ -290,7 +310,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .filter(|prompt| !prompt.trim().is_empty());
     let command = request.agent.launch_command(prompt);
     let args = tmux_args(&request, &cwd, &command)?;
-    let output = muxa::tmux::tmux_command()
+    let output = muxa::tmux::tmux_command_scoped()
         .args(&args)
         .output()
         .context("run tmux agent launcher")?;
@@ -313,14 +333,33 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .ok_or_else(|| anyhow::anyhow!("tmux created the surface but returned no pane id"))?
         .to_string();
 
+    let managed = work.is_some();
+    let session = managed
+        .then(|| crate::tmux_work::session_name_for_pane(&pane))
+        .transpose()?;
+    let window = managed
+        .then(|| crate::tmux_work::window_id_for_pane(&pane))
+        .transpose()?;
+
     let mark = (|| {
+        if created_workspace {
+            crate::tmux_work::mark_workspace(
+                session
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("created workspace has no tmux session"))?,
+                workspace
+                    .as_deref()
+                    .expect("created workspace has workspace id"),
+                &cwd,
+            )?;
+        }
         if created_work {
-            let session = request
-                .name
+            let window = window
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("created work has no tmux session name"))?;
+                .ok_or_else(|| anyhow::anyhow!("created work has no tmux window id"))?;
             crate::tmux_work::mark_work(
-                session,
+                window,
+                workspace.as_deref().expect("created work has workspace id"),
                 work.as_deref().expect("created work has id"),
                 &cwd,
             )?;
@@ -328,6 +367,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         crate::tmux_work::mark_agent(
             &pane,
             request.agent.label(),
+            workspace.as_deref(),
             work.as_deref(),
             request.role.as_deref(),
             request.task.as_deref(),
@@ -343,8 +383,12 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         agent: request.agent,
         placement: request.placement,
         name: request.name,
+        workspace,
         work,
+        created_workspace,
         created_work,
+        session,
+        window,
         role: request.role,
         task: request.task,
         cwd,
@@ -354,43 +398,63 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
 
 struct PreparedLaunch {
     cwd: PathBuf,
+    workspace: Option<String>,
     work: Option<String>,
+    created_workspace: bool,
     created_work: bool,
 }
 
 fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
+    if request.workspace.is_some() && request.work.is_none() {
+        bail!("--workspace is valid only together with --work");
+    }
     let work = request
         .work
         .as_deref()
         .map(crate::tmux_work::normalize_work_id)
         .transpose()?;
-    let existing_work = work
-        .as_deref()
-        .map(crate::tmux_work::find_work)
-        .transpose()?
-        .flatten();
 
     if work.is_some()
         && (request.placement != Placement::Pane
             || request.target.is_some()
             || request.name.is_some())
     {
-        bail!("--work uses its managed session; do not combine it with --placement, --target, or --name");
+        bail!("--work uses its managed workspace and window; do not combine it with --placement, --target, or --name");
     }
 
     let requested_cwd = request.cwd.take();
+    let initial_cwd_source = requested_cwd
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)
+        .context("resolve current directory")?;
+    let initial_cwd = std::fs::canonicalize(&initial_cwd_source)
+        .with_context(|| format!("resolve cwd {}", initial_cwd_source.display()))?;
+    if !initial_cwd.is_dir() {
+        bail!("cwd is not a directory: {}", initial_cwd.display());
+    }
+
+    let workspace = work
+        .as_ref()
+        .map(|_| match request.workspace.as_deref() {
+            Some(workspace) => crate::tmux_work::normalize_workspace_id(workspace),
+            None => crate::tmux_work::workspace_id_for_cwd(&initial_cwd),
+        })
+        .transpose()?;
+    let existing_workspace = workspace
+        .as_deref()
+        .map(crate::tmux_work::find_workspace)
+        .transpose()?
+        .flatten();
+    let existing_work = match (work.as_deref(), workspace.as_deref()) {
+        (Some(work), Some(workspace)) => crate::tmux_work::find_work_in(work, Some(workspace))?,
+        _ => None,
+    };
+
     let cwd_source = existing_work
         .as_ref()
-        .map_or_else(
-            || requested_cwd.clone().map_or_else(std::env::current_dir, Ok),
-            |existing| Ok(existing.cwd.clone()),
-        )
-        .context("resolve current directory")?;
-    let cwd = std::fs::canonicalize(&cwd_source)
+        .map_or(initial_cwd.as_path(), |existing| existing.cwd.as_path());
+    let cwd = std::fs::canonicalize(cwd_source)
         .with_context(|| format!("resolve cwd {}", cwd_source.display()))?;
-    if !cwd.is_dir() {
-        bail!("cwd is not a directory: {}", cwd.display());
-    }
     if let (Some(existing), Some(requested)) = (&existing_work, requested_cwd) {
         let requested = std::fs::canonicalize(&requested)
             .with_context(|| format!("resolve cwd {}", requested.display()))?;
@@ -404,17 +468,35 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
         }
     }
 
+    let created_workspace = workspace.is_some() && existing_workspace.is_none();
     let created_work = work.is_some() && existing_work.is_none();
     if let Some(existing) = &existing_work {
         request.placement = Placement::Pane;
+        request.target = Some(existing.window.clone());
+        request.name = Some(existing.window_name.clone());
+    } else if let Some(existing) = &existing_workspace {
+        request.placement = Placement::Window;
         request.target = Some(existing.session.clone());
-        request.name = Some(existing.session.clone());
-    } else if let Some(work) = work.as_deref() {
+        request.name = Some(crate::tmux_work::window_name_for_work(
+            work.as_deref().expect("managed work has id"),
+        )?);
+    } else if let Some(workspace) = workspace.as_deref() {
         request.placement = Placement::Session;
         request.target = None;
-        request.name = Some(crate::tmux_work::session_name_for_work(work)?);
+        request.name = Some(crate::tmux_work::session_name_for_workspace(workspace)?);
     }
 
+    resolve_placement_target(request, &cwd)?;
+    Ok(PreparedLaunch {
+        cwd,
+        workspace,
+        work,
+        created_workspace,
+        created_work,
+    })
+}
+
+fn resolve_placement_target(request: &mut StartRequest, cwd: &Path) -> Result<()> {
     // new-window rejects a pane id even though pane ids are the stable target
     // Muxa exposes to callers. Resolve either a pane or window input to the
     // owning tmux session and let tmux choose an unused window index.
@@ -444,15 +526,11 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
             existing.iter().any(|name| name == candidate)
         }));
     }
-    Ok(PreparedLaunch {
-        cwd,
-        work,
-        created_work,
-    })
+    Ok(())
 }
 
 fn resolve_window_session(target: &str) -> Result<String> {
-    let output = muxa::tmux::tmux_command()
+    let output = muxa::tmux::tmux_command_scoped()
         .args(["display-message", "-p", "-t", target, "#{session_name}"])
         .output()
         .context("resolve tmux window target")?;
@@ -547,7 +625,7 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
                 .as_deref()
                 .filter(|name| !name.trim().is_empty())
                 .map_or_else(|| session_base_name(cwd), sanitize_session_name);
-            vec![
+            let mut args = vec![
                 "new-session".into(),
                 "-d".into(),
                 "-P".into(),
@@ -555,10 +633,12 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
                 "#{pane_id}".into(),
                 "-s".into(),
                 name,
-                "-c".into(),
-                cwd.into(),
-                command.into(),
-            ]
+            ];
+            if let Some(work) = request.work.as_deref() {
+                args.extend(["-n".into(), crate::tmux_work::window_name_for_work(work)?]);
+            }
+            args.extend(["-c".into(), cwd.into(), command.into()]);
+            args
         }
     };
     Ok(args)
@@ -589,7 +669,7 @@ fn sanitize_session_name(name: &str) -> String {
 }
 
 fn existing_session_names() -> Vec<String> {
-    muxa::tmux::tmux_command()
+    muxa::tmux::tmux_command_scoped()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .map(|output| {
@@ -623,6 +703,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             prompt: Some("review June's changes; don't edit".into()),
             name: None,
+            workspace: None,
             work: None,
             role: None,
             task: None,
@@ -667,6 +748,18 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-s", "cal-7041-review"]));
+    }
+
+    #[test]
+    fn managed_workspace_session_names_its_first_work_window() {
+        let mut session = request(AgentProgram::Codex, Placement::Session);
+        session.target = None;
+        session.name = Some("muxa".into());
+        session.workspace = Some("muxa".into());
+        session.work = Some("TEST-0001".into());
+        let args = tmux_args(&session, Path::new("/tmp"), "codex --yolo").unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-s", "muxa"]));
+        assert!(args.windows(2).any(|pair| pair == ["-n", "test-0001"]));
     }
 
     #[test]

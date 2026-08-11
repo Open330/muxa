@@ -163,7 +163,7 @@ can tell which host governs a row (see reaping guard below).
    `HumanInteraction` (keypress/scroll) ticks are emitted on herdr hosts —
    only the workspace-foreground observation.
 
-7. **Watch session view** (`muxa-cli/src/watch.rs`, done): the session
+7. **Watch work view** (`muxa-cli/src/watch.rs`, done): the workspace/work
    view sources its "sessions" per host — tmux shells `list-sessions`,
    herdr derives them from `workspace.list`
    (`backend::herdr::herdr_list_workspaces`, the `list_sessions` analog).
@@ -175,7 +175,7 @@ can tell which host governs a row (see reaping guard below).
    label instead of the raw `w1`. The activity bridge gained a
    session-id fallback so the herdr key (pane session == ledger key) resolves
    directly. Attach (Enter-twice) is host-dispatched via `jump_to_pane` →
-   `focus_pane`, so a herdr session row never fires a tmux-only action. The
+   `focus_pane`, so a herdr workspace row never fires a tmux-only action. The
    dashboard TUI already sources sessions from the daemon's own registry, so
    it was host-agnostic and needed no change. zellij has no session concept
    here and stays empty.

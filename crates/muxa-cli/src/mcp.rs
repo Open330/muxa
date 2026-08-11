@@ -57,8 +57,8 @@ const MAX_WAIT_SECS: u64 = 600;
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    For managed tmux work, treat one session as one work/ticket, one pane as one \
-    agent, and windows as layout only. Use muxa_start_agent with a work id instead \
+    For managed tmux work, treat one session as one workspace/project, one window \
+    as one work/ticket, and one pane as one agent. Use muxa_start_agent with a work id instead \
     of delegating tmux setup to another model; use muxa_manage_tmux for lifecycle \
     control and never invent raw tmux commands. \
     At the start of substantial work, call muxa_collaboration_guide (or \
@@ -320,7 +320,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "muxa_status",
             "description": "Focused observation of muxa agents. With no arguments, \
-                snapshot every agent. Set pane to avoid loading the whole fleet; \
+                snapshot every agent plus the managed workspace > work > agent tmux topology. \
+                Set pane to avoid loading the whole fleet; \
                 optionally include its visible screen and recent prompt history in \
                 the same result to save MCP round trips and model context.",
             "inputSchema": {
@@ -363,7 +364,8 @@ fn tool_definitions() -> Vec<Value> {
                     "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
                     "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
                     "name": { "type": "string", "description": "Optional window/session name." },
-                    "work": { "type": "string", "description": "Managed work/ticket id. Reuses its tmux session or creates it once; conflicts with placement/target/name." },
+                    "workspace": { "type": "string", "description": "Managed workspace/project id. Valid with work; defaults to cwd basename." },
+                    "work": { "type": "string", "description": "Managed work/ticket id. Reuses its tmux window or creates it once; conflicts with placement/target/name." },
                     "role": { "type": "string", "description": "Optional pane role such as implementer or reviewer." },
                     "task": { "type": "string", "description": "Optional short pane task label." },
                     "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Default right." }
@@ -374,20 +376,21 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_manage_tmux",
-            "description": "Manage Muxa's tmux lifecycle using the policy session=work/ticket \
-                and pane=agent. List/show managed work, interrupt an agent turn, or explicitly \
-                terminate an agent pane/close a whole work session. Destructive actions require \
-                confirm=true and refuse unmanaged panes/sessions.",
+            "description": "Manage Muxa's tmux lifecycle using workspace=session, work=window, \
+                and agent=pane. List/show managed workspaces and work, interrupt an agent turn, \
+                or explicitly terminate an agent pane/close a work window or workspace session. \
+                Destructive actions require confirm=true and refuse unmanaged targets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list_work", "show_work", "interrupt_agent", "terminate_agent", "close_work"]
+                        "enum": ["list_workspace", "show_workspace", "list_work", "show_work", "interrupt_agent", "terminate_agent", "close_work", "close_workspace"]
                     },
                     "pane": { "type": "string", "description": "Exact pane id for agent actions, for example %42." },
-                    "work": { "type": "string", "description": "Work/ticket id for work actions, for example CAL-7041." },
-                    "confirm": { "type": "boolean", "description": "Must be true for terminate_agent and close_work." }
+                    "workspace": { "type": "string", "description": "Workspace/project id for workspace actions or to disambiguate work." },
+                    "work": { "type": "string", "description": "Work/ticket id for work actions, for example TEST-0001." },
+                    "confirm": { "type": "boolean", "description": "Must be true for terminate_agent, close_work, and close_workspace." }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -593,6 +596,13 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 }
             };
             let mut payload = json!({ "agents": agents });
+            if pane.is_none() {
+                match tokio::task::spawn_blocking(crate::tmux_work::list_workspaces).await {
+                    Ok(Ok(workspaces)) => payload["tmux"] = json!({ "workspaces": workspaces }),
+                    Ok(Err(error)) => payload["tmux_error"] = json!(error.to_string()),
+                    Err(error) => payload["tmux_error"] = json!(error.to_string()),
+                }
+            }
             if let Some(pane) = pane {
                 if include_capture {
                     let max_lines = args
@@ -666,6 +676,10 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 name: args.get("name").and_then(Value::as_str).map(str::to_string),
+                workspace: args
+                    .get("workspace")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 work: args.get("work").and_then(Value::as_str).map(str::to_string),
                 role: args.get("role").and_then(Value::as_str).map(str::to_string),
                 task: args.get("task").and_then(Value::as_str).map(str::to_string),
@@ -691,6 +705,10 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
             let request = crate::tmux_work::ManageRequest {
                 action,
                 pane: args.get("pane").and_then(Value::as_str).map(str::to_string),
+                workspace: args
+                    .get("workspace")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 work: args.get("work").and_then(Value::as_str).map(str::to_string),
                 confirm: args
                     .get("confirm")
@@ -1662,7 +1680,8 @@ mod tests {
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
         assert!(instructions.contains("start of substantial work"));
-        assert!(instructions.contains("one session as one work/ticket"));
+        assert!(instructions.contains("one session as one workspace/project"));
+        assert!(instructions.contains("one window as one work/ticket"));
         assert!(instructions.contains("muxa_manage_tmux"));
         assert!(instructions.contains("review + read_only"));
         assert!(instructions.contains("task + execute + narrow paths"));
@@ -1707,11 +1726,13 @@ mod tests {
             json!(["claude", "codex", "gemini", "opencode"])
         );
         assert!(start_agent["inputSchema"]["properties"]["work"].is_object());
+        assert!(start_agent["inputSchema"]["properties"]["workspace"].is_object());
         let manage_tmux = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_manage_tmux")
             .unwrap();
         assert_eq!(manage_tmux["inputSchema"]["required"], json!(["action"]));
+        assert!(manage_tmux["inputSchema"]["properties"]["workspace"].is_object());
         let guide = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_collaboration_guide")

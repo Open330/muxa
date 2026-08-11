@@ -26,8 +26,8 @@ use muxa::adapters::{
     claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
 };
 use muxa::collaboration::{
-    AirArtifactReference, CollaborationOrigin, NewRequest, RequestKind, RequestMailbox,
-    RequestStatus, WorkMode,
+    AirArtifactReference, CollaborationClientKind, CollaborationOrigin, NewRequest, RequestKind,
+    RequestMailbox, RequestStatus, WorkMode,
 };
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
@@ -123,10 +123,15 @@ enum Cmd {
         #[command(subcommand)]
         action: AgentCmd,
     },
-    /// Manage work/ticket tmux sessions.
+    /// Manage work/ticket tmux windows.
     Work {
         #[command(subcommand)]
         action: WorkCmd,
+    },
+    /// Manage workspace/project tmux sessions.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCmd,
     },
     /// Register a room-local alias and roles for this exact agent session.
     Identity {
@@ -167,10 +172,10 @@ enum Cmd {
         /// detached SDK session.
         #[arg(long)]
         include_paneless: bool,
-        /// Row granularity: tmux session (default) or pane.
+        /// Row granularity: tmux work/window (default) or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
-        /// One-shot sort override: session, latest/activity/act, dur/duration, st/state, pane, pane-id.
+        /// One-shot sort override: workspace, latest/activity/act, workspace-time/dur/duration, st/state, pane, pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
         /// One-shot visual theme override.
@@ -346,14 +351,24 @@ enum AgentCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
-    /// Create a work session with its first agent, or add an agent when it exists.
+    /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
-    /// List muxa-managed work sessions.
+    /// List muxa-managed work windows.
     List(tmux_work::WorkListArgs),
-    /// Show one work session and its agent panes.
+    /// Show one work window and its agent panes.
     Show(tmux_work::WorkShowArgs),
-    /// Close a work session and every agent pane in it.
+    /// Close a work window and every agent pane in it.
     Close(tmux_work::WorkCloseArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCmd {
+    /// List muxa-managed workspace sessions.
+    List(tmux_work::WorkspaceListArgs),
+    /// Show one workspace session with its work windows.
+    Show(tmux_work::WorkspaceShowArgs),
+    /// Close a workspace session, including every work and agent.
+    Close(tmux_work::WorkspaceCloseArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -413,7 +428,7 @@ enum HookCmd {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WatchViewArg {
     Pane,
-    Session,
+    Work,
     Swarm,
 }
 
@@ -421,7 +436,7 @@ impl From<WatchViewArg> for muxa::config::WatchView {
     fn from(value: WatchViewArg) -> Self {
         match value {
             WatchViewArg::Pane => Self::Pane,
-            WatchViewArg::Session => Self::Session,
+            WatchViewArg::Work => Self::Work,
             WatchViewArg::Swarm => Self::Swarm,
         }
     }
@@ -429,11 +444,11 @@ impl From<WatchViewArg> for muxa::config::WatchView {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WatchSortArg {
-    Session,
+    Workspace,
     #[value(alias = "activity", alias = "act")]
     Latest,
     #[value(alias = "dur", alias = "duration")]
-    SessionTime,
+    WorkspaceTime,
     #[value(alias = "st")]
     State,
     Pane,
@@ -444,11 +459,11 @@ enum WatchSortArg {
 impl WatchSortArg {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
-            Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
+            Self::Workspace => vec![WatchSortKey::Workspace, WatchSortKey::Activity],
             Self::Latest => vec![WatchSortKey::Activity],
-            Self::SessionTime => vec![WatchSortKey::SessionTime],
+            Self::WorkspaceTime => vec![WatchSortKey::WorkspaceTime],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
-            Self::Pane => vec![WatchSortKey::Session, WatchSortKey::Pane],
+            Self::Pane => vec![WatchSortKey::Workspace, WatchSortKey::Pane],
             Self::PaneId => vec![WatchSortKey::PaneId],
         }
     }
@@ -467,6 +482,23 @@ fn run_work_cmd(action: WorkCmd) -> Result<()> {
         WorkCmd::List(args) => tmux_work::run_work_list(args),
         WorkCmd::Show(args) => tmux_work::run_work_show(args),
         WorkCmd::Close(args) => tmux_work::run_work_close(args),
+    }
+}
+
+fn run_workspace_cmd(action: WorkspaceCmd) -> Result<()> {
+    match action {
+        WorkspaceCmd::List(args) => tmux_work::run_workspace_list(args),
+        WorkspaceCmd::Show(args) => tmux_work::run_workspace_show(args),
+        WorkspaceCmd::Close(args) => tmux_work::run_workspace_close(args),
+    }
+}
+
+fn collaboration_client_kind(command: &Cmd) -> CollaborationClientKind {
+    match command {
+        Cmd::Watch { .. } => CollaborationClientKind::Watch,
+        Cmd::Mcp => CollaborationClientKind::Mcp,
+        Cmd::Dashboard(_) => CollaborationClientKind::Dashboard,
+        _ => CollaborationClientKind::Cli,
     }
 }
 
@@ -493,7 +525,8 @@ async fn main() -> Result<()> {
         .socket
         .or_else(|| cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
-    let client = Client::new(socket.clone());
+    let client = Client::new(socket.clone())
+        .with_collaboration_client_kind(collaboration_client_kind(&args.cmd));
 
     match args.cmd {
         Cmd::Status { theme, json } => cmd_status(&client, &cfg, theme, json).await,
@@ -506,6 +539,7 @@ async fn main() -> Result<()> {
         Cmd::Msg { action } => cmd_msg(&client, action).await,
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Work { action } => run_work_cmd(action),
+        Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
         Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
@@ -915,9 +949,19 @@ fn print_collaboration_messages(
             } else {
                 format!("from {}", request.from.label())
             };
+            let provenance = request.provenance.as_ref().map_or_else(String::new, |p| {
+                let caller = p
+                    .observed_pane
+                    .as_deref()
+                    .map_or_else(|| "pane=?".into(), |pane| format!("pane={pane}"));
+                let pid = p
+                    .caller_pid
+                    .map_or_else(String::new, |pid| format!(" pid={pid}"));
+                format!("  [via {} {caller}{pid} {}]", p.client_kind, p.origin_match)
+            });
             println!(
-                "{}  {:?}  {:?}  {}\n  {}",
-                request.id, request.status, request.kind, direction, request.body,
+                "{}  {:?}  {:?}  {}{}\n  {}",
+                request.id, request.status, request.kind, direction, provenance, request.body,
             );
         }
     }
@@ -2434,11 +2478,11 @@ mod tests {
     fn watch_sort_cli_aliases_parse_to_expected_keys() {
         for (raw, expected) in [
             (
-                "session",
-                vec![WatchSortKey::Session, WatchSortKey::Activity],
+                "workspace",
+                vec![WatchSortKey::Workspace, WatchSortKey::Activity],
             ),
             ("act", vec![WatchSortKey::Activity]),
-            ("dur", vec![WatchSortKey::SessionTime]),
+            ("dur", vec![WatchSortKey::WorkspaceTime]),
             ("st", vec![WatchSortKey::State, WatchSortKey::Activity]),
             ("pane_id", vec![WatchSortKey::PaneId]),
         ] {
@@ -2492,6 +2536,8 @@ mod tests {
             "work",
             "start",
             "cal-7041",
+            "--workspace",
+            "muxa",
             "--agent",
             "codex",
             "--cwd",
@@ -2509,8 +2555,22 @@ mod tests {
             panic!("expected work start");
         };
         assert_eq!(start.work, "cal-7041");
+        assert_eq!(start.workspace.as_deref(), Some("muxa"));
         assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
         assert_eq!(start.role.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn workspace_cli_exposes_session_lifecycle() {
+        let args = Args::try_parse_from(["muxa", "workspace", "show", "muxa", "--json"]).unwrap();
+        let Cmd::Workspace {
+            action: WorkspaceCmd::Show(show),
+        } = args.cmd
+        else {
+            panic!("expected workspace show");
+        };
+        assert_eq!(show.workspace, "muxa");
+        assert!(show.json);
     }
 
     #[test]

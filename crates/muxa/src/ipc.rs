@@ -22,8 +22,13 @@
 use crate::ask::{AskEntry, AskStore};
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
-    self, AirArtifactReference, CollaborationOptions, CollaborationOrigin, CollaborationRequest,
-    CollaborationStore, NewRequest, RequestMailbox, RequestStatus, RoomContext,
+    self, AirArtifactReference, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
+    CollaborationOriginMatch, CollaborationPaneEvidence, CollaborationProvenance,
+    CollaborationRequest, CollaborationStore, NewRequest, Participant, RequestMailbox,
+    RequestStatus, RoomContext,
+};
+use crate::collaboration_audit::{
+    CollaborationAuditContext, CollaborationAuditLog, CollaborationAuditOperation,
 };
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::session::{
@@ -349,6 +354,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_mailbox",
     "collaboration_lifecycle",
     "collaboration_identity",
+    "collaboration_provenance",
 ];
 
 #[derive(Debug, Serialize)]
@@ -562,6 +568,7 @@ pub struct Server {
     backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
     collaboration: Arc<CollaborationStore>,
+    collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
     handler_limit: usize,
 }
@@ -576,6 +583,7 @@ impl Server {
             backends: vec![backend],
             sessions: PtySessionBackend::shared(),
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
+            collaboration_audit: CollaborationAuditLog::in_memory(),
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
@@ -625,6 +633,12 @@ impl Server {
         self
     }
 
+    #[must_use]
+    pub fn with_collaboration_audit(mut self, audit: Arc<CollaborationAuditLog>) -> Self {
+        self.collaboration_audit = audit;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     fn with_handler_limit(mut self, handler_limit: usize) -> Self {
@@ -640,6 +654,7 @@ impl Server {
     /// `Store::apply` *after* the snapshotter task has already done its
     /// final flush, losing that event on the next restart. Drained with
     /// a bounded timeout so a hung handler can't block daemon exit.
+    #[allow(clippy::too_many_lines)] // accept loop plus bounded drain and socket cleanup
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<(), RuntimeError> {
         self.bind_with_perms()?;
         let listener = UnixListener::bind(&self.socket_path)?;
@@ -714,13 +729,23 @@ impl Server {
                     let backends = self.backends.clone();
                     let sessions = self.sessions.clone();
                     let collaboration = self.collaboration.clone();
+                    let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
                         if let Err(e) =
-                            handle(stream, store, backend, backends, sessions, collaboration, ask)
-                                .await
+                            Box::pin(handle(
+                                stream,
+                                store,
+                                backend,
+                                backends,
+                                sessions,
+                                collaboration,
+                                collaboration_audit,
+                                ask,
+                            ))
+                            .await
                         {
                             if e.is_client_disconnect() {
                                 tracing::debug!(error = %e, "client disconnected");
@@ -1043,11 +1068,248 @@ async fn collaboration_participants(
     participants
 }
 
+#[derive(Debug, Clone)]
+struct CollaborationConnectionActor {
+    client_kind: CollaborationClientKind,
+    caller_pid: Option<u32>,
+    caller_uid: Option<u32>,
+    caller_gid: Option<u32>,
+    executable: Option<String>,
+    observed_pane: Option<String>,
+    pane_evidence: Option<CollaborationPaneEvidence>,
+    pane_observed: bool,
+}
+
+impl CollaborationConnectionActor {
+    async fn observe_pane(&mut self, backends: &[SharedBackend]) {
+        if self.pane_observed {
+            return;
+        }
+        self.pane_observed = true;
+        let Some(pid) = self.caller_pid else {
+            return;
+        };
+        let pane_backends = backends.to_vec();
+        let observed =
+            tokio::task::spawn_blocking(move || observed_process_pane(pid, &pane_backends))
+                .await
+                .ok()
+                .flatten();
+        if let Some((pane, evidence)) = observed {
+            self.observed_pane = Some(pane);
+            self.pane_evidence = Some(evidence);
+        }
+    }
+
+    fn provenance(&self, origin: &CollaborationOrigin) -> CollaborationProvenance {
+        let origin_match = match self.observed_pane.as_deref() {
+            Some(pane) if pane == origin.pane => CollaborationOriginMatch::Matched,
+            Some(_) => CollaborationOriginMatch::Mismatched,
+            None => CollaborationOriginMatch::Unverifiable,
+        };
+        CollaborationProvenance {
+            client_kind: self.client_kind,
+            caller_pid: self.caller_pid,
+            caller_uid: self.caller_uid,
+            caller_gid: self.caller_gid,
+            executable: self.executable.clone(),
+            observed_pane: self.observed_pane.clone(),
+            pane_evidence: self.pane_evidence,
+            origin_match,
+        }
+    }
+}
+
+#[allow(clippy::similar_names)] // PID/UID/GID are the exact peer credential fields
+fn observe_collaboration_actor(stream: &UnixStream) -> CollaborationConnectionActor {
+    let credentials = stream.peer_cred().ok();
+    let caller_pid = credentials
+        .as_ref()
+        .and_then(tokio::net::unix::UCred::pid)
+        .and_then(|pid| u32::try_from(pid).ok());
+    let caller_uid: Option<u32> = credentials.as_ref().map(tokio::net::unix::UCred::uid);
+    let caller_gid: Option<u32> = credentials.as_ref().map(tokio::net::unix::UCred::gid);
+    let (executable, process_kind) =
+        caller_pid.map_or((None, CollaborationClientKind::Unknown), process_identity);
+    CollaborationConnectionActor {
+        client_kind: process_kind,
+        caller_pid,
+        caller_uid,
+        caller_gid,
+        executable,
+        observed_pane: None,
+        pane_evidence: None,
+        pane_observed: false,
+    }
+}
+
+fn observed_process_pane(
+    pid: u32,
+    backends: &[SharedBackend],
+) -> Option<(String, CollaborationPaneEvidence)> {
+    if let Some(pane) = process_environment_pane(pid) {
+        if backends
+            .iter()
+            .any(|backend| backend.resolve_pane(&pane).is_some())
+        {
+            return Some((pane, CollaborationPaneEvidence::ProcessEnvironment));
+        }
+    }
+    let pane_pids = backends
+        .iter()
+        .flat_map(|backend| backend.pane_pid_map())
+        .collect::<std::collections::HashMap<_, _>>();
+    if pane_pids.is_empty() {
+        return None;
+    }
+    if let Some(pane) = pane_pids.get(&pid) {
+        return Some((pane.clone(), CollaborationPaneEvidence::ProcessAncestry));
+    }
+    let candidates = pane_pids
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let pane_pid = crate::adapters::proc_ancestry::ancestor_in_set(
+        pid,
+        &candidates,
+        crate::adapters::proc_ancestry::parent_pid,
+    )?;
+    pane_pids
+        .get(&pane_pid)
+        .cloned()
+        .map(|pane| (pane, CollaborationPaneEvidence::ProcessAncestry))
+}
+
+#[cfg(target_os = "linux")]
+fn process_environment_pane(pid: u32) -> Option<String> {
+    let environment = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    environment
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix("TMUX_PANE="))
+        .filter(|pane| pane.starts_with('%'))
+        .map(str::to_string)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_environment_pane(_pid: u32) -> Option<String> {
+    None
+}
+
+fn process_identity(pid: u32) -> (Option<String>, CollaborationClientKind) {
+    #[cfg(target_os = "linux")]
+    {
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
+        let kind = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map_or(
+            CollaborationClientKind::Unknown,
+            |bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter_map(|arg| std::str::from_utf8(arg).ok())
+                    .find_map(client_kind_from_arg)
+                    .unwrap_or(CollaborationClientKind::Unknown)
+            },
+        );
+        (executable, kind)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .ok();
+        let executable = output.and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        });
+        (executable, CollaborationClientKind::Unknown)
+    }
+}
+
+fn client_kind_from_arg(arg: &str) -> Option<CollaborationClientKind> {
+    match arg {
+        "watch" => Some(CollaborationClientKind::Watch),
+        "mcp" => Some(CollaborationClientKind::Mcp),
+        "dashboard" => Some(CollaborationClientKind::Dashboard),
+        "msg" | "peers" | "identity" => Some(CollaborationClientKind::Cli),
+        _ => None,
+    }
+}
+
+fn represented_participant(
+    response: &Response,
+    origin: &CollaborationOrigin,
+) -> Option<Participant> {
+    if let Some(room) = response.room.as_ref() {
+        return Some(room.current.clone());
+    }
+    let requests = response
+        .collaboration_request
+        .iter()
+        .chain(response.collaboration_requests.iter().flatten());
+    for request in requests {
+        for participant in [&request.from, &request.to] {
+            if participant.pane == origin.pane
+                && origin
+                    .socket
+                    .as_deref()
+                    .is_none_or(|socket| participant.socket.as_deref() == Some(socket))
+            {
+                return Some(participant.clone());
+            }
+        }
+    }
+    None
+}
+
+async fn record_collaboration_audit(
+    audit: &CollaborationAuditLog,
+    actor: &CollaborationConnectionActor,
+    context: CollaborationAuditContext,
+    response: &Response,
+) {
+    let represented = represented_participant(response, &context.represented_origin);
+    let response_request_id = response
+        .collaboration_request
+        .as_ref()
+        .map(|request| request.id.as_str());
+    let result_count = response
+        .collaboration_requests
+        .as_ref()
+        .map(Vec::len)
+        .or_else(|| response.collaboration_request.as_ref().map(|_| 1));
+    let provenance = actor.provenance(&context.represented_origin);
+    let entry = context.finish(
+        provenance,
+        represented.as_ref(),
+        response_request_id,
+        result_count,
+        response.error.as_deref(),
+    );
+    audit.append(entry).await;
+}
+
 #[tracing::instrument(
     level = "debug",
-    skip(stream, store, backend, backends, sessions, collaboration, ask)
+    skip(
+        stream,
+        store,
+        backend,
+        backends,
+        sessions,
+        collaboration,
+        collaboration_audit,
+        ask
+    )
 )]
-#[allow(clippy::too_many_lines)] // dispatch table — splitting would only spread the match across files
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
 async fn handle(
     stream: UnixStream,
     store: SharedStore,
@@ -1055,8 +1317,10 @@ async fn handle(
     backends: Vec<SharedBackend>,
     sessions: SharedSessionBackend,
     collaboration: Arc<CollaborationStore>,
+    collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
 ) -> Result<(), RuntimeError> {
+    let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -1137,6 +1401,13 @@ async fn handle(
                     };
                     if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&requested) {
                         negotiated = Some(requested);
+                        if let Some(client_kind) = client
+                            .as_deref()
+                            .map(CollaborationClientKind::from_hello_label)
+                            .filter(|kind| *kind != CollaborationClientKind::Unknown)
+                        {
+                            collaboration_actor.client_kind = client_kind;
+                        }
                         tracing::debug!(
                             client = client.as_deref().unwrap_or("(unknown)"),
                             protocol = requested,
@@ -1338,7 +1609,12 @@ async fn handle(
                 }
                 RequestBody::CollaborationContext { origin } => {
                     kind = "collaboration_context";
-                    if collaboration.enabled() {
+                    collaboration_actor.observe_pane(&backends).await;
+                    let audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Context,
+                        origin.clone(),
+                    );
+                    let response = if collaboration.enabled() {
                         let participants =
                             collaboration_participants(&store, &backends, &collaboration).await;
                         match collaboration::resolve_origin(&origin, &participants) {
@@ -1356,7 +1632,15 @@ async fn handle(
                         Response::err(
                             "agent collaboration is disabled; enable [collaboration].enabled",
                         )
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationSetIdentity {
                     origin,
@@ -1364,9 +1648,14 @@ async fn handle(
                     roles,
                 } => {
                     kind = "collaboration_set_identity";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::SetIdentity,
+                        origin.clone(),
+                    );
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration
                             .set_identity(&current, &participants, alias, roles)
                             .await
@@ -1382,7 +1671,15 @@ async fn handle(
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::AskSend { prompt } => {
                     kind = "ask_send";
@@ -1424,6 +1721,13 @@ async fn handle(
                     request,
                 } => {
                     kind = "collaboration_send";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Send,
+                        origin.clone(),
+                    );
+                    audit_context.target = Some(target.clone());
+                    audit_context.message_bytes = Some(request.body.len());
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
                     let result =
@@ -1436,39 +1740,83 @@ async fn handle(
                             )
                             .map(|recipient| (sender, recipient))
                         });
-                    match result {
+                    let response = match result {
                         Ok((sender, recipient)) => {
-                            match collaboration.create(sender, recipient, request).await {
+                            let provenance = collaboration_actor.provenance(&origin);
+                            match collaboration
+                                .create_with_provenance(
+                                    sender,
+                                    recipient,
+                                    request,
+                                    Some(provenance),
+                                )
+                                .await
+                            {
                                 Ok(request) => Response::with_collaboration_request(request),
                                 Err(error) => Response::err(error.to_string()),
                             }
                         }
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationInbox { origin } => {
                     kind = "collaboration_inbox";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Inbox,
+                        origin.clone(),
+                    );
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration.claim_for(&current).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationList { origin, mailbox } => {
                     kind = "collaboration_list";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::List,
+                        origin.clone(),
+                    );
+                    audit_context.mailbox = Some(mailbox);
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration.list_for(&current, mailbox).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationReply {
                     origin,
@@ -1479,9 +1827,17 @@ async fn handle(
                     air_artifacts,
                 } => {
                     kind = "collaboration_reply";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Reply,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    audit_context.status = Some(status);
+                    audit_context.message_bytes = Some(body.len());
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration
                             .reply(
                                 &current,
@@ -1497,25 +1853,53 @@ async fn handle(
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationGet { origin, request_id } => {
                     kind = "collaboration_get";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Get,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => match collaboration.get_for(&current, &request_id).await {
                             Ok(request) => Response::with_collaboration_request(request),
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Cancel,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
                     let participants =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match collaboration::resolve_origin(&origin, &participants) {
                         Ok(current) => {
                             match collaboration.cancel_for(&current, &request_id).await {
                                 Ok(request) => Response::with_collaboration_request(request),
@@ -1523,7 +1907,15 @@ async fn handle(
                             }
                         }
                         Err(error) => Response::err(error.to_string()),
-                    }
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::SpawnSession {
                     command,
@@ -1683,6 +2075,7 @@ pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
+    collaboration_client_kind: CollaborationClientKind,
 }
 
 /// The result of a [`Client::send_prompt`]: the two non-atomic keystroke
@@ -1771,7 +2164,18 @@ impl TransitionStream {
 
 impl Client {
     pub fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+        Self {
+            socket_path,
+            collaboration_client_kind: CollaborationClientKind::Unknown,
+        }
+    }
+
+    /// Label this client for collaboration provenance. This changes audit
+    /// metadata only; it grants and removes no authority.
+    #[must_use]
+    pub fn with_collaboration_client_kind(mut self, kind: CollaborationClientKind) -> Self {
+        self.collaboration_client_kind = kind;
+        self
     }
 
     pub async fn ingest(&self, event: &AgentEvent) -> Result<(), RuntimeError> {
@@ -2178,7 +2582,7 @@ impl Client {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        Self::send_hello(&mut reader, &mut writer).await?;
+        self.send_hello(&mut reader, &mut writer).await?;
 
         let mut req = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
@@ -2356,7 +2760,11 @@ impl Client {
     /// `hello` (older build) returns `ok:false` with a parse error or a
     /// protocol-mismatch error; we ignore the failure so the legacy
     /// strict-match path on the daemon stays usable.
-    async fn send_hello<R, W>(reader: &mut BufReader<R>, writer: &mut W) -> Result<(), RuntimeError>
+    async fn send_hello<R, W>(
+        &self,
+        reader: &mut BufReader<R>,
+        writer: &mut W,
+    ) -> Result<(), RuntimeError>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
@@ -2364,7 +2772,7 @@ impl Client {
         let mut bytes = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "hello",
-            "client": concat!("muxa/", env!("CARGO_PKG_VERSION")),
+            "client": self.collaboration_client_kind.hello_label(),
         }))?;
         bytes.push(b'\n');
         if bytes.len() > MAX_IPC_LINE_BYTES {
@@ -2415,7 +2823,7 @@ impl Client {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        Self::send_hello(&mut reader, &mut writer).await?;
+        self.send_hello(&mut reader, &mut writer).await?;
 
         let mut bytes = serde_json::to_vec(req)?;
         bytes.push(b'\n');
@@ -2537,6 +2945,29 @@ mod tests {
             .await;
     }
 
+    #[test]
+    fn caller_pane_mismatch_is_audit_evidence_not_a_refusal() {
+        let actor = CollaborationConnectionActor {
+            client_kind: CollaborationClientKind::Cli,
+            caller_pid: Some(77),
+            caller_uid: Some(1000),
+            caller_gid: Some(1000),
+            executable: Some("muxa".into()),
+            observed_pane: Some("%9".into()),
+            pane_evidence: Some(CollaborationPaneEvidence::ProcessEnvironment),
+            pane_observed: true,
+        };
+        let provenance = actor.provenance(&CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+        });
+        assert_eq!(
+            provenance.origin_match,
+            CollaborationOriginMatch::Mismatched
+        );
+        assert_eq!(provenance.observed_pane.as_deref(), Some("%9"));
+    }
+
     #[tokio::test]
     async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
         let dir = tempdir().unwrap();
@@ -2553,14 +2984,17 @@ mod tests {
             ],
         });
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
         let server = Server::new(sock.clone(), store)
             .with_backends(vec![backend])
-            .with_collaboration(mailbox.clone());
+            .with_collaboration(mailbox.clone())
+            .with_collaboration_audit(audit.clone());
         let (tx, rx) = broadcast::channel(1);
         let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
         wait_for_socket(&sock).await;
 
-        let client = Client::new(sock);
+        let client =
+            Client::new(sock).with_collaboration_client_kind(CollaborationClientKind::Watch);
         let sender = CollaborationOrigin {
             pane: "%1".into(),
             socket: Some("default".into()),
@@ -2631,6 +3065,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let provenance = request.provenance.as_ref().unwrap();
+        assert_eq!(provenance.client_kind, CollaborationClientKind::Watch);
+        assert_eq!(provenance.caller_pid, Some(std::process::id()));
+        assert_eq!(
+            provenance.origin_match,
+            CollaborationOriginMatch::Unverifiable
+        );
         assert_eq!(
             client
                 .collaboration_context(&recipient)
@@ -2709,6 +3150,17 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        let audit_entries = audit.entries().await;
+        assert!(audit_entries.iter().any(|entry| {
+            entry.operation == CollaborationAuditOperation::Send
+                && entry.request_id.as_deref() == Some(request.id.as_str())
+                && entry.actor.client_kind == CollaborationClientKind::Watch
+                && entry.message_bytes == Some("review this".len())
+        }));
+        assert!(audit_entries
+            .iter()
+            .any(|entry| entry.operation == CollaborationAuditOperation::Reply));
 
         tx.send(()).unwrap();
         handle.await.unwrap();
@@ -2969,6 +3421,7 @@ mod tests {
             vec![default_backend()],
             PtySessionBackend::shared(),
             CollaborationStore::in_memory(CollaborationOptions::default()),
+            CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
         ));
 

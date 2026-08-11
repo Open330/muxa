@@ -113,39 +113,39 @@ struct Section {
 }
 
 const POLICY: &str = "\
-session = work/ticket\n\
+session = workspace/project\n\
+window  = work/ticket\n\
 pane    = agent\n\
-window  = layout only\n\
 \n\
 Muxa owns tmux lifecycle, location, state, and collaboration routing.\n\
 Agents own files, code, Git, tests, and reasoning.\n\
-One ticket reuses one managed session; it never silently becomes ticket-2.";
+One ticket reuses one managed window in its workspace session.";
 
 const WORKFLOW: &str = "\
 1. Start the work with its first agent:\n\
-   muxa work start muxa-onboarding --cwd /repo --agent codex --role implementer --prompt \"Implement muxa-onboarding\"\n\
+   muxa work start muxa-onboarding --workspace muxa --cwd /repo --agent codex --role implementer --prompt \"Implement muxa-onboarding\"\n\
 \n\
 2. Add another agent to the same work:\n\
-   muxa agent start --work muxa-onboarding --agent claude --role reviewer --prompt \"Review the current changes\"\n\
+   muxa agent start --workspace muxa --work muxa-onboarding --agent claude --role reviewer --prompt \"Review the current changes\"\n\
 \n\
 3. Inspect or operate it:\n\
-   muxa work list\n\
-   muxa work show muxa-onboarding\n\
+   muxa workspace list\n\
+   muxa work show muxa-onboarding --workspace muxa\n\
    muxa watch\n\
    muxa agent control --pane %42 --action interrupt\n\
 \n\
 4. Close explicitly when the work is finished:\n\
-   muxa work close muxa-onboarding";
+   muxa work close muxa-onboarding --workspace muxa";
 
 const MCP_PATTERN: &str = "\
 Use the existing muxa MCP server; do not add a second tmux MCP.\n\
 \n\
-muxa_start_agent(work=\"muxa-onboarding\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
+muxa_start_agent(workspace=\"muxa\", work=\"muxa-onboarding\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
 muxa_wait_for_change(pane=\"%42\", until=\"settled\", include_capture=true)\n\
 muxa_status(pane=\"%42\", include_capture=true, history_limit=1)\n\
 muxa_manage_tmux(action=\"interrupt_agent\", pane=\"%42\")\n\
 \n\
-terminate_agent and close_work require confirm=true. Muxa refuses to terminate unmanaged panes.";
+terminate_agent, close_work, and close_workspace require confirm=true.";
 
 const SAFETY: &str = "\
 Muxa deliberately does not expose arbitrary shell or generic tmux commands.\n\
@@ -153,39 +153,39 @@ Use exact pane ids for agent control. Destructive actions require confirmation.\
 Use collaboration review + read_only by default; grant execute only with narrow paths.";
 
 const POLICY_KO: &str = "\
-session = work/ticket\n\
+session = workspace/project\n\
+window  = work/ticket\n\
 pane    = agent\n\
-window  = 화면 배치 전용\n\
 \n\
 Muxa는 tmux 생명주기, 위치, 상태, 협업 routing을 관리합니다.\n\
 Agent는 파일, 코드, Git, 테스트와 추론을 담당합니다.\n\
-같은 ticket은 하나의 managed session을 재사용하며 ticket-2를 조용히 만들지 않습니다.";
+같은 ticket은 workspace session 안의 같은 managed window를 재사용합니다.";
 
 const WORKFLOW_KO: &str = "\
 1. 첫 agent와 함께 work 시작:\n\
-   muxa work start muxa-onboarding --cwd /repo --agent codex --role implementer --prompt \"Implement muxa-onboarding\"\n\
+   muxa work start muxa-onboarding --workspace muxa --cwd /repo --agent codex --role implementer --prompt \"Implement muxa-onboarding\"\n\
 \n\
 2. 같은 work에 다른 agent 추가:\n\
-   muxa agent start --work muxa-onboarding --agent claude --role reviewer --prompt \"Review the current changes\"\n\
+   muxa agent start --workspace muxa --work muxa-onboarding --agent claude --role reviewer --prompt \"Review the current changes\"\n\
 \n\
 3. 조회 또는 제어:\n\
-   muxa work list\n\
-   muxa work show muxa-onboarding\n\
+   muxa workspace list\n\
+   muxa work show muxa-onboarding --workspace muxa\n\
    muxa watch\n\
    muxa agent control --pane %42 --action interrupt\n\
 \n\
 4. work가 끝나면 명시적으로 닫기:\n\
-   muxa work close muxa-onboarding";
+   muxa work close muxa-onboarding --workspace muxa";
 
 const MCP_PATTERN_KO: &str = "\
 별도 tmux MCP를 추가하지 말고 기존 Muxa MCP server를 사용합니다.\n\
 \n\
-muxa_start_agent(work=\"muxa-onboarding\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
+muxa_start_agent(workspace=\"muxa\", work=\"muxa-onboarding\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
 muxa_wait_for_change(pane=\"%42\", until=\"settled\", include_capture=true)\n\
 muxa_status(pane=\"%42\", include_capture=true, history_limit=1)\n\
 muxa_manage_tmux(action=\"interrupt_agent\", pane=\"%42\")\n\
 \n\
-terminate_agent와 close_work는 confirm=true가 필요하며 unmanaged pane은 종료하지 않습니다.";
+terminate_agent, close_work, close_workspace는 confirm=true가 필요합니다.";
 
 const SAFETY_KO: &str = "\
 Muxa는 임의 shell 실행이나 범용 tmux 명령을 노출하지 않습니다.\n\
@@ -279,16 +279,16 @@ fn print_guide(language: UiLanguage) {
 fn korean_watch_help() -> &'static [&'static str] {
     &[
         "이동",
-        "  ↑/↓ · j/k       session/child 이동",
+        "  ↑/↓ · j/k       work/agent 이동",
         "  ←/→ · h/l       parent / 첫 child agent",
         "  Enter           선택한 pane에 attach",
-        "  n               work session + agent 생성/재사용",
+        "  n               workspace/work + agent 생성/재사용",
         "",
         "조회와 협업",
         "  o / Alt-P       preview 열기",
         "  m / M           선택한 agent에 메시지 / mailbox",
         "  a / A           ask / history",
-        "  Alt-S/L/D/T     session / latest / duration / state 정렬",
+        "  Alt-S/L/D/T     workspace / latest / duration / state 정렬",
         "  ? / F1          전체 도움말",
     ]
 }
@@ -740,7 +740,7 @@ fn render_mock_header(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  2 sessions  ",
+                "  2 works  ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -773,7 +773,7 @@ fn render_mock_header(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
 
 fn render_mock_sessions(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
     let mut lines = vec![Line::from(Span::styled(
-        "  SESSION                 DUR    ACT    SUMMARY",
+        "  WORKSPACE › WORK         DUR    ACT    SUMMARY",
         Style::default().fg(Color::DarkGray),
     ))];
     if app.sort == MockSort::State {
@@ -795,7 +795,7 @@ fn render_mock_sessions(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
             Block::default()
-                .title(" Sessions ")
+                .title(" Workspace › work › agent ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(border)),
@@ -818,7 +818,7 @@ fn mock_onboarding_rows(app: &TourApp) -> Vec<Line<'static>> {
         Span::styled(" ", style),
         mock_state_span(AgentState::Working, bg),
         Span::styled(
-            "   muxa-onboarding   12m    8s     harden checkout auth",
+            "   muxa › onboarding  12m    8s     harden checkout auth",
             style,
         ),
     ])];
@@ -855,7 +855,7 @@ fn mock_sandbox_row(app: &TourApp) -> Line<'static> {
         Span::styled(if selected { "> " } else { "  " }, style),
         mock_state_span(AgentState::Idle, bg),
         Span::styled(
-            "     muxa-sandbox      31m    1m     dashboard authentication",
+            "     muxa › sandbox     31m    1m     dashboard authentication",
             style,
         ),
     ])
@@ -870,7 +870,7 @@ fn row_style(selected: bool) -> Style {
 }
 
 /// Use the same canonical glyph source as `muxa watch` and its Classic state
-/// palette. Session summaries put it in the left edge of the SESSION cell,
+/// palette. Work summaries put it in the left edge of the WORK cell,
 /// matching watch's fixed six-cell state gutter.
 fn mock_state_span(state: AgentState, background: Color) -> Span<'static> {
     let foreground = match state {
@@ -1119,10 +1119,10 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
                 "필터와 이동",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from("  ↑/↓ · j/k       session/child 이동"),
+            Line::from("  ↑/↓ · j/k       work/agent 이동"),
             Line::from("  ←/→ · h/l       parent / 첫 child agent"),
             Line::from("  Enter           선택한 pane에 attach"),
-            Line::from("  n               work session + agent 생성/재사용"),
+            Line::from("  n               workspace/work + agent 생성/재사용"),
             Line::from(""),
             Line::from(Span::styled(
                 "조회와 협업",
@@ -1131,7 +1131,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
             Line::from("  o / Alt-P       preview 열기"),
             Line::from("  m / M           선택한 agent에 메시지 / mailbox"),
             Line::from("  a / A           ask / history"),
-            Line::from("  Alt-S/L/D/T     session / latest / duration / state 정렬"),
+            Line::from("  Alt-S/L/D/T     workspace / latest / duration / state 정렬"),
             Line::from(""),
             Line::from(Span::styled(
                 "상태 표시",
@@ -1145,10 +1145,10 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
                 "Filter & navigation",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from("  ↑/↓ · j/k       move sessions/children"),
+            Line::from("  ↑/↓ · j/k       move works/agents"),
             Line::from("  ←/→ · h/l       parent / first child agent"),
             Line::from("  Enter           attach to selected pane"),
-            Line::from("  n               new/reused work session + agent"),
+            Line::from("  n               new/reused workspace/work + agent"),
             Line::from(""),
             Line::from(Span::styled(
                 "Commands & inspection",
@@ -1157,7 +1157,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
             Line::from("  o / Alt-P       open preview overlay"),
             Line::from("  m / M           message selected agent / mailbox"),
             Line::from("  a / A           ask / history"),
-            Line::from("  Alt-S/L/D/T     session / latest / duration / state"),
+            Line::from("  Alt-S/L/D/T     workspace / latest / duration / state"),
             Line::from(""),
             Line::from(Span::styled(
                 "State markers",
@@ -1180,7 +1180,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
 }
 
 fn render_new_work_overlay(frame: &mut Frame<'_>, area: Rect) {
-    let height = area.height.min(7);
+    let height = area.height.min(8);
     let popup = Rect::new(
         area.x,
         area.y + area.height.saturating_sub(height),
@@ -1191,6 +1191,7 @@ fn render_new_work_overlay(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from("> dir    /home/june/personal/muxa"),
+            Line::from("  space  muxa  (from directory)"),
             Line::from("  ticket muxa-onboarding"),
             Line::from("  agent  ◂  codex  ▸"),
             Line::from("  prompt Implement muxa-onboarding"),
@@ -1323,7 +1324,7 @@ fn callout_footer(app: &TourApp) -> &'static str {
 
 fn step_title(step: TourStep, language: UiLanguage) -> &'static str {
     let en = match step {
-        TourStep::Work => "one session = one work",
+        TourStep::Work => "one window = one work",
         TourStep::Agents => "one pane = one agent",
         TourStep::States => "state tells you what to do",
         TourStep::Preview => "inspect without attaching",
@@ -1334,7 +1335,7 @@ fn step_title(step: TourStep, language: UiLanguage) -> &'static str {
         TourStep::Finish => "ready for live watch",
     };
     let ko = match step {
-        TourStep::Work => "session 하나 = work 하나",
+        TourStep::Work => "window 하나 = work 하나",
         TourStep::Agents => "pane 하나 = agent 하나",
         TourStep::States => "상태가 다음 행동을 알려줍니다",
         TourStep::Preview => "attach 없이 확인하기",
@@ -1422,18 +1423,18 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             callout_label("← MOVE THE REAL WATCH CURSOR"),
             Line::from(""),
             Line::from("muxa-sandbox is selected. Press j or ↓ to reach muxa-onboarding."),
-            Line::from("Each session row is one work/ticket identity."),
-            Line::from("Starting muxa-onboarding again reuses that same session."),
+            Line::from("Each row is one work window inside the muxa workspace session."),
+            Line::from("Starting it again reuses that same window and adds an agent pane."),
         ],
         TourStep::Agents => vec![
-            callout_label("← ENTER THE SESSION TREE"),
+            callout_label("← ENTER THE WORK TREE"),
             Line::from(""),
             Line::from("The selected work expanded to its agent panes."),
             Line::from("Press l or → to select its first child agent."),
-            Line::from("h/← returns to the parent; windows are layout only."),
+            Line::from("h/← returns to the parent work window."),
         ],
         TourStep::States => vec![
-            callout_label("← STATE LIVES LEFT OF THE SESSION NAME"),
+            callout_label("← STATE LIVES LEFT OF THE WORK NAME"),
             Line::from(""),
             state_legend_line(AgentState::Working, "working — leave it alone"),
             state_legend_line(AgentState::WaitingInput, "waiting — it needs input"),
@@ -1444,7 +1445,7 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::Preview => vec![
             callout_label("→ INSPECT WITHOUT ATTACHING"),
             Line::from(""),
-            Line::from("The wide inspector stays beside the 50/50 session list."),
+            Line::from("The wide inspector stays beside the 50/50 work list."),
             Line::from("Press o now to open the selected pane preview."),
             Line::from("Enter attaches when you need the real terminal."),
         ],
@@ -1479,9 +1480,9 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::Finish => vec![
             callout_label("THE MODEL TO REMEMBER"),
             Line::from(""),
-            policy_line("SESSION", "work / ticket"),
+            policy_line("SESSION", "workspace / project"),
+            policy_line("WINDOW", "work / ticket"),
             policy_line("PANE", "agent"),
-            policy_line("WINDOW", "layout only"),
             Line::from(""),
             Line::from(Span::styled(
                 "✓ muxa watch — press q to finish (q also quits watch)",
@@ -1501,18 +1502,18 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
             Line::from(
                 "muxa-sandbox가 선택되어 있습니다. j 또는 ↓로 muxa-onboarding으로 이동하세요.",
             ),
-            Line::from("각 session row는 하나의 work/ticket입니다."),
-            Line::from("muxa-onboarding을 다시 시작하면 같은 session을 재사용합니다."),
+            Line::from("각 row는 muxa workspace session 안의 work window 하나입니다."),
+            Line::from("다시 시작하면 같은 window를 재사용하고 agent pane을 추가합니다."),
         ],
         TourStep::Agents => vec![
-            callout_label("← SESSION TREE 안으로 들어가세요"),
+            callout_label("← WORK TREE 안으로 들어가세요"),
             Line::from(""),
             Line::from("선택한 work 아래에 agent pane이 펼쳐졌습니다."),
             Line::from("l 또는 →로 첫 child agent를 선택하세요."),
-            Line::from("h/←는 parent로 돌아가며 window는 화면 배치 전용입니다."),
+            Line::from("h/←는 parent work window로 돌아갑니다."),
         ],
         TourStep::States => vec![
-            callout_label("← STATE는 SESSION 이름 왼쪽에 있습니다"),
+            callout_label("← STATE는 WORK 이름 왼쪽에 있습니다"),
             Line::from(""),
             state_legend_line(AgentState::Working, "작업 중 — 그대로 두세요"),
             state_legend_line(AgentState::WaitingInput, "입력 대기 — 응답이 필요합니다"),
@@ -1523,7 +1524,7 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::Preview => vec![
             callout_label("→ ATTACH하지 않고 확인하세요"),
             Line::from(""),
-            Line::from("넓은 화면에서는 Inspector가 session 목록 옆에 50/50으로 표시됩니다."),
+            Line::from("넓은 화면에서는 Inspector가 work 목록 옆에 50/50으로 표시됩니다."),
             Line::from("o를 눌러 선택한 pane의 preview를 여세요."),
             Line::from("실제 terminal이 필요할 때는 Enter로 attach합니다."),
         ],
@@ -1558,9 +1559,9 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::Finish => vec![
             callout_label("기억할 운영 모델"),
             Line::from(""),
-            policy_line("SESSION", "work / ticket"),
+            policy_line("SESSION", "workspace / project"),
+            policy_line("WINDOW", "work / ticket"),
             policy_line("PANE", "agent"),
-            policy_line("WINDOW", "화면 배치 전용"),
             Line::from(""),
             Line::from(Span::styled(
                 "✓ 준비 완료 — q로 끝내세요. q는 실제 watch 종료 키이기도 합니다.",
@@ -1844,11 +1845,11 @@ mod tests {
 
     #[test]
     fn onboarding_policy_and_workflow_pin_the_domain_model() {
-        assert!(POLICY.contains("session = work/ticket"));
+        assert!(POLICY.contains("session = workspace/project"));
+        assert!(POLICY.contains("window  = work/ticket"));
         assert!(POLICY.contains("pane    = agent"));
-        assert!(POLICY.contains("window  = layout only"));
         assert!(WORKFLOW.contains("muxa work start muxa-onboarding"));
-        assert!(WORKFLOW.contains("muxa agent start --work muxa-onboarding"));
+        assert!(WORKFLOW.contains("muxa agent start --workspace muxa --work muxa-onboarding"));
         assert!(POLICY_KO.contains("같은 ticket"));
         assert!(WORKFLOW_KO.contains("같은 work에 다른 agent 추가"));
     }
@@ -1859,7 +1860,7 @@ mod tests {
         assert!(shortcuts.contains("m / M"));
         assert!(shortcuts.contains("a / A"));
         assert!(shortcuts.contains("Alt-K"));
-        assert!(shortcuts.contains("n              new/reused work session + agent"));
+        assert!(shortcuts.contains("n              new/reused workspace/work + agent"));
     }
 
     #[test]
@@ -1878,11 +1879,11 @@ mod tests {
             .unwrap();
         let work = rendered(&app, 120, 34);
         assert!(work.contains("muxa watch"));
-        assert!(work.contains("Sessions"));
-        assert!(work.contains("SESSION                 DUR    ACT    SUMMARY"));
+        assert!(work.contains("Workspace › work › agent"));
+        assert!(work.contains("WORKSPACE › WORK"));
         assert!(!work.contains("AGENTS  STATE"));
         assert!(work.contains("muxa-onboarding"));
-        assert!(work.contains("one session = one work"));
+        assert!(work.contains("one window = one work"));
         assert!(work.contains("MOVE THE REAL WATCH CURSOR"));
 
         app.step = TourStep::ALL
@@ -1961,8 +1962,8 @@ mod tests {
         ] {
             assert!(screen.contains(crate::state_icon(state)));
         }
-        assert!(screen.contains("▶ ●   muxa-onboarding"));
-        assert!(screen.contains("○     muxa-sandbox"));
+        assert!(screen.contains("▶ ●   muxa › onboarding"));
+        assert!(screen.contains("○     muxa › sandbox"));
         assert!(!screen.contains("AGENTS  STATE"));
         assert!(!screen.contains("WORKING"));
         assert!(!screen.contains("WAITING"));
@@ -2078,6 +2079,6 @@ mod tests {
         let compact = rendered(&TourApp::new(false), 80, 24);
         assert!(compact.contains("muxa watch"));
         assert!(compact.contains("muxa-onboarding"));
-        assert!(compact.contains("one session = one work"));
+        assert!(compact.contains("one window = one work"));
     }
 }

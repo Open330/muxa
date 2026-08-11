@@ -1,11 +1,11 @@
 # CLI dashboard
 
-`muxa dashboard` is a session-card TUI console. It is built for operating
-multiple agent sessions from one screen without attaching to tmux first.
+`muxa dashboard` is a workspace-card TUI console. A tmux card is one workspace
+session and its panes retain their work-window locations.
 
 Use `muxa watch` when you want the compact picker/table. Use
 `muxa dashboard` when you want a richer console with cards, an inspector,
-live terminal capture, prompt composition, and session-level ACT/WACT totals.
+live terminal capture, prompt composition, and workspace-level ACT/WACT totals.
 When it runs inside a tracked tmux agent pane, it also becomes that agent's
 collaboration-room console.
 
@@ -30,17 +30,17 @@ muxa dashboard --include-paneless
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` / `←` / `→`, `h` / `j` / `k` / `l` | Move card selection. |
-| `Tab`, `[` / `]` | Cycle the action target inside the selected session card. |
+| `Tab`, `[` / `]` | Cycle the action target inside the selected workspace card. |
 | `PageUp` / `PageDown` | Scroll live capture history. |
 | `G` / `End` | Return capture to the latest output. |
 | `f` | Toggle capture fullscreen. |
 | `n` | Open dashboard notes when diagnostics are available. |
-| `Enter` | Toggle the selected session inspector. |
+| `Enter` | Toggle the selected workspace inspector. |
 | `p` | Open the prompt composer for the selected pane or muxa PTY session. |
 | `m` | Compose a structured request for the selected same-room agent. |
 | `b` | Open incoming/sent collaboration mailbox history without claiming requests. |
 | `i` | Claim pending collaboration requests and open the incoming mailbox. |
-| `c` | Copy the selected session's latest prompt. |
+| `c` | Copy the selected workspace's latest prompt. |
 | `R` | Confirm and send Ctrl-C to the selected pane or PTY session. |
 | `K` | Confirm and terminate the selected pane or PTY session. |
 | `o` | Explicitly open the selected pane/session. |

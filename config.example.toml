@@ -119,7 +119,7 @@
 
 # tmux session foreground-time tracker. A session counts as active while an
 # interactive tmux client has that session foregrounded. `muxa watch`
-# (session view — the default) shows the cumulative total in its DUR column.
+# (work view — the default) shows the workspace cumulative total in its DUR column.
 [session_activity]
 # enabled       = true
 # path          = "/home/$USER/.local/share/muxa/session-activity.json"
@@ -149,13 +149,13 @@
 # to opt back into model / ctx / cost, always-visible workload, or to reorder.
 #
 # Valid column keys: pane, kind, state, state_age, model, ctx, cost, limits, workload,
-# prompt, activity, session_time.
+# prompt, activity, workspace_time.
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
 # theme = "classic"   # optional watch-only override for [ui].theme
-# view = "session"    # one row per tmux session; panes merge by latest activity (default)
+# view = "work"       # one row per tmux work window; children are agent panes (default)
 # view = "pane"       # one row per agent/pane
-# view = "swarm"      # k9s-style console: session clusters, animated dot spinners
+# view = "swarm"      # k9s-style console: work clusters, animated dot spinners
 #                     # for working/starting agents, and an expandable subagent tree
 # columns = ["pane", "state_age", "model", "ctx", "cost", "workload", "prompt", "activity"]
 
@@ -196,11 +196,12 @@
 # `pane_id` as a final stable tiebreaker. Stale agents (pane closed)
 # always sink to the bottom regardless of what's listed here.
 #
-# Default: ["state", "session", "latest"] — floats attention states first,
-# then groups by tmux session and recency.
+# Default: ["state", "workspace", "latest"] — floats attention states first,
+# then groups by workspace and recency.
 #
 # Available keys:
-#   session   — tmux session name asc (groups same-session panes)
+#   workspace — tmux workspace/session name asc
+#   workspace_time — workspace foreground duration desc
 #   latest    — last_activity_at desc (most recently updated first)
 #   activity  — alias for latest
 #   pane      — window then pane index, parsed numerically
@@ -208,9 +209,9 @@
 #
 # Examples:
 #   sort = ["latest"]                # global newest-first, no grouping
-#   sort = ["session", "pane"]       # tmux-native order within session
-#   sort = ["session", "latest"]     # default — grouping + recency
-# sort = ["session", "latest"]
+#   sort = ["workspace", "pane"]       # tmux-native order within workspace
+#   sort = ["workspace", "latest"]     # workspace grouping + recency
+# sort = ["workspace", "latest"]
 
 # Per-column widths. Three accepted forms:
 #   integer  -> fixed length      (Constraint::Length)
@@ -223,7 +224,7 @@
 # workload = 8
 # prompt   = "min:20"
 # activity = 6
-# session_time = 6
+# workspace_time = 6
 
 # Selected-row detail: a dim "↳ <text>" line rendered under the highlighted
 # row. Visible child shell/subagent work is shown as `tree ◇1 ▸1 +2` in the

@@ -84,13 +84,13 @@ Sleep 1000ms
 Enter
 Sleep 1000ms
 
-# Move from muxa-sandbox to muxa-onboarding, then enter its first child agent.
+# Move from muxa › sandbox to muxa › onboarding, then enter its first agent.
 Type "j"
 Sleep 1100ms
 Type "l"
 Sleep 1200ms
 
-# State is the left gutter of SESSION; Alt-T applies the real state sort.
+# State is the left gutter of WORKSPACE › WORK; Alt-T applies the real state sort.
 Alt+t
 Sleep 1800ms
 

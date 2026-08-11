@@ -2481,7 +2481,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &DashboardApp) {
             app.theme.key_style(),
         ),
         Span::raw("  "),
-        subtle_pill(format!("{} sessions", totals.sessions), app.theme),
+        subtle_pill(format!("{} workspaces", totals.sessions), app.theme),
         Span::raw("  "),
         subtle_pill(format!("{} agents", totals.tracked_agents), app.theme),
         Span::raw("  "),
@@ -2563,13 +2563,13 @@ fn render_cards(f: &mut Frame, area: Rect, app: &mut DashboardApp) {
         .borders(Borders::ALL)
         .border_style(app.theme.border_style())
         .border_type(BorderType::Plain)
-        .title(Span::styled(" sessions ", app.theme.title_style()));
+        .title(Span::styled(" workspaces ", app.theme.title_style()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.data.cards.is_empty() {
         let text = Text::from(Line::from(Span::styled(
-            "No sessions or tracked agents found.",
+            "No workspaces or tracked agents found.",
             app.theme.dim_style(),
         )));
         f.render_widget(Paragraph::new(text), inner);
@@ -4407,6 +4407,7 @@ mod tests {
             id: id.into(),
             from,
             to,
+            provenance: None,
             kind: RequestKind::Review,
             body: "review the auth change".into(),
             expects_reply: true,
