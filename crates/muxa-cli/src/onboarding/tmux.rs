@@ -1,9 +1,9 @@
 //! Safe, fullscreen tmux fundamentals track for `muxa onboard --tmux`.
 //!
-//! A real tmux prefix is deliberately never sent: an attached tmux client
-//! would consume it and the following key could mutate the user's live
-//! session. The mock displays the detected prefix, treats it as already
-//! pressed, and asks for only the real suffix key.
+//! The first drill detects one real prefix-only press. Inside tmux, the mock
+//! observes the current client's transition to the prefix key table and
+//! immediately returns that client to the root table before asking for any
+//! suffix. Later drills use suffix keys only, so no live binding is executed.
 
 use super::{centered_rect, dialog_block, setup_terminal, tr, Mode, TerminalGuard, UiLanguage};
 use anyhow::{Context, Result};
@@ -15,7 +15,15 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 #[cfg(test)]
 use ratatui::Terminal;
+use std::env;
 use std::process::Command;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+struct DetectedPrefix {
+    tmux_key: String,
+    display: String,
+}
 
 pub(super) fn run(mode: Mode, no_quiz: bool, language: UiLanguage) -> Result<()> {
     let prefix = detect_tmux_prefix();
@@ -26,16 +34,20 @@ pub(super) fn run(mode: Mode, no_quiz: bool, language: UiLanguage) -> Result<()>
     Ok(())
 }
 
-fn detect_tmux_prefix() -> String {
-    Command::new("tmux")
+fn detect_tmux_prefix() -> DetectedPrefix {
+    let tmux_key = Command::new("tmux")
         .args(["show-options", "-gv", "prefix"])
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|raw| humanize_prefix(raw.trim()))
+        .map(|raw| raw.trim().to_string())
         .filter(|prefix| !prefix.is_empty())
-        .unwrap_or_else(|| "Ctrl-b".to_string())
+        .unwrap_or_else(|| "C-b".to_string());
+    DetectedPrefix {
+        display: humanize_prefix(&tmux_key),
+        tmux_key,
+    }
 }
 
 fn humanize_prefix(raw: &str) -> String {
@@ -51,11 +63,48 @@ fn humanize_prefix(raw: &str) -> String {
     }
 }
 
-fn print_guide(language: UiLanguage, prefix: &str) {
+fn prefix_key_matches(prefix: &str, key: KeyEvent) -> bool {
+    let (modifier, name) = if let Some(name) = prefix.strip_prefix("C-") {
+        (Some(KeyModifiers::CONTROL), name)
+    } else if let Some(name) = prefix.strip_prefix("M-") {
+        (Some(KeyModifiers::ALT), name)
+    } else {
+        (None, prefix)
+    };
+    match modifier {
+        Some(required) if !key.modifiers.contains(required) => return false,
+        None if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    match name {
+        "Space" => matches!(key.code, KeyCode::Char(' ') | KeyCode::Null),
+        "BSpace" => key.code == KeyCode::Backspace,
+        "Enter" => key.code == KeyCode::Enter,
+        "Escape" => key.code == KeyCode::Esc,
+        name if name.starts_with('F') => name[1..]
+            .parse::<u8>()
+            .is_ok_and(|number| key.code == KeyCode::F(number)),
+        name => {
+            let mut chars = name.chars();
+            let Some(expected) = chars.next() else {
+                return false;
+            };
+            chars.next().is_none()
+                && matches!(key.code, KeyCode::Char(actual) if actual.eq_ignore_ascii_case(&expected))
+        }
+    }
+}
+
+fn print_guide(language: UiLanguage, prefix: &DetectedPrefix) {
     if language == UiLanguage::Ko {
         println!("tmux 온보딩");
         println!("============");
-        println!("\n현재 prefix: {prefix}");
+        println!("\n현재 prefix: {}", prefix.display);
         println!("\nsession = work/ticket\nwindow = layout/room\npane = process/agent");
         println!("\n기본 조합");
         println!("  prefix+w       session/window tree");
@@ -69,11 +118,12 @@ fn print_guide(language: UiLanguage, prefix: &str) {
         println!("  prefix+s       muxa watch");
         println!("  prefix+q       muxa peek");
         println!("  prefix+D       muxa dashboard");
-        println!("\n실습에서는 안전을 위해 prefix를 보내지 않고 suffix key만 입력합니다.");
+        println!("\n첫 단계에서 감지된 prefix만 직접 누르고 확인을 기다립니다.");
+        println!("이후에는 live binding 실행을 막기 위해 suffix key만 입력합니다.");
     } else {
         println!("tmux onboarding");
         println!("===============");
-        println!("\nCurrent prefix: {prefix}");
+        println!("\nCurrent prefix: {}", prefix.display);
         println!("\nsession = work/ticket\nwindow = layout/room\npane = process/agent");
         println!("\nCore combinations");
         println!("  prefix+w       session/window tree");
@@ -87,20 +137,40 @@ fn print_guide(language: UiLanguage, prefix: &str) {
         println!("  prefix+s       muxa watch");
         println!("  prefix+q       muxa peek");
         println!("  prefix+D       muxa dashboard");
-        println!("\nFor safety, practice sends only suffix keys and never the real prefix.");
+        println!("\nFirst, press only the detected prefix and wait for confirmation.");
+        println!("Later drills accept suffix keys only, preventing live bindings.");
     }
 }
 
-fn interactive_guide(no_quiz: bool, language: UiLanguage, prefix: String) -> Result<()> {
+fn interactive_guide(no_quiz: bool, language: UiLanguage, prefix: DetectedPrefix) -> Result<()> {
+    let prefix_probe = TmuxPrefixProbe::detect();
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
     guard.terminal_mut().hide_cursor()?;
-    let mut app = TmuxApp::new(no_quiz, language, prefix);
+    let prefix_capture = if prefix_probe.is_some() {
+        PrefixCapture::TmuxClient
+    } else {
+        PrefixCapture::Direct
+    };
+    let mut app = TmuxApp::new(no_quiz, language, prefix, prefix_capture);
 
     while !app.done {
         guard
             .terminal_mut()
             .draw(|frame| render_tour(frame, &app))?;
+        if app.guided() && app.current() == Step::Prefix {
+            if let Some(probe) = prefix_probe.as_ref() {
+                if probe.consume_prefix_press()? {
+                    app.advance();
+                    continue;
+                }
+                if !event::poll(Duration::from_millis(35))
+                    .context("polling for tmux prefix onboarding input")?
+                {
+                    continue;
+                }
+            }
+        }
         if let Event::Key(key) = event::read().context("reading tmux onboarding input")? {
             handle_key(&mut app, key);
         }
@@ -108,9 +178,94 @@ fn interactive_guide(no_quiz: bool, language: UiLanguage, prefix: String) -> Res
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxClientSnapshot {
+    tty: String,
+    pane: String,
+    key_table: String,
+}
+
+impl TmuxClientSnapshot {
+    fn parse(raw: &str) -> Option<Self> {
+        let mut fields = raw.trim().split('|');
+        let snapshot = Self {
+            tty: fields.next()?.to_string(),
+            pane: fields.next()?.to_string(),
+            key_table: fields.next()?.to_string(),
+        };
+        if fields.next().is_some()
+            || snapshot.tty.is_empty()
+            || snapshot.pane.is_empty()
+            || snapshot.key_table.is_empty()
+        {
+            return None;
+        }
+        Some(snapshot)
+    }
+}
+
+#[derive(Debug)]
+struct TmuxPrefixProbe {
+    pane: String,
+    client_tty: String,
+}
+
+impl TmuxPrefixProbe {
+    fn detect() -> Option<Self> {
+        env::var_os("TMUX").filter(|value| !value.is_empty())?;
+        let pane = env::var("TMUX_PANE")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let snapshot = Self::snapshot(&pane)?;
+        (snapshot.pane == pane).then_some(Self {
+            pane,
+            client_tty: snapshot.tty,
+        })
+    }
+
+    fn snapshot(pane: &str) -> Option<TmuxClientSnapshot> {
+        let output = Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{client_tty}|#{pane_id}|#{client_key_table}",
+            ])
+            .output()
+            .ok()?;
+        output.status.success().then_some(())?;
+        TmuxClientSnapshot::parse(std::str::from_utf8(&output.stdout).ok()?)
+    }
+
+    fn consume_prefix_press(&self) -> Result<bool> {
+        let Some(snapshot) = Self::snapshot(&self.pane) else {
+            return Ok(false);
+        };
+        if snapshot.pane != self.pane
+            || snapshot.tty != self.client_tty
+            || snapshot.key_table != "prefix"
+        {
+            return Ok(false);
+        }
+        let output = Command::new("tmux")
+            .args(["switch-client", "-t", &self.client_tty, "-T", "root"])
+            .output()
+            .context("returning the tmux onboarding client to the root key table")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "could not safely release tmux prefix table: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(true)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Welcome,
+    Prefix,
     Model,
     Windows,
     Splits,
@@ -123,8 +278,9 @@ enum Step {
 }
 
 impl Step {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Welcome,
+        Self::Prefix,
         Self::Model,
         Self::Windows,
         Self::Splits,
@@ -166,6 +322,13 @@ enum MuxaStage {
     Watch,
     Peek,
     Dashboard,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixCapture {
+    Direct,
+    TmuxClient,
 }
 
 #[derive(Debug)]
@@ -174,6 +337,8 @@ struct TmuxApp {
     mode: TourMode,
     language: UiLanguage,
     prefix: String,
+    prefix_key: String,
+    prefix_capture: PrefixCapture,
     split_stage: SplitStage,
     zoom_stage: ZoomStage,
     copy_stage: CopyStage,
@@ -187,7 +352,12 @@ struct TmuxApp {
 }
 
 impl TmuxApp {
-    fn new(no_quiz: bool, language: UiLanguage, prefix: String) -> Self {
+    fn new(
+        no_quiz: bool,
+        language: UiLanguage,
+        prefix: DetectedPrefix,
+        prefix_capture: PrefixCapture,
+    ) -> Self {
         Self {
             step: 0,
             mode: if no_quiz {
@@ -196,7 +366,9 @@ impl TmuxApp {
                 TourMode::Guided
             },
             language,
-            prefix,
+            prefix: prefix.display,
+            prefix_key: prefix.tmux_key,
+            prefix_capture,
             split_stage: SplitStage::LeftRight,
             zoom_stage: ZoomStage::In,
             copy_stage: CopyStage::Enter,
@@ -292,6 +464,9 @@ fn handle_guided_key(app: &mut TmuxApp, key: KeyEvent) -> bool {
         Step::Welcome if key.code == KeyCode::Enter => {
             app.advance();
         }
+        Step::Prefix if prefix_key_matches(&app.prefix_key, key) => {
+            app.advance();
+        }
         Step::Model if plain && key.code == KeyCode::Char('w') => {
             app.advance();
         }
@@ -354,6 +529,10 @@ fn handle_guided_key(app: &mut TmuxApp, key: KeyEvent) -> bool {
             app.blocked_hint = false;
         }
         Step::Muxa if app.muxa_stage == MuxaStage::Dashboard && key.code == KeyCode::Char('D') => {
+            app.muxa_stage = MuxaStage::Complete;
+            app.blocked_hint = false;
+        }
+        Step::Muxa if app.muxa_stage == MuxaStage::Complete && key.code == KeyCode::Enter => {
             app.advance();
         }
         Step::Finish if key.code == KeyCode::Enter => {
@@ -382,6 +561,14 @@ fn render_tour(frame: &mut Frame<'_>, app: &TmuxApp) {
     render_status_line(frame, rows[1], app);
     if app.current() == Step::CopyMode && app.copy_stage == CopyStage::Exit {
         render_copy_mode(frame, rows[0], app);
+    }
+    if app.current() == Step::Muxa {
+        match app.muxa_stage {
+            MuxaStage::Watch => {}
+            MuxaStage::Peek => render_muxa_watch(frame, rows[0], app),
+            MuxaStage::Dashboard => render_muxa_peek(frame, rows[0], app),
+            MuxaStage::Complete => render_muxa_dashboard(frame, rows[0], app),
+        }
     }
     render_callout(frame, area, app);
 }
@@ -555,6 +742,149 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
     );
 }
 
+fn render_muxa_watch(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    frame.render_widget(Clear, area);
+    let lines = if app.ko() {
+        vec![
+            Line::from(" ● CAL-7041   18m   14m   onboarding 구현 및 테스트"),
+            Line::from("   ├─ ● codex       9m   tmux onboarding 편집 중"),
+            Line::from("   └─ ▶ reviewer    4m   검토 입력 대기"),
+            Line::from(" ○ CAL-7088    7m    2m   README 업데이트 완료"),
+            Line::from(""),
+            Line::from(" INSPECTOR · codex · %903"),
+            Line::from(" › prefix 입력 감지와 안전한 mock surface 구현"),
+        ]
+    } else {
+        vec![
+            Line::from(" ● CAL-7041   18m   14m   implement and test onboarding"),
+            Line::from("   ├─ ● codex       9m   editing tmux onboarding"),
+            Line::from("   └─ ▶ reviewer    4m   waiting for review input"),
+            Line::from(" ○ CAL-7088    7m    2m   README update complete"),
+            Line::from(""),
+            Line::from(" INSPECTOR · codex · %903"),
+            Line::from(" › detect prefix input and render safe mock surfaces"),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(" muxa watch · SESSION · DUR · ACT · SUMMARY ")
+                    .title_bottom(Line::from(" j/k move · m message · M mailbox · q quit "))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .style(Style::default().bg(Color::Rgb(7, 11, 18))),
+        area,
+    );
+}
+
+fn render_muxa_peek(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .margin(2)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+    let states = if app.ko() {
+        [
+            (
+                " 1 · editor · ○ IDLE ",
+                "최근 prompt 없음\nEnter/숫자: pane 이동",
+            ),
+            (
+                " 2 · codex · ● WORKING ",
+                "tmux onboarding 편집 중\n마지막 prompt: 방금 전",
+            ),
+            (
+                " 3 · reviewer · ▶ INPUT ",
+                "변경사항 검토 대기\n마지막 prompt: 4분 전",
+            ),
+        ]
+    } else {
+        [
+            (
+                " 1 · editor · ○ IDLE ",
+                "no recent prompt\nEnter/digit: jump pane",
+            ),
+            (
+                " 2 · codex · ● WORKING ",
+                "editing tmux onboarding\nlast prompted: just now",
+            ),
+            (
+                " 3 · reviewer · ▶ INPUT ",
+                "waiting to review changes\nlast prompted: 4m ago",
+            ),
+        ]
+    };
+    for (column, (title, body)) in columns.iter().zip(states) {
+        let height = 8.min(column.height);
+        let popup = Rect::new(column.x, column.y + 1, column.width, height);
+        frame.render_widget(
+            Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
+            popup,
+        );
+    }
+}
+
+fn render_muxa_dashboard(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    frame.render_widget(Clear, area);
+    let cards = Layout::default()
+        .direction(Direction::Horizontal)
+        .margin(1)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let first = vec![
+        Line::from("● 2 agents · 1 working · 1 waiting"),
+        Line::from("ACT 14m · WACT 9m"),
+        Line::from(""),
+        Line::from("codex      ● WORKING"),
+        Line::from("reviewer   ▶ INPUT"),
+    ];
+    let second = if app.ko() {
+        vec![
+            Line::from("○ 1 agent · idle"),
+            Line::from("ACT 2m · WACT 2m"),
+            Line::from(""),
+            Line::from("claude     ○ IDLE"),
+            Line::from("README 업데이트 완료"),
+        ]
+    } else {
+        vec![
+            Line::from("○ 1 agent · idle"),
+            Line::from("ACT 2m · WACT 2m"),
+            Line::from(""),
+            Line::from("claude     ○ IDLE"),
+            Line::from("README update complete"),
+        ]
+    };
+    for (area, title, lines) in [
+        (cards[0], " CAL-7041 · session card ", first),
+        (cards[1], " CAL-7088 · session card ", second),
+    ] {
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            area,
+        );
+    }
+}
+
 fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
     let popup = callout_rect(area, app.current());
     frame.render_widget(Clear, popup);
@@ -596,7 +926,7 @@ fn callout_rect(area: Rect, step: Step) -> Rect {
     }
     .min(area.height.saturating_sub(2));
     match step {
-        Step::Welcome | Step::Finish | Step::Zoom | Step::Detach => {
+        Step::Welcome | Step::Prefix | Step::Finish | Step::Zoom | Step::Detach => {
             centered_rect(area, width, height)
         }
         Step::Model | Step::Windows | Step::CopyMode | Step::Muxa => Rect::new(
@@ -617,6 +947,7 @@ fn callout_rect(area: Rect, step: Step) -> Rect {
 fn step_title(step: Step, language: UiLanguage) -> &'static str {
     let en = match step {
         Step::Welcome => "safe tmux fundamentals",
+        Step::Prefix => "press the detected prefix safely",
         Step::Model => "session, window, pane",
         Step::Windows => "windows organize one session",
         Step::Splits => "split the layout into panes",
@@ -629,6 +960,7 @@ fn step_title(step: Step, language: UiLanguage) -> &'static str {
     };
     let ko = match step {
         Step::Welcome => "안전한 tmux 기초",
+        Step::Prefix => "감지한 prefix를 안전하게 입력",
         Step::Model => "session, window, pane",
         Step::Windows => "하나의 session을 구성하는 window",
         Step::Splits => "layout을 pane으로 분할",
@@ -651,11 +983,12 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             label("THIS IS A SAFE, INERT TMUX CLIENT"),
             Line::from(""),
             Line::from(format!("Detected prefix: {}", app.prefix)),
-            Line::from("The tutorial never sends that prefix or runs tmux commands."),
-            Line::from("It arms a virtual prefix; you press only the real suffix key."),
+            Line::from("First you will press that prefix by itself and wait for ✓."),
+            Line::from("Then a virtual prefix lets you practise suffix keys safely."),
             Line::from("Nothing can create, split, detach, or kill a live session."),
             Line::from("Press Enter to begin. F2 switches to 한국어."),
         ],
+        Step::Prefix => prefix_lines(app),
         Step::Model => vec![
             label("↓ READ TMUX AS A HIERARCHY"),
             Line::from(""),
@@ -742,11 +1075,12 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
             label("안전하고 아무 동작도 하지 않는 TMUX CLIENT입니다"),
             Line::from(""),
             Line::from(format!("감지한 prefix: {}", app.prefix)),
-            Line::from("이 tutorial은 prefix를 보내거나 tmux 명령을 실행하지 않습니다."),
-            Line::from("가상 prefix를 대신 누르고 사용자는 실제 suffix key만 입력합니다."),
+            Line::from("먼저 이 prefix만 직접 누르고 ✓ 표시를 기다립니다."),
+            Line::from("그다음 가상 prefix로 suffix key를 안전하게 실습합니다."),
             Line::from("실제 session 생성, 분할, detach, 종료는 일어나지 않습니다."),
             Line::from("Enter로 시작하세요. F2는 English 전환입니다."),
         ],
+        Step::Prefix => prefix_lines(app),
         Step::Model => vec![
             label("↓ TMUX를 계층 구조로 이해하세요"),
             Line::from(""),
@@ -827,6 +1161,43 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
     }
 }
 
+fn prefix_lines(app: &TmuxApp) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        label(tr(
+            app.language,
+            "PRESS THE PREFIX BY ITSELF",
+            "PREFIX만 단독으로 누르세요",
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "{}: {}",
+            tr(app.language, "Detected prefix", "감지한 prefix"),
+            app.prefix
+        )),
+    ];
+    if app.prefix_capture == PrefixCapture::TmuxClient {
+        lines.extend([
+            Line::from(tr(
+                app.language,
+                "Press it once, release it, and wait for this dialog to advance.",
+                "한 번 누르고 손을 뗀 뒤 이 dialog가 넘어갈 때까지 기다리세요.",
+            )),
+            Line::from(tr(
+                app.language,
+                "Do not press w yet. Muxa will immediately cancel the live prefix table.",
+                "아직 w를 누르지 마세요. Muxa가 live prefix table을 즉시 해제합니다.",
+            )),
+        ]);
+    } else {
+        lines.push(Line::from(tr(
+            app.language,
+            "Press it once. This terminal is outside tmux, so the mock receives it directly.",
+            "한 번 누르세요. 현재 tmux 밖이므로 mock이 prefix를 직접 받습니다.",
+        )));
+    }
+    lines
+}
+
 fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
     let (done, key, description_en, description_ko) = match app.muxa_stage {
         MuxaStage::Watch => (
@@ -847,6 +1218,12 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             "prefix+D opens the richer session-card dashboard.",
             "prefix+D는 상세한 session-card dashboard를 엽니다.",
         ),
+        MuxaStage::Complete => (
+            "✓ prefix+s  ✓ prefix+q  ✓ prefix+D",
+            "Enter",
+            "The mock now shows session cards with agent state and ACT/WACT.",
+            "mock에 agent 상태와 ACT/WACT가 있는 session card가 표시됩니다.",
+        ),
     };
     vec![
         label(tr(
@@ -862,17 +1239,26 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(tr(app.language, description_en, description_ko)),
-        Line::from(format!(
-            "{} {}.",
-            tr(app.language, "Press suffix", "suffix를 누르세요:"),
-            key
-        )),
+        Line::from(if app.muxa_stage == MuxaStage::Complete {
+            tr(
+                app.language,
+                "Press Enter after inspecting the dashboard.",
+                "dashboard를 확인한 뒤 Enter를 누르세요.",
+            )
+            .to_string()
+        } else {
+            format!(
+                "{} {}.",
+                tr(app.language, "Press suffix", "suffix를 누르세요:"),
+                key
+            )
+        }),
     ]
 }
 
-fn expected_key(app: &TmuxApp) -> &'static str {
+fn expected_key(app: &TmuxApp) -> String {
     match app.current() {
-        Step::Welcome | Step::Finish => "Enter",
+        Step::Prefix => return app.prefix.clone(),
         Step::Model => "w",
         Step::Windows => "c",
         Step::Splits if app.split_stage == SplitStage::LeftRight => "%",
@@ -884,8 +1270,10 @@ fn expected_key(app: &TmuxApp) -> &'static str {
         Step::Detach => "d",
         Step::Muxa if app.muxa_stage == MuxaStage::Watch => "s",
         Step::Muxa if app.muxa_stage == MuxaStage::Peek => "q",
-        Step::Muxa => "D",
+        Step::Muxa if app.muxa_stage == MuxaStage::Dashboard => "D",
+        Step::Welcome | Step::Finish | Step::Muxa => "Enter",
     }
+    .to_string()
 }
 
 fn callout_footer(app: &TmuxApp) -> String {
@@ -907,6 +1295,14 @@ fn callout_footer(app: &TmuxApp) -> String {
             " Enter 계속 · F2 English · Esc 종료 ",
         )
         .to_string();
+    }
+    if app.current() == Step::Prefix {
+        return format!(
+            " {} {} · {} ",
+            tr(app.language, "press only", "단독 입력"),
+            app.prefix,
+            tr(app.language, "wait for ✓ · Esc quit", "✓ 대기 · Esc 종료")
+        );
     }
     format!(
         " prefix {} simulated · press {} · ← back · Esc quit ",
@@ -1001,6 +1397,17 @@ mod tests {
         handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    fn detected(raw: &str) -> DetectedPrefix {
+        DetectedPrefix {
+            tmux_key: raw.to_string(),
+            display: humanize_prefix(raw),
+        }
+    }
+
+    fn test_app(language: UiLanguage) -> TmuxApp {
+        TmuxApp::new(false, language, detected("C-b"), PrefixCapture::Direct)
+    }
+
     #[test]
     fn prefix_display_humanizes_tmux_notation() {
         assert_eq!(humanize_prefix("C-b"), "Ctrl-b");
@@ -1009,14 +1416,54 @@ mod tests {
     }
 
     #[test]
-    fn guided_track_requires_only_real_suffix_keys() {
-        let mut app = TmuxApp::new(false, UiLanguage::En, "Ctrl-b".into());
+    fn prefix_matcher_accepts_tmux_notation_and_rejects_plain_suffixes() {
+        assert!(prefix_key_matches(
+            "C-b",
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        ));
+        assert!(prefix_key_matches(
+            "M-a",
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)
+        ));
+        assert!(prefix_key_matches(
+            "F12",
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)
+        ));
+        assert!(!prefix_key_matches(
+            "C-b",
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn client_snapshot_parser_requires_exact_safe_fields() {
+        assert_eq!(
+            TmuxClientSnapshot::parse("/dev/pts/68|%903|prefix\n"),
+            Some(TmuxClientSnapshot {
+                tty: "/dev/pts/68".into(),
+                pane: "%903".into(),
+                key_table: "prefix".into(),
+            })
+        );
+        assert_eq!(TmuxClientSnapshot::parse("missing|fields"), None);
+        assert_eq!(TmuxClientSnapshot::parse("tty|%1|root|extra"), None);
+    }
+
+    #[test]
+    fn guided_track_requires_prefix_checkpoint_then_real_suffix_keys() {
+        let mut app = test_app(UiLanguage::En);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.current(), Step::Model);
+        assert_eq!(app.current(), Step::Prefix);
 
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.current(), Step::Model);
+        assert_eq!(app.current(), Step::Prefix);
         assert!(app.blocked_hint);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.current(), Step::Model);
 
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('c'));
@@ -1040,6 +1487,9 @@ mod tests {
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.current(), Step::Muxa);
+        assert_eq!(app.muxa_stage, MuxaStage::Complete);
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.current(), Step::Finish);
         press(&mut app, KeyCode::Enter);
         assert!(app.done);
@@ -1047,13 +1497,18 @@ mod tests {
 
     #[test]
     fn korean_track_explains_virtual_prefix_and_tmux_hierarchy() {
-        let app = TmuxApp::new(false, UiLanguage::Ko, "Ctrl-a".into());
+        let app = TmuxApp::new(
+            false,
+            UiLanguage::Ko,
+            detected("C-a"),
+            PrefixCapture::TmuxClient,
+        );
         let screen = rendered(&app, 130, 32).replace(' ', "");
         assert!(screen.contains("안전하고아무동작도하지않는TMUXCLIENT"));
         assert!(screen.contains("감지한prefix:Ctrl-a"));
 
         let mut model = app;
-        model.step = 1;
+        model.step = 2;
         let screen = rendered(&model, 130, 32).replace(' ', "");
         assert!(screen.contains("SESSION=work/ticket"));
         assert!(screen.contains("WINDOW=layout/room"));
@@ -1062,7 +1517,7 @@ mod tests {
 
     #[test]
     fn f2_switches_language_without_advancing() {
-        let mut app = TmuxApp::new(false, UiLanguage::En, "Ctrl-b".into());
+        let mut app = test_app(UiLanguage::En);
         press(&mut app, KeyCode::F(2));
         assert_eq!(app.language, UiLanguage::Ko);
         assert_eq!(app.current(), Step::Welcome);
@@ -1070,14 +1525,14 @@ mod tests {
 
     #[test]
     fn split_and_copy_mode_render_the_mock_effects() {
-        let mut app = TmuxApp::new(false, UiLanguage::En, "Ctrl-b".into());
-        app.step = 3;
+        let mut app = test_app(UiLanguage::En);
+        app.step = 4;
         press(&mut app, KeyCode::Char('%'));
         let split = rendered(&app, 130, 32);
         assert!(split.contains("codex · agent"));
         assert!(split.contains("NOW SPLIT TOP AND BOTTOM"));
 
-        app.step = 6;
+        app.step = 7;
         app.copy_stage = CopyStage::Exit;
         let copy = rendered(&app, 130, 32);
         assert!(copy.contains("copy mode · [0/120]"));
@@ -1085,8 +1540,29 @@ mod tests {
     }
 
     #[test]
+    fn muxa_shortcuts_render_watch_peek_and_dashboard_surfaces() {
+        let mut app = test_app(UiLanguage::Ko);
+        app.step = 9;
+
+        press(&mut app, KeyCode::Char('s'));
+        let watch = rendered(&app, 130, 32);
+        assert!(watch.contains("muxa watch · SESSION · DUR · ACT · SUMMARY"));
+        assert!(watch.contains("INSPECTOR · codex · %903"));
+
+        press(&mut app, KeyCode::Char('q'));
+        let peek = rendered(&app, 130, 32);
+        assert!(peek.contains("2 · codex · ● WORKING"));
+        assert!(peek.contains("3 · reviewer · ▶ INPUT"));
+
+        press(&mut app, KeyCode::Char('D'));
+        let dashboard = rendered(&app, 130, 32);
+        assert!(dashboard.contains("CAL-7041 · session card"));
+        assert!(dashboard.contains("ACT 14m · WACT 9m"));
+    }
+
+    #[test]
     fn compact_terminal_requests_resize() {
-        let app = TmuxApp::new(false, UiLanguage::En, "Ctrl-b".into());
+        let app = test_app(UiLanguage::En);
         let screen = rendered(&app, 60, 16);
         assert!(screen.contains("needs a little more room"));
         assert!(screen.contains("68 × 20"));

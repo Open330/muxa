@@ -73,11 +73,13 @@ Muxa workflow보다 먼저 tmux의 session/window/pane 구조와 기본 조작�
 
     muxa onboard --tmux --lang ko
 
-이 과정도 실제 tmux를 건드리지 않는 fullscreen mock입니다. 현재 설정된
-prefix(`Ctrl-b`, `Ctrl-a` 등)는 읽어서 표시하지만 terminal로 전송하지
-않습니다. 화면이 prefix를 가상으로 누른 상태를 만들고 사용자는 suffix key만
-입력합니다. 따라서 학습 중에 live window를 만들거나 pane을 분할하고 client를
-detach할 위험이 없습니다.
+이 과정도 실제 layout과 lifecycle을 건드리지 않는 fullscreen mock입니다.
+현재 설정된 prefix(`Ctrl-b`, `Ctrl-a` 등)를 감지하고 첫 단계에서 prefix만
+직접 누르게 합니다. tmux 안에서는 현재 client가 prefix key table로 들어간 것을
+확인하자마자 root table로 되돌립니다. 화면이 넘어가기 전에 suffix를 연속해서
+누르지 말고 ✓ 확인을 기다리면 live binding은 실행되지 않습니다. 이후 단계는
+가상 prefix와 실제 suffix key로 진행하므로 live window 생성, pane 분할,
+client detach가 일어나지 않습니다.
 
 실제 키를 다음 순서로 눌러 진행합니다.
 
@@ -88,7 +90,7 @@ detach할 위험이 없습니다.
 - `z`, `z`: pane 확대 후 원래 split layout 복원
 - `[`, `q`: copy mode 진입과 종료
 - `d`: client detach; session과 agent가 계속 실행된다는 의미
-- `s`, `q`, `D`: Muxa의 watch, peek, dashboard prefix binding
+- `s`, `q`, `D`: Muxa의 watch, peek, dashboard prefix binding과 실제 모양의 mock 화면
 
 여기서도 `F2`로 한글/영문을 전환하고, `Esc`로 종료하며, `--no-quiz`로 키
 gate를 건너뛸 수 있습니다. 정적 안내만 필요하면 다음을 사용합니다.

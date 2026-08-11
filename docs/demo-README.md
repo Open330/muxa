@@ -19,7 +19,7 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo.gif`           | Hero output. 1320 × 620, ~1.6 MB after optimizing.                                          |
 | `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.5 MB after optimizing.                                 |
 | `docs/demo-onboard.gif`   | Korean onboarding output. 1320 × 720, ~806 KB after optimizing.                           |
-| `docs/demo-tmux-onboard.gif` | Korean tmux onboarding output. 1320 × 720, ~433 KB after optimizing.                   |
+| `docs/demo-tmux-onboard.gif` | Korean tmux onboarding output. 1320 × 720, ~613 KB after optimizing.                   |
 
 ## What the recordings cover
 
@@ -45,8 +45,10 @@ onboarding must not touch real sessions.
 
 **`demo-tmux-onboard.tape` — learning tmux itself.** A second inert mock that
 teaches the session/window/pane hierarchy, splits, focus, reversible zoom,
-copy mode, detach semantics, and Muxa's prefix bindings. It displays the
-detected prefix but types only suffix keys, so it cannot alter a live client.
+copy mode, detach semantics, and Muxa's prefix bindings. It starts with a
+detected prefix-only checkpoint, then uses suffix keys. The `s`, `q`, and `D`
+frames render watch-, peek-, and dashboard-shaped surfaces instead of merely
+changing explanatory text.
 
 ## The fixture
 

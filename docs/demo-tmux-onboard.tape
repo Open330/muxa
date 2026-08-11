@@ -1,17 +1,16 @@
-# muxa tmux onboarding demo — safe suffix-key muscle memory
+# muxa tmux onboarding demo — prefix checkpoint + safe suffix muscle memory
 #
 #   vhs docs/demo-tmux-onboard.tape   →   docs/demo-tmux-onboard.gif
 #
-# The mock detects and displays the configured tmux prefix but never sends it.
-# Every typed character below is only the suffix that follows a virtually
-# armed prefix, so this recording cannot mutate a live tmux client.
+# The mock first verifies one detected prefix-only press. It then uses suffix
+# keys with a virtually armed prefix, so no live tmux binding is executed.
 #
 # Arc:
-#   0–4s    hierarchy and windows — w, c
+#   0–4s    prefix, hierarchy     — Ctrl-b, w
 #   4–9s    pane layout          — %, ", Right
 #   9–14s   zoom and copy mode   — z/z, [/q
 #   14–18s  detach semantics     — d
-#   18–22s  Muxa prefix table    — s/q/D
+#   18–24s  Muxa surfaces         — s watch, q peek, D dashboard
 
 Output docs/demo-tmux-onboard.gif
 
@@ -39,9 +38,13 @@ Type "muxa onboard --tmux --lang ko"
 Enter
 Sleep 1800ms
 
-# Start once with Enter; every lesson after this uses the real suffix key.
+# Start once, then press only the detected prefix and wait for confirmation.
 Enter
 Sleep 1000ms
+Ctrl+B
+Sleep 1200ms
+
+# Every feature lesson after the checkpoint uses the real suffix key.
 Type "w"
 Sleep 1100ms
 Type "c"
@@ -73,11 +76,14 @@ Sleep 1200ms
 
 # Muxa adds watch, peek, and dashboard to the same prefix table.
 Type "s"
-Sleep 900ms
-Type "q"
-Sleep 900ms
-Type "D"
 Sleep 1300ms
+Type "q"
+Sleep 1300ms
+Type "D"
+Sleep 1500ms
 
+# Confirm the visible dashboard, then finish the final summary.
+Enter
+Sleep 900ms
 Enter
 Sleep 800ms
