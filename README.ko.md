@@ -20,7 +20,7 @@
 
 ## README를 읽기 전에 Muxa 온보딩부터 체험해 보세요
 
-Muxa binary를 내려받거나 설치하지 않고 workflow를 바로 체험하세요.
+Muxa binary를 내려받거나 설치하지 않고 전체 화면 tour를 바로 체험하세요.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko

@@ -16,18 +16,19 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 ```
 
 This path needs none of the requirements above. The fetched shell script is the
-entire preview: it draws an inert Muxa workflow with POSIX shell builtins and
-does not download a Muxa binary, create temporary files, change config, start a
-daemon, or operate a real tmux session. It works in a normal Unix-like terminal
-regardless of CPU architecture. Forward preview flags after `sh -s --`:
+entire 20-step fullscreen tour: it uses ANSI terminal controls to preserve the
+virtual shell, tmux status line, window/pane layouts, and Muxa watch UI without
+downloading a Muxa binary, creating temporary files, changing config, starting
+a daemon, or operating a real tmux session. It works in a normal Unix-like
+terminal regardless of CPU architecture. Forward tour flags after `sh -s --`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-After installing Muxa, run `muxa onboard` for the complete 20-step fullscreen
-tmux and Muxa practice scenario.
+After installing Muxa, `muxa onboard` provides the native Ratatui version of
+the same practice scenario.
 
 ## One-Shot Install
 

@@ -20,8 +20,9 @@ muxad가 필요하지 않습니다. config나 실제 tmux session도 변경하�
 
     curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 
-이 shell preview는 Muxa의 작업 모델, watch 화면, attention과 협업 흐름을 네
-단계로 보여줍니다. 이미 설치했다면 다음 명령으로 전체 20단계 실습을 실행합니다.
+shell tour도 alternate screen 안에서 가상 shell과 tmux session/window/pane layout,
+status line, Muxa watch의 attention과 협업 흐름을 전체 20단계로 재현합니다. 이미
+설치했다면 다음 명령으로 같은 실습의 native Ratatui 버전을 실행합니다.
 
 하나의 전체 화면 시나리오가 가상 기본 shell에서 시작해 tmux session/window/
 pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮은 화면으로

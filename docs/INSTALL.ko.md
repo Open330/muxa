@@ -16,18 +16,19 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 ```
 
 이 경로에는 위 필요 조건이 적용되지 않습니다. 가져온 shell script 자체가 전체
-preview이며 POSIX shell builtin만으로 안전한 Muxa workflow dummy를 그립니다. Muxa
-binary 다운로드, 임시 파일 생성, config 수정, daemon 시작, 실제 tmux session
-조작을 전혀 하지 않습니다. CPU architecture와 관계없이 일반 Unix-like terminal에서
-실행할 수 있습니다. preview flag는 `sh -s --` 뒤에 전달합니다.
+20단계 fullscreen tour입니다. ANSI terminal control로 가상 shell, tmux status line,
+window/pane layout과 Muxa watch UI를 계속 유지하면서도 Muxa binary 다운로드, 임시
+파일 생성, config 수정, daemon 시작, 실제 tmux session 조작을 전혀 하지 않습니다.
+CPU architecture와 관계없이 일반 Unix-like terminal에서 실행할 수 있습니다. tour
+flag는 `sh -s --` 뒤에 전달합니다.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-Muxa를 설치한 뒤 `muxa onboard`를 실행하면 tmux와 Muxa를 다루는 전체 20단계
-fullscreen 실습을 진행할 수 있습니다.
+Muxa를 설치한 뒤에는 `muxa onboard`로 같은 실습의 native Ratatui 버전을 실행할
+수 있습니다.
 
 ## One-Shot 설치
 

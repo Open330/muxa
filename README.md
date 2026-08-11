@@ -20,7 +20,7 @@ status line, a live TUI, desktop notifications, and local reports.
 
 ## Try Muxa onboarding before reading
 
-Preview the workflow instantly—no Muxa binary download or installation:
+Launch the complete fullscreen tour—no Muxa binary download or installation:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
