@@ -781,7 +781,9 @@ while [ "$step" -le 20 ]; do
     if [ "$step" -eq 1 ]; then prompt_row=5; else prompt_row=6; fi
     move_to "$prompt_row" 32
     read_line
-    if [ "$step" -eq 1 ] && { [ "$input" = 'tmux new-session -s muxa-onboarding' ] || [ "$input" = 'tmux new -s muxa-onboarding' ]; }; then
+    if [ "$input" = q ] || [ "$input" = quit ] || [ "$input" = exit ]; then
+      exit 0
+    elif [ "$step" -eq 1 ] && { [ "$input" = 'tmux new-session -s muxa-onboarding' ] || [ "$input" = 'tmux new -s muxa-onboarding' ]; }; then
       step=2
       error_hint=0
     elif [ "$step" -eq 10 ] && { [ "$input" = 'tmux attach -t muxa-onboarding' ] || [ "$input" = 'tmux attach-session -t muxa-onboarding' ]; }; then
