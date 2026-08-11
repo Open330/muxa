@@ -28,7 +28,17 @@ watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
 
     muxa onboard
 
-![Muxa onboarding: watch mock 위의 위치별 dialog, 실제 상태 icon, 명령 입력 실습](demo-onboard.gif)
+한국어 locale(`LANG`, `LC_MESSAGES`, `LC_ALL`의 `ko*`)에서는 한글 안내가
+자동으로 선택됩니다. 명시적으로 선택하거나 영어로 실행할 수도 있습니다.
+
+    muxa onboard --lang ko
+    muxa onboard --lang en
+
+온보딩 도중에는 어느 단계에서든 `F2`로 한글과 영어를 즉시 전환할 수 있습니다.
+실제 watch를 재현하는 `SESSION`, `DUR`, `ACT`, `SUMMARY` 같은 UI label은
+그대로 유지하고 안내 dialog, 도움말, footer 설명은 선택한 언어로 표시합니다.
+
+![한글 Muxa onboarding: watch mock 위의 위치별 dialog, 실제 상태 icon과 단축키 실습](demo-onboard.gif)
 
 첫 안내만 `Enter`로 시작합니다. 이후 기능 단계는 설명을 읽고 Enter를 누르는
 방식이 아니라 실제 watch 키를 눌러야 진행됩니다.
@@ -41,24 +51,20 @@ watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
 - `n`: new work + agent form 열기, `Esc`로 안전하게 닫기
 - `m`: 선택한 peer의 composer 열기, 빈 입력에서 `Backspace`로 닫기
 - `M`: mailbox 열기와 닫기
+- `q`: 온보딩 완료. 실제 watch에서도 종료 키
 
-shell에서 사용하는 다음 실제 명령도 mock prompt에 직접 입력합니다.
+shell 명령을 그대로 따라 입력하거나 암기하는 단계는 없습니다. `n`으로 form을
+열고 위치와 조작 키를 확인한 다음 `Esc`를 누르면 바로 협업 단계로 넘어갑니다.
+`Esc`는 실제 watch와 마찬가지로 열려 있는 preview/help/form/composer를 먼저
+닫고, modal이 없을 때 tour를 종료합니다.
 
-    muxa work start CAL-7041 --agent codex
-    muxa watch
-
-입력한 명령은 검증만 하며 실행하지 않습니다. 빈 command prompt에서
-`Backspace`를 누르면 이전 단계로 돌아갑니다. `Esc`는 실제 watch와 마찬가지로
-열려 있는 preview/help/form/composer를 먼저 닫고, modal이 없을 때 tour를
-종료합니다.
-
-모든 화면 설명은 보되 단축키와 명령 입력 gate를 건너뛰려면 다음을 사용합니다.
+모든 화면 설명은 보되 단축키 gate를 건너뛰려면 다음을 사용합니다.
 
     muxa onboard --no-quiz
 
 터미널 상호작용 없이 전체 가이드를 출력할 수도 있습니다.
 
-    muxa onboard --print
+    muxa onboard --print --lang ko
 
 설치 직후에는 다음 순서가 권장됩니다.
 
@@ -126,8 +132,7 @@ work를 나타내고, 펼친 child row는 agent pane을 나타냅니다.
 - Alt-S/L/D/T: session, latest, duration, state 정렬
 - ? 또는 F1: 전체 단축키 도움말
 
-onboarding은 watch의 실제 도움말 데이터를 사용하므로 단축키 설명과
-구현이 서로 어긋나지 않습니다.
+onboarding의 한글 도움말은 watch의 실제 키 구성을 같은 순서로 설명합니다.
 
 ## Agent가 Muxa MCP를 사용하는 패턴
 

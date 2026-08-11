@@ -4,15 +4,15 @@
 #
 # Unlike the fleet recordings, this needs no daemon or tmux fixture. The
 # dashboard behind each coach dialog is Muxa's deliberately inert onboarding
-# mock: it teaches location, state icons, and commands without touching a real
+# mock: it teaches location, state icons, and shortcuts without touching a real
 # session.
 #
 # Arc:
 #   0–6s    navigate & sort — j/l and Alt-T over the real session-state gutter
 #   6–12s   inspect & help  — o and ? open/close watch-shaped overlays
-#   12–18s  create work     — n form, Esc, then validated CLI equivalent
-#   18–23s  collaborate     — m, empty Backspace, M mailbox toggle, MCP
-#   23–26s  launch          — type `muxa watch`, then recall q
+#   12–15s  create work     — n opens the form and Esc safely closes it
+#   15–20s  collaborate     — m, empty Backspace, M mailbox toggle, MCP
+#   20–22s  finish          — q, the same key that quits live watch
 
 Output docs/demo-onboard.gif
 
@@ -36,7 +36,7 @@ Type "clear"
 Enter
 Show
 
-Type "muxa onboard"
+Type "muxa onboard --lang ko"
 Enter
 Sleep 1800ms
 
@@ -70,12 +70,6 @@ Sleep 1400ms
 Escape
 Sleep 900ms
 
-# A real command is typed, but onboarding only validates it.
-Type "muxa work start CAL-7041 --agent codex"
-Sleep 800ms
-Enter
-Sleep 1400ms
-
 # Message composer closes with empty Backspace; M toggles the mailbox.
 Type "m"
 Sleep 1100ms
@@ -90,10 +84,6 @@ Sleep 1000ms
 Right
 Sleep 1200ms
 
-# Finish by recalling the command that opens the real dashboard.
-Type "muxa watch"
-Sleep 700ms
-Enter
-Sleep 1200ms
+# Finish with q, which also quits the live dashboard.
 Type "q"
 Sleep 800ms

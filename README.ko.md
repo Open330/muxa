@@ -137,11 +137,12 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 정책과 현재 `muxa watch` 단축키를 안전한 mock 화면에서 안내합니다. watch와
 같은 왼쪽 session-state gutter, 열, 50/50 inspector, overlay, 한 줄 footer를
 보여줍니다. `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`, `M`을 실제로
-눌러 진행하며, 실행하지는 않으면서 `muxa work start`와 `muxa watch` 명령도
-직접 입력하게 합니다.
+누르고 마지막에는 `q`로 마칩니다. shell 명령을 그대로 따라 입력하는 단계는
+없습니다. 한국어 locale에서는 한글을 자동으로 선택하며 `--lang ko`로
+명시하거나 온보딩 도중 `F2`로 한/영을 전환할 수 있습니다.
 
 <div align="center">
-  <img src="docs/demo-onboard.gif" alt="Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon, 명령 입력 실습" width="900" />
+  <img src="docs/demo-onboard.gif" alt="한글 Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon과 단축키 실습" width="900" />
   <br />
   <sub><code>muxa onboard</code> — 안전한 interactive watch mock에서 운영 모델을 익힙니다.</sub>
 </div>
@@ -165,7 +166,7 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 | `muxa work list/show/close` | managed work session을 조회하고 명시적으로 종료. |
 | `muxa agent start --work CAL-7041 ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
-| `muxa onboard` | 실제 watch 상태 icon과 명령 입력 실습을 제공하는 fullscreen walkthrough. `--no-quiz`로 입력 gate를 건너뛰거나 `--print`로 정적 guide 출력. |
+| `muxa onboard [--lang auto\|en\|ko]` | 한글/영문 fullscreen walkthrough와 실제 watch 단축키 실습. `F2`로 언어를 전환하고 `--no-quiz`로 단축키 gate를 건너뛰거나 `--print`로 정적 guide 출력. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |

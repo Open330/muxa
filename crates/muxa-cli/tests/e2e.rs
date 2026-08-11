@@ -181,6 +181,22 @@ fn onboarding_prints_even_when_config_is_invalid() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("session = work/ticket"));
     assert!(stdout.contains("muxa watch shortcuts"));
+
+    let korean = Command::new(bin("muxa"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "onboard",
+            "--print",
+            "--lang",
+            "ko",
+        ])
+        .output()
+        .expect("run Korean onboarding");
+    assert!(korean.status.success());
+    let stdout = String::from_utf8_lossy(&korean.stdout);
+    assert!(stdout.contains("Muxa 온보딩"));
+    assert!(stdout.contains("muxa watch 단축키"));
 }
 
 #[test]

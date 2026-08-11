@@ -162,11 +162,12 @@ and windows are layout only. Run `muxa onboard` to learn this workflow and the
 current `muxa watch` shortcuts interactively. Its safe mock mirrors watch's
 left-edge session-state gutter, columns, 50/50 inspector, overlays, and footer.
 You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`,
-and `M` actions, then type the real `muxa work start` / `muxa watch` commands
-without executing them.
+`M`, and `q` actions. The tour never asks you to transcribe shell commands.
+Korean is selected automatically for a Korean locale, can be requested with
+`--lang ko`, and can be toggled with `F2` during the tour.
 
 <div align="center">
-  <img src="docs/demo-onboard.gif" alt="muxa onboarding: location-aware dialogs over a safe watch mock, canonical state icons, and simulated real-command practice" width="900" />
+  <img src="docs/demo-onboard.gif" alt="Korean muxa onboarding: location-aware dialogs over a safe watch mock, canonical state icons, and real shortcut practice" width="900" />
   <br />
   <sub><code>muxa onboard</code> — learn the model on a safe, interactive watch mock.</sub>
 </div>
@@ -192,7 +193,7 @@ without executing them.
 | `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
 | `muxa agent start --work CAL-7041 ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
-| `muxa onboard` | Fullscreen mock-dashboard walkthrough with canonical watch state icons and simulated real-command practice; use `--no-quiz` to skip input gates or `--print` for a static guide. |
+| `muxa onboard [--lang auto\|en\|ko]` | Localized fullscreen mock-dashboard walkthrough with canonical watch state icons and real shortcut practice; `F2` switches language, `--no-quiz` skips shortcut gates, and `--print` emits a static guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |

@@ -17,7 +17,7 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo-optimize.sh`   | Rebuilds a rendered GIF on a 64-colour palette. Run it after `vhs`, before committing.     |
 | `docs/demo.gif`           | Hero output. 1320 × 620, ~1.6 MB after optimizing.                                          |
 | `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.5 MB after optimizing.                                 |
-| `docs/demo-onboard.gif`   | Onboarding output. 1320 × 720, ~837 KB after optimizing.                                  |
+| `docs/demo-onboard.gif`   | Korean onboarding output. 1320 × 720, ~806 KB after optimizing.                           |
 
 ## What the recordings cover
 
@@ -37,9 +37,9 @@ asking claude a headless question and `A` browsing the answers.
 
 **`demo-onboard.tape` — learning the model.** A safe replica of watch's
 session-state gutter, columns, inspector, overlays, and footer. The tape
-advances with the real watch keys before typing simulated `muxa work start` /
-`muxa watch` commands. It does not use `demo-setup.sh` because onboarding must
-not touch real sessions.
+uses the Korean UI and advances only with real watch keys; there is no shell
+command transcription exercise. It does not use `demo-setup.sh` because
+onboarding must not touch real sessions.
 
 ## The fixture
 
