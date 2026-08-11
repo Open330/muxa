@@ -1859,7 +1859,8 @@ mod tests {
         let sock = dir.path().join("mcp-call.sock");
         let (client, sends, tx, handle) = spawn_daemon(&sock).await;
 
-        // muxa_status returns a (possibly empty) agents payload as text.
+        // Fleet-wide muxa_status returns the canonical nested topology, even
+        // when the runner has no live multiplexer sessions.
         let status = dispatch(
             &client,
             &json!({
@@ -1870,7 +1871,15 @@ mod tests {
         .await
         .unwrap();
         let text = status["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"agents\""), "status text: {text}");
+        let status_payload: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            status_payload["topology"]["sessions"].is_array(),
+            "status text: {text}"
+        );
+        assert!(
+            status_payload.get("agents").is_none(),
+            "status text: {text}"
+        );
 
         let focused = dispatch(
             &client,
