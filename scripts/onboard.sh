@@ -157,9 +157,27 @@ cleanup() {
   printf '%s[?25h%s[?1049l%s' "$esc" "$esc" "$(printf '\033[0m')"
   if [ "$finished" -eq 1 ]; then
     if [ "$language" = ko ]; then
-      printf '%s\n' 'muxa-onboard: simulation 완료 — 다운로드하거나 설치한 항목이 없습니다.'
+      printf '%s\n' \
+        '' \
+        'Muxa onboarding 완료 — 실제 환경은 변경되지 않았습니다.' \
+        '' \
+        '설치하기 (pre-built, 권장):' \
+        '  brew install open330/tap/muxa' \
+        '  muxa init' \
+        '' \
+        '직접 다운로드: https://github.com/Open330/muxa/releases/latest' \
+        '설치 안내:     https://github.com/Open330/muxa#install-muxa'
     else
-      printf '%s\n' 'muxa-onboard: simulation complete — nothing was downloaded or installed.'
+      printf '%s\n' \
+        '' \
+        'Muxa onboarding complete — your real environment was not changed.' \
+        '' \
+        'Install (pre-built, recommended):' \
+        '  brew install open330/tap/muxa' \
+        '  muxa init' \
+        '' \
+        'Direct download: https://github.com/Open330/muxa/releases/latest' \
+        'Install guide:   https://github.com/Open330/muxa#install-muxa'
     fi
   fi
 }
@@ -313,7 +331,7 @@ set_step_copy() {
       17) title='new work form'; body1='n은 workspace, work, cwd, agent를 받는 form을 엽니다.'; if [ "$step17_sub" -eq 0 ]; then expected='입력: n'; else body2='실제 생성 없이 안전하게 form을 닫습니다.'; expected='입력: Esc'; fi ;;
       18) title='협업과 mailbox'; body1='같은 work의 agent에게 메시지를 보내고 reply를 추적합니다.'; case "$step18_sub" in 0) expected='입력: m';; 1) expected='빈 composer에서 Backspace';; 2) expected='입력: M';; *) expected='다시 입력: M';; esac ;;
       19) title='agent-side Muxa MCP'; body1='agent도 같은 work 경계 안에서 peer를 조회하고 기다립니다.'; body2='범용 shell 대신 좁은 Muxa operation을 사용합니다.'; expected='입력: l' ;;
-      20) title='온보딩 완료'; body1='관측, attention, 협업과 명시적 lifecycle을 모두 확인했습니다.'; body2='지금까지 Muxa binary나 실제 tmux session은 사용하지 않았습니다.'; body3='계속하려면 brew install open330/tap/muxa'; expected='입력: q' ;;
+      20) title='온보딩 완료'; body1='관측, attention, 협업과 명시적 lifecycle을 모두 확인했습니다.'; body2='지금까지 Muxa binary나 실제 tmux session은 사용하지 않았습니다.'; body3='화면을 닫으면 다운로드와 설치 방법을 안내합니다.'; expected='입력: q' ;;
     esac
   else
     case "$step" in
@@ -336,7 +354,7 @@ set_step_copy() {
       17) title='New-work form'; body1='n opens fields for workspace, work, cwd, and agent.'; if [ "$step17_sub" -eq 0 ]; then expected='Press n'; else body2='Close it without creating anything.'; expected='Press Esc'; fi ;;
       18) title='Collaboration and mailbox'; body1='Message peers in one work and track their replies.'; case "$step18_sub" in 0) expected='Press m';; 1) expected='Press Backspace in the empty composer';; 2) expected='Press M';; *) expected='Press M again';; esac ;;
       19) title='Agent-side Muxa MCP'; body1='Agents inspect and wait for peers inside the same work boundary.'; body2='Narrow Muxa operations replace arbitrary shell control.'; expected='Press l' ;;
-      20) title='Onboarding complete'; body1='You saw observability, attention, collaboration, and lifecycle.'; body2='No Muxa binary or real tmux session was used.'; body3='Continue with: brew install open330/tap/muxa'; expected='Press q' ;;
+      20) title='Onboarding complete'; body1='You saw observability, attention, collaboration, and lifecycle.'; body2='No Muxa binary or real tmux session was used.'; body3='Close the tour to see download and install options.'; expected='Press q' ;;
     esac
   fi
 

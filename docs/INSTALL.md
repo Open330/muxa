@@ -28,7 +28,9 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 ```
 
 After installing Muxa, `muxa onboard` provides the native Ratatui version of
-the same practice scenario.
+the same practice scenario. Completing the shell tour returns to the original
+terminal and prints the recommended Homebrew command, direct-download link,
+and install-guide link.
 
 ## One-Shot Install
 

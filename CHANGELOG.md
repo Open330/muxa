@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rendering preserves the virtual shell, tmux status line, window/pane layout,
   and Muxa watch interactions without fetching an archive, creating temporary
   files, or checking the host architecture. The installed `muxa onboard`
-  command remains the native Ratatui version of the same hands-on tour.
+  command remains the native Ratatui version of the same hands-on tour. After
+  a completed shell tour exits the alternate screen, it now prints concise
+  Homebrew, direct-download, and install-guide next steps.
 
 ## [0.8.31] - 2026-08-11
 

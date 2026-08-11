@@ -38,6 +38,9 @@ watch처럼 Works와 Inspector를 50/50으로 나눕니다.
 
     muxa onboard
 
+shell tour의 마지막 화면에서 `q`를 누르면 원래 terminal로 돌아와 권장 설치 명령과
+직접 다운로드·설치 문서 링크를 표시합니다.
+
 한국어 locale(`LANG`, `LC_MESSAGES`, `LC_ALL`의 `ko*`)에서는 한글 안내가
 자동으로 선택됩니다. 명시적으로 선택하거나 영어로 실행할 수도 있습니다.
 
