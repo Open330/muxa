@@ -117,6 +117,8 @@ pub(super) fn print_guide(language: UiLanguage) {
         println!("  prefix+s       muxa watch");
         println!("  prefix+q       muxa peek");
         println!("  prefix+D       muxa dashboard");
+        println!("\ntmux 명령은 prefix를 누르고 뗀 뒤 명령 키를 누르는 순서로 실행합니다.");
+        println!("동시에 누르는 조합이 아닙니다. 예: prefix → c, prefix → %, prefix → d");
         println!("\nsession 진입 후 감지된 prefix만 직접 누르고 확인을 기다립니다.");
         println!("이후에는 live binding 실행을 막기 위해 suffix key만 입력합니다.");
         println!("c, %, \" 및 d의 결과는 shell/window/pane 장면에 누적되어 표시됩니다.");
@@ -139,6 +141,10 @@ pub(super) fn print_guide(language: UiLanguage) {
         println!("  prefix+s       muxa watch");
         println!("  prefix+q       muxa peek");
         println!("  prefix+D       muxa dashboard");
+        println!(
+            "\nEvery tmux command starts by pressing and releasing the prefix, then its command key."
+        );
+        println!("It is a sequence, not a simultaneous chord: prefix → c, prefix → %, prefix → d");
         println!("\nAfter entering the session, press only the detected prefix and wait.");
         println!("Later drills accept suffix keys only, preventing live bindings.");
         println!("The shell/window/pane scene keeps the visible effects of c, %, \" and d.");
@@ -1365,7 +1371,7 @@ fn callout_rect(area: Rect, step: Step) -> Rect {
 fn step_title(step: Step, language: UiLanguage) -> &'static str {
     let en = match step {
         Step::Shell => "start outside tmux",
-        Step::Prefix => "press the detected prefix safely",
+        Step::Prefix => "tmux commands begin with the prefix",
         Step::Model => "session, window, pane",
         Step::Windows => "windows organize one session",
         Step::Splits => "split the layout into panes",
@@ -1379,7 +1385,7 @@ fn step_title(step: Step, language: UiLanguage) -> &'static str {
     };
     let ko = match step {
         Step::Shell => "tmux 밖의 shell에서 시작",
-        Step::Prefix => "감지한 prefix를 안전하게 입력",
+        Step::Prefix => "tmux 명령은 prefix로 시작합니다",
         Step::Model => "session, window, pane",
         Step::Windows => "하나의 session을 구성하는 window",
         Step::Splits => "layout을 pane으로 분할",
@@ -1610,6 +1616,22 @@ fn prefix_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             tr(app.language, "Detected prefix", "감지한 prefix"),
             app.prefix
         )),
+        Line::from(tr(
+            app.language,
+            "Every tmux command begins with this prefix.",
+            "tmux의 모든 명령은 이 prefix로 시작합니다.",
+        )),
+        Line::from(tr(
+            app.language,
+            "Press and release it, then press a command key; this is not a simultaneous chord.",
+            "prefix를 누르고 뗀 뒤 명령 키를 누릅니다. 동시에 누르는 조합이 아닙니다.",
+        )),
+        Line::from(tr(
+            app.language,
+            "Examples: prefix → c new window · prefix → % split pane · prefix → d detach",
+            "예: prefix → c 새 window · prefix → % pane 분할 · prefix → d detach",
+        )),
+        Line::from(""),
     ];
     if app.prefix_capture == PrefixCapture::TmuxClient {
         lines.extend([
@@ -1975,8 +1997,14 @@ mod tests {
         assert!(screen.contains("설정에서감지한prefix:Ctrl-a"));
 
         let mut model = app;
-        model.step = 2;
+        model.step = 1;
         model.client_location = ClientLocation::Tmux;
+        let screen = rendered(&model, 130, 32).replace(' ', "");
+        assert!(screen.contains("tmux의모든명령은이prefix로시작합니다"));
+        assert!(screen.contains("동시에누르는조합이아닙니다"));
+        assert!(screen.contains("prefix→c새window"));
+
+        model.step = 2;
         let screen = rendered(&model, 130, 32).replace(' ', "");
         assert!(screen.contains("SESSION=work/ticket"));
         assert!(screen.contains("WINDOW=layout/room"));
