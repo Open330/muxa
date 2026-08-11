@@ -15,18 +15,19 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
 ```
 
-이 경로에는 위 필요 조건이 적용되지 않습니다. 최신 프리빌트 `muxa` CLI만 임시
-디렉터리에 내려받고 release checksum을 검증한 뒤 안전한 onboarding simulation을
-실행합니다. `muxa`나 `muxad`를 설치하지 않고, config 수정, daemon 시작, 실제 tmux
-session 조작도 하지 않습니다. tour를 종료하면 임시 파일도 삭제됩니다.
-
-x86_64/arm64 Linux와 macOS를 지원합니다. 일반 onboarding flag는 `sh -s --`
-뒤에 전달할 수 있습니다.
+이 경로에는 위 필요 조건이 적용되지 않습니다. 가져온 shell script 자체가 전체
+preview이며 POSIX shell builtin만으로 안전한 Muxa workflow dummy를 그립니다. Muxa
+binary 다운로드, 임시 파일 생성, config 수정, daemon 시작, 실제 tmux session
+조작을 전혀 하지 않습니다. CPU architecture와 관계없이 일반 Unix-like terminal에서
+실행할 수 있습니다. preview flag는 `sh -s --` 뒤에 전달합니다.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
+
+Muxa를 설치한 뒤 `muxa onboard`를 실행하면 tmux와 Muxa를 다루는 전체 20단계
+fullscreen 실습을 진행할 수 있습니다.
 
 ## One-Shot 설치
 

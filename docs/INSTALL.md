@@ -15,19 +15,19 @@ This page keeps the detailed install and wiring notes out of the README.
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
 ```
 
-This path needs none of the requirements above. It downloads only the latest
-pre-built `muxa` CLI into a temporary directory, verifies the release checksum,
-and runs the safe onboarding simulation. It does not install `muxa` or `muxad`,
-change config, start a daemon, or operate a real tmux session. The temporary
-files are removed when the tour exits.
-
-The supported trial platforms are x86_64/arm64 Linux and macOS. Forward normal
-onboarding flags after `sh -s --`:
+This path needs none of the requirements above. The fetched shell script is the
+entire preview: it draws an inert Muxa workflow with POSIX shell builtins and
+does not download a Muxa binary, create temporary files, change config, start a
+daemon, or operate a real tmux session. It works in a normal Unix-like terminal
+regardless of CPU architecture. Forward preview flags after `sh -s --`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
+
+After installing Muxa, run `muxa onboard` for the complete 20-step fullscreen
+tmux and Muxa practice scenario.
 
 ## One-Shot Install
 

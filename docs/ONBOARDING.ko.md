@@ -14,13 +14,14 @@ session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존�
 
 ## 온보딩 실행
 
-아직 Muxa를 설치하지 않았다면 최신 프리빌트 CLI를 임시로 받아 바로 실행할 수
-있습니다. Rust, Git, tmux, muxad가 필요하지 않고 종료할 때 임시 바이너리도
-삭제됩니다.
+아직 Muxa를 설치하지 않았다면 shell preview를 바로 실행할 수 있습니다. 가져온
+script 자체가 전체 preview이므로 Muxa binary를 내려받지 않으며 Rust, Git, tmux,
+muxad가 필요하지 않습니다. config나 실제 tmux session도 변경하지 않습니다.
 
     curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 
-이미 설치했다면 다음 명령을 사용합니다.
+이 shell preview는 Muxa의 작업 모델, watch 화면, attention과 협업 흐름을 네
+단계로 보여줍니다. 이미 설치했다면 다음 명령으로 전체 20단계 실습을 실행합니다.
 
 하나의 전체 화면 시나리오가 가상 기본 shell에서 시작해 tmux session/window/
 pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮은 화면으로

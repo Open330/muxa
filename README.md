@@ -20,18 +20,17 @@ status line, a live TUI, desktop notifications, and local reports.
 
 ## Try Muxa onboarding before reading
 
-Experience the complete interactive tour without installing Muxa first:
+Preview the workflow instantly—no Muxa binary download or installation:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
 ```
 
-The script downloads the latest pre-built CLI to a temporary directory,
-verifies its SHA-256 checksum, runs the safe `muxa onboard` simulation, and
-removes the binary when you leave. It does not install `muxa`/`muxad`, edit
-config, or require Rust, Git, a running daemon, or even tmux. Linux and macOS
-on x86_64 or arm64 are supported. To force Korean, replace the final `| sh`
-with `| sh -s -- --lang ko`.
+<div align="center">
+  <img src="docs/demo.gif" alt="muxa watch: sixteen agent sessions on one screen, the inspector, the swarm view, and muxa attend jumping to the agent that needs you" width="900" />
+  <br />
+  <sub><code>muxa watch</code> — the fleet, the inspector, the swarm view, and <code>muxa attend</code>.</sub>
+</div>
 
 `muxa` is a small daemon and CLI for observing — and now driving — AI
 coding agents running inside terminal multiplexer panes. It reads agent
@@ -73,12 +72,6 @@ It welcomes you with the reason for creating a practice tmux session, then lets
 you type `tmux new-session`, learn the hierarchy, windows, panes, detach/attach,
 and managed prefix bindings before continuing directly into the Muxa watch workflow.
 Nothing in the tour mutates a live tmux session.
-
-<div align="center">
-  <img src="docs/demo.gif" alt="muxa watch: sixteen agent sessions on one screen, the inspector, the swarm view, and muxa attend jumping to the agent that needs you" width="900" />
-  <br />
-  <sub><code>muxa watch</code> — the fleet, the inspector, the swarm view, and <code>muxa attend</code>.</sub>
-</div>
 
 > [!IMPORTANT]
 > Beta. Event ingest, the daemon, CLI, live TUI, desktop notifications,

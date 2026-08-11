@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The curl onboarding preview no longer downloads Muxa.**
+  `scripts/onboard.sh` is now the entire POSIX-shell preview: it renders the
+  work model, watch view, attention flow, and next steps without fetching an
+  archive, creating temporary files, or checking the host architecture. The
+  installed `muxa onboard` command remains the complete 20-step hands-on tour.
+
 ## [0.8.31] - 2026-08-11
 
 ### Added

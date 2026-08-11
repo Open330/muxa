@@ -20,16 +20,15 @@
 
 ## README를 읽기 전에 Muxa 온보딩부터 체험해 보세요
 
-아무것도 설치하지 않고 전체 대화형 tour를 바로 실행할 수 있습니다.
+Muxa binary를 내려받거나 설치하지 않고 workflow를 바로 체험하세요.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 ```
 
-최신 프리빌트 CLI를 임시 디렉터리에 내려받고 SHA-256 checksum을 검증한 뒤,
-안전한 `muxa onboard` simulation을 실행합니다. 종료하면 받은 바이너리도
-삭제됩니다. `muxa`/`muxad` 설치, config 수정, Rust, Git, 실행 중인 daemon은
-물론 tmux도 필요하지 않습니다. x86_64/arm64 Linux와 macOS를 지원합니다.
+<div align="center">
+  <img src="docs/demo.gif" alt="muxa watch에서 여러 agent의 상태를 한눈에 확인하고 필요한 agent로 이동하는 모습" width="900" />
+</div>
 
 `muxa`는 terminal multiplexer pane 안에서 실행되는 AI coding agent를 관측하는
 작은 daemon + CLI입니다. Claude Code, OpenAI Codex, Google Gemini CLI의 기존
@@ -64,10 +63,6 @@ Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 
 이어서 가상 shell의 `tmux new-session`부터 tmux 계층과 조작, detach/attach,
 Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 있습니다.
 실제 tmux session은 변경하지 않습니다.
-
-<div align="center">
-  <img src="docs/demo.gif" alt="muxa demo" width="900" />
-</div>
 
 > [!IMPORTANT]
 > Beta입니다. event ingest, daemon, CLI, live TUI, desktop notification,
