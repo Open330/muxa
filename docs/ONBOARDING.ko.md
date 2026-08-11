@@ -1,6 +1,6 @@
 # Muxa 온보딩
 
-Muxa의 기본 운영 모델은 단순합니다.
+Muxa는 다음 작업 단위 tmux workflow에 맞춰 설계되고 최적화되어 있습니다.
 
 - tmux session = 하나의 work 또는 ticket
 - tmux pane = 하나의 agent

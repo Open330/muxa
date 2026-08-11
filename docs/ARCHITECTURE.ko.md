@@ -2,6 +2,21 @@
 
 `muxa`는 의도적으로 작게 유지합니다: daemon 하나, CLI 하나, local file, database 없음.
 
+## Managed tmux domain model
+
+Muxa는 작업 단위 tmux 모델에 최적화되어 있습니다.
+
+| tmux 객체 | Domain identity | 불변 조건 |
+| --- | --- | --- |
+| Session | Work/ticket | 하나의 work ID와 cwd에 managed session 하나를 생성하거나 재사용합니다. |
+| Pane | Agent | 모든 managed agent는 해당 work session 안의 독립 pane에서 실행됩니다. |
+| Window | Layout/collaboration room | agent를 배치하고 가까운 협업 범위를 정하지만 work identity로 사용하지 않습니다. |
+
+CLI, `muxa watch`, daemon registry, `muxa mcp`가 모두 이 매핑을 공유합니다.
+같은 work 시작은 기존 session을 재사용하거나 cwd가 다르면 실패해야 하고, agent
+추가는 pane 추가로 이어져야 하며, 파괴적 제어는 unmanaged pane/session을
+거부해야 합니다.
+
 ## Flow
 
 ```text

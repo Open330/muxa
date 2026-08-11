@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="muxa" width="260" />
 
-**Agent CLI observability & orchestration layer for tmux.**
+**Work-oriented AI-agent observability & orchestration for tmux.**
 
 See which agents are working, waiting, idle, or blocked from your tmux
 status line, a live TUI, desktop notifications, and local reports.
@@ -29,6 +29,33 @@ prompts, wait for changes.
 It does not fork the multiplexer or modify agent binaries. tmux and
 [herdr](https://herdr.dev) are full backends and can be observed at the
 same time; zellij has a CLI baseline. See the Hosts table below.
+
+## Optimized for work-oriented tmux
+
+Muxa treats tmux as a durable work execution model, not just a collection of
+terminal panes:
+
+| tmux object | Muxa meaning | How it is used |
+| --- | --- | --- |
+| **session** | One work item or ticket | Stable work identity, cwd, and managed lifecycle. Starting the same work again reuses this session. |
+| **pane** | One agent | An implementer, reviewer, or other agent working inside that work session. |
+| **window** | Layout and collaboration room | Organizes panes visually and scopes nearby collaboration; it does not create another work identity. |
+
+The intended workflow is equally direct:
+
+1. Start a work ID once; Muxa creates or reuses its managed tmux session and
+   starts the first agent pane.
+2. Add implementer, reviewer, or helper agents as additional panes in that
+   same session.
+3. Observe, preview, message, and control those agents through `muxa watch`,
+   or let an agent use the same policy through `muxa mcp`.
+4. Close the pane or work explicitly when it is complete. Muxa refuses to
+   silently split one ticket into suffixed sessions or terminate unmanaged
+   tmux objects.
+
+In short: **work/ticket → session → agent panes → observe and collaborate →
+explicit close**. Run `muxa onboard` to practise this model on a safe watch
+mock before touching live sessions.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa watch: sixteen agent sessions on one screen, the inspector, the swarm view, and muxa attend jumping to the agent that needs you" width="900" />

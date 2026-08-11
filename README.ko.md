@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="muxa" width="260" />
 
-**tmux 안의 AI agent CLI를 관측하고 조작하는 로컬 도구.**
+**tmux를 작업 단위로 구성하는 AI agent 관측·오케스트레이션 도구.**
 
 에이전트가 working, waiting, idle, error 중 어디에 있는지 tmux 상태바,
 실시간 TUI, 데스크톱 알림, 로컬 리포트에서 확인합니다.
@@ -24,6 +24,31 @@ hook/event 시스템을 사용하고, 이를 tmux pane/session과 연결합니�
 
 tmux나 agent binary를 fork하지 않습니다. tmux는 기본 full backend이고,
 zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
+
+## 작업 단위 tmux workflow에 최적화
+
+Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 실행 모델로
+사용합니다.
+
+| tmux 객체 | Muxa에서의 의미 | 사용 방식 |
+| --- | --- | --- |
+| **session** | 하나의 work 또는 ticket | 안정적인 작업 identity, cwd, managed lifecycle. 같은 work를 다시 시작하면 이 session을 재사용합니다. |
+| **pane** | 하나의 agent | 해당 work 안에서 일하는 implementer, reviewer 또는 helper agent입니다. |
+| **window** | 화면 배치와 collaboration room | pane을 시각적으로 배치하고 가까운 협업 범위를 정하지만 별도 work identity를 만들지는 않습니다. |
+
+권장 workflow도 이 모델을 그대로 따릅니다.
+
+1. work ID를 한 번 시작하면 Muxa가 managed tmux session을 생성하거나 재사용하고
+   첫 agent pane을 시작합니다.
+2. 같은 session에 implementer, reviewer, helper agent를 pane으로 추가합니다.
+3. `muxa watch`에서 상태 확인, preview, 메시지, 제어를 수행하거나 agent가
+   `muxa mcp`를 통해 같은 정책으로 다른 agent를 관리합니다.
+4. 작업이 끝나면 pane 또는 work를 명시적으로 닫습니다. Muxa는 하나의 ticket을
+   suffix session으로 조용히 분리하거나 unmanaged tmux 객체를 종료하지 않습니다.
+
+요약하면 **work/ticket → session → agent pane들 → 관측·협업 → 명시적 종료**입니다.
+`muxa onboard`에서 실제 session을 건드리지 않는 watch mock으로 이 흐름을 먼저
+익힐 수 있습니다.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa demo" width="900" />

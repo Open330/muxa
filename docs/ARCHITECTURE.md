@@ -3,6 +3,21 @@
 `muxa` is intentionally small: one daemon, one CLI, local files, and no
 database.
 
+## Managed tmux domain model
+
+Muxa is optimized around a work-oriented tmux model:
+
+| tmux object | Domain identity | Invariant |
+| --- | --- | --- |
+| Session | Work/ticket | One managed session is created or reused for one work ID and cwd. |
+| Pane | Agent | Every managed agent is placed in its own pane inside the work session. |
+| Window | Layout/collaboration room | Windows arrange agents and scope nearby collaboration; they do not identify work. |
+
+This mapping is shared by the CLI, `muxa watch`, the daemon registry, and
+`muxa mcp`. Starting the same work must reuse its session or fail on an
+incompatible cwd; adding an agent must add a pane; destructive controls must
+refuse unmanaged panes and sessions.
+
 ## Flow
 
 ```text
