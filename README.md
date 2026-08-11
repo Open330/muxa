@@ -18,6 +18,21 @@ status line, a live TUI, desktop notifications, and local reports.
 
 ---
 
+## Try Muxa onboarding before reading
+
+Experience the complete interactive tour without installing Muxa first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+```
+
+The script downloads the latest pre-built CLI to a temporary directory,
+verifies its SHA-256 checksum, runs the safe `muxa onboard` simulation, and
+removes the binary when you leave. It does not install `muxa`/`muxad`, edit
+config, or require Rust, Git, a running daemon, or even tmux. Linux and macOS
+on x86_64 or arm64 are supported. To force Korean, replace the final `| sh`
+with `| sh -s -- --lang ko`.
+
 `muxa` is a small daemon and CLI for observing — and now driving — AI
 coding agents running inside terminal multiplexer panes. It reads agent
 state from existing hook/event systems (Claude Code, OpenAI Codex, Google
@@ -85,19 +100,7 @@ Nothing in the tour mutates a live tmux session.
 | Dashboard | Optional loopback HTTP UI with SSE live updates and a timeline graph. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
-## Quick Start
-
-Try the complete interactive tour before installing anything:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
-```
-
-This downloads the latest pre-built CLI to a temporary directory, verifies its
-SHA-256 checksum, runs the inert `muxa onboard` simulation, and removes the
-binary when you leave. It does not install `muxa`/`muxad`, edit config, or
-require Rust, Git, a running daemon, or even tmux. Linux and macOS on x86_64 or
-arm64 are supported. To force Korean, append `| sh -s -- --lang ko` instead.
+## Install Muxa
 
 If you decide to keep Muxa, install it with one of the following methods.
 

@@ -18,6 +18,19 @@
 
 ---
 
+## README를 읽기 전에 Muxa 온보딩부터 체험해 보세요
+
+아무것도 설치하지 않고 전체 대화형 tour를 바로 실행할 수 있습니다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
+```
+
+최신 프리빌트 CLI를 임시 디렉터리에 내려받고 SHA-256 checksum을 검증한 뒤,
+안전한 `muxa onboard` simulation을 실행합니다. 종료하면 받은 바이너리도
+삭제됩니다. `muxa`/`muxad` 설치, config 수정, Rust, Git, 실행 중인 daemon은
+물론 tmux도 필요하지 않습니다. x86_64/arm64 Linux와 macOS를 지원합니다.
+
 `muxa`는 terminal multiplexer pane 안에서 실행되는 AI coding agent를 관측하는
 작은 daemon + CLI입니다. Claude Code, OpenAI Codex, Google Gemini CLI의 기존
 hook/event 시스템을 사용하고, 이를 tmux pane/session과 연결합니다.
@@ -76,19 +89,7 @@ Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 �
 | Dashboard | optional loopback HTTP UI + SSE live update + timeline graph. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
-## 빠른 시작
-
-아무것도 설치하기 전에 전체 대화형 tour를 바로 체험할 수 있습니다.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
-```
-
-최신 프리빌트 CLI를 임시 디렉터리에 내려받고 SHA-256 checksum을 검증한 뒤,
-실제 환경을 건드리지 않는 `muxa onboard` simulation만 실행합니다. 종료하면 받은
-바이너리도 삭제됩니다. `muxa`/`muxad` 설치, config 수정, Rust, Git, 실행 중인
-daemon은 물론 tmux도 필요하지 않습니다. x86_64/arm64 Linux와 macOS를 지원합니다.
-한국어를 명시하려면 명령 끝을 `| sh -s -- --lang ko`로 바꾸면 됩니다.
+## Muxa 설치
 
 체험 후 계속 사용하기로 했다면 아래 방법 중 하나로 설치합니다.
 
