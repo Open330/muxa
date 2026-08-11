@@ -162,7 +162,7 @@ rather than appearing paneless.
 
 Connected agents are told that room peers can serve as read-only reviewers or
 narrowly scoped execution subagents. Requests and replies can also carry
-validated AIR 1.0 artifact references, which watch/dashboard visualize with
+validated AIR 1.0 artifact references, which watch visualizes with
 profile-colored mailbox badges.
 
 Agents reported as synthetic by `muxa doctor` are omitted from collaboration
@@ -177,9 +177,8 @@ Then:
    `Enter`. Press `M` to read and reply from the mailbox (`b` remains an alias).
 
 Do not open watch from a spare shell pane when you want to collaborate: that
-shell is not an agent. `muxa dashboard` remains an optional richer console,
-not a required collaboration entry point. For request/reply details, see
-[docs/COLLABORATION.md](docs/COLLABORATION.md).
+shell is not an agent. Continue the collaboration workflow in watch. For
+request/reply details, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
 
 For install modes, `muxa init` presets, systemd, manual hook wiring, and
 rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
@@ -195,7 +194,9 @@ commands, and explains why each session command is needed before asking for it.
 It preserves every virtual window/pane transition, then continues without
 leaving fullscreen into the current `muxa watch` workflow. The watch half mirrors
 the left-edge session-state gutter, columns, 50/50 inspector, overlays, and
-footer. You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
+footer. Commands and keys that you must enter are shown in bold yellow in both
+the dialog body and footer. You advance with the real `j`, `l`, `Alt-T`, `o`,
+`?`, `n`, `m`,
 `Backspace`, `M`, and `q` actions. One 20-step counter covers the whole scenario:
 managed prefix bindings are step 11 and work navigation follows as step 12.
 Korean is selected automatically for a Korean locale, can be requested with

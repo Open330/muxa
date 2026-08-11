@@ -88,6 +88,62 @@ fn tr(language: UiLanguage, en: &'static str, ko: &'static str) -> &'static str 
     }
 }
 
+const ACTION_COLOR: Color = Color::LightYellow;
+
+fn action_style() -> Style {
+    Style::default()
+        .fg(ACTION_COLOR)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn action_line(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(text.into(), action_style()))
+}
+
+fn highlighted_actions(text: impl Into<String>, tokens: &[&str]) -> Line<'static> {
+    let text = text.into();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        let mut next = None;
+        for token in tokens.iter().copied().filter(|token| !token.is_empty()) {
+            for (offset, _) in text[cursor..].match_indices(token) {
+                let start = cursor + offset;
+                let end = start + token.len();
+                if token_boundary(&text, start, end) {
+                    if next.is_none_or(|(best_start, best_end, _)| {
+                        (start, std::cmp::Reverse(end - start))
+                            < (best_start, std::cmp::Reverse(best_end - best_start))
+                    }) {
+                        next = Some((start, end, token));
+                    }
+                    break;
+                }
+            }
+        }
+
+        let Some((start, end, token)) = next else {
+            spans.push(Span::raw(text[cursor..].to_string()));
+            break;
+        };
+        if start > cursor {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(token.to_string(), action_style()));
+        cursor = end;
+    }
+
+    Line::from(spans)
+}
+
+fn token_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && !after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Interactive,
@@ -855,7 +911,7 @@ fn mock_sandbox_row(app: &TourApp) -> Line<'static> {
         Span::styled(if selected { "> " } else { "  " }, style),
         mock_state_span(AgentState::Idle, bg),
         Span::styled(
-            "     muxa › sandbox     31m    1m     dashboard authentication",
+            "     muxa › sandbox     31m    1m     release checks complete",
             style,
         ),
     ])
@@ -895,7 +951,7 @@ fn render_mock_inspector(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
             "IDLE",
             "1m",
             "codex",
-            "dashboard authentication",
+            "release checks complete",
         ),
         MockSelection::WorkOnboarding => (
             "muxa-onboarding:1.0",
@@ -933,7 +989,7 @@ fn render_mock_inspector(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
         Line::from("› implement checkout hardening"),
         Line::from(""),
         Line::from(Span::styled(
-            "  ⚙ editing  crates/muxa/src/dashboard/server.rs",
+            "  ⚙ editing  crates/muxa-cli/src/watch.rs",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -1090,8 +1146,8 @@ fn render_preview_overlay(frame: &mut Frame<'_>, area: Rect) {
             Line::from(""),
             Line::from("› implement checkout hardening"),
             Line::from(""),
-            Line::from("  ⚙ read     crates/muxa/src/dashboard/server.rs"),
-            Line::from("  ⚙ editing  crates/muxa/src/dashboard/auth.rs"),
+            Line::from("  ⚙ read     crates/muxa/src/tmux_work.rs"),
+            Line::from("  ⚙ editing  crates/muxa-cli/src/watch.rs"),
             Line::from(""),
             Line::from(Span::styled(
                 "  ● working…",
@@ -1119,19 +1175,28 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
                 "필터와 이동",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from("  ↑/↓ · j/k       work/agent 이동"),
-            Line::from("  ←/→ · h/l       상위 work / 첫 agent"),
-            Line::from("  Enter           선택한 pane에 attach"),
-            Line::from("  n               workspace/work + agent 생성/재사용"),
+            highlighted_actions("  ↑/↓ · j/k       work/agent 이동", &["↑/↓", "j/k"]),
+            highlighted_actions("  ←/→ · h/l       상위 work / 첫 agent", &["←/→", "h/l"]),
+            highlighted_actions("  Enter           선택한 pane에 attach", &["Enter"]),
+            highlighted_actions(
+                "  n               workspace/work + agent 생성/재사용",
+                &["n"],
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 "조회와 협업",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from("  o / Alt-P       preview 열기"),
-            Line::from("  m / M           선택한 agent에 메시지 / mailbox"),
-            Line::from("  a / A           ask / history"),
-            Line::from("  Alt-S/L/D/T     workspace / latest / duration / state 정렬"),
+            highlighted_actions("  o / Alt-P       preview 열기", &["o", "Alt-P"]),
+            highlighted_actions(
+                "  m / M           선택한 agent에 메시지 / mailbox",
+                &["m", "M"],
+            ),
+            highlighted_actions("  a / A           ask / history", &["a", "A"]),
+            highlighted_actions(
+                "  Alt-S/L/D/T     workspace / latest / duration / state 정렬",
+                &["Alt-S/L/D/T"],
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 "상태 표시",
@@ -1145,19 +1210,31 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
                 "Filter & navigation",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from("  ↑/↓ · j/k       move works/agents"),
-            Line::from("  ←/→ · h/l       parent work / first agent"),
-            Line::from("  Enter           attach to selected pane"),
-            Line::from("  n               new/reused workspace/work + agent"),
+            highlighted_actions("  ↑/↓ · j/k       move works/agents", &["↑/↓", "j/k"]),
+            highlighted_actions(
+                "  ←/→ · h/l       parent work / first agent",
+                &["←/→", "h/l"],
+            ),
+            highlighted_actions("  Enter           attach to selected pane", &["Enter"]),
+            highlighted_actions(
+                "  n               new/reused workspace/work + agent",
+                &["n"],
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 "Commands & inspection",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from("  o / Alt-P       open preview overlay"),
-            Line::from("  m / M           message selected agent / mailbox"),
-            Line::from("  a / A           ask / history"),
-            Line::from("  Alt-S/L/D/T     workspace / latest / duration / state"),
+            highlighted_actions("  o / Alt-P       open preview overlay", &["o", "Alt-P"]),
+            highlighted_actions(
+                "  m / M           message selected agent / mailbox",
+                &["m", "M"],
+            ),
+            highlighted_actions("  a / A           ask / history", &["a", "A"]),
+            highlighted_actions(
+                "  Alt-S/L/D/T     workspace / latest / duration / state",
+                &["Alt-S/L/D/T"],
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 "State markers",
@@ -1241,11 +1318,30 @@ fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
         step_title(step, app.language)
     );
     let body = step_body(app);
-    let footer = callout_footer(app);
+    let footer = highlighted_actions(
+        callout_footer(app),
+        &[
+            "←/Backspace",
+            "Enter/→",
+            "j/↓",
+            "l/→",
+            "Alt-T",
+            "?/F1",
+            "Backspace",
+            "Enter",
+            "F2",
+            "Esc",
+            "←",
+            "o",
+            "n",
+            "m",
+            "M",
+            "q",
+        ],
+    );
     frame.render_widget(
         Paragraph::new(body).wrap(Wrap { trim: false }).block(
-            dialog_block(&title, Color::Cyan)
-                .title_bottom(Line::from(footer).alignment(Alignment::Center)),
+            dialog_block(&title, Color::Cyan).title_bottom(footer.alignment(Alignment::Center)),
         ),
         popup,
     );
@@ -1422,7 +1518,10 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::Work => vec![
             callout_label("← MOVE BETWEEN WORK WINDOWS"),
             Line::from(""),
-            Line::from("The cursor is on muxa-sandbox. Press j or ↓ to select muxa-onboarding."),
+            highlighted_actions(
+                "The cursor is on muxa-sandbox. Press j or ↓ to select muxa-onboarding.",
+                &["j", "↓"],
+            ),
             Line::from("Each row represents one work window in the muxa workspace session."),
             Line::from("Starting the same work again reuses its window and adds an agent pane."),
         ],
@@ -1430,8 +1529,11 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             callout_label("← OPEN THE SELECTED WORK"),
             Line::from(""),
             Line::from("Expanding a work reveals the agent panes running inside it."),
-            Line::from("Press l or → to select the first agent."),
-            Line::from("Use h or ← whenever you want to return to the work window."),
+            highlighted_actions("Press l or → to select the first agent.", &["l", "→"]),
+            highlighted_actions(
+                "Use h or ← whenever you want to return to the work window.",
+                &["h", "←"],
+            ),
         ],
         TourStep::States => vec![
             callout_label("← READ THE STATE BEFORE YOU INTERRUPT AN AGENT"),
@@ -1440,32 +1542,44 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             state_legend_line(AgentState::WaitingInput, "waiting — it needs input"),
             state_legend_line(AgentState::Idle, "idle — its turn has settled"),
             state_legend_line(AgentState::Error, "error — inspect the pane"),
-            Line::from("Press Alt-T to sort the watch by state and attention."),
+            highlighted_actions(
+                "Press Alt-T to sort the watch by state and attention.",
+                &["Alt-T"],
+            ),
         ],
         TourStep::Preview => vec![
             callout_label("→ CHECK A PANE WITHOUT ATTACHING"),
             Line::from(""),
             Line::from("On a wide screen, the inspector sits beside the work list."),
-            Line::from("Press o to preview the selected pane."),
-            Line::from("Use Enter only when you need to attach to the real terminal."),
+            highlighted_actions("Press o to preview the selected pane.", &["o"]),
+            highlighted_actions(
+                "Use Enter only when you need to attach to the real terminal.",
+                &["Enter"],
+            ),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Preview => vec![
             callout_label("THE PREVIEW OPENS OVER THE WATCH"),
             Line::from(""),
             Line::from("The work list remains behind it, so your place is preserved."),
-            Line::from("Press o again to close the preview."),
+            highlighted_actions("Press o again to close the preview.", &["o"]),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Help => vec![
             callout_label("? OPENS THE COMPLETE SHORTCUT MAP"),
             Line::from(""),
             Line::from("This is the same shortcut reference used by the live watch."),
-            Line::from("Press ? or F1 again to close it and continue."),
+            highlighted_actions(
+                "Press ? or F1 again to close it and continue.",
+                &["?", "F1"],
+            ),
         ],
         TourStep::Shortcuts => vec![
             callout_label("↓ THE FOOTER SHOWS WHAT YOU CAN DO HERE"),
             Line::from(""),
             Line::from("Its actions change with the current selection and open panel."),
-            Line::from("Press ? or F1 whenever you need the complete shortcut map."),
+            highlighted_actions(
+                "Press ? or F1 whenever you need the complete shortcut map.",
+                &["?", "F1"],
+            ),
         ],
         TourStep::NewWork => new_work_step_lines(app),
         TourStep::Collaboration => collaboration_step_lines(app),
@@ -1475,7 +1589,7 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             Line::from("muxa_start_agent creates or reuses the expected window and pane."),
             Line::from("settled + capture returns the useful final screen."),
             Line::from("Agents do not need a separate tmux MCP or handwritten tmux script."),
-            Line::from("Press l or → to continue."),
+            highlighted_actions("Press l or → to continue.", &["l", "→"]),
         ],
         TourStep::Finish => vec![
             callout_label("THE MODEL TO REMEMBER"),
@@ -1484,12 +1598,10 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
             policy_line("WINDOW", "work / ticket"),
             policy_line("PANE", "agent"),
             Line::from(""),
-            Line::from(Span::styled(
+            highlighted_actions(
                 "✓ muxa watch — press q to finish (q also quits watch)",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
+                &["q"],
+            ),
         ],
     }
 }
@@ -1499,8 +1611,9 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
         TourStep::Work => vec![
             callout_label("← WORK WINDOW 사이를 이동합니다"),
             Line::from(""),
-            Line::from(
+            highlighted_actions(
                 "cursor는 muxa-sandbox에 있습니다. j 또는 ↓로 muxa-onboarding을 선택하세요.",
+                &["j", "↓"],
             ),
             Line::from("각 row는 muxa workspace session 안의 work window 하나를 나타냅니다."),
             Line::from("같은 work를 다시 시작하면 window를 재사용하고 agent pane을 추가합니다."),
@@ -1509,8 +1622,8 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
             callout_label("← 선택한 WORK를 펼칩니다"),
             Line::from(""),
             Line::from("work를 펼치면 그 안에서 실행 중인 agent pane이 보입니다."),
-            Line::from("l 또는 →로 첫 번째 agent를 선택하세요."),
-            Line::from("work window로 돌아가려면 h 또는 ←를 누르세요."),
+            highlighted_actions("l 또는 →로 첫 번째 agent를 선택하세요.", &["l", "→"]),
+            highlighted_actions("work window로 돌아가려면 h 또는 ←를 누르세요.", &["h", "←"]),
         ],
         TourStep::States => vec![
             callout_label("← AGENT를 방해하기 전에 상태부터 확인합니다"),
@@ -1519,32 +1632,38 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
             state_legend_line(AgentState::WaitingInput, "입력 대기 — 응답이 필요합니다"),
             state_legend_line(AgentState::Idle, "대기 — turn이 끝났습니다"),
             state_legend_line(AgentState::Error, "오류 — pane을 확인하세요"),
-            Line::from("Alt-T를 눌러 state와 attention이 필요한 순서로 정렬하세요."),
+            highlighted_actions(
+                "Alt-T를 눌러 state와 attention이 필요한 순서로 정렬하세요.",
+                &["Alt-T"],
+            ),
         ],
         TourStep::Preview => vec![
             callout_label("→ ATTACH하지 않고 PANE을 확인합니다"),
             Line::from(""),
             Line::from("넓은 화면에서는 inspector가 work 목록 옆에 표시됩니다."),
-            Line::from("o를 눌러 선택한 pane의 preview를 여세요."),
-            Line::from("실제 terminal 조작이 필요할 때만 Enter로 attach하세요."),
+            highlighted_actions("o를 눌러 선택한 pane의 preview를 여세요.", &["o"]),
+            highlighted_actions(
+                "실제 terminal 조작이 필요할 때만 Enter로 attach하세요.",
+                &["Enter"],
+            ),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Preview => vec![
             callout_label("PREVIEW는 WATCH 위에 열립니다"),
             Line::from(""),
             Line::from("뒤에 work 목록이 남아 있어 현재 위치가 유지됩니다."),
-            Line::from("o를 다시 눌러 preview를 닫으세요."),
+            highlighted_actions("o를 다시 눌러 preview를 닫으세요.", &["o"]),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Help => vec![
             callout_label("?로 전체 단축키 지도를 확인합니다"),
             Line::from(""),
             Line::from("실제 watch와 같은 단축키 설명을 볼 수 있습니다."),
-            Line::from("? 또는 F1을 다시 눌러 닫고 계속하세요."),
+            highlighted_actions("? 또는 F1을 다시 눌러 닫고 계속하세요.", &["?", "F1"]),
         ],
         TourStep::Shortcuts => vec![
             callout_label("↓ FOOTER에서 지금 가능한 동작을 확인합니다"),
             Line::from(""),
             Line::from("footer의 동작은 현재 선택과 열린 panel에 맞춰 바뀝니다."),
-            Line::from("전체 단축키가 필요하면 ? 또는 F1을 누르세요."),
+            highlighted_actions("전체 단축키가 필요하면 ? 또는 F1을 누르세요.", &["?", "F1"]),
         ],
         TourStep::NewWork => new_work_step_lines(app),
         TourStep::Collaboration => collaboration_step_lines(app),
@@ -1554,7 +1673,7 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
             Line::from("muxa_start_agent가 정해진 window와 pane을 생성하거나 재사용합니다."),
             Line::from("settled + capture를 사용하면 작업이 끝난 화면까지 확인할 수 있습니다."),
             Line::from("별도 tmux MCP나 agent가 직접 작성한 tmux script는 필요하지 않습니다."),
-            Line::from("l 또는 →로 계속하세요."),
+            highlighted_actions("l 또는 →로 계속하세요.", &["l", "→"]),
         ],
         TourStep::Finish => vec![
             callout_label("기억할 운영 모델"),
@@ -1563,12 +1682,10 @@ fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
             policy_line("WINDOW", "work / ticket"),
             policy_line("PANE", "agent"),
             Line::from(""),
-            Line::from(Span::styled(
+            highlighted_actions(
                 "✓ 준비 완료 — q로 끝내세요. q는 실제 watch 종료 키이기도 합니다.",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
+                &["q"],
+            ),
         ],
     }
 }
@@ -1579,14 +1696,23 @@ fn new_work_step_lines(app: &TourApp) -> Vec<Line<'static>> {
             NewWorkStage::Shortcut => vec![
                 callout_label("새 WORK와 첫 AGENT를 함께 만듭니다"),
                 Line::from(""),
-                Line::from("n을 누르면 work와 agent를 만드는 안내 form이 열립니다."),
+                highlighted_actions(
+                    "n을 누르면 work와 agent를 만드는 안내 form이 열립니다.",
+                    &["n"],
+                ),
                 Line::from("directory, ticket, agent, 첫 prompt를 차례로 입력할 수 있습니다."),
             ],
             NewWorkStage::Form => vec![
                 callout_label("FORM에서 생성할 WORK를 확인합니다"),
                 Line::from(""),
-                Line::from("Tab/↑/↓로 항목을 바꾸고 ←/→로 agent를 바꿉니다."),
-                Line::from("연습이므로 Esc로 form을 닫고 다음 단계로 이동하세요."),
+                highlighted_actions(
+                    "Tab/↑/↓로 항목을 바꾸고 ←/→로 agent를 바꿉니다.",
+                    &["Tab/↑/↓", "←/→"],
+                ),
+                highlighted_actions(
+                    "연습이므로 Esc로 form을 닫고 다음 단계로 이동하세요.",
+                    &["Esc"],
+                ),
             ],
         };
     }
@@ -1594,14 +1720,23 @@ fn new_work_step_lines(app: &TourApp) -> Vec<Line<'static>> {
         NewWorkStage::Shortcut => vec![
             callout_label("CREATE A WORK AND ITS FIRST AGENT TOGETHER"),
             Line::from(""),
-            Line::from("Press n to open the guided form for a work and its agent."),
+            highlighted_actions(
+                "Press n to open the guided form for a work and its agent.",
+                &["n"],
+            ),
             Line::from("It collects the directory, ticket, agent, and first prompt."),
         ],
         NewWorkStage::Form => vec![
             callout_label("REVIEW THE WORK YOU ARE ABOUT TO CREATE"),
             Line::from(""),
-            Line::from("Use Tab/↑/↓ to change fields and ←/→ to change the agent."),
-            Line::from("This is practice, so press Esc to close the form and continue."),
+            highlighted_actions(
+                "Use Tab/↑/↓ to change fields and ←/→ to change the agent.",
+                &["Tab/↑/↓", "←/→"],
+            ),
+            highlighted_actions(
+                "This is practice, so press Esc to close the form and continue.",
+                &["Esc"],
+            ),
         ],
     }
 }
@@ -1613,25 +1748,28 @@ fn collaboration_step_lines(app: &TourApp) -> Vec<Line<'static>> {
                 callout_label("선택한 AGENT에게 메시지를 보냅니다"),
                 Line::from(""),
                 Line::from("m은 watch cursor가 가리키는 agent 한 명을 대상으로 합니다."),
-                Line::from("m을 눌러 해당 agent의 request composer를 여세요."),
+                highlighted_actions("m을 눌러 해당 agent의 request composer를 여세요.", &["m"]),
             ],
             CollaborationStage::Composer => vec![
                 callout_label("COMPOSER에서 요청 방식을 확인합니다"),
                 Line::from(""),
                 Line::from("kind와 mode는 화면에 표시되고 다음 메시지에도 유지됩니다."),
-                Line::from("지금은 내용이 비어 있으므로 Backspace를 눌러 닫으세요."),
+                highlighted_actions(
+                    "지금은 내용이 비어 있으므로 Backspace를 눌러 닫으세요.",
+                    &["Backspace"],
+                ),
             ],
             CollaborationStage::Mailbox => vec![
                 callout_label("MAILBOX에서 요청 이력을 확인합니다"),
                 Line::from(""),
                 Line::from("M은 받은 요청과 보낸 요청을 함께 엽니다. b도 같은 기능입니다."),
-                Line::from("M을 눌러 mailbox를 여세요."),
+                highlighted_actions("M을 눌러 mailbox를 여세요.", &["M"]),
             ],
             CollaborationStage::MailboxOpen => vec![
                 callout_label("보낸 요청도 MAILBOX에 남습니다"),
                 Line::from(""),
                 Line::from("보낸 요청 tab에는 한 agent에게 전송한 request도 남습니다."),
-                Line::from("M을 다시 눌러 닫고 계속하세요."),
+                highlighted_actions("M을 다시 눌러 닫고 계속하세요.", &["M"]),
             ],
         };
     }
@@ -1640,25 +1778,31 @@ fn collaboration_step_lines(app: &TourApp) -> Vec<Line<'static>> {
             callout_label("MESSAGE THE SELECTED AGENT"),
             Line::from(""),
             Line::from("m targets the single agent under the watch cursor."),
-            Line::from("Press m to open the request composer for that agent."),
+            highlighted_actions(
+                "Press m to open the request composer for that agent.",
+                &["m"],
+            ),
         ],
         CollaborationStage::Composer => vec![
             callout_label("REVIEW HOW THE REQUEST WILL BE SENT"),
             Line::from(""),
             Line::from("kind and mode stay visible and are remembered for the next message."),
-            Line::from("The body is empty, so press Backspace to close the composer."),
+            highlighted_actions(
+                "The body is empty, so press Backspace to close the composer.",
+                &["Backspace"],
+            ),
         ],
         CollaborationStage::Mailbox => vec![
             callout_label("REVIEW REQUEST HISTORY IN THE MAILBOX"),
             Line::from(""),
             Line::from("M opens incoming and sent requests together; b is an alias."),
-            Line::from("Press M to open the mailbox."),
+            highlighted_actions("Press M to open the mailbox.", &["M"]),
         ],
         CollaborationStage::MailboxOpen => vec![
             callout_label("SENT REQUESTS STAY IN THE MAILBOX"),
             Line::from(""),
             Line::from("The sent tab also keeps requests addressed to one agent."),
-            Line::from("Press M again to close it and continue."),
+            highlighted_actions("Press M again to close it and continue.", &["M"]),
         ],
     }
 }
@@ -1830,6 +1974,18 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
+    }
+
+    #[test]
+    fn interactive_input_tokens_use_the_shared_action_color() {
+        let line = highlighted_actions("Press q, not quiet.", &["q"]);
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content.as_ref(), "q");
+        assert_eq!(line.spans[1].style.fg, Some(ACTION_COLOR));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+
+        let command = action_line("tmux new-session -s muxa-onboarding");
+        assert_eq!(command.spans[0].style.fg, Some(ACTION_COLOR));
     }
 
     #[test]

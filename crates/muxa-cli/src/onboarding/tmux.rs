@@ -6,7 +6,9 @@
 //! that client to the root table before asking for any suffix. Later drills use
 //! suffix keys only, so no live binding is executed.
 
-use super::{centered_rect, dialog_block, tr, UiLanguage};
+use super::{
+    action_line, action_style, centered_rect, dialog_block, highlighted_actions, tr, UiLanguage,
+};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use muxa::AgentState;
@@ -337,7 +339,6 @@ enum ZoomStage {
 enum MuxaStage {
     Watch,
     Peek,
-    Dashboard,
     Complete,
 }
 
@@ -632,14 +633,12 @@ fn handle_guided_key(app: &mut TmuxApp, key: KeyEvent) -> bool {
         Step::Muxa
             if app.muxa_stage == MuxaStage::Peek && plain && key.code == KeyCode::Char('q') =>
         {
-            app.muxa_stage = MuxaStage::Dashboard;
-            app.blocked_hint = false;
-        }
-        Step::Muxa if app.muxa_stage == MuxaStage::Dashboard && key.code == KeyCode::Char('D') => {
             app.muxa_stage = MuxaStage::Complete;
             app.blocked_hint = false;
         }
-        Step::Muxa if app.muxa_stage == MuxaStage::Complete && key.code == KeyCode::Enter => {
+        Step::Muxa
+            if app.muxa_stage == MuxaStage::Complete && plain && key.code == KeyCode::Char('s') =>
+        {
             app.advance();
         }
         _ => return false,
@@ -717,12 +716,11 @@ fn render_tour(frame: &mut Frame<'_>, app: &TmuxApp) {
         match app.muxa_stage {
             MuxaStage::Watch => {}
             MuxaStage::Peek => render_muxa_watch(frame, area, app),
-            MuxaStage::Dashboard => {
+            MuxaStage::Complete => {
                 frame.render_widget(Clear, area);
                 render_mock_terminal(frame, area, app);
                 render_muxa_peek(frame, area, app);
             }
-            MuxaStage::Complete => render_muxa_dashboard(frame, rows[0], app),
         }
     }
     render_callout(frame, area, app);
@@ -734,7 +732,7 @@ fn render_shell_terminal(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
             "june@devbox:~/personal/muxa$ ",
             Style::default().fg(Color::Green),
         ),
-        Span::styled(app.shell_input.clone(), Style::default().fg(Color::White)),
+        Span::styled(app.shell_input.clone(), action_style()),
         Span::styled("█", Style::default().fg(Color::Cyan)),
     ]);
     let lines = if app.current() == Step::Reattach {
@@ -808,30 +806,27 @@ fn render_mock_terminal(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
         render_pane(frame, area, app, app.selected_pane, true);
         return;
     }
-    match app.panes {
-        1 => render_pane(frame, area, app, 0, true),
-        2 => {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(area);
-            render_pane(frame, panes[0], app, 0, app.selected_pane == 0);
-            render_pane(frame, panes[1], app, 1, app.selected_pane == 1);
-        }
-        _ => {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(area);
-            let left = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(columns[0]);
-            render_pane(frame, left[0], app, 0, app.selected_pane == 0);
-            render_pane(frame, columns[1], app, 1, app.selected_pane == 1);
-            render_pane(frame, left[1], app, 2, app.selected_pane == 2);
-        }
+    for (index, pane_area) in mock_pane_areas(area, app.panes).into_iter().enumerate() {
+        render_pane(frame, pane_area, app, index, app.selected_pane == index);
     }
+}
+
+fn mock_pane_areas(area: Rect, panes: usize) -> Vec<Rect> {
+    if panes <= 1 {
+        return vec![area];
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+    if panes == 2 {
+        return vec![columns[0], columns[1]];
+    }
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(columns[0]);
+    vec![left[0], columns[1], left[1]]
 }
 
 fn render_pane(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp, index: usize, selected: bool) {
@@ -964,7 +959,7 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
             Line::from("running 11 tests"),
             Line::from("test result: ok. 11 passed"),
             Line::from(""),
-            Line::from("↑/↓ 스크롤 · / 검색 · q 종료"),
+            highlighted_actions("↑/↓ 스크롤 · / 검색 · q 종료", &["↑/↓", "/", "q"]),
         ]
     } else {
         vec![
@@ -972,7 +967,7 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
             Line::from("running 11 tests"),
             Line::from("test result: ok. 11 passed"),
             Line::from(""),
-            Line::from("↑/↓ scroll · / search · q exit"),
+            highlighted_actions("↑/↓ scroll · / search · q exit", &["↑/↓", "/", "q"]),
         ]
     };
     frame.render_widget(
@@ -1064,11 +1059,7 @@ fn render_muxa_watch_sessions(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) 
         "implement and test tmux onboarding",
         "tmux onboarding 구현 및 테스트",
     );
-    let done = tr(
-        app.language,
-        "dashboard authentication complete",
-        "dashboard 인증 완료",
-    );
+    let done = tr(app.language, "release checks complete", "release 점검 완료");
     let lines = vec![
         Line::from(Span::styled(
             "  WORKSPACE › WORK         DUR    ACT    SUMMARY",
@@ -1212,112 +1203,79 @@ fn watch_state_span_with_bg(state: AgentState, background: Style) -> Span<'stati
 }
 
 fn render_muxa_peek(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .margin(2)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(area);
     let states = if app.ko() {
         [
             (
                 " 1 · editor · ○ IDLE ",
-                "최근 prompt 없음\nEnter/숫자: pane 이동",
+                vec![
+                    Line::from("최근 prompt 없음"),
+                    highlighted_actions("Enter/숫자: pane 이동", &["Enter/숫자"]),
+                ],
             ),
             (
                 " 2 · codex · ● WORKING ",
-                "tmux onboarding 편집 중\n마지막 prompt: 방금 전",
+                vec![
+                    Line::from("tmux onboarding 편집 중"),
+                    Line::from("마지막 prompt: 방금 전"),
+                ],
             ),
             (
                 " 3 · reviewer · ▶ INPUT ",
-                "변경사항 검토 대기\n마지막 prompt: 4분 전",
+                vec![
+                    Line::from("변경사항 검토 대기"),
+                    Line::from("마지막 prompt: 4분 전"),
+                ],
             ),
         ]
     } else {
         [
             (
                 " 1 · editor · ○ IDLE ",
-                "no recent prompt\nEnter/digit: jump pane",
+                vec![
+                    Line::from("no recent prompt"),
+                    highlighted_actions("Enter/digit: jump pane", &["Enter/digit"]),
+                ],
             ),
             (
                 " 2 · codex · ● WORKING ",
-                "editing tmux onboarding\nlast prompted: just now",
+                vec![
+                    Line::from("editing tmux onboarding"),
+                    Line::from("last prompted: just now"),
+                ],
             ),
             (
                 " 3 · reviewer · ▶ INPUT ",
-                "waiting to review changes\nlast prompted: 4m ago",
+                vec![
+                    Line::from("waiting to review changes"),
+                    Line::from("last prompted: 4m ago"),
+                ],
             ),
         ]
     };
-    for (column, (title, body)) in columns.iter().zip(states) {
-        let height = 8.min(column.height);
-        let popup = Rect::new(column.x, column.y + 1, column.width, height);
+    for (pane_area, (title, body)) in mock_pane_areas(area, app.panes).into_iter().zip(states) {
+        let popup = centered_rect(
+            pane_area,
+            pane_area.width.saturating_sub(4).min(38),
+            8.min(pane_area.height.saturating_sub(2)),
+        );
+        frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(body).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            ),
+            Paragraph::new(Text::from(body))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
             popup,
         );
     }
 }
 
-fn render_muxa_dashboard(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
-    frame.render_widget(Clear, area);
-    let cards = Layout::default()
-        .direction(Direction::Horizontal)
-        .margin(1)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    let first = vec![
-        Line::from("● 2 agents · 1 working · 1 waiting"),
-        Line::from("ACT 14m · WACT 9m"),
-        Line::from(""),
-        Line::from("codex      ● WORKING"),
-        Line::from("reviewer   ▶ INPUT"),
-    ];
-    let second = if app.ko() {
-        vec![
-            Line::from("○ 1 agent · idle"),
-            Line::from("ACT 2m · WACT 2m"),
-            Line::from(""),
-            Line::from("claude     ○ IDLE"),
-            Line::from("README 업데이트 완료"),
-        ]
-    } else {
-        vec![
-            Line::from("○ 1 agent · idle"),
-            Line::from("ACT 2m · WACT 2m"),
-            Line::from(""),
-            Line::from("claude     ○ IDLE"),
-            Line::from("README update complete"),
-        ]
-    };
-    for (area, title, lines) in [
-        (cards[0], " muxa › onboarding · work card ", first),
-        (cards[1], " muxa › sandbox · work card ", second),
-    ] {
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
-            area,
-        );
-    }
-}
-
 fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
-    let popup = callout_rect(area, app.current());
+    let popup = callout_rect(area, app);
     frame.render_widget(Clear, popup);
     let title = format!(
         " {}/{} · {} ",
@@ -1342,13 +1300,24 @@ fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
             .wrap(Wrap { trim: false })
             .block(
                 dialog_block(&title, Color::Cyan)
-                    .title_bottom(Line::from(callout_footer(app)).alignment(Alignment::Center)),
+                    .title_bottom(callout_footer_line(app).alignment(Alignment::Center)),
             ),
         popup,
     );
 }
 
-fn callout_rect(area: Rect, step: Step) -> Rect {
+fn callout_rect(area: Rect, app: &TmuxApp) -> Rect {
+    let step = app.current();
+    if step == Step::Muxa && app.muxa_stage == MuxaStage::Complete {
+        let width = area.width.saturating_mul(45) / 100;
+        let height = 13.min(area.height.saturating_sub(2));
+        return Rect::new(
+            area.x + area.width.saturating_sub(width),
+            area.y + area.height.saturating_sub(height + 2),
+            width,
+            height,
+        );
+    }
     let width = area.width.saturating_sub(6).min(82);
     let height = if step == Step::Shell { 16 } else { 13 }.min(area.height.saturating_sub(2));
     match step {
@@ -1401,16 +1370,7 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
         return step_lines_ko(app);
     }
     match app.current() {
-        Step::Shell => vec![
-            label("WELCOME TO THE MUXA ONBOARDING"),
-            Line::from(""),
-            Line::from("We’ll begin with the tmux foundation that Muxa builds on."),
-            Line::from("A tmux session keeps related terminals running as one workspace."),
-            Line::from("Create and enter the practice session named muxa-onboarding:"),
-            Line::from("tmux new-session -s muxa-onboarding"),
-            Line::from("This safe simulation will not change your real tmux setup."),
-            Line::from("Press F2 for 한국어."),
-        ],
+        Step::Shell => shell_step_lines(app.language),
         Step::Prefix => prefix_lines(app),
         Step::Model => vec![
             label("↓ SEE HOW THE THREE LEVELS FIT TOGETHER"),
@@ -1419,65 +1379,80 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             mapping_line("WINDOW", "independent screen in a session"),
             mapping_line("PANE", "split terminal region in a window"),
             Line::from(""),
-            Line::from("Press w to open tmux’s session and window tree."),
+            highlighted_actions("Press w to open tmux’s session and window tree.", &["w"]),
         ],
         Step::Windows => vec![
             label("↓ CREATE AN INDEPENDENT SCREEN IN THIS SESSION"),
             Line::from(""),
             Line::from("A window is an independent work screen inside one session."),
-            Line::from("Press c to create a new window and move to that screen."),
+            highlighted_actions(
+                "Press c to create a new window and move to that screen.",
+                &["c"],
+            ),
             Line::from("The simulated client will move to the new 1:review screen."),
         ],
         Step::Splits if app.split_stage == SplitStage::LeftRight => vec![
             label("SPLIT THE CURRENT SCREEN LEFT AND RIGHT"),
             Line::from(""),
             Line::from("A pane lets you view another terminal without leaving this window."),
-            Line::from("Press % (usually Shift-5) to split the selected pane."),
+            highlighted_actions(
+                "Press % (usually Shift-5) to split the selected pane.",
+                &["%", "Shift-5"],
+            ),
         ],
         Step::Splits => vec![
             label("SPLIT THE SELECTED PANE TOP AND BOTTOM"),
             Line::from(""),
             Line::from("You now have two panes in the same window."),
-            Line::from("Press \" (usually Shift-apostrophe) to add a third pane."),
+            highlighted_actions(
+                "Press \" (usually Shift-apostrophe) to add a third pane.",
+                &["\"", "Shift-apostrophe"],
+            ),
         ],
         Step::Panes => vec![
             label("MOVE FOCUS TO THE PANE YOU WANT TO USE"),
             Line::from(""),
             Line::from("Focus determines which pane receives your keyboard input."),
-            Line::from("Use Arrow keys by direction, or o to cycle through panes."),
-            Line::from("Press → to select the pane on the right."),
+            highlighted_actions(
+                "Use Arrow keys by direction, or o to cycle through panes.",
+                &["Arrow", "o"],
+            ),
+            highlighted_actions("Press → to select the pane on the right.", &["→"]),
         ],
         Step::Zoom if app.zoom_stage == ZoomStage::In => vec![
             label("ZOOM ONE PANE WITHOUT LOSING THE LAYOUT"),
             Line::from(""),
             Line::from("prefix+z toggles the selected pane fullscreen."),
             Line::from("The underlying split layout remains intact."),
-            Line::from("Press z to enlarge the selected pane."),
+            highlighted_actions("Press z to enlarge the selected pane.", &["z"]),
         ],
         Step::Zoom => vec![
             label("RESTORE THE SPLIT LAYOUT"),
             Line::from(""),
             Line::from("The pane is fullscreen but the split layout still exists."),
-            Line::from("Press z again to restore every pane."),
+            highlighted_actions("Press z again to restore every pane.", &["z"]),
         ],
         Step::CopyMode if app.copy_stage == CopyStage::Enter => vec![
             label("OPEN COPY MODE TO REVIEW EARLIER OUTPUT"),
             Line::from(""),
             Line::from("Copy mode lets you scroll and search a pane’s terminal history."),
-            Line::from("Press [ to open the simulated history view."),
+            highlighted_actions("Press [ to open the simulated history view.", &["["]),
         ],
         Step::CopyMode => vec![
             label("LEAVE COPY MODE WHEN YOU ARE DONE"),
             Line::from(""),
-            Line::from("Use arrows/PageUp/PageDown to scroll and / to search."),
-            Line::from("Press q to leave copy mode and return to the pane."),
+            highlighted_actions(
+                "Use arrows/PageUp/PageDown to scroll and / to search.",
+                &["arrows", "PageUp", "PageDown", "/"],
+            ),
+            highlighted_actions("Press q to leave copy mode and return to the pane.", &["q"]),
         ],
         Step::Detach => vec![
             label("DETACH LEAVES THE SESSION RUNNING"),
             Line::from(""),
             Line::from("prefix+d detaches this client from the tmux server."),
             Line::from("The session and the programs in its panes keep running."),
-            Line::from("Press d to return to the simulated shell."),
+            highlighted_actions("Press d to return to the simulated shell.", &["d"]),
         ],
         Step::Reattach => vec![
             label("THE SESSION IS STILL AVAILABLE FROM THE SHELL"),
@@ -1485,8 +1460,8 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from("The [detached] notice means only this client left tmux."),
             Line::from("The muxa-onboarding session and its panes are still running."),
             Line::from("Return to that session with:"),
-            Line::from("tmux attach -t muxa-onboarding"),
-            Line::from("Press Enter to reattach and continue."),
+            action_line(ATTACH_COMMAND),
+            highlighted_actions("Press Enter to reattach and continue.", &["Enter"]),
         ],
         Step::Muxa => muxa_lines(app),
     }
@@ -1494,16 +1469,7 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
 
 fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
     match app.current() {
-        Step::Shell => vec![
-            label("MUXA 온보딩에 오신 것을 환영합니다"),
-            Line::from(""),
-            Line::from("먼저 Muxa의 바탕이 되는 tmux 기본 흐름부터 익힙니다."),
-            Line::from("tmux session은 관련 terminal을 하나의 작업 공간으로 유지합니다."),
-            Line::from("muxa-onboarding이라는 연습용 session을 만들고 들어갑니다:"),
-            Line::from("tmux new-session -s muxa-onboarding"),
-            Line::from("안전한 가상 화면이므로 실제 tmux 설정은 바뀌지 않습니다."),
-            Line::from("F2를 누르면 English로 전환됩니다."),
-        ],
+        Step::Shell => shell_step_lines(app.language),
         Step::Prefix => prefix_lines(app),
         Step::Model => vec![
             label("↓ 세 단계가 어떻게 연결되는지 살펴봅니다"),
@@ -1512,65 +1478,80 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
             mapping_line("WINDOW", "session 안의 독립된 작업 화면"),
             mapping_line("PANE", "window를 나눈 terminal 영역"),
             Line::from(""),
-            Line::from("w를 눌러 tmux의 session/window tree를 여세요."),
+            highlighted_actions("w를 눌러 tmux의 session/window tree를 여세요.", &["w"]),
         ],
         Step::Windows => vec![
             label("↓ SESSION 안에 독립된 작업 화면을 만듭니다"),
             Line::from(""),
             Line::from("window는 한 session 안의 독립된 작업 화면입니다."),
-            Line::from("c를 눌러 새 window를 만들고 그 화면으로 이동하세요."),
+            highlighted_actions(
+                "c를 눌러 새 window를 만들고 그 화면으로 이동하세요.",
+                &["c"],
+            ),
             Line::from("가상 client가 새 1:review 화면으로 이동합니다."),
         ],
         Step::Splits if app.split_stage == SplitStage::LeftRight => vec![
             label("현재 화면을 좌우로 나눕니다"),
             Line::from(""),
             Line::from("pane을 나누면 이 window를 벗어나지 않고 다른 terminal을 볼 수 있습니다."),
-            Line::from("%를 눌러(보통 Shift-5) 선택한 pane을 나누세요."),
+            highlighted_actions(
+                "%를 눌러(보통 Shift-5) 선택한 pane을 나누세요.",
+                &["%", "Shift-5"],
+            ),
         ],
         Step::Splits => vec![
             label("선택한 PANE을 상하로 나눕니다"),
             Line::from(""),
             Line::from("이제 같은 window 안에 pane이 두 개 있습니다."),
-            Line::from("\"를 눌러(보통 Shift-apostrophe) 세 번째 pane을 만드세요."),
+            highlighted_actions(
+                "\"를 눌러(보통 Shift-apostrophe) 세 번째 pane을 만드세요.",
+                &["\"", "Shift-apostrophe"],
+            ),
         ],
         Step::Panes => vec![
             label("사용할 PANE으로 FOCUS를 옮깁니다"),
             Line::from(""),
             Line::from("focus가 있는 pane이 keyboard 입력을 받습니다."),
-            Line::from("방향키로 이동하거나 o로 pane을 순서대로 전환할 수 있습니다."),
-            Line::from("→를 눌러 오른쪽 pane을 선택하세요."),
+            highlighted_actions(
+                "방향키로 이동하거나 o로 pane을 순서대로 전환할 수 있습니다.",
+                &["방향키", "o"],
+            ),
+            highlighted_actions("→를 눌러 오른쪽 pane을 선택하세요.", &["→"]),
         ],
         Step::Zoom if app.zoom_stage == ZoomStage::In => vec![
             label("LAYOUT은 유지한 채 PANE 하나를 확대합니다"),
             Line::from(""),
             Line::from("prefix+z는 선택 pane의 fullscreen을 toggle합니다."),
             Line::from("기존 split layout은 그대로 유지됩니다."),
-            Line::from("z를 눌러 선택한 pane을 확대하세요."),
+            highlighted_actions("z를 눌러 선택한 pane을 확대하세요.", &["z"]),
         ],
         Step::Zoom => vec![
             label("분할된 LAYOUT으로 돌아갑니다"),
             Line::from(""),
             Line::from("pane은 fullscreen이지만 기존 split layout은 남아 있습니다."),
-            Line::from("z를 다시 눌러 모든 pane을 복원하세요."),
+            highlighted_actions("z를 다시 눌러 모든 pane을 복원하세요.", &["z"]),
         ],
         Step::CopyMode if app.copy_stage == CopyStage::Enter => vec![
             label("COPY MODE에서 이전 출력을 살펴봅니다"),
             Line::from(""),
             Line::from("copy mode에서는 pane의 terminal 기록을 scroll하고 검색할 수 있습니다."),
-            Line::from("[를 눌러 가상의 기록 화면을 여세요."),
+            highlighted_actions("[를 눌러 가상의 기록 화면을 여세요.", &["["]),
         ],
         Step::CopyMode => vec![
             label("확인을 마치면 COPY MODE를 닫습니다"),
             Line::from(""),
-            Line::from("방향키/PageUp/PageDown으로 scroll하고 /로 검색합니다."),
-            Line::from("q를 눌러 copy mode를 닫고 pane으로 돌아가세요."),
+            highlighted_actions(
+                "방향키/PageUp/PageDown으로 scroll하고 /로 검색합니다.",
+                &["방향키", "PageUp", "PageDown", "/"],
+            ),
+            highlighted_actions("q를 눌러 copy mode를 닫고 pane으로 돌아가세요.", &["q"]),
         ],
         Step::Detach => vec![
             label("DETACH해도 SESSION은 계속 실행됩니다"),
             Line::from(""),
             Line::from("prefix+d는 이 client만 tmux server에서 분리합니다."),
             Line::from("session과 pane 안의 program은 계속 실행됩니다."),
-            Line::from("d를 눌러 가상 shell로 돌아가세요."),
+            highlighted_actions("d를 눌러 가상 shell로 돌아가세요.", &["d"]),
         ],
         Step::Reattach => vec![
             label("SHELL에서도 실행 중인 SESSION에 다시 들어갈 수 있습니다"),
@@ -1578,10 +1559,39 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from("[detached] 표시는 이 client만 tmux에서 나왔다는 뜻입니다."),
             Line::from("muxa-onboarding session과 그 안의 pane은 계속 실행 중입니다."),
             Line::from("다시 들어가려면 다음 명령을 입력하세요:"),
-            Line::from("tmux attach -t muxa-onboarding"),
-            Line::from("Enter를 눌러 attach한 뒤 다음 단계로 이동하세요."),
+            action_line(ATTACH_COMMAND),
+            highlighted_actions(
+                "Enter를 눌러 attach한 뒤 다음 단계로 이동하세요.",
+                &["Enter"],
+            ),
         ],
         Step::Muxa => muxa_lines(app),
+    }
+}
+
+fn shell_step_lines(language: UiLanguage) -> Vec<Line<'static>> {
+    if language == UiLanguage::Ko {
+        vec![
+            label("MUXA 온보딩에 오신 것을 환영합니다"),
+            Line::from(""),
+            Line::from("먼저 Muxa의 바탕이 되는 tmux 기본 흐름부터 익힙니다."),
+            Line::from("tmux session은 관련 terminal을 하나의 작업 공간으로 유지합니다."),
+            Line::from("muxa-onboarding이라는 연습용 session을 만들고 들어갑니다:"),
+            action_line(NEW_SESSION_COMMAND),
+            Line::from("안전한 가상 화면이므로 실제 tmux 설정은 바뀌지 않습니다."),
+            highlighted_actions("F2를 누르면 English로 전환됩니다.", &["F2"]),
+        ]
+    } else {
+        vec![
+            label("WELCOME TO THE MUXA ONBOARDING"),
+            Line::from(""),
+            Line::from("We’ll begin with the tmux foundation that Muxa builds on."),
+            Line::from("A tmux session keeps related terminals running as one workspace."),
+            Line::from("Create and enter the practice session named muxa-onboarding:"),
+            action_line(NEW_SESSION_COMMAND),
+            Line::from("This safe simulation will not change your real tmux setup."),
+            highlighted_actions("Press F2 for 한국어.", &["F2"]),
+        ]
     }
 }
 
@@ -1593,11 +1603,14 @@ fn prefix_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             "감지한 PREFIX부터 익혀봅니다",
         )),
         Line::from(""),
-        Line::from(format!(
-            "{}: {}",
-            tr(app.language, "Detected prefix", "감지한 prefix"),
-            app.prefix
-        )),
+        highlighted_actions(
+            format!(
+                "{}: {}",
+                tr(app.language, "Detected prefix", "감지한 prefix"),
+                app.prefix
+            ),
+            &[app.prefix.as_str()],
+        ),
         Line::from(tr(
             app.language,
             "Every tmux shortcut begins with this prefix.",
@@ -1608,11 +1621,14 @@ fn prefix_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             "Press and release it first, then press a command key; the keys are sequential.",
             "prefix를 먼저 누르고 뗀 뒤 명령 키를 누릅니다. 두 키는 순서대로 입력합니다.",
         )),
-        Line::from(tr(
-            app.language,
-            "Examples: prefix → c new window · prefix → % split pane · prefix → d detach",
-            "예: prefix → c 새 window · prefix → % pane 분할 · prefix → d detach",
-        )),
+        highlighted_actions(
+            tr(
+                app.language,
+                "Examples: prefix → c new window · prefix → % split pane · prefix → d detach",
+                "예: prefix → c 새 window · prefix → % pane 분할 · prefix → d detach",
+            ),
+            &["prefix → c", "prefix → %", "prefix → d"],
+        ),
         Line::from(""),
     ];
     if app.prefix_capture == PrefixCapture::TmuxClient {
@@ -1622,11 +1638,14 @@ fn prefix_lines(app: &TmuxApp) -> Vec<Line<'static>> {
                 "Press and release it once. This walkthrough will recognize it and continue.",
                 "한 번 누르고 손을 떼세요. 온보딩이 입력을 감지해 다음 단계로 이동합니다.",
             )),
-            Line::from(tr(
-                app.language,
-                "Wait before pressing w; the live tmux key table is cancelled safely.",
-                "아직 w는 누르지 마세요. 실제 tmux key table은 안전하게 해제됩니다.",
-            )),
+            highlighted_actions(
+                tr(
+                    app.language,
+                    "Wait before pressing w; the live tmux key table is cancelled safely.",
+                    "아직 w는 누르지 마세요. 실제 tmux key table은 안전하게 해제됩니다.",
+                ),
+                &["w"],
+            ),
         ]);
     } else {
         lines.push(Line::from(tr(
@@ -1652,17 +1671,11 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             "prefix+q shows each agent’s state and jump number directly on its pane.",
             "prefix+q는 각 pane에 agent 상태와 이동 번호를 바로 표시합니다.",
         ),
-        MuxaStage::Dashboard => (
-            "✓ prefix+s  ✓ prefix+q  ",
-            "D",
-            "prefix+D opens a dashboard with more detail for each work.",
-            "prefix+D는 work별 상세 정보를 보여주는 dashboard를 엽니다.",
-        ),
         MuxaStage::Complete => (
-            "✓ prefix+s  ✓ prefix+q  ✓ prefix+D",
-            "Enter",
-            "The simulation now shows work cards with agent state and ACT/WACT.",
-            "가상 화면에 agent 상태와 ACT/WACT를 담은 work card가 표시됩니다.",
+            "✓ prefix+s  ✓ prefix+q",
+            "s",
+            "The state overlay now follows the pane layout you created with % and \".",
+            "상태 overlay가 앞에서 %와 \"로 만든 pane layout을 그대로 따릅니다.",
         ),
     };
     let mut lines = vec![
@@ -1681,6 +1694,12 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from(""),
         ]);
     }
+    let binding = format!("prefix+{key}");
+    let description_actions = if app.muxa_stage == MuxaStage::Complete {
+        vec!["%", "\""]
+    } else {
+        vec![binding.as_str()]
+    };
     lines.extend([
         Line::from(Span::styled(
             done,
@@ -1688,21 +1707,29 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(tr(app.language, description_en, description_ko)),
-        Line::from(if app.muxa_stage == MuxaStage::Complete {
-            tr(
-                app.language,
-                "Press Enter to continue into the simulated muxa watch.",
-                "Enter를 눌러 가상의 muxa watch 실습으로 이어가세요.",
+        highlighted_actions(
+            tr(app.language, description_en, description_ko),
+            &description_actions,
+        ),
+        if app.muxa_stage == MuxaStage::Complete {
+            highlighted_actions(
+                tr(
+                    app.language,
+                    "Press s to continue directly into the simulated muxa watch.",
+                    "s를 눌러 가상의 muxa watch 실습으로 바로 이어가세요.",
+                ),
+                &["s"],
             )
-            .to_string()
         } else {
-            format!(
-                "{} {}.",
-                tr(app.language, "Press", "다음 키를 누르세요:"),
-                key
+            highlighted_actions(
+                format!(
+                    "{} {}.",
+                    tr(app.language, "Press", "다음 키를 누르세요:"),
+                    key
+                ),
+                &[key],
             )
-        }),
+        },
     ]);
     lines
 }
@@ -1723,8 +1750,7 @@ fn expected_key(app: &TmuxApp) -> String {
         Step::Detach => "d",
         Step::Muxa if app.muxa_stage == MuxaStage::Watch => "s",
         Step::Muxa if app.muxa_stage == MuxaStage::Peek => "q",
-        Step::Muxa if app.muxa_stage == MuxaStage::Dashboard => "D",
-        Step::Muxa => "Enter",
+        Step::Muxa => "s",
     }
     .to_string()
 }
@@ -1752,8 +1778,8 @@ fn callout_footer(app: &TmuxApp) -> String {
     if app.current() == Step::Muxa && app.muxa_stage == MuxaStage::Complete {
         return tr(
             app.language,
-            " Enter next exercise · F2 한국어 · Esc quit ",
-            " Enter 다음 실습 · F2 English · Esc 종료 ",
+            " s open watch and continue · F2 한국어 · Esc to quit ",
+            " s watch를 열고 계속 · F2 English · Esc로 종료 ",
         )
         .to_string();
     }
@@ -1782,6 +1808,24 @@ fn callout_footer(app: &TmuxApp) -> String {
             expected_key(app)
         )
     }
+}
+
+fn callout_footer_line(app: &TmuxApp) -> Line<'static> {
+    let footer = callout_footer(app);
+    let expected = expected_key(app);
+    highlighted_actions(
+        footer,
+        &[
+            expected.as_str(),
+            app.prefix.as_str(),
+            "Enter/→",
+            "Backspace",
+            "Enter",
+            "F2",
+            "Esc",
+            "←",
+        ],
+    )
 }
 
 fn mapping_line(label_text: &'static str, value: &'static str) -> Line<'static> {
@@ -1977,10 +2021,9 @@ mod tests {
         assert!(app.attached());
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('q'));
-        press(&mut app, KeyCode::Char('D'));
         assert_eq!(app.current(), Step::Muxa);
         assert_eq!(app.muxa_stage, MuxaStage::Complete);
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('s'));
         assert!(app.done);
     }
 
@@ -2110,10 +2153,11 @@ mod tests {
     }
 
     #[test]
-    fn muxa_shortcuts_render_watch_peek_and_dashboard_surfaces() {
+    fn muxa_shortcuts_flow_from_watch_to_pane_peek_and_back_to_watch() {
         let mut app = test_app(UiLanguage::Ko);
         app.step = 10;
         app.client_location = ClientLocation::Tmux;
+        app.panes = 3;
 
         press(&mut app, KeyCode::Char('s'));
         let watch = rendered(&app, 130, 32);
@@ -2127,14 +2171,23 @@ mod tests {
         let peek = rendered(&app, 130, 32);
         assert!(peek.contains("2 · codex · ● WORKING"));
         assert!(peek.contains("3 · reviewer · ▶ INPUT"));
-
-        press(&mut app, KeyCode::Char('D'));
         assert_eq!(app.muxa_stage, MuxaStage::Complete);
-        let dashboard = rendered(&app, 130, 32);
-        assert!(dashboard.replace(' ', "").contains("11/20"));
-        assert!(dashboard.contains("muxa › onboarding · work card"));
-        assert!(dashboard.contains("ACT 14m · WACT 9m"));
-        assert!(!dashboard.contains("Muxa 계속"));
+        assert!(peek.replace(' ', "").contains("%와\"로만든panelayout"));
+        assert!(!peek.contains("prefix+D"));
+
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.done);
+    }
+
+    #[test]
+    fn muxa_peek_reuses_the_percent_then_quote_pane_geometry() {
+        let panes = mock_pane_areas(Rect::new(0, 0, 120, 30), 3);
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[0].x, panes[2].x);
+        assert_eq!(panes[0].width, panes[2].width);
+        assert!(panes[2].y > panes[0].y);
+        assert!(panes[1].x > panes[0].x);
+        assert_eq!(panes[1].height, 30);
     }
 
     #[test]

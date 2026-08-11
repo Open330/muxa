@@ -9,7 +9,7 @@
 #
 # Arc:
 #   0–17s   shell + tmux    — new-session, prefix, windows, panes, detach/attach
-#   17–20s  managed keys    — s watch, q peek, D dashboard
+#   17–20s  managed keys    — s watch, q pane-state overlay, s back to watch
 #   20–25s  navigate/sort   — j/l and Alt-T over the real state gutter
 #   25–31s  inspect/create  — o, ?, n and safe cancel
 #   31–38s  collaboration   — m, Backspace, M mailbox, MCP, q
@@ -79,10 +79,8 @@ Sleep 900ms
 Type "s"
 Sleep 1000ms
 Type "q"
-Sleep 900ms
-Type "D"
-Sleep 1000ms
-Enter
+Sleep 1400ms
+Type "s"
 Sleep 1000ms
 
 # Move from muxa › sandbox to muxa › onboarding, then enter its first agent.
@@ -125,6 +123,6 @@ Sleep 1000ms
 Right
 Sleep 1200ms
 
-# Finish with q, which also quits the live dashboard.
+# Finish with q, which also quits the live watch.
 Type "q"
 Sleep 800ms

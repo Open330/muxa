@@ -135,8 +135,8 @@ codex mcp add muxa -- muxa mcp
 
 연결된 agent에는 같은 room의 peer를 read-only reviewer 또는 좁은 범위의 실행
 subagent로 활용하라는 협업 지침이 자동으로 노출됩니다. 요청과 응답에는 검증된
-AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 profile별 색상
-배지로 표시합니다.
+AIR 1.0 artifact 참조를 첨부할 수 있고, watch mailbox가 profile별 색상 배지로
+표시합니다.
 
 `muxa doctor`에서 synthetic으로 표시되는 agent는 안정적인 session identity가
 생길 때까지 협업 대상에서 제외됩니다. 새 prompt로 hook을 발생시키거나 agent를
@@ -150,8 +150,7 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
    응답은 `M` mailbox에서 확인합니다(`b`는 alias로 유지됩니다).
 
 일반 shell pane에서 watch를 열면 그 shell은 agent가 아니므로 협업할 수 없습니다.
-`muxa dashboard`는 더 상세한 운영 화면이 필요할 때만 선택적으로 사용합니다.
-설정과 응답 흐름은
+협업 workflow는 watch에서 그대로 이어갑니다. 설정과 응답 흐름은
 [docs/COLLABORATION.ko.md](docs/COLLABORATION.ko.md)를 참고하세요.
 
 설치 모드, `muxa init` preset, systemd, 수동 hook wiring, rollback은
@@ -168,7 +167,8 @@ work/ticket, pane 하나가 agent라는 것입니다. `muxa onboard`는 Muxa를 
 `tmux attach -t muxa-onboarding`을 입력해 다시 들어갑니다. 이어서 같은 fullscreen
 화면에서 현재 `muxa watch` workflow로
 전환합니다. watch와 같은 왼쪽 session-state gutter, 열, 50/50 inspector,
-overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
+overlay, 한 줄 footer를 보여줍니다. 직접 입력해야 하는 명령과 키는 dialog 본문과
+footer에서 굵은 노란색으로 강조합니다. `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 `Backspace`, `M`을 실제로 누르고 마지막에는 `q`로 마칩니다. 전체 과정은 하나의
 20단계 진행률을 사용하며 managed prefix binding 11단계에서 work 이동
 12단계로 바로 이어집니다. 한국어 locale에서는 한글을 자동으로 선택하며 `--lang ko`로

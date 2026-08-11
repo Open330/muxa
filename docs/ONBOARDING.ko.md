@@ -15,8 +15,8 @@ session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존�
 ## 온보딩 실행
 
 하나의 전체 화면 시나리오가 가상 기본 shell에서 시작해 tmux session/window/
-pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮은 mock
-dashboard로 이어집니다. 모든 장면은 설명용이므로 실제 tmux session을 변경하지
+pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮은 화면으로
+이어집니다. 모든 장면은 설명용이므로 실제 tmux session을 변경하지
 않습니다.
 
 mock은 실제 work view처럼 `WORKSPACE › WORK · DUR · ACT · SUMMARY` 열을 사용하고,
@@ -37,6 +37,8 @@ watch처럼 Works와 Inspector를 50/50으로 나눕니다.
 온보딩 도중에는 어느 단계에서든 `F2`로 한글과 영어를 즉시 전환할 수 있습니다.
 실제 watch를 재현하는 `WORKSPACE › WORK`, `DUR`, `ACT`, `SUMMARY` label은
 그대로 유지하고 안내 dialog, 도움말, footer 설명은 선택한 언어로 표시합니다.
+각 단계에서 직접 입력하거나 눌러야 하는 명령과 키는 굵은 노란색으로 표시되어
+설명 문장과 한눈에 구분됩니다.
 
 ![한글 통합 onboarding: 가상 shell과 tmux 조작에서 Muxa watch workflow로 이어지는 단일 시나리오](demo-onboard.gif)
 
@@ -96,7 +98,11 @@ client detach가 일어나지 않습니다.
 - `[`, `q`: copy mode 진입과 종료
 - `d`: client를 detach하고 `[detached …]`가 있는 원래 기본 shell로 복귀
 - `tmux attach -t muxa-onboarding`, `Enter`: 기본 shell에서 직접 입력해 재연결
-- `s`, `q`, `D`: Muxa의 watch, peek, dashboard prefix binding과 실제 모양의 mock 화면
+- `s`, `q`, `s`: watch 열기, pane 상태 overlay 확인, watch 실습으로 이어가기
+
+`q`로 여는 pane 상태 overlay는 앞에서 `%`와 `"`로 만든 좌우 분할 후 왼쪽 상하
+분할 layout을 그대로 사용합니다. 따라서 숫자와 agent 상태가 실제 pane 위치와
+일치합니다.
 
 `w`의 tree, `c`의 활성 window, `%`와 `"`의 pane layout은 다음 단계에서도
 사라지지 않고 누적됩니다. `s` 화면은 기본 onboarding과 같은 live watch형

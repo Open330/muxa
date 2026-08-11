@@ -38,8 +38,8 @@ asking claude a headless question and `A` browsing the answers.
 **`demo-onboard.tape` — learning tmux and Muxa as one model.** The welcome first
 explains why the practice session is needed. The safe shell simulation then accepts
 real `tmux new-session` and `tmux attach` input, preserves the visible
-window, pane, detach, and reattach transitions, demonstrates the managed `s`,
-`q`, and `D` surfaces as step 11, then continues directly at step 12 through
+window, pane, detach, and reattach transitions, demonstrates the managed `s`
+watch and `q` pane-state overlay as step 11, then continues directly at step 12 through
 watch's workspace/work state gutter, inspector, overlays, collaboration, and footer.
 One 20-step counter covers the scenario; there is no second welcome or phase
 completion screen. It does not use `demo-setup.sh` because onboarding must not
