@@ -48,7 +48,9 @@ Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 
 
 요약하면 **work/ticket → session → agent pane들 → 관측·협업 → 명시적 종료**입니다.
 `muxa onboard`에서 실제 session을 건드리지 않는 watch mock으로 이 흐름을 먼저
-익힐 수 있습니다.
+익힐 수 있습니다. tmux 자체가 익숙하지 않다면 `muxa onboard --tmux`에서
+session/window/pane 계층, window 생성, pane 분할·이동, zoom, copy mode,
+detach, Muxa prefix binding을 실제 tmux 상태를 바꾸지 않고 배울 수 있습니다.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa demo" width="900" />
@@ -166,10 +168,21 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 없습니다. 한국어 locale에서는 한글을 자동으로 선택하며 `--lang ko`로
 명시하거나 온보딩 도중 `F2`로 한/영을 전환할 수 있습니다.
 
+`muxa onboard --tmux`는 tmux 기초를 위한 별도 과정입니다. 현재 설정된 tmux
+prefix를 화면에 표시하되 실제로 전송하지 않고, 가상으로 prefix가 눌린 상태에서
+실제 suffix key만 입력하게 합니다. 따라서 올바른 조합을 익히면서도 live
+window를 만들거나 pane을 분할하고 client를 detach하지 않습니다.
+
 <div align="center">
   <img src="docs/demo-onboard.gif" alt="한글 Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon과 단축키 실습" width="900" />
   <br />
   <sub><code>muxa onboard</code> — 안전한 interactive watch mock에서 운영 모델을 익힙니다.</sub>
+</div>
+
+<div align="center">
+  <img src="docs/demo-tmux-onboard.gif" alt="한글 tmux onboarding: 안전한 tmux mock에서 window, pane 분할과 이동, zoom, copy mode, detach, Muxa prefix binding 실습" width="900" />
+  <br />
+  <sub><code>muxa onboard --tmux</code> — live session을 바꾸지 않고 tmux 동작을 익힙니다.</sub>
 </div>
 
 | Command | 목적 |
@@ -191,7 +204,7 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 | `muxa work list/show/close` | managed work session을 조회하고 명시적으로 종료. |
 | `muxa agent start --work CAL-7041 ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
-| `muxa onboard [--lang auto\|en\|ko]` | 한글/영문 fullscreen walkthrough와 실제 watch 단축키 실습. `F2`로 언어를 전환하고 `--no-quiz`로 단축키 gate를 건너뛰거나 `--print`로 정적 guide 출력. |
+| `muxa onboard [--tmux] [--lang auto\|en\|ko]` | 한글/영문 fullscreen walkthrough. 기본 과정은 Muxa watch workflow를, `--tmux`는 감지된 prefix를 사용하는 안전한 tmux 기초를 안내. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 정적 guide 출력 지원. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |

@@ -197,6 +197,24 @@ fn onboarding_prints_even_when_config_is_invalid() {
     let stdout = String::from_utf8_lossy(&korean.stdout);
     assert!(stdout.contains("Muxa 온보딩"));
     assert!(stdout.contains("muxa watch 단축키"));
+
+    let tmux = Command::new(bin("muxa"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "onboard",
+            "--tmux",
+            "--print",
+            "--lang",
+            "ko",
+        ])
+        .output()
+        .expect("run Korean tmux onboarding");
+    assert!(tmux.status.success());
+    let stdout = String::from_utf8_lossy(&tmux.stdout);
+    assert!(stdout.contains("tmux 온보딩"));
+    assert!(stdout.contains("prefix+s"));
+    assert!(stdout.contains("suffix key만"));
 }
 
 #[test]

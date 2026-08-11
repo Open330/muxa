@@ -11,6 +11,7 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo.tape`          | [VHS](https://github.com/charmbracelet/vhs) script for the hero GIF.                      |
 | `docs/demo-collab.tape`   | VHS script for the collaboration GIF.                                                     |
 | `docs/demo-onboard.tape`  | Standalone fullscreen onboarding walkthrough; no fixture or daemon needed.                |
+| `docs/demo-tmux-onboard.tape` | Safe tmux-fundamentals walkthrough; detects but never sends the real prefix.          |
 | `docs/demo-setup.sh`      | Builds the whole fixture: config, PATH shims, tmux server, `muxad`, the seeded fleet, the mailbox, and the ask history. |
 | `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
 | `docs/demo-teardown.sh`   | Removes all of it. Safe to run at any time, including after a half-finished render.        |
@@ -18,6 +19,7 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo.gif`           | Hero output. 1320 × 620, ~1.6 MB after optimizing.                                          |
 | `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.5 MB after optimizing.                                 |
 | `docs/demo-onboard.gif`   | Korean onboarding output. 1320 × 720, ~806 KB after optimizing.                           |
+| `docs/demo-tmux-onboard.gif` | Korean tmux onboarding output. 1320 × 720, ~433 KB after optimizing.                   |
 
 ## What the recordings cover
 
@@ -40,6 +42,11 @@ session-state gutter, columns, inspector, overlays, and footer. The tape
 uses the Korean UI and advances only with real watch keys; there is no shell
 command transcription exercise. It does not use `demo-setup.sh` because
 onboarding must not touch real sessions.
+
+**`demo-tmux-onboard.tape` — learning tmux itself.** A second inert mock that
+teaches the session/window/pane hierarchy, splits, focus, reversible zoom,
+copy mode, detach semantics, and Muxa's prefix bindings. It displays the
+detected prefix but types only suffix keys, so it cannot alter a live client.
 
 ## The fixture
 
@@ -80,7 +87,8 @@ cargo build -p muxa-cli  # demo-onboard.tape prefers target/debug/muxa
 vhs docs/demo.tape
 vhs docs/demo-collab.tape
 vhs docs/demo-onboard.tape
-docs/demo-optimize.sh docs/demo.gif docs/demo-collab.gif docs/demo-onboard.gif
+vhs docs/demo-tmux-onboard.tape
+docs/demo-optimize.sh docs/demo.gif docs/demo-collab.gif docs/demo-onboard.gif docs/demo-tmux-onboard.gif
 ```
 
 The optimize pass is not optional housekeeping — VHS emits a 256-colour
@@ -93,8 +101,8 @@ VHS spins up `ttyd`, points headless Chrome at it, records the rendered
 terminal, and encodes the GIF. The fleet tapes run `demo-setup.sh` in their
 prelude and `demo-teardown.sh` in their postlude, so no state is left behind —
 and setup tears down before it builds, so an interrupted render does not poison
-the next one. `demo-onboard.tape` runs the inert onboarding mock directly and
-does not need teardown.
+the next one. Both onboarding tapes run inert mocks directly and do not need
+teardown.
 
 You need [JetBrains Mono Nerd Font](https://github.com/ryanoasis/nerd-fonts)
 installed. Without it the terminal falls back to a font with different

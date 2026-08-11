@@ -66,6 +66,37 @@ shell 명령을 그대로 따라 입력하거나 암기하는 단계는 없습�
 
     muxa onboard --print --lang ko
 
+## tmux 자체를 배우기
+
+Muxa workflow보다 먼저 tmux의 session/window/pane 구조와 기본 조작을
+익히고 싶다면 별도 tmux 과정을 실행합니다.
+
+    muxa onboard --tmux --lang ko
+
+이 과정도 실제 tmux를 건드리지 않는 fullscreen mock입니다. 현재 설정된
+prefix(`Ctrl-b`, `Ctrl-a` 등)는 읽어서 표시하지만 terminal로 전송하지
+않습니다. 화면이 prefix를 가상으로 누른 상태를 만들고 사용자는 suffix key만
+입력합니다. 따라서 학습 중에 live window를 만들거나 pane을 분할하고 client를
+detach할 위험이 없습니다.
+
+실제 키를 다음 순서로 눌러 진행합니다.
+
+- `w`: session/window tree와 session → window → pane 계층
+- `c`: 현재 session 안에 window 생성
+- `%`, `"`: pane 좌우·상하 분할
+- `→`: pane focus 이동
+- `z`, `z`: pane 확대 후 원래 split layout 복원
+- `[`, `q`: copy mode 진입과 종료
+- `d`: client detach; session과 agent가 계속 실행된다는 의미
+- `s`, `q`, `D`: Muxa의 watch, peek, dashboard prefix binding
+
+여기서도 `F2`로 한글/영문을 전환하고, `Esc`로 종료하며, `--no-quiz`로 키
+gate를 건너뛸 수 있습니다. 정적 안내만 필요하면 다음을 사용합니다.
+
+    muxa onboard --tmux --print --lang ko
+
+![한글 tmux onboarding: 안전한 mock에서 window, pane 분할과 이동, zoom, copy mode, detach, Muxa prefix binding 실습](demo-tmux-onboard.gif)
+
 설치 직후에는 다음 순서가 권장됩니다.
 
     muxa init

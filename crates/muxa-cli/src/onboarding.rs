@@ -5,6 +5,8 @@
 //! new user connect the domain model and shortcuts to the UI before touching
 //! live sessions. `--print` remains available for scripts and accessibility.
 
+mod tmux;
+
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -28,6 +30,9 @@ pub struct Args {
     /// Skip hands-on shortcut gates while keeping every visual explanation.
     #[arg(long)]
     pub no_quiz: bool,
+    /// Learn tmux itself on a safe mock instead of the Muxa workflow.
+    #[arg(long)]
+    pub tmux: bool,
     /// Display language: auto, en, or ko. / 표시 언어: auto, en, ko.
     #[arg(long, value_enum, default_value_t)]
     pub lang: Language,
@@ -218,6 +223,9 @@ pub fn run(args: Args) -> Result<()> {
     apply_icon_preference();
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();
+    if args.tmux {
+        return tmux::run(mode, args.no_quiz, language);
+    }
     match mode {
         Mode::Print => print_guide(language),
         Mode::Interactive => interactive_guide(args.no_quiz, language)?,
