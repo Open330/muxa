@@ -189,12 +189,13 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 Managed tmux policy: one session is one work/ticket, each pane is one agent,
 and windows are layout only. `muxa onboard` now teaches tmux and Muxa as one
 continuous scenario. It starts at a blank virtual shell, accepts the real
-`tmux new-session -s CAL-7041` and `tmux attach -t CAL-7041` commands, preserves
-every virtual window/pane transition, then continues without leaving fullscreen
-into the current `muxa watch` workflow. The watch half mirrors the left-edge
-session-state gutter, columns, 50/50 inspector, overlays, and footer. You advance
-with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`, `M`, and `q`
-actions.
+`tmux new-session -s muxa-onboarding` and `tmux attach -t muxa-onboarding`
+commands, preserves every virtual window/pane transition, then continues without
+leaving fullscreen into the current `muxa watch` workflow. The watch half mirrors
+the left-edge session-state gutter, columns, 50/50 inspector, overlays, and
+footer. You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
+`Backspace`, `M`, and `q` actions. One 20-step counter covers the whole scenario:
+managed prefix bindings are step 11 and session navigation follows as step 12.
 Korean is selected automatically for a Korean locale, can be requested with
 `--lang ko`, and can be toggled with `F2` during the tour.
 
@@ -221,9 +222,9 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
-| `muxa work start CAL-7041 --agent codex ...` | Create one managed tmux session per work/ticket, or reuse it and add another agent pane. |
+| `muxa work start muxa-onboarding --agent codex ...` | Create one managed tmux session per work/ticket, or reuse it and add another agent pane. |
 | `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
-| `muxa agent start --work CAL-7041 ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
+| `muxa agent start --work muxa-onboarding ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
 | `muxa onboard [--lang auto\|en\|ko]` | Unified shell → tmux → Muxa fullscreen walkthrough. `F2` switches language, `--no-quiz` skips gates, and `--print` emits the combined guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |

@@ -38,9 +38,11 @@ asking claude a headless question and `A` browsing the answers.
 **`demo-onboard.tape` — learning tmux and Muxa as one model.** The inert shell
 accepts real `tmux new-session` and `tmux attach` input, preserves the visible
 window, pane, detach, and reattach transitions, demonstrates the managed `s`,
-`q`, and `D` surfaces, then continues in the same fullscreen scenario through
+`q`, and `D` surfaces as step 11, then continues directly at step 12 through
 watch's session-state gutter, inspector, overlays, collaboration, and footer.
-It does not use `demo-setup.sh` because onboarding must not touch real sessions.
+One 20-step counter covers the scenario; there is no second welcome or phase
+completion screen. It does not use `demo-setup.sh` because onboarding must not
+touch real sessions.
 
 ## The fixture
 

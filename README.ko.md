@@ -160,13 +160,14 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 
 기본 tmux 운영 정책은 session 하나가 work/ticket 하나, pane 하나가 agent
 하나이며 window는 화면 배치에만 사용한다는 것입니다. `muxa onboard`는 가상
-기본 shell에서 시작해 `tmux new-session -s CAL-7041`을 직접 입력하게 하고,
-window/pane 조작과 detach 뒤에는 `tmux attach -t CAL-7041`도 직접 입력하게
+기본 shell에서 시작해 `tmux new-session -s muxa-onboarding`을 직접 입력하게 하고,
+window/pane 조작과 detach 뒤에는 `tmux attach -t muxa-onboarding`도 직접 입력하게
 합니다. 이어서 같은 fullscreen 화면에서 현재 `muxa watch` workflow로
 전환합니다. watch와 같은 왼쪽 session-state gutter, 열, 50/50 inspector,
 overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
-`Backspace`, `M`을 실제로 누르고 마지막에는 `q`로 마칩니다. 한국어 locale에서는
-한글을 자동으로 선택하며 `--lang ko`로
+`Backspace`, `M`을 실제로 누르고 마지막에는 `q`로 마칩니다. 전체 과정은 하나의
+20단계 진행률을 사용하며 managed prefix binding 11단계에서 session 이동
+12단계로 바로 이어집니다. 한국어 locale에서는 한글을 자동으로 선택하며 `--lang ko`로
 명시하거나 온보딩 도중 `F2`로 한/영을 전환할 수 있습니다.
 
 <div align="center">
@@ -190,9 +191,9 @@ overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
-| `muxa work start CAL-7041 --agent codex ...` | work/ticket마다 managed tmux session 하나를 만들거나 재사용하고 agent pane을 추가. |
+| `muxa work start muxa-onboarding --agent codex ...` | work/ticket마다 managed tmux session 하나를 만들거나 재사용하고 agent pane을 추가. |
 | `muxa work list/show/close` | managed work session을 조회하고 명시적으로 종료. |
-| `muxa agent start --work CAL-7041 ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
+| `muxa agent start --work muxa-onboarding ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
 | `muxa onboard [--lang auto\|en\|ko]` | shell → tmux → Muxa 통합 fullscreen walkthrough. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 통합 guide 출력 지원. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |

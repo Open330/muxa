@@ -8,10 +8,10 @@
 #
 # Arc:
 #   0–17s   shell + tmux    — new-session, prefix, windows, panes, detach/attach
-#   17–21s  Muxa bindings   — s watch, q peek, D dashboard
-#   21–26s  navigate/sort   — j/l and Alt-T over the real state gutter
-#   26–32s  inspect/create  — o, ?, n and safe cancel
-#   32–38s  collaboration   — m, Backspace, M mailbox, MCP, q
+#   17–20s  managed keys    — s watch, q peek, D dashboard
+#   20–25s  navigate/sort   — j/l and Alt-T over the real state gutter
+#   25–31s  inspect/create  — o, ?, n and safe cancel
+#   31–38s  collaboration   — m, Backspace, M mailbox, MCP, q
 
 Output docs/demo-onboard.gif
 
@@ -41,7 +41,7 @@ Sleep 1800ms
 
 # Type the real commands into the virtual shell rather than accepting a
 # pre-filled prompt.
-Type "tmux new-session -s CAL-7041"
+Type "tmux new-session -s muxa-onboarding"
 Enter
 Sleep 900ms
 Ctrl+B
@@ -70,11 +70,11 @@ Sleep 800ms
 # d returns to the virtual base shell. Type a real attach command to resume.
 Type "d"
 Sleep 1200ms
-Type "tmux attach -t CAL-7041"
+Type "tmux attach -t muxa-onboarding"
 Enter
 Sleep 900ms
 
-# The managed bindings lead directly into the Muxa half of the same tour.
+# Step 11 teaches managed bindings; step 12 continues on the same watch surface.
 Type "s"
 Sleep 1000ms
 Type "q"
@@ -82,11 +82,9 @@ Sleep 900ms
 Type "D"
 Sleep 1000ms
 Enter
-Sleep 700ms
-Enter
 Sleep 1000ms
 
-# Move from CAL-7088 to CAL-7041, then enter its first child agent.
+# Move from muxa-sandbox to muxa-onboarding, then enter its first child agent.
 Type "j"
 Sleep 1100ms
 Type "l"

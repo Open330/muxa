@@ -123,24 +123,24 @@ One ticket reuses one managed session; it never silently becomes ticket-2.";
 
 const WORKFLOW: &str = "\
 1. Start the work with its first agent:\n\
-   muxa work start CAL-7041 --cwd /repo --agent codex --role implementer --prompt \"Implement CAL-7041\"\n\
+   muxa work start muxa-onboarding --cwd /repo --agent codex --role implementer --prompt \"Implement muxa-onboarding\"\n\
 \n\
 2. Add another agent to the same work:\n\
-   muxa agent start --work CAL-7041 --agent claude --role reviewer --prompt \"Review the current changes\"\n\
+   muxa agent start --work muxa-onboarding --agent claude --role reviewer --prompt \"Review the current changes\"\n\
 \n\
 3. Inspect or operate it:\n\
    muxa work list\n\
-   muxa work show CAL-7041\n\
+   muxa work show muxa-onboarding\n\
    muxa watch\n\
    muxa agent control --pane %42 --action interrupt\n\
 \n\
 4. Close explicitly when the work is finished:\n\
-   muxa work close CAL-7041";
+   muxa work close muxa-onboarding";
 
 const MCP_PATTERN: &str = "\
 Use the existing muxa MCP server; do not add a second tmux MCP.\n\
 \n\
-muxa_start_agent(work=\"CAL-7041\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
+muxa_start_agent(work=\"muxa-onboarding\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
 muxa_wait_for_change(pane=\"%42\", until=\"settled\", include_capture=true)\n\
 muxa_status(pane=\"%42\", include_capture=true, history_limit=1)\n\
 muxa_manage_tmux(action=\"interrupt_agent\", pane=\"%42\")\n\
@@ -163,24 +163,24 @@ Agent는 파일, 코드, Git, 테스트와 추론을 담당합니다.\n\
 
 const WORKFLOW_KO: &str = "\
 1. 첫 agent와 함께 work 시작:\n\
-   muxa work start CAL-7041 --cwd /repo --agent codex --role implementer --prompt \"Implement CAL-7041\"\n\
+   muxa work start muxa-onboarding --cwd /repo --agent codex --role implementer --prompt \"Implement muxa-onboarding\"\n\
 \n\
 2. 같은 work에 다른 agent 추가:\n\
-   muxa agent start --work CAL-7041 --agent claude --role reviewer --prompt \"Review the current changes\"\n\
+   muxa agent start --work muxa-onboarding --agent claude --role reviewer --prompt \"Review the current changes\"\n\
 \n\
 3. 조회 또는 제어:\n\
    muxa work list\n\
-   muxa work show CAL-7041\n\
+   muxa work show muxa-onboarding\n\
    muxa watch\n\
    muxa agent control --pane %42 --action interrupt\n\
 \n\
 4. work가 끝나면 명시적으로 닫기:\n\
-   muxa work close CAL-7041";
+   muxa work close muxa-onboarding";
 
 const MCP_PATTERN_KO: &str = "\
 별도 tmux MCP를 추가하지 말고 기존 Muxa MCP server를 사용합니다.\n\
 \n\
-muxa_start_agent(work=\"CAL-7041\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
+muxa_start_agent(work=\"muxa-onboarding\", agent=\"codex\", role=\"reviewer\", prompt=\"Review ...\")\n\
 muxa_wait_for_change(pane=\"%42\", until=\"settled\", include_capture=true)\n\
 muxa_status(pane=\"%42\", include_capture=true, history_limit=1)\n\
 muxa_manage_tmux(action=\"interrupt_agent\", pane=\"%42\")\n\
@@ -194,27 +194,27 @@ Agent 제어에는 정확한 pane id를 사용하고 파괴적 동작은 확인�
 
 const SECTIONS: &[Section] = &[
     Section {
-        title_en: "1 · Mental model",
+        title_en: "2 · Mental model",
         body_en: POLICY,
-        title_ko: "1 · 운영 모델",
+        title_ko: "2 · 운영 모델",
         body_ko: POLICY_KO,
     },
     Section {
-        title_en: "2 · Default workflow",
+        title_en: "3 · Default workflow",
         body_en: WORKFLOW,
-        title_ko: "2 · 기본 작업 흐름",
+        title_ko: "3 · 기본 작업 흐름",
         body_ko: WORKFLOW_KO,
     },
     Section {
-        title_en: "3 · Agent-facing MCP pattern",
+        title_en: "4 · Agent-facing MCP pattern",
         body_en: MCP_PATTERN,
-        title_ko: "3 · Agent용 MCP 패턴",
+        title_ko: "4 · Agent용 MCP 패턴",
         body_ko: MCP_PATTERN_KO,
     },
     Section {
-        title_en: "4 · Safety boundary",
+        title_en: "5 · Safety boundary",
         body_en: SAFETY,
-        title_ko: "4 · 안전 경계",
+        title_ko: "5 · 안전 경계",
         body_ko: SAFETY_KO,
     },
 ];
@@ -224,11 +224,7 @@ pub fn run(args: Args) -> Result<()> {
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();
     match mode {
-        Mode::Print => {
-            tmux::print_guide(language);
-            println!("\n{}\n", "=".repeat(72));
-            print_guide(language);
-        }
+        Mode::Print => print_guide(language),
         Mode::Interactive => interactive_guide(args.no_quiz, language)?,
     }
     Ok(())
@@ -249,12 +245,13 @@ fn print_guide(language: UiLanguage) {
     println!(
         "{}",
         if language == UiLanguage::Ko {
-            "Muxa 온보딩"
+            "Muxa 통합 온보딩"
         } else {
-            "Muxa onboarding"
+            "Muxa unified onboarding"
         }
     );
-    println!("===============");
+    println!("======================");
+    tmux::print_guide(language);
     for section in SECTIONS {
         let (title, body) = if language == UiLanguage::Ko {
             (section.title_ko, section.body_ko)
@@ -265,13 +262,13 @@ fn print_guide(language: UiLanguage) {
         println!("{body}");
     }
     if language == UiLanguage::Ko {
-        println!("\n5 · muxa watch 단축키\n----------------------");
+        println!("\n6 · muxa watch 단축키\n----------------------");
         for line in korean_watch_help() {
             println!("{line}");
         }
         println!("\n다음: muxa watch를 실행하거나 tmux prefix+s를 누르세요.");
     } else {
-        println!("\n5 · muxa watch shortcuts\n------------------------");
+        println!("\n6 · muxa watch shortcuts\n------------------------");
         for line in crate::watch::help_overlay_text() {
             println!("{line}");
         }
@@ -300,10 +297,10 @@ fn interactive_guide(no_quiz: bool, language: UiLanguage) -> Result<()> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
     guard.terminal_mut().hide_cursor()?;
-    if !tmux::interactive_guide(guard.terminal_mut(), no_quiz, language)? {
+    let Some(language) = tmux::interactive_guide(guard.terminal_mut(), no_quiz, language)? else {
         return Ok(());
-    }
-    let mut app = TourApp::after_tmux(no_quiz, language);
+    };
+    let mut app = TourApp::with_language(no_quiz, language);
 
     while !app.done {
         guard
@@ -318,7 +315,6 @@ fn interactive_guide(no_quiz: bool, language: UiLanguage) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TourStep {
-    Welcome,
     Work,
     Agents,
     States,
@@ -331,8 +327,7 @@ enum TourStep {
 }
 
 impl TourStep {
-    const ALL: [Self; 10] = [
-        Self::Welcome,
+    const ALL: [Self; 9] = [
         Self::Work,
         Self::Agents,
         Self::States,
@@ -344,6 +339,8 @@ impl TourStep {
         Self::Finish,
     ];
 }
+
+const UNIFIED_STEP_COUNT: usize = tmux::STEP_COUNT + TourStep::ALL.len();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MockOverlay {
@@ -357,8 +354,8 @@ enum MockOverlay {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MockSelection {
-    Work7041,
-    Work7088,
+    WorkOnboarding,
+    WorkSandbox,
     Codex,
 }
 
@@ -424,9 +421,9 @@ impl TourApp {
                 TourMode::Guided
             },
             language,
-            // The first exercise moves from the idle work to CAL-7041 with
+            // The first exercise moves from the idle work to muxa-onboarding with
             // the same `j`/Down navigation used by live watch.
-            selection: MockSelection::Work7088,
+            selection: MockSelection::WorkSandbox,
             sort: MockSort::Latest,
             panel: MockPanel::None,
             new_work_stage: NewWorkStage::Shortcut,
@@ -434,12 +431,6 @@ impl TourApp {
             blocked_hint: false,
             done: false,
         }
-    }
-
-    fn after_tmux(no_quiz: bool, language: UiLanguage) -> Self {
-        let mut app = Self::with_language(no_quiz, language);
-        app.step = 1;
-        app
     }
 
     fn current(&self) -> TourStep {
@@ -544,19 +535,10 @@ fn handle_guided_key(app: &mut TourApp, key: KeyEvent) -> bool {
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match app.current() {
-        TourStep::Welcome
-            if matches!(
-                key.code,
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
-            ) =>
-        {
-            app.advance();
-            true
-        }
         TourStep::Work
             if key.code == KeyCode::Down || (plain && key.code == KeyCode::Char('j')) =>
         {
-            app.selection = MockSelection::Work7041;
+            app.selection = MockSelection::WorkOnboarding;
             app.advance();
             true
         }
@@ -795,11 +777,11 @@ fn render_mock_sessions(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
         Style::default().fg(Color::DarkGray),
     ))];
     if app.sort == MockSort::State {
-        lines.extend(mock_cal_7041_rows(app));
-        lines.push(mock_cal_7088_row(app));
+        lines.extend(mock_onboarding_rows(app));
+        lines.push(mock_sandbox_row(app));
     } else {
-        lines.push(mock_cal_7088_row(app));
-        lines.extend(mock_cal_7041_rows(app));
+        lines.push(mock_sandbox_row(app));
+        lines.extend(mock_onboarding_rows(app));
     }
 
     let border = if matches!(
@@ -822,8 +804,8 @@ fn render_mock_sessions(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
     );
 }
 
-fn mock_cal_7041_rows(app: &TourApp) -> Vec<Line<'static>> {
-    let selected = app.selection == MockSelection::Work7041;
+fn mock_onboarding_rows(app: &TourApp) -> Vec<Line<'static>> {
+    let selected = app.selection == MockSelection::WorkOnboarding;
     let bg = if selected {
         Color::Rgb(18, 83, 108)
     } else {
@@ -836,33 +818,33 @@ fn mock_cal_7041_rows(app: &TourApp) -> Vec<Line<'static>> {
         Span::styled(" ", style),
         mock_state_span(AgentState::Working, bg),
         Span::styled(
-            "   CAL-7041          12m    8s     harden checkout auth",
+            "   muxa-onboarding   12m    8s     harden checkout auth",
             style,
         ),
     ])];
     if matches!(
         app.selection,
-        MockSelection::Work7041 | MockSelection::Codex
+        MockSelection::WorkOnboarding | MockSelection::Codex
     ) {
         let codex_selected = app.selection == MockSelection::Codex;
         rows.push(Line::from(Span::styled(
             if codex_selected {
-                ">   └─ cal-7041:0.0   -      8s     implement checkout hardening"
+                ">   └─ muxa-onboarding:0.0   -      8s     implement checkout hardening"
             } else {
-                "    └─ cal-7041:0.0   -      8s     implement checkout hardening"
+                "    └─ muxa-onboarding:0.0   -      8s     implement checkout hardening"
             },
             row_style(codex_selected),
         )));
         rows.push(Line::from(Span::styled(
-            "    └─ cal-7041:1.0   -      2m     review public-read boundary",
+            "    └─ muxa-onboarding:1.0   -      2m     review public-read boundary",
             Style::default().fg(Color::Gray),
         )));
     }
     rows
 }
 
-fn mock_cal_7088_row(app: &TourApp) -> Line<'static> {
-    let selected = app.selection == MockSelection::Work7088;
+fn mock_sandbox_row(app: &TourApp) -> Line<'static> {
+    let selected = app.selection == MockSelection::WorkSandbox;
     let bg = if selected {
         Color::Rgb(18, 83, 108)
     } else {
@@ -873,7 +855,7 @@ fn mock_cal_7088_row(app: &TourApp) -> Line<'static> {
         Span::styled(if selected { "> " } else { "  " }, style),
         mock_state_span(AgentState::Idle, bg),
         Span::styled(
-            "     CAL-7088          31m    1m     dashboard authentication",
+            "     muxa-sandbox      31m    1m     dashboard authentication",
             style,
         ),
     ])
@@ -908,22 +890,22 @@ fn mock_state_span(state: AgentState, background: Color) -> Span<'static> {
 
 fn render_mock_inspector(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
     let (pane, state, age, kind, latest) = match app.selection {
-        MockSelection::Work7088 => (
-            "cal-7088:0.0",
+        MockSelection::WorkSandbox => (
+            "muxa-sandbox:0.0",
             "IDLE",
             "1m",
             "codex",
             "dashboard authentication",
         ),
-        MockSelection::Work7041 => (
-            "cal-7041:1.0",
+        MockSelection::WorkOnboarding => (
+            "muxa-onboarding:1.0",
             "WAIT",
             "2m",
             "claude_code",
             "review public-read boundary",
         ),
         MockSelection::Codex => (
-            "cal-7041:0.0",
+            "muxa-onboarding:0.0",
             "WORK",
             "8s",
             "codex",
@@ -1103,7 +1085,7 @@ fn render_preview_overlay(frame: &mut Frame<'_>, area: Rect) {
         Paragraph::new(Text::from(vec![
             Line::from(vec![
                 Span::styled("● codex", Style::default().fg(Color::Cyan)),
-                Span::styled("  CAL-7041", Style::default().fg(Color::DarkGray)),
+                Span::styled("  muxa-onboarding", Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(""),
             Line::from("› implement checkout hardening"),
@@ -1117,7 +1099,7 @@ fn render_preview_overlay(frame: &mut Frame<'_>, area: Rect) {
             )),
         ]))
         .block(dialog_block(
-            " Preview · cal-7041:0.0 · live pane ",
+            " Preview · muxa-onboarding:0.0 · live pane ",
             Color::Cyan,
         )),
         popup,
@@ -1209,9 +1191,9 @@ fn render_new_work_overlay(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from("> dir    /home/june/personal/muxa"),
-            Line::from("  ticket CAL-7041"),
+            Line::from("  ticket muxa-onboarding"),
             Line::from("  agent  ◂  codex  ▸"),
-            Line::from("  prompt Implement CAL-7041"),
+            Line::from("  prompt Implement muxa-onboarding"),
         ]))
         .block(dialog_block(" new work + agent ", Color::Cyan)),
         popup,
@@ -1253,8 +1235,8 @@ fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TourApp) {
     frame.render_widget(Clear, popup);
     let title = format!(
         " {}/{} · {} ",
-        app.step + 1,
-        TourStep::ALL.len(),
+        tmux::STEP_COUNT + app.step + 1,
+        UNIFIED_STEP_COUNT,
         step_title(step, app.language)
     );
     let body = step_body(app);
@@ -1277,8 +1259,7 @@ fn callout_footer(app: &TourApp) -> &'static str {
         );
     }
     let en = match app.current() {
-        TourStep::Welcome => " Enter begin · F2 한국어 · Esc quit ",
-        TourStep::Work => " j/↓ move to CAL-7041 · ← back · Esc quit ",
+        TourStep::Work => " j/↓ move to muxa-onboarding · F2 한국어 · Esc quit ",
         TourStep::Agents => " l/→ enter child agent · ← back · Esc quit ",
         TourStep::States => " Alt-T sort by state · ← back · Esc quit ",
         TourStep::Preview => " o open preview · ← back · Esc quit ",
@@ -1308,8 +1289,7 @@ fn callout_footer(app: &TourApp) -> &'static str {
         TourStep::Finish => " q finish · q also quits watch ",
     };
     let ko = match app.current() {
-        TourStep::Welcome => " Enter 시작 · F2 English · Esc 종료 ",
-        TourStep::Work => " j/↓ CAL-7041로 이동 · ← 이전 · Esc 종료 ",
+        TourStep::Work => " j/↓ muxa-onboarding으로 이동 · F2 English · Esc 종료 ",
         TourStep::Agents => " l/→ child agent 선택 · ← 이전 · Esc 종료 ",
         TourStep::States => " Alt-T 상태순 정렬 · ← 이전 · Esc 종료 ",
         TourStep::Preview => " o preview 열기 · ← 이전 · Esc 종료 ",
@@ -1343,7 +1323,6 @@ fn callout_footer(app: &TourApp) -> &'static str {
 
 fn step_title(step: TourStep, language: UiLanguage) -> &'static str {
     let en = match step {
-        TourStep::Welcome => "learn on a safe mock",
         TourStep::Work => "one session = one work",
         TourStep::Agents => "one pane = one agent",
         TourStep::States => "state tells you what to do",
@@ -1355,7 +1334,6 @@ fn step_title(step: TourStep, language: UiLanguage) -> &'static str {
         TourStep::Finish => "ready for live watch",
     };
     let ko = match step {
-        TourStep::Welcome => "안전한 mock에서 배우기",
         TourStep::Work => "session 하나 = work 하나",
         TourStep::Agents => "pane 하나 = agent 하나",
         TourStep::States => "상태가 다음 행동을 알려줍니다",
@@ -1387,7 +1365,6 @@ fn step_body(app: &TourApp) -> Text<'static> {
 
 fn required_action(app: &TourApp) -> &'static str {
     let en = match app.current() {
-        TourStep::Welcome => "press Enter to begin",
         TourStep::Work => "press j or Down",
         TourStep::Agents | TourStep::Mcp => "press l or Right",
         TourStep::States => "press Alt-T",
@@ -1411,7 +1388,6 @@ fn required_action(app: &TourApp) -> &'static str {
         TourStep::Finish => "press q to finish",
     };
     let ko = match app.current() {
-        TourStep::Welcome => "Enter를 눌러 시작하세요",
         TourStep::Work => "j 또는 ↓를 누르세요",
         TourStep::Agents | TourStep::Mcp => "l 또는 →를 누르세요",
         TourStep::States => "Alt-T를 누르세요",
@@ -1442,23 +1418,12 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
         return step_lines_ko(app);
     }
     match app.current() {
-        TourStep::Welcome => vec![
-            callout_label("↙ THIS IS A SAFE MUXA WATCH REPLICA"),
-            Line::from(""),
-            Line::from("Nothing here touches your real tmux sessions."),
-            Line::from("Press Enter once; later steps require the real watch key."),
-            Line::from("Press F2 at any time to switch to 한국어."),
-            Line::from(""),
-            policy_line("SESSION", "work / ticket"),
-            policy_line("PANE", "agent"),
-            policy_line("WINDOW", "layout only"),
-        ],
         TourStep::Work => vec![
             callout_label("← MOVE THE REAL WATCH CURSOR"),
             Line::from(""),
-            Line::from("CAL-7088 is selected. Press j or ↓ to reach CAL-7041."),
+            Line::from("muxa-sandbox is selected. Press j or ↓ to reach muxa-onboarding."),
             Line::from("Each session row is one work/ticket identity."),
-            Line::from("Starting CAL-7041 again reuses that same session."),
+            Line::from("Starting muxa-onboarding again reuses that same session."),
         ],
         TourStep::Agents => vec![
             callout_label("← ENTER THE SESSION TREE"),
@@ -1530,23 +1495,14 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
 
 fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
     match app.current() {
-        TourStep::Welcome => vec![
-            callout_label("↙ 안전한 MUXA WATCH 복제 화면입니다"),
-            Line::from(""),
-            Line::from("실제 tmux session에는 아무 변화도 주지 않습니다."),
-            Line::from("처음만 Enter를 누르고 이후에는 실제 watch 키로 진행합니다."),
-            Line::from("F2를 누르면 언제든 English로 전환할 수 있습니다."),
-            Line::from(""),
-            policy_line("SESSION", "work / ticket"),
-            policy_line("PANE", "agent"),
-            policy_line("WINDOW", "화면 배치 전용"),
-        ],
         TourStep::Work => vec![
             callout_label("← 실제 WATCH CURSOR를 움직여보세요"),
             Line::from(""),
-            Line::from("CAL-7088이 선택되어 있습니다. j 또는 ↓로 CAL-7041로 이동하세요."),
+            Line::from(
+                "muxa-sandbox가 선택되어 있습니다. j 또는 ↓로 muxa-onboarding으로 이동하세요.",
+            ),
             Line::from("각 session row는 하나의 work/ticket입니다."),
-            Line::from("CAL-7041을 다시 시작하면 같은 session을 재사용합니다."),
+            Line::from("muxa-onboarding을 다시 시작하면 같은 session을 재사용합니다."),
         ],
         TourStep::Agents => vec![
             callout_label("← SESSION TREE 안으로 들어가세요"),
@@ -1758,12 +1714,8 @@ fn callout_rect(area: Rect, app: &TourApp) -> Rect {
     let step = app.current();
     let compact = area.width < 100 || area.height < 23;
     if compact {
-        let height = if matches!(step, TourStep::Welcome | TourStep::Finish) {
-            12
-        } else {
-            10
-        }
-        .min(area.height.saturating_sub(2));
+        let height =
+            if step == TourStep::Finish { 12 } else { 10 }.min(area.height.saturating_sub(2));
         let y = if step == TourStep::Shortcuts {
             area.y + 2
         } else {
@@ -1771,7 +1723,7 @@ fn callout_rect(area: Rect, app: &TourApp) -> Rect {
         };
         return Rect::new(area.x + 2, y, area.width.saturating_sub(4), height);
     }
-    if matches!(step, TourStep::Welcome | TourStep::Finish) {
+    if step == TourStep::Finish {
         return centered_rect(
             area,
             area.width.saturating_sub(6).min(78),
@@ -1802,7 +1754,7 @@ fn callout_rect(area: Rect, app: &TourApp) -> Rect {
         TourStep::NewWork | TourStep::Collaboration => {
             Rect::new(area.x + 4, area.y + area.height - 10, area.width - 8, 9)
         }
-        TourStep::Welcome | TourStep::Finish => unreachable!(),
+        TourStep::Finish => unreachable!(),
     }
 }
 
@@ -1880,13 +1832,14 @@ mod tests {
     }
 
     #[test]
-    fn unified_handoff_enters_watch_without_a_second_welcome_gate() {
-        let app = TourApp::after_tmux(false, UiLanguage::Ko);
+    fn unified_step_twelve_enters_watch_without_a_second_welcome_gate() {
+        let app = TourApp::with_language(false, UiLanguage::Ko);
         assert_eq!(app.current(), TourStep::Work);
-        assert_eq!(app.selection, MockSelection::Work7088);
+        assert_eq!(app.selection, MockSelection::WorkSandbox);
         let screen = rendered(&app, 130, 32).replace(' ', "");
-        assert!(screen.contains("CAL-7088"));
-        assert!(screen.contains("CAL-7088이선택"));
+        assert!(screen.contains("12/20"));
+        assert!(screen.contains("muxa-sandbox"));
+        assert!(screen.contains("muxa-sandbox가선택"));
     }
 
     #[test]
@@ -1894,8 +1847,8 @@ mod tests {
         assert!(POLICY.contains("session = work/ticket"));
         assert!(POLICY.contains("pane    = agent"));
         assert!(POLICY.contains("window  = layout only"));
-        assert!(WORKFLOW.contains("muxa work start CAL-7041"));
-        assert!(WORKFLOW.contains("muxa agent start --work CAL-7041"));
+        assert!(WORKFLOW.contains("muxa work start muxa-onboarding"));
+        assert!(WORKFLOW.contains("muxa agent start --work muxa-onboarding"));
         assert!(POLICY_KO.contains("같은 ticket"));
         assert!(WORKFLOW_KO.contains("같은 work에 다른 agent 추가"));
     }
@@ -1928,7 +1881,7 @@ mod tests {
         assert!(work.contains("Sessions"));
         assert!(work.contains("SESSION                 DUR    ACT    SUMMARY"));
         assert!(!work.contains("AGENTS  STATE"));
-        assert!(work.contains("CAL-7041"));
+        assert!(work.contains("muxa-onboarding"));
         assert!(work.contains("one session = one work"));
         assert!(work.contains("MOVE THE REAL WATCH CURSOR"));
 
@@ -2008,8 +1961,8 @@ mod tests {
         ] {
             assert!(screen.contains(crate::state_icon(state)));
         }
-        assert!(screen.contains("▶ ●   CAL-7041"));
-        assert!(screen.contains("○     CAL-7088"));
+        assert!(screen.contains("▶ ●   muxa-onboarding"));
+        assert!(screen.contains("○     muxa-sandbox"));
         assert!(!screen.contains("AGENTS  STATE"));
         assert!(!screen.contains("WORKING"));
         assert!(!screen.contains("WAITING"));
@@ -2051,9 +2004,6 @@ mod tests {
             handle_key(app, KeyEvent::new(code, modifiers));
         };
 
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.current(), TourStep::Work);
-
         // Enter is deliberately not a generic "next" key once a live
         // watch action is being taught.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
@@ -2062,7 +2012,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.current(), TourStep::Agents);
-        assert_eq!(app.selection, MockSelection::Work7041);
+        assert_eq!(app.selection, MockSelection::WorkOnboarding);
         press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
         assert_eq!(app.current(), TourStep::States);
         assert_eq!(app.selection, MockSelection::Codex);
@@ -2108,7 +2058,7 @@ mod tests {
         let mut app = TourApp::with_language(false, UiLanguage::Ko);
         let korean = rendered(&app, 120, 34);
         let compact_korean = korean.replace(' ', "");
-        assert!(compact_korean.contains("안전한MUXAWATCH복제화면"));
+        assert!(compact_korean.contains("실제WATCHCURSOR를움직여보세요"));
         assert!(korean.contains("F2 English"));
 
         handle_key(
@@ -2116,7 +2066,7 @@ mod tests {
             KeyEvent::new(KeyCode::F(2), crossterm::event::KeyModifiers::NONE),
         );
         assert_eq!(app.language, UiLanguage::En);
-        assert!(rendered(&app, 120, 34).contains("SAFE MUXA WATCH REPLICA"));
+        assert!(rendered(&app, 120, 34).contains("MOVE THE REAL WATCH CURSOR"));
     }
 
     #[test]
@@ -2127,7 +2077,7 @@ mod tests {
 
         let compact = rendered(&TourApp::new(false), 80, 24);
         assert!(compact.contains("muxa watch"));
-        assert!(compact.contains("CAL-7041"));
-        assert!(compact.contains("learn on a safe mock"));
+        assert!(compact.contains("muxa-onboarding"));
+        assert!(compact.contains("one session = one work"));
     }
 }
