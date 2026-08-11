@@ -205,8 +205,10 @@ and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 Sinks are opt-in fan-out targets. The current documented sink forwards
 prompts to oh-my-prompt. See [SINKS.md](SINKS.md).
 
-## Zellij
+## Pane host selection
 
-`MUXA_HOST=tmux|zellij` can pin host selection. tmux is the full backend;
-zellij support is still planned beyond the CLI baseline. See
+`MUXA_HOST=tmux|rmux|herdr|zellij` pins a single host. `MUXA_HOSTS` accepts an
+ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
+`RMUX` variables take precedence over the `TMUX` compatibility variables it
+also exports. See [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
 [ZELLIJ.md](ZELLIJ.md).

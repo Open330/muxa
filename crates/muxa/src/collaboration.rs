@@ -908,13 +908,15 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
         let agent_socket = agent
             .tmux_socket
             .as_deref()
-            .map(crate::tmux::socket_short_name);
+            .map(|endpoint| crate::backend::pane_endpoint_identity(Some(pane_id), endpoint));
         let candidates: Vec<_> = panes
             .iter()
             .filter(|pane| {
                 pane.pane_id == *pane_id
                     && match agent_socket.as_deref() {
-                        Some(socket) => pane.socket.as_deref() == Some(socket),
+                        Some(socket) => pane.socket.as_deref().is_some_and(|candidate| {
+                            crate::backend::pane_endpoints_match(Some(pane_id), candidate, socket)
+                        }),
                         None => true,
                     }
             })

@@ -1,7 +1,7 @@
 # Multi-host observation
 
 Status: **daemon + CLI implemented.** `muxad` observes every backend in
-`muxa::active_backends()` simultaneously (tmux + herdr during a
+`muxa::active_backends()` simultaneously (for example tmux + rmux + herdr during a
 migration) — the reconciler, discovery, session-activity sampling,
 pane-session cache, history enrichment, and the herdr bridge/report
 tasks all iterate the set. The CLI reads now aggregate across the same
@@ -25,7 +25,7 @@ The herdr work landed the key enablers:
 
 - **Cross-host reaping guard**: `Store::reconcile_observation(obs, kind)`
   already scopes an observation to rows whose pane-id namespace matches
-  the observing host (`%…`/`zellij:…`/`herdr:…` via `pane_id_host_kind`).
+  the observing host (`%…`/`rmux:%…`/`zellij:…`/`herdr:…` via `pane_id_host_kind`).
   Multiple observers converging the same store is safe *by construction*
   — each governs only its own namespace.
 - **Hook ingest is host-agnostic**: `host_pane_env` resolves whichever
@@ -42,16 +42,16 @@ The herdr work landed the key enablers:
 ### Backend set, not backend
 
 - `active_backends() -> Vec<SharedBackend>`: tmux unconditionally (its
-  methods degrade to empty), herdr if its server actually **answers** on
+  methods degrade to empty), rmux when its native env is present or the CLI is
+  installed (so a login daemon notices servers started later), herdr if its server actually **answers** on
   the socket (a live `connect`, not a stale socket file — a crashed
   server's leftover socket must not ghost a dead backend into the set),
   zellij per current detection. The **env-preferred host** (whatever the
   current shell resolves to via `detect_host_env`) leads the auto-detected
   set, so `backends[0]` is that host — consumers treat the first backend as
   primary (dashboard, watch initial cursor). Config override:
-  `MUXA_HOSTS=tmux,herdr` (env, verbatim order) / `hosts = ["tmux", "herdr"]`
-  (config); `MUXA_HOST=<one>` keeps meaning "exactly this one" for
-  compatibility.
+  `MUXA_HOSTS=rmux,tmux,herdr` (env, verbatim order);
+  `MUXA_HOST=<one>` keeps meaning "exactly this one" for compatibility.
 - The daemon threads the set. Single-backend consumers changed shape
   (all **implemented** in `crates/muxad/src/main.rs` unless noted):
   - **Reconciler**: one `Reconciler` over the whole set
@@ -85,7 +85,8 @@ The herdr work landed the key enablers:
   - **Discovery**: startup + periodic passes iterate the set and concat
     pane scans (`run_discovery` per backend, reports summed).
   - **Session activity**: a **single** tracker samples one source per
-    host that has a foreground signal (tmux, herdr) and merges them into
+    host that has a foreground signal (currently tmux and herdr; rmux sampling
+    is a follow-up) and merges them into
     one ledger. One tracker = one writer, so the two sources can't
     clobber `session-activity.json` (each `save()` rewrites the whole
     file); merging is safe because the session-id keyspaces are disjoint

@@ -50,7 +50,7 @@ fn same_pane_identity(agent: &Agent, pane: &str, tmux_socket: Option<&str>) -> b
     }
     match (agent.tmux_socket.as_deref(), tmux_socket) {
         (Some(left), Some(right)) => {
-            crate::tmux::socket_short_name(left) == crate::tmux::socket_short_name(right)
+            crate::backend::pane_endpoints_match(agent.pane.as_deref(), left, right)
         }
         (None, None) => true,
         (Some(_), None) | (None, Some(_)) => false,
@@ -60,6 +60,7 @@ fn same_pane_identity(agent: &Agent, pane: &str, tmux_socket: Option<&str>) -> b
 fn pane_is_live(
     agent: &Agent,
     panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+    observed_endpoints: &HashSet<&str>,
     observing_kind: HostKind,
 ) -> bool {
     if agent.pid.is_some() {
@@ -76,6 +77,18 @@ fn pane_is_live(
     if let Some(pane_id) = agent.pane.as_deref() {
         if let Some(host) = crate::backend::pane_id_host_kind(pane_id) {
             if host != observing_kind {
+                return true;
+            }
+        }
+    }
+    // A single RmuxBackend observes exactly one socket (the endpoint inherited
+    // through RMUX, or the default). Hook events can register agents from
+    // other named sockets, and pane ids repeat on every server. Absence from
+    // this snapshot is negative evidence only when the agent's endpoint is
+    // among the endpoints actually represented by the snapshot.
+    if observing_kind == HostKind::Rmux {
+        if let Some(endpoint) = agent.tmux_socket.as_deref() {
+            if !observed_endpoints.contains(endpoint) {
                 return true;
             }
         }
@@ -150,11 +163,10 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<SurfaceRef>,
     pub pane: Option<String>,
-    /// Short name of the tmux server socket `pane` lives on (the socket
-    /// file's basename, e.g. `default` or `amux`) — from the adapter's
-    /// `$TMUX` at hook time, or backfilled by the reconciler's pane scan.
-    /// Pane ids are only unique per server; wire consumers matching by pane
-    /// use this to disambiguate. Optional and purely additive on the wire.
+    /// Control endpoint of the server `pane` lives on. tmux stores the short
+    /// socket name (`default`, `amux`); rmux stores its full native socket path
+    /// so `rmux -S` can target it. The historical field name remains for wire
+    /// compatibility. Optional and purely additive on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_socket: Option<String>,
     /// Name of the tmux session `pane` belongs to, backfilled by the
@@ -1127,12 +1139,12 @@ impl Store {
             agent.pane.clone_from(&id.pane);
         }
         if agent.tmux_socket.is_none() {
-            // `$TMUX` carries the socket *path*; store the short name so it
-            // compares directly against the pane scan's socket tags.
-            agent.tmux_socket = id
-                .tmux_socket
-                .as_deref()
-                .map(crate::tmux::socket_short_name);
+            // tmux scan rows carry short socket names; rmux needs the native
+            // full endpoint for `rmux -S`. Normalize according to the pane's
+            // namespace rather than treating every host endpoint as tmux.
+            agent.tmux_socket = id.tmux_socket.as_deref().map(|endpoint| {
+                crate::backend::pane_endpoint_identity(id.pane.as_deref(), endpoint)
+            });
         }
         if agent.surface.is_none() {
             agent.surface.clone_from(&id.surface);
@@ -1864,15 +1876,19 @@ impl Store {
         // map to several panes. Liveness and the session-name backfill both
         // use the agent's `tmux_socket` (when known) to pick the right one.
         let mut panes_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        let mut observed_endpoints = HashSet::new();
         for p in live_panes {
             panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
+            if let Some(endpoint) = p.socket.as_deref() {
+                observed_endpoints.insert(endpoint);
+            }
         }
 
         let reaped_at = OffsetDateTime::now_utc();
         let mut stale_transitions = Vec::new();
         let before = agents.len();
         agents.retain(|_, a| {
-            let keep = pane_is_live(a, &panes_by_id, observing_kind);
+            let keep = pane_is_live(a, &panes_by_id, &observed_endpoints, observing_kind);
             if !keep && a.state != AgentState::Stopped {
                 let mut stopped = a.clone();
                 let from = stopped.state;
@@ -4576,6 +4592,68 @@ mod tests {
         let report = store.reconcile(&[default_pane]).await;
         assert_eq!(report.stale_panes_reaped, 1);
         assert!(store.by_session("amux-only").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rmux_endpoint_path_is_preserved_and_unobserved_endpoint_is_not_reaped() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "rmux-one".into(),
+                    surface: None,
+                    pane: Some("rmux:%9".into()),
+                    tmux_socket: Some("/tmp/rmux-one/default".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+        assert_eq!(
+            store
+                .by_session("rmux-one")
+                .await
+                .and_then(|agent| agent.tmux_socket)
+                .as_deref(),
+            Some("/tmp/rmux-one/default"),
+        );
+
+        let mut other_server = pane("rmux:%9");
+        other_server.socket = Some("/tmp/rmux-two/default".into());
+        let report = store
+            .reconcile_hosted(&[other_server], HostKind::Rmux)
+            .await;
+        assert_eq!(report.stale_panes_reaped, 0);
+        assert!(store.by_session("rmux-one").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rmux_observation_reaps_missing_pane_on_the_same_endpoint() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "rmux-gone".into(),
+                    surface: None,
+                    pane: Some("rmux:%9".into()),
+                    tmux_socket: Some("/tmp/rmux-one/default".into()),
+                    cwd: None,
+                },
+                at: t0,
+            })
+            .await;
+
+        let mut another_pane = pane("rmux:%10");
+        another_pane.socket = Some("/tmp/rmux-one/default".into());
+        let report = store
+            .reconcile_hosted(&[another_pane], HostKind::Rmux)
+            .await;
+        assert_eq!(report.stale_panes_reaped, 1);
+        assert!(store.by_session("rmux-gone").await.is_none());
     }
 
     #[tokio::test]

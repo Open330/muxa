@@ -200,8 +200,10 @@ dashboard는 명시적으로 public binding을 허용하기 전까지 loopback-o
 sink는 opt-in fan-out target입니다. 현재 문서화된 sink는 prompt를 oh-my-prompt로
 forward합니다. 자세한 내용은 [SINKS.md](SINKS.md).
 
-## Zellij
+## Pane host 선택
 
-`MUXA_HOST=tmux|zellij`로 host selection을 고정할 수 있습니다. tmux는 full
-backend이고, zellij는 CLI baseline 이후 richer support를 계획 중입니다.
-자세한 내용은 [ZELLIJ.md](ZELLIJ.md).
+`MUXA_HOST=tmux|rmux|herdr|zellij`로 단일 host를 고정할 수 있습니다.
+`MUXA_HOSTS`에는 `MUXA_HOSTS=rmux,tmux`처럼 순서가 있는 host 목록을 지정합니다.
+rmux가 tmux 호환 환경변수도 함께 설정하므로 native `RMUX` 환경변수를 먼저
+판별합니다. 자세한 내용은 [RMUX.md](RMUX.md), [HERDR.md](HERDR.md),
+[ZELLIJ.md](ZELLIJ.md)을 참고하세요.

@@ -148,7 +148,7 @@ enum Cmd {
         #[command(subcommand)]
         which: HookCmd,
     },
-    /// Debug: print tmux pane inventory.
+    /// Debug: print the active pane-host inventory.
     Panes,
     /// Overlay every pane in the current tmux window with its agent's
     /// state, summary, latest prompt, and latest response — then jump to
@@ -1371,6 +1371,10 @@ fn jump_to_pane(pane_id: &str) {
     match kind {
         // tmux jumps go straight through `tmux::` helpers and need no backend.
         muxa::HostKind::Tmux => jump_to_pane_tmux(pane_id),
+        muxa::HostKind::Rmux => {
+            let backend = backend_for_dispatch(kind, &fallback);
+            jump_to_pane_rmux(backend.as_ref(), pane_id);
+        }
         muxa::HostKind::Zellij => {
             let backend = backend_for_dispatch(kind, &fallback);
             jump_to_pane_zellij(backend.as_ref(), pane_id);
@@ -1409,6 +1413,7 @@ fn backend_for_dispatch(
 pub(crate) fn backend_for_kind(kind: muxa::HostKind) -> muxa::SharedBackend {
     match kind {
         muxa::HostKind::Tmux => std::sync::Arc::new(muxa::TmuxBackend::new()),
+        muxa::HostKind::Rmux => std::sync::Arc::new(muxa::RmuxBackend::new()),
         muxa::HostKind::Zellij => std::sync::Arc::new(muxa::ZellijBackend::new()),
         muxa::HostKind::Herdr => std::sync::Arc::new(muxa::backend::herdr::HerdrBackend::new()),
     }
@@ -1535,6 +1540,15 @@ fn jump_to_pane_tmux(pane_id: &str) {
 fn jump_to_pane_zellij(backend: &dyn muxa::PaneBackend, pane_id: &str) {
     if !backend.focus_pane(pane_id) {
         eprintln!("muxa: zellij focus-pane-with-id {pane_id} failed — pane may have closed");
+    }
+}
+
+/// Jump within the rmux client associated with the native `$RMUX` endpoint.
+/// Full bare-terminal attach is intentionally outside the initial backend
+/// slice; focus still covers watch/dashboard usage launched from rmux itself.
+fn jump_to_pane_rmux(backend: &dyn muxa::PaneBackend, pane_id: &str) {
+    if !backend.focus_pane(pane_id) {
+        eprintln!("muxa: rmux select-pane {pane_id} failed — pane may have closed");
     }
 }
 
@@ -2007,6 +2021,7 @@ fn cmd_panes() {
 fn empty_pane_hint(backend: &dyn muxa::PaneBackend) -> &'static str {
     match backend.kind() {
         muxa::HostKind::Tmux => "(no tmux panes — server may be down)",
+        muxa::HostKind::Rmux => "(no rmux panes — server may be down or endpoint unreachable)",
         muxa::HostKind::Zellij if !backend.caps().current_command => {
             "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
         }
@@ -2355,6 +2370,7 @@ mod tests {
         // process-global fallback — a herdr row jumps via herdr even when
         // the shell is tmux-primary, and vice versa.
         assert_eq!(dispatch_kind("%3", HostKind::Herdr), HostKind::Tmux);
+        assert_eq!(dispatch_kind("rmux:%3", HostKind::Tmux), HostKind::Rmux);
         assert_eq!(dispatch_kind("herdr:abc", HostKind::Tmux), HostKind::Herdr);
         assert_eq!(dispatch_kind("zellij:7", HostKind::Tmux), HostKind::Zellij);
         // Unrecognized ids fall back to the process-global host.

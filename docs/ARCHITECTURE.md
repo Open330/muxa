@@ -47,7 +47,7 @@ for history/reporting views, and can drive agents back through the socket
 | `muxad` | Long-running daemon. Owns the registry, IPC server, background tasks, and optional dashboard. |
 | `muxa` | CLI for status, watch, attend, recap, stats, reports, activity queries, init, hook entrypoints, and the `mcp` control server. |
 | Agent adapters | Translate Claude/Codex/Gemini hook events into muxa state transitions. |
-| Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, herdr, zellij). The daemon can observe several at once; each pane id is namespaced by host. |
+| Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, rmux, herdr, zellij). The daemon can observe several at once; each non-tmux pane id is namespaced by host. |
 | herdr bridge | Translates herdr's own `agent_status` stream into synthetic rows for agents muxa has no hooks for. |
 | Screen detection | Classifies hook-less agents (cursor, amp, …) from pane captures against TOML manifests; synthetic, hook-authoritative. |
 | Activity ledger | Append-only duration source for state/foreground/human intervals. |

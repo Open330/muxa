@@ -459,11 +459,10 @@ pub struct PaneInfo {
     /// truncated lines from older tmux) leave it zeroed out, and downstream
     /// discovery treats `0` as "no process tree to walk."
     pub pane_pid: u32,
-    /// Short name of the tmux server socket this pane lives on (the socket
-    /// file's basename, e.g. `default` or `amux`). Pane ids are only unique
-    /// per server, so consumers matching by pane id use this to
-    /// disambiguate. `None` when the row came from a bare `tmux` call whose
-    /// socket couldn't be named (or from a backend without sockets).
+    /// Server endpoint identity for this pane. tmux rows use a short socket
+    /// name (for example `default`); rmux rows use the full native endpoint.
+    /// Pane ids are only unique per server, so consumers matching by pane id
+    /// use this to disambiguate. `None` when the backend cannot name one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
 }

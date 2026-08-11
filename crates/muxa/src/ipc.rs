@@ -1002,6 +1002,27 @@ fn resolve_backend<'a>(
     }
 }
 
+/// Resolve the one recorded endpoint for a pane-id control operation.
+/// Pane ids repeat across tmux and rmux servers, so silently choosing the
+/// first `HashMap` row could inject into an unrelated pane. Duplicate agents on
+/// the same endpoint are harmless; distinct endpoints are an explicit error.
+fn unique_pane_endpoint(pane: &str, agents: &[Agent]) -> Result<Option<String>, String> {
+    let mut endpoints = agents
+        .iter()
+        .filter_map(|agent| agent.tmux_socket.as_deref())
+        .map(|endpoint| crate::backend::pane_endpoint_identity(Some(pane), endpoint))
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    match endpoints.as_slice() {
+        [] => Ok(None),
+        [endpoint] => Ok(Some(endpoint.clone())),
+        _ => Err(format!(
+            "ambiguous pane {pane}: it exists on multiple endpoints; use socket-scoped dashboard control"
+        )),
+    }
+}
+
 async fn collaboration_participants(
     store: &SharedStore,
     backends: &[SharedBackend],
@@ -1139,9 +1160,16 @@ async fn handle(
                     // register here with pane ids muxa can't correlate —
                     // unmappable `%NN` ghost rows. Ack it either way so the
                     // agent's hook never sees an error on its critical path.
-                    if crate::tmux::scanner::event_tmux_socket_in_scope(
-                        event.id().tmux_socket.as_deref(),
-                    ) {
+                    let pane_host = event
+                        .id()
+                        .pane
+                        .as_deref()
+                        .and_then(crate::backend::pane_id_host_kind);
+                    let in_scope = pane_host == Some(HostKind::Rmux)
+                        || crate::tmux::scanner::event_tmux_socket_in_scope(
+                            event.id().tmux_socket.as_deref(),
+                        );
+                    if in_scope {
                         tracing::debug!(?event, "ingest");
                         store.apply(&event).await;
                     } else {
@@ -1240,44 +1268,43 @@ async fn handle(
                             // the wrong one. `None` for hosts without a server
                             // concept (herdr) or an untracked pane, which falls
                             // back to the env-scoped default.
-                            let socket = store
-                                .by_pane(&pane)
-                                .await
-                                .into_iter()
-                                .find_map(|a| a.tmux_socket);
-                            // `send_text_on` is a blocking shell-out / socket
-                            // call, so run it off the async worker. The text and
-                            // the submit CR are TWO non-atomic injections, so
-                            // report the outcomes distinctly (`sent` /
-                            // `submitted`): a caller that sees `sent:true,
-                            // submitted:false` knows the text already landed and
-                            // must NOT resend it. The submit CR is attempted only
-                            // when the text landed — never commit a half-sent
-                            // line, and never let a CR failure masquerade as a
-                            // text failure (which would drive a double-inject
-                            // retry).
-                            let (sent, submitted) = tokio::task::spawn_blocking(move || {
-                                let s = socket.as_deref();
-                                let sent = target.send_text_on(s, &pane, &text);
-                                let submitted = if sent && submit {
-                                    if !text.is_empty() {
-                                        std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+                            let agents = store.by_pane(&pane).await;
+                            match unique_pane_endpoint(&pane, &agents) {
+                                Err(error) => Response::err(error),
+                                Ok(socket) => {
+                                    // `send_text_on` is a blocking shell-out /
+                                    // socket call, so run it off the async worker.
+                                    // Text and submit CR are TWO non-atomic
+                                    // injections; report the outcomes separately.
+                                    let (sent, submitted) =
+                                        tokio::task::spawn_blocking(move || {
+                                            let s = socket.as_deref();
+                                            let sent = target.send_text_on(s, &pane, &text);
+                                            let submitted = if sent && submit {
+                                                if !text.is_empty() {
+                                                    std::thread::sleep(
+                                                        crate::backend::PROMPT_SUBMIT_GRACE,
+                                                    );
+                                                }
+                                                target.send_text_on(s, &pane, "\r")
+                                            } else {
+                                                false
+                                            };
+                                            (sent, submitted)
+                                        })
+                                        .await
+                                        .unwrap_or((false, false));
+                                    if sent {
+                                        tracing::debug!(submit, submitted, "send_prompt");
+                                        Response::with_send_result(sent, submitted)
+                                    } else {
+                                        // Nothing landed — safe for the caller to
+                                        // retry the whole send.
+                                        Response::err(
+                                            "send_text failed: pane gone or host unreachable",
+                                        )
                                     }
-                                    target.send_text_on(s, &pane, "\r")
-                                } else {
-                                    false
-                                };
-                                (sent, submitted)
-                            })
-                            .await
-                            .unwrap_or((false, false));
-                            if sent {
-                                tracing::debug!(submit, submitted, "send_prompt");
-                                Response::with_send_result(sent, submitted)
-                            } else {
-                                // Nothing landed — safe for the caller to retry
-                                // the whole send.
-                                Response::err("send_text failed: pane gone or host unreachable")
+                                }
                             }
                         }
                     }
@@ -1294,17 +1321,18 @@ async fn handle(
                             let target = target.clone();
                             // Capture the RIGHT `%5` by pinning to the pane's
                             // recorded server (see send_prompt above).
-                            let socket = store
-                                .by_pane(&pane)
-                                .await
-                                .into_iter()
-                                .find_map(|a| a.tmux_socket);
-                            let text = tokio::task::spawn_blocking(move || {
-                                target.capture_pane_on(socket.as_deref(), &pane)
-                            })
-                            .await
-                            .unwrap_or(None);
-                            Response::with_capture(text)
+                            let agents = store.by_pane(&pane).await;
+                            match unique_pane_endpoint(&pane, &agents) {
+                                Err(error) => Response::err(error),
+                                Ok(socket) => {
+                                    let text = tokio::task::spawn_blocking(move || {
+                                        target.capture_pane_on(socket.as_deref(), &pane)
+                                    })
+                                    .await
+                                    .unwrap_or(None);
+                                    Response::with_capture(text)
+                                }
+                            }
                         }
                     }
                 }
@@ -3714,6 +3742,86 @@ mod tests {
             sockets.lock().unwrap().clone(),
             vec![Some("amux".to_string()), Some("amux".to_string())],
         );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rmux_send_prompt_routes_namespace_and_preserves_full_endpoint() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-rmux.sock");
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: Some("/tmp/rmux-501/default".into()),
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "rmux-sess".into(),
+                    surface: None,
+                    pane: Some("rmux:%5".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let (backend, sends, sockets) =
+            RecordingBackend::new_full(HostKind::Rmux, true, true, false);
+        let (tx, handle) = serve(&sock, store, vec![backend]).await;
+
+        Client::new(sock.clone())
+            .send_prompt("rmux:%5", "go", false)
+            .await
+            .expect("rmux send_prompt ok");
+
+        assert_eq!(
+            sends.lock().unwrap().clone(),
+            vec![("rmux:%5".to_string(), "go".to_string())],
+        );
+        assert_eq!(
+            sockets.lock().unwrap().clone(),
+            vec![Some("/tmp/rmux-501/default".to_string())],
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rmux_send_prompt_refuses_same_pane_id_on_multiple_endpoints() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-rmux-ambiguous.sock");
+        let store = Store::shared();
+        for (session_id, endpoint) in [
+            ("rmux-one", "/tmp/rmux-one/default"),
+            ("rmux-two", "/tmp/rmux-two/default"),
+        ] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        tmux_socket: Some(endpoint.into()),
+                        kind: AgentKind::ClaudeCode,
+                        session_id: session_id.into(),
+                        surface: None,
+                        pane: Some("rmux:%5".into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+
+        let (backend, sends, _sockets) =
+            RecordingBackend::new_full(HostKind::Rmux, true, true, false);
+        let (tx, handle) = serve(&sock, store, vec![backend]).await;
+
+        let error = Client::new(sock.clone())
+            .send_prompt("rmux:%5", "do not misroute", false)
+            .await
+            .expect_err("ambiguous endpoint must be refused");
+        assert!(format!("{error}").contains("multiple endpoints"));
+        assert!(sends.lock().unwrap().is_empty());
 
         tx.send(()).unwrap();
         handle.await.unwrap();

@@ -31,13 +31,14 @@ table in `~/.codex/config.toml`:
 [mcp_servers.muxa]
 command = "muxa"
 args = ["mcp"]
-env_vars = ["TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 ```
 
-This preserves the exact pane, tmux socket, and non-default muxa socket.
-For existing Codex registrations, muxa can recover a default-socket pane by
-walking the MCP process ancestry back to the pane shell. Explicit forwarding
-remains the reliable configuration for custom or multiple sockets.
+This preserves the exact pane, tmux/rmux endpoint, and non-default muxa socket.
+For existing Codex registrations, muxa can recover a default-endpoint pane by
+walking the MCP process ancestry across active backends back to the pane shell.
+Explicit forwarding remains the reliable configuration for custom or multiple
+endpoints.
 
 That runs `muxa mcp` as a stdio MCP server. Point it at a non-default socket
 with the global flag or env var if you run an isolated daemon:
@@ -112,10 +113,10 @@ it:
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
-only reaches the focused pane. tmux and herdr support it.
+only reaches the focused pane. tmux, rmux, and herdr support it.
 
-Pane ids carry their host namespace: tmux `%12`, herdr `herdr:p1`. Use the
-`pane` field from `muxa_status` verbatim.
+Pane ids carry their host namespace: tmux `%12`, rmux `rmux:%12`, herdr
+`herdr:p1`. Use the `pane` field from `muxa_status` verbatim.
 
 ### Deterministic agent launch
 
