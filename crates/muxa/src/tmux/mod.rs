@@ -249,17 +249,49 @@ fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
 /// server's full socket path and passes `-S <path>` so the command can't leak
 /// onto a different server that happens to share the pane id.
 ///
-/// Falls back to [`tmux_command_scoped`] (the `MUXA_TMUX_SOCKET`-or-default
-/// behavior) when `socket` is `None`/empty or doesn't resolve to a live
-/// server — i.e. when the agent row has no recorded socket — preserving the
-/// pre-control-plane single-server behavior.
+/// Falls back to [`tmux_command_scoped`] only when `socket` is `None`, i.e.
+/// when the caller has no recorded endpoint and explicitly requested the
+/// legacy single-server behavior. A supplied socket that no longer resolves
+/// is pinned to `/dev/null` so the command fails closed instead of leaking to
+/// the default server where the same `$N`, `@N`, or `%N` may exist.
 fn tmux_command_targeting(socket: Option<&str>) -> Command {
-    if let Some(path) = socket.and_then(resolve_socket_path) {
+    if let Some(socket) = socket {
         let mut cmd = tmux_command();
-        cmd.arg("-S").arg(path);
+        cmd.arg("-S")
+            .arg(resolve_socket_path(socket).unwrap_or_else(|| PathBuf::from("/dev/null")));
         return cmd;
     }
     tmux_command_scoped()
+}
+
+/// Build a tmux command pinned to a recorded server socket. Interactive CLI
+/// flows such as `attach-session` need the `Command` handle rather than the
+/// bounded output helper used by non-interactive controls.
+pub fn tmux_command_on(socket: Option<&str>) -> Command {
+    tmux_command_targeting(socket)
+}
+
+/// Run one tmux control command against an explicitly identified server.
+///
+/// This is intentionally narrower than exposing [`tmux_command_targeting`]:
+/// callers supply only tmux argv and receive the normal bounded error shape.
+/// Watch uses it for hierarchy-aware close/interrupt actions where `$N`, `@N`
+/// and `%N` are unsafe without the socket recorded in the topology key.
+pub fn run_control_on(socket: Option<&str>, args: &[&str]) -> Result<(), TmuxError> {
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(args);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux {}", args.join(" ")),
+    )?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
 }
 
 /// The `send-keys` argv (after any server-scope flags) for a literal text
@@ -1036,6 +1068,16 @@ mod tests {
         assert!(!needs_paste("")); // empty is a no-op, not hazardous
         assert!(!needs_paste("\r")); // lone submit CR stays on send-keys
         assert!(!needs_paste("plain text"));
+    }
+
+    #[test]
+    fn unresolved_explicit_socket_fails_closed_instead_of_using_default_server() {
+        let command = tmux_command_targeting(Some("/__muxa_missing_socket__"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-S", "/dev/null"]));
     }
 
     #[test]

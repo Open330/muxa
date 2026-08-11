@@ -61,6 +61,7 @@ pub mod snapshot;
 pub mod state;
 pub mod timeline;
 pub mod tmux;
+pub mod topology;
 
 // ---------------------------------------------------------------------------
 // Stable public surface.
@@ -78,6 +79,11 @@ pub use event::{
 pub use history::{HistoryEntry, PromptHistory};
 pub use process_tree::{WorkloadProcess, WorkloadProcessKind, WorkloadSummary};
 pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
+pub use topology::{
+    BackendEndpoint, BackendTopologyCapabilities, HierarchyCapability, PaneKey, PaneNode,
+    SessionKey, SessionNode, StateDistribution, TopologyInput, TopologyNodeKey, TopologyNodeRef,
+    TopologySessionInput, TopologySnapshot, WindowKey, WindowNode, TOPOLOGY_SCHEMA_VERSION,
+};
 
 // ---------------------------------------------------------------------------
 // Unstable wire-format constants — `pub` so daemon/readers can negotiate

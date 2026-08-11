@@ -10,12 +10,12 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │> alpha:0.0              ○ │  type or /       filter; / allows reserved first characters                      │                           │
 │                           │  Backspace/C-W   edit filter / delete previous word                              │                           │
 │                           │  Ctrl-U / Esc    clear filter; Esc again backs out / quits                       │                           │
-│                           │  ↑/↓ · j/k       move works/agents while browsing                                │                           │
-│                           │  ←/→ · h/l       return to parent / enter first child agent                      │                           │
+│                           │  ↑/↓ · j/k       move visible session/window/pane nodes                          │                           │
+│                           │  ←/→ · h/l       collapse/parent · expand/first child                            │                           │
 │                           │  gg/G · Home/End first / last selectable row                                     │                           │
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
-│                           │  Enter          attach to selected pane                                          │                           │
-│                           │  n              new/reused workspace/work + agent (dir · ticket · prompt)        │                           │
+│                           │  Enter          attach via active window/pane or exact pane                      │                           │
+│                           │  n              new window or sibling agent pane                                 │                           │
 │                           │  a / A          ask / history; d deletes one · D clears all in A                 │                           │
 │                           │                                                                                  │                           │
 │                           │Commands & inspection                                                             │                           │
@@ -25,20 +25,20 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  |              cycle list/inspector split (50/50 → 70/30 → 30/70)               │                           │
 │                           │  Alt-A          attention-only filter                                            │                           │
 │                           │  [/] · f/c      (in preview) agent / geometry / content                          │                           │
-│                           │  Enter          (in preview) compose prompt                                      │                           │
+│                           │  Enter          (in preview) jump to pinned pane                                 │                           │
 │                           │  m / M          message selected agent / mailbox (b alias)                       │                           │
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
 │                           │                                                                                  │                           │
 │                           │Sorting                                                                           │                           │
-│                           │  Alt-S/L/D/T    workspace / latest / duration / state                            │                           │
+│                           │  Alt-S/L/D/T    sibling name / latest / duration / state                         │                           │
 │                           │State markers                                                                     │                           │
 │                           │  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped            │                           │
 │                           │  TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden                  │                           │
 │                           │                                                                                  │                           │
-│                           │Quick actions (act on selected row)                                               │                           │
+│                           │Quick actions (act on selected node)                                              │                           │
 │                           │  Alt-C          copy last prompt to clipboard                                    │                           │
-│                           │  Alt-K          kill the pane (confirm popup)                                    │                           │
-│                           │  Alt-X          abort current turn (confirm popup)                               │                           │
+│                           │  Alt-K          close session/window/pane (confirm popup)                        │                           │
+│                           │  Alt-X          interrupt selected agent pane (confirm popup)                    │                           │
 │                           │  r/Ctrl-R/Alt-R force refresh while browsing                                     │                           │
 └───────────────────────────└──────────────────────────────────────────────────────────────────────────────────┘───────────────────────────┘
- j/k  move   h/l  tree   /  filter   :  commands   ⏎  prompt   o  preview   m  message   M  mailbox   ?  help
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   M  mailbox   ?  help

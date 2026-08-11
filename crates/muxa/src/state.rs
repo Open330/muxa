@@ -159,6 +159,10 @@ pub struct Subagent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub kind: AgentKind,
+    /// Agent-runtime session identity (Claude/Codex/etc.). The Rust field name
+    /// remains temporarily source-compatible, while every serialized public
+    /// boundary uses the unambiguous canonical name.
+    #[serde(rename = "agent_session_id", alias = "session_id")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<SurfaceRef>,

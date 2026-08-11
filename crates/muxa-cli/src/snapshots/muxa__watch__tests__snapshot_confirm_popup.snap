@@ -25,4 +25,4 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                                                          ││                                                          │
 │                                                          ││                                                          │
 └──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
- j/k  move   h/l  tree   /  filter   :  commands   ⏎  prompt   o  preview   m  message   M  mailbox   ?  help
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   M  mailbox   ?  help

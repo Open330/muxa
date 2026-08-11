@@ -1,0 +1,20 @@
+---
+source: crates/muxa-cli/src/watch.rs
+expression: "snapshot_helpers::buffer_string(&terminal)"
+---
+ muxa watch   2 sessions · 3 windows · 4 panes   sort NAME   <clock>
+j/k move  ·  type or / filter  ·  : commands  ·  ? help
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌ Topology ──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  STATE   SESSION / WINDOW / PANE                           AGE     SUMMARY                                         │
+│  ▶       tmux:amux ▸ junia                                 —       1 window · 1 agent                              │
+│  ◆ ● ○   tmux:default ▼ muxa                               —       2 windows · 3 agents                            │
+│> ◆ ●       ├─ ▼ TEST-0001                                  <rel> 2 agents · reviewing changes / editing middlewar│
+│  ●         │ ├─   %12  codex                               <rel> editing middleware                              │
+│  ◆         │ └─   %13  codex                               <rel> reviewing changes                               │
+│  ○         └─ ▼ TEST-0002                                  <rel> docs update                                     │
+│  ○           └─   %18  codex                               <rel> docs update                                     │
+│                                                                                                                    │
+│                                                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   M  mailbox   ?  help

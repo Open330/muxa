@@ -759,7 +759,7 @@ mod tests {
         session.work = Some("TEST-0001".into());
         let args = tmux_args(&session, Path::new("/tmp"), "codex --yolo").unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-s", "muxa"]));
-        assert!(args.windows(2).any(|pair| pair == ["-n", "test-0001"]));
+        assert!(args.windows(2).any(|pair| pair == ["-n", "TEST-0001"]));
     }
 
     #[test]

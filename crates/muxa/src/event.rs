@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 /// when the IPC envelope schema evolves. Pinning to a specific value across
 /// muxa upgrades is not supported; treat it as a runtime negotiation token,
 /// not a stable API constant.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +78,8 @@ pub struct SurfaceRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentId {
     pub kind: AgentKind,
+    /// Agent-runtime session identity, distinct from a tmux session id.
+    #[serde(rename = "agent_session_id", alias = "session_id")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<SurfaceRef>,

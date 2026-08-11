@@ -30,6 +30,8 @@ const PANE_WORK_OPTION: &str = "@muxa_agent_work_id";
 const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
 const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}";
 const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}";
+const WINDOW_IDENTITY_FORMAT: &str =
+    "#{window_id}\t#{session_id}\t#{session_name}\t#{window_name}\t#{automatic-rename}";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ManagedAgentPane {
@@ -63,6 +65,16 @@ pub struct WorkspaceInfo {
     pub attached_clients: u32,
     pub windows: u32,
     pub works: Vec<WorkInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WindowRenameResult {
+    pub window_id: String,
+    pub session_id: String,
+    pub session_name: String,
+    pub previous_name: String,
+    pub name: String,
+    pub automatic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -161,6 +173,26 @@ pub struct AgentControlArgs {
 }
 
 #[derive(Debug, clap::Args)]
+pub struct WindowRenameArgs {
+    /// New stable display name. Whitespace is normalized to `-`.
+    #[arg(
+        value_name = "NAME",
+        required_unless_present = "auto",
+        conflicts_with = "auto"
+    )]
+    pub name: Option<String>,
+    /// Exact window target such as @42. Defaults to the current tmux pane's window.
+    #[arg(long, value_name = "TARGET")]
+    pub window: Option<String>,
+    /// Restore tmux's dynamic process-based automatic window name.
+    #[arg(long)]
+    pub auto: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct WorkListArgs {
     /// Limit work windows to one managed workspace.
     #[arg(long)]
@@ -237,6 +269,24 @@ pub fn run_agent_control(args: AgentControlArgs) -> Result<()> {
     }
     let result = control_agent(&args.pane, args.action, args.yes)?;
     print_result(&result, args.json)
+}
+
+pub fn run_window_rename(args: WindowRenameArgs) -> Result<()> {
+    let result = rename_window(args.window.as_deref(), args.name.as_deref(), args.auto)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.automatic {
+        println!(
+            "window {} ({}) now uses automatic name {:?}",
+            result.window_id, result.session_name, result.name
+        );
+    } else {
+        println!(
+            "renamed window {} ({}) from {:?} to {:?}",
+            result.window_id, result.session_name, result.previous_name, result.name
+        );
+    }
+    Ok(())
 }
 
 pub fn run_work_list(args: WorkListArgs) -> Result<()> {
@@ -517,9 +567,117 @@ pub fn session_name_for_workspace(workspace: &str) -> Result<String> {
 }
 
 pub fn window_name_for_work(work: &str) -> Result<String> {
-    Ok(sanitize_window_name(
-        &normalize_work_id(work)?.to_ascii_lowercase(),
-    ))
+    Ok(sanitize_window_name(&normalize_work_id(work)?))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowIdentity {
+    window_id: String,
+    session_id: String,
+    session_name: String,
+    name: String,
+}
+
+fn rename_window(
+    target: Option<&str>,
+    name: Option<&str>,
+    automatic: bool,
+) -> Result<WindowRenameResult> {
+    let before = resolve_window_identity(target)?;
+    if automatic {
+        set_window_automatic_rename(&before.window_id, true)?;
+    } else {
+        let name = normalize_window_name(required(name, "window rename requires NAME or --auto")?)?;
+        ensure_window_name_available(&before, &name)?;
+        // Pin the mode explicitly. `rename-window` currently disables automatic
+        // rename itself, but relying on that side effect makes the policy
+        // sensitive to tmux behavior changes.
+        set_window_automatic_rename(&before.window_id, false)?;
+        tmux_status(&["rename-window", "-t", &before.window_id, &name])?;
+    }
+    let after = resolve_window_identity(Some(&before.window_id))?;
+    Ok(WindowRenameResult {
+        window_id: after.window_id,
+        session_id: after.session_id,
+        session_name: after.session_name,
+        previous_name: before.name,
+        name: after.name,
+        automatic,
+    })
+}
+
+fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
+    let target = target
+        .filter(|target| !target.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("TMUX_PANE")
+                .ok()
+                .filter(|pane| !pane.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("window target is required outside tmux; pass --window @N")
+        })?;
+    let output = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        WINDOW_IDENTITY_FORMAT,
+    ])?;
+    parse_window_identity(output.trim()).ok_or_else(|| {
+        anyhow::anyhow!("tmux target {target:?} did not resolve to a complete window identity")
+    })
+}
+
+fn parse_window_identity(line: &str) -> Option<WindowIdentity> {
+    let mut fields = line.splitn(5, '\t');
+    let window_id = fields.next()?.trim();
+    let session_id = fields.next()?.trim();
+    let session_name = fields.next()?;
+    let name = fields.next()?;
+    // Consume the mode field as part of validating the complete format even
+    // though the caller already knows which mode it requested.
+    fields.next()?;
+    if !window_id.starts_with('@') || !session_id.starts_with('$') || session_name.is_empty() {
+        return None;
+    }
+    Some(WindowIdentity {
+        window_id: window_id.into(),
+        session_id: session_id.into(),
+        session_name: session_name.into(),
+        name: name.into(),
+    })
+}
+
+fn ensure_window_name_available(window: &WindowIdentity, name: &str) -> Result<()> {
+    let rows = tmux_output(&[
+        "list-windows",
+        "-t",
+        &window.session_id,
+        "-F",
+        "#{window_id}\t#{window_name}",
+    ])?;
+    if rows.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(window_id, current)| window_id != window.window_id && current == name)
+    }) {
+        bail!(
+            "window name {name:?} already exists in session {} ({})",
+            window.session_name,
+            window.session_id
+        );
+    }
+    Ok(())
+}
+
+fn set_window_automatic_rename(window: &str, enabled: bool) -> Result<()> {
+    set_option(
+        OptionScope::Window,
+        window,
+        "automatic-rename",
+        if enabled { "on" } else { "off" },
+    )
 }
 
 pub fn mark_workspace(session: &str, workspace: &str, cwd: &Path) -> Result<()> {
@@ -548,6 +706,7 @@ pub fn mark_work(window: &str, workspace: &str, work: &str, cwd: &Path) -> Resul
     set_option(OptionScope::Window, window, WORK_CWD_OPTION, cwd)?;
     set_option(OptionScope::Window, window, MANAGED_WORK_OPTION, "1")?;
     set_option(OptionScope::Window, window, WORKSPACE_ID_OPTION, &workspace)?;
+    set_window_automatic_rename(window, false)?;
     Ok(())
 }
 
@@ -836,6 +995,31 @@ fn sanitize_window_name(name: &str) -> String {
     sanitize_session_name(name)
 }
 
+fn normalize_window_name(raw: &str) -> Result<String> {
+    let value = metadata(raw, 64)?;
+    if value.chars().any(char::is_control) {
+        bail!("window name cannot contain control characters");
+    }
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !normalized.ends_with('-') {
+                normalized.push('-');
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        bail!("window name cannot be empty");
+    }
+    if normalized.len() > 64 {
+        bail!("window name is too long after normalization (max 64 bytes)");
+    }
+    Ok(normalized)
+}
+
 fn unique_name(base: String, exists: impl Fn(&str) -> bool) -> String {
     if !exists(&base) {
         return base;
@@ -983,13 +1167,37 @@ mod tests {
         assert_eq!(normalize_work_id(" test-0001 ").unwrap(), "TEST-0001");
         assert!(normalize_work_id("bad\nid").is_err());
         assert_eq!(
-            sanitize_window_name(
-                &normalize_work_id("TEST.0001: Review")
-                    .unwrap()
-                    .to_lowercase()
-            ),
-            "test-0001-review"
+            window_name_for_work("TEST.0001: Review").unwrap(),
+            "TEST-0001-REVIEW"
         );
+    }
+
+    #[test]
+    fn explicit_window_names_preserve_case_and_normalize_whitespace() {
+        assert_eq!(
+            normalize_window_name("  CAL-7175  auth refactor  ").unwrap(),
+            "CAL-7175-auth-refactor"
+        );
+        assert_eq!(
+            normalize_window_name("topology-watch").unwrap(),
+            "topology-watch"
+        );
+        assert!(normalize_window_name("\n").is_err());
+    }
+
+    #[test]
+    fn window_identity_parser_requires_stable_native_ids() {
+        assert_eq!(
+            parse_window_identity("@42\t$7\tmuxa\tCAL-7175\t0"),
+            Some(WindowIdentity {
+                window_id: "@42".into(),
+                session_id: "$7".into(),
+                session_name: "muxa".into(),
+                name: "CAL-7175".into(),
+            })
+        );
+        assert!(parse_window_identity("CAL-7175\t$7\tmuxa\tname\t0").is_none());
+        assert!(parse_window_identity("@42\tmuxa\tmuxa\tname\t0").is_none());
     }
 
     #[test]

@@ -595,12 +595,28 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                     return Ok(error_result(&format!("status failed: {error}")));
                 }
             };
+            let topology_agents = agents.clone();
             let mut payload = json!({ "agents": agents });
             if pane.is_none() {
-                match tokio::task::spawn_blocking(crate::tmux_work::list_workspaces).await {
-                    Ok(Ok(workspaces)) => payload["tmux"] = json!({ "workspaces": workspaces }),
-                    Ok(Err(error)) => payload["tmux_error"] = json!(error.to_string()),
-                    Err(error) => payload["tmux_error"] = json!(error.to_string()),
+                match tokio::task::spawn_blocking(move || {
+                    let inputs = muxa::active_backends()
+                        .into_iter()
+                        .map(|backend| {
+                            muxa::TopologyInput::new(backend.kind(), backend.list_panes())
+                        })
+                        .collect();
+                    muxa::TopologySnapshot::build(
+                        time::OffsetDateTime::now_utc(),
+                        inputs,
+                        topology_agents,
+                    )
+                })
+                .await
+                {
+                    Ok(topology) => {
+                        payload = json!({ "topology": topology });
+                    }
+                    Err(error) => payload["topology_error"] = json!(error.to_string()),
                 }
             }
             if let Some(pane) = pane {

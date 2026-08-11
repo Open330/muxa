@@ -28,7 +28,7 @@ const WATCH_COLUMN_KEYS: &[&str] = &[
     "workload",
     "prompt",
     "activity",
-    "workspace_time",
+    "duration",
 ];
 
 /// All known placeholder names accepted in `[watch.detail] template`. A
@@ -1053,23 +1053,21 @@ pub struct WatchConfig {
     /// `Ctrl-E` changes the badge.
     #[serde(default)]
     pub collaboration_mode: Option<WatchCollaborationMode>,
-    /// Row granularity for `muxa watch`. Defaults to `work`.
-    ///
-    /// `work` (default) collapses all panes in the same managed tmux window
-    /// into one row, using the most recently active agent as that work's
-    /// representative. `pane` is the finer-grained view: one row per tracked
-    /// agent / bare pane.
+    /// Default expansion depth for `muxa watch`. Defaults to `window`.
     pub view: WatchView,
+    /// Presentation of the same canonical topology. Defaults to `tree`.
+    #[serde(default)]
+    pub layout: WatchLayout,
     /// Expanded detail line shown under the currently-selected row.
     pub detail: DetailConfig,
     /// Ordered list of sort keys applied to the agent rows in `muxa watch`.
     /// Stale agents (pane closed) always bucket at the end, regardless of
     /// what's listed here.
     ///
-    /// Default: `["state", "workspace", "latest"]` — floats needs-attention
+    /// Default: `["state", "name", "latest"]` — floats needs-attention
     /// rows (error / input / choice) to the top so a blocked agent is never
-    /// buried below busy/idle ones, then groups by workspace, then floats
-    /// the most-recently-active agent inside each group. `t` (sort by state)
+    /// buried below busy/idle ones, then sorts siblings by name and recent
+    /// activity. `t` (sort by state)
     /// and any user-configured order still take over verbatim.
     pub sort: Vec<WatchSortKey>,
     /// What the summary column shows, and in what priority order.
@@ -1140,11 +1138,24 @@ pub enum PreviewContent {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchView {
-    Pane,
+    /// Show session roots; children start collapsed.
+    Session,
+    /// Show sessions and their windows; pane children start collapsed.
     #[default]
-    Work,
-    /// k9s-style swarm console: work clusters, animated dot spinners for
-    /// working/starting agents, and an expandable subagent tree.
+    Window,
+    /// Show the complete session → window → pane ancestry.
+    Pane,
+}
+
+/// Presentation of the canonical watch topology.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchLayout {
+    /// Selectable session → window → pane tree.
+    #[default]
+    Tree,
+    /// Dense animated collaboration-room clusters. Node identities and the
+    /// requested topology depth remain unchanged.
     Swarm,
 }
 
@@ -1207,9 +1218,8 @@ impl Default for PreviewConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchSortKey {
-    /// tmux workspace/session name, ascending. Resolved against pane inventory
-    /// because agent records only carry `pane_id`.
-    Workspace,
+    /// Session/window/pane node name, ascending within its siblings.
+    Name,
     /// `last_activity_at` descending — most recently updated first. The
     /// useful default to surface "what's moving right now" without
     /// scrolling.
@@ -1220,13 +1230,13 @@ pub enum WatchSortKey {
     /// not alphabetical.
     #[serde(alias = "st")]
     State,
-    /// Workspace/session foreground duration descending. In pane view this resolves
-    /// each pane's tmux workspace duration; panes without a known duration
-    /// duration sort as zero.
-    #[serde(alias = "duration", alias = "dur")]
-    WorkspaceTime,
+    /// Hierarchy-specific duration descending within siblings. Session rows use
+    /// attached duration when it is unambiguous, windows use their earliest agent
+    /// lifetime, and panes use their current state age.
+    #[serde(alias = "dur")]
+    Duration,
     /// tmux window index, then pane index, both ascending and parsed
-    /// numerically so `10` sorts after `2`. Combined with `Workspace`, this
+    /// numerically so `10` sorts after `2`. Combined with `Name`, this
     /// reproduces the tmux-native pane ordering.
     Pane,
     /// Raw `pane_id` (e.g. `%42`) lexicographic ascending. Mostly useful
@@ -1259,7 +1269,7 @@ impl Default for WatchConfig {
         widths.insert("prompt".to_string(), WidthSpec::Min(20));
         widths.insert("activity".to_string(), WidthSpec::Length(6));
         widths.insert("workload".to_string(), WidthSpec::Length(8));
-        widths.insert("workspace_time".to_string(), WidthSpec::Length(6));
+        widths.insert("duration".to_string(), WidthSpec::Length(6));
         Self {
             theme: None,
             columns,
@@ -1267,20 +1277,21 @@ impl Default for WatchConfig {
             collaboration_kind: None,
             collaboration_mode: None,
             widths,
-            view: WatchView::Work,
+            view: WatchView::Window,
+            layout: WatchLayout::Tree,
             summary: WatchSummary::default(),
             detail: DetailConfig::default(),
             // Lead with State so needs-attention rows (error / input /
             // choice) float to the top and a blocked agent is never buried
-            // below busy/idle ones. Then group by workspace and bring the most
-            // recently active agent in each group to the top — covers "who
+            // below busy/idle ones. Then sort siblings by name and bring the most
+            // recently active node in each group to the top — covers "who
             // needs me", "what's moving", and "where is it" at a glance,
             // without losing the grouping shipped in c9a6572. Users who
-            // preferred workspace-first order can set
-            // `sort = ["workspace", "latest"]`.
+            // preferred name-first order can set
+            // `sort = ["name", "latest"]`.
             sort: vec![
                 WatchSortKey::State,
-                WatchSortKey::Workspace,
+                WatchSortKey::Name,
                 WatchSortKey::Activity,
             ],
             hide_paneless: true,
@@ -1585,13 +1596,13 @@ broken = "what"
     }
 
     #[test]
-    fn watch_sort_default_leads_with_state_then_workspace_then_activity() {
+    fn watch_sort_default_leads_with_state_then_name_then_activity() {
         let cfg = WatchConfig::default();
         assert_eq!(
             cfg.sort,
             vec![
                 WatchSortKey::State,
-                WatchSortKey::Workspace,
+                WatchSortKey::Name,
                 WatchSortKey::Activity
             ]
         );
@@ -1621,8 +1632,8 @@ sort = ["activity", "act", "latest", "st", "dur", "duration"]
                 WatchSortKey::Activity,
                 WatchSortKey::Activity,
                 WatchSortKey::State,
-                WatchSortKey::WorkspaceTime,
-                WatchSortKey::WorkspaceTime,
+                WatchSortKey::Duration,
+                WatchSortKey::Duration,
             ]
         );
     }
@@ -1635,27 +1646,34 @@ sort = ["activity", "act", "latest", "st", "dur", "duration"]
         }
 
         let rendered = toml::to_string(&SortOnly {
-            sort: vec![WatchSortKey::Workspace, WatchSortKey::Activity],
+            sort: vec![WatchSortKey::Name, WatchSortKey::Activity],
         })
         .unwrap();
-        assert_eq!(rendered.trim(), "sort = [\"workspace\", \"latest\"]");
+        assert_eq!(rendered.trim(), "sort = [\"name\", \"latest\"]");
     }
 
     #[test]
-    fn parses_watch_work_view() {
-        let cfg: Config = toml::from_str("[watch]\nview = \"work\"\n").unwrap();
-        assert_eq!(cfg.watch.view, WatchView::Work);
+    fn parses_watch_window_view() {
+        let cfg: Config = toml::from_str("[watch]\nview = \"window\"\n").unwrap();
+        assert_eq!(cfg.watch.view, WatchView::Window);
     }
 
-    /// The default view is `work` — the fleet-at-a-glance window granularity.
+    /// The default view is `window` — the fleet-at-a-glance granularity.
     /// Both the struct default and a config that omits `view` resolve to it,
-    /// so an empty `~/.config/muxa/config.toml` lands on work view.
+    /// so an empty `~/.config/muxa/config.toml` lands on window view.
     #[test]
-    fn default_watch_view_is_work() {
-        assert_eq!(WatchConfig::default().view, WatchView::Work);
-        assert_eq!(WatchView::default(), WatchView::Work);
+    fn default_watch_view_is_window() {
+        assert_eq!(WatchConfig::default().view, WatchView::Window);
+        assert_eq!(WatchView::default(), WatchView::Window);
         let cfg: Config = toml::from_str("[watch]\n").unwrap();
-        assert_eq!(cfg.watch.view, WatchView::Work);
+        assert_eq!(cfg.watch.view, WatchView::Window);
+    }
+
+    #[test]
+    fn parses_watch_layout_independently_from_view() {
+        let cfg: Config = toml::from_str("[watch]\nview = \"pane\"\nlayout = \"swarm\"\n").unwrap();
+        assert_eq!(cfg.watch.view, WatchView::Pane);
+        assert_eq!(cfg.watch.layout, WatchLayout::Swarm);
     }
 
     /// `pane` is now the opt-in (non-default) granularity; setting it
@@ -1687,13 +1705,10 @@ sort = ["activity", "act", "latest", "st", "dur", "duration"]
     fn parses_watch_sort_with_multiple_keys() {
         let toml = r#"
 [watch]
-sort = ["workspace", "pane"]
+sort = ["name", "pane"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            cfg.watch.sort,
-            vec![WatchSortKey::Workspace, WatchSortKey::Pane]
-        );
+        assert_eq!(cfg.watch.sort, vec![WatchSortKey::Name, WatchSortKey::Pane]);
     }
 
     #[test]
@@ -1706,6 +1721,22 @@ sort = ["workspace", "pane"]
 sort = ["nope"]
 "#;
         assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn legacy_workspace_sort_names_are_not_accepted() {
+        for key in ["workspace", "workspace_time"] {
+            let toml = format!("[watch]\nsort = [\"{key}\"]\n");
+            assert!(toml::from_str::<Config>(&toml).is_err(), "accepted {key}");
+        }
+    }
+
+    #[test]
+    fn legacy_work_and_swarm_view_names_are_not_accepted() {
+        for view in ["work", "swarm"] {
+            let toml = format!("[watch]\nview = \"{view}\"\n");
+            assert!(toml::from_str::<Config>(&toml).is_err(), "accepted {view}");
+        }
     }
 
     #[test]

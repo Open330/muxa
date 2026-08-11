@@ -2774,7 +2774,7 @@ mod tests {
 
         // Peel the `data:` line(s) out of the rendered SSE block and confirm
         // they deserialize to the `Transition` wire shape (`from`, `to`,
-        // `agent.session_id`). `Transition` itself isn't `Deserialize` (it's
+        // `agent.agent_session_id`). `Transition` itself isn't `Deserialize` (it's
         // an outbound-only type), so we verify shape via `serde_json::Value`.
         let data_payload: String = body
             .lines()
@@ -2789,7 +2789,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("data payload must be JSON: {e} (raw: {data_payload})"));
         assert_eq!(v["from"], "starting");
         assert_eq!(v["to"], "idle");
-        assert_eq!(v["agent"]["session_id"], "s1");
+        assert_eq!(v["agent"]["agent_session_id"], "s1");
         assert_eq!(v["agent"]["kind"], "claude_code");
     }
 

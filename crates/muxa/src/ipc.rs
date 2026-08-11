@@ -348,6 +348,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// semver-additive capability the server supports; clients use the list
 /// to feature-gate behaviour without re-reading `protocol`.
 const CAPABILITIES: &[&str] = &[
+    "agent_session_id",
     "waiting_choice",
     "needs_choice",
     "rate_limited",
@@ -828,7 +829,17 @@ fn downgrade_wire(v: &mut serde_json::Value, protocol: u32) {
             }
         }
         serde_json::Value::Array(xs) => xs.iter_mut().for_each(|x| downgrade_wire(x, protocol)),
-        serde_json::Value::Object(m) => m.values_mut().for_each(|x| downgrade_wire(x, protocol)),
+        serde_json::Value::Object(m) => {
+            // `agent_session_id` is the v4 canonical name. Older peers still
+            // expect the historical `session_id` key, so preserve it on
+            // negotiated v1-v3 responses without emitting both names.
+            if protocol < 4 {
+                if let Some(value) = m.remove("agent_session_id") {
+                    m.insert("session_id".to_string(), value);
+                }
+            }
+            m.values_mut().for_each(|x| downgrade_wire(x, protocol));
+        }
         _ => {}
     }
 }
@@ -4404,6 +4415,19 @@ mod tests {
                 lagged_markers: true
             }
         ));
+    }
+
+    #[test]
+    fn v3_wire_downgrade_restores_legacy_agent_session_key() {
+        let mut value = serde_json::json!({
+            "agent": {
+                "agent_session_id": "codex-session",
+                "kind": "codex"
+            }
+        });
+        downgrade_wire(&mut value, 3);
+        assert_eq!(value["agent"]["session_id"], "codex-session");
+        assert!(value["agent"].get("agent_session_id").is_none());
     }
 
     /// `is_lagged_marker` recognizes the daemon's overflow marker and

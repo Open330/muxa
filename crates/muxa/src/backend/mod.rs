@@ -295,7 +295,20 @@ fn detect_from_override(read: &impl Fn(&str) -> Option<String>) -> Option<HostKi
 /// Identity of the pane host. Surfaced through telemetry and log lines so
 /// operators running both backends can tell which one a given event went
 /// through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::Display,
+)]
+#[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum HostKind {
     Tmux,

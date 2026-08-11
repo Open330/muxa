@@ -9,8 +9,8 @@
 //!   Backspace edits and Esc clears before quitting.
 //! - Navigation: arrows always move between sessions. While the filter is
 //!   empty, `hjkl`, `gg` / `G`, Home / End, page keys, and Ctrl-U / Ctrl-D add
-//!   conventional TUI navigation. Enter opens the prompt composer (`Enter`
-//!   again on an empty prompt attaches).
+//!   conventional TUI navigation. Enter jumps through the selected node's
+//!   active descendants; `m` owns prompt/message composition.
 //! - Inspection: `Alt-P` opens preview, `Alt-I` toggles the responsive split
 //!   inspector, and `Alt-E` opens the persistent transition inbox.
 //! - Destructive and sort actions retain Alt chords (`Alt-K`, `Alt-X`, …),
@@ -20,6 +20,7 @@
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
 
+use std::cmp::Ordering;
 use std::future::Future;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -40,8 +41,8 @@ use muxa::collaboration::{
     NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use muxa::config::{
-    IconSet, WatchCollaborationMode, WatchConfig, WatchSortKey, WatchSummary, WatchTheme,
-    WatchView, WidthSpec,
+    IconSet, WatchCollaborationMode, WatchConfig, WatchLayout, WatchSortKey, WatchSummary,
+    WatchTheme, WatchView, WidthSpec,
 };
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
@@ -49,7 +50,11 @@ use muxa::process_tree::WorkloadProcessKind;
 use muxa::session_activity::SessionActivity;
 use muxa::state::Agent;
 use muxa::tmux::{PaneInfo, SessionInfo};
-use muxa::{ActivityEntry, HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind};
+use muxa::{
+    ActivityEntry, BackendEndpoint, HumanInteractionEntry, HumanInteractionInput,
+    HumanInteractionKind, PaneKey, PaneNode, SessionNode, StateDistribution, TopologyInput,
+    TopologyNodeKey, TopologyNodeRef, TopologySnapshot, WindowKey, WindowNode,
+};
 use muxa::{AgentKind, AgentState};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -399,7 +404,7 @@ pub(crate) enum WatchColumn {
     Workload,
     Prompt,
     Activity,
-    WorkspaceTime,
+    Duration,
 }
 
 impl WatchColumn {
@@ -418,7 +423,7 @@ impl WatchColumn {
             "workload" => Self::Workload,
             "prompt" => Self::Prompt,
             "activity" => Self::Activity,
-            "workspace_time" => Self::WorkspaceTime,
+            "duration" => Self::Duration,
             _ => return None,
         })
     }
@@ -436,7 +441,7 @@ impl WatchColumn {
             Self::Workload => "TREE",
             Self::Prompt => "LAST PROMPT",
             Self::Activity => "ACT",
-            Self::WorkspaceTime => "DUR",
+            Self::Duration => "DUR",
         }
     }
 
@@ -450,7 +455,7 @@ impl WatchColumn {
             Self::State => Constraint::Length(3),
             Self::Model => Constraint::Length(16),
             Self::Ctx => Constraint::Length(5),
-            Self::Activity | Self::WorkspaceTime => Constraint::Length(6),
+            Self::Activity | Self::Duration => Constraint::Length(6),
             Self::Cost => Constraint::Length(7),
             // LIMITS — widest realistic payload is `⛔ 7d in 23h 59m`
             // (~17 cells with a wide-cell emoji). Wider columns crowd the
@@ -476,7 +481,7 @@ impl WatchColumn {
     ) -> Text<'a> {
         match self {
             Self::Pane => {
-                let label = pane_display(a.pane.as_deref(), panes);
+                let label = agent_pane_display(a, panes);
                 // Dim the pane cell when there's nothing to attach to —
                 // a deliberate visual signal that Enter won't do anything
                 // useful for this row. Keeping the rest of the row's
@@ -512,7 +517,7 @@ impl WatchColumn {
             Self::Workload => workload_text(a),
             Self::Prompt => summary_line(a, summary).into(),
             Self::Activity => relative_time(a.last_activity_at, now).into(),
-            Self::WorkspaceTime => Text::from(Span::styled(
+            Self::Duration => Text::from(Span::styled(
                 "-",
                 Style::default()
                     .fg(Color::DarkGray)
@@ -549,7 +554,7 @@ impl WatchColumn {
             | Self::Limits
             | Self::Workload
             | Self::Activity
-            | Self::WorkspaceTime => Text::from(Span::styled("-", dim)),
+            | Self::Duration => Text::from(Span::styled("-", dim)),
         }
     }
 
@@ -575,7 +580,7 @@ impl WatchColumn {
                     }),
                     dim,
                 )),
-                Self::WorkspaceTime => workspace_time_text(s, now),
+                Self::Duration => duration_text(s, now),
                 Self::Kind | Self::State | Self::StateAge => Text::from(Span::styled("—", dim)),
                 Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
                     Text::from(Span::styled("-", dim))
@@ -596,7 +601,7 @@ impl WatchColumn {
             | Self::Prompt
             | Self::Activity => self.agent_text(agent, now, panes, theme, spin, summary),
             Self::Workload => work_workload_text(s),
-            Self::WorkspaceTime => workspace_time_text(s, now),
+            Self::Duration => duration_text(s, now),
         }
     }
 }
@@ -623,13 +628,13 @@ pub(crate) fn resolve_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
     out
 }
 
-/// Resolve columns and apply the work-view duration default. This is used
+/// Resolve columns and apply the window-view duration default. This is used
 /// both at startup and when `:view` changes granularity at runtime so the two
 /// paths cannot drift into different table shapes.
 fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
     let mut columns = resolve_columns(cfg);
-    if cfg.view == WatchView::Work && !columns.contains(&WatchColumn::WorkspaceTime) {
-        // The default layout carries STATE (glyph + state + age). In work
+    if cfg.view == WatchView::Window && !columns.contains(&WatchColumn::Duration) {
+        // The default layout carries STATE (glyph + state + age). In window
         // view the leftmost cluster of the WORK cell already shows every
         // state as icon-with-count, so a STATE column is the same fact
         // twice — and 12 columns wide. Swap it for DUR rather than keeping
@@ -651,7 +656,7 @@ fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
         {
             columns = vec![
                 WatchColumn::Pane,
-                WatchColumn::WorkspaceTime,
+                WatchColumn::Duration,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
             ];
@@ -660,7 +665,7 @@ fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
                 .iter()
                 .position(|c| matches!(c, WatchColumn::Prompt | WatchColumn::Activity))
                 .unwrap_or(columns.len());
-            columns.insert(insert_at, WatchColumn::WorkspaceTime);
+            columns.insert(insert_at, WatchColumn::Duration);
         }
     }
     columns
@@ -696,7 +701,7 @@ impl WatchColumn {
             Self::Workload => "workload",
             Self::Prompt => "prompt",
             Self::Activity => "activity",
-            Self::WorkspaceTime => "workspace_time",
+            Self::Duration => "duration",
         }
     }
 }
@@ -719,9 +724,16 @@ pub(crate) enum WatchRow {
 /// survive that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RowIdentity {
+    Topology(TopologyNodeKey),
     Agent(AgentKind, String),
-    BarePane(String),
-    Work(String),
+    BarePane(PaneKey),
+    Work(WorkIdentity),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkIdentity {
+    window_key: Option<WindowKey>,
+    fallback: String,
 }
 
 /// One selectable line after runtime filtering and optional work
@@ -731,6 +743,29 @@ pub(crate) enum RowIdentity {
 struct VisibleTarget {
     row_idx: usize,
     agent_idx: Option<usize>,
+}
+
+/// One selectable line in the canonical tree presentation. The stable key is
+/// the selection identity; depth and branch flags are presentation-only and
+/// are rebuilt from the current snapshot on every render/filter operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent branch/disclosure rendering facts
+struct TreeTarget {
+    key: TopologyNodeKey,
+    depth: u8,
+    is_last_sibling: bool,
+    parent_is_last_sibling: bool,
+    has_children: bool,
+    expanded: bool,
+}
+
+/// One-shot context used to place the cursor after the initial empty frame.
+/// The endpoint is present when the invoking multiplexer exposes it, allowing
+/// `%N` values repeated on another socket to resolve without guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitialPaneHint {
+    pane_id: String,
+    endpoint: Option<BackendEndpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,6 +794,9 @@ pub(crate) struct WorkRow {
     /// Host-namespaced work identity. tmux keys include stable session and
     /// window ids; other hosts keep their native workspace grouping.
     pub group_key: String,
+    /// Canonical identity of this backend window/tab. `None` is reserved for
+    /// paneless/stale fallback rows that have no observable topology node.
+    pub window_key: Option<WindowKey>,
     /// Human-facing `workspace › work` label on tmux; native workspace label
     /// on hosts that do not expose a window-level work unit.
     pub display_name: String,
@@ -774,7 +812,7 @@ pub(crate) struct WorkRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchSortPreset {
-    Workspace,
+    Name,
     Latest,
     Duration,
     State,
@@ -783,16 +821,16 @@ pub(crate) enum WatchSortPreset {
 impl WatchSortPreset {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
-            Self::Workspace => vec![WatchSortKey::Workspace, WatchSortKey::Activity],
+            Self::Name => vec![WatchSortKey::Name, WatchSortKey::Activity],
             Self::Latest => vec![WatchSortKey::Activity],
-            Self::Duration => vec![WatchSortKey::WorkspaceTime],
+            Self::Duration => vec![WatchSortKey::Duration],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::Workspace => "WORKSPACE",
+            Self::Name => "NAME",
             Self::Latest => "LATEST",
             Self::Duration => "DUR",
             Self::State => "ST",
@@ -802,9 +840,9 @@ impl WatchSortPreset {
 
 fn sort_label(keys: &[WatchSortKey]) -> &'static str {
     match keys.first().copied() {
-        Some(WatchSortKey::Workspace) | None => "WORKSPACE",
+        Some(WatchSortKey::Name) | None => "NAME",
         Some(WatchSortKey::Activity) => "LATEST",
-        Some(WatchSortKey::WorkspaceTime) => "DUR",
+        Some(WatchSortKey::Duration) => "DUR",
         Some(WatchSortKey::State) => "ST",
         Some(WatchSortKey::Pane) => "PANE",
         Some(WatchSortKey::PaneId) => "PANE ID",
@@ -813,9 +851,9 @@ fn sort_label(keys: &[WatchSortKey]) -> &'static str {
 
 fn sort_key_toml_name(key: WatchSortKey) -> &'static str {
     match key {
-        WatchSortKey::Workspace => "workspace",
+        WatchSortKey::Name => "name",
         WatchSortKey::Activity => "latest",
-        WatchSortKey::WorkspaceTime => "workspace_time",
+        WatchSortKey::Duration => "duration",
         WatchSortKey::State => "state",
         WatchSortKey::Pane => "pane",
         WatchSortKey::PaneId => "pane_id",
@@ -877,8 +915,14 @@ impl WatchRow {
     fn identity(&self) -> RowIdentity {
         match self {
             Self::Agent(a) => RowIdentity::Agent(a.kind, a.session_id.clone()),
-            Self::BarePane(p) => RowIdentity::BarePane(p.pane_id.clone()),
-            Self::Work(s) => RowIdentity::Work(s.group_key.clone()),
+            Self::BarePane(p) => RowIdentity::BarePane(PaneKey::from_pane(
+                muxa::backend::pane_id_host_kind(&p.pane_id).unwrap_or(muxa::HostKind::Tmux),
+                p,
+            )),
+            Self::Work(s) => RowIdentity::Work(WorkIdentity {
+                window_key: s.window_key.clone(),
+                fallback: s.group_key.clone(),
+            }),
         }
     }
 
@@ -913,6 +957,11 @@ pub(crate) struct DaemonError {
 /// the real subprocess world — see the `Effects` trait below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QuickAction {
+    /// Close the exact selected session/window/pane. The key carries the
+    /// backend endpoint so repeated native ids cannot hit another server.
+    TerminateNode(TopologyNodeKey),
+    /// Interrupt the exact selected agent pane without closing it.
+    InterruptPane(PaneKey),
     /// Kill the tmux pane the agent is running in. String is the
     /// `pane_id` (e.g. `%42`) we'll pass to `tmux kill-pane -t`.
     KillPane(String),
@@ -929,9 +978,12 @@ pub(crate) enum QuickAction {
     /// The dispatcher writes the text literally, waits briefly, then
     /// sends Enter as a separate key so the target agent submits it.
     SendPrompt { pane_id: String, text: String },
+    /// Endpoint-pinned form used by the topology tree. Raw `%N` is not a
+    /// sufficient control target when multiple tmux sockets are visible.
+    SendPromptTo { pane: PaneKey, text: String },
     /// Toggle the `?` help overlay. Pure UI — no side-effects.
     ShowHelp,
-    /// Create or reuse a workspace session and work window at `dir`, then
+    /// Legacy no-selection fallback: create or reuse a session and window at `dir`, then
     /// start an agent pane with its first prompt on the command line. The launch
     /// string is fully assembled (and shell-quoted) by the spawn form so
     /// the dispatcher stays a dumb pipe.
@@ -941,6 +993,15 @@ pub(crate) enum QuickAction {
         launch: String,
         /// Explicit work/ticket id; `None` derives one from the directory.
         work: Option<String>,
+    },
+    /// Spawn relative to an exact selected topology node. Session targets
+    /// create a new window; window/pane targets add a sibling pane.
+    SpawnAt {
+        target: TopologyNodeKey,
+        dir: String,
+        name: String,
+        agent_label: &'static str,
+        launch: String,
     },
 }
 
@@ -982,6 +1043,17 @@ pub(crate) trait Effects {
     fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String>;
     /// Run `tmux send-keys -t <pane_id> C-c`. Return Ok on exit 0.
     fn send_ctrl_c(&mut self, pane_id: &str) -> std::result::Result<(), String>;
+    fn terminate_node(&mut self, key: &TopologyNodeKey) -> std::result::Result<(), String> {
+        match key {
+            TopologyNodeKey::Pane(pane) => self.kill_pane(&pane.pane_id),
+            TopologyNodeKey::Session(_) | TopologyNodeKey::Window(_) => {
+                Err("hierarchy close is not implemented by this effect sink".into())
+            }
+        }
+    }
+    fn interrupt_pane(&mut self, key: &PaneKey) -> std::result::Result<(), String> {
+        self.send_ctrl_c(&key.pane_id)
+    }
     /// Pipe `text` into the system clipboard. Returns the name of the
     /// helper that succeeded (`pbcopy` / `wl-copy` / `xclip`) or
     /// `tmpfile:<path>` if all helpers were missing and we wrote a
@@ -991,14 +1063,29 @@ pub(crate) trait Effects {
     /// Enter after a short grace delay. Return Ok only if both tmux
     /// calls succeed.
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String>;
-    /// Create or reuse one managed workspace/work and start an agent pane.
-    /// The explicit name is the work/ticket id; otherwise cwd derives it.
+    fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
+        self.send_prompt(&pane.pane_id, text)
+    }
+    /// Create or reuse one managed session/window and start an agent pane.
+    /// The explicit name is the window/ticket id; otherwise cwd derives it.
     fn spawn_work(
         &mut self,
         dir: &str,
         launch: &str,
         work: Option<&str>,
     ) -> std::result::Result<String, String>;
+    fn spawn_at(
+        &mut self,
+        target: &TopologyNodeKey,
+        dir: &str,
+        name: &str,
+        agent_label: &str,
+        launch: &str,
+    ) -> std::result::Result<String, String> {
+        let _ = target;
+        self.spawn_work(dir, launch, (!name.is_empty()).then_some(name))
+            .map(|result| format!("{result} ({agent_label})"))
+    }
 }
 
 /// Real-world `Effects` impl — shells out to tmux and the system
@@ -1101,6 +1188,138 @@ fn plan_spawn_work(
 }
 
 impl Effects for RealEffects {
+    fn spawn_at(
+        &mut self,
+        target: &TopologyNodeKey,
+        dir: &str,
+        name: &str,
+        agent_label: &str,
+        launch: &str,
+    ) -> std::result::Result<String, String> {
+        let endpoint = match target {
+            TopologyNodeKey::Session(session) => &session.endpoint,
+            TopologyNodeKey::Window(window) => &window.session.endpoint,
+            TopologyNodeKey::Pane(pane) => &pane.window.session.endpoint,
+        };
+        if endpoint.host != muxa::HostKind::Tmux {
+            return Err(format!("{} topology spawn is not supported", endpoint.host));
+        }
+        let cwd = std::fs::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
+        let cwd = cwd.display().to_string();
+        let args = match target {
+            TopologyNodeKey::Session(session) => {
+                if name.trim().is_empty() {
+                    return Err("a new window needs a name".into());
+                }
+                vec![
+                    "new-window".to_string(),
+                    "-d".into(),
+                    "-P".into(),
+                    "-F".into(),
+                    "#{pane_id}".into(),
+                    "-t".into(),
+                    session.session_id.clone(),
+                    "-n".into(),
+                    name.to_string(),
+                    "-c".into(),
+                    cwd,
+                    launch.to_string(),
+                ]
+            }
+            TopologyNodeKey::Window(window) => vec![
+                "split-window".to_string(),
+                "-h".into(),
+                "-d".into(),
+                "-P".into(),
+                "-F".into(),
+                "#{pane_id}".into(),
+                "-t".into(),
+                window.window_id.clone(),
+                "-c".into(),
+                cwd,
+                launch.to_string(),
+            ],
+            TopologyNodeKey::Pane(pane) => vec![
+                "split-window".to_string(),
+                "-h".into(),
+                "-d".into(),
+                "-P".into(),
+                "-F".into(),
+                "#{pane_id}".into(),
+                "-t".into(),
+                pane.window.window_id.clone(),
+                "-c".into(),
+                cwd,
+                launch.to_string(),
+            ],
+        };
+        let output = muxa::tmux::tmux_command_on(Some(&endpoint.socket))
+            .args(&args)
+            .output()
+            .map_err(|error| format!("tmux: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let pane = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with('%'))
+            .ok_or_else(|| "tmux returned no pane id".to_string())?
+            .to_string();
+        muxa::tmux::run_control_on(
+            Some(&endpoint.socket),
+            &["set-option", "-p", "-t", &pane, "@muxa_agent", agent_label],
+        )
+        .and_then(|()| {
+            muxa::tmux::run_control_on(
+                Some(&endpoint.socket),
+                &["set-option", "-p", "-t", &pane, "@muxa_managed_agent", "1"],
+            )
+        })
+        .map_err(|error| format!("record pane metadata: {error}"))?;
+        Ok(format!("{} pane {pane}", topology_key_label(target)))
+    }
+
+    fn terminate_node(&mut self, key: &TopologyNodeKey) -> std::result::Result<(), String> {
+        let (endpoint, command, target) = match key {
+            TopologyNodeKey::Session(session) => (
+                &session.endpoint,
+                "kill-session",
+                session.session_id.as_str(),
+            ),
+            TopologyNodeKey::Window(window) => (
+                &window.session.endpoint,
+                "kill-window",
+                window.window_id.as_str(),
+            ),
+            TopologyNodeKey::Pane(pane) => (
+                &pane.window.session.endpoint,
+                "kill-pane",
+                pane.pane_id.as_str(),
+            ),
+        };
+        if endpoint.host != muxa::HostKind::Tmux {
+            return Err(format!(
+                "{} hierarchy close is not supported",
+                endpoint.host
+            ));
+        }
+        muxa::tmux::run_control_on(Some(&endpoint.socket), &[command, "-t", target])
+            .map_err(|error| error.to_string())
+    }
+
+    fn interrupt_pane(&mut self, key: &PaneKey) -> std::result::Result<(), String> {
+        let endpoint = &key.window.session.endpoint;
+        if endpoint.host != muxa::HostKind::Tmux {
+            return Err(format!("{} pane interrupt is not supported", endpoint.host));
+        }
+        muxa::tmux::run_control_on(
+            Some(&endpoint.socket),
+            &["send-keys", "-t", &key.pane_id, "C-c"],
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String> {
         run_status("tmux", &["kill-pane", "-t", pane_id])
     }
@@ -1115,6 +1334,23 @@ impl Effects for RealEffects {
             text,
             PROMPT_SUBMIT_GRACE,
             |args| run_status("tmux", args),
+            std::thread::sleep,
+        )
+    }
+
+    fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
+        let endpoint = &pane.window.session.endpoint;
+        if endpoint.host != muxa::HostKind::Tmux {
+            return Err(format!("{} pane prompt is not supported", endpoint.host));
+        }
+        send_prompt_to_tmux(
+            &pane.pane_id,
+            text,
+            PROMPT_SUBMIT_GRACE,
+            |args| {
+                muxa::tmux::run_control_on(Some(&endpoint.socket), args)
+                    .map_err(|error| error.to_string())
+            },
             std::thread::sleep,
         )
     }
@@ -1323,6 +1559,17 @@ fn run_status(bin: &str, args: &[&str]) -> std::result::Result<(), String> {
 /// state — the caller mutates `App` based on the returned outcome.
 pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -> ActionOutcome {
     match action {
+        QuickAction::TerminateNode(key) => match fx.terminate_node(&key) {
+            Ok(()) => ActionOutcome::Ok(format!("✔ closed {}", topology_key_label(&key))),
+            Err(error) => ActionOutcome::Err(format!("✗ close failed: {error}")),
+        },
+        QuickAction::InterruptPane(key) => match fx.interrupt_pane(&key) {
+            Ok(()) => ActionOutcome::Ok(format!(
+                "✔ interrupted {}",
+                topology_key_label(&TopologyNodeKey::Pane(key))
+            )),
+            Err(error) => ActionOutcome::Err(format!("✗ interrupt failed: {error}")),
+        },
         QuickAction::KillPane(pane_id) => match fx.kill_pane(&pane_id) {
             Ok(()) => ActionOutcome::Ok(format!("✔ killed pane {pane_id}")),
             Err(e) => ActionOutcome::Err(format!("✗ kill-pane failed: {e}")),
@@ -1348,13 +1595,30 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             work,
         } => match fx.spawn_work(&dir, &launch, work.as_deref()) {
             Ok(name) => ActionOutcome::Ok(format!(
-                "started {agent_label} in workspace/work {name} — Enter on its row to attach"
+                "started {agent_label} in session/window {name} — Enter on its row to attach"
             )),
             Err(e) => ActionOutcome::Err(format!("spawn failed: {e}")),
+        },
+        QuickAction::SpawnAt {
+            target,
+            dir,
+            name,
+            agent_label,
+            launch,
+        } => match fx.spawn_at(&target, &dir, &name, agent_label, &launch) {
+            Ok(result) => ActionOutcome::Ok(format!("started {agent_label} in {result}")),
+            Err(error) => ActionOutcome::Err(format!("spawn failed: {error}")),
         },
         QuickAction::SendPrompt { pane_id, text } => match fx.send_prompt(&pane_id, &text) {
             Ok(()) => ActionOutcome::Ok(format!("✔ sent prompt to {pane_id}")),
             Err(e) => ActionOutcome::Err(format!("✗ send failed: {e}")),
+        },
+        QuickAction::SendPromptTo { pane, text } => match fx.send_prompt_to(&pane, &text) {
+            Ok(()) => ActionOutcome::Ok(format!(
+                "✔ sent prompt to {}",
+                topology_key_label(&TopologyNodeKey::Pane(pane))
+            )),
+            Err(error) => ActionOutcome::Err(format!("✗ send failed: {error}")),
         },
         QuickAction::ShowHelp => ActionOutcome::HelpToggled,
     }
@@ -1385,12 +1649,12 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  type or /       filter; / allows reserved first characters",
         "  Backspace/C-W   edit filter / delete previous word",
         "  Ctrl-U / Esc    clear filter; Esc again backs out / quits",
-        "  ↑/↓ · j/k       move works/agents while browsing",
-        "  ←/→ · h/l       return to parent / enter first child agent",
+        "  ↑/↓ · j/k       move visible session/window/pane nodes",
+        "  ←/→ · h/l       collapse/parent · expand/first child",
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
-        "  Enter          attach to selected pane",
-        "  n              new/reused workspace/work + agent (dir · ticket · prompt)",
+        "  Enter          attach via active window/pane or exact pane",
+        "  n              new window or sibling agent pane",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -1400,12 +1664,12 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
-        "  Enter          (in preview) compose prompt",
+        "  Enter          (in preview) jump to pinned pane",
         "  m / M          message selected agent / mailbox (b alias)",
         "  i / e          (in mailbox) claim inbox / reply",
         "",
         "Sorting",
-        "  Alt-S/L/D/T    workspace / latest / duration / state",
+        "  Alt-S/L/D/T    sibling name / latest / duration / state",
         "State markers",
         match crate::icon_set() {
             IconSet::Unicode => {
@@ -1417,10 +1681,10 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         },
         "  TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden",
         "",
-        "Quick actions (act on selected row)",
+        "Quick actions (act on selected node)",
         "  Alt-C          copy last prompt to clipboard",
-        "  Alt-K          kill the pane (confirm popup)",
-        "  Alt-X          abort current turn (confirm popup)",
+        "  Alt-K          close session/window/pane (confirm popup)",
+        "  Alt-X          interrupt selected agent pane (confirm popup)",
         "  r/Ctrl-R/Alt-R force refresh while browsing",
     ]
 }
@@ -1664,9 +1928,13 @@ enum SpawnField {
     Prompt,
 }
 
-/// `n` launches or reuses one workspace session and work window, then adds an agent pane.
+/// `n` creates a window with its first agent or adds a sibling agent pane,
+/// depending on the selected topology level.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SpawnComposer {
+    /// Stable node selected when the form opened. Background refresh cannot
+    /// redirect the eventual spawn to another session/window.
+    target: Option<TopologyNodeKey>,
     dir: String,
     dir_cursor: usize,
     /// Work/ticket id. Empty means derive it from the directory.
@@ -1679,12 +1947,36 @@ struct SpawnComposer {
 }
 
 impl SpawnComposer {
+    fn creates_window(&self) -> bool {
+        matches!(self.target, None | Some(TopologyNodeKey::Session(_)))
+    }
+
     fn field_mut(&mut self) -> Option<(&mut String, &mut usize)> {
         match self.focus {
             SpawnField::Dir => Some((&mut self.dir, &mut self.dir_cursor)),
-            SpawnField::Name => Some((&mut self.name, &mut self.name_cursor)),
+            SpawnField::Name if self.creates_window() => {
+                Some((&mut self.name, &mut self.name_cursor))
+            }
             SpawnField::Prompt => Some((&mut self.prompt, &mut self.prompt_cursor)),
-            SpawnField::Agent => None,
+            SpawnField::Name | SpawnField::Agent => None,
+        }
+    }
+
+    fn next_focus(&self) -> SpawnField {
+        match self.focus {
+            SpawnField::Dir if self.creates_window() => SpawnField::Name,
+            SpawnField::Dir | SpawnField::Name => SpawnField::Agent,
+            SpawnField::Agent => SpawnField::Prompt,
+            SpawnField::Prompt => SpawnField::Dir,
+        }
+    }
+
+    fn previous_focus(&self) -> SpawnField {
+        match self.focus {
+            SpawnField::Dir => SpawnField::Prompt,
+            SpawnField::Agent if self.creates_window() => SpawnField::Name,
+            SpawnField::Name | SpawnField::Agent => SpawnField::Dir,
+            SpawnField::Prompt => SpawnField::Agent,
         }
     }
 }
@@ -1887,6 +2179,9 @@ enum CollaborationComposeTarget {
         /// (`pane:%N`); this copy exists so `just send` mode can type
         /// into the pane without re-parsing its own address.
         pane: String,
+        /// Exact pane identity when the recipient came from the topology
+        /// tree or endpoint-rich collaboration metadata.
+        pane_key: Option<PaneKey>,
         target: String,
         kind: RequestKind,
         mode: ComposeSendMode,
@@ -1902,6 +2197,8 @@ enum CollaborationComposeTarget {
     /// pointing at; what it cannot do is dress those keystrokes up as a
     /// contract, so `Tab`/`Ctrl-E` explain instead of cycling.
     Prompt { pane: String },
+    /// Endpoint-pinned keystrokes composer opened from a topology node.
+    PromptTopology { pane: PaneKey },
 }
 
 /// What Ctrl-E cycles: how the composed text leaves the composer.
@@ -2141,6 +2438,14 @@ impl FooterHint {
 #[allow(clippy::struct_excessive_bools)] // independent overlay/filter/runtime flags are clearer than a coupled state enum
 pub(crate) struct App {
     pub rows: Vec<WatchRow>,
+    /// Canonical nested snapshot behind every production presentation and
+    /// action. Compatibility rows remain as a transition/event cache and for
+    /// the test-only flat renderer; they never define tree identity.
+    pub topology: TopologySnapshot,
+    /// Internal harness for the pre-tree renderer's regression tests. It is
+    /// never enabled by the production constructor path and can be deleted
+    /// with those golden tests after the tree snapshots have replaced them.
+    legacy_flat_table: bool,
     pub table_state: TableState,
     /// Monotonic frame counter advanced once per paint. Drives the swarm
     /// view's dot-spinner animation; unused by the table views.
@@ -2166,6 +2471,18 @@ pub(crate) struct App {
     table_page_rows: usize,
     /// When true, only error / input / choice targets remain visible.
     pub attention_only: bool,
+    /// Explicitly expanded session/window keys. Pane keys are leaves and never
+    /// enter this set. Keys survive refresh and sort because they include the
+    /// complete host+socket ancestry.
+    expanded_nodes: HashSet<TopologyNodeKey>,
+    /// Whether default expansion has been applied to at least one non-empty
+    /// topology. This distinguishes an intentionally-collapsed tree from the
+    /// empty first frame.
+    tree_expansion_initialized: bool,
+    /// Full key selected before a search/attention filter hid it. The visible
+    /// cursor may temporarily sit on an ancestor, but clearing the filter
+    /// restores this node. Explicit navigation while filtered replaces it.
+    filtered_selection_anchor: Option<TopologyNodeKey>,
     /// Work group currently expanded into individually-selectable child rows.
     /// Selection keeps this to at most one group: the selected work, or the
     /// parent work of the selected child agent.
@@ -2206,11 +2523,10 @@ pub(crate) struct App {
     /// background ticks intentionally don't toggle this — only the
     /// user's deliberate action lights it up.
     pub refresh_pending: bool,
-    /// Pane to focus on the first non-empty data load — `$TMUX_PANE`
-    /// when invoked from inside tmux. Consumed by `clamp_selection`
-    /// the first time it sees rows, so subsequent refreshes don't
-    /// keep snapping the cursor away from the user's manual selection.
-    initial_pane: Option<String>,
+    /// Pane to focus on the first non-empty data load. In the topology view
+    /// this resolves to the nearest visible ancestor at the configured depth.
+    /// Consumed once so later refreshes never steal the user's selection.
+    initial_pane: Option<InitialPaneHint>,
     /// `Some` when the user has popped open the full-screen detail
     /// preview (`o` / `Alt-P`). The table is hidden behind the preview while
     /// this is set; `q`/`Esc`/`p` clears it.
@@ -2287,6 +2603,9 @@ pub struct PreviewState {
     /// Pane id at the time the preview was opened — also the lookup key
     /// every render frame uses to find the live agent record.
     pub pane_id: String,
+    /// Exact topology identity when opened from the tree. Legacy previews
+    /// retain `None` and use their historical pane-id lookup.
+    pub pane_key: Option<PaneKey>,
     /// Vertical scroll offset in *lines from the top of the content*.
     /// `↑/↓` (or `j/k`) increment / decrement; `saturating_*` so we
     /// can't underflow past the top.
@@ -2329,6 +2648,7 @@ pub use muxa::config::PreviewContent;
 #[derive(Debug, Clone)]
 pub struct CapturedPane {
     pub pane_id: String,
+    pub socket: Option<String>,
     /// Raw stdout from `tmux capture-pane -ep`, ANSI escapes intact.
     /// Decoded to ratatui `Text` lazily at render time so a stale row
     /// re-render never re-parses the same bytes.
@@ -2347,10 +2667,19 @@ impl App {
         // work-view behavior is covered separately by config-crate tests and
         // the explicit `view: Work` cases below. Pinning here keeps
         // those pane-mechanics assertions stable regardless of the default.
-        Self::with_config(WatchConfig {
+        let mut app = Self::with_config(WatchConfig {
             view: WatchView::Pane,
             ..WatchConfig::default()
-        })
+        });
+        app.legacy_flat_table = true;
+        app
+    }
+
+    #[cfg(test)]
+    fn with_legacy_config(cfg: WatchConfig) -> Self {
+        let mut app = Self::with_config(cfg);
+        app.legacy_flat_table = true;
+        app
     }
 
     pub(crate) fn with_config(cfg: WatchConfig) -> Self {
@@ -2366,6 +2695,8 @@ impl App {
         };
         Self {
             rows: Vec::new(),
+            topology: TopologySnapshot::build(OffsetDateTime::now_utc(), Vec::new(), Vec::new()),
+            legacy_flat_table: false,
             table_state: TableState::default(),
             anim_frame: 0,
             prev_agent_states: HashMap::new(),
@@ -2375,6 +2706,9 @@ impl App {
             pending_g: false,
             table_page_rows: 10,
             attention_only: false,
+            expanded_nodes: HashSet::new(),
+            tree_expansion_initialized: false,
+            filtered_selection_anchor: None,
             expanded_works: HashSet::new(),
             inspector_enabled: true,
             inspector_visible: false,
@@ -2415,8 +2749,13 @@ impl App {
     /// Hint which pane should be highlighted on first load — typically
     /// `$TMUX_PANE` so launching `muxa watch` from inside tmux lands the
     /// cursor on the user's current pane instead of always row 0.
+    #[cfg(test)]
     pub(crate) fn set_initial_pane(&mut self, pane: Option<String>) {
-        self.initial_pane = pane;
+        self.set_initial_pane_on(pane, None);
+    }
+
+    fn set_initial_pane_on(&mut self, pane: Option<String>, endpoint: Option<BackendEndpoint>) {
+        self.initial_pane = pane.map(|pane_id| InitialPaneHint { pane_id, endpoint });
     }
 
     /// Replace the row set. `agents` (tracked) are listed first in stable
@@ -2481,7 +2820,7 @@ impl App {
             if let Some(kind) = event_kind {
                 let label = agent.pane.as_deref().map_or_else(
                     || agent.session_id.clone(),
-                    |pane| pane_display(Some(pane), &self.panes),
+                    |_| agent_pane_display(agent, &self.panes),
                 );
                 let summary = agent
                     .last_notification
@@ -2545,10 +2884,17 @@ impl App {
     ) {
         // Remember *which row* the cursor is on before the row set is
         // rebuilt from scratch below. Every refresh re-sorts, and the
-        // default `sort = ["state", "workspace", "latest"]` reorders as
+        // default `sort = ["state", "name", "latest"]` reorders as
         // agents flip state, so holding the raw table index would silently
         // slide the highlight onto a neighbouring session.
-        let selected = self.selected_identity();
+        let selected = self.selection_identity_for_rebuild();
+        let previous_topology_keys = topology_keys(&self.topology);
+
+        // Build the shared topology before presentation-specific filtering.
+        // This retains paneless/ambiguous agents in `unassigned_agents` and
+        // gives every tree action a collision-free target.
+        self.topology = build_watch_topology(&agents, &panes, &sessions);
+        self.reconcile_tree_expansion(&previous_topology_keys);
 
         // Filter out paneless agents up front when the user has opted in
         // (the default). They can't be attached to from the picker — Enter
@@ -2574,7 +2920,7 @@ impl App {
             self.paneless_hidden = before - agents.len();
         }
 
-        if self.watch_cfg.view != WatchView::Pane {
+        if self.watch_cfg.layout == WatchLayout::Swarm || self.watch_cfg.view != WatchView::Pane {
             self.rows = build_work_rows(
                 agents,
                 &panes,
@@ -2607,11 +2953,23 @@ impl App {
         let sort_keys = &self.watch_cfg.sort;
         agents.sort_by(|a, b| sort_agents(a, b, sort_keys, &sort_context));
 
-        let known: HashSet<String> = agents.iter().filter_map(|a| a.pane.clone()).collect();
+        let known: HashSet<PaneKey> = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .filter(|pane| pane.agent.is_some())
+            .map(|pane| pane.key.clone())
+            .collect();
 
         let mut bare: Vec<PaneInfo> = panes
             .iter()
-            .filter(|p| !known.contains(&p.pane_id))
+            .filter(|pane| {
+                let host =
+                    muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+                !known.contains(&PaneKey::from_pane(host, pane))
+            })
             .cloned()
             .collect();
         bare.sort_by(|a, b| {
@@ -2648,7 +3006,7 @@ impl App {
         if self.watch_cfg.view == view {
             return;
         }
-        let selected_pane = self.selected_pane();
+        let selected = self.selection_identity_for_rebuild();
         let paneless_hidden = self.paneless_hidden;
         let paneless_attention = self.paneless_attention;
         let agents = self.current_agents();
@@ -2659,6 +3017,8 @@ impl App {
         self.watch_cfg.view = view;
         self.columns = resolve_display_columns(&self.watch_cfg);
         self.expanded_works.clear();
+        self.expanded_nodes.clear();
+        self.tree_expansion_initialized = false;
         self.set_data_with_sessions(agents, panes, sessions, session_activity);
         // Hidden paneless agents are not present in `current_agents()`, so a
         // cache-only view rebuild cannot recount them. Preserve the counts
@@ -2666,19 +3026,33 @@ impl App {
         self.paneless_hidden = paneless_hidden;
         self.paneless_attention = paneless_attention;
 
-        if let Some(pane_id) = selected_pane {
-            if let Some(index) = self.visible_targets().iter().position(|target| {
-                target_pane(self, *target).as_deref() == Some(pane_id.as_str())
-                    || self.rows[target.row_idx].contains_pane(&pane_id)
-            }) {
-                self.table_state.select(Some(index));
-                self.sync_auto_expansion();
-            }
+        if let Some(selected) = selected {
+            self.restore_selection(Some(selected));
+        }
+    }
+
+    pub(crate) fn apply_layout(&mut self, layout: WatchLayout) {
+        if self.watch_cfg.layout == layout {
+            return;
+        }
+        let selected = self.selection_identity_for_rebuild();
+        let agents = self.current_agents();
+        let panes = self.panes.clone();
+        let sessions = self.sessions.clone();
+        let activity = self.session_activity.clone();
+        self.watch_cfg.layout = layout;
+        self.set_data_with_sessions(agents, panes, sessions, activity);
+        if let Some(selected) = selected {
+            self.restore_selection(Some(selected));
         }
     }
 
     fn resort_rows_preserving_selection(&mut self) {
-        let selected = self.selected_identity();
+        let selected = self.selection_identity_for_rebuild();
+        if self.uses_tree() {
+            self.restore_selection(selected);
+            return;
+        }
         let sort_context = SortContext::new(
             &self.panes,
             &self.sessions,
@@ -2687,7 +3061,7 @@ impl App {
         );
         let sort_keys = &self.watch_cfg.sort;
 
-        if self.watch_cfg.view == WatchView::Work {
+        if self.watch_cfg.view == WatchView::Window {
             self.rows.sort_by(|a, b| match (a, b) {
                 (WatchRow::Work(a), WatchRow::Work(b)) => {
                     sort_works(a, b, sort_keys, &sort_context)
@@ -2711,10 +3085,223 @@ impl App {
         self.restore_selection(selected);
     }
 
+    fn uses_tree(&self) -> bool {
+        // Both tree and swarm are presentations over the same canonical
+        // node set. Only the test-only legacy renderer opts out.
+        !self.legacy_flat_table
+    }
+
+    fn reconcile_tree_expansion(&mut self, previous_keys: &HashSet<TopologyNodeKey>) {
+        let current = topology_keys(&self.topology);
+        self.expanded_nodes.retain(|key| current.contains(key));
+        let initialize_all = !self.tree_expansion_initialized && !self.topology.sessions.is_empty();
+        for session in &self.topology.sessions {
+            let session_key = session.node_key();
+            if default_tree_expanded(&session_key, self.watch_cfg.view)
+                && (initialize_all || !previous_keys.contains(&session_key))
+            {
+                self.expanded_nodes.insert(session_key);
+            }
+            for window in &session.windows {
+                let window_key = window.node_key();
+                if default_tree_expanded(&window_key, self.watch_cfg.view)
+                    && (initialize_all || !previous_keys.contains(&window_key))
+                {
+                    self.expanded_nodes.insert(window_key);
+                }
+            }
+        }
+        if initialize_all {
+            self.tree_expansion_initialized = true;
+        }
+    }
+
+    fn tree_targets(&self) -> Vec<TreeTarget> {
+        let query = self.search_query.trim().to_lowercase();
+        let filtering = !query.is_empty() || self.attention_only;
+        let mut sessions: Vec<&SessionNode> = self.topology.sessions.iter().collect();
+        sessions.sort_by(|left, right| self.compare_sessions(left, right));
+
+        let mut targets = Vec::new();
+        let matching_sessions: Vec<_> = sessions
+            .into_iter()
+            .filter(|session| tree_session_relevant(session, &query, self.attention_only))
+            .collect();
+        let session_count = matching_sessions.len();
+        for (session_index, session) in matching_sessions.into_iter().enumerate() {
+            let mut windows: Vec<&WindowNode> = session
+                .windows
+                .iter()
+                .filter(|window| tree_window_relevant(window, session, &query, self.attention_only))
+                .collect();
+            windows.sort_by(|left, right| self.compare_windows(left, right));
+            let session_key = session.node_key();
+            let session_expanded =
+                self.expanded_nodes.contains(&session_key) || (filtering && !windows.is_empty());
+            targets.push(TreeTarget {
+                key: session_key,
+                depth: 0,
+                is_last_sibling: session_index + 1 == session_count,
+                parent_is_last_sibling: true,
+                has_children: !session.windows.is_empty(),
+                expanded: session_expanded,
+            });
+            if !session_expanded {
+                continue;
+            }
+
+            let window_count = windows.len();
+            for (window_index, window) in windows.into_iter().enumerate() {
+                let mut panes: Vec<&PaneNode> = window
+                    .panes
+                    .iter()
+                    .filter(|pane| {
+                        tree_pane_relevant(pane, session, window, &query, self.attention_only)
+                    })
+                    .collect();
+                panes.sort_by(|left, right| self.compare_panes(left, right));
+                let window_key = window.node_key();
+                let window_expanded =
+                    self.expanded_nodes.contains(&window_key) || (filtering && !panes.is_empty());
+                targets.push(TreeTarget {
+                    key: window_key,
+                    depth: 1,
+                    is_last_sibling: window_index + 1 == window_count,
+                    parent_is_last_sibling: session_index + 1 == session_count,
+                    has_children: !window.panes.is_empty(),
+                    expanded: window_expanded,
+                });
+                if !window_expanded {
+                    continue;
+                }
+                let pane_count = panes.len();
+                for (pane_index, pane) in panes.into_iter().enumerate() {
+                    targets.push(TreeTarget {
+                        key: pane.node_key(),
+                        depth: 2,
+                        is_last_sibling: pane_index + 1 == pane_count,
+                        parent_is_last_sibling: window_index + 1 == window_count,
+                        has_children: false,
+                        expanded: false,
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    fn compare_sessions(&self, left: &SessionNode, right: &SessionNode) -> Ordering {
+        let now = OffsetDateTime::now_utc();
+        compare_topology_siblings(
+            &self.watch_cfg.sort,
+            TopologySortFacts::for_session(
+                left,
+                unambiguous_session_activity_secs(self, left, now).unwrap_or(0),
+            ),
+            TopologySortFacts::for_session(
+                right,
+                unambiguous_session_activity_secs(self, right, now).unwrap_or(0),
+            ),
+        )
+    }
+
+    fn compare_windows(&self, left: &WindowNode, right: &WindowNode) -> Ordering {
+        compare_topology_siblings(
+            &self.watch_cfg.sort,
+            TopologySortFacts::for_window(left),
+            TopologySortFacts::for_window(right),
+        )
+    }
+
+    fn compare_panes(&self, left: &PaneNode, right: &PaneNode) -> Ordering {
+        compare_topology_siblings(
+            &self.watch_cfg.sort,
+            TopologySortFacts::for_pane(left),
+            TopologySortFacts::for_pane(right),
+        )
+    }
+
+    fn selected_tree_target(&self) -> Option<TreeTarget> {
+        let index = self.table_state.selected()?;
+        self.tree_targets().get(index).cloned()
+    }
+
+    fn selected_node_key(&self) -> Option<TopologyNodeKey> {
+        self.selected_tree_target().map(|target| target.key)
+    }
+
+    fn selected_node(&self) -> Option<TopologyNodeRef<'_>> {
+        let key = self.selected_node_key()?;
+        self.topology.find(&key)
+    }
+
+    fn spawn_context(&self, fallback_dir: String) -> (Option<TopologyNodeKey>, String, String) {
+        if !self.uses_tree() {
+            return (None, fallback_dir, String::new());
+        }
+        let Some(node) = self.selected_node() else {
+            return (None, fallback_dir, String::new());
+        };
+        match node {
+            TopologyNodeRef::Session(session) => (
+                Some(session.node_key()),
+                session
+                    .active_window()
+                    .and_then(|window| window.cwd.clone())
+                    .unwrap_or(fallback_dir),
+                String::new(),
+            ),
+            TopologyNodeRef::Window(window) => (
+                Some(window.node_key()),
+                window.cwd.clone().unwrap_or(fallback_dir),
+                window.name.clone(),
+            ),
+            TopologyNodeRef::Pane(pane) => (
+                Some(pane.node_key()),
+                if pane.cwd.is_empty() {
+                    fallback_dir
+                } else {
+                    pane.cwd.clone()
+                },
+                self.topology
+                    .find(&TopologyNodeKey::Window(pane.key.window.clone()))
+                    .and_then(|node| match node {
+                        TopologyNodeRef::Window(window) => Some(window.name.clone()),
+                        TopologyNodeRef::Session(_) | TopologyNodeRef::Pane(_) => None,
+                    })
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
     /// Identity of the row the cursor is on, if any.
     fn selected_identity(&self) -> Option<RowIdentity> {
+        if self.uses_tree() {
+            return self.selected_node_key().map(RowIdentity::Topology);
+        }
         let target = self.selected_target()?;
         self.identity_for_target(target)
+    }
+
+    fn topology_filtering(&self) -> bool {
+        !self.search_query.trim().is_empty() || self.attention_only
+    }
+
+    fn selection_identity_for_rebuild(&self) -> Option<RowIdentity> {
+        if self.uses_tree() && self.topology_filtering() {
+            self.filtered_selection_anchor
+                .clone()
+                .map(RowIdentity::Topology)
+                .or_else(|| self.selected_identity())
+        } else {
+            self.selected_identity()
+        }
+    }
+
+    fn pin_filtered_tree_selection(&mut self) {
+        if self.uses_tree() && self.topology_filtering() {
+            self.filtered_selection_anchor = self.selected_node_key();
+        }
     }
 
     fn identity_for_target(&self, target: VisibleTarget) -> Option<RowIdentity> {
@@ -2730,23 +3317,21 @@ impl App {
     }
 
     fn work_group_for_identity(&self, identity: &RowIdentity) -> Option<String> {
-        if self.watch_cfg.view != WatchView::Work {
+        if self.uses_tree() {
             return None;
         }
         match identity {
-            RowIdentity::Work(group_key) => self
-                .rows
-                .iter()
-                .any(|row| {
-                    matches!(
-                        row,
-                        WatchRow::Work(session)
-                            if &session.group_key == group_key
-                                && session.pane_count > 1
-                                && !session.agents.is_empty()
-                    )
-                })
-                .then(|| group_key.clone()),
+            RowIdentity::Work(identity) => self.rows.iter().find_map(|row| {
+                let WatchRow::Work(session) = row else {
+                    return None;
+                };
+                let matches = identity.window_key.as_ref().map_or_else(
+                    || session.group_key == identity.fallback,
+                    |key| session.window_key.as_ref() == Some(key),
+                );
+                (matches && session.pane_count > 1 && !session.agents.is_empty())
+                    .then(|| session.group_key.clone())
+            }),
             RowIdentity::Agent(kind, session_id) => self.rows.iter().find_map(|row| {
                 let WatchRow::Work(session) = row else {
                     return None;
@@ -2759,11 +3344,14 @@ impl App {
                         .any(|agent| agent.kind == *kind && agent.session_id == *session_id))
                 .then(|| session.group_key.clone())
             }),
-            RowIdentity::BarePane(_) => None,
+            RowIdentity::Topology(_) | RowIdentity::BarePane(_) => None,
         }
     }
 
     fn set_auto_expansion(&mut self, identity: Option<&RowIdentity>) {
+        if self.uses_tree() {
+            return;
+        }
         let group_key = identity.and_then(|id| self.work_group_for_identity(id));
         self.expanded_works.clear();
         if let Some(group_key) = group_key {
@@ -2772,6 +3360,12 @@ impl App {
     }
 
     fn target_index_for_identity(&self, identity: &RowIdentity) -> Option<usize> {
+        if let RowIdentity::Topology(key) = identity {
+            return self
+                .tree_targets()
+                .iter()
+                .position(|target| &target.key == key);
+        }
         self.visible_targets().iter().position(|target| {
             self.identity_for_target(*target)
                 .is_some_and(|candidate| &candidate == identity)
@@ -2782,6 +3376,9 @@ impl App {
     /// keystroke. Selecting one of its child agents keeps the same parent open;
     /// moving to another work folds the previous one and opens the new one.
     fn sync_auto_expansion(&mut self) {
+        if self.uses_tree() {
+            return;
+        }
         let identity = self.selected_identity();
         self.set_auto_expansion(identity.as_ref());
         if let Some(identity) = identity {
@@ -2813,11 +3410,35 @@ impl App {
                 self.table_state.select(Some(idx));
                 return;
             }
+            if let RowIdentity::Topology(key) = prev {
+                let ancestors: Vec<TopologyNodeKey> = match key {
+                    TopologyNodeKey::Pane(pane) => vec![
+                        TopologyNodeKey::Window(pane.window.clone()),
+                        TopologyNodeKey::Session(pane.window.session.clone()),
+                    ],
+                    TopologyNodeKey::Window(window) => {
+                        vec![TopologyNodeKey::Session(window.session.clone())]
+                    }
+                    TopologyNodeKey::Session(_) => Vec::new(),
+                };
+                for ancestor in ancestors {
+                    if let Some(index) =
+                        self.target_index_for_identity(&RowIdentity::Topology(ancestor))
+                    {
+                        self.table_state.select(Some(index));
+                        return;
+                    }
+                }
+            }
         }
         self.clamp_selection();
     }
 
     fn clamp_selection(&mut self) {
+        if self.uses_tree() {
+            self.clamp_tree_selection();
+            return;
+        }
         let targets = self.visible_targets();
         if targets.is_empty() {
             self.table_state.select(None);
@@ -2834,11 +3455,11 @@ impl App {
                 // `take()` ensures later refreshes don't re-snap selection.
                 let hint = self.initial_pane.take();
                 let initial = hint
-                    .as_deref()
-                    .and_then(|id| {
+                    .as_ref()
+                    .and_then(|hint| {
                         targets.iter().position(|target| {
-                            target_pane(self, *target).as_deref() == Some(id)
-                                || self.rows[target.row_idx].contains_pane(id)
+                            target_pane(self, *target).as_deref() == Some(&hint.pane_id)
+                                || self.rows[target.row_idx].contains_pane(&hint.pane_id)
                         })
                     })
                     .unwrap_or(0);
@@ -2847,6 +3468,60 @@ impl App {
             Some(_) => {}
         }
         self.sync_auto_expansion();
+    }
+
+    fn initial_tree_target_index(
+        &self,
+        hint: &InitialPaneHint,
+        targets: &[TreeTarget],
+    ) -> Option<usize> {
+        let mut matches = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .filter(|pane| {
+                pane.key.pane_id == hint.pane_id
+                    && hint
+                        .endpoint
+                        .as_ref()
+                        .is_none_or(|endpoint| &pane.key.window.session.endpoint == endpoint)
+            });
+        let pane = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+
+        [
+            pane.node_key(),
+            TopologyNodeKey::Window(pane.key.window.clone()),
+            TopologyNodeKey::Session(pane.key.window.session.clone()),
+        ]
+        .into_iter()
+        .find_map(|key| targets.iter().position(|target| target.key == key))
+    }
+
+    fn clamp_tree_selection(&mut self) {
+        let targets = self.tree_targets();
+        if targets.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        match self.table_state.selected() {
+            Some(index) if index >= targets.len() => {
+                self.table_state.select(Some(targets.len() - 1));
+            }
+            None => {
+                let hint = self.initial_pane.take();
+                let initial = hint
+                    .as_ref()
+                    .and_then(|hint| self.initial_tree_target_index(hint, &targets))
+                    .unwrap_or(0);
+                self.table_state.select(Some(initial));
+            }
+            Some(_) => {}
+        }
     }
 
     pub(crate) fn move_down(&mut self) {
@@ -2896,6 +3571,10 @@ impl App {
     /// to the parent. This keeps a long child roster from slowing down the
     /// common case of scanning between work items.
     fn move_vertical(&mut self, delta: isize) {
+        if self.uses_tree() {
+            self.move_tree_vertical(delta, true);
+            return;
+        }
         let targets = self.visible_targets();
         if targets.is_empty() {
             return;
@@ -2918,6 +3597,10 @@ impl App {
     }
 
     fn move_vertical_bounded(&mut self, delta: isize) {
+        if self.uses_tree() {
+            self.move_tree_vertical(delta, false);
+            return;
+        }
         let targets = self.visible_targets();
         if targets.is_empty() {
             return;
@@ -2941,6 +3624,15 @@ impl App {
     }
 
     fn move_to_vertical_boundary(&mut self, last: bool) {
+        if self.uses_tree() {
+            let targets = self.tree_targets();
+            if !targets.is_empty() {
+                self.table_state
+                    .select(Some(if last { targets.len() - 1 } else { 0 }));
+                self.pin_filtered_tree_selection();
+            }
+            return;
+        }
         let targets = self.visible_targets();
         if targets.is_empty() {
             return;
@@ -2964,13 +3656,36 @@ impl App {
             .filter(|index| *index < targets.len())
     }
 
+    fn move_tree_vertical(&mut self, delta: isize, wrap: bool) {
+        let len = self.tree_targets().len();
+        if len == 0 {
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0).min(len - 1);
+        let next = if wrap {
+            if delta.is_negative() {
+                current.checked_sub(delta.unsigned_abs()).unwrap_or(len - 1)
+            } else {
+                current.saturating_add(delta.unsigned_abs()) % len
+            }
+        } else if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
+        };
+        self.table_state.select(Some(next));
+        self.pin_filtered_tree_selection();
+    }
+
     fn vertical_candidates(
         &self,
         targets: &[VisibleTarget],
         selected: Option<usize>,
     ) -> Vec<usize> {
         let current = selected.and_then(|index| targets.get(index));
-        if self.watch_cfg.view == WatchView::Work {
+        if self.uses_tree() {
+            (0..targets.len()).collect()
+        } else {
             match current {
                 Some(target) if target.agent_idx.is_some() => targets
                     .iter()
@@ -2986,12 +3701,14 @@ impl App {
                     .filter_map(|(index, target)| target.agent_idx.is_none().then_some(index))
                     .collect(),
             }
-        } else {
-            (0..targets.len()).collect()
         }
     }
 
     fn move_into_work(&mut self) {
+        if self.uses_tree() {
+            self.expand_or_enter_tree_child();
+            return;
+        }
         self.sync_auto_expansion();
         let Some(index) = self.table_state.selected() else {
             return;
@@ -3013,6 +3730,10 @@ impl App {
     }
 
     fn move_to_work_parent(&mut self) {
+        if self.uses_tree() {
+            self.collapse_or_select_tree_parent();
+            return;
+        }
         let Some(target) = self.selected_target() else {
             return;
         };
@@ -3022,12 +3743,112 @@ impl App {
         let Some(WatchRow::Work(session)) = self.rows.get(target.row_idx) else {
             return;
         };
-        self.restore_selection(Some(RowIdentity::Work(session.group_key.clone())));
+        self.restore_selection(Some(RowIdentity::Work(WorkIdentity {
+            window_key: session.window_key.clone(),
+            fallback: session.group_key.clone(),
+        })));
+    }
+
+    fn expand_or_enter_tree_child(&mut self) {
+        let Some(target) = self.selected_tree_target() else {
+            return;
+        };
+        if target.has_children && !self.expanded_nodes.contains(&target.key) {
+            self.expanded_nodes.insert(target.key.clone());
+            if let Some(index) = self
+                .tree_targets()
+                .iter()
+                .position(|candidate| candidate.key == target.key)
+            {
+                self.table_state.select(Some(index));
+                self.pin_filtered_tree_selection();
+            }
+            return;
+        }
+        let targets = self.tree_targets();
+        let Some(index) = targets
+            .iter()
+            .position(|candidate| candidate.key == target.key)
+        else {
+            return;
+        };
+        if targets
+            .get(index + 1)
+            .is_some_and(|child| child.depth == target.depth + 1)
+        {
+            self.table_state.select(Some(index + 1));
+            self.pin_filtered_tree_selection();
+        }
+    }
+
+    fn collapse_or_select_tree_parent(&mut self) {
+        let Some(target) = self.selected_tree_target() else {
+            return;
+        };
+        if target.has_children && self.expanded_nodes.remove(&target.key) {
+            if let Some(index) = self
+                .tree_targets()
+                .iter()
+                .position(|candidate| candidate.key == target.key)
+            {
+                self.table_state.select(Some(index));
+                self.pin_filtered_tree_selection();
+            }
+            return;
+        }
+        let parent = match &target.key {
+            TopologyNodeKey::Session(_) => None,
+            TopologyNodeKey::Window(key) => Some(TopologyNodeKey::Session(key.session.clone())),
+            TopologyNodeKey::Pane(key) => Some(TopologyNodeKey::Window(key.window.clone())),
+        };
+        if let Some(parent) = parent {
+            if let Some(index) = self
+                .tree_targets()
+                .iter()
+                .position(|candidate| candidate.key == parent)
+            {
+                self.table_state.select(Some(index));
+                self.pin_filtered_tree_selection();
+            }
+        }
     }
 
     /// `pane_id` of the currently selected row, if any.
     pub(crate) fn selected_pane(&self) -> Option<String> {
+        if self.uses_tree() {
+            return self
+                .selected_action_pane()
+                .map(|pane| pane.key.pane_id.clone());
+        }
         target_pane(self, self.selected_target()?)
+    }
+
+    fn selected_action_pane(&self) -> Option<&PaneNode> {
+        match self.selected_node()? {
+            TopologyNodeRef::Session(session) => session.active_window()?.active_pane(),
+            TopologyNodeRef::Window(window) => window.active_pane(),
+            TopologyNodeRef::Pane(pane) => Some(pane),
+        }
+    }
+
+    fn selected_exact_pane(&self) -> Option<&PaneNode> {
+        match self.selected_node()? {
+            TopologyNodeRef::Pane(pane) => Some(pane),
+            TopologyNodeRef::Session(_) | TopologyNodeRef::Window(_) => None,
+        }
+    }
+
+    fn selected_topology_panes(&self) -> Vec<&PaneNode> {
+        match self.selected_node() {
+            Some(TopologyNodeRef::Session(session)) => session
+                .windows
+                .iter()
+                .flat_map(|window| &window.panes)
+                .collect(),
+            Some(TopologyNodeRef::Window(window)) => window.panes.iter().collect(),
+            Some(TopologyNodeRef::Pane(pane)) => vec![pane],
+            None => Vec::new(),
+        }
     }
 
     fn selected_target(&self) -> Option<VisibleTarget> {
@@ -3040,11 +3861,17 @@ impl App {
     /// (e.g. `K` only applies to `WatchRow::Agent` rows with a
     /// non-`None` pane).
     pub(crate) fn selected_row(&self) -> Option<&WatchRow> {
+        if self.uses_tree() {
+            return None;
+        }
         let target = self.selected_target()?;
         self.rows.get(target.row_idx)
     }
 
     fn selected_agent(&self) -> Option<&Agent> {
+        if self.uses_tree() {
+            return self.selected_exact_pane()?.agent.as_ref();
+        }
         let target = self.selected_target()?;
         match self.rows.get(target.row_idx)? {
             WatchRow::Agent(agent) => Some(agent),
@@ -3079,7 +3906,7 @@ impl App {
             let WatchRow::Work(session) = row else {
                 continue;
             };
-            if self.watch_cfg.view == WatchView::Swarm
+            if self.watch_cfg.layout == WatchLayout::Swarm
                 || session.pane_count <= 1
                 || !self.expanded_works.contains(&session.group_key)
             {
@@ -3104,9 +3931,24 @@ impl App {
     }
 
     fn edit_search(&mut self, edit: impl FnOnce(&mut String)) {
-        let selected = self.selected_identity();
+        let was_filtering = self.topology_filtering();
+        if self.uses_tree() && !was_filtering {
+            self.filtered_selection_anchor = self.selected_node_key();
+        }
         edit(&mut self.search_query);
+        let is_filtering = self.topology_filtering();
+        let selected = if self.uses_tree() {
+            self.filtered_selection_anchor
+                .clone()
+                .map(RowIdentity::Topology)
+                .or_else(|| self.selected_identity())
+        } else {
+            self.selected_identity()
+        };
         self.restore_selection(selected);
+        if self.uses_tree() && !is_filtering {
+            self.filtered_selection_anchor = None;
+        }
     }
 
     fn browse_keys_active(&self) -> bool {
@@ -3135,9 +3977,24 @@ impl App {
     }
 
     fn toggle_attention_only(&mut self) {
-        let selected = self.selected_identity();
+        let was_filtering = self.topology_filtering();
+        if self.uses_tree() && !was_filtering {
+            self.filtered_selection_anchor = self.selected_node_key();
+        }
         self.attention_only = !self.attention_only;
+        let is_filtering = self.topology_filtering();
+        let selected = if self.uses_tree() {
+            self.filtered_selection_anchor
+                .clone()
+                .map(RowIdentity::Topology)
+                .or_else(|| self.selected_identity())
+        } else {
+            self.selected_identity()
+        };
         self.restore_selection(selected);
+        if self.uses_tree() && !is_filtering {
+            self.filtered_selection_anchor = None;
+        }
     }
 
     fn toggle_event_inbox(&mut self) {
@@ -3200,6 +4057,261 @@ fn target_pane(app: &App, target: VisibleTarget) -> Option<String> {
     }
 }
 
+fn topology_keys(snapshot: &TopologySnapshot) -> HashSet<TopologyNodeKey> {
+    let mut keys = HashSet::new();
+    for session in &snapshot.sessions {
+        keys.insert(session.node_key());
+        for window in &session.windows {
+            keys.insert(window.node_key());
+            keys.extend(window.panes.iter().map(PaneNode::node_key));
+        }
+    }
+    keys
+}
+
+fn topology_key_label(key: &TopologyNodeKey) -> String {
+    match key {
+        TopologyNodeKey::Session(session) => format!(
+            "{}:{} session {}",
+            session.endpoint.host, session.endpoint.socket, session.session_id
+        ),
+        TopologyNodeKey::Window(window) => format!(
+            "{}:{} session {} window {}",
+            window.session.endpoint.host,
+            window.session.endpoint.socket,
+            window.session.session_id,
+            window.window_id
+        ),
+        TopologyNodeKey::Pane(pane) => format!(
+            "{}:{} session {} window {} pane {}",
+            pane.window.session.endpoint.host,
+            pane.window.session.endpoint.socket,
+            pane.window.session.session_id,
+            pane.window.window_id,
+            pane.pane_id
+        ),
+    }
+}
+
+fn default_tree_expanded(key: &TopologyNodeKey, view: WatchView) -> bool {
+    matches!(
+        (key, view),
+        (
+            TopologyNodeKey::Session(_),
+            WatchView::Window | WatchView::Pane
+        ) | (TopologyNodeKey::Window(_), WatchView::Pane)
+    )
+}
+
+fn distribution_rank(states: &StateDistribution) -> u8 {
+    if states.error > 0 {
+        state_sort_rank(AgentState::Error)
+    } else if states.waiting_choice > 0 {
+        state_sort_rank(AgentState::WaitingChoice)
+    } else if states.waiting_input > 0 {
+        state_sort_rank(AgentState::WaitingInput)
+    } else if states.working > 0 {
+        state_sort_rank(AgentState::Working)
+    } else if states.starting > 0 {
+        state_sort_rank(AgentState::Starting)
+    } else if states.idle > 0 {
+        state_sort_rank(AgentState::Idle)
+    } else if states.stopped > 0 {
+        state_sort_rank(AgentState::Stopped)
+    } else {
+        u8::MAX
+    }
+}
+
+fn node_query_match(values: impl IntoIterator<Item = String>, query: &str) -> bool {
+    query.is_empty() || values.into_iter().any(|value| contains_ci(&value, query))
+}
+
+fn session_matches_query(session: &SessionNode, query: &str) -> bool {
+    node_query_match(
+        [
+            session.name.clone(),
+            session.key.session_id.clone(),
+            session.key.endpoint.host.to_string(),
+            session.key.endpoint.socket.clone(),
+        ],
+        query,
+    )
+}
+
+fn window_matches_query(window: &WindowNode, session: &SessionNode, query: &str) -> bool {
+    node_query_match(
+        [
+            session.name.clone(),
+            window.name.clone(),
+            window.index.clone(),
+            window.key.window_id.clone(),
+            window.cwd.clone().unwrap_or_default(),
+        ],
+        query,
+    )
+}
+
+fn pane_matches_query(pane: &PaneNode, query: &str) -> bool {
+    if node_query_match(
+        [
+            pane.key.pane_id.clone(),
+            pane.index.clone(),
+            pane.current_command.clone(),
+            pane.title.clone(),
+            pane.cwd.clone(),
+        ],
+        query,
+    ) {
+        return true;
+    }
+    pane.agent
+        .as_ref()
+        .is_some_and(|agent| agent_matches_query(agent, &[], query))
+}
+
+fn tree_pane_relevant(
+    pane: &PaneNode,
+    session: &SessionNode,
+    window: &WindowNode,
+    query: &str,
+    attention_only: bool,
+) -> bool {
+    let query_match = query.is_empty()
+        || session_matches_query(session, query)
+        || window_matches_query(window, session, query)
+        || pane_matches_query(pane, query);
+    let attention_match = !attention_only
+        || pane
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent_needs_attention(agent.state));
+    query_match && attention_match
+}
+
+fn tree_window_relevant(
+    window: &WindowNode,
+    session: &SessionNode,
+    query: &str,
+    attention_only: bool,
+) -> bool {
+    let query_match = query.is_empty()
+        || window_matches_query(window, session, query)
+        || window
+            .panes
+            .iter()
+            .any(|pane| pane_matches_query(pane, query));
+    let attention_match = !attention_only || window.states.needs_attention();
+    query_match && attention_match
+}
+
+fn tree_session_relevant(session: &SessionNode, query: &str, attention_only: bool) -> bool {
+    let query_match = query.is_empty()
+        || session_matches_query(session, query)
+        || session.windows.iter().any(|window| {
+            window_matches_query(window, session, query)
+                || window
+                    .panes
+                    .iter()
+                    .any(|pane| pane_matches_query(pane, query))
+        });
+    let attention_match = !attention_only || session.states.needs_attention();
+    query_match && attention_match
+}
+
+struct TopologySortFacts {
+    label: String,
+    state_rank: u8,
+    activity: Option<OffsetDateTime>,
+    duration_secs: u64,
+    native_index: u64,
+    pane_id: String,
+    stable: String,
+}
+
+impl TopologySortFacts {
+    fn for_session(session: &SessionNode, duration_secs: u64) -> Self {
+        Self {
+            label: session.name.clone(),
+            state_rank: distribution_rank(&session.states),
+            activity: session
+                .windows
+                .iter()
+                .flat_map(|window| &window.panes)
+                .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.last_activity_at))
+                .max(),
+            duration_secs,
+            native_index: 0,
+            pane_id: String::new(),
+            stable: serde_json::to_string(&session.key).unwrap_or_default(),
+        }
+    }
+
+    fn for_window(window: &WindowNode) -> Self {
+        let agents: Vec<&Agent> = window
+            .panes
+            .iter()
+            .filter_map(|pane| pane.agent.as_ref())
+            .collect();
+        let now = OffsetDateTime::now_utc();
+        let earliest = agents.iter().map(|agent| agent.started_at).min();
+        Self {
+            label: window.name.clone(),
+            state_rank: distribution_rank(&window.states),
+            activity: agents.iter().map(|agent| agent.last_activity_at).max(),
+            duration_secs: earliest.map_or(0, |at| {
+                u64::try_from((now - at).whole_seconds().max(0)).unwrap_or(u64::MAX)
+            }),
+            native_index: window.index.parse().unwrap_or(u64::MAX),
+            pane_id: String::new(),
+            stable: serde_json::to_string(&window.key).unwrap_or_default(),
+        }
+    }
+
+    fn for_pane(pane: &PaneNode) -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            label: pane
+                .agent
+                .as_ref()
+                .map_or_else(|| pane.title.clone(), |agent| agent.kind.to_string()),
+            state_rank: pane
+                .agent
+                .as_ref()
+                .map_or(u8::MAX, |agent| state_sort_rank(agent.state)),
+            activity: pane.agent.as_ref().map(|agent| agent.last_activity_at),
+            duration_secs: pane.agent.as_ref().map_or(0, |agent| {
+                u64::try_from((now - agent.state_entered_at).whole_seconds().max(0))
+                    .unwrap_or(u64::MAX)
+            }),
+            native_index: pane.index.parse().unwrap_or(u64::MAX),
+            pane_id: pane.key.pane_id.clone(),
+            stable: serde_json::to_string(&pane.key).unwrap_or_default(),
+        }
+    }
+}
+
+fn compare_topology_siblings(
+    keys: &[WatchSortKey],
+    left: TopologySortFacts,
+    right: TopologySortFacts,
+) -> Ordering {
+    for key in keys {
+        let ordering = match key {
+            WatchSortKey::Name => left.label.cmp(&right.label),
+            WatchSortKey::Activity => right.activity.cmp(&left.activity),
+            WatchSortKey::State => left.state_rank.cmp(&right.state_rank),
+            WatchSortKey::Duration => right.duration_secs.cmp(&left.duration_secs),
+            WatchSortKey::Pane => left.native_index.cmp(&right.native_index),
+            WatchSortKey::PaneId => left.pane_id.cmp(&right.pane_id),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.stable.cmp(&right.stable)
+}
+
 fn contains_ci(value: &str, lowercase_query: &str) -> bool {
     value.to_lowercase().contains(lowercase_query)
 }
@@ -3208,7 +4320,7 @@ fn agent_matches_query(agent: &Agent, panes: &[PaneInfo], query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    let pane_label = pane_display(agent.pane.as_deref(), panes);
+    let pane_label = agent_pane_display(agent, panes);
     let kind = agent.kind.to_string();
     let state = agent.state.to_string();
     let matches = [
@@ -3270,7 +4382,7 @@ fn row_needs_attention(row: &WatchRow) -> bool {
 }
 
 struct SortContext<'a> {
-    pane_by_id: HashMap<&'a str, &'a PaneInfo>,
+    pane_by_id: HashMap<&'a str, Vec<&'a PaneInfo>>,
     session_id_by_name: HashMap<&'a str, &'a str>,
     /// Display name for a group key. A group is keyed by `PaneInfo.session`:
     /// the session name on tmux, the `workspace_id` on herdr. Mapped from
@@ -3295,8 +4407,15 @@ impl<'a> SortContext<'a> {
             display_by_key.insert(s.name.as_str(), s.name.as_str());
             display_by_key.insert(s.session_id.as_str(), s.name.as_str());
         }
+        let mut pane_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for pane in panes {
+            pane_by_id
+                .entry(pane.pane_id.as_str())
+                .or_default()
+                .push(pane);
+        }
         Self {
-            pane_by_id: panes.iter().map(|p| (p.pane_id.as_str(), p)).collect(),
+            pane_by_id,
             session_id_by_name: sessions
                 .iter()
                 .map(|s| (s.name.as_str(), s.session_id.as_str()))
@@ -3311,7 +4430,35 @@ impl<'a> SortContext<'a> {
     }
 
     fn pane(&self, pane_id: &str) -> Option<&'a PaneInfo> {
-        self.pane_by_id.get(pane_id).copied()
+        let candidates = self.pane_by_id.get(pane_id)?;
+        (candidates.len() == 1).then_some(candidates[0])
+    }
+
+    fn pane_for_agent(&self, agent: &Agent) -> Option<&'a PaneInfo> {
+        let pane_id = agent.pane.as_deref()?;
+        let candidates = self.pane_by_id.get(pane_id)?;
+        match agent.tmux_socket.as_deref() {
+            Some(endpoint) => candidates.iter().copied().find(|pane| {
+                let host =
+                    muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+                let pane_endpoint = PaneKey::from_pane(host, pane)
+                    .window
+                    .session
+                    .endpoint
+                    .socket;
+                muxa::backend::pane_endpoint_identity(Some(pane_id), endpoint) == pane_endpoint
+            }),
+            None if candidates.len() == 1 => Some(candidates[0]),
+            None => None,
+        }
+    }
+
+    fn pane_for_window(&self, window_key: &WindowKey) -> Option<&'a PaneInfo> {
+        self.pane_by_id.values().flatten().copied().find(|pane| {
+            let host =
+                muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+            WindowKey::from_pane(host, pane) == *window_key
+        })
     }
 
     /// The human-facing display name for a group key, falling back to the key
@@ -3343,17 +4490,13 @@ impl<'a> SortContext<'a> {
     }
 
     fn agent_session_duration_secs(&self, agent: &Agent) -> u64 {
-        agent
-            .pane
-            .as_deref()
-            .and_then(|id| self.pane(id))
-            .map_or(0, |pane| {
-                if muxa::backend::pane_id_host_kind(&pane.pane_id) == Some(muxa::HostKind::Rmux) {
-                    0
-                } else {
-                    self.session_duration_secs(&pane.session)
-                }
-            })
+        self.pane_for_agent(agent).map_or(0, |pane| {
+            if muxa::backend::pane_id_host_kind(&pane.pane_id) == Some(muxa::HostKind::Rmux) {
+                0
+            } else {
+                self.session_duration_secs(&pane.session)
+            }
+        })
     }
 }
 
@@ -3396,8 +4539,8 @@ fn sort_agents(
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    let info_a = a.pane.as_deref().and_then(|id| sort_context.pane(id));
-    let info_b = b.pane.as_deref().and_then(|id| sort_context.pane(id));
+    let info_a = sort_context.pane_for_agent(a);
+    let info_b = sort_context.pane_for_agent(b);
 
     // Stale (pane gone) → Ordering::Greater so it sinks to the bottom.
     match (info_a.is_some(), info_b.is_some()) {
@@ -3408,7 +4551,7 @@ fn sort_agents(
 
     for key in keys {
         let cmp = match key {
-            WatchSortKey::Workspace => info_a
+            WatchSortKey::Name => info_a
                 .map(|p| p.session.as_str())
                 .cmp(&info_b.map(|p| p.session.as_str())),
             WatchSortKey::Activity => {
@@ -3416,7 +4559,7 @@ fn sort_agents(
                 b.last_activity_at.cmp(&a.last_activity_at)
             }
             WatchSortKey::State => state_sort_rank(a.state).cmp(&state_sort_rank(b.state)),
-            WatchSortKey::WorkspaceTime => sort_context
+            WatchSortKey::Duration => sort_context
                 .agent_session_duration_secs(b)
                 .cmp(&sort_context.agent_session_duration_secs(a)),
             WatchSortKey::Pane => {
@@ -3460,39 +4603,89 @@ fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
     }
 }
 
+fn build_watch_topology(
+    agents: &[Agent],
+    panes: &[PaneInfo],
+    session_info: &[SessionInfo],
+) -> TopologySnapshot {
+    let mut panes_by_host: HashMap<muxa::HostKind, Vec<PaneInfo>> = HashMap::new();
+    for pane in panes {
+        // Legacy un-namespaced ids predate multi-host support and historically
+        // belonged to tmux. Keeping that fallback preserves visibility while
+        // still assigning a complete host+socket topology key.
+        let host = muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+        panes_by_host.entry(host).or_default().push(pane.clone());
+    }
+    let inputs = panes_by_host
+        .into_iter()
+        .map(|(host, panes)| TopologyInput::new(host, panes))
+        .collect();
+    let mut snapshot = TopologySnapshot::build(OffsetDateTime::now_utc(), inputs, agents.to_vec());
+    let unique_topology_sessions: HashSet<(muxa::HostKind, String)> = snapshot
+        .sessions
+        .iter()
+        .filter(|candidate| {
+            snapshot
+                .sessions
+                .iter()
+                .filter(|other| {
+                    other.key.endpoint.host == candidate.key.endpoint.host
+                        && other.key.session_id == candidate.key.session_id
+                })
+                .count()
+                == 1
+        })
+        .map(|session| (session.key.endpoint.host, session.key.session_id.clone()))
+        .collect();
+    for node in &mut snapshot.sessions {
+        // SessionInfo currently has no endpoint field. Apply it only when its
+        // native id/name identifies one topology session uniquely; duplicate
+        // `$N` ids across sockets deliberately remain unset rather than
+        // borrowing another server's attached-client count.
+        if node.key.endpoint.host != muxa::HostKind::Tmux
+            || !unique_topology_sessions
+                .contains(&(node.key.endpoint.host, node.key.session_id.clone()))
+        {
+            continue;
+        }
+        let mut matches = session_info
+            .iter()
+            .filter(|info| info.session_id == node.key.session_id || info.name == node.name);
+        if let Some(info) = matches.next() {
+            if matches.next().is_none() {
+                node.name.clone_from(&info.name);
+                node.attached_clients = Some(info.attached_clients);
+            }
+        }
+    }
+    snapshot
+}
+
 /// Stable grouping key for one visible work unit. tmux exposes the complete
 /// three-level topology, so the work identity is its window inside a session.
 /// Other backends currently expose only a workspace/session level.
 fn pane_work_group_key(pane: &PaneInfo) -> String {
-    match muxa::backend::pane_id_host_kind(&pane.pane_id) {
-        Some(muxa::HostKind::Tmux) => {
-            let session = if pane.session_id.is_empty() {
-                pane.session.as_str()
-            } else {
-                pane.session_id.as_str()
-            };
-            let window = if pane.window_id.is_empty() {
-                pane.window_index.as_str()
-            } else {
-                pane.window_id.as_str()
-            };
-            format!("tmux:{session}:{window}")
-        }
-        host => session_group_key(host, &pane.session),
-    }
+    let host = muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+    // JSON is used only as an opaque in-process identity string here. Unlike a
+    // delimiter-joined label it cannot collide when a socket path or native id
+    // itself contains `:`.
+    serde_json::to_string(&WindowKey::from_pane(host, pane))
+        .expect("topology window keys are serializable")
 }
 
 fn pane_work_display_name(pane: &PaneInfo) -> Option<String> {
-    if muxa::backend::pane_id_host_kind(&pane.pane_id) == Some(muxa::HostKind::Tmux) {
-        let work = if pane.window_name.trim().is_empty() {
-            format!("window {}", pane.window_index)
-        } else {
-            pane.window_name.clone()
-        };
-        Some(format!("{} › {work}", pane.session))
-    } else {
-        None
+    if muxa::backend::pane_id_host_kind(&pane.pane_id) != Some(muxa::HostKind::Tmux) {
+        // Non-tmux session labels come from their SessionInfo projection
+        // (herdr workspace label, zellij/rmux native metadata). Defer until
+        // `finish_work_row`, then append this pane's native tab/window label.
+        return None;
     }
+    let window = if pane.window_name.trim().is_empty() {
+        format!("window {}", pane.window_index)
+    } else {
+        pane.window_name.clone()
+    };
+    Some(format!("{} › {window}", pane.session))
 }
 
 /// Resolve an agent's session group: the raw session id (display/ledger key)
@@ -3524,6 +4717,7 @@ struct WorkRowBuilder {
     session: String,
     /// Host-namespaced grouping/identity key.
     group_key: String,
+    window_key: Option<WindowKey>,
     display_name: Option<String>,
     panes: Vec<PaneInfo>,
     agents: Vec<Agent>,
@@ -3563,11 +4757,24 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
         .iter()
         .map(|agent| ((agent.kind, agent.session_id.clone()), agent.state))
         .collect();
+    let display_name = builder.display_name.unwrap_or_else(|| {
+        let session = sort_context.display_name(&builder.session);
+        builder.panes.first().map_or_else(
+            || session.clone(),
+            |pane| {
+                let window = if pane.window_name.trim().is_empty() {
+                    format!("window {}", pane.window_index)
+                } else {
+                    pane.window_name.clone()
+                };
+                format!("{session} › {window}")
+            },
+        )
+    });
     WorkRow {
-        display_name: builder
-            .display_name
-            .unwrap_or_else(|| sort_context.display_name(&builder.session)),
+        display_name,
         group_key: builder.group_key,
+        window_key: builder.window_key,
         session: builder.session,
         pane_ids: builder
             .panes
@@ -3604,6 +4811,10 @@ fn build_work_rows(
             .or_insert_with(|| WorkRowBuilder {
                 session: p.session.clone(),
                 group_key: key,
+                window_key: Some(WindowKey::from_pane(
+                    muxa::backend::pane_id_host_kind(&p.pane_id).unwrap_or(muxa::HostKind::Tmux),
+                    p,
+                )),
                 display_name: pane_work_display_name(p),
                 ..WorkRowBuilder::default()
             });
@@ -3611,27 +4822,27 @@ fn build_work_rows(
     }
 
     for agent in agents {
-        let located = agent
-            .pane
-            .as_deref()
-            .and_then(|id| sort_context.pane(id))
-            .map(|pane| {
-                (
-                    pane.session.clone(),
-                    pane_work_group_key(pane),
-                    pane_work_display_name(pane),
-                )
-            });
-        let (session, key, display_name) = located.unwrap_or_else(|| {
+        let located = sort_context.pane_for_agent(&agent).map(|pane| {
+            let host =
+                muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+            (
+                pane.session.clone(),
+                pane_work_group_key(pane),
+                Some(WindowKey::from_pane(host, pane)),
+                pane_work_display_name(pane),
+            )
+        });
+        let (session, key, window_key, display_name) = located.unwrap_or_else(|| {
             let (session, host) = agent_session_group(&agent, |_| None);
             let key = session_group_key(host, &session);
-            (session, key, None)
+            (session, key, None, None)
         });
         let entry = builders
             .entry(key.clone())
             .or_insert_with(|| WorkRowBuilder {
                 session,
                 group_key: key,
+                window_key,
                 display_name,
                 ..WorkRowBuilder::default()
             });
@@ -3740,7 +4951,13 @@ fn sort_panes(a: &PaneInfo, b: &PaneInfo) -> std::cmp::Ordering {
                 .unwrap_or(u32::MAX)
                 .cmp(&b.pane_index.parse::<u32>().unwrap_or(u32::MAX))
         })
-        .then_with(|| a.pane_id.cmp(&b.pane_id))
+        .then_with(|| {
+            let host_a =
+                muxa::backend::pane_id_host_kind(&a.pane_id).unwrap_or(muxa::HostKind::Tmux);
+            let host_b =
+                muxa::backend::pane_id_host_kind(&b.pane_id).unwrap_or(muxa::HostKind::Tmux);
+            PaneKey::from_pane(host_a, a).cmp(&PaneKey::from_pane(host_b, b))
+        })
 }
 
 fn sort_works(
@@ -3751,13 +4968,18 @@ fn sort_works(
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let pane_info = |row: &WorkRow| {
-        row.representative_pane
-            .as_deref()
-            .and_then(|id| sort_context.pane(id))
+        row.window_key
+            .as_ref()
+            .and_then(|key| sort_context.pane_for_window(key))
+            .or_else(|| {
+                row.representative_pane
+                    .as_deref()
+                    .and_then(|id| sort_context.pane(id))
+            })
     };
     for key in keys {
         let cmp = match key {
-            WatchSortKey::Workspace => a.session.cmp(&b.session),
+            WatchSortKey::Name => a.session.cmp(&b.session),
             WatchSortKey::Activity => b
                 .latest_agent
                 .as_ref()
@@ -3771,7 +4993,7 @@ fn sort_works(
                 };
                 rank(a).cmp(&rank(b))
             }
-            WatchSortKey::WorkspaceTime => sort_context
+            WatchSortKey::Duration => sort_context
                 .session_duration_secs(&b.session)
                 .cmp(&sort_context.session_duration_secs(&a.session)),
             WatchSortKey::Pane => {
@@ -3807,6 +5029,14 @@ fn sort_works(
 /// already caches the full pane inventory in `App::panes`; we read
 /// from there instead.
 fn pane_display(pane_id: Option<&str>, panes: &[PaneInfo]) -> String {
+    pane_display_on(pane_id, None, panes)
+}
+
+fn agent_pane_display(agent: &Agent, panes: &[PaneInfo]) -> String {
+    pane_display_on(agent.pane.as_deref(), agent.tmux_socket.as_deref(), panes)
+}
+
+fn pane_display_on(pane_id: Option<&str>, socket: Option<&str>, panes: &[PaneInfo]) -> String {
     let Some(id) = pane_id else {
         // Distinguished from "—" / dash placeholders elsewhere so users
         // can see at a glance which agents have no tmux attachment to
@@ -3815,7 +5045,22 @@ fn pane_display(pane_id: Option<&str>, panes: &[PaneInfo]) -> String {
         // failed to find a pane.
         return "(no pane)".into();
     };
-    match panes.iter().find(|p| p.pane_id == id) {
+    let candidates: Vec<_> = panes.iter().filter(|pane| pane.pane_id == id).collect();
+    let matched = match socket {
+        Some(endpoint) => candidates.iter().copied().find(|pane| {
+            let host =
+                muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+            let pane_endpoint = PaneKey::from_pane(host, pane)
+                .window
+                .session
+                .endpoint
+                .socket;
+            muxa::backend::pane_endpoint_identity(Some(id), endpoint) == pane_endpoint
+        }),
+        None if candidates.len() == 1 => Some(candidates[0]),
+        None => None,
+    };
+    match matched {
         Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
         None => id.to_string(),
     }
@@ -4162,7 +5407,7 @@ fn rows_have_active_spinner(rows: &[WatchRow]) -> bool {
     })
 }
 
-fn workspace_time_text(s: &WorkRow, now: OffsetDateTime) -> Text<'static> {
+fn duration_text(s: &WorkRow, now: OffsetDateTime) -> Text<'static> {
     let Some(activity) = s.activity.as_ref() else {
         return Text::from(Span::styled(
             "-",
@@ -4340,6 +5585,7 @@ fn apply_outcome_inner(app: &mut App, outcome: RefreshOutcome) {
         RefreshOutcome::Full(full) => apply_full(app, full),
         RefreshOutcome::SingleAgent(agent) => {
             apply_single_agent(app, agent);
+            app.topology = build_watch_topology(&app.current_agents(), &app.panes, &app.sessions);
             // Re-sort immediately so a pushed state/activity change moves the
             // row to its sorted position now instead of waiting for the 5 s
             // `Full` fallback tick. This matters most for `sort = ["state",
@@ -4420,7 +5666,7 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
 /// "first event for this session" case, where the next fallback
 /// tick will reconcile sort order and pane labels.
 fn apply_single_agent(app: &mut App, agent: Agent) {
-    if app.watch_cfg.view == WatchView::Work {
+    if app.watch_cfg.layout == WatchLayout::Swarm || app.watch_cfg.view != WatchView::Pane {
         apply_single_agent_to_work(app, agent);
         return;
     }
@@ -4450,22 +5696,28 @@ fn apply_single_agent_to_work(app: &mut App, agent: Agent) {
     // Match the same session+window work key used by the full refresh. This
     // keeps a pushed transition inside its ticket window instead of merging
     // every agent in the workspace session.
-    let located = agent.pane.as_deref().and_then(|id| {
-        app.panes.iter().find(|p| p.pane_id == id).map(|p| {
-            (
-                p.session.clone(),
-                pane_work_group_key(p),
-                pane_work_display_name(p),
-            )
-        })
+    let sort_context = SortContext::new(
+        &app.panes,
+        &app.sessions,
+        &app.session_activity,
+        OffsetDateTime::now_utc(),
+    );
+    let located = sort_context.pane_for_agent(&agent).map(|pane| {
+        let host = muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+        (
+            pane.session.clone(),
+            pane_work_group_key(pane),
+            Some(WindowKey::from_pane(host, pane)),
+            pane_work_display_name(pane),
+        )
     });
-    let (session, group_key, display_name) = located.unwrap_or_else(|| {
+    let (session, group_key, window_key, display_name) = located.unwrap_or_else(|| {
         let session = agent
             .pane
             .as_deref()
             .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"));
         let group_key = session_group_key(None, &session);
-        (session.clone(), group_key, Some(session))
+        (session.clone(), group_key, None, Some(session))
     });
     let display_name = display_name.unwrap_or_else(|| {
         app.sessions
@@ -4479,6 +5731,9 @@ fn apply_single_agent_to_work(app: &mut App, agent: Agent) {
         };
         if s.group_key != group_key {
             continue;
+        }
+        if s.window_key.is_none() {
+            s.window_key.clone_from(&window_key);
         }
         let key = (agent.kind, agent.session_id.clone());
         let mut updated_agent = agent.clone();
@@ -4518,6 +5773,7 @@ fn apply_single_agent_to_work(app: &mut App, agent: Agent) {
     app.rows.push(WatchRow::Work(Box::new(WorkRow {
         display_name,
         group_key,
+        window_key,
         session,
         pane_ids: agent.pane.clone().into_iter().collect(),
         representative_pane: agent.pane.clone(),
@@ -4796,10 +6052,31 @@ async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Optio
     }
 }
 
+/// Resolve the server identity that owns the invoking pane. This is kept as a
+/// separate hint from the raw pane id because `%N` values repeat across tmux
+/// sockets. Hosts without a native multi-server address use the same sentinel
+/// as `TopologySnapshot`.
+fn current_backend_endpoint(host: muxa::HostKind, pane_id: &str) -> Option<BackendEndpoint> {
+    let socket = match host {
+        muxa::HostKind::Tmux => muxa::tmux::layout::current_socket_name().or_else(|| {
+            std::env::var("MUXA_TMUX_SOCKET")
+                .ok()
+                .filter(|socket| !socket.trim().is_empty())
+        }),
+        muxa::HostKind::Rmux => muxa::backend::rmux::endpoint_from_env(),
+        muxa::HostKind::Zellij => Some("zellij".into()),
+        muxa::HostKind::Herdr => Some("herdr".into()),
+    }?;
+    Some(BackendEndpoint {
+        host,
+        socket: muxa::backend::pane_endpoint_identity(Some(pane_id), &socket),
+    })
+}
+
 /// Entry point for `muxa watch`.
 ///
-/// Returns `Some(pane_id)` if the user pressed Enter on a selected agent,
-/// meaning they want to attach to that pane. The caller (`main.rs`) runs
+/// Returns the exact topology pane (or a legacy raw pane target from an old
+/// overlay) when the user presses Enter. The caller (`main.rs`) runs
 /// the actual tmux switch-client invocation *after* this returns so the
 /// terminal is already restored by the time we hand off control.
 #[allow(clippy::too_many_lines)] // mostly setup + action dispatch — extracting a helper
@@ -4812,7 +6089,7 @@ pub async fn run(
     sort_persist_path: Option<PathBuf>,
     caller_pane: Option<String>,
     collaboration_scope: muxa::config::CollaborationScope,
-) -> Result<Option<String>> {
+) -> Result<Option<WatchOpenTarget>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
@@ -4832,8 +6109,22 @@ pub async fn run(
     // The binding-expanded pane beats anything derived in-process: it was
     // resolved by tmux at the keypress, in the pressing client's context,
     // which no query made from inside a popup can reproduce.
-    let initial_pane = caller_pane.or_else(|| backends.iter().find_map(|b| b.current_pane()));
-    app.set_initial_pane(initial_pane.clone());
+    let (initial_pane, initial_host) = if let Some(pane) = caller_pane {
+        (Some(pane), Some(muxa::HostKind::Tmux))
+    } else {
+        backends
+            .iter()
+            .find_map(|backend| {
+                backend
+                    .current_pane()
+                    .map(|pane| (Some(pane), Some(backend.kind())))
+            })
+            .unwrap_or((None, None))
+    };
+    let initial_endpoint = initial_pane
+        .as_deref()
+        .and_then(|pane_id| initial_host.and_then(|host| current_backend_endpoint(host, pane_id)));
+    app.set_initial_pane_on(initial_pane.clone(), initial_endpoint);
     app.collaboration.origin = watch_collaboration_origin(initial_pane.clone());
     app.collaboration_scope = collaboration_scope;
     let watch_started_at = OffsetDateTime::now_utc();
@@ -4898,7 +6189,7 @@ pub async fn run(
     // block or fail.
     let _ = wake_tx.try_send(());
 
-    let mut jump_target: Option<String> = None;
+    let mut jump_target: Option<WatchOpenTarget> = None;
 
     // Repaint only when something actually changed (`needs_render`) or the
     // idle cadence elapsed, instead of once per input-poll tick. `true` here
@@ -4912,7 +6203,7 @@ pub async fn run(
         // is on and at least one agent is working/starting — or while a
         // transition pulse is still lit. An otherwise-idle fleet falls back to
         // the calm 1 s idle repaint.
-        let spinning = (app.watch_cfg.view == WatchView::Swarm || app.watch_cfg.spinner)
+        let spinning = (app.watch_cfg.layout == WatchLayout::Swarm || app.watch_cfg.spinner)
             && icons_unicode()
             && rows_have_active_spinner(&app.rows);
         let animating = spinning || app.has_active_pulse(std::time::Instant::now());
@@ -4970,7 +6261,12 @@ pub async fn run(
                     break;
                 }
                 Action::AttachPane(pane) => {
-                    jump_target = Some(pane);
+                    jump_target = Some(WatchOpenTarget::LegacyPane(pane));
+                    quit = true;
+                    break;
+                }
+                Action::AttachTopologyPane(pane) => {
+                    jump_target = Some(WatchOpenTarget::TopologyPane(pane));
                     quit = true;
                     break;
                 }
@@ -4984,9 +6280,19 @@ pub async fn run(
                     refresh_watch_collaboration(client, &mut app).await;
                 }
                 Action::OpenPreview => {
-                    if let Some(pane_id) = app.selected_pane() {
+                    let pane_key = if app.uses_tree() {
+                        app.selected_action_pane().map(|pane| pane.key.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(pane_id) = pane_key
+                        .as_ref()
+                        .map(|key| key.pane_id.clone())
+                        .or_else(|| app.selected_pane())
+                    {
                         app.preview = Some(PreviewState {
                             pane_id,
+                            pane_key,
                             scroll: 0,
                             mode: PreviewMode::Popup,
                             // Honor `[watch.preview] default_content` so
@@ -5076,11 +6382,19 @@ pub async fn run(
                 Action::SetView(view) => {
                     app.apply_view(view);
                     let label = match view {
+                        WatchView::Session => "session",
+                        WatchView::Window => "window",
                         WatchView::Pane => "pane",
-                        WatchView::Work => "work",
-                        WatchView::Swarm => "swarm",
                     };
                     app.set_hint(format!("view: {label}"), HintLevel::Ok);
+                }
+                Action::SetLayout(layout) => {
+                    app.apply_layout(layout);
+                    let label = match layout {
+                        WatchLayout::Tree => "tree",
+                        WatchLayout::Swarm => "swarm",
+                    };
+                    app.set_hint(format!("layout: {label}"), HintLevel::Ok);
                 }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
@@ -5284,32 +6598,73 @@ pub async fn run(
         // gated: backends that report `caps().capture_pane == false`
         // (zellij CLI today) skip the call and the renderer shows a
         // "(not supported)" placeholder.
-        let capture_pane = app
+        let capture_target = app
             .preview
             .as_ref()
             .filter(|preview| preview.content == PreviewContent::LivePane)
-            .map(|preview| preview.pane_id.clone())
-            .or_else(|| app.inspector_visible.then(|| app.selected_pane()).flatten());
-        if let Some(capture_pane) = capture_pane {
+            .map(|preview| {
+                preview.pane_key.as_ref().map_or_else(
+                    || {
+                        (
+                            preview.pane_id.clone(),
+                            None,
+                            muxa::backend::pane_id_host_kind(&preview.pane_id)
+                                .unwrap_or(muxa::HostKind::Tmux),
+                        )
+                    },
+                    |key| {
+                        (
+                            key.pane_id.clone(),
+                            Some(key.window.session.endpoint.socket.clone()),
+                            key.window.session.endpoint.host,
+                        )
+                    },
+                )
+            })
+            .or_else(|| {
+                if !app.inspector_visible {
+                    return None;
+                }
+                if app.uses_tree() {
+                    app.selected_exact_pane().map(|pane| {
+                        (
+                            pane.key.pane_id.clone(),
+                            Some(pane.key.window.session.endpoint.socket.clone()),
+                            pane.key.window.session.endpoint.host,
+                        )
+                    })
+                } else {
+                    app.selected_pane().map(|pane_id| {
+                        let host = muxa::backend::pane_id_host_kind(&pane_id)
+                            .unwrap_or(muxa::HostKind::Tmux);
+                        (pane_id, None, host)
+                    })
+                }
+            });
+        if let Some((capture_pane, capture_socket, capture_host)) = capture_target {
             // Resolve the capturing backend by the pane id's namespace so a
             // herdr row captures via herdr even when tmux is the primary
             // host (and vice versa). Cheap to build per capture (bounded to
             // ~2 Hz by the TTL below).
-            let cap_backend = crate::backend_for_pane(&capture_pane);
+            let cap_backend = crate::backend_for_kind(capture_host);
             if cap_backend.caps().capture_pane {
                 let stale = app.pane_capture.as_ref().is_none_or(|c| {
                     c.pane_id != capture_pane
+                        || c.socket != capture_socket
                         || c.fetched_at.elapsed() >= Duration::from_millis(500)
                 });
                 if stale {
                     let pane_id = capture_pane.clone();
-                    let captured =
-                        tokio::task::spawn_blocking(move || cap_backend.capture_pane(&pane_id))
-                            .await
-                            .ok()
-                            .flatten();
+                    let socket = capture_socket.clone();
+                    let captured = tokio::task::spawn_blocking(move || {
+                        cap_backend.capture_pane_on(socket.as_deref(), &pane_id)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
                     app.pane_capture = Some(CapturedPane {
                         pane_id: capture_pane,
+                        socket: capture_socket,
                         text: captured.unwrap_or_default(),
                         fetched_at: std::time::Instant::now(),
                     });
@@ -5471,14 +6826,28 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
 /// the selected pane instead of refusing outright, and the reason the
 /// contract modes are missing rides along as a warning hint.
 fn open_prompt_only_composer(app: &mut App, reason: String) {
-    let Some(pane) = app.selected_pane() else {
+    let pane_key = if app.uses_tree() {
+        app.selected_action_pane().map(|pane| pane.key.clone())
+    } else {
+        None
+    };
+    let Some(pane) = pane_key
+        .as_ref()
+        .map(|key| key.pane_id.clone())
+        .or_else(|| app.selected_pane())
+    else {
         app.set_hint("no tmux pane on this row", HintLevel::Err);
         return;
     };
-    let label = app.pane_label(&pane);
+    let label = pane_key.as_ref().map_or_else(
+        || app.pane_label(&pane),
+        |key| topology_key_label(&TopologyNodeKey::Pane(key.clone())),
+    );
     app.collaboration_mailbox.open = false;
     app.collaboration_composer = Some(CollaborationComposer::new(
-        CollaborationComposeTarget::Prompt { pane },
+        pane_key.map_or(CollaborationComposeTarget::Prompt { pane }, |pane| {
+            CollaborationComposeTarget::PromptTopology { pane }
+        }),
         label.clone(),
     ));
     // Lead with what *works* — this composer sends, to exactly the pane the
@@ -5499,6 +6868,20 @@ fn open_prompt_only_composer(app: &mut App, reason: String) {
 /// peers in the same row stays ambiguous — picking one for the user
 /// would silently address the wrong agent.
 fn peer_inside_selected_row<'a>(app: &'a App, room: &'a RoomContext) -> Option<&'a Participant> {
+    if app.uses_tree() {
+        let panes = app.selected_topology_panes();
+        let mut inside = room.peers.iter().filter(|peer| {
+            panes.iter().any(|pane| {
+                pane.key.pane_id == peer.pane
+                    && peer.socket.as_deref().is_none_or(|socket| {
+                        muxa::backend::pane_endpoint_identity(Some(&peer.pane), socket)
+                            == pane.key.window.session.endpoint.socket
+                    })
+            })
+        });
+        let first = inside.next()?;
+        return inside.next().is_none().then_some(first);
+    }
     let row = app.selected_row()?;
     let mut inside = room
         .peers
@@ -5506,6 +6889,51 @@ fn peer_inside_selected_row<'a>(app: &'a App, room: &'a RoomContext) -> Option<&
         .filter(|peer| row.contains_pane(&peer.pane));
     let first = inside.next()?;
     inside.next().is_none().then_some(first)
+}
+
+fn participant_matches_pane(participant: &Participant, pane: &PaneNode) -> bool {
+    participant.pane == pane.key.pane_id
+        && participant.room.host == pane.key.window.session.endpoint.host.to_string()
+        && participant.room.window_id == pane.key.window.window_id
+        && participant
+            .tmux_session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id == pane.key.window.session.session_id)
+        && participant.socket.as_deref().is_none_or(|socket| {
+            muxa::backend::pane_endpoints_match(
+                Some(&participant.pane),
+                socket,
+                &pane.key.window.session.endpoint.socket,
+            )
+        })
+}
+
+fn participant_matches_window(participant: &Participant, window: &WindowNode) -> bool {
+    participant.room.host == window.key.session.endpoint.host.to_string()
+        && participant.room.window_id == window.key.window_id
+        && participant
+            .tmux_session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id == window.key.session.session_id)
+        && participant.socket.as_deref().is_none_or(|socket| {
+            muxa::backend::pane_endpoints_match(
+                window.panes.first().map(|pane| pane.key.pane_id.as_str()),
+                socket,
+                &window.key.session.endpoint.socket,
+            )
+        })
+}
+
+fn participant_pane_key(app: &App, participant: &Participant) -> Option<PaneKey> {
+    let mut matches = app
+        .topology
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .filter(|pane| participant_matches_pane(participant, pane));
+    let first = matches.next()?.key.clone();
+    matches.next().is_none().then_some(first)
 }
 
 /// Name the room, so "no peer here" points somewhere.
@@ -5550,16 +6978,35 @@ fn peer_choice_hint(labels: &[String]) -> String {
 /// one-agent work addressable without expanding it.
 /// The origin — and thus where the reply lands, this watch's `M` mailbox —
 /// stays the launch agent; only the target leaves the room.
-fn host_scope_target(app: &App) -> Option<(String, String)> {
+fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
     if app.collaboration_scope != muxa::config::CollaborationScope::Host {
         return None;
     }
-    let selected = app.selected_target()?;
     let origin_pane = app
         .collaboration
         .origin
         .as_ref()
         .map(|origin| origin.pane.as_str());
+    if app.uses_tree() {
+        let mut candidates = app
+            .selected_topology_panes()
+            .into_iter()
+            .filter(|pane| pane.agent.is_some())
+            .filter(|pane| Some(pane.key.pane_id.as_str()) != origin_pane);
+        let pane = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        let agent = pane.agent.as_ref()?;
+        let label = format!(
+            "{}@{} · {}",
+            agent.kind,
+            pane.key.pane_id,
+            topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
+        );
+        return Some((pane.key.pane_id.clone(), label, Some(pane.key.clone())));
+    }
+    let selected = app.selected_target()?;
     let agent = match app.rows.get(selected.row_idx)? {
         WatchRow::Agent(agent) => Some(agent.as_ref()),
         WatchRow::Work(session) => selected
@@ -5581,7 +7028,7 @@ fn host_scope_target(app: &App) -> Option<(String, String)> {
         return None;
     }
     let label = format!("{}@{} · {}", agent.kind, pane, app.pane_label(&pane));
-    Some((pane, label))
+    Some((pane, label, None))
 }
 
 /// The entries the panel currently shows, oldest first.
@@ -5626,17 +7073,31 @@ fn open_watch_collaboration_composer(app: &mut App) {
         // plainly false to someone pointing at a two-agent work.
         Some(room) if room.peers.is_empty() => Err(empty_room_hint(&room.current)),
         Some(room) => {
-            let selected_pane = app.selected_pane();
-            selected_pane
-                .as_deref()
-                .and_then(|pane| app.collaboration.peer_for_pane(pane))
+            let selected_peer = if app.uses_tree() {
+                app.selected_action_pane().and_then(|pane| {
+                    room.peers
+                        .iter()
+                        .find(|peer| participant_matches_pane(peer, pane))
+                })
+            } else {
+                app.selected_pane()
+                    .as_deref()
+                    .and_then(|pane| app.collaboration.peer_for_pane(pane))
+            };
+            selected_peer
                 // A work row is a whole tmux window, and the pane it resolves
                 // to drifts with agent activity. Accept the row
                 // when exactly one peer lives in it; more than one is
                 // genuinely ambiguous and still asks.
                 .or_else(|| peer_inside_selected_row(app, room))
                 .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]))
-                .map(|peer| (peer.pane.clone(), peer.label()))
+                .map(|peer| {
+                    (
+                        peer.pane.clone(),
+                        peer.label(),
+                        participant_pane_key(app, peer),
+                    )
+                })
                 .ok_or_else(|| {
                     let labels = room
                         .peers
@@ -5659,7 +7120,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
             None
         }
     });
-    let Some((peer_pane, peer_label)) = peer else {
+    let Some((peer_pane, peer_label, pane_key)) = peer else {
         return;
     };
     let Some(origin) = app.collaboration.origin.clone() else {
@@ -5677,6 +7138,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
             origin,
             target: format!("pane:{peer_pane}"),
             pane: peer_pane,
+            pane_key,
             kind: defaults.kind,
             mode: defaults.mode,
         },
@@ -5726,7 +7188,8 @@ async fn run_watch_collaboration_composer(
                 Err(error) => ActionOutcome::Err(format!("collaboration send failed: {error}")),
             }
         }
-        CollaborationComposeTarget::Prompt { .. } => ActionOutcome::Err(
+        CollaborationComposeTarget::Prompt { .. }
+        | CollaborationComposeTarget::PromptTopology { .. } => ActionOutcome::Err(
             "keystrokes go to the pane directly and cannot become a request".into(),
         ),
         CollaborationComposeTarget::Reply {
@@ -5986,6 +7449,8 @@ pub(crate) enum Action {
     Refresh,
     /// Attach to a pane that was pinned by an overlay.
     AttachPane(String),
+    /// Attach using the complete host+socket ancestry.
+    AttachTopologyPane(PaneKey),
     /// Pop open the preview overlay for the selected row.
     OpenPreview,
     /// Close the preview overlay and return to the table.
@@ -5999,6 +7464,8 @@ pub(crate) enum Action {
     SetSort(WatchSortPreset),
     /// Change table granularity from the command palette.
     SetView(WatchView),
+    /// Change presentation without changing topology granularity.
+    SetLayout(WatchLayout),
     /// Resolve the selected row as a same-window collaboration peer and open
     /// the durable request composer.
     OpenCollaborationMessage,
@@ -6043,6 +7510,12 @@ pub(crate) enum Action {
     /// the requested action doesn't fit the selected row. String is
     /// the rendered hint body.
     NotApplicable(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOpenTarget {
+    TopologyPane(PaneKey),
+    LegacyPane(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6090,35 +7563,43 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "sort duration",
-        description: "sort by workspace duration",
+        description: "sort siblings by hierarchy duration",
     },
     CommandSpec {
-        command: "sort workspace",
-        description: "sort by workspace name",
+        command: "sort name",
+        description: "sort siblings by name",
     },
     CommandSpec {
         command: "sort state",
         description: "sort by attention state",
     },
     CommandSpec {
-        command: "view work",
-        description: "group agents by work window",
+        command: "view session",
+        description: "show session roots",
+    },
+    CommandSpec {
+        command: "view window",
+        description: "show sessions and windows",
     },
     CommandSpec {
         command: "view pane",
         description: "show individual panes",
     },
     CommandSpec {
-        command: "view swarm",
+        command: "layout tree",
+        description: "show nested topology tree",
+    },
+    CommandSpec {
+        command: "layout swarm",
         description: "show swarm clusters",
     },
     CommandSpec {
         command: "kill",
-        description: "kill selected pane (confirm)",
+        description: "close selected session/window/pane (confirm)",
     },
     CommandSpec {
         command: "abort",
-        description: "abort selected turn (confirm)",
+        description: "interrupt selected agent pane (confirm)",
     },
     CommandSpec {
         command: "help",
@@ -6179,11 +7660,13 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         }
         "sort latest" => Action::SetSort(WatchSortPreset::Latest),
         "sort duration" => Action::SetSort(WatchSortPreset::Duration),
-        "sort workspace" => Action::SetSort(WatchSortPreset::Workspace),
+        "sort name" => Action::SetSort(WatchSortPreset::Name),
         "sort state" | "sort attention" => Action::SetSort(WatchSortPreset::State),
-        "view work" | "view works" => Action::SetView(WatchView::Work),
+        "view session" | "view sessions" => Action::SetView(WatchView::Session),
+        "view window" | "view windows" => Action::SetView(WatchView::Window),
         "view pane" | "view panes" => Action::SetView(WatchView::Pane),
-        "view swarm" => Action::SetView(WatchView::Swarm),
+        "layout tree" => Action::SetLayout(WatchLayout::Tree),
+        "layout swarm" => Action::SetLayout(WatchLayout::Swarm),
         "" => {
             app.set_hint("command: type a command or press Esc", HintLevel::Warn);
             Action::None
@@ -6324,7 +7807,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => Action::OpenPreview,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => Action::Refresh,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
-                Action::SetSort(WatchSortPreset::Workspace)
+                Action::SetSort(WatchSortPreset::Name)
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'l') => {
                 Action::SetSort(WatchSortPreset::Latest)
@@ -6451,15 +7934,20 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         // `b` is the legacy alias retained after the pair became m/M.
         KeyCode::Char('M' | 'b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('n') if app.browse_keys_active() => {
-            let dir =
+            let fallback_dir =
                 std::env::current_dir().map_or_else(|_| "~".into(), |p| p.display().to_string());
+            let (target, dir, name) = app.spawn_context(fallback_dir);
             // Cursor at the end of the prefill — editing a path means
             // appending or trimming, and a cursor at column zero turns the
             // first keystroke into a prefix splice.
             let dir_cursor = dir.chars().count();
+            let name_cursor = name.chars().count();
             app.spawn = Some(SpawnComposer {
+                target,
                 dir,
                 dir_cursor,
+                name,
+                name_cursor,
                 ..SpawnComposer::default()
             });
             Action::None
@@ -6756,21 +8244,11 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
             Action::None
         }
         KeyCode::Tab | KeyCode::Down => {
-            spawn.focus = match spawn.focus {
-                SpawnField::Dir => SpawnField::Name,
-                SpawnField::Name => SpawnField::Agent,
-                SpawnField::Agent => SpawnField::Prompt,
-                SpawnField::Prompt => SpawnField::Dir,
-            };
+            spawn.focus = spawn.next_focus();
             Action::None
         }
         KeyCode::BackTab | KeyCode::Up => {
-            spawn.focus = match spawn.focus {
-                SpawnField::Dir => SpawnField::Prompt,
-                SpawnField::Name => SpawnField::Dir,
-                SpawnField::Agent => SpawnField::Name,
-                SpawnField::Prompt => SpawnField::Agent,
-            };
+            spawn.focus = spawn.previous_focus();
             Action::None
         }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -6816,14 +8294,29 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
             }
             let agent = spawn.agent;
             let name = spawn.name.trim().to_string();
+            if matches!(spawn.target, Some(TopologyNodeKey::Session(_))) && name.is_empty() {
+                app.set_hint("new session window needs a window name", HintLevel::Warn);
+                return Action::None;
+            }
             let work = (!name.is_empty()).then_some(name);
+            let target = spawn.target.clone();
             app.spawn = None;
-            Action::Quick(QuickAction::SpawnWork {
-                launch: agent.launch_command(&prompt),
-                agent_label: agent.label(),
-                dir,
-                work,
-            })
+            let launch = agent.launch_command(&prompt);
+            match target {
+                Some(target) => Action::Quick(QuickAction::SpawnAt {
+                    target,
+                    launch,
+                    agent_label: agent.label(),
+                    dir,
+                    name: work.unwrap_or_default(),
+                }),
+                None => Action::Quick(QuickAction::SpawnWork {
+                    launch,
+                    agent_label: agent.label(),
+                    dir,
+                    work,
+                }),
+            }
         }
         other => {
             if let Some((text, cursor)) = spawn.field_mut() {
@@ -6895,7 +8388,8 @@ fn composer_cycle_option(app: &mut App) -> bool {
             };
             None
         }
-        CollaborationComposeTarget::Prompt { .. } => {
+        CollaborationComposeTarget::Prompt { .. }
+        | CollaborationComposeTarget::PromptTopology { .. } => {
             hint = Some("requests need a same-window peer — keystrokes only here");
             None
         }
@@ -6927,7 +8421,10 @@ fn composer_cycle_mode(app: &mut App) -> bool {
                 mode: *mode,
             })
         }
-        Some(CollaborationComposeTarget::Prompt { .. }) => {
+        Some(
+            CollaborationComposeTarget::Prompt { .. }
+            | CollaborationComposeTarget::PromptTopology { .. },
+        ) => {
             app.set_hint(
                 "requests need a same-window peer — keystrokes only here",
                 HintLevel::Warn,
@@ -6963,13 +8460,29 @@ fn composer_submit_action(app: &mut App) -> Action {
     }
     match app.collaboration_composer.take() {
         Some(CollaborationComposer {
+            target: CollaborationComposeTarget::PromptTopology { pane },
+            input,
+            ..
+        }) => Action::Quick(QuickAction::SendPromptTo { pane, text: input }),
+        Some(CollaborationComposer {
             target:
                 CollaborationComposeTarget::Send {
                     pane,
+                    pane_key,
                     mode: ComposeSendMode::JustSend,
                     ..
-                }
-                | CollaborationComposeTarget::Prompt { pane },
+                },
+            input,
+            ..
+        }) => match pane_key {
+            Some(pane) => Action::Quick(QuickAction::SendPromptTo { pane, text: input }),
+            None => Action::Quick(QuickAction::SendPrompt {
+                pane_id: pane,
+                text: input,
+            }),
+        },
+        Some(CollaborationComposer {
+            target: CollaborationComposeTarget::Prompt { pane },
             input,
             ..
         }) => Action::Quick(QuickAction::SendPrompt {
@@ -7189,7 +8702,83 @@ fn preview_target_position(app: &App, pane_id: &str) -> Option<(usize, usize)> {
     Some((idx + 1, targets.len()))
 }
 
+fn topology_preview_target_position(app: &App, pane_key: &PaneKey) -> Option<(usize, usize)> {
+    let TopologyNodeRef::Window(window) = app
+        .topology
+        .find(&TopologyNodeKey::Window(pane_key.window.clone()))?
+    else {
+        return None;
+    };
+    let targets: Vec<_> = window
+        .panes
+        .iter()
+        .filter(|pane| pane.agent.is_some())
+        .map(|pane| &pane.key)
+        .collect();
+    let index = targets
+        .iter()
+        .position(|candidate| *candidate == pane_key)?;
+    Some((index + 1, targets.len()))
+}
+
+fn preview_position(app: &App, preview: &PreviewState) -> Option<(usize, usize)> {
+    preview.pane_key.as_ref().map_or_else(
+        || preview_target_position(app, &preview.pane_id),
+        |key| topology_preview_target_position(app, key),
+    )
+}
+
+fn preview_label(app: &App, preview: &PreviewState) -> String {
+    preview.pane_key.as_ref().map_or_else(
+        || app.pane_label(&preview.pane_id),
+        |key| {
+            format!(
+                "{} · {}:{}",
+                key.pane_id, key.window.session.endpoint.host, key.window.session.endpoint.socket
+            )
+        },
+    )
+}
+
 fn cycle_preview_agent(app: &mut App, delta: isize) {
+    if let Some(current_key) = app
+        .preview
+        .as_ref()
+        .and_then(|preview| preview.pane_key.clone())
+    {
+        let Some(TopologyNodeRef::Window(window)) = app
+            .topology
+            .find(&TopologyNodeKey::Window(current_key.window.clone()))
+        else {
+            return;
+        };
+        let targets: Vec<PaneKey> = window
+            .panes
+            .iter()
+            .filter(|pane| pane.agent.is_some())
+            .map(|pane| pane.key.clone())
+            .collect();
+        if targets.len() <= 1 {
+            return;
+        }
+        let Some(current_index) = targets.iter().position(|key| key == &current_key) else {
+            return;
+        };
+        let next_index = if delta >= 0 {
+            (current_index + 1) % targets.len()
+        } else if current_index == 0 {
+            targets.len() - 1
+        } else {
+            current_index - 1
+        };
+        if let Some(preview) = app.preview.as_mut() {
+            preview.pane_id.clone_from(&targets[next_index].pane_id);
+            preview.pane_key = Some(targets[next_index].clone());
+            preview.scroll = 0;
+        }
+        app.pane_capture = None;
+        return;
+    }
     let Some(current) = app.preview.as_ref().map(|p| p.pane_id.clone()) else {
         return;
     };
@@ -7226,13 +8815,11 @@ fn cycle_preview_agent(app: &mut App, delta: isize) {
 /// prompt composer against the preview-pinned pane, not the table cursor.
 fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
     if matches!(code, KeyCode::Enter) {
-        let pane_id = app
-            .preview
-            .as_ref()
-            .expect("preview present")
-            .pane_id
-            .clone();
-        return Action::AttachPane(pane_id);
+        let preview = app.preview.as_ref().expect("preview present");
+        return preview.pane_key.as_ref().map_or_else(
+            || Action::AttachPane(preview.pane_id.clone()),
+            |key| Action::AttachTopologyPane(key.clone()),
+        );
     }
 
     match code {
@@ -7283,6 +8870,15 @@ fn handle_preview_event(code: KeyCode, app: &mut App) -> Action {
 /// the same logic can be unit-tested without the `handle_event`
 /// keystroke matrix in the way.
 pub(crate) fn quick_kill_action(app: &App) -> Action {
+    if app.uses_tree() {
+        return match app.selected_node_key() {
+            Some(key) => Action::AskConfirm(ConfirmPopup {
+                message: format!("Close {}?", topology_key_label(&key)),
+                on_confirm: ConfirmAction::Quick(QuickAction::TerminateNode(key)),
+            }),
+            None => Action::NotApplicable("close: no topology node selected"),
+        };
+    }
     if app
         .selected_target()
         .is_some_and(|target| target.agent_idx.is_some())
@@ -7327,6 +8923,19 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
 /// Resolve `R` (abort current turn). Same shape as `quick_kill_action`
 /// but the destructive verb in the popup says "Abort" instead of "Kill".
 pub(crate) fn quick_abort_action(app: &App) -> Action {
+    if app.uses_tree() {
+        return match app.selected_exact_pane() {
+            Some(pane) if pane.agent.is_some() => Action::AskConfirm(ConfirmPopup {
+                message: format!(
+                    "Interrupt {}?",
+                    topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
+                ),
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPane(pane.key.clone())),
+            }),
+            Some(_) => Action::NotApplicable("interrupt: pane has no tracked agent"),
+            None => Action::NotApplicable("interrupt: select an exact pane"),
+        };
+    }
     match app.selected_row() {
         Some(WatchRow::Agent(_) | WatchRow::Work(_)) => {
             match app.selected_agent().and_then(|agent| agent.pane.as_deref()) {
@@ -7353,6 +8962,12 @@ pub(crate) fn quick_abort_action(app: &App) -> Action {
 /// action in the TUI. Typing at an agent now lives in the `m` composer,
 /// whose Ctrl-E `just send` mode does what the prompt popup did.
 pub(crate) fn quick_prompt_action(app: &App) -> Action {
+    if app.uses_tree() {
+        return match app.selected_action_pane() {
+            Some(pane) => Action::AttachTopologyPane(pane.key.clone()),
+            None => Action::NotApplicable("attach: selected node has no pane"),
+        };
+    }
     match app.selected_pane() {
         Some(pane_id) => Action::AttachPane(pane_id),
         None => Action::NotApplicable("attach: no tmux pane on this row"),
@@ -7902,7 +9517,13 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(theme.action))
         .border_type(theme.border_type)
         .title(Span::styled(
-            " new work + agent ",
+            match spawn.target.as_ref() {
+                Some(TopologyNodeKey::Session(_)) => " new window + first agent ",
+                Some(TopologyNodeKey::Window(_) | TopologyNodeKey::Pane(_)) => {
+                    " new sibling agent pane "
+                }
+                None => " new window + agent ",
+            },
             theme.action_badge().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -7918,10 +9539,17 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
     // the field that grows, and it wraps *down* instead of clipping right —
     // a brief is a sentence or three, not a filename.
     let dir_view = truncate_prompt_input(&spawn.dir, avail);
-    let name_line: Line = if spawn.name.is_empty() && spawn.focus != SpawnField::Name {
+    let name_line: Line = if !spawn.creates_window() {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("window ", theme.dim_style()),
+            Span::raw(truncate_prompt_input(&spawn.name, avail).text),
+            Span::styled("  (selected)", theme.dim_style()),
+        ])
+    } else if spawn.name.is_empty() && spawn.focus != SpawnField::Name {
         Line::from(vec![
             focus_marker(SpawnField::Name),
-            Span::styled("ticket ", theme.dim_style()),
+            Span::styled("window ", theme.dim_style()),
             Span::styled(
                 format!("(auto: {})", session_base_name(&spawn.dir)),
                 theme.dim_style(),
@@ -7930,7 +9558,7 @@ fn render_spawn(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Line::from(vec![
             focus_marker(SpawnField::Name),
-            Span::styled("ticket ", theme.dim_style()),
+            Span::styled("window ", theme.dim_style()),
             Span::raw(truncate_prompt_input(&spawn.name, avail).text),
         ])
     };
@@ -8075,7 +9703,8 @@ fn collaboration_composer_title(
             mode: ComposeSendMode::JustSend,
             ..
         }
-        | CollaborationComposeTarget::Prompt { .. } => (
+        | CollaborationComposeTarget::Prompt { .. }
+        | CollaborationComposeTarget::PromptTopology { .. } => (
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
@@ -8620,13 +10249,13 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
         PreviewContent::PromptResponse => "prompt",
         PreviewContent::LivePane => "live",
     };
-    let target_tag = preview_target_position(app, &preview.pane_id)
+    let target_tag = preview_position(app, preview)
         .filter(|(_, total)| *total > 1)
         .map(|(idx, total)| format!(" · {idx}/{total}"))
         .unwrap_or_default();
     let title = format!(
         " preview · {} · {}{} ",
-        app.pane_label(&preview.pane_id),
+        preview_label(app, preview),
         mode_tag,
         target_tag
     );
@@ -8642,7 +10271,14 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
     // wrapped at the source pane's width — turning it on a second time
     // breaks alignment of TUIs running inside the captured pane.
     if matches!(preview.content, PreviewContent::LivePane) {
-        let body = build_pane_capture_body(app, &preview.pane_id);
+        let body = build_pane_capture_body_on(
+            app,
+            &preview.pane_id,
+            preview
+                .pane_key
+                .as_ref()
+                .map(|key| key.window.session.endpoint.socket.as_str()),
+        );
         let paragraph = Paragraph::new(body)
             .block(block)
             .scroll((preview.scroll, 0));
@@ -8650,7 +10286,7 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines = build_preview_lines(app, &preview.pane_id);
+    let lines = build_preview_lines_for(app, &preview.pane_id, preview.pane_key.as_ref());
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(ratatui::widgets::Wrap { trim: false })
@@ -8663,6 +10299,14 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
 /// half-rendered capture is easier to debug than a panic deep in the
 /// frame path.
 fn build_pane_capture_body<'a>(app: &'a App, pane_id: &str) -> ratatui::text::Text<'a> {
+    build_pane_capture_body_on(app, pane_id, None)
+}
+
+fn build_pane_capture_body_on<'a>(
+    app: &'a App,
+    pane_id: &str,
+    socket: Option<&str>,
+) -> ratatui::text::Text<'a> {
     use ansi_to_tui::IntoText;
 
     let placeholder = |msg: &str| {
@@ -8677,7 +10321,7 @@ fn build_pane_capture_body<'a>(app: &'a App, pane_id: &str) -> ratatui::text::Te
     let Some(cached) = app.pane_capture.as_ref() else {
         return placeholder("(capturing pane…)");
     };
-    if cached.pane_id != pane_id {
+    if cached.pane_id != pane_id || cached.socket.as_deref() != socket {
         // Stale entry from a previous selection — the main loop will
         // re-fetch on the next iteration.
         return placeholder("(capturing pane…)");
@@ -8694,26 +10338,54 @@ fn build_pane_capture_body<'a>(app: &'a App, pane_id: &str) -> ratatui::text::Te
 
 /// Compose the textual body of the preview pane. Pulled out so unit tests
 /// can assert on the rendered structure without going through ratatui.
+#[cfg(test)]
 fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
+    build_preview_lines_for(app, pane_id, None)
+}
+
+fn build_preview_lines_for<'a>(
+    app: &'a App,
+    pane_id: &str,
+    pane_key: Option<&PaneKey>,
+) -> Vec<Line<'a>> {
     let mut out: Vec<Line<'a>> = Vec::new();
 
-    let agent = app.rows.iter().find_map(|r| match r {
-        WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a.as_ref()),
-        WatchRow::Work(s) => s
-            .agents
-            .iter()
-            .find(|a| a.pane.as_deref() == Some(pane_id))
-            .or_else(|| {
-                if s.representative_pane.as_deref() == Some(pane_id) {
-                    s.latest_agent.as_ref()
-                } else {
-                    None
-                }
-            }),
-        WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
-    });
+    let agent = pane_key
+        .and_then(|key| app.topology.find(&TopologyNodeKey::Pane(key.clone())))
+        .and_then(|node| match node {
+            TopologyNodeRef::Pane(pane) => pane.agent.as_ref(),
+            TopologyNodeRef::Session(_) | TopologyNodeRef::Window(_) => None,
+        })
+        .or_else(|| {
+            if pane_key.is_some() {
+                return None;
+            }
+            app.rows.iter().find_map(|r| match r {
+                WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a.as_ref()),
+                WatchRow::Work(s) => s
+                    .agents
+                    .iter()
+                    .find(|a| a.pane.as_deref() == Some(pane_id))
+                    .or_else(|| {
+                        if s.representative_pane.as_deref() == Some(pane_id) {
+                            s.latest_agent.as_ref()
+                        } else {
+                            None
+                        }
+                    }),
+                WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
+            })
+        });
 
-    let pane_label = pane_display(Some(pane_id), &app.panes);
+    let pane_label = pane_key.map_or_else(
+        || pane_display(Some(pane_id), &app.panes),
+        |key| {
+            format!(
+                "{}:{} {}",
+                key.window.session.endpoint.host, key.window.session.endpoint.socket, key.pane_id
+            )
+        },
+    );
     if let Some(agent) = agent {
         // Header line — pane label + kind + state, all on one row.
         out.push(Line::from(vec![
@@ -8819,13 +10491,13 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let agents = app
         .rows
         .iter()
-        .filter(|r| match r {
+        .filter(|row| match row {
             WatchRow::Agent(_) => true,
-            WatchRow::Work(s) => s.latest_agent.is_some(),
+            WatchRow::Work(work) => work.latest_agent.is_some(),
             WatchRow::BarePane(_) => false,
         })
         .count();
-    let bare = app.rows.len() - agents;
+    let bare = app.rows.len().saturating_sub(agents);
     let now = app.last_refresh;
     let clock = format!(
         "{:02}:{:02}:{:02} UTC",
@@ -8846,7 +10518,25 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  "),
     ];
 
-    if matches!(app.watch_cfg.view, WatchView::Work | WatchView::Swarm) {
+    if !app.legacy_flat_table {
+        spans.push(Span::styled(
+            format!(
+                "{} sessions · {} windows · {} panes",
+                app.topology.sessions.len(),
+                app.topology
+                    .sessions
+                    .iter()
+                    .map(|session| session.windows.len())
+                    .sum::<usize>(),
+                app.topology
+                    .sessions
+                    .iter()
+                    .map(SessionNode::pane_count)
+                    .sum::<usize>()
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    } else if app.watch_cfg.view == WatchView::Window {
         spans.push(Span::styled(
             format!("{} work{}", app.rows.len(), plural(app.rows.len())),
             Style::default().add_modifier(Modifier::BOLD),
@@ -8949,7 +10639,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(Span::styled(text, Style::default().fg(Color::Red)))
     } else if app.explicit_search || !app.search_query.is_empty() || app.attention_only {
-        let visible = app.visible_targets().len();
+        let visible = if app.uses_tree() {
+            app.tree_targets().len()
+        } else {
+            app.visible_targets().len()
+        };
         let mut parts = Vec::new();
         if app.explicit_search && app.search_query.is_empty() {
             parts.push("filter: ▏".to_string());
@@ -8980,12 +10674,16 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(header, area);
 }
 
-/// Dispatch the main body: the k9s-style swarm console for
-/// [`WatchView::Swarm`], otherwise the classic table.
+/// Dispatch the main body according to presentation; granularity remains a
+/// separate [`WatchView`] concern.
 fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
     let split_inspector = app.inspector_enabled
         && area.width >= 120
-        && app.selected_pane().is_some()
+        && if app.uses_tree() {
+            app.selected_node_key().is_some()
+        } else {
+            app.selected_pane().is_some()
+        }
         && app.preview.is_none()
         && !app.help_open
         && !app.event_inbox_open
@@ -9016,15 +10714,21 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_primary_body(f: &mut Frame, area: Rect, app: &mut App) {
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
-    if app.watch_cfg.view == WatchView::Swarm {
+    if app.legacy_flat_table {
+        render_table(f, area, app);
+    } else if app.watch_cfg.layout == WatchLayout::Swarm {
         render_swarm(f, area, app);
     } else {
-        render_table(f, area, app);
+        render_tree_table(f, area, app);
     }
 }
 
 fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    if app.uses_tree() {
+        render_topology_inspector(f, area, app, theme);
+        return;
+    }
     let Some(pane_id) = app.selected_pane() else {
         return;
     };
@@ -9071,6 +10775,322 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
         )));
     }
     lines.extend(build_pane_capture_body(app, &pane_id).lines);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn state_distribution_label(states: &StateDistribution) -> String {
+    let mut labels = Vec::new();
+    for (label, count) in [
+        ("error", states.error),
+        ("input", states.waiting_input),
+        ("choice", states.waiting_choice),
+        ("working", states.working),
+        ("starting", states.starting),
+        ("idle", states.idle),
+        ("stopped", states.stopped),
+    ] {
+        if count > 0 {
+            labels.push(format!("{label} {count}"));
+        }
+    }
+    if labels.is_empty() {
+        "no agents".into()
+    } else {
+        labels.join(" · ")
+    }
+}
+
+fn topology_inspector_status_line(
+    node: TopologyNodeRef<'_>,
+    app: &App,
+    theme: WatchThemeSpec,
+) -> Line<'static> {
+    let states = tree_node_states(node);
+    let label = match node {
+        TopologyNodeRef::Session(session) => state_distribution_label(&session.states),
+        TopologyNodeRef::Window(window) => state_distribution_label(&window.states),
+        TopologyNodeRef::Pane(pane) => pane
+            .agent
+            .as_ref()
+            .map_or_else(|| "untracked".into(), |agent| agent.state.to_string()),
+    };
+    let mut spans = vec![Span::styled("status  ", theme.dim_style())];
+    if states.is_empty() {
+        spans.push(Span::styled("○", theme.dim_style()));
+    } else {
+        spans.extend(state_summary_spans(
+            states,
+            theme,
+            Spinner {
+                frame: app.anim_frame,
+                enabled: app.watch_cfg.spinner && icons_unicode(),
+            },
+        ));
+    }
+    spans.push(Span::raw(format!("  {label}")));
+    Line::from(spans)
+}
+
+/// The activity ledger predates endpoint-aware topology and is keyed only by
+/// native session id. Never project one ledger value onto two sockets that
+/// happen to reuse `$N`; absence is more honest than a plausible wrong age.
+fn unambiguous_session_activity_secs(
+    app: &App,
+    session: &SessionNode,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    let topology_matches = app
+        .topology
+        .sessions
+        .iter()
+        .filter(|candidate| candidate.key.session_id == session.key.session_id)
+        .count();
+    if topology_matches != 1 {
+        return None;
+    }
+    app.session_activity
+        .iter()
+        .filter(|activity| activity.session_id == session.key.session_id)
+        .map(|activity| activity.effective_total_secs(now))
+        .max()
+}
+
+fn inspector_rule(width: u16, theme: WatchThemeSpec) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(usize::from(width.saturating_sub(2))),
+        theme.dim_style(),
+    ))
+}
+
+#[allow(clippy::too_many_lines)] // one hierarchy-specific inspector body per match arm
+fn render_topology_inspector(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
+    let Some(node) = app.selected_node() else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc();
+    let (title, mut lines) = match node {
+        TopologyNodeRef::Session(session) => {
+            let attached = session
+                .attached_clients
+                .map_or_else(|| "unknown".into(), |count| count.to_string());
+            let duration = unambiguous_session_activity_secs(app, session, now)
+                .map_or_else(|| "—".into(), format_duration);
+            (
+                format!(" Inspector · session {} ", session.name),
+                vec![
+                    Line::from(format!(
+                        "endpoint  {}:{}",
+                        session.key.endpoint.host, session.key.endpoint.socket
+                    )),
+                    Line::from(format!(
+                        "{} session id  {}",
+                        session.key.endpoint.host, session.key.session_id
+                    )),
+                    Line::from(format!(
+                        "topology  {} windows · {} panes",
+                        session.windows.len(),
+                        session.pane_count()
+                    )),
+                    Line::from(format!("attached clients  {attached}")),
+                    Line::from(format!("cumulative attached time  {duration}")),
+                ],
+            )
+        }
+        TopologyNodeRef::Window(window) => {
+            let recent = window
+                .panes
+                .iter()
+                .filter_map(|pane| pane.agent.as_ref())
+                .max_by_key(|agent| agent.last_activity_at)
+                .map_or_else(
+                    || "—".into(),
+                    |agent| {
+                        let summary = agent
+                            .last_notification
+                            .as_deref()
+                            .or(agent.recap.as_deref())
+                            .or(agent.ai_title.as_deref())
+                            .or(agent.last_prompt.as_deref())
+                            .unwrap_or("—")
+                            .replace('\n', " ");
+                        format!(
+                            "{} · {} · {}",
+                            agent_kind_short(agent.kind),
+                            relative_time(agent.last_activity_at, now),
+                            truncate_chars(&summary, usize::from(area.width.saturating_sub(8)))
+                        )
+                    },
+                );
+            let incoming = app
+                .collaboration
+                .incoming
+                .iter()
+                .filter(|request| {
+                    participant_matches_window(&request.from, window)
+                        || participant_matches_window(&request.to, window)
+                })
+                .count();
+            let sent = app
+                .collaboration
+                .sent
+                .iter()
+                .filter(|request| {
+                    participant_matches_window(&request.from, window)
+                        || participant_matches_window(&request.to, window)
+                })
+                .count();
+            let room_status = app
+                .collaboration
+                .room
+                .as_ref()
+                .filter(|room| participant_matches_window(&room.current, window))
+                .map_or_else(
+                    || "not loaded for selected window".into(),
+                    |room| {
+                        format!(
+                            "{} peers · {} unread · {incoming} incoming · {sent} sent",
+                            room.peers.len(),
+                            room.unread
+                        )
+                    },
+                );
+            let mut window_lines = vec![
+                Line::from(format!("window id  {}", window.key.window_id)),
+                Line::from(format!(
+                    "room  {}:{}:{}",
+                    window.key.session.endpoint.host,
+                    window.key.session.endpoint.socket,
+                    window.key.window_id
+                )),
+                Line::from(format!("mailbox  {room_status}")),
+                Line::from(format!(
+                    "cwd  {}",
+                    window.cwd.as_deref().unwrap_or("mixed/unknown")
+                )),
+                Line::from(format!("recent  {recent}")),
+                inspector_rule(area.width, theme),
+                Line::from(Span::styled("pane roster", theme.accent_badge())),
+            ];
+            for pane in &window.panes {
+                let owner = pane.agent.as_ref().map_or("untracked".into(), |agent| {
+                    format!("{} · {}", agent_kind_short(agent.kind), agent.state)
+                });
+                window_lines.push(Line::from(format!(
+                    "{}  {:<18}  {}",
+                    pane.key.pane_id,
+                    owner,
+                    truncate_chars(&pane.cwd, usize::from(area.width.saturating_sub(28)))
+                )));
+            }
+            (
+                format!(" Inspector · window {} ", window.name),
+                window_lines,
+            )
+        }
+        TopologyNodeRef::Pane(pane) => {
+            let mut pane_lines = vec![
+                Line::from(format!(
+                    "pane  {}  ·  pid {}  ·  {}",
+                    pane.key.pane_id, pane.pane_pid, pane.current_command
+                )),
+                Line::from(format!(
+                    "endpoint  {}:{}  ·  session {}  ·  window {}",
+                    pane.key.window.session.endpoint.host,
+                    pane.key.window.session.endpoint.socket,
+                    pane.key.window.session.session_id,
+                    pane.key.window.window_id
+                )),
+                Line::from(format!("cwd  {}", pane.cwd)),
+            ];
+            if let Some(agent) = pane.agent.as_ref() {
+                pane_lines.extend([
+                    Line::from(format!(
+                        "agent  {}  ·  {} {}",
+                        agent_kind_short(agent.kind),
+                        state_age_label(agent.state),
+                        relative_time(agent.state_entered_at, now)
+                    )),
+                    Line::from(format!(
+                        "model  {}  ·  ctx {}  ·  cost {}",
+                        agent.model.as_deref().unwrap_or("—"),
+                        agent
+                            .context_used_pct
+                            .map_or_else(|| "—".into(), |value| format!("{value:.0}%")),
+                        agent
+                            .cost_usd
+                            .map_or_else(|| "—".into(), |value| format!("${value:.2}"))
+                    )),
+                    Line::from(format!(
+                        "processes  {}  ·  shells {}  ·  subagents {}",
+                        agent.workload.process_count,
+                        agent.workload.shell_count,
+                        agent.workload.subagent_count
+                    )),
+                    Line::from(format!(
+                        "prompt  {}",
+                        truncate_chars(
+                            &agent
+                                .last_prompt
+                                .as_deref()
+                                .unwrap_or("—")
+                                .replace('\n', " "),
+                            usize::from(area.width.saturating_sub(10))
+                        )
+                    )),
+                    Line::from(format!(
+                        "response  {}",
+                        truncate_chars(
+                            &agent
+                                .last_response
+                                .as_deref()
+                                .unwrap_or("—")
+                                .replace('\n', " "),
+                            usize::from(area.width.saturating_sub(12))
+                        )
+                    )),
+                ]);
+                if !agent.workload.preview.is_empty() {
+                    pane_lines.push(Line::from(Span::styled(
+                        "process tree",
+                        theme.accent_badge(),
+                    )));
+                    pane_lines.extend(agent.workload.preview.iter().map(|process| {
+                        let branch = "  ".repeat(usize::from(process.depth.saturating_sub(1)));
+                        Line::from(format!(
+                            "{branch}{}  pid {}  {}",
+                            match process.kind {
+                                WorkloadProcessKind::Subagent => "◇",
+                                WorkloadProcessKind::Shell => "▸",
+                                WorkloadProcessKind::Helper => "·",
+                                WorkloadProcessKind::Process => "+",
+                            },
+                            process.pid,
+                            process.command
+                        ))
+                    }));
+                }
+            }
+            pane_lines.push(inspector_rule(area.width, theme));
+            pane_lines.extend(
+                build_pane_capture_body_on(
+                    app,
+                    &pane.key.pane_id,
+                    Some(&pane.key.window.session.endpoint.socket),
+                )
+                .lines,
+            );
+            (
+                format!(" Inspector · pane {} ", pane.key.pane_id),
+                pane_lines,
+            )
+        }
+    };
+    lines.insert(0, topology_inspector_status_line(node, app, theme));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(title, theme.accent_badge()));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -9272,6 +11292,10 @@ fn swarm_agent_lines(
 /// for working/starting agents, and an indented subagent tree under each
 /// agent. Selection (j/k) highlights the work cluster.
 fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.uses_tree() {
+        render_topology_table(f, area, app, " Swarm topology ");
+        return;
+    }
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let frame = app.anim_frame;
     let selected = app.table_state.selected();
@@ -9326,6 +11350,375 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
+fn tree_node_states(node: TopologyNodeRef<'_>) -> Vec<AgentState> {
+    match node {
+        TopologyNodeRef::Session(session) => session
+            .windows
+            .iter()
+            .flat_map(|window| &window.panes)
+            .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.state))
+            .collect(),
+        TopologyNodeRef::Window(window) => window
+            .panes
+            .iter()
+            .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.state))
+            .collect(),
+        TopologyNodeRef::Pane(pane) => pane
+            .agent
+            .as_ref()
+            .map(|agent| vec![agent.state])
+            .unwrap_or_default(),
+    }
+}
+
+fn tree_state_cell(
+    node: TopologyNodeRef<'_>,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) -> Text<'static> {
+    let states = tree_node_states(node);
+    if states.is_empty() {
+        return Text::from(Span::styled("○", theme.dim_style()));
+    }
+    Text::from(Line::from(state_summary_gutter_spans(states, theme, spin)))
+}
+
+fn tree_node_label(
+    target: &TreeTarget,
+    node: TopologyNodeRef<'_>,
+    show_endpoint: bool,
+    theme: WatchThemeSpec,
+) -> Text<'static> {
+    let branch = match target.depth {
+        0 => "",
+        1 => {
+            if target.is_last_sibling {
+                "  └─ "
+            } else {
+                "  ├─ "
+            }
+        }
+        _ => match (target.parent_is_last_sibling, target.is_last_sibling) {
+            (true, true) => "    └─ ",
+            (true, false) => "    ├─ ",
+            (false, true) => "  │ └─ ",
+            (false, false) => "  │ ├─ ",
+        },
+    };
+    let disclosure = if target.has_children {
+        if target.expanded {
+            "▼ "
+        } else {
+            "▸ "
+        }
+    } else {
+        "  "
+    };
+    let mut spans = vec![Span::styled(branch.to_string(), theme.dim_style())];
+    if target.depth == 0 && show_endpoint {
+        let TopologyNodeRef::Session(session) = node else {
+            unreachable!("depth-zero tree nodes are sessions")
+        };
+        spans.push(Span::styled(
+            format!(
+                "{}:{} ",
+                session.key.endpoint.host, session.key.endpoint.socket
+            ),
+            theme.dim_style(),
+        ));
+    }
+    spans.push(Span::styled(disclosure.to_string(), theme.dim_style()));
+    let label = match node {
+        TopologyNodeRef::Session(session) => session.name.clone(),
+        TopologyNodeRef::Window(window) => window.name.clone(),
+        TopologyNodeRef::Pane(pane) => {
+            let owner = pane.agent.as_ref().map_or_else(
+                || pane.current_command.clone(),
+                |agent| agent_kind_short(agent.kind).to_string(),
+            );
+            if owner.trim().is_empty() {
+                pane.key.pane_id.clone()
+            } else {
+                format!("{}  {owner}", pane.key.pane_id)
+            }
+        }
+    };
+    if target.depth == 0 {
+        spans.push(Span::styled(
+            label,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::raw(label));
+    }
+    Text::from(Line::from(spans))
+}
+
+fn tree_node_age(app: &App, node: TopologyNodeRef<'_>, now: OffsetDateTime) -> String {
+    match node {
+        TopologyNodeRef::Session(session) => unambiguous_session_activity_secs(app, session, now)
+            .map_or_else(|| "—".into(), format_duration),
+        TopologyNodeRef::Window(window) => window
+            .panes
+            .iter()
+            .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.started_at))
+            .min()
+            .map_or_else(
+                || "—".into(),
+                |started| {
+                    format_duration(
+                        u64::try_from((now - started).whole_seconds().max(0)).unwrap_or(u64::MAX),
+                    )
+                },
+            ),
+        TopologyNodeRef::Pane(pane) => pane.agent.as_ref().map_or_else(
+            || "—".into(),
+            |agent| relative_time(agent.state_entered_at, now),
+        ),
+    }
+}
+
+const WINDOW_ACTIVITY_SUMMARY_LIMIT: usize = 2;
+const WINDOW_ACTIVITY_ITEM_CHARS: usize = 42;
+
+fn topology_agent_summary(agent: &Agent, layout: WatchLayout) -> String {
+    let raw = if layout == WatchLayout::Swarm {
+        swarm_topology_agent_summary(agent)
+    } else {
+        agent
+            .last_notification
+            .as_deref()
+            .or(agent.recap.as_deref())
+            .or(agent.ai_title.as_deref())
+            .or(agent.last_prompt.as_deref())
+            .map_or_else(|| agent.state.to_string(), str::to_string)
+    };
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&one_line, WINDOW_ACTIVITY_ITEM_CHARS)
+}
+
+fn window_node_summary(window: &WindowNode, layout: WatchLayout) -> String {
+    let mut agents = window
+        .panes
+        .iter()
+        .filter_map(|pane| {
+            pane.agent.as_ref().map(|agent| {
+                (
+                    agent.last_activity_at,
+                    pane.key.pane_id.as_str(),
+                    topology_agent_summary(agent, layout),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if agents.is_empty() {
+        return format!(
+            "{} pane{} · no tracked agents",
+            window.panes.len(),
+            plural(window.panes.len())
+        );
+    }
+    agents.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+
+    // Preserve recent-first order while folding identical child activity.
+    // This makes a window row describe the whole room instead of copying its
+    // currently active pane, without wasting space when several agents share
+    // the same prompt/title.
+    let mut grouped: Vec<(String, usize)> = Vec::new();
+    for (_, _, summary) in &agents {
+        if let Some((_, count)) = grouped.iter_mut().find(|(seen, _)| seen == summary) {
+            *count += 1;
+        } else {
+            grouped.push((summary.clone(), 1));
+        }
+    }
+
+    let mut parts = grouped
+        .iter()
+        .take(WINDOW_ACTIVITY_SUMMARY_LIMIT)
+        .map(|(summary, count)| {
+            if *count > 1 {
+                format!("{summary} ×{count}")
+            } else {
+                summary.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let hidden_agents = grouped
+        .iter()
+        .skip(WINDOW_ACTIVITY_SUMMARY_LIMIT)
+        .map(|(_, count)| count)
+        .sum::<usize>();
+    if hidden_agents > 0 {
+        parts.push(format!("+{hidden_agents}"));
+    }
+    let aggregate = parts.join(" / ");
+    if agents.len() == 1 {
+        aggregate
+    } else {
+        format!("{} agents · {aggregate}", agents.len())
+    }
+}
+
+fn tree_node_summary(node: TopologyNodeRef<'_>, layout: WatchLayout) -> String {
+    match node {
+        TopologyNodeRef::Session(session) => {
+            let agents = session.states.total();
+            format!(
+                "{} window{} · {agents} agent{}",
+                session.windows.len(),
+                plural(session.windows.len()),
+                plural(agents)
+            )
+        }
+        TopologyNodeRef::Window(window) => window_node_summary(window, layout),
+        TopologyNodeRef::Pane(pane) => pane.agent.as_ref().map_or_else(
+            || {
+                if pane.title.is_empty() || pane.title == pane.current_command {
+                    pane.current_command.clone()
+                } else {
+                    format!("{} · {}", pane.current_command, pane.title)
+                }
+            },
+            |agent| topology_agent_summary(agent, layout),
+        ),
+    }
+}
+
+fn swarm_topology_agent_summary(agent: &Agent) -> String {
+    let mut parts = Vec::new();
+    if let Some(badge) = agent_workload_badge(agent) {
+        parts.push(badge);
+    }
+    if !agent.subagents.is_empty() {
+        if parts.iter().all(|part| !part.contains('◇')) {
+            parts.push(format!("◇{}", agent.subagents.len()));
+        }
+        parts.push(
+            agent
+                .subagents
+                .iter()
+                .map(|subagent| subagent.kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    let activity = agent
+        .last_notification
+        .as_deref()
+        .or(agent.recap.as_deref())
+        .or(agent.ai_title.as_deref())
+        .or(agent.last_prompt.as_deref())
+        .unwrap_or("waiting")
+        .replace('\n', " ");
+    parts.push(activity);
+    parts.join(" · ")
+}
+
+fn render_tree_table(f: &mut Frame, area: Rect, app: &mut App) {
+    render_topology_table(f, area, app, " Topology ");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologyTableColumn {
+    State,
+    Node,
+    Age,
+    Summary,
+}
+
+impl TopologyTableColumn {
+    fn header(self) -> &'static str {
+        match self {
+            Self::State => "STATE",
+            Self::Node => "SESSION / WINDOW / PANE",
+            Self::Age => "AGE",
+            Self::Summary => "SUMMARY",
+        }
+    }
+
+    fn constraint(self) -> Constraint {
+        match self {
+            Self::State | Self::Age => Constraint::Length(7),
+            Self::Node => Constraint::Min(24),
+            Self::Summary => Constraint::Min(18),
+        }
+    }
+}
+
+fn topology_table_columns(width: u16) -> Vec<TopologyTableColumn> {
+    let mut columns = vec![TopologyTableColumn::State, TopologyTableColumn::Node];
+    // SUMMARY carries the current work/subagent context, so it returns before
+    // AGE as horizontal space grows. The final order remains the familiar
+    // STATE / NODE / AGE / SUMMARY once every column fits.
+    if width >= 70 {
+        columns.push(TopologyTableColumn::Age);
+    }
+    if width >= 60 {
+        columns.push(TopologyTableColumn::Summary);
+    }
+    columns
+}
+
+fn render_topology_table(f: &mut Frame, area: Rect, app: &mut App, title: &'static str) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let targets = app.tree_targets();
+    if targets.is_empty() {
+        render_empty_table(f, area, app, theme);
+        return;
+    }
+    let columns = topology_table_columns(area.width);
+    let header =
+        Row::new(columns.iter().map(|column| column.header())).style(theme.table_header_style());
+    let now = OffsetDateTime::now_utc();
+    let spin = Spinner {
+        frame: app.anim_frame,
+        enabled: app.watch_cfg.spinner && icons_unicode(),
+    };
+    let endpoint_count = app
+        .topology
+        .sessions
+        .iter()
+        .map(|session| &session.key.endpoint)
+        .collect::<HashSet<_>>()
+        .len();
+    let rows: Vec<Row> = targets
+        .iter()
+        .filter_map(|target| {
+            let node = app.topology.find(&target.key)?;
+            let cells = columns
+                .iter()
+                .map(|column| match column {
+                    TopologyTableColumn::State => Cell::from(tree_state_cell(node, theme, spin)),
+                    TopologyTableColumn::Node => {
+                        Cell::from(tree_node_label(target, node, endpoint_count > 1, theme))
+                    }
+                    TopologyTableColumn::Age => Cell::from(tree_node_age(app, node, now)),
+                    TopologyTableColumn::Summary => Cell::from(truncate_chars(
+                        &tree_node_summary(node, app.watch_cfg.layout),
+                        120,
+                    )),
+                })
+                .collect::<Vec<_>>();
+            Some(Row::new(cells))
+        })
+        .collect();
+    let widths = columns.iter().map(|column| column.constraint());
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border_style())
+                .border_type(theme.border_type)
+                .title(title),
+        )
+        .row_highlight_style(theme.selected_style())
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
 /// Below this table width the SUMMARY column folds away entirely.
 ///
 /// Squeezing every column keeps SUMMARY alive as a four-character scrap
@@ -9370,7 +11763,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let header_cells = columns.iter().map(|c| {
-        let header = if app.watch_cfg.view == WatchView::Work && matches!(c, WatchColumn::Pane) {
+        let header = if app.watch_cfg.view == WatchView::Window && matches!(c, WatchColumn::Pane) {
             "WORKSPACE › WORK"
         } else if matches!(c, WatchColumn::Prompt) && app.watch_cfg.summary != WatchSummary::Prompt
         {
@@ -9549,7 +11942,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(theme.border_style())
                 .border_type(theme.border_type)
-                .title(if app.watch_cfg.view == WatchView::Work {
+                .title(if app.watch_cfg.view == WatchView::Window {
                     " Works "
                 } else {
                     " Agents "
@@ -9570,8 +11963,10 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 /// from "everything visible is hidden as paneless" so the hint is
 /// actionable in both cases.
 fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
-    let title = if app.watch_cfg.view == WatchView::Work {
-        " Works "
+    let title = if app.uses_tree() {
+        " Topology "
+    } else if app.watch_cfg.view == WatchView::Window {
+        " Windows "
     } else {
         " Agents "
     };
@@ -9776,7 +12171,7 @@ fn resolve_var(
 ) -> Option<String> {
     match row {
         WatchRow::Agent(a) => Some(match name {
-            "pane" => pane_display(a.pane.as_deref(), panes),
+            "pane" => agent_pane_display(a, panes),
             "kind" => a.kind.to_string(),
             "state" => a.state.to_string(),
             "model" => a.model.clone().unwrap_or_else(|| "—".into()),
@@ -10291,7 +12686,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" : ", theme.action_badge()),
         Span::raw(" commands  "),
         Span::styled(" ⏎ ", theme.action_badge()),
-        Span::raw(" prompt  "),
+        Span::raw(" jump  "),
         Span::styled(" o ", theme.key_badge()),
         Span::raw(" preview  "),
         Span::styled(" m ", theme.action_badge()),
@@ -10460,7 +12855,11 @@ fn render_collaboration_composer_footer(
                 Span::raw("status  "),
             ]);
         }
-        Some(CollaborationComposeTarget::Prompt { .. }) | None => {}
+        Some(
+            CollaborationComposeTarget::Prompt { .. }
+            | CollaborationComposeTarget::PromptTopology { .. },
+        )
+        | None => {}
     }
     if matches!(target, Some(CollaborationComposeTarget::Send { .. })) {
         spans.extend([
@@ -10498,7 +12897,7 @@ fn render_preview_footer(
         Span::styled(" PgUp/PgDn ", theme.key_badge()),
         Span::raw(" page  "),
     ];
-    if preview_target_position(app, &preview.pane_id).is_some_and(|(_, total)| total > 1) {
+    if preview_position(app, preview).is_some_and(|(_, total)| total > 1) {
         spans.push(Span::styled(" [ / ] ", theme.key_badge()));
         spans.push(Span::raw(" agent  "));
     }
@@ -10508,7 +12907,7 @@ fn render_preview_footer(
         Span::styled(" c ", theme.key_badge()),
         Span::raw(content_label),
         Span::styled(" ⏎ ", theme.action_badge()),
-        Span::raw(" prompt  "),
+        Span::raw(" jump  "),
         Span::styled(" r ", theme.key_badge()),
         Span::raw(" refresh  "),
         Span::styled(" o/p/q/Esc ", theme.key_badge()),
@@ -10518,7 +12917,11 @@ fn render_preview_footer(
 }
 
 fn selected_has_no_pane(app: &App) -> bool {
-    app.selected_row().is_some() && app.selected_pane().is_none()
+    if app.uses_tree() {
+        app.selected_node_key().is_some() && app.selected_pane().is_none()
+    } else {
+        app.selected_row().is_some() && app.selected_pane().is_none()
+    }
 }
 
 #[cfg(test)]
@@ -10629,7 +13032,7 @@ mod tests {
             spinner: true,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let working = fake_agent(
             "s1",
             Some("%1"),
@@ -10794,6 +13197,688 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn fake_topology_pane(
+        socket: &str,
+        session_id: &str,
+        session_name: &str,
+        window_id: &str,
+        window_name: &str,
+        window_index: u32,
+        pane_id: &str,
+        pane_index: u32,
+    ) -> PaneInfo {
+        PaneInfo {
+            socket: Some(socket.into()),
+            pane_id: pane_id.into(),
+            session_id: session_id.into(),
+            session: session_name.into(),
+            window_id: window_id.into(),
+            window_name: window_name.into(),
+            window_index: window_index.to_string(),
+            pane_index: pane_index.to_string(),
+            tty: format!("/dev/pts/{pane_index}"),
+            current_command: "codex".into(),
+            title: "codex".into(),
+            pane_pid: 100 + pane_index,
+            current_path: format!("/repo/{session_name}/{window_name}"),
+        }
+    }
+
+    fn topology_agent(
+        agent_session_id: &str,
+        pane_id: &str,
+        socket: &str,
+        state: AgentState,
+        prompt: &str,
+        activity_offset: i64,
+    ) -> Agent {
+        let mut agent = fake_agent(
+            agent_session_id,
+            Some(pane_id),
+            AgentKind::Codex,
+            state,
+            Some(prompt),
+            Some("gpt-5"),
+            Some(12.0),
+            Some(0.42),
+        );
+        agent.tmux_socket = Some(socket.into());
+        let now = OffsetDateTime::now_utc();
+        agent.started_at = now - time::Duration::minutes(10);
+        agent.last_activity_at =
+            now - time::Duration::minutes(5) + time::Duration::seconds(activity_offset);
+        agent.state_entered_at = now - time::Duration::seconds(30);
+        agent
+    }
+
+    fn topology_watch(view: WatchView, agents: Vec<Agent>, panes: Vec<PaneInfo>) -> App {
+        let mut app = App::with_config(WatchConfig {
+            view,
+            layout: WatchLayout::Tree,
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_data(agents, panes);
+        app
+    }
+
+    fn select_tree_key(app: &mut App, key: &TopologyNodeKey) {
+        let index = app
+            .tree_targets()
+            .iter()
+            .position(|target| &target.key == key)
+            .unwrap_or_else(|| panic!("tree target not visible: {key:?}"));
+        app.table_state.select(Some(index));
+    }
+
+    fn basic_topology_fixture() -> (Vec<Agent>, Vec<PaneInfo>) {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%2", 1),
+        ];
+        let agents = vec![
+            topology_agent(
+                "agent-1",
+                "%1",
+                "default",
+                AgentState::Working,
+                "edit auth",
+                1,
+            ),
+            topology_agent(
+                "agent-2",
+                "%2",
+                "default",
+                AgentState::WaitingInput,
+                "review auth",
+                2,
+            ),
+        ];
+        (agents, panes)
+    }
+
+    #[test]
+    fn tree_view_defaults_control_expansion_without_losing_ancestry() {
+        let (agents, panes) = basic_topology_fixture();
+        for (view, expected_depths) in [
+            (WatchView::Session, vec![0]),
+            (WatchView::Window, vec![0, 1]),
+            (WatchView::Pane, vec![0, 1, 2, 2]),
+        ] {
+            let app = topology_watch(view, agents.clone(), panes.clone());
+            assert_eq!(
+                app.tree_targets()
+                    .iter()
+                    .map(|target| target.depth)
+                    .collect::<Vec<_>>(),
+                expected_depths
+            );
+        }
+    }
+
+    #[test]
+    fn window_summary_aggregates_all_child_agent_activity() {
+        let (agents, panes) = basic_topology_fixture();
+        let app = topology_watch(WatchView::Pane, agents, panes);
+        let summary = window_node_summary(&app.topology.sessions[0].windows[0], WatchLayout::Tree);
+        assert_eq!(summary, "2 agents · review auth / edit auth");
+    }
+
+    #[test]
+    fn window_summary_folds_duplicate_activity_and_handles_bare_panes() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%2", 1),
+        ];
+        let agents = vec![
+            topology_agent(
+                "one",
+                "%1",
+                "default",
+                AgentState::Working,
+                "shared task",
+                1,
+            ),
+            topology_agent("two", "%2", "default", AgentState::Idle, "shared task", 2),
+        ];
+        let app = topology_watch(WatchView::Pane, agents, panes.clone());
+        assert_eq!(
+            window_node_summary(&app.topology.sessions[0].windows[0], WatchLayout::Tree),
+            "2 agents · shared task ×2"
+        );
+
+        let app = topology_watch(WatchView::Pane, Vec::new(), panes);
+        assert_eq!(
+            window_node_summary(&app.topology.sessions[0].windows[0], WatchLayout::Tree),
+            "2 panes · no tracked agents"
+        );
+    }
+
+    #[test]
+    fn initial_pane_selects_nearest_visible_ancestor_after_empty_first_frame() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "alpha", "@2", "DOCS", 1, "%2", 0),
+            fake_topology_pane("default", "$2", "beta", "@3", "REVIEW", 0, "%3", 0),
+        ];
+        let agents = vec![
+            topology_agent("auth", "%1", "default", AgentState::Working, "auth", 1),
+            topology_agent("docs", "%2", "default", AgentState::Idle, "docs", 2),
+            topology_agent(
+                "review",
+                "%3",
+                "default",
+                AgentState::WaitingInput,
+                "review",
+                3,
+            ),
+        ];
+
+        for view in [WatchView::Session, WatchView::Window, WatchView::Pane] {
+            let mut app = App::with_config(WatchConfig {
+                view,
+                layout: WatchLayout::Tree,
+                sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+                hide_paneless: false,
+                ..WatchConfig::default()
+            });
+            app.set_initial_pane(Some("%3".into()));
+            assert!(app.tree_targets().is_empty());
+
+            app.set_data(agents.clone(), panes.clone());
+
+            match (view, app.selected_node_key().unwrap()) {
+                (WatchView::Session, TopologyNodeKey::Session(key)) => {
+                    assert_eq!(key.session_id, "$2");
+                }
+                (WatchView::Window, TopologyNodeKey::Window(key)) => {
+                    assert_eq!(key.window_id, "@3");
+                }
+                (WatchView::Pane, TopologyNodeKey::Pane(key)) => {
+                    assert_eq!(key.pane_id, "%3");
+                }
+                (view, key) => panic!("unexpected initial selection for {view:?}: {key:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn initial_pane_endpoint_disambiguates_duplicate_native_ids() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("amux", "$1", "beta", "@1", "AUTH", 0, "%1", 0),
+        ];
+        let agents = vec![
+            topology_agent("default-agent", "%1", "default", AgentState::Idle, "one", 1),
+            topology_agent("amux-agent", "%1", "amux", AgentState::Working, "two", 2),
+        ];
+        let mut app = App::with_config(WatchConfig {
+            view: WatchView::Pane,
+            layout: WatchLayout::Tree,
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_initial_pane_on(
+            Some("%1".into()),
+            Some(BackendEndpoint {
+                host: muxa::HostKind::Tmux,
+                socket: "amux".into(),
+            }),
+        );
+
+        app.set_data(agents, panes);
+
+        let TopologyNodeKey::Pane(key) = app.selected_node_key().unwrap() else {
+            panic!("expected the exact pane to be selected");
+        };
+        assert_eq!(key.window.session.endpoint.socket, "amux");
+    }
+
+    #[test]
+    fn tree_left_and_right_expand_enter_child_collapse_and_return_parent() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Session, agents, panes);
+        assert_eq!(app.tree_targets().len(), 1);
+
+        app.move_into_work();
+        assert_eq!(app.tree_targets().len(), 2);
+        assert_eq!(app.table_state.selected(), Some(0));
+        app.move_into_work();
+        assert!(matches!(
+            app.selected_node_key(),
+            Some(TopologyNodeKey::Window(_))
+        ));
+        app.move_into_work();
+        assert_eq!(app.tree_targets().len(), 4);
+        app.move_into_work();
+        assert!(matches!(
+            app.selected_node_key(),
+            Some(TopologyNodeKey::Pane(_))
+        ));
+        app.move_to_work_parent();
+        assert!(matches!(
+            app.selected_node_key(),
+            Some(TopologyNodeKey::Window(_))
+        ));
+        app.move_to_work_parent();
+        assert_eq!(app.tree_targets().len(), 2);
+    }
+
+    #[test]
+    fn tree_refresh_preserves_full_key_selection_and_expansion() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents.clone(), panes.clone());
+        let pane_key = app.topology.sessions[0].windows[0].panes[1].node_key();
+        select_tree_key(&mut app, &pane_key);
+
+        let mut reordered = panes;
+        reordered.reverse();
+        app.set_data(agents, reordered);
+
+        assert_eq!(app.selected_node_key().as_ref(), Some(&pane_key));
+        assert!(app.expanded_nodes.contains(&TopologyNodeKey::Session(
+            app.topology.sessions[0].key.clone()
+        )));
+        assert!(app.expanded_nodes.contains(&TopologyNodeKey::Window(
+            app.topology.sessions[0].windows[0].key.clone()
+        )));
+    }
+
+    #[test]
+    fn tree_search_and_attention_keep_matching_ancestors() {
+        let mut other = topology_agent(
+            "other-agent",
+            "%9",
+            "amux",
+            AgentState::Idle,
+            "unrelated docs",
+            0,
+        );
+        other.last_response = Some("nothing relevant".into());
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("amux", "$2", "other", "@2", "DOCS", 0, "%9", 0),
+        ];
+        let agents = vec![
+            topology_agent(
+                "waiting-agent",
+                "%1",
+                "default",
+                AgentState::WaitingChoice,
+                "needle token",
+                1,
+            ),
+            other,
+        ];
+        let mut app = topology_watch(WatchView::Session, agents, panes);
+        app.search_query = "needle".into();
+        let targets = app.tree_targets();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.depth)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(targets.iter().all(|target| match &target.key {
+            TopologyNodeKey::Session(key) => key.endpoint.socket == "default",
+            TopologyNodeKey::Window(key) => key.session.endpoint.socket == "default",
+            TopologyNodeKey::Pane(key) => key.window.session.endpoint.socket == "default",
+        }));
+
+        app.search_query.clear();
+        app.attention_only = true;
+        assert_eq!(
+            app.tree_targets()
+                .iter()
+                .map(|target| target.depth)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn clearing_tree_filter_restores_the_full_hidden_selection_key() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("amux", "$1", "beta", "@1", "DOCS", 0, "%1", 0),
+        ];
+        let agents = vec![
+            topology_agent("auth", "%1", "default", AgentState::Working, "needle", 1),
+            topology_agent("docs", "%1", "amux", AgentState::Idle, "manual", 2),
+        ];
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let hidden_key = app
+            .topology
+            .sessions
+            .iter()
+            .find(|session| session.key.endpoint.socket == "amux")
+            .unwrap()
+            .windows[0]
+            .panes[0]
+            .node_key();
+        select_tree_key(&mut app, &hidden_key);
+
+        app.edit_search(|query| query.push_str("needle"));
+        assert_ne!(app.selected_node_key().as_ref(), Some(&hidden_key));
+        app.clear_search();
+
+        assert_eq!(app.selected_node_key().as_ref(), Some(&hidden_key));
+    }
+
+    #[test]
+    fn tree_sort_is_sibling_scoped_and_keeps_each_subtree_contiguous() {
+        let panes = vec![
+            fake_topology_pane("default", "$2", "zeta", "@3", "z-window", 1, "%3", 0),
+            fake_topology_pane("default", "$2", "zeta", "@2", "a-window", 0, "%2", 0),
+            fake_topology_pane("amux", "$1", "alpha", "@1", "only", 0, "%1", 0),
+        ];
+        let agents = vec![
+            topology_agent("a3", "%3", "default", AgentState::Idle, "three", 30),
+            topology_agent("a2", "%2", "default", AgentState::Idle, "two", 20),
+            topology_agent("a1", "%1", "amux", AgentState::Idle, "one", 10),
+        ];
+        let app = topology_watch(WatchView::Pane, agents, panes);
+        let targets = app.tree_targets();
+        let labels = targets
+            .iter()
+            .map(|target| match app.topology.find(&target.key).unwrap() {
+                TopologyNodeRef::Session(session) => format!("s:{}", session.name),
+                TopologyNodeRef::Window(window) => format!("w:{}", window.name),
+                TopologyNodeRef::Pane(pane) => format!("p:{}", pane.key.pane_id),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "s:alpha",
+                "w:only",
+                "p:%1",
+                "s:zeta",
+                "w:a-window",
+                "p:%2",
+                "w:z-window",
+                "p:%3"
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_duration_sort_uses_state_age_not_agent_lifetime() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "main", "@1", "work", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "main", "@1", "work", 0, "%2", 1),
+        ];
+        let now = OffsetDateTime::now_utc();
+        let mut long_lived_recent_state =
+            topology_agent("long-lived", "%1", "default", AgentState::Working, "one", 0);
+        long_lived_recent_state.started_at = now - time::Duration::hours(2);
+        long_lived_recent_state.state_entered_at = now - time::Duration::seconds(10);
+        let mut short_lived_old_state =
+            topology_agent("short-lived", "%2", "default", AgentState::Idle, "two", 0);
+        short_lived_old_state.started_at = now - time::Duration::minutes(1);
+        short_lived_old_state.state_entered_at = now - time::Duration::seconds(50);
+
+        let mut app = App::with_config(WatchConfig {
+            view: WatchView::Pane,
+            layout: WatchLayout::Tree,
+            sort: vec![WatchSortKey::Duration],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_data(vec![long_lived_recent_state, short_lived_old_state], panes);
+
+        let pane_ids = app
+            .tree_targets()
+            .into_iter()
+            .filter_map(|target| match target.key {
+                TopologyNodeKey::Pane(key) => Some(key.pane_id),
+                TopologyNodeKey::Session(_) | TopologyNodeKey::Window(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pane_ids, vec!["%2", "%1"]);
+    }
+
+    #[test]
+    fn parent_attention_rank_uses_the_same_choice_before_input_priority_as_panes() {
+        let states = StateDistribution {
+            waiting_input: 1,
+            waiting_choice: 1,
+            ..StateDistribution::default()
+        };
+        assert_eq!(
+            distribution_rank(&states),
+            state_sort_rank(AgentState::WaitingChoice)
+        );
+    }
+
+    #[test]
+    fn duplicate_native_ids_use_exact_socket_for_attach_close_interrupt_and_send() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "main", "@1", "work", 0, "%1", 0),
+            fake_topology_pane("amux", "$1", "main", "@1", "work", 0, "%1", 0),
+        ];
+        let agents = vec![
+            topology_agent(
+                "default-agent",
+                "%1",
+                "default",
+                AgentState::Working,
+                "one",
+                0,
+            ),
+            topology_agent("amux-agent", "%1", "amux", AgentState::Working, "two", 1),
+        ];
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let pane_key = app
+            .topology
+            .sessions
+            .iter()
+            .find(|session| session.key.endpoint.socket == "amux")
+            .unwrap()
+            .windows[0]
+            .panes[0]
+            .key
+            .clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Pane(pane_key.clone()));
+        app.apply_layout(WatchLayout::Swarm);
+        assert_eq!(
+            app.selected_node_key(),
+            Some(TopologyNodeKey::Pane(pane_key.clone()))
+        );
+        app.apply_layout(WatchLayout::Tree);
+
+        assert!(matches!(
+            quick_prompt_action(&app),
+            Action::AttachTopologyPane(ref key) if key == &pane_key
+        ));
+        assert!(matches!(
+            quick_kill_action(&app),
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::TerminateNode(
+                    TopologyNodeKey::Pane(ref key)
+                )),
+                ..
+            }) if key == &pane_key
+        ));
+        assert!(matches!(
+            quick_abort_action(&app),
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPane(ref key)),
+                ..
+            }) if key == &pane_key
+        ));
+
+        open_prompt_only_composer(&mut app, "test".into());
+        app.collaboration_composer.as_mut().unwrap().insert('x');
+        assert!(matches!(
+            composer_submit_action(&mut app),
+            Action::Quick(QuickAction::SendPromptTo { pane: ref key, ref text })
+                if key == &pane_key && text == "x"
+        ));
+    }
+
+    #[test]
+    fn parent_inspector_never_renders_a_representative_pane_capture() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.pane_capture = Some(CapturedPane {
+            pane_id: "%1".into(),
+            socket: Some("default".into()),
+            text: "SHOULD-NOT-LEAK".into(),
+            fetched_at: std::time::Instant::now(),
+        });
+        app.table_state.select(Some(0));
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Inspector · session muxa"));
+        assert!(screen.contains("2 panes"));
+        assert!(!screen.contains("SHOULD-NOT-LEAK"));
+    }
+
+    #[test]
+    fn inspector_wide_keeps_aggregate_state_glyphs_visible() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%2", 1),
+        ];
+        let agents = vec![
+            topology_agent("loading", "%1", "default", AgentState::Starting, "boot", 1),
+            topology_agent("idle", "%2", "default", AgentState::Idle, "ready", 2),
+        ];
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let window_key = app.topology.sessions[0].windows[0].node_key();
+        select_tree_key(&mut app, &window_key);
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>();
+        let screen = rows.join("\n");
+        // InspectorWide gives the topology 30% of 150 columns. AGE and
+        // SUMMARY must yield at that width; STATE and the hierarchy are the
+        // two columns that may never disappear.
+        let topology = rows
+            .iter()
+            .map(|row| row.chars().take(45).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Inspector · window TEST-1"));
+        assert!(
+            screen.contains("status  ◌ ○  starting 1 · idle 1"),
+            "maximized inspector lost its state glyphs:\n{screen}"
+        );
+        assert!(
+            topology.contains("STATE"),
+            "maximized inspector squeezed out the topology STATE gutter:\n{topology}"
+        );
+        assert!(
+            topology.contains("◌ ○"),
+            "selected window lost its aggregate state glyphs:\n{topology}"
+        );
+        assert!(
+            !topology.contains("AGE") && !topology.contains("SUMMARY"),
+            "secondary columns should fold before STATE at 45 columns:\n{topology}"
+        );
+    }
+
+    #[test]
+    fn topology_columns_fold_in_information_priority_order() {
+        assert_eq!(
+            topology_table_columns(45),
+            vec![TopologyTableColumn::State, TopologyTableColumn::Node]
+        );
+        assert_eq!(
+            topology_table_columns(60),
+            vec![
+                TopologyTableColumn::State,
+                TopologyTableColumn::Node,
+                TopologyTableColumn::Summary,
+            ]
+        );
+        assert_eq!(
+            topology_table_columns(80),
+            vec![
+                TopologyTableColumn::State,
+                TopologyTableColumn::Node,
+                TopologyTableColumn::Age,
+                TopologyTableColumn::Summary,
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_on_parent_resolves_active_descendant_but_pane_enter_stays_exact() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "main", "@1", "old", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "main", "@2", "active", 1, "%2", 0),
+        ];
+        let agents = vec![
+            topology_agent("old", "%1", "default", AgentState::Idle, "old", 0),
+            topology_agent("active", "%2", "default", AgentState::Working, "new", 60),
+        ];
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.table_state.select(Some(0));
+        let active_key = app.topology.sessions[0].windows[1].panes[0].key.clone();
+        assert!(matches!(
+            quick_prompt_action(&app),
+            Action::AttachTopologyPane(ref key) if key == &active_key
+        ));
+
+        let exact_key = app.topology.sessions[0].windows[0].panes[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Pane(exact_key.clone()));
+        assert!(matches!(
+            quick_prompt_action(&app),
+            Action::AttachTopologyPane(ref key) if key == &exact_key
+        ));
+    }
+
+    #[test]
+    fn spawn_composer_only_edits_a_window_name_for_session_targets() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+
+        app.table_state.select(Some(0));
+        assert!(matches!(key_action(&mut app, 'n'), Action::None));
+        let session_spawn = app.spawn.as_mut().expect("session spawn composer");
+        assert!(matches!(
+            session_spawn.target.as_ref(),
+            Some(TopologyNodeKey::Session(_))
+        ));
+        assert!(session_spawn.name.is_empty());
+        session_spawn.focus = SpawnField::Dir;
+        let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        assert_eq!(app.spawn.as_ref().unwrap().focus, SpawnField::Name);
+
+        app.spawn = None;
+        app.table_state.select(Some(1));
+        let expected_window = app.topology.sessions[0].windows[0].name.clone();
+        assert!(matches!(key_action(&mut app, 'n'), Action::None));
+        let window_spawn = app.spawn.as_mut().expect("window spawn composer");
+        assert!(matches!(
+            window_spawn.target.as_ref(),
+            Some(TopologyNodeKey::Window(_))
+        ));
+        assert_eq!(window_spawn.name, expected_window);
+        window_spawn.focus = SpawnField::Dir;
+        let _ = handle_spawn_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
+        assert_eq!(app.spawn.as_ref().unwrap().focus, SpawnField::Agent);
+    }
+
     fn fake_collaboration_participant(
         pane: &str,
         session_id: &str,
@@ -10854,7 +13939,7 @@ mod tests {
             hide_paneless: false,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent(
@@ -11201,7 +14286,7 @@ mod tests {
     fn narrow_tables_fold_the_summary_column_before_the_name() {
         let cols = vec![
             WatchColumn::Pane,
-            WatchColumn::WorkspaceTime,
+            WatchColumn::Duration,
             WatchColumn::Activity,
             WatchColumn::Prompt,
         ];
@@ -11213,7 +14298,7 @@ mod tests {
             effective_columns(&cols, 59),
             vec![
                 WatchColumn::Pane,
-                WatchColumn::WorkspaceTime,
+                WatchColumn::Duration,
                 WatchColumn::Activity,
             ]
         );
@@ -11456,7 +14541,7 @@ mod tests {
                 fake_pane("%913", "cal-7041", 0, 0, "claude"),
             ],
         );
-        app.apply_view(WatchView::Work);
+        app.apply_view(WatchView::Window);
         let row_index = app
             .rows
             .iter()
@@ -11630,7 +14715,7 @@ mod tests {
         // Pointing at the session the peer lives in is enough; the user
         // should not have to expand it to the exact pane first.
         let mut app = collaboration_watch_app();
-        app.apply_view(WatchView::Work);
+        app.apply_view(WatchView::Window);
         app.table_state.select(Some(0));
 
         open_watch_collaboration_composer(&mut app);
@@ -11937,10 +15022,10 @@ mod tests {
         // default `[Workspace, Activity]` is exercised by separate tests.
         let cfg = WatchConfig {
             view: WatchView::Pane,
-            sort: vec![WatchSortKey::Workspace, WatchSortKey::Pane],
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mk = |session_id: &str, pane: &str| {
             fake_agent(
                 session_id,
@@ -11992,10 +15077,10 @@ mod tests {
         // Uses explicit `Pane` sort so activity-jitter doesn't matter.
         let cfg = WatchConfig {
             view: WatchView::Pane,
-            sort: vec![WatchSortKey::Workspace, WatchSortKey::Pane],
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mk = |session_id: &str, pane: &str| {
             fake_agent(
                 session_id,
@@ -12043,6 +15128,71 @@ mod tests {
         );
         a.last_activity_at = last_activity_at;
         a
+    }
+
+    #[test]
+    fn multi_socket_topology_does_not_merge_or_hide_duplicate_native_ids() {
+        let mut default_pane = fake_pane("%1", "main", 0, 0, "codex");
+        default_pane.socket = Some("default".into());
+        default_pane.session_id = "$1".into();
+        default_pane.window_id = "@1".into();
+        default_pane.window_name = "ticket".into();
+        let mut amux_pane = default_pane.clone();
+        amux_pane.socket = Some("amux".into());
+        amux_pane.session = "other".into();
+
+        let mut tracked = fake_agent_at("agent-default", "%1", OffsetDateTime::now_utc());
+        tracked.tmux_socket = Some("default".into());
+
+        // Pane presentation: the tracked default/%1 consumes only its exact
+        // key. amux/%1 remains a bare selectable row instead of disappearing
+        // through a raw-pane-id `HashSet` join.
+        let mut pane_app = App::new();
+        pane_app.set_data(
+            vec![tracked.clone()],
+            vec![default_pane.clone(), amux_pane.clone()],
+        );
+        assert_eq!(pane_app.topology.sessions.len(), 2);
+        assert_eq!(
+            pane_app
+                .rows
+                .iter()
+                .filter(|row| matches!(row, WatchRow::BarePane(_)))
+                .count(),
+            1
+        );
+        let bare = pane_app
+            .rows
+            .iter()
+            .find_map(|row| match row {
+                WatchRow::BarePane(pane) => Some(pane),
+                WatchRow::Agent(_) | WatchRow::Work(_) => None,
+            })
+            .expect("foreign socket pane remains visible");
+        assert_eq!(bare.socket.as_deref(), Some("amux"));
+
+        // Window presentation: the two identical `$1/@1` native ids become
+        // two WorkRow compatibility shells backed by different WindowKeys.
+        let cfg = WatchConfig {
+            view: WatchView::Window,
+            ..WatchConfig::default()
+        };
+        let mut window_app = App::with_legacy_config(cfg);
+        window_app.set_data_with_sessions(
+            vec![tracked],
+            vec![default_pane, amux_pane],
+            Vec::new(),
+            Vec::new(),
+        );
+        let keys: HashSet<_> = window_app
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                WatchRow::Work(window) => window.window_key.clone(),
+                WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
     }
 
     #[test]
@@ -12129,7 +15279,7 @@ mod tests {
             sort: vec![WatchSortKey::State, WatchSortKey::Activity],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent_at("a", "%1", t_old), // Idle, older
@@ -12168,11 +15318,11 @@ mod tests {
         let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![
                 fake_agent_at("old", "%1", t0),
@@ -12212,15 +15362,15 @@ mod tests {
     fn full_refresh_reorder_keeps_the_cursor_on_the_same_work() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             sort: vec![
                 WatchSortKey::State,
-                WatchSortKey::Workspace,
+                WatchSortKey::Name,
                 WatchSortKey::Activity,
             ],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
 
         let panes = || {
             vec![
@@ -12283,11 +15433,11 @@ mod tests {
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             sort: vec![WatchSortKey::Activity],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let panes = vec![
             fake_pane("%1", "side", 0, 0, "claude"),
             fake_pane("%2", "muxa", 0, 0, "claude"),
@@ -12333,11 +15483,11 @@ mod tests {
     fn work_view_label_summarizes_agent_states() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mut working = fake_agent_at("working", "%1", now);
         working.state = AgentState::Working;
         let mut working_2 = fake_agent_at("working-2", "%5", now);
@@ -12380,13 +15530,13 @@ mod tests {
     fn work_view_state_summary_survives_long_session_name() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             // Assert the static gutter layout, not an animation frame.
             spinner: false,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let session = "a-very-long-session-name-that-would-otherwise-eat-state-markers";
         let mut working = fake_agent_at("working", "%1", now);
         working.state = AgentState::Working;
@@ -12423,8 +15573,9 @@ mod tests {
     #[test]
     fn swarm_view_renders_cluster_spinner_and_subagent_tree() {
         let cfg = WatchConfig {
-            view: WatchView::Swarm,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            layout: WatchLayout::Swarm,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12468,11 +15619,11 @@ mod tests {
     fn work_view_shows_single_agent_state_summary() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mut agent = fake_agent_at("agent", "%1", now);
         agent.state = AgentState::Idle;
         app.set_data_with_sessions(
@@ -12504,11 +15655,11 @@ mod tests {
     fn work_view_state_gutter_keeps_names_aligned() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mut multi_working = fake_agent_at("multi-working", "%1", now);
         multi_working.state = AgentState::Working;
         let mut multi_waiting = fake_agent_at("multi-waiting", "%2", now);
@@ -12565,11 +15716,11 @@ mod tests {
     fn work_view_state_gutter_compresses_overflow_before_name() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let states = [
             AgentState::Error,
             AgentState::WaitingInput,
@@ -12630,10 +15781,10 @@ mod tests {
     fn work_view_adds_attached_time_column_and_renders_total() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![],
             vec![fake_pane("%1", "main", 0, 0, "zsh")],
@@ -12646,11 +15797,11 @@ mod tests {
             )],
         );
 
-        assert!(app.columns.contains(&WatchColumn::WorkspaceTime));
+        assert!(app.columns.contains(&WatchColumn::Duration));
         let WatchRow::Work(row) = &app.rows[0] else {
             panic!("expected work row");
         };
-        let text = WatchColumn::WorkspaceTime.work_text(
+        let text = WatchColumn::Duration.work_text(
             row,
             now,
             &app.panes,
@@ -12675,10 +15826,10 @@ mod tests {
         // session-id fallback even though no session *name* matches `w1`.
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![],
             vec![fake_pane("herdr:p1", "w1", 0, 0, "zsh")],
@@ -12695,7 +15846,10 @@ mod tests {
             panic!("expected work row");
         };
         assert_eq!(row.session, "w1", "group key stays the workspace id");
-        assert_eq!(row.display_name, "muxa", "display name is the label");
+        assert_eq!(
+            row.display_name, "muxa › window 0",
+            "window row keeps the labeled session ancestry"
+        );
 
         let label = plain_text(&work_label(
             row,
@@ -12707,7 +15861,7 @@ mod tests {
             "label renders the workspace label: {label}"
         );
 
-        let text = WatchColumn::WorkspaceTime.work_text(
+        let text = WatchColumn::Duration.work_text(
             row,
             now,
             &app.panes,
@@ -12728,10 +15882,10 @@ mod tests {
         // No SessionInfo for the pane's workspace (e.g. the workspace list
         // was unreachable this refresh): the display name degrades to the id.
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![],
             vec![fake_pane("herdr:p1", "w1", 0, 0, "zsh")],
@@ -12742,7 +15896,10 @@ mod tests {
         let WatchRow::Work(row) = &app.rows[0] else {
             panic!("expected work row");
         };
-        assert_eq!(row.display_name, "w1", "display name falls back to the id");
+        assert_eq!(
+            row.display_name, "w1 › window 0",
+            "window row falls back to the session id while retaining ancestry"
+        );
     }
 
     #[test]
@@ -12752,10 +15909,10 @@ mod tests {
         // into one corrupted row (panes from both hosts, wrong count); the
         // host-namespaced group key keeps them apart.
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![],
             vec![
@@ -12785,12 +15942,20 @@ mod tests {
 
         let tmux_row = session_rows
             .iter()
-            .find(|s| s.group_key == "tmux:w1:0")
-            .expect("tmux:w1:0 work row present");
+            .find(|row| {
+                row.window_key
+                    .as_ref()
+                    .is_some_and(|key| key.session.endpoint.host == muxa::HostKind::Tmux)
+            })
+            .expect("tmux window row present");
         let herdr_row = session_rows
             .iter()
-            .find(|s| s.group_key == "herdr:w1")
-            .expect("herdr:w1 row present");
+            .find(|row| {
+                row.window_key
+                    .as_ref()
+                    .is_some_and(|key| key.session.endpoint.host == muxa::HostKind::Herdr)
+            })
+            .expect("herdr window row present");
 
         // Raw session id stays "w1" on both (display/ledger key), only the
         // group key is namespaced.
@@ -12849,10 +16014,10 @@ mod tests {
         // A tmux session and a herdr workspace with colliding-looking keys
         // ("main" vs "w1") stay separate rows, each classified to its host.
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![],
             vec![
@@ -12888,10 +16053,10 @@ mod tests {
         // session names ("main"/"w1") don't contain those words, so a match
         // can only come from the badge.
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut multi = App::with_config(cfg.clone());
+        let mut multi = App::with_legacy_config(cfg.clone());
         multi.set_data_with_sessions(
             vec![],
             vec![
@@ -12913,7 +16078,7 @@ mod tests {
 
         // Single-host: no badge — a lone tmux session must not gain a
         // "herdr" (or any) host tag.
-        let mut single = App::with_config(cfg);
+        let mut single = App::with_legacy_config(cfg);
         single.set_data_with_sessions(
             vec![],
             vec![fake_pane("%1", "main", 0, 0, "vim")],
@@ -12930,10 +16095,10 @@ mod tests {
     #[test]
     fn work_view_keeps_duration_column_visible_at_80_cols() {
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         // STATE is deliberately absent: the SESSION cell's leftmost cluster
         // already shows every state as icon-with-count, so the column said
         // the same thing twice at twelve columns' cost. DUR + ACT carry the
@@ -12942,7 +16107,7 @@ mod tests {
             app.columns,
             vec![
                 WatchColumn::Pane,
-                WatchColumn::WorkspaceTime,
+                WatchColumn::Duration,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
             ]
@@ -12969,17 +16134,17 @@ mod tests {
     #[test]
     fn work_view_explicit_state_column_is_preserved() {
         let cfg = WatchConfig {
-            view: WatchView::Work,
+            view: WatchView::Window,
             columns: vec!["pane".into(), "state".into(), "prompt".into()],
             ..WatchConfig::default()
         };
-        let app = App::with_config(cfg);
+        let app = App::with_legacy_config(cfg);
         assert_eq!(
             app.columns,
             vec![
                 WatchColumn::Pane,
                 WatchColumn::State,
-                WatchColumn::WorkspaceTime,
+                WatchColumn::Duration,
                 WatchColumn::Prompt,
             ]
         );
@@ -12998,7 +16163,7 @@ mod tests {
             sort: vec![WatchSortKey::Activity],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent_at("alpha", "%10", t0),
@@ -13031,7 +16196,7 @@ mod tests {
             sort: vec![WatchSortKey::State],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mut idle = fake_agent_at("idle", "%10", now);
         idle.state = AgentState::Idle;
         let mut working = fake_agent_at("working", "%20", now);
@@ -13065,11 +16230,11 @@ mod tests {
     #[test]
     fn work_view_duration_sort_orders_longest_session_first() {
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::WorkspaceTime],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Duration],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data_with_sessions(
             vec![],
             vec![
@@ -13103,10 +16268,10 @@ mod tests {
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
             view: WatchView::Pane,
-            sort: vec![WatchSortKey::Workspace],
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent_at("alpha", "%10", t0),
@@ -13137,7 +16302,7 @@ mod tests {
     fn sort_keybindings_switch_sort_presets() {
         let mut app = App::new();
         for (key, preset) in [
-            ('s', WatchSortPreset::Workspace),
+            ('s', WatchSortPreset::Name),
             ('l', WatchSortPreset::Latest),
             ('d', WatchSortPreset::Duration),
             ('t', WatchSortPreset::State),
@@ -13205,7 +16370,7 @@ mod tests {
             cfg.watch.collaboration_mode,
             Some(WatchCollaborationMode::Execute)
         );
-        let app = App::with_config(cfg.watch);
+        let app = App::with_legacy_config(cfg.watch);
         assert_eq!(
             app.collaboration_compose_defaults,
             CollaborationComposeDefaults {
@@ -13270,7 +16435,7 @@ sort = ["state"]
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent_at("a", "%30", now),
@@ -13310,7 +16475,7 @@ sort = ["state"]
             sort: vec![WatchSortKey::Activity],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent_at("stale-but-recent", "%999", very_recent),
@@ -13376,7 +16541,7 @@ sort = ["state"]
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent(
@@ -13491,7 +16656,7 @@ sort = ["state"]
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_initial_pane(Some("%2".into()));
         app.set_data(
             vec![
@@ -13670,7 +16835,7 @@ sort = ["state"]
             widths: HashMap::new(),
             ..Default::default()
         };
-        let app = App::with_config(cfg);
+        let app = App::with_legacy_config(cfg);
         assert_eq!(
             app.columns,
             vec![WatchColumn::Prompt, WatchColumn::Pane, WatchColumn::Kind]
@@ -13685,7 +16850,7 @@ sort = ["state"]
             widths: HashMap::new(),
             ..Default::default()
         };
-        let app = App::with_config(cfg);
+        let app = App::with_legacy_config(cfg);
         // "bogus" was warned-and-skipped; the rest survive in order.
         assert_eq!(app.columns, vec![WatchColumn::Pane, WatchColumn::Prompt]);
     }
@@ -13756,7 +16921,7 @@ sort = ["state"]
             WatchColumn::Limits,
             WatchColumn::Prompt,
             WatchColumn::Activity,
-            WatchColumn::WorkspaceTime,
+            WatchColumn::Duration,
         ] {
             let _ = col.agent_text(
                 &a,
@@ -14006,7 +17171,7 @@ sort = ["state"]
             widths: HashMap::new(),
             ..Default::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![],
             vec![fake_pane("%99", "main", 0, 0, "vim README.md")],
@@ -14431,7 +17596,7 @@ sort = ["state"]
         };
         let backend = TestBackend::new(140, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![fake_agent(
                 "s1",
@@ -14549,7 +17714,7 @@ sort = ["state"]
             hide_paneless: false,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![fake_agent(
                 "s-no-pane",
@@ -14621,7 +17786,7 @@ sort = ["state"]
             hide_paneless: false,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![fake_agent(
                 "s",
@@ -14686,7 +17851,7 @@ sort = ["state"]
             hide_paneless: false,
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         app.set_data(
             vec![
                 fake_agent(
@@ -15306,7 +18471,7 @@ sort = ["state"]
             sort: vec![WatchSortKey::PaneId],
             ..Default::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         seed_three_agents(&mut app);
         app
     }
@@ -15552,7 +18717,7 @@ sort = ["state"]
         let cfg = WatchConfig::default();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let mut a = fake_agent(
             "s1",
             Some("%1"),
@@ -15653,6 +18818,7 @@ sort = ["state"]
                 if let Some(pane) = app.selected_pane() {
                     app.preview = Some(PreviewState {
                         pane_id: pane,
+                        pane_key: None,
                         scroll: 0,
                         mode: PreviewMode::Popup,
                         content: app.watch_cfg.preview.default_content,
@@ -15689,6 +18855,9 @@ sort = ["state"]
             Action::SetView(view) => {
                 app.apply_view(view);
             }
+            Action::SetLayout(layout) => {
+                app.apply_layout(layout);
+            }
             // Quick-action paths aren't exercised through `press` —
             // tests that need them call `handle_event` directly so
             // they can inspect the `Action` variant. Anything we
@@ -15698,6 +18867,7 @@ sort = ["state"]
             | Action::Quit
             | Action::Refresh
             | Action::AttachPane(_)
+            | Action::AttachTopologyPane(_)
             | Action::OpenCollaborationMessage
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
@@ -15733,6 +18903,7 @@ sort = ["state"]
             if let Some(pane) = app.selected_pane() {
                 app.preview = Some(PreviewState {
                     pane_id: pane,
+                    pane_key: None,
                     scroll: 0,
                     mode: PreviewMode::Popup,
                     content: PreviewContent::PromptResponse,
@@ -15757,6 +18928,7 @@ sort = ["state"]
             let mut app = three_agent_app(muxa::config::DetailConfig::default());
             app.preview = Some(PreviewState {
                 pane_id: "%1".into(),
+                pane_key: None,
                 scroll: 0,
                 mode: PreviewMode::Popup,
                 content: PreviewContent::PromptResponse,
@@ -15778,6 +18950,7 @@ sort = ["state"]
         app.table_state.select(Some(2));
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Popup,
             content: PreviewContent::PromptResponse,
@@ -15799,6 +18972,7 @@ sort = ["state"]
         app.table_state.select(Some(0));
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Popup,
             content: PreviewContent::PromptResponse,
@@ -15829,14 +19003,14 @@ sort = ["state"]
 
     fn work_preview_app() -> App {
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             preview: muxa::config::PreviewConfig {
                 default_content: PreviewContent::PromptResponse,
             },
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let mut alpha = fake_agent_at("alpha", "%1", t0);
@@ -15878,12 +19052,14 @@ sort = ["state"]
         let mut app = work_preview_app();
         app.preview = Some(PreviewState {
             pane_id: "%2".into(),
+            pane_key: None,
             scroll: 7,
             mode: PreviewMode::Popup,
             content: PreviewContent::LivePane,
         });
         app.pane_capture = Some(CapturedPane {
             pane_id: "%2".into(),
+            socket: None,
             text: "old screen".into(),
             fetched_at: std::time::Instant::now(),
         });
@@ -16011,6 +19187,7 @@ sort = ["state"]
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Popup,
             content: PreviewContent::PromptResponse,
@@ -16047,6 +19224,7 @@ sort = ["state"]
         if let (Action::OpenPreview, Some(pane)) = (action, app.selected_pane()) {
             app.preview = Some(PreviewState {
                 pane_id: pane,
+                pane_key: None,
                 scroll: 0,
                 mode: PreviewMode::Popup,
                 content: PreviewContent::PromptResponse,
@@ -16063,6 +19241,7 @@ sort = ["state"]
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Popup,
             content: PreviewContent::PromptResponse,
@@ -16110,6 +19289,7 @@ sort = ["state"]
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Fullscreen,
             content: PreviewContent::PromptResponse,
@@ -16180,7 +19360,7 @@ sort = ["state"]
 
     #[test]
     fn c_toggles_preview_content_and_resets_scroll() {
-        let mut app = App::with_config(cfg_with_prompt_default());
+        let mut app = App::with_legacy_config(cfg_with_prompt_default());
         seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         // Open the preview and scroll into the body.
@@ -16228,7 +19408,7 @@ sort = ["state"]
     /// through, not just the default.
     #[test]
     fn prompt_response_default_opens_preview_in_text_mode() {
-        let mut app = App::with_config(cfg_with_prompt_default());
+        let mut app = App::with_legacy_config(cfg_with_prompt_default());
         seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         press(&mut app, 'p');
@@ -16246,7 +19426,7 @@ sort = ["state"]
         // Pin the starting axis state explicitly so this test reads as
         // "all four (mode, content) combinations are reachable", not
         // "the current default + 3 toggles lands somewhere expected."
-        let mut app = App::with_config(cfg_with_prompt_default());
+        let mut app = App::with_legacy_config(cfg_with_prompt_default());
         seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         press(&mut app, 'p');
@@ -16285,6 +19465,7 @@ sort = ["state"]
         // about the App field's lifecycle.
         app.pane_capture = Some(CapturedPane {
             pane_id: "%1".into(),
+            socket: None,
             text: "old screen".into(),
             fetched_at: std::time::Instant::now(),
         });
@@ -16300,13 +19481,14 @@ sort = ["state"]
     fn toggle_to_prompt_drops_cache() {
         // Start from PromptResponse so the toggle direction this test
         // exercises (LivePane → PromptResponse) is unambiguous.
-        let mut app = App::with_config(cfg_with_prompt_default());
+        let mut app = App::with_legacy_config(cfg_with_prompt_default());
         seed_three_agents(&mut app);
         app.table_state.select(Some(0));
         press(&mut app, 'p');
         press(&mut app, 'c'); // → LivePane
         app.pane_capture = Some(CapturedPane {
             pane_id: "%1".into(),
+            socket: None,
             text: "old".into(),
             fetched_at: std::time::Instant::now(),
         });
@@ -16336,6 +19518,7 @@ sort = ["state"]
         // Cache present but for a different pane → still placeholder.
         app.pane_capture = Some(CapturedPane {
             pane_id: "%999".into(),
+            socket: None,
             text: "irrelevant".into(),
             fetched_at: std::time::Instant::now(),
         });
@@ -16350,6 +19533,7 @@ sort = ["state"]
         // Cache present, correct pane, but empty text → pane-gone hint.
         app.pane_capture = Some(CapturedPane {
             pane_id: "%1".into(),
+            socket: None,
             text: String::new(),
             fetched_at: std::time::Instant::now(),
         });
@@ -16375,6 +19559,7 @@ sort = ["state"]
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Popup,
             content: PreviewContent::PromptResponse,
@@ -16476,7 +19661,7 @@ sort = ["state"]
             sort: vec![WatchSortKey::PaneId],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let paneless = fake_agent(
             "no-pane",
             None,
@@ -16765,10 +19950,10 @@ sort = ["state"]
         let body = help_overlay_text().join("\n");
         assert!(body.contains("type or /       filter"));
         assert!(body.contains("gg/G · Home/End first / last selectable row"));
-        assert!(body.contains("↑/↓ · j/k       move works/agents"));
+        assert!(body.contains("↑/↓ · j/k       move visible session/window/pane nodes"));
         assert!(body.contains(":              command palette"));
         assert!(body.contains("Alt-A          attention-only filter"));
-        assert!(body.contains("Alt-S/L/D/T    workspace / latest / duration / state"));
+        assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
@@ -17236,9 +20421,9 @@ sort = ["state"]
         app.paneless_attention = 1;
         let selected = app.selected_pane();
 
-        app.apply_view(WatchView::Work);
+        app.apply_view(WatchView::Window);
         assert!(app.rows.iter().all(|row| matches!(row, WatchRow::Work(_))));
-        assert!(app.columns.contains(&WatchColumn::WorkspaceTime));
+        assert!(app.columns.contains(&WatchColumn::Duration));
         assert_eq!(app.selected_pane(), selected);
         assert_eq!(app.paneless_hidden, 2);
         assert_eq!(app.paneless_attention, 1);
@@ -17326,11 +20511,11 @@ sort = ["state"]
     #[test]
     fn moving_to_another_work_folds_the_previous_and_opens_the_new_one() {
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let now = OffsetDateTime::now_utc();
         app.set_data_with_sessions(
             vec![
@@ -17374,11 +20559,11 @@ sort = ["state"]
     #[test]
     fn single_pane_work_keeps_detail_without_a_redundant_child_row() {
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let now = OffsetDateTime::now_utc();
         let mut agent = fake_agent_at("solo-agent", "%1", now);
         agent.last_response = Some("solo detail remains visible".into());
@@ -17421,11 +20606,11 @@ sort = ["state"]
     #[test]
     fn single_and_multi_pane_work_names_start_in_the_same_column() {
         let cfg = WatchConfig {
-            view: WatchView::Work,
-            sort: vec![WatchSortKey::Workspace],
+            view: WatchView::Window,
+            sort: vec![WatchSortKey::Name],
             ..WatchConfig::default()
         };
-        let mut app = App::with_config(cfg);
+        let mut app = App::with_legacy_config(cfg);
         let now = OffsetDateTime::now_utc();
         app.set_data_with_sessions(
             vec![
@@ -17601,7 +20786,10 @@ sort = ["state"]
             dump.contains("Quick actions"),
             "missing Quick actions: {dump:?}",
         );
-        assert!(dump.contains("kill the pane"), "missing kill: {dump:?}");
+        assert!(
+            dump.contains("close session/window/pane"),
+            "missing close hierarchy action: {dump:?}"
+        );
     }
 
     // ---- visual snapshots --------------------------------------------------
@@ -17641,7 +20829,7 @@ sort = ["state"]
         /// Replace compact `\d+(s|m|h|d)` tokens with `<rel>` and `HH:MM:SS UTC` with
         /// `<clock>` so neither the activity column nor the header clock
         /// drifts across runs. (`render_header` reads `app.last_refresh`,
-        /// which is set to `now_utc()` inside `App::with_config`/`set_data`
+        /// which is set to `now_utc()` inside `App::with_legacy_config`/`set_data`
         /// — not injectable without a production-code change.)
         fn normalize_relative_time(s: &str) -> String {
             let bytes = s.as_bytes();
@@ -17734,7 +20922,7 @@ sort = ["state"]
             spinner: false,
             ..WatchConfig::default()
         };
-        App::with_config(cfg)
+        App::with_legacy_config(cfg)
     }
 
     #[test]
@@ -17747,10 +20935,78 @@ sort = ["state"]
     }
 
     #[test]
+    fn snapshot_nested_topology_tree() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-0001", 0, "%12", 0),
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-0001", 0, "%13", 1),
+            fake_topology_pane("default", "$1", "muxa", "@2", "TEST-0002", 1, "%18", 0),
+            fake_topology_pane("amux", "$1", "junia", "@1", "DOCS", 0, "%1", 0),
+        ];
+        let agents = vec![
+            topology_agent(
+                "claude-impl",
+                "%12",
+                "default",
+                AgentState::Working,
+                "editing middleware",
+                1,
+            ),
+            topology_agent(
+                "codex-review",
+                "%13",
+                "default",
+                AgentState::WaitingChoice,
+                "reviewing changes",
+                2,
+            ),
+            topology_agent(
+                "codex-wait",
+                "%18",
+                "default",
+                AgentState::Idle,
+                "docs update",
+                3,
+            ),
+            topology_agent(
+                "junia-agent",
+                "%1",
+                "amux",
+                AgentState::WaitingInput,
+                "release approval",
+                4,
+            ),
+        ];
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        let junia_key = app
+            .topology
+            .sessions
+            .iter()
+            .find(|session| session.name == "junia")
+            .unwrap()
+            .node_key();
+        app.expanded_nodes.remove(&junia_key);
+        let muxa_window_key = app
+            .topology
+            .sessions
+            .iter()
+            .find(|session| session.name == "muxa")
+            .unwrap()
+            .windows[0]
+            .node_key();
+        select_tree_key(&mut app, &muxa_window_key);
+
+        let backend = TestBackend::new(118, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
+    }
+
+    #[test]
     fn oh_my_muxa_theme_renders_polished_chrome() {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::with_config(WatchConfig {
+        let mut app = App::with_legacy_config(WatchConfig {
             theme: Some(WatchTheme::OhMyMuxa),
             view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],
@@ -17777,7 +21033,7 @@ sort = ["state"]
         ] {
             let backend = TestBackend::new(100, 12);
             let mut terminal = Terminal::new(backend).unwrap();
-            let mut app = App::with_config(WatchConfig {
+            let mut app = App::with_legacy_config(WatchConfig {
                 theme: Some(theme),
                 view: WatchView::Pane,
                 sort: vec![WatchSortKey::PaneId],
@@ -18015,6 +21271,7 @@ sort = ["state"]
         app.set_data(vec![a], vec![fake_pane("%1", "alpha", 0, 0, "claude")]);
         app.preview = Some(PreviewState {
             pane_id: "%1".into(),
+            pane_key: None,
             scroll: 0,
             mode: PreviewMode::Popup,
             content: PreviewContent::PromptResponse,

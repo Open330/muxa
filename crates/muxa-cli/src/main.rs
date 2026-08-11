@@ -37,7 +37,6 @@ use muxa::{
     HumanInteractionInput, HumanInteractionKind,
 };
 use owo_colors::Style;
-use serde::Serialize;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -123,6 +122,11 @@ enum Cmd {
         #[command(subcommand)]
         action: AgentCmd,
     },
+    /// Manage tmux windows using their stable native identity.
+    Window {
+        #[command(subcommand)]
+        action: WindowCmd,
+    },
     /// Manage work/ticket tmux windows.
     Work {
         #[command(subcommand)]
@@ -162,7 +166,7 @@ enum Cmd {
     /// Designed to be bound to `prefix + Q` via a borderless fullscreen
     /// `display-popup` (see `muxa init --only tmux-peek`).
     Peek(peek::Args),
-    /// Fullscreen TUI dashboard of all tracked agents.
+    /// Fullscreen nested session/window/pane topology of tracked agents.
     Watch {
         /// Show agents that have no tmux pane attached. Default behavior
         /// (governed by `[watch] hide_paneless = true`) hides them
@@ -172,10 +176,13 @@ enum Cmd {
         /// detached SDK session.
         #[arg(long)]
         include_paneless: bool,
-        /// Row granularity: tmux work/window (default) or pane.
+        /// Default expansion depth: session, window (default), or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
-        /// One-shot sort override: workspace, latest/activity/act, workspace-time/dur/duration, st/state, pane, pane-id.
+        /// Presentation of the same topology: nested tree (default) or swarm.
+        #[arg(long, value_enum)]
+        layout: Option<WatchLayoutArg>,
+        /// One-shot sibling sort: name, latest/activity/act, duration/dur, st/state, pane, or pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
         /// One-shot visual theme override.
@@ -350,6 +357,12 @@ enum AgentCmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum WindowCmd {
+    /// Set a stable display name, or restore tmux's automatic process name.
+    Rename(tmux_work::WindowRenameArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum WorkCmd {
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
@@ -427,28 +440,43 @@ enum HookCmd {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WatchViewArg {
+    Session,
+    Window,
     Pane,
-    Work,
-    Swarm,
 }
 
 impl From<WatchViewArg> for muxa::config::WatchView {
     fn from(value: WatchViewArg) -> Self {
         match value {
+            WatchViewArg::Session => Self::Session,
+            WatchViewArg::Window => Self::Window,
             WatchViewArg::Pane => Self::Pane,
-            WatchViewArg::Work => Self::Work,
-            WatchViewArg::Swarm => Self::Swarm,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WatchLayoutArg {
+    Tree,
+    Swarm,
+}
+
+impl From<WatchLayoutArg> for muxa::config::WatchLayout {
+    fn from(value: WatchLayoutArg) -> Self {
+        match value {
+            WatchLayoutArg::Tree => Self::Tree,
+            WatchLayoutArg::Swarm => Self::Swarm,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WatchSortArg {
-    Workspace,
+    Name,
     #[value(alias = "activity", alias = "act")]
     Latest,
-    #[value(alias = "dur", alias = "duration")]
-    WorkspaceTime,
+    #[value(alias = "dur")]
+    Duration,
     #[value(alias = "st")]
     State,
     Pane,
@@ -459,11 +487,11 @@ enum WatchSortArg {
 impl WatchSortArg {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
-            Self::Workspace => vec![WatchSortKey::Workspace, WatchSortKey::Activity],
+            Self::Name => vec![WatchSortKey::Name, WatchSortKey::Activity],
             Self::Latest => vec![WatchSortKey::Activity],
-            Self::WorkspaceTime => vec![WatchSortKey::WorkspaceTime],
+            Self::Duration => vec![WatchSortKey::Duration],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
-            Self::Pane => vec![WatchSortKey::Workspace, WatchSortKey::Pane],
+            Self::Pane => vec![WatchSortKey::Name, WatchSortKey::Pane],
             Self::PaneId => vec![WatchSortKey::PaneId],
         }
     }
@@ -473,6 +501,12 @@ fn run_agent_cmd(action: AgentCmd) -> Result<()> {
     match action {
         AgentCmd::Start(args) => agent_launch::run(args),
         AgentCmd::Control(args) => tmux_work::run_agent_control(args),
+    }
+}
+
+fn run_window_cmd(action: WindowCmd) -> Result<()> {
+    match action {
+        WindowCmd::Rename(args) => tmux_work::run_window_rename(args),
     }
 }
 
@@ -538,6 +572,7 @@ async fn main() -> Result<()> {
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
         Cmd::Agent { action } => run_agent_cmd(action),
+        Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action),
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
@@ -547,21 +582,18 @@ async fn main() -> Result<()> {
         Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
         Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
-        Cmd::Panes => {
-            cmd_panes();
-            Ok(())
-        }
+        Cmd::Panes => cmd_panes(),
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
             include_paneless,
             view,
+            layout,
             sort,
             theme,
             caller_client,
             caller_pane,
         } => {
-            // Pin every later focus-moving tmux command to the client that
-            // actually asked. Set-once; jump_to_pane_tmux reads it.
+            // Pin focus-moving commands to the requesting client; jump_to_pane_tmux reads it.
             //
             // A value still containing `#{` is a binding that never expanded
             // its formats (plain `display-popup` does not expand; only the
@@ -579,6 +611,7 @@ async fn main() -> Result<()> {
                 WatchInvocation {
                     include_paneless,
                     view,
+                    layout,
                     sort,
                     theme,
                     // Same unexpanded-format guard as the client: a literal
@@ -1244,6 +1277,7 @@ async fn cmd_sync(client: &Client) -> Result<()> {
 struct WatchInvocation {
     include_paneless: bool,
     view: Option<WatchViewArg>,
+    layout: Option<WatchLayoutArg>,
     sort: Option<WatchSortArg>,
     theme: Option<ThemeArg>,
     caller_pane: Option<String>,
@@ -1260,6 +1294,7 @@ async fn cmd_watch(
     let WatchInvocation {
         include_paneless,
         view,
+        layout,
         sort,
         theme,
         caller_pane,
@@ -1276,6 +1311,9 @@ async fn cmd_watch(
     };
     if let Some(view) = view {
         watch_cfg.view = view.into();
+    }
+    if let Some(layout) = layout {
+        watch_cfg.layout = layout.into();
     }
     if let Some(sort) = sort {
         watch_cfg.sort = sort.keys();
@@ -1307,7 +1345,7 @@ async fn cmd_watch(
         })
         .flatten();
     let collaboration_scope: CollaborationScope = cfg.collaboration.scope;
-    if let Some(pane_id) = watch::run(
+    if let Some(target) = watch::run(
         client,
         watch_cfg,
         session_activity_path,
@@ -1318,7 +1356,14 @@ async fn cmd_watch(
     )
     .await?
     {
-        jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
+        match target {
+            watch::WatchOpenTarget::TopologyPane(key) => {
+                jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
+            }
+            watch::WatchOpenTarget::LegacyPane(pane_id) => {
+                jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
+            }
+        }
     }
     Ok(())
 }
@@ -1377,6 +1422,33 @@ async fn jump_to_pane_logged(pane_id: &str, activity_path: Option<&Path>) {
     }
 }
 
+async fn jump_to_topology_pane_logged(key: &muxa::PaneKey, activity_path: Option<&Path>) {
+    let endpoint = &key.window.session.endpoint;
+    let should_log_attach =
+        endpoint.host == muxa::HostKind::Tmux && !tmux::inside_tmux() && activity_path.is_some();
+    let started_at = OffsetDateTime::now_utc();
+    jump_to_topology_pane(key);
+    let ended_at = OffsetDateTime::now_utc();
+    if !should_log_attach || (ended_at - started_at).whole_seconds() <= 0 {
+        return;
+    }
+    let Some(path) = activity_path else {
+        return;
+    };
+    let entry =
+        ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+            kind: HumanInteractionKind::TmuxAttach,
+            pane: Some(key.pane_id.clone()),
+            session_id: Some(key.window.session.session_id.clone()),
+            session_name: None,
+            started_at,
+            ended_at,
+        }));
+    if let Err(error) = muxa::activity::append_entry(path, &entry).await {
+        tracing::warn!(error = %error, path = %path.display(), "could not append tmux attach interval");
+    }
+}
+
 fn tmux_interaction_target(pane_id: &str) -> Option<(Option<String>, Option<String>)> {
     let pane = tmux::resolve_pane(pane_id)?;
     let session_id = tmux::list_sessions().ok().and_then(|sessions| {
@@ -1427,6 +1499,56 @@ fn jump_to_pane(pane_id: &str) {
             let backend = backend_for_dispatch(kind, &fallback);
             jump_to_pane_herdr(backend.as_ref(), pane_id);
         }
+    }
+}
+
+fn jump_to_topology_pane(key: &muxa::PaneKey) {
+    match key.window.session.endpoint.host {
+        muxa::HostKind::Tmux => jump_to_pane_tmux_key(key),
+        muxa::HostKind::Rmux | muxa::HostKind::Zellij | muxa::HostKind::Herdr => {
+            jump_to_pane(&key.pane_id);
+        }
+    }
+}
+
+fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
+    let socket = Some(key.window.session.endpoint.socket.as_str());
+    let pane = key.pane_id.as_str();
+    let run = |args: &[&str]| {
+        if let Err(error) = muxa::tmux::run_control_on(socket, args) {
+            eprintln!("muxa: tmux {} failed: {error}", args.join(" "));
+        }
+    };
+    if tmux::inside_tmux() {
+        let pinned = CALLER_CLIENT.get().cloned().or_else(tmux::current_client);
+        if let Some(client) = pinned.as_deref() {
+            run(&["switch-client", "-c", client, "-t", pane]);
+        } else {
+            run(&["switch-client", "-t", pane]);
+        }
+        run(&["select-window", "-t", pane]);
+        run(&["select-pane", "-t", pane]);
+        return;
+    }
+
+    run(&["select-window", "-t", pane]);
+    run(&["select-pane", "-t", pane]);
+    match muxa::tmux::tmux_command_on(socket)
+        .args([
+            "attach-session",
+            "-t",
+            key.window.session.session_id.as_str(),
+        ])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!(
+            "muxa: tmux attach-session exited with {}",
+            status
+                .code()
+                .map_or_else(|| "signal".into(), |code| code.to_string())
+        ),
+        Err(error) => eprintln!("muxa: failed to spawn tmux attach-session: {error}"),
     }
 }
 
@@ -1746,8 +1868,11 @@ async fn cmd_status(
 ) -> Result<()> {
     let agents = client.snapshot().await?;
     if json {
-        let panes = muxa::default_backend().list_panes();
-        return print_status_json(&agents, &panes, OffsetDateTime::now_utc());
+        let inputs = muxa::active_backends()
+            .into_iter()
+            .map(|backend| muxa::TopologyInput::new(backend.kind(), backend.list_panes()))
+            .collect();
+        return print_status_json(&agents, inputs, OffsetDateTime::now_utc());
     }
     if agents.is_empty() {
         println!("no active agents");
@@ -1765,126 +1890,22 @@ async fn cmd_status(
     Ok(())
 }
 
-/// Versioned, display-oriented status payload for local desktop integrations.
-///
-/// This deliberately exposes less than the daemon's internal `Agent` wire
-/// shape: `BarShelf` needs identity, state, timing, and the current prompt, but
-/// not assistant responses, workload process trees, or rate-limit internals.
-/// Keeping the boundary narrow also avoids coupling integrations to the IPC
-/// protocol version, which is intentionally unstable across minor releases.
-#[derive(Debug, Serialize)]
-struct StatusJson<'a> {
-    schema_version: u8,
-    #[serde(with = "time::serde::rfc3339")]
+fn status_json(
+    agents: &[Agent],
+    inputs: Vec<muxa::TopologyInput>,
     generated_at: OffsetDateTime,
-    agents: Vec<StatusAgentJson<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusAgentJson<'a> {
-    kind: AgentKind,
-    session_id: &'a str,
-    state: AgentState,
-    pane: Option<&'a str>,
-    location: String,
-    cwd: Option<&'a str>,
-    model: Option<&'a str>,
-    last_prompt: Option<&'a str>,
-    last_notification: Option<&'a str>,
-    context_used_pct: Option<f32>,
-    cost_usd: Option<f64>,
-    /// Slim child-process rollup for the swarm view. Omitted when the agent
-    /// has no tracked descendants, so quiet fleets stay noise-free.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workload: Option<WorkloadJson>,
-    /// Named subagents (Claude `Task` children) currently in flight, newest
-    /// last. Omitted when none are running.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    subagents: Vec<SubagentJson<'a>>,
-    #[serde(with = "time::serde::rfc3339")]
-    started_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    last_activity_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    state_entered_at: OffsetDateTime,
-}
-
-/// Counts-only workload projection. Deliberately drops the internal
-/// process-tree preview (pids, argv) — integrations want "how many children of
-/// each kind", not the raw tree the daemon keeps for reconciliation. The
-/// `subagents` count here is process-fork subagents seen by the tree scan;
-/// the named, hook-tracked `Task` subagents live in the sibling `subagents`
-/// array on the agent.
-#[derive(Debug, Serialize)]
-struct WorkloadJson {
-    subagents: u16,
-    shells: u16,
-    processes: u16,
-}
-
-/// One in-flight subagent for the swarm view: its type, optional label, and
-/// when it started. Sourced from the agent's hook-tracked `Task` children.
-#[derive(Debug, Serialize)]
-struct SubagentJson<'a> {
-    kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<&'a str>,
-    #[serde(with = "time::serde::rfc3339")]
-    started_at: OffsetDateTime,
-}
-
-fn status_json<'a>(
-    agents: &'a [Agent],
-    panes: &[muxa::tmux::PaneInfo],
-    generated_at: OffsetDateTime,
-) -> StatusJson<'a> {
-    StatusJson {
-        schema_version: 2,
-        generated_at,
-        agents: agents
-            .iter()
-            .map(|agent| StatusAgentJson {
-                kind: agent.kind,
-                session_id: &agent.session_id,
-                state: agent.state,
-                pane: agent.pane.as_deref(),
-                location: pane_display(agent, panes),
-                cwd: agent.cwd.as_deref(),
-                model: agent.model.as_deref(),
-                last_prompt: agent.last_prompt.as_deref(),
-                last_notification: agent.last_notification.as_deref(),
-                context_used_pct: agent.context_used_pct,
-                cost_usd: agent.cost_usd,
-                workload: (!agent.workload.is_empty()).then_some(WorkloadJson {
-                    subagents: agent.workload.subagent_count,
-                    shells: agent.workload.shell_count,
-                    processes: agent.workload.process_count,
-                }),
-                subagents: agent
-                    .subagents
-                    .iter()
-                    .map(|s| SubagentJson {
-                        kind: &s.kind,
-                        description: s.description.as_deref(),
-                        started_at: s.started_at,
-                    })
-                    .collect(),
-                started_at: agent.started_at,
-                last_activity_at: agent.last_activity_at,
-                state_entered_at: agent.state_entered_at,
-            })
-            .collect(),
-    }
+) -> muxa::TopologySnapshot {
+    muxa::TopologySnapshot::build(generated_at, inputs, agents.to_vec())
 }
 
 fn print_status_json(
     agents: &[Agent],
-    panes: &[muxa::tmux::PaneInfo],
+    inputs: Vec<muxa::TopologyInput>,
     generated_at: OffsetDateTime,
 ) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    serde_json::to_writer(&mut out, &status_json(agents, panes, generated_at))
+    serde_json::to_writer(&mut out, &status_json(agents, inputs, generated_at))
         .context("serializing status JSON")?;
     writeln!(out)?;
     Ok(())
@@ -2019,7 +2040,7 @@ async fn cmd_recap(client: &Client, pane: Option<String>, limit: usize, all: boo
     Ok(())
 }
 
-fn cmd_panes() {
+fn cmd_panes() -> Result<()> {
     // Aggregate across every active host — the cross-multiplexer pane
     // inventory. Rows carry their namespace in `pane_id`, so a concat keeps
     // tmux `%N` and herdr `herdr:…` rows distinct. Per-host hints still fire
@@ -2044,8 +2065,11 @@ fn cmd_panes() {
             "{:<8} {}:{}.{}  tty={}  cmd={}  title={}",
             p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title
         );
-        if writeln!(out, "{}", truncate_cell(&line, terminal_width)).is_err() {
-            return;
+        if let Err(error) = writeln!(out, "{}", truncate_cell(&line, terminal_width)) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error).context("write pane inventory");
         }
     }
 
@@ -2054,8 +2078,14 @@ fn cmd_panes() {
     // when other hosts have panes it tells the user which side came up dry.
     for backend in empty_hosts {
         let hint = empty_pane_hint(backend.as_ref());
-        let _ = writeln!(out, "{hint}");
+        if let Err(error) = writeln!(out, "{hint}") {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error).context("write pane inventory hint");
+        }
     }
+    Ok(())
 }
 
 /// The empty-state diagnostic for a host that reported no panes. Two ways
@@ -2477,12 +2507,9 @@ mod tests {
     #[test]
     fn watch_sort_cli_aliases_parse_to_expected_keys() {
         for (raw, expected) in [
-            (
-                "workspace",
-                vec![WatchSortKey::Workspace, WatchSortKey::Activity],
-            ),
+            ("name", vec![WatchSortKey::Name, WatchSortKey::Activity]),
             ("act", vec![WatchSortKey::Activity]),
-            ("dur", vec![WatchSortKey::WorkspaceTime]),
+            ("dur", vec![WatchSortKey::Duration]),
             ("st", vec![WatchSortKey::State, WatchSortKey::Activity]),
             ("pane_id", vec![WatchSortKey::PaneId]),
         ] {
@@ -2495,6 +2522,19 @@ mod tests {
             };
             assert_eq!(sort.keys(), expected);
         }
+    }
+
+    #[test]
+    fn watch_rejects_legacy_view_and_sort_vocabulary() {
+        for args in [
+            ["muxa", "watch", "--view", "work"],
+            ["muxa", "watch", "--view", "swarm"],
+            ["muxa", "watch", "--sort", "workspace"],
+            ["muxa", "watch", "--sort", "workspace-time"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err(), "accepted {args:?}");
+        }
+        assert!(Args::try_parse_from(["muxa", "watch", "--layout", "swarm"]).is_ok());
     }
 
     #[test]
@@ -2558,6 +2598,43 @@ mod tests {
         assert_eq!(start.workspace.as_deref(), Some("muxa"));
         assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
         assert_eq!(start.role.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn window_rename_cli_supports_explicit_and_automatic_names() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "window",
+            "rename",
+            "CAL-7175 auth refactor",
+            "--window",
+            "@42",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Window {
+            action: WindowCmd::Rename(rename),
+        } = args.cmd
+        else {
+            panic!("expected window rename");
+        };
+        assert_eq!(rename.name.as_deref(), Some("CAL-7175 auth refactor"));
+        assert_eq!(rename.window.as_deref(), Some("@42"));
+        assert!(!rename.auto);
+        assert!(rename.json);
+
+        let args = Args::try_parse_from(["muxa", "window", "rename", "--window", "@42", "--auto"])
+            .unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Window {
+                action: WindowCmd::Rename(tmux_work::WindowRenameArgs { auto: true, .. })
+            }
+        ));
+        assert!(Args::try_parse_from([
+            "muxa", "window", "rename", "name", "--window", "@42", "--auto"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2655,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn status_json_is_versioned_and_display_oriented() {
+    fn status_json_uses_the_nested_topology_contract() {
         let mut tracked = agent(
             "session-1",
             Some("%7"),
@@ -2669,24 +2746,30 @@ mod tests {
         tracked.cost_usd = Some(1.25);
 
         let generated_at = datetime!(2026-04-24 12:01:00 UTC);
-        let value =
-            serde_json::to_value(status_json(&[tracked], &[pane("%7", "muxa")], generated_at))
-                .unwrap();
+        let value = serde_json::to_value(status_json(
+            &[tracked],
+            vec![muxa::TopologyInput::new(
+                muxa::HostKind::Tmux,
+                vec![pane("%7", "muxa")],
+            )],
+            generated_at,
+        ))
+        .unwrap();
 
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 1);
         assert_eq!(value["generated_at"], "2026-04-24T12:01:00Z");
-        assert_eq!(value["agents"][0]["kind"], "claude_code");
-        assert_eq!(value["agents"][0]["state"], "waiting_input");
-        assert_eq!(value["agents"][0]["location"], "muxa:12.3");
-        assert_eq!(
-            value["agents"][0]["last_prompt"],
-            "Approve the deployment?\nMore detail"
-        );
-        assert_eq!(value["agents"][0]["context_used_pct"], 42.5);
-        assert!(value["agents"][0].get("last_response").is_none());
-        // Workload is omitted when the agent has no tracked descendants.
-        assert!(value["agents"][0].get("workload").is_none());
-        assert!(value["agents"][0].get("rate_limit_5h_pct").is_none());
+        assert_eq!(value["sessions"][0]["name"], "muxa");
+        assert_eq!(value["sessions"][0]["windows"][0]["index"], "12");
+        let agent = &value["sessions"][0]["windows"][0]["panes"][0]["agent"];
+        assert_eq!(agent["kind"], "claude_code");
+        assert_eq!(agent["agent_session_id"], "session-1");
+        assert!(agent.get("session_id").is_none());
+        assert_eq!(agent["state"], "waiting_input");
+        assert_eq!(agent["last_prompt"], "Approve the deployment?\nMore detail");
+        assert_eq!(agent["context_used_pct"], 42.5);
+        assert_eq!(agent["last_response"], "private assistant response");
+        assert!(agent.get("rate_limit_5h_pct").is_none());
+        assert_eq!(value["sessions"][0]["states"]["waiting_input"], 1);
     }
 
     #[test]
@@ -2719,20 +2802,26 @@ mod tests {
             },
         ];
 
-        let value =
-            serde_json::to_value(status_json(&[tracked], &[pane("%9", "muxa")], generated_at))
-                .unwrap();
+        let value = serde_json::to_value(status_json(
+            &[tracked],
+            vec![muxa::TopologyInput::new(
+                muxa::HostKind::Tmux,
+                vec![pane("%9", "muxa")],
+            )],
+            generated_at,
+        ))
+        .unwrap();
 
-        let wl = &value["agents"][0]["workload"];
-        assert_eq!(wl["subagents"], 2);
-        assert_eq!(wl["shells"], 1);
-        assert_eq!(wl["processes"], 4);
-        // The internal process-tree preview / helper counts stay out of the projection.
+        let agent = &value["sessions"][0]["windows"][0]["panes"][0]["agent"];
+        let wl = &agent["workload"];
+        assert_eq!(wl["subagent_count"], 2);
+        assert_eq!(wl["shell_count"], 1);
+        assert_eq!(wl["process_count"], 4);
+        assert_eq!(wl["helper_count"], 1);
         assert!(wl.get("preview").is_none());
-        assert!(wl.get("helpers").is_none());
 
         // Named, hook-tracked Task subagents ride in a sibling array.
-        let subs = &value["agents"][0]["subagents"];
+        let subs = &agent["subagents"];
         assert_eq!(subs[0]["kind"], "Explore");
         assert_eq!(subs[0]["description"], "map the codebase");
         assert_eq!(subs[0]["started_at"], "2026-04-24T12:01:00Z");

@@ -2016,7 +2016,7 @@ mod tests {
         assert!(shortcuts.contains("m / M"));
         assert!(shortcuts.contains("a / A"));
         assert!(shortcuts.contains("Alt-K"));
-        assert!(shortcuts.contains("n              new/reused workspace/work + agent"));
+        assert!(shortcuts.contains("n              new window or sibling agent pane"));
     }
 
     #[test]
