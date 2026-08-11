@@ -1,9 +1,9 @@
 //! Fullscreen and printable Muxa onboarding.
 //!
-//! Interactive onboarding renders a stable mock of `muxa watch`, then places
-//! short, location-aware dialogs beside the part being explained. This lets a
-//! new user connect the domain model and shortcuts to the UI before touching
-//! live sessions. `--print` remains available for scripts and accessibility.
+//! Interactive onboarding is one inert shell → tmux → Muxa scenario. It first
+//! preserves virtual tmux command and layout effects, then hands the same
+//! fullscreen terminal to a stable `muxa watch` mock with location-aware
+//! dialogs. `--print` remains available for scripts and accessibility.
 
 mod tmux;
 
@@ -30,8 +30,8 @@ pub struct Args {
     /// Skip hands-on shortcut gates while keeping every visual explanation.
     #[arg(long)]
     pub no_quiz: bool,
-    /// Learn tmux itself on a safe mock instead of the Muxa workflow.
-    #[arg(long)]
+    /// Compatibility alias; onboarding now always includes tmux and Muxa.
+    #[arg(long, hide = true)]
     pub tmux: bool,
     /// Display language: auto, en, or ko. / 표시 언어: auto, en, ko.
     #[arg(long, value_enum, default_value_t)]
@@ -223,11 +223,12 @@ pub fn run(args: Args) -> Result<()> {
     apply_icon_preference();
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();
-    if args.tmux {
-        return tmux::run(mode, args.no_quiz, language);
-    }
     match mode {
-        Mode::Print => print_guide(language),
+        Mode::Print => {
+            tmux::print_guide(language);
+            println!("\n{}\n", "=".repeat(72));
+            print_guide(language);
+        }
         Mode::Interactive => interactive_guide(args.no_quiz, language)?,
     }
     Ok(())
@@ -299,7 +300,10 @@ fn interactive_guide(no_quiz: bool, language: UiLanguage) -> Result<()> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
     guard.terminal_mut().hide_cursor()?;
-    let mut app = TourApp::with_language(no_quiz, language);
+    if !tmux::interactive_guide(guard.terminal_mut(), no_quiz, language)? {
+        return Ok(());
+    }
+    let mut app = TourApp::after_tmux(no_quiz, language);
 
     while !app.done {
         guard
@@ -430,6 +434,12 @@ impl TourApp {
             blocked_hint: false,
             done: false,
         }
+    }
+
+    fn after_tmux(no_quiz: bool, language: UiLanguage) -> Self {
+        let mut app = Self::with_language(no_quiz, language);
+        app.step = 1;
+        app
     }
 
     fn current(&self) -> TourStep {
@@ -1867,6 +1877,16 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
+    }
+
+    #[test]
+    fn unified_handoff_enters_watch_without_a_second_welcome_gate() {
+        let app = TourApp::after_tmux(false, UiLanguage::Ko);
+        assert_eq!(app.current(), TourStep::Work);
+        assert_eq!(app.selection, MockSelection::Work7088);
+        let screen = rendered(&app, 130, 32).replace(' ', "");
+        assert!(screen.contains("CAL-7088"));
+        assert!(screen.contains("CAL-7088이선택"));
     }
 
     #[test]

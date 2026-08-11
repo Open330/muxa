@@ -179,6 +179,8 @@ fn onboarding_prints_even_when_config_is_invalid() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tmux onboarding"));
+    assert!(stdout.contains("tmux new-session -s CAL-7041"));
     assert!(stdout.contains("session = work/ticket"));
     assert!(stdout.contains("muxa watch shortcuts"));
 
@@ -195,10 +197,11 @@ fn onboarding_prints_even_when_config_is_invalid() {
         .expect("run Korean onboarding");
     assert!(korean.status.success());
     let stdout = String::from_utf8_lossy(&korean.stdout);
+    assert!(stdout.contains("tmux 온보딩"));
     assert!(stdout.contains("Muxa 온보딩"));
     assert!(stdout.contains("muxa watch 단축키"));
 
-    let tmux = Command::new(bin("muxa"))
+    let compatibility_alias = Command::new(bin("muxa"))
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -209,10 +212,11 @@ fn onboarding_prints_even_when_config_is_invalid() {
             "ko",
         ])
         .output()
-        .expect("run Korean tmux onboarding");
-    assert!(tmux.status.success());
-    let stdout = String::from_utf8_lossy(&tmux.stdout);
+        .expect("run unified onboarding through the compatibility alias");
+    assert!(compatibility_alias.status.success());
+    let stdout = String::from_utf8_lossy(&compatibility_alias.stdout);
     assert!(stdout.contains("tmux 온보딩"));
+    assert!(stdout.contains("Muxa 온보딩"));
     assert!(stdout.contains("prefix+s"));
     assert!(stdout.contains("suffix key만"));
 }

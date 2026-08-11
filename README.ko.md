@@ -47,10 +47,9 @@ Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 
    suffix session으로 조용히 분리하거나 unmanaged tmux 객체를 종료하지 않습니다.
 
 요약하면 **work/ticket → session → agent pane들 → 관측·협업 → 명시적 종료**입니다.
-`muxa onboard`에서 실제 session을 건드리지 않는 watch mock으로 이 흐름을 먼저
-익힐 수 있습니다. tmux 자체가 익숙하지 않다면 `muxa onboard --tmux`에서
-session/window/pane 계층, window 생성, pane 분할·이동, zoom, copy mode,
-detach, Muxa prefix binding을 실제 tmux 상태를 바꾸지 않고 배울 수 있습니다.
+`muxa onboard` 하나에서 가상 shell의 `tmux new-session`부터 tmux 계층과 조작,
+detach/attach, Muxa prefix binding, watch workflow까지 연속해서 익힐 수 있습니다.
+실제 tmux session은 변경하지 않습니다.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa demo" width="900" />
@@ -160,33 +159,20 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 ## 핵심 명령어
 
 기본 tmux 운영 정책은 session 하나가 work/ticket 하나, pane 하나가 agent
-하나이며 window는 화면 배치에만 사용한다는 것입니다. `muxa onboard`는 이
-정책과 현재 `muxa watch` 단축키를 안전한 mock 화면에서 안내합니다. watch와
-같은 왼쪽 session-state gutter, 열, 50/50 inspector, overlay, 한 줄 footer를
-보여줍니다. `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`, `M`을 실제로
-누르고 마지막에는 `q`로 마칩니다. shell 명령을 그대로 따라 입력하는 단계는
-없습니다. 한국어 locale에서는 한글을 자동으로 선택하며 `--lang ko`로
+하나이며 window는 화면 배치에만 사용한다는 것입니다. `muxa onboard`는 가상
+기본 shell에서 시작해 `tmux new-session -s CAL-7041`을 직접 입력하게 하고,
+window/pane 조작과 detach 뒤에는 `tmux attach -t CAL-7041`도 직접 입력하게
+합니다. 이어서 같은 fullscreen 화면에서 현재 `muxa watch` workflow로
+전환합니다. watch와 같은 왼쪽 session-state gutter, 열, 50/50 inspector,
+overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
+`Backspace`, `M`을 실제로 누르고 마지막에는 `q`로 마칩니다. 한국어 locale에서는
+한글을 자동으로 선택하며 `--lang ko`로
 명시하거나 온보딩 도중 `F2`로 한/영을 전환할 수 있습니다.
 
-`muxa onboard --tmux`는 tmux 기초를 위한 별도 과정입니다. 현재 설정된 tmux
-prefix를 감지하고, 준비된 가상 `tmux new-session`이 있는 기본 shell에서
-시작합니다. 실제 suffix key를 누를 때마다 tree, 활성 window, pane 분할, zoom,
-copy mode, detached shell 장면이 다음 단계에도 유지됩니다. tmux 안에서는 해당
-client의 prefix key table 진입을 확인하자마자 root table로 되돌린 뒤 suffix
-실습을 시작합니다. `s`, `q`, `D`를 누르면 live watch 형태의 session/inspector,
-peek, dashboard mock 화면도 표시됩니다. live window 생성, pane 분할, client
-detach는 일어나지 않습니다.
-
 <div align="center">
-  <img src="docs/demo-onboard.gif" alt="한글 Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon과 단축키 실습" width="900" />
+  <img src="docs/demo-onboard.gif" alt="한글 통합 onboarding: 가상 shell과 tmux 실습에서 Muxa watch workflow로 이어지는 단일 과정" width="900" />
   <br />
-  <sub><code>muxa onboard</code> — 안전한 interactive watch mock에서 운영 모델을 익힙니다.</sub>
-</div>
-
-<div align="center">
-  <img src="docs/demo-tmux-onboard.gif" alt="한글 tmux onboarding: 안전한 tmux mock에서 window, pane 분할과 이동, zoom, copy mode, detach, Muxa prefix binding 실습" width="900" />
-  <br />
-  <sub><code>muxa onboard --tmux</code> — live session을 바꾸지 않고 tmux 동작을 익힙니다.</sub>
+  <sub><code>muxa onboard</code> — shell, tmux, Muxa를 하나의 안전한 시나리오로 익힙니다.</sub>
 </div>
 
 | Command | 목적 |
@@ -208,7 +194,7 @@ detach는 일어나지 않습니다.
 | `muxa work list/show/close` | managed work session을 조회하고 명시적으로 종료. |
 | `muxa agent start --work CAL-7041 ...` | allowlist에 있는 agent pane을 work에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
-| `muxa onboard [--tmux] [--lang auto\|en\|ko]` | 한글/영문 fullscreen walkthrough. 기본 과정은 Muxa watch workflow를, `--tmux`는 감지된 prefix를 사용하는 안전한 tmux 기초를 안내. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 정적 guide 출력 지원. |
+| `muxa onboard [--lang auto\|en\|ko]` | shell → tmux → Muxa 통합 fullscreen walkthrough. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 통합 guide 출력 지원. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |

@@ -14,9 +14,9 @@ Muxa는 다음 작업 단위 tmux workflow에 맞춰 설계되고 최적화되�
 
 ## 온보딩 실행
 
-전체 화면에서 실제 `muxa watch`와 닮은 mock dashboard를 띄우고 단계별
-dialog로 work row, agent pane, 상태, inspector, footer 단축키의 위치를
-직접 보여줍니다. 이 화면은 설명용이므로 실제 tmux session을 변경하지
+하나의 전체 화면 시나리오가 가상 기본 shell에서 시작해 tmux session/window/
+pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮은 mock
+dashboard로 이어집니다. 모든 장면은 설명용이므로 실제 tmux session을 변경하지
 않습니다.
 
 mock은 실제 session view처럼 `SESSION · DUR · ACT · SUMMARY` 열을 사용하고,
@@ -38,10 +38,11 @@ watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
 실제 watch를 재현하는 `SESSION`, `DUR`, `ACT`, `SUMMARY` 같은 UI label은
 그대로 유지하고 안내 dialog, 도움말, footer 설명은 선택한 언어로 표시합니다.
 
-![한글 Muxa onboarding: watch mock 위의 위치별 dialog, 실제 상태 icon과 단축키 실습](demo-onboard.gif)
+![한글 통합 onboarding: 가상 shell과 tmux 조작에서 Muxa watch workflow로 이어지는 단일 시나리오](demo-onboard.gif)
 
-첫 안내만 `Enter`로 시작합니다. 이후 기능 단계는 설명을 읽고 Enter를 누르는
-방식이 아니라 실제 watch 키를 눌러야 진행됩니다.
+첫 shell에서는 `tmux new-session -s CAL-7041`을 직접 입력합니다. tmux 구간과
+watch 구간도 설명을 읽고 Enter만 누르는 방식이 아니라 실제 키를 눌러야
+진행됩니다.
 
 - `j`/`↓`: 다음 session으로 이동
 - `l`/`→`: 선택한 session의 child agent로 진입
@@ -53,8 +54,10 @@ watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
 - `M`: mailbox 열기와 닫기
 - `q`: 온보딩 완료. 실제 watch에서도 종료 키
 
-shell 명령을 그대로 따라 입력하거나 암기하는 단계는 없습니다. `n`으로 form을
-열고 위치와 조작 키를 확인한 다음 `Esc`를 누르면 바로 협업 단계로 넘어갑니다.
+shell 명령은 실제 tmux 진입과 재접속에 필요한 `tmux new-session`과
+`tmux attach` 두 개만 직접 입력합니다. Muxa의 긴 work/agent 명령은 따라 치지
+않으며, `n`으로 form을 열고 위치와 조작 키를 확인한 다음 `Esc`를 누르면 바로
+협업 단계로 넘어갑니다.
 `Esc`는 실제 watch와 마찬가지로 열려 있는 preview/help/form/composer를 먼저
 닫고, modal이 없을 때 tour를 종료합니다.
 
@@ -66,14 +69,11 @@ shell 명령을 그대로 따라 입력하거나 암기하는 단계는 없습�
 
     muxa onboard --print --lang ko
 
-## tmux 자체를 배우기
+## 통합 시나리오의 tmux 구간
 
-Muxa workflow보다 먼저 tmux의 session/window/pane 구조와 기본 조작을
-익히고 싶다면 별도 tmux 과정을 실행합니다.
-
-    muxa onboard --tmux --lang ko
-
-이 과정도 실제 layout과 lifecycle을 건드리지 않는 fullscreen mock입니다.
+Muxa workflow로 들어가기 전에 같은 과정 안에서 tmux의 session/window/pane
+구조와 기본 조작을 익힙니다. 이 구간도 실제 layout과 lifecycle을 건드리지 않는
+fullscreen mock입니다.
 현재 설정된 prefix(`Ctrl-b`, `Ctrl-a` 등)를 감지하고 가상 session에 들어간 뒤
 prefix만 직접 누르게 합니다. tmux 안에서는 현재 client가 prefix key table로 들어간 것을
 확인하자마자 root table로 되돌립니다. 화면이 넘어가기 전에 suffix를 연속해서
@@ -81,9 +81,8 @@ prefix만 직접 누르게 합니다. tmux 안에서는 현재 client가 prefix 
 가상 prefix와 실제 suffix key로 진행하므로 live window 생성, pane 분할,
 client detach가 일어나지 않습니다.
 
-가상 기본 shell에서 `tmux new-session -s CAL-7041`이 준비된 상태로 시작하며,
-Enter를 누르면 가상 tmux client로 들어갑니다. 실제 키를 다음 순서로 눌러
-진행합니다.
+가상 기본 shell의 빈 prompt에서 `tmux new-session -s CAL-7041`을 직접 입력해
+가상 tmux client로 들어갑니다. 실제 키를 다음 순서로 눌러 진행합니다.
 
 - `w`: session/window tree와 session → window → pane 계층
 - `c`: 현재 session 안에 새 window를 만들고 그 window의 shell 화면으로 전환
@@ -92,19 +91,19 @@ Enter를 누르면 가상 tmux client로 들어갑니다. 실제 키를 다음 �
 - `z`, `z`: pane 확대 후 원래 split layout 복원
 - `[`, `q`: copy mode 진입과 종료
 - `d`: client를 detach하고 `[detached …]`가 있는 원래 기본 shell로 복귀
-- `Enter`: 준비된 `tmux attach-session`으로 가상 session에 다시 연결
+- `tmux attach -t CAL-7041`, `Enter`: 기본 shell에서 직접 입력해 재연결
 - `s`, `q`, `D`: Muxa의 watch, peek, dashboard prefix binding과 실제 모양의 mock 화면
 
 `w`의 tree, `c`의 활성 window, `%`와 `"`의 pane layout은 다음 단계에서도
 사라지지 않고 누적됩니다. `s` 화면은 기본 onboarding과 같은 live watch형
 header, 왼쪽 state gutter, session tree, 50/50 inspector, footer를 사용합니다.
+tmux 요약에서 Enter를 누르면 alternate screen을 나가지 않고 바로 Muxa watch
+workflow의 session 이동 단계로 이어집니다.
 
 여기서도 `F2`로 한글/영문을 전환하고, `Esc`로 종료하며, `--no-quiz`로 키
 gate를 건너뛸 수 있습니다. 정적 안내만 필요하면 다음을 사용합니다.
 
-    muxa onboard --tmux --print --lang ko
-
-![한글 tmux onboarding: 안전한 mock에서 window, pane 분할과 이동, zoom, copy mode, detach, Muxa prefix binding 실습](demo-tmux-onboard.gif)
+    muxa onboard --print --lang ko
 
 설치 직후에는 다음 순서가 권장됩니다.
 

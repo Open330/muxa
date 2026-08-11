@@ -54,11 +54,10 @@ The intended workflow is equally direct:
    tmux objects.
 
 In short: **work/ticket → session → agent panes → observe and collaborate →
-explicit close**. Run `muxa onboard` to practise this model on a safe watch
-mock before touching live sessions. If tmux itself is new, run `muxa onboard
---tmux`; it teaches the underlying hierarchy, windows, splits, pane movement,
-zoom, copy mode, detach, and Muxa prefix bindings without mutating a live tmux
-session.
+explicit close**. Run `muxa onboard` for one continuous safe scenario: type
+`tmux new-session`, learn the hierarchy, windows, panes, detach/attach, and
+managed prefix bindings, then continue directly into the Muxa watch workflow.
+Nothing in the tour mutates a live tmux session.
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa watch: sixteen agent sessions on one screen, the inspector, the swarm view, and muxa attend jumping to the agent that needs you" width="900" />
@@ -188,33 +187,21 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 ## Core Commands
 
 Managed tmux policy: one session is one work/ticket, each pane is one agent,
-and windows are layout only. Run `muxa onboard` to learn this workflow and the
-current `muxa watch` shortcuts interactively. Its safe mock mirrors watch's
-left-edge session-state gutter, columns, 50/50 inspector, overlays, and footer.
-You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`,
-`M`, and `q` actions. The tour never asks you to transcribe shell commands.
+and windows are layout only. `muxa onboard` now teaches tmux and Muxa as one
+continuous scenario. It starts at a blank virtual shell, accepts the real
+`tmux new-session -s CAL-7041` and `tmux attach -t CAL-7041` commands, preserves
+every virtual window/pane transition, then continues without leaving fullscreen
+into the current `muxa watch` workflow. The watch half mirrors the left-edge
+session-state gutter, columns, 50/50 inspector, overlays, and footer. You advance
+with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`, `Backspace`, `M`, and `q`
+actions.
 Korean is selected automatically for a Korean locale, can be requested with
 `--lang ko`, and can be toggled with `F2` during the tour.
 
-Use `muxa onboard --tmux` for the companion tmux fundamentals track. It reads
-the configured tmux prefix and starts in an inert shell with a prepared virtual
-`tmux new-session`. It preserves the visible tree, active window, pane splits,
-zoom, copy mode, and detached-shell scene as the real suffix keys are pressed.
-Inside tmux it observes that client's prefix key table, immediately returns it
-to the root table, and only then begins the suffix-key drills. Press `s`, `q`,
-and `D` to see a live-watch-shaped session/inspector view, peek, and dashboard.
-No live window is created, no pane is split, and the client is never detached.
-
 <div align="center">
-  <img src="docs/demo-onboard.gif" alt="Korean muxa onboarding: location-aware dialogs over a safe watch mock, canonical state icons, and real shortcut practice" width="900" />
+  <img src="docs/demo-onboard.gif" alt="Unified Korean onboarding: virtual shell and tmux practice flowing directly into the Muxa watch workflow" width="900" />
   <br />
-  <sub><code>muxa onboard</code> — learn the model on a safe, interactive watch mock.</sub>
-</div>
-
-<div align="center">
-  <img src="docs/demo-tmux-onboard.gif" alt="Korean tmux onboarding: a safe tmux mock teaching windows, pane splits, movement, zoom, copy mode, detach, and Muxa prefix bindings" width="900" />
-  <br />
-  <sub><code>muxa onboard --tmux</code> — learn tmux muscle memory without changing a live session.</sub>
+  <sub><code>muxa onboard</code> — shell, tmux, and Muxa in one inert interactive scenario.</sub>
 </div>
 
 | Command | Purpose |
@@ -238,7 +225,7 @@ No live window is created, no pane is split, and the client is never detached.
 | `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
 | `muxa agent start --work CAL-7041 ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
-| `muxa onboard [--tmux] [--lang auto\|en\|ko]` | Localized fullscreen walkthrough. The default track teaches the Muxa watch workflow; `--tmux` teaches safe tmux fundamentals with the detected prefix. `F2` switches language, `--no-quiz` skips shortcut gates, and `--print` emits a static guide. |
+| `muxa onboard [--lang auto\|en\|ko]` | Unified shell → tmux → Muxa fullscreen walkthrough. `F2` switches language, `--no-quiz` skips gates, and `--print` emits the combined guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |

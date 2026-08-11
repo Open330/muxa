@@ -1,18 +1,17 @@
-# muxa onboarding demo — "learn it where it appears"
+# muxa onboarding demo — shell → tmux → Muxa, one continuous scenario
 #
 #   vhs docs/demo-onboard.tape   →   docs/demo-onboard.gif
 #
-# Unlike the fleet recordings, this needs no daemon or tmux fixture. The
-# dashboard behind each coach dialog is Muxa's deliberately inert onboarding
-# mock: it teaches location, state icons, and shortcuts without touching a real
-# session.
+# Unlike the fleet recordings, this needs no daemon or tmux fixture. It starts
+# at an inert shell, teaches tmux by preserving each virtual layout transition,
+# then continues in the same fullscreen client into the Muxa watch workflow.
 #
 # Arc:
-#   0–6s    navigate & sort — j/l and Alt-T over the real session-state gutter
-#   6–12s   inspect & help  — o and ? open/close watch-shaped overlays
-#   12–15s  create work     — n opens the form and Esc safely closes it
-#   15–20s  collaborate     — m, empty Backspace, M mailbox toggle, MCP
-#   20–22s  finish          — q, the same key that quits live watch
+#   0–17s   shell + tmux    — new-session, prefix, windows, panes, detach/attach
+#   17–21s  Muxa bindings   — s watch, q peek, D dashboard
+#   21–26s  navigate/sort   — j/l and Alt-T over the real state gutter
+#   26–32s  inspect/create  — o, ?, n and safe cancel
+#   32–38s  collaboration   — m, Backspace, M mailbox, MCP, q
 
 Output docs/demo-onboard.gif
 
@@ -40,9 +39,52 @@ Type "muxa onboard --lang ko"
 Enter
 Sleep 1800ms
 
-# Start once with Enter; every feature lesson after this uses its live key.
+# Type the real commands into the virtual shell rather than accepting a
+# pre-filled prompt.
+Type "tmux new-session -s CAL-7041"
 Enter
-Sleep 1100ms
+Sleep 900ms
+Ctrl+B
+Sleep 900ms
+
+# Safe tmux suffix drills preserve every visual result.
+Type "w"
+Sleep 800ms
+Type "c"
+Sleep 900ms
+Type "%"
+Sleep 800ms
+Type `"`
+Sleep 900ms
+Right
+Sleep 800ms
+Type "z"
+Sleep 800ms
+Type "z"
+Sleep 700ms
+Type "["
+Sleep 900ms
+Type "q"
+Sleep 800ms
+
+# d returns to the virtual base shell. Type a real attach command to resume.
+Type "d"
+Sleep 1200ms
+Type "tmux attach -t CAL-7041"
+Enter
+Sleep 900ms
+
+# The managed bindings lead directly into the Muxa half of the same tour.
+Type "s"
+Sleep 1000ms
+Type "q"
+Sleep 900ms
+Type "D"
+Sleep 1000ms
+Enter
+Sleep 700ms
+Enter
+Sleep 1000ms
 
 # Move from CAL-7088 to CAL-7041, then enter its first child agent.
 Type "j"
