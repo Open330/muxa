@@ -1,13 +1,15 @@
 //! Safe, fullscreen tmux fundamentals track for `muxa onboard --tmux`.
 //!
-//! The first drill detects one real prefix-only press. Inside tmux, the mock
-//! observes the current client's transition to the prefix key table and
-//! immediately returns that client to the root table before asking for any
-//! suffix. Later drills use suffix keys only, so no live binding is executed.
+//! The tour begins in an inert shell, enters a virtual tmux session, then
+//! detects one real prefix-only press. Inside tmux, the mock observes the
+//! current client's transition to the prefix key table and immediately returns
+//! that client to the root table before asking for any suffix. Later drills use
+//! suffix keys only, so no live binding is executed.
 
 use super::{centered_rect, dialog_block, setup_terminal, tr, Mode, TerminalGuard, UiLanguage};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use muxa::AgentState;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -105,6 +107,7 @@ fn print_guide(language: UiLanguage, prefix: &DetectedPrefix) {
         println!("tmux 온보딩");
         println!("============");
         println!("\n현재 prefix: {}", prefix.display);
+        println!("\n가상 기본 shell에서 tmux new-session -s CAL-7041로 시작합니다.");
         println!("\nsession = work/ticket\nwindow = layout/room\npane = process/agent");
         println!("\n기본 조합");
         println!("  prefix+w       session/window tree");
@@ -114,16 +117,19 @@ fn print_guide(language: UiLanguage, prefix: &DetectedPrefix) {
         println!("  prefix+z       pane zoom toggle");
         println!("  prefix+[       copy mode, q로 종료");
         println!("  prefix+d       client detach; session은 계속 실행");
+        println!("  Enter          가상 shell의 tmux attach-session 실행");
         println!("\nMuxa binding");
         println!("  prefix+s       muxa watch");
         println!("  prefix+q       muxa peek");
         println!("  prefix+D       muxa dashboard");
-        println!("\n첫 단계에서 감지된 prefix만 직접 누르고 확인을 기다립니다.");
+        println!("\nsession 진입 후 감지된 prefix만 직접 누르고 확인을 기다립니다.");
         println!("이후에는 live binding 실행을 막기 위해 suffix key만 입력합니다.");
+        println!("c, %, \" 및 d의 결과는 shell/window/pane 장면에 누적되어 표시됩니다.");
     } else {
         println!("tmux onboarding");
         println!("===============");
         println!("\nCurrent prefix: {}", prefix.display);
+        println!("\nStart in a virtual shell with tmux new-session -s CAL-7041.");
         println!("\nsession = work/ticket\nwindow = layout/room\npane = process/agent");
         println!("\nCore combinations");
         println!("  prefix+w       session/window tree");
@@ -133,12 +139,14 @@ fn print_guide(language: UiLanguage, prefix: &DetectedPrefix) {
         println!("  prefix+z       toggle pane zoom");
         println!("  prefix+[       copy mode; q exits");
         println!("  prefix+d       detach the client; sessions keep running");
+        println!("  Enter          run the prepared tmux attach-session in the mock shell");
         println!("\nMuxa bindings");
         println!("  prefix+s       muxa watch");
         println!("  prefix+q       muxa peek");
         println!("  prefix+D       muxa dashboard");
-        println!("\nFirst, press only the detected prefix and wait for confirmation.");
+        println!("\nAfter entering the session, press only the detected prefix and wait.");
         println!("Later drills accept suffix keys only, preventing live bindings.");
+        println!("The shell/window/pane scene keeps the visible effects of c, %, \" and d.");
     }
 }
 
@@ -264,7 +272,7 @@ impl TmuxPrefixProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
-    Welcome,
+    Shell,
     Prefix,
     Model,
     Windows,
@@ -273,13 +281,14 @@ enum Step {
     Zoom,
     CopyMode,
     Detach,
+    Reattach,
     Muxa,
     Finish,
 }
 
 impl Step {
-    const ALL: [Self; 11] = [
-        Self::Welcome,
+    const ALL: [Self; 12] = [
+        Self::Shell,
         Self::Prefix,
         Self::Model,
         Self::Windows,
@@ -288,6 +297,7 @@ impl Step {
         Self::Zoom,
         Self::CopyMode,
         Self::Detach,
+        Self::Reattach,
         Self::Muxa,
         Self::Finish,
     ];
@@ -331,6 +341,18 @@ enum PrefixCapture {
     TmuxClient,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientLocation {
+    Shell,
+    Tmux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeVisibility {
+    Hidden,
+    Visible,
+}
+
 #[derive(Debug)]
 struct TmuxApp {
     step: usize,
@@ -343,7 +365,10 @@ struct TmuxApp {
     zoom_stage: ZoomStage,
     copy_stage: CopyStage,
     muxa_stage: MuxaStage,
+    client_location: ClientLocation,
+    tree_visibility: TreeVisibility,
     windows: usize,
+    active_window: usize,
     panes: usize,
     selected_pane: usize,
     zoomed: bool,
@@ -373,7 +398,10 @@ impl TmuxApp {
             zoom_stage: ZoomStage::In,
             copy_stage: CopyStage::Enter,
             muxa_stage: MuxaStage::Watch,
-            windows: 2,
+            client_location: ClientLocation::Shell,
+            tree_visibility: TreeVisibility::Hidden,
+            windows: 1,
+            active_window: 0,
             panes: 1,
             selected_pane: 0,
             zoomed: false,
@@ -394,6 +422,14 @@ impl TmuxApp {
         self.language == UiLanguage::Ko
     }
 
+    fn attached(&self) -> bool {
+        self.client_location == ClientLocation::Tmux
+    }
+
+    fn tree_open(&self) -> bool {
+        self.tree_visibility == TreeVisibility::Visible
+    }
+
     fn advance(&mut self) {
         self.blocked_hint = false;
         if self.step + 1 == Step::ALL.len() {
@@ -407,6 +443,7 @@ impl TmuxApp {
         self.blocked_hint = false;
         self.step = self.step.saturating_sub(1);
         self.reset_exercises();
+        self.sync_scene_to_step();
     }
 
     fn reset_exercises(&mut self) {
@@ -414,6 +451,52 @@ impl TmuxApp {
         self.zoom_stage = ZoomStage::In;
         self.copy_stage = CopyStage::Enter;
         self.muxa_stage = MuxaStage::Watch;
+    }
+
+    fn apply_skipped_step(&mut self) {
+        match self.current() {
+            Step::Shell | Step::Reattach => self.client_location = ClientLocation::Tmux,
+            Step::Model => self.tree_visibility = TreeVisibility::Visible,
+            Step::Windows => {
+                self.tree_visibility = TreeVisibility::Hidden;
+                self.windows = 2;
+                self.active_window = 1;
+                self.panes = 1;
+                self.selected_pane = 0;
+            }
+            Step::Splits => self.panes = 3,
+            Step::Panes => self.selected_pane = 1,
+            Step::Detach => self.client_location = ClientLocation::Shell,
+            _ => {}
+        }
+    }
+
+    fn sync_scene_to_step(&mut self) {
+        self.zoomed = false;
+        self.tree_visibility = TreeVisibility::Hidden;
+        self.client_location = if self.current() == Step::Shell || self.current() == Step::Reattach
+        {
+            ClientLocation::Shell
+        } else {
+            ClientLocation::Tmux
+        };
+        if self.step < Step::Windows as usize {
+            self.windows = 1;
+            self.active_window = 0;
+            self.panes = 1;
+            self.selected_pane = 0;
+        } else if self.current() == Step::Windows {
+            self.windows = 1;
+            self.active_window = 0;
+            self.panes = 1;
+            self.selected_pane = 0;
+            self.tree_visibility = TreeVisibility::Visible;
+        } else {
+            self.windows = 2;
+            self.active_window = 1;
+            self.panes = if self.current() == Step::Splits { 1 } else { 3 };
+            self.selected_pane = usize::from(self.step >= Step::Zoom as usize);
+        }
     }
 
     fn toggle_language(&mut self) {
@@ -440,9 +523,18 @@ fn handle_key(app: &mut TmuxApp, key: KeyEvent) {
     if !app.guided() {
         match key.code {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.previous(),
-            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => app.advance(),
-            KeyCode::Home => app.step = 0,
-            KeyCode::End => app.step = Step::ALL.len() - 1,
+            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => {
+                app.apply_skipped_step();
+                app.advance();
+            }
+            KeyCode::Home => {
+                app.step = 0;
+                app.sync_scene_to_step();
+            }
+            KeyCode::End => {
+                app.step = Step::ALL.len() - 1;
+                app.sync_scene_to_step();
+            }
             _ => {}
         }
         return;
@@ -461,17 +553,23 @@ fn handle_guided_key(app: &mut TmuxApp, key: KeyEvent) -> bool {
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match app.current() {
-        Step::Welcome if key.code == KeyCode::Enter => {
+        Step::Shell | Step::Reattach if key.code == KeyCode::Enter => {
+            app.client_location = ClientLocation::Tmux;
             app.advance();
         }
         Step::Prefix if prefix_key_matches(&app.prefix_key, key) => {
             app.advance();
         }
         Step::Model if plain && key.code == KeyCode::Char('w') => {
+            app.tree_visibility = TreeVisibility::Visible;
             app.advance();
         }
         Step::Windows if plain && key.code == KeyCode::Char('c') => {
-            app.windows = 3;
+            app.tree_visibility = TreeVisibility::Hidden;
+            app.windows = 2;
+            app.active_window = 1;
+            app.panes = 1;
+            app.selected_pane = 0;
             app.advance();
         }
         Step::Splits
@@ -514,6 +612,7 @@ fn handle_guided_key(app: &mut TmuxApp, key: KeyEvent) -> bool {
             app.advance();
         }
         Step::Detach if plain && key.code == KeyCode::Char('d') => {
+            app.client_location = ClientLocation::Shell;
             app.advance();
         }
         Step::Muxa
@@ -553,24 +652,119 @@ fn render_tour(frame: &mut Frame<'_>, app: &TmuxApp) {
         render_small_terminal(frame, area, app.language);
         return;
     }
+    if !app.attached() {
+        render_shell_terminal(frame, area, app);
+        render_callout(frame, area, app);
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(1)])
         .split(area);
     render_mock_terminal(frame, rows[0], app);
     render_status_line(frame, rows[1], app);
+    if app.tree_open() {
+        render_window_tree(frame, rows[0], app);
+    }
     if app.current() == Step::CopyMode && app.copy_stage == CopyStage::Exit {
         render_copy_mode(frame, rows[0], app);
     }
     if app.current() == Step::Muxa {
         match app.muxa_stage {
             MuxaStage::Watch => {}
-            MuxaStage::Peek => render_muxa_watch(frame, rows[0], app),
-            MuxaStage::Dashboard => render_muxa_peek(frame, rows[0], app),
+            MuxaStage::Peek => render_muxa_watch(frame, area, app),
+            MuxaStage::Dashboard => {
+                frame.render_widget(Clear, area);
+                render_mock_terminal(frame, area, app);
+                render_muxa_peek(frame, area, app);
+            }
             MuxaStage::Complete => render_muxa_dashboard(frame, rows[0], app),
         }
     }
     render_callout(frame, area, app);
+}
+
+fn render_shell_terminal(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    let lines = if app.current() == Step::Reattach {
+        vec![
+            Line::from("june@devbox:~/personal/muxa$"),
+            Line::from("[detached (from session CAL-7041)]"),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "june@devbox:~/personal/muxa$ ",
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    "tmux attach-session -t CAL-7041",
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from("Muxa tmux onboarding · inert shell mock"),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "june@devbox:~/personal/muxa$ ",
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    "tmux new-session -s CAL-7041",
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ]),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(" shell · outside tmux ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(Color::Rgb(45, 57, 75))),
+            )
+            .style(Style::default().bg(Color::Rgb(7, 11, 18))),
+        area,
+    );
+}
+
+fn render_window_tree(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    let width = area.width.saturating_sub(6).min(52);
+    let height = 10.min(area.height.saturating_sub(2));
+    let popup = Rect::new(area.x + 3, area.y + 2, width, height);
+    frame.render_widget(Clear, popup);
+    let body = if app.ko() {
+        vec![
+            Line::from("CAL-7041: 1 windows (created Tue Aug 11)"),
+            Line::from("└─ 0: shell* (1 panes) [132x43]"),
+            Line::from("   └─ 0: zsh  june@devbox:~/personal/muxa"),
+            Line::from(""),
+            Line::from("w로 연 session/window tree · c로 새 window 생성"),
+        ]
+    } else {
+        vec![
+            Line::from("CAL-7041: 1 windows (created Tue Aug 11)"),
+            Line::from("└─ 0: shell* (1 panes) [132x43]"),
+            Line::from("   └─ 0: zsh  june@devbox:~/personal/muxa"),
+            Line::from(""),
+            Line::from("session/window tree opened by w · c creates a window"),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(body)).block(
+            Block::default()
+                .title(" choose-tree -Zw ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        popup,
+    );
 }
 
 fn render_mock_terminal(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
@@ -605,23 +799,38 @@ fn render_mock_terminal(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
 }
 
 fn render_pane(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp, index: usize, selected: bool) {
-    let (title, lines_en, lines_ko) = match index {
-        0 => (
-            " editor ",
+    let (title, lines_en, lines_ko) = match (app.active_window, index) {
+        (0, _) => (
+            " shell ",
             [
-                "$ nvim crates/muxa-cli/src/onboarding.rs",
+                "june@devbox ~/personal/muxa",
                 "",
-                "  README       modified",
-                "  onboarding   tests passing",
+                "$ tmux display-message -p '#S:#I.#P'",
+                "CAL-7041:0.0",
             ],
             [
-                "$ nvim crates/muxa-cli/src/onboarding.rs",
+                "june@devbox ~/personal/muxa",
                 "",
-                "  README       수정됨",
-                "  onboarding   테스트 통과",
+                "$ tmux display-message -p '#S:#I.#P'",
+                "CAL-7041:0.0",
             ],
         ),
-        1 => (
+        (1, 0) => (
+            " review · shell ",
+            [
+                "june@devbox ~/personal/muxa",
+                "",
+                "$",
+                "new window ready · split this layout next",
+            ],
+            [
+                "june@devbox ~/personal/muxa",
+                "",
+                "$",
+                "새 window 준비 완료 · 이제 이 layout을 분할합니다",
+            ],
+        ),
+        (1, 1) => (
             " codex · agent ",
             [
                 "› implement CAL-7041",
@@ -679,10 +888,11 @@ fn render_pane(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp, index: usize, s
 }
 
 fn render_status_line(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
-    let mut windows = vec!["0:shell", "1:agents*"];
-    if app.windows >= 3 {
-        windows.push("2:review");
-    }
+    let windows = if app.windows == 1 {
+        vec!["0:shell*"]
+    } else {
+        vec!["0:shell", "1:review*"]
+    };
     let left = format!(" [CAL-7041] {}", windows.join("  "));
     let right = format!(" prefix {} · {} panes ", app.prefix, app.panes);
     let padding =
@@ -744,40 +954,225 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
 
 fn render_muxa_watch(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
     frame.render_widget(Clear, area);
-    let lines = if app.ko() {
-        vec![
-            Line::from(" ● CAL-7041   18m   14m   onboarding 구현 및 테스트"),
-            Line::from("   ├─ ● codex       9m   tmux onboarding 편집 중"),
-            Line::from("   └─ ▶ reviewer    4m   검토 입력 대기"),
-            Line::from(" ○ CAL-7088    7m    2m   README 업데이트 완료"),
-            Line::from(""),
-            Line::from(" INSPECTOR · codex · %903"),
-            Line::from(" › prefix 입력 감지와 안전한 mock surface 구현"),
-        ]
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    render_muxa_watch_header(frame, rows[0]);
+    if rows[1].width >= 120 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[1]);
+        render_muxa_watch_sessions(frame, columns[0], app);
+        render_muxa_watch_inspector(frame, columns[1], app);
     } else {
-        vec![
-            Line::from(" ● CAL-7041   18m   14m   implement and test onboarding"),
-            Line::from("   ├─ ● codex       9m   editing tmux onboarding"),
-            Line::from("   └─ ▶ reviewer    4m   waiting for review input"),
-            Line::from(" ○ CAL-7088    7m    2m   README update complete"),
-            Line::from(""),
-            Line::from(" INSPECTOR · codex · %903"),
-            Line::from(" › detect prefix input and render safe mock surfaces"),
-        ]
-    };
+        render_muxa_watch_sessions(frame, rows[1], app);
+    }
+    render_muxa_watch_footer(frame, rows[2]);
+}
+
+fn render_muxa_watch_header(frame: &mut Frame<'_>, area: Rect) {
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                " muxa watch ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  2 sessions  ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            watch_state_span(AgentState::WaitingInput),
+            Span::raw("1  "),
+            watch_state_span(AgentState::Working),
+            Span::raw("1  "),
+            watch_state_span(AgentState::Idle),
+            Span::styled("1", Style::default().fg(Color::Green)),
+            Span::styled("  mail 0/1", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "   sort LATEST   10:37:32 UTC",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "j/k move  ·  type or / filter  ·  : commands  ·  ? help",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::Rgb(43, 57, 78))),
+    );
+    frame.render_widget(header, area);
+}
+
+fn render_muxa_watch_sessions(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    let selected = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(18, 83, 108));
+    let summary = tr(
+        app.language,
+        "implement and test tmux onboarding",
+        "tmux onboarding 구현 및 테스트",
+    );
+    let done = tr(
+        app.language,
+        "dashboard authentication complete",
+        "dashboard 인증 완료",
+    );
+    let lines = vec![
+        Line::from(Span::styled(
+            "  SESSION                 DUR    ACT    SUMMARY",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(vec![
+            Span::styled("> ", selected),
+            watch_state_span_with_bg(AgentState::WaitingInput, selected),
+            Span::styled(" ", selected),
+            watch_state_span_with_bg(AgentState::Working, selected),
+            Span::styled(
+                format!("   CAL-7041          18m    14m    {summary}"),
+                selected,
+            ),
+        ]),
+        Line::from("      └─ CAL-7041:1.0   -      9m     codex · editing onboarding"),
+        Line::from(Span::styled(
+            "      └─ CAL-7041:1.1   -      4m     reviewer · waiting for input",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(vec![
+            Span::raw("  "),
+            watch_state_span(AgentState::Idle),
+            Span::raw(format!("     CAL-7088          7m     2m     {done}")),
+        ]),
+    ];
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
-                    .title(" muxa watch · SESSION · DUR · ACT · SUMMARY ")
-                    .title_bottom(Line::from(" j/k move · m message · M mailbox · q quit "))
+                    .title(" Sessions ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(Color::Rgb(43, 57, 78))),
             )
             .style(Style::default().bg(Color::Rgb(7, 11, 18))),
         area,
     );
+}
+
+fn render_muxa_watch_inspector(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
+    let latest = tr(
+        app.language,
+        "implement and test tmux onboarding",
+        "tmux onboarding 구현 및 테스트",
+    );
+    let activity = tr(
+        app.language,
+        "editing crates/muxa-cli/src/onboarding/tmux.rs",
+        "crates/muxa-cli/src/onboarding/tmux.rs 편집 중",
+    );
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("kind ", Style::default().fg(Color::DarkGray)),
+            Span::raw("codex"),
+            Span::styled("  model ", Style::default().fg(Color::DarkGray)),
+            Span::raw("—"),
+        ]),
+        Line::from(vec![
+            Span::styled("latest ", Style::default().fg(Color::DarkGray)),
+            Span::raw(latest),
+        ]),
+        Line::from(Span::styled(
+            "────────────────────────────────────────────────────────",
+            Style::default().fg(Color::Rgb(43, 57, 78)),
+        )),
+        Line::from(Span::styled("● codex", Style::default().fg(Color::Cyan))),
+        Line::from(""),
+        Line::from("› improve the tmux onboarding simulation"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  ⚙ {activity}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ● working…",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Inspector · CAL-7041:1.0 · WORK 8s ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Rgb(43, 57, 78))),
+            ),
+        area,
+    );
+}
+
+fn render_muxa_watch_footer(frame: &mut Frame<'_>, area: Rect) {
+    let key = Style::default()
+        .fg(Color::Cyan)
+        .bg(Color::Rgb(19, 61, 80))
+        .add_modifier(Modifier::BOLD);
+    let text = Style::default().fg(Color::DarkGray);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" j/k ", key),
+            Span::styled("move  ", text),
+            Span::styled(" h/l ", key),
+            Span::styled("tree  ", text),
+            Span::styled(" / ", key),
+            Span::styled("filter  ", text),
+            Span::styled(" ⏎ ", key),
+            Span::styled("prompt  ", text),
+            Span::styled(" o ", key),
+            Span::styled("preview  ", text),
+            Span::styled(" m ", key),
+            Span::styled("message  ", text),
+            Span::styled(" M ", key),
+            Span::styled("mailbox  ", text),
+            Span::styled(" ? ", key),
+            Span::styled("help", text),
+        ])),
+        area,
+    );
+}
+
+fn watch_state_span(state: AgentState) -> Span<'static> {
+    watch_state_span_with_bg(state, Style::default())
+}
+
+fn watch_state_span_with_bg(state: AgentState, background: Style) -> Span<'static> {
+    let color = match state {
+        AgentState::Idle => Color::Green,
+        AgentState::Working | AgentState::WaitingInput => Color::Yellow,
+        AgentState::WaitingChoice => Color::LightYellow,
+        AgentState::Error => Color::Red,
+        AgentState::Starting => Color::Cyan,
+        AgentState::Stopped => Color::DarkGray,
+    };
+    Span::styled(
+        crate::state_icon(state),
+        background.fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
 fn render_muxa_peek(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
@@ -919,34 +1314,30 @@ fn render_callout(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
 
 fn callout_rect(area: Rect, step: Step) -> Rect {
     let width = area.width.saturating_sub(6).min(82);
-    let height = if matches!(step, Step::Welcome | Step::Finish) {
+    let height = if matches!(step, Step::Shell | Step::Finish) {
         16
     } else {
         13
     }
     .min(area.height.saturating_sub(2));
     match step {
-        Step::Welcome | Step::Prefix | Step::Finish | Step::Zoom | Step::Detach => {
+        Step::Shell | Step::Prefix | Step::Finish | Step::Zoom | Step::Detach | Step::Reattach => {
             centered_rect(area, width, height)
         }
-        Step::Model | Step::Windows | Step::CopyMode | Step::Muxa => Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height + 2),
-            width,
-            height,
-        ),
-        Step::Splits | Step::Panes => Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + 2,
-            width,
-            height,
-        ),
+        Step::Model | Step::Windows | Step::Splits | Step::Panes | Step::CopyMode | Step::Muxa => {
+            Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(height + 2),
+                width,
+                height,
+            )
+        }
     }
 }
 
 fn step_title(step: Step, language: UiLanguage) -> &'static str {
     let en = match step {
-        Step::Welcome => "safe tmux fundamentals",
+        Step::Shell => "start outside tmux",
         Step::Prefix => "press the detected prefix safely",
         Step::Model => "session, window, pane",
         Step::Windows => "windows organize one session",
@@ -955,11 +1346,12 @@ fn step_title(step: Step, language: UiLanguage) -> &'static str {
         Step::Zoom => "zoom without changing layout",
         Step::CopyMode => "scroll and search history",
         Step::Detach => "client is not the server",
+        Step::Reattach => "the shell remains after detach",
         Step::Muxa => "Muxa extends the prefix table",
         Step::Finish => "tmux muscle memory ready",
     };
     let ko = match step {
-        Step::Welcome => "안전한 tmux 기초",
+        Step::Shell => "tmux 밖의 shell에서 시작",
         Step::Prefix => "감지한 prefix를 안전하게 입력",
         Step::Model => "session, window, pane",
         Step::Windows => "하나의 session을 구성하는 window",
@@ -968,6 +1360,7 @@ fn step_title(step: Step, language: UiLanguage) -> &'static str {
         Step::Zoom => "layout을 바꾸지 않는 zoom",
         Step::CopyMode => "화면 기록 scroll과 검색",
         Step::Detach => "client와 server는 다릅니다",
+        Step::Reattach => "detach 뒤에도 shell은 남아 있습니다",
         Step::Muxa => "Muxa가 확장하는 prefix table",
         Step::Finish => "tmux 기본 동작 준비 완료",
     };
@@ -979,14 +1372,14 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
         return step_lines_ko(app);
     }
     match app.current() {
-        Step::Welcome => vec![
-            label("THIS IS A SAFE, INERT TMUX CLIENT"),
+        Step::Shell => vec![
+            label("START FROM A VIRTUAL SHELL OUTSIDE TMUX"),
             Line::from(""),
-            Line::from(format!("Detected prefix: {}", app.prefix)),
-            Line::from("First you will press that prefix by itself and wait for ✓."),
-            Line::from("Then a virtual prefix lets you practise suffix keys safely."),
-            Line::from("Nothing can create, split, detach, or kill a live session."),
-            Line::from("Press Enter to begin. F2 switches to 한국어."),
+            Line::from("The shell mock has prepared tmux new-session -s CAL-7041."),
+            Line::from("Press Enter to run it and enter the virtual tmux client."),
+            Line::from(format!("Configured prefix detected: {}", app.prefix)),
+            Line::from("All later windows, panes, and detach actions stay inert."),
+            Line::from("F2 switches to 한국어."),
         ],
         Step::Prefix => prefix_lines(app),
         Step::Model => vec![
@@ -1003,7 +1396,7 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from("prefix+c creates another window in the current session."),
             Line::from("A window is layout, not another Muxa work identity."),
-            Line::from("Press c; the mock status line will add 2:review."),
+            Line::from("Press c; a new 1:review shell will fill the client."),
         ],
         Step::Splits if app.split_stage == SplitStage::LeftRight => vec![
             label("SPLIT LEFT AND RIGHT"),
@@ -1055,6 +1448,14 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from("Sessions, panes, and agents continue running."),
             Line::from("Press d to simulate a safe detach and reattach."),
         ],
+        Step::Reattach => vec![
+            label("YOU ARE BACK IN THE ORIGINAL SHELL"),
+            Line::from(""),
+            Line::from("The [detached] notice proves only the client left tmux."),
+            Line::from("CAL-7041 and every pane continue in the tmux server."),
+            Line::from("The shell mock prepared tmux attach-session -t CAL-7041."),
+            Line::from("Press Enter to reattach and continue with Muxa keys."),
+        ],
         Step::Muxa => muxa_lines(app),
         Step::Finish => vec![
             label("KEEP TMUX FOR LAYOUT, MUXA FOR AGENTS"),
@@ -1071,14 +1472,14 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
 
 fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
     match app.current() {
-        Step::Welcome => vec![
-            label("안전하고 아무 동작도 하지 않는 TMUX CLIENT입니다"),
+        Step::Shell => vec![
+            label("TMUX 밖의 가상 기본 SHELL에서 시작합니다"),
             Line::from(""),
-            Line::from(format!("감지한 prefix: {}", app.prefix)),
-            Line::from("먼저 이 prefix만 직접 누르고 ✓ 표시를 기다립니다."),
-            Line::from("그다음 가상 prefix로 suffix key를 안전하게 실습합니다."),
-            Line::from("실제 session 생성, 분할, detach, 종료는 일어나지 않습니다."),
-            Line::from("Enter로 시작하세요. F2는 English 전환입니다."),
+            Line::from("shell mock에 tmux new-session -s CAL-7041이 준비되어 있습니다."),
+            Line::from("Enter를 누르면 실행되어 가상 tmux client로 들어갑니다."),
+            Line::from(format!("설정에서 감지한 prefix: {}", app.prefix)),
+            Line::from("이후 window, pane, detach 동작은 모두 mock 안에서만 일어납니다."),
+            Line::from("F2는 English 전환입니다."),
         ],
         Step::Prefix => prefix_lines(app),
         Step::Model => vec![
@@ -1095,7 +1496,7 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from("prefix+c는 현재 session에 window를 하나 만듭니다."),
             Line::from("window는 layout이며 별도의 Muxa work identity가 아닙니다."),
-            Line::from("c를 누르면 mock status line에 2:review가 추가됩니다."),
+            Line::from("c를 누르면 새 1:review shell이 client 전체에 표시됩니다."),
         ],
         Step::Splits if app.split_stage == SplitStage::LeftRight => vec![
             label("좌우로 분할하세요"),
@@ -1146,6 +1547,14 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
             Line::from("prefix+d는 이 client만 tmux server에서 분리합니다."),
             Line::from("session, pane, agent는 계속 실행됩니다."),
             Line::from("d를 눌러 안전한 detach/reattach를 시뮬레이션하세요."),
+        ],
+        Step::Reattach => vec![
+            label("원래의 기본 SHELL로 돌아왔습니다"),
+            Line::from(""),
+            Line::from("[detached] 표시는 이 client만 tmux에서 나온 결과입니다."),
+            Line::from("CAL-7041 session과 모든 pane은 server에서 계속 실행됩니다."),
+            Line::from("shell mock에 tmux attach-session -t CAL-7041이 준비되었습니다."),
+            Line::from("Enter를 눌러 다시 붙은 뒤 Muxa key를 실습하세요."),
         ],
         Step::Muxa => muxa_lines(app),
         Step::Finish => vec![
@@ -1271,7 +1680,7 @@ fn expected_key(app: &TmuxApp) -> String {
         Step::Muxa if app.muxa_stage == MuxaStage::Watch => "s",
         Step::Muxa if app.muxa_stage == MuxaStage::Peek => "q",
         Step::Muxa if app.muxa_stage == MuxaStage::Dashboard => "D",
-        Step::Welcome | Step::Finish | Step::Muxa => "Enter",
+        Step::Shell | Step::Reattach | Step::Finish | Step::Muxa => "Enter",
     }
     .to_string()
 }
@@ -1288,7 +1697,7 @@ fn callout_footer(app: &TmuxApp) -> String {
             tr(app.language, "quiz skipped", "실습 생략")
         );
     }
-    if matches!(app.current(), Step::Welcome | Step::Finish) {
+    if matches!(app.current(), Step::Shell | Step::Reattach | Step::Finish) {
         return tr(
             app.language,
             " Enter continue · F2 한국어 · Esc quit ",
@@ -1466,8 +1875,11 @@ mod tests {
         assert_eq!(app.current(), Step::Model);
 
         press(&mut app, KeyCode::Char('w'));
+        assert!(app.tree_open());
         press(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.windows, 3);
+        assert_eq!(app.windows, 2);
+        assert_eq!(app.active_window, 1);
+        assert!(!app.tree_open());
         press(&mut app, KeyCode::Char('%'));
         assert_eq!(app.panes, 2);
         press(&mut app, KeyCode::Char('"'));
@@ -1483,7 +1895,11 @@ mod tests {
         assert_eq!(app.copy_stage, CopyStage::Exit);
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.current(), Step::Reattach);
+        assert!(!app.attached());
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.current(), Step::Muxa);
+        assert!(app.attached());
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('D'));
@@ -1504,11 +1920,12 @@ mod tests {
             PrefixCapture::TmuxClient,
         );
         let screen = rendered(&app, 130, 32).replace(' ', "");
-        assert!(screen.contains("안전하고아무동작도하지않는TMUXCLIENT"));
-        assert!(screen.contains("감지한prefix:Ctrl-a"));
+        assert!(screen.contains("TMUX밖의가상기본SHELL에서시작합니다"));
+        assert!(screen.contains("설정에서감지한prefix:Ctrl-a"));
 
         let mut model = app;
         model.step = 2;
+        model.client_location = ClientLocation::Tmux;
         let screen = rendered(&model, 130, 32).replace(' ', "");
         assert!(screen.contains("SESSION=work/ticket"));
         assert!(screen.contains("WINDOW=layout/room"));
@@ -1520,13 +1937,56 @@ mod tests {
         let mut app = test_app(UiLanguage::En);
         press(&mut app, KeyCode::F(2));
         assert_eq!(app.language, UiLanguage::Ko);
-        assert_eq!(app.current(), Step::Welcome);
+        assert_eq!(app.current(), Step::Shell);
+    }
+
+    #[test]
+    fn shell_window_tree_new_window_and_detach_are_persistent_scenes() {
+        let mut app = test_app(UiLanguage::Ko);
+        let shell = rendered(&app, 130, 32);
+        assert!(shell.contains("shell · outside tmux"));
+        assert!(shell.contains("tmux new-session -s CAL-7041"));
+
+        press(&mut app, KeyCode::Enter);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        );
+        press(&mut app, KeyCode::Char('w'));
+        let tree = rendered(&app, 130, 32);
+        assert!(tree.contains("choose-tree -Zw"));
+        assert!(tree.contains("0: shell* (1 panes)"));
+
+        press(&mut app, KeyCode::Char('c'));
+        let created = rendered(&app, 130, 32);
+        assert!(created.contains("review · shell *"));
+        assert!(created.contains("1:review*"));
+        assert!(
+            created.replace(' ', "").contains("새window준비완료"),
+            "{created}"
+        );
+
+        app.step = 8;
+        press(&mut app, KeyCode::Char('d'));
+        let detached = rendered(&app, 130, 32);
+        assert!(detached.contains("shell · outside tmux"));
+        assert!(detached.contains("[detached (from session CAL-7041)]"));
+        assert!(detached.contains("tmux attach-session -t CAL-7041"));
+        assert!(!detached.contains("1:review*"));
+
+        press(&mut app, KeyCode::Backspace);
+        let restored = rendered(&app, 130, 32);
+        assert_eq!(app.current(), Step::Detach);
+        assert!(app.attached());
+        assert!(restored.contains("1:review*"));
     }
 
     #[test]
     fn split_and_copy_mode_render_the_mock_effects() {
         let mut app = test_app(UiLanguage::En);
         app.step = 4;
+        app.client_location = ClientLocation::Tmux;
+        app.active_window = 1;
         press(&mut app, KeyCode::Char('%'));
         let split = rendered(&app, 130, 32);
         assert!(split.contains("codex · agent"));
@@ -1542,12 +2002,16 @@ mod tests {
     #[test]
     fn muxa_shortcuts_render_watch_peek_and_dashboard_surfaces() {
         let mut app = test_app(UiLanguage::Ko);
-        app.step = 9;
+        app.step = 10;
+        app.client_location = ClientLocation::Tmux;
 
         press(&mut app, KeyCode::Char('s'));
         let watch = rendered(&app, 130, 32);
-        assert!(watch.contains("muxa watch · SESSION · DUR · ACT · SUMMARY"));
-        assert!(watch.contains("INSPECTOR · codex · %903"));
+        assert!(watch.contains("muxa watch"));
+        assert!(watch.contains("SESSION                 DUR    ACT    SUMMARY"));
+        assert!(watch.contains("Inspector · CAL-7041:1.0 · WORK 8s"));
+        assert!(watch.contains("j/k move"));
+        assert!(!watch.contains("prefix Ctrl-b · 3 panes"));
 
         press(&mut app, KeyCode::Char('q'));
         let peek = rendered(&app, 130, 32);

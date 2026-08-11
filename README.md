@@ -197,11 +197,13 @@ Korean is selected automatically for a Korean locale, can be requested with
 `--lang ko`, and can be toggled with `F2` during the tour.
 
 Use `muxa onboard --tmux` for the companion tmux fundamentals track. It reads
-the configured tmux prefix and starts with one prefix-only checkpoint. Inside
-tmux it observes that client's prefix key table, immediately returns it to the
-root table, and only then begins the suffix-key drills. Press `s`, `q`, and `D`
-to see watch, peek, and dashboard-shaped mock surfaces. No live window is
-created, no pane is split, and the client is never detached.
+the configured tmux prefix and starts in an inert shell with a prepared virtual
+`tmux new-session`. It preserves the visible tree, active window, pane splits,
+zoom, copy mode, and detached-shell scene as the real suffix keys are pressed.
+Inside tmux it observes that client's prefix key table, immediately returns it
+to the root table, and only then begins the suffix-key drills. Press `s`, `q`,
+and `D` to see a live-watch-shaped session/inspector view, peek, and dashboard.
+No live window is created, no pane is split, and the client is never detached.
 
 <div align="center">
   <img src="docs/demo-onboard.gif" alt="Korean muxa onboarding: location-aware dialogs over a safe watch mock, canonical state icons, and real shortcut practice" width="900" />

@@ -169,11 +169,13 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 명시하거나 온보딩 도중 `F2`로 한/영을 전환할 수 있습니다.
 
 `muxa onboard --tmux`는 tmux 기초를 위한 별도 과정입니다. 현재 설정된 tmux
-prefix를 감지하고 처음 한 번은 prefix만 직접 누르게 합니다. tmux 안에서는 해당
+prefix를 감지하고, 준비된 가상 `tmux new-session`이 있는 기본 shell에서
+시작합니다. 실제 suffix key를 누를 때마다 tree, 활성 window, pane 분할, zoom,
+copy mode, detached shell 장면이 다음 단계에도 유지됩니다. tmux 안에서는 해당
 client의 prefix key table 진입을 확인하자마자 root table로 되돌린 뒤 suffix
-실습을 시작합니다. `s`, `q`, `D`를 누르면 각각 watch, peek, dashboard 모양의
-mock 화면도 표시됩니다. live window 생성, pane 분할, client detach는 일어나지
-않습니다.
+실습을 시작합니다. `s`, `q`, `D`를 누르면 live watch 형태의 session/inspector,
+peek, dashboard mock 화면도 표시됩니다. live window 생성, pane 분할, client
+detach는 일어나지 않습니다.
 
 <div align="center">
   <img src="docs/demo-onboard.gif" alt="한글 Muxa onboarding: 안전한 watch mock 위의 위치별 안내, 실제 상태 icon과 단축키 실습" width="900" />

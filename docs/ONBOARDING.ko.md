@@ -74,23 +74,30 @@ Muxa workflow보다 먼저 tmux의 session/window/pane 구조와 기본 조작�
     muxa onboard --tmux --lang ko
 
 이 과정도 실제 layout과 lifecycle을 건드리지 않는 fullscreen mock입니다.
-현재 설정된 prefix(`Ctrl-b`, `Ctrl-a` 등)를 감지하고 첫 단계에서 prefix만
-직접 누르게 합니다. tmux 안에서는 현재 client가 prefix key table로 들어간 것을
+현재 설정된 prefix(`Ctrl-b`, `Ctrl-a` 등)를 감지하고 가상 session에 들어간 뒤
+prefix만 직접 누르게 합니다. tmux 안에서는 현재 client가 prefix key table로 들어간 것을
 확인하자마자 root table로 되돌립니다. 화면이 넘어가기 전에 suffix를 연속해서
 누르지 말고 ✓ 확인을 기다리면 live binding은 실행되지 않습니다. 이후 단계는
 가상 prefix와 실제 suffix key로 진행하므로 live window 생성, pane 분할,
 client detach가 일어나지 않습니다.
 
-실제 키를 다음 순서로 눌러 진행합니다.
+가상 기본 shell에서 `tmux new-session -s CAL-7041`이 준비된 상태로 시작하며,
+Enter를 누르면 가상 tmux client로 들어갑니다. 실제 키를 다음 순서로 눌러
+진행합니다.
 
 - `w`: session/window tree와 session → window → pane 계층
-- `c`: 현재 session 안에 window 생성
+- `c`: 현재 session 안에 새 window를 만들고 그 window의 shell 화면으로 전환
 - `%`, `"`: pane 좌우·상하 분할
 - `→`: pane focus 이동
 - `z`, `z`: pane 확대 후 원래 split layout 복원
 - `[`, `q`: copy mode 진입과 종료
-- `d`: client detach; session과 agent가 계속 실행된다는 의미
+- `d`: client를 detach하고 `[detached …]`가 있는 원래 기본 shell로 복귀
+- `Enter`: 준비된 `tmux attach-session`으로 가상 session에 다시 연결
 - `s`, `q`, `D`: Muxa의 watch, peek, dashboard prefix binding과 실제 모양의 mock 화면
+
+`w`의 tree, `c`의 활성 window, `%`와 `"`의 pane layout은 다음 단계에서도
+사라지지 않고 누적됩니다. `s` 화면은 기본 onboarding과 같은 live watch형
+header, 왼쪽 state gutter, session tree, 50/50 inspector, footer를 사용합니다.
 
 여기서도 `F2`로 한글/영문을 전환하고, `Esc`로 종료하며, `--no-quiz`로 키
 gate를 건너뛸 수 있습니다. 정적 안내만 필요하면 다음을 사용합니다.

@@ -1,16 +1,16 @@
-# muxa tmux onboarding demo — prefix checkpoint + safe suffix muscle memory
+# muxa tmux onboarding demo — shell → tmux → detached shell, all inert
 #
 #   vhs docs/demo-tmux-onboard.tape   →   docs/demo-tmux-onboard.gif
 #
-# The mock first verifies one detected prefix-only press. It then uses suffix
-# keys with a virtually armed prefix, so no live tmux binding is executed.
+# The mock begins outside tmux, enters a virtual CAL-7041 session, verifies one
+# detected prefix-only press, and then preserves every simulated UI transition.
 #
 # Arc:
-#   0–4s    prefix, hierarchy     — Ctrl-b, w
-#   4–9s    pane layout          — %, ", Right
-#   9–14s   zoom and copy mode   — z/z, [/q
-#   14–18s  detach semantics     — d
-#   18–24s  Muxa surfaces         — s watch, q peek, D dashboard
+#   0–5s    shell, prefix, tree  — Enter, Ctrl-b, w
+#   5–10s   window and panes     — c, %, ", Right
+#   10–15s  zoom and copy mode   — z/z, [/q
+#   15–19s  detach + reattach    — d, Enter
+#   19–24s  Muxa surfaces         — s watch, q peek, D dashboard
 
 Output docs/demo-tmux-onboard.gif
 
@@ -38,7 +38,8 @@ Type "muxa onboard --tmux --lang ko"
 Enter
 Sleep 1800ms
 
-# Start once, then press only the detected prefix and wait for confirmation.
+# Run the prepared virtual tmux new-session command, then press only the
+# detected prefix and wait for confirmation.
 Enter
 Sleep 1000ms
 Ctrl+B
@@ -70,8 +71,11 @@ Sleep 1200ms
 Type "q"
 Sleep 1100ms
 
-# Detach is simulated; no real tmux client is detached.
+# Detach visibly returns to the original shell; Enter runs the prepared mock
+# attach command so the remaining prefix drills resume inside the session.
 Type "d"
+Sleep 1500ms
+Enter
 Sleep 1200ms
 
 # Muxa adds watch, peek, and dashboard to the same prefix table.
