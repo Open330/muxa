@@ -280,7 +280,7 @@ fn korean_watch_help() -> &'static [&'static str] {
     &[
         "이동",
         "  ↑/↓ · j/k       work/agent 이동",
-        "  ←/→ · h/l       parent / 첫 child agent",
+        "  ←/→ · h/l       상위 work / 첫 agent",
         "  Enter           선택한 pane에 attach",
         "  n               workspace/work + agent 생성/재사용",
         "",
@@ -1120,7 +1120,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from("  ↑/↓ · j/k       work/agent 이동"),
-            Line::from("  ←/→ · h/l       parent / 첫 child agent"),
+            Line::from("  ←/→ · h/l       상위 work / 첫 agent"),
             Line::from("  Enter           선택한 pane에 attach"),
             Line::from("  n               workspace/work + agent 생성/재사용"),
             Line::from(""),
@@ -1146,7 +1146,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, language: UiLanguage) 
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from("  ↑/↓ · j/k       move works/agents"),
-            Line::from("  ←/→ · h/l       parent / first child agent"),
+            Line::from("  ←/→ · h/l       parent work / first agent"),
             Line::from("  Enter           attach to selected pane"),
             Line::from("  n               new/reused workspace/work + agent"),
             Line::from(""),
@@ -1260,63 +1260,63 @@ fn callout_footer(app: &TourApp) -> &'static str {
         );
     }
     let en = match app.current() {
-        TourStep::Work => " j/↓ move to muxa-onboarding · F2 한국어 · Esc quit ",
-        TourStep::Agents => " l/→ enter child agent · ← back · Esc quit ",
-        TourStep::States => " Alt-T sort by state · ← back · Esc quit ",
-        TourStep::Preview => " o open preview · ← back · Esc quit ",
+        TourStep::Work => " j/↓ move to muxa-onboarding · F2 한국어 · Esc to quit ",
+        TourStep::Agents => " l/→ move to the first agent · ← back · Esc to quit ",
+        TourStep::States => " Alt-T sort by state · ← back · Esc to quit ",
+        TourStep::Preview => " o open preview · ← back · Esc to quit ",
         TourStep::Shortcuts if app.panel == MockPanel::Preview => {
-            " o close preview · Esc quits tour "
+            " o close preview · Esc to quit the onboarding "
         }
         TourStep::Shortcuts if app.panel == MockPanel::Help => " ?/F1 close help and continue ",
-        TourStep::Shortcuts => " ?/F1 open full help · ← back · Esc quit ",
+        TourStep::Shortcuts => " ?/F1 open full help · ← back · Esc to quit ",
         TourStep::NewWork if app.new_work_stage == NewWorkStage::Shortcut => {
-            " n open new-work form · ← back · Esc quit "
+            " n open the new-work form · ← back · Esc to quit "
         }
         TourStep::NewWork if app.new_work_stage == NewWorkStage::Form => {
-            " Esc close mock form and continue "
+            " Esc close the practice form and continue "
         }
         TourStep::NewWork => " n open form · Esc close form and continue ",
         TourStep::Collaboration if app.collaboration_stage == CollaborationStage::Message => {
-            " m open selected-peer composer · ← back · Esc quit "
+            " m message the selected agent · ← back · Esc to quit "
         }
         TourStep::Collaboration if app.collaboration_stage == CollaborationStage::Composer => {
-            " empty Backspace close composer "
+            " Backspace closes the empty composer "
         }
         TourStep::Collaboration if app.collaboration_stage == CollaborationStage::Mailbox => {
             " M open mailbox "
         }
         TourStep::Collaboration => " M close mailbox and continue ",
-        TourStep::Mcp => " l/→ continue · ← back · Esc quit ",
+        TourStep::Mcp => " l/→ continue · ← back · Esc to quit ",
         TourStep::Finish => " q finish · q also quits watch ",
     };
     let ko = match app.current() {
-        TourStep::Work => " j/↓ muxa-onboarding으로 이동 · F2 English · Esc 종료 ",
-        TourStep::Agents => " l/→ child agent 선택 · ← 이전 · Esc 종료 ",
-        TourStep::States => " Alt-T 상태순 정렬 · ← 이전 · Esc 종료 ",
-        TourStep::Preview => " o preview 열기 · ← 이전 · Esc 종료 ",
+        TourStep::Work => " j/↓ muxa-onboarding으로 이동 · F2 English · Esc로 종료 ",
+        TourStep::Agents => " l/→ 첫 agent로 이동 · ← 이전 · Esc로 종료 ",
+        TourStep::States => " Alt-T 상태순 정렬 · ← 이전 · Esc로 종료 ",
+        TourStep::Preview => " o preview 열기 · ← 이전 · Esc로 종료 ",
         TourStep::Shortcuts if app.panel == MockPanel::Preview => {
             " o preview 닫기 · Esc 온보딩 종료 "
         }
         TourStep::Shortcuts if app.panel == MockPanel::Help => " ?/F1 도움말 닫고 계속 ",
-        TourStep::Shortcuts => " ?/F1 전체 도움말 · ← 이전 · Esc 종료 ",
+        TourStep::Shortcuts => " ?/F1 전체 도움말 · ← 이전 · Esc로 종료 ",
         TourStep::NewWork if app.new_work_stage == NewWorkStage::Shortcut => {
-            " n 새 work form 열기 · ← 이전 · Esc 종료 "
+            " n 새 work form 열기 · ← 이전 · Esc로 종료 "
         }
         TourStep::NewWork if app.new_work_stage == NewWorkStage::Form => {
-            " Esc mock form을 닫고 계속 "
+            " Esc 연습 form 닫고 계속 "
         }
         TourStep::NewWork => " n form 열기 · Esc 닫고 계속 ",
         TourStep::Collaboration if app.collaboration_stage == CollaborationStage::Message => {
-            " m 선택 peer composer · ← 이전 · Esc 종료 "
+            " m 선택한 agent에게 메시지 · ← 이전 · Esc로 종료 "
         }
         TourStep::Collaboration if app.collaboration_stage == CollaborationStage::Composer => {
-            " 빈 composer에서 Backspace로 닫기 "
+            " 빈 composer는 Backspace로 닫기 "
         }
         TourStep::Collaboration if app.collaboration_stage == CollaborationStage::Mailbox => {
             " M mailbox 열기 "
         }
         TourStep::Collaboration => " M mailbox 닫고 계속 ",
-        TourStep::Mcp => " l/→ 계속 · ← 이전 · Esc 종료 ",
+        TourStep::Mcp => " l/→ 계속 · ← 이전 · Esc로 종료 ",
         TourStep::Finish => " q 완료 · q는 watch 종료 키 ",
     };
     tr(app.language, en, ko)
@@ -1324,26 +1324,26 @@ fn callout_footer(app: &TourApp) -> &'static str {
 
 fn step_title(step: TourStep, language: UiLanguage) -> &'static str {
     let en = match step {
-        TourStep::Work => "one window = one work",
-        TourStep::Agents => "one pane = one agent",
-        TourStep::States => "state tells you what to do",
-        TourStep::Preview => "inspect without attaching",
-        TourStep::Shortcuts => "actions stay at the bottom",
-        TourStep::NewWork => "new work: real key and form",
-        TourStep::Collaboration => "message and mailbox muscle memory",
-        TourStep::Mcp => "agents use the same control plane",
-        TourStep::Finish => "ready for live watch",
+        TourStep::Work => "navigate between work windows",
+        TourStep::Agents => "open a work to see its agents",
+        TourStep::States => "use state to choose the next action",
+        TourStep::Preview => "preview a pane before attaching",
+        TourStep::Shortcuts => "find actions in the footer and Help",
+        TourStep::NewWork => "create a work and its first agent",
+        TourStep::Collaboration => "message an agent and review the mailbox",
+        TourStep::Mcp => "let agents use Muxa through MCP",
+        TourStep::Finish => "ready for the live watch",
     };
     let ko = match step {
-        TourStep::Work => "window 하나 = work 하나",
-        TourStep::Agents => "pane 하나 = agent 하나",
-        TourStep::States => "상태가 다음 행동을 알려줍니다",
-        TourStep::Preview => "attach 없이 확인하기",
-        TourStep::Shortcuts => "하단에 보이는 상황별 동작",
-        TourStep::NewWork => "실제 키로 새 work form 열기",
-        TourStep::Collaboration => "메시지와 mailbox 익히기",
-        TourStep::Mcp => "agent도 같은 control plane 사용",
-        TourStep::Finish => "live watch를 사용할 준비 완료",
+        TourStep::Work => "work window 사이 이동하기",
+        TourStep::Agents => "work를 열어 agent 확인하기",
+        TourStep::States => "상태를 보고 다음 행동 정하기",
+        TourStep::Preview => "attach 전에 pane 미리 보기",
+        TourStep::Shortcuts => "footer와 도움말에서 동작 찾기",
+        TourStep::NewWork => "work와 첫 agent 만들기",
+        TourStep::Collaboration => "agent에게 메시지 보내고 mailbox 확인하기",
+        TourStep::Mcp => "MCP로 agent에게 Muxa 맡기기",
+        TourStep::Finish => "실제 watch를 사용할 준비 완료",
     };
     tr(language, en, ko)
 }
@@ -1420,61 +1420,61 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
     }
     match app.current() {
         TourStep::Work => vec![
-            callout_label("← MOVE THE REAL WATCH CURSOR"),
+            callout_label("← MOVE BETWEEN WORK WINDOWS"),
             Line::from(""),
-            Line::from("muxa-sandbox is selected. Press j or ↓ to reach muxa-onboarding."),
-            Line::from("Each row is one work window inside the muxa workspace session."),
-            Line::from("Starting it again reuses that same window and adds an agent pane."),
+            Line::from("The cursor is on muxa-sandbox. Press j or ↓ to select muxa-onboarding."),
+            Line::from("Each row represents one work window in the muxa workspace session."),
+            Line::from("Starting the same work again reuses its window and adds an agent pane."),
         ],
         TourStep::Agents => vec![
-            callout_label("← ENTER THE WORK TREE"),
+            callout_label("← OPEN THE SELECTED WORK"),
             Line::from(""),
-            Line::from("The selected work expanded to its agent panes."),
-            Line::from("Press l or → to select its first child agent."),
-            Line::from("h/← returns to the parent work window."),
+            Line::from("Expanding a work reveals the agent panes running inside it."),
+            Line::from("Press l or → to select the first agent."),
+            Line::from("Use h or ← whenever you want to return to the work window."),
         ],
         TourStep::States => vec![
-            callout_label("← STATE LIVES LEFT OF THE WORK NAME"),
+            callout_label("← READ THE STATE BEFORE YOU INTERRUPT AN AGENT"),
             Line::from(""),
             state_legend_line(AgentState::Working, "working — leave it alone"),
             state_legend_line(AgentState::WaitingInput, "waiting — it needs input"),
-            state_legend_line(AgentState::Idle, "idle — its turn settled"),
+            state_legend_line(AgentState::Idle, "idle — its turn has settled"),
             state_legend_line(AgentState::Error, "error — inspect the pane"),
-            Line::from("Press Alt-T to apply watch's state/attention sort."),
+            Line::from("Press Alt-T to sort the watch by state and attention."),
         ],
         TourStep::Preview => vec![
-            callout_label("→ INSPECT WITHOUT ATTACHING"),
+            callout_label("→ CHECK A PANE WITHOUT ATTACHING"),
             Line::from(""),
-            Line::from("The wide inspector stays beside the 50/50 work list."),
-            Line::from("Press o now to open the selected pane preview."),
-            Line::from("Enter attaches when you need the real terminal."),
+            Line::from("On a wide screen, the inspector sits beside the work list."),
+            Line::from("Press o to preview the selected pane."),
+            Line::from("Use Enter only when you need to attach to the real terminal."),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Preview => vec![
-            callout_label("PREVIEW IS AN ACTUAL WATCH OVERLAY"),
+            callout_label("THE PREVIEW OPENS OVER THE WATCH"),
             Line::from(""),
-            Line::from("The table remains behind it so you keep your place."),
+            Line::from("The work list remains behind it, so your place is preserved."),
             Line::from("Press o again to close the preview."),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Help => vec![
-            callout_label("? OPENS THE COMPLETE LIVE KEY MAP"),
+            callout_label("? OPENS THE COMPLETE SHORTCUT MAP"),
             Line::from(""),
-            Line::from("The help content comes from watch's shortcut source."),
+            Line::from("This is the same shortcut reference used by the live watch."),
             Line::from("Press ? or F1 again to close it and continue."),
         ],
         TourStep::Shortcuts => vec![
-            callout_label("↓ THE FOOTER TEACHES CONTEXTUAL ACTIONS"),
+            callout_label("↓ THE FOOTER SHOWS WHAT YOU CAN DO HERE"),
             Line::from(""),
-            Line::from("The strip now matches the live one-line watch footer."),
-            Line::from("Press ? or F1 to open the complete shortcut map."),
+            Line::from("Its actions change with the current selection and open panel."),
+            Line::from("Press ? or F1 whenever you need the complete shortcut map."),
         ],
         TourStep::NewWork => new_work_step_lines(app),
         TourStep::Collaboration => collaboration_step_lines(app),
         TourStep::Mcp => vec![
-            callout_label("AGENTS USE THE SAME MUXA CONTROL PLANE"),
+            callout_label("LET AGENTS MANAGE TMUX THROUGH MUXA"),
             Line::from(""),
-            Line::from("muxa_start_agent creates/reuses tmux deterministically."),
+            Line::from("muxa_start_agent creates or reuses the expected window and pane."),
             Line::from("settled + capture returns the useful final screen."),
-            Line::from("No separate tmux MCP or model-written tmux script."),
+            Line::from("Agents do not need a separate tmux MCP or handwritten tmux script."),
             Line::from("Press l or → to continue."),
         ],
         TourStep::Finish => vec![
@@ -1497,63 +1497,63 @@ fn step_lines(app: &TourApp) -> Vec<Line<'static>> {
 fn step_lines_ko(app: &TourApp) -> Vec<Line<'static>> {
     match app.current() {
         TourStep::Work => vec![
-            callout_label("← 실제 WATCH CURSOR를 움직여보세요"),
+            callout_label("← WORK WINDOW 사이를 이동합니다"),
             Line::from(""),
             Line::from(
-                "muxa-sandbox가 선택되어 있습니다. j 또는 ↓로 muxa-onboarding으로 이동하세요.",
+                "cursor는 muxa-sandbox에 있습니다. j 또는 ↓로 muxa-onboarding을 선택하세요.",
             ),
-            Line::from("각 row는 muxa workspace session 안의 work window 하나입니다."),
-            Line::from("다시 시작하면 같은 window를 재사용하고 agent pane을 추가합니다."),
+            Line::from("각 row는 muxa workspace session 안의 work window 하나를 나타냅니다."),
+            Line::from("같은 work를 다시 시작하면 window를 재사용하고 agent pane을 추가합니다."),
         ],
         TourStep::Agents => vec![
-            callout_label("← WORK TREE 안으로 들어가세요"),
+            callout_label("← 선택한 WORK를 펼칩니다"),
             Line::from(""),
-            Line::from("선택한 work 아래에 agent pane이 펼쳐졌습니다."),
-            Line::from("l 또는 →로 첫 child agent를 선택하세요."),
-            Line::from("h/←는 parent work window로 돌아갑니다."),
+            Line::from("work를 펼치면 그 안에서 실행 중인 agent pane이 보입니다."),
+            Line::from("l 또는 →로 첫 번째 agent를 선택하세요."),
+            Line::from("work window로 돌아가려면 h 또는 ←를 누르세요."),
         ],
         TourStep::States => vec![
-            callout_label("← STATE는 WORK 이름 왼쪽에 있습니다"),
+            callout_label("← AGENT를 방해하기 전에 상태부터 확인합니다"),
             Line::from(""),
             state_legend_line(AgentState::Working, "작업 중 — 그대로 두세요"),
             state_legend_line(AgentState::WaitingInput, "입력 대기 — 응답이 필요합니다"),
             state_legend_line(AgentState::Idle, "대기 — turn이 끝났습니다"),
             state_legend_line(AgentState::Error, "오류 — pane을 확인하세요"),
-            Line::from("Alt-T로 state/attention 순 정렬을 적용하세요."),
+            Line::from("Alt-T를 눌러 state와 attention이 필요한 순서로 정렬하세요."),
         ],
         TourStep::Preview => vec![
-            callout_label("→ ATTACH하지 않고 확인하세요"),
+            callout_label("→ ATTACH하지 않고 PANE을 확인합니다"),
             Line::from(""),
-            Line::from("넓은 화면에서는 Inspector가 work 목록 옆에 50/50으로 표시됩니다."),
+            Line::from("넓은 화면에서는 inspector가 work 목록 옆에 표시됩니다."),
             Line::from("o를 눌러 선택한 pane의 preview를 여세요."),
-            Line::from("실제 terminal이 필요할 때는 Enter로 attach합니다."),
+            Line::from("실제 terminal 조작이 필요할 때만 Enter로 attach하세요."),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Preview => vec![
-            callout_label("PREVIEW는 실제 WATCH와 같은 OVERLAY입니다"),
+            callout_label("PREVIEW는 WATCH 위에 열립니다"),
             Line::from(""),
-            Line::from("뒤에 table이 남아 있어 현재 위치를 잃지 않습니다."),
+            Line::from("뒤에 work 목록이 남아 있어 현재 위치가 유지됩니다."),
             Line::from("o를 다시 눌러 preview를 닫으세요."),
         ],
         TourStep::Shortcuts if app.panel == MockPanel::Help => vec![
-            callout_label("?로 전체 단축키 지도를 엽니다"),
+            callout_label("?로 전체 단축키 지도를 확인합니다"),
             Line::from(""),
-            Line::from("실제 watch에서 사용하는 주요 키를 한글로 설명합니다."),
+            Line::from("실제 watch와 같은 단축키 설명을 볼 수 있습니다."),
             Line::from("? 또는 F1을 다시 눌러 닫고 계속하세요."),
         ],
         TourStep::Shortcuts => vec![
-            callout_label("↓ FOOTER에서 현재 가능한 동작을 확인하세요"),
+            callout_label("↓ FOOTER에서 지금 가능한 동작을 확인합니다"),
             Line::from(""),
-            Line::from("한 줄 footer는 실제 watch와 같은 위치에 있습니다."),
-            Line::from("? 또는 F1으로 전체 단축키 도움말을 여세요."),
+            Line::from("footer의 동작은 현재 선택과 열린 panel에 맞춰 바뀝니다."),
+            Line::from("전체 단축키가 필요하면 ? 또는 F1을 누르세요."),
         ],
         TourStep::NewWork => new_work_step_lines(app),
         TourStep::Collaboration => collaboration_step_lines(app),
         TourStep::Mcp => vec![
-            callout_label("AGENT도 같은 MUXA CONTROL PLANE을 사용합니다"),
+            callout_label("AGENT도 MUXA를 통해 TMUX를 관리합니다"),
             Line::from(""),
-            Line::from("muxa_start_agent가 tmux를 결정적으로 생성하거나 재사용합니다."),
-            Line::from("settled + capture로 유용한 마지막 화면을 받습니다."),
-            Line::from("별도 tmux MCP나 model이 작성한 tmux script는 필요하지 않습니다."),
+            Line::from("muxa_start_agent가 정해진 window와 pane을 생성하거나 재사용합니다."),
+            Line::from("settled + capture를 사용하면 작업이 끝난 화면까지 확인할 수 있습니다."),
+            Line::from("별도 tmux MCP나 agent가 직접 작성한 tmux script는 필요하지 않습니다."),
             Line::from("l 또는 →로 계속하세요."),
         ],
         TourStep::Finish => vec![
@@ -1577,31 +1577,31 @@ fn new_work_step_lines(app: &TourApp) -> Vec<Line<'static>> {
     if app.ko() {
         return match app.new_work_stage {
             NewWorkStage::Shortcut => vec![
-                callout_label("실제 새 WORK 단축키를 눌러보세요"),
+                callout_label("새 WORK와 첫 AGENT를 함께 만듭니다"),
                 Line::from(""),
-                Line::from("n을 누르면 watch의 work + agent 안내 form이 열립니다."),
-                Line::from("directory, ticket, agent와 첫 prompt를 입력하는 form입니다."),
+                Line::from("n을 누르면 work와 agent를 만드는 안내 form이 열립니다."),
+                Line::from("directory, ticket, agent, 첫 prompt를 차례로 입력할 수 있습니다."),
             ],
             NewWorkStage::Form => vec![
-                callout_label("FORM은 실제 WATCH처럼 하단에 붙습니다"),
+                callout_label("FORM에서 생성할 WORK를 확인합니다"),
                 Line::from(""),
                 Line::from("Tab/↑/↓로 항목을 바꾸고 ←/→로 agent를 바꿉니다."),
-                Line::from("Esc로 이 mock form을 닫고 계속하세요."),
+                Line::from("연습이므로 Esc로 form을 닫고 다음 단계로 이동하세요."),
             ],
         };
     }
     match app.new_work_stage {
         NewWorkStage::Shortcut => vec![
-            callout_label("PRESS THE REAL NEW-WORK KEY"),
+            callout_label("CREATE A WORK AND ITS FIRST AGENT TOGETHER"),
             Line::from(""),
-            Line::from("Press n to open watch's guided work + agent form."),
-            Line::from("It asks for directory, ticket, agent, and first prompt."),
+            Line::from("Press n to open the guided form for a work and its agent."),
+            Line::from("It collects the directory, ticket, agent, and first prompt."),
         ],
         NewWorkStage::Form => vec![
-            callout_label("THE FORM IS BOTTOM-ANCHORED LIKE WATCH"),
+            callout_label("REVIEW THE WORK YOU ARE ABOUT TO CREATE"),
             Line::from(""),
-            Line::from("Tab/↑/↓ changes fields; ←/→ changes the agent."),
-            Line::from("Press Esc to close this mock form and continue."),
+            Line::from("Use Tab/↑/↓ to change fields and ←/→ to change the agent."),
+            Line::from("This is practice, so press Esc to close the form and continue."),
         ],
     }
 }
@@ -1610,54 +1610,54 @@ fn collaboration_step_lines(app: &TourApp) -> Vec<Line<'static>> {
     if app.ko() {
         return match app.collaboration_stage {
             CollaborationStage::Message => vec![
-                callout_label("선택한 PEER에게 보내려면 m을 누르세요"),
+                callout_label("선택한 AGENT에게 메시지를 보냅니다"),
                 Line::from(""),
-                Line::from("m은 watch cursor 아래의 정확한 agent를 대상으로 합니다."),
-                Line::from("m을 눌러 request composer를 여세요."),
+                Line::from("m은 watch cursor가 가리키는 agent 한 명을 대상으로 합니다."),
+                Line::from("m을 눌러 해당 agent의 request composer를 여세요."),
             ],
             CollaborationStage::Composer => vec![
-                callout_label("COMPOSER는 빈 상태로 시작합니다"),
+                callout_label("COMPOSER에서 요청 방식을 확인합니다"),
                 Line::from(""),
-                Line::from("kind와 mode는 화면에 보이며 다음에도 유지됩니다."),
-                Line::from("내용이 비어 있을 때 Backspace를 눌러 닫으세요."),
+                Line::from("kind와 mode는 화면에 표시되고 다음 메시지에도 유지됩니다."),
+                Line::from("지금은 내용이 비어 있으므로 Backspace를 눌러 닫으세요."),
             ],
             CollaborationStage::Mailbox => vec![
-                callout_label("MAILBOX를 열려면 M을 누르세요"),
+                callout_label("MAILBOX에서 요청 이력을 확인합니다"),
                 Line::from(""),
-                Line::from("M은 받은 요청과 보낸 요청을 열며 b도 alias로 동작합니다."),
-                Line::from("지금 M을 누르세요."),
+                Line::from("M은 받은 요청과 보낸 요청을 함께 엽니다. b도 같은 기능입니다."),
+                Line::from("M을 눌러 mailbox를 여세요."),
             ],
             CollaborationStage::MailboxOpen => vec![
-                callout_label("MAILBOX 열림 — 다시 눌러 닫으세요"),
+                callout_label("보낸 요청도 MAILBOX에 남습니다"),
                 Line::from(""),
-                Line::from("보낸 요청 tab에는 한 peer에게 보낸 request가 남습니다."),
+                Line::from("보낸 요청 tab에는 한 agent에게 전송한 request도 남습니다."),
                 Line::from("M을 다시 눌러 닫고 계속하세요."),
             ],
         };
     }
     match app.collaboration_stage {
         CollaborationStage::Message => vec![
-            callout_label("PRESS m FOR THE SELECTED PEER"),
+            callout_label("MESSAGE THE SELECTED AGENT"),
             Line::from(""),
-            Line::from("m targets the exact agent under the watch cursor."),
-            Line::from("Press m to open its request composer."),
+            Line::from("m targets the single agent under the watch cursor."),
+            Line::from("Press m to open the request composer for that agent."),
         ],
         CollaborationStage::Composer => vec![
-            callout_label("THE COMPOSER STARTS EMPTY"),
+            callout_label("REVIEW HOW THE REQUEST WILL BE SENT"),
             Line::from(""),
-            Line::from("kind and mode remain visible and remembered."),
-            Line::from("Press Backspace while empty to close it."),
+            Line::from("kind and mode stay visible and are remembered for the next message."),
+            Line::from("The body is empty, so press Backspace to close the composer."),
         ],
         CollaborationStage::Mailbox => vec![
-            callout_label("PRESS M FOR THE MAILBOX"),
+            callout_label("REVIEW REQUEST HISTORY IN THE MAILBOX"),
             Line::from(""),
-            Line::from("M opens incoming and sent requests; b is an alias."),
-            Line::from("Press M now."),
+            Line::from("M opens incoming and sent requests together; b is an alias."),
+            Line::from("Press M to open the mailbox."),
         ],
         CollaborationStage::MailboxOpen => vec![
-            callout_label("MAILBOX OPEN — TOGGLE IT CLOSED"),
+            callout_label("SENT REQUESTS STAY IN THE MAILBOX"),
             Line::from(""),
-            Line::from("The sent tab keeps the request addressed to one peer."),
+            Line::from("The sent tab also keeps requests addressed to one agent."),
             Line::from("Press M again to close it and continue."),
         ],
     }
@@ -1840,7 +1840,7 @@ mod tests {
         let screen = rendered(&app, 130, 32).replace(' ', "");
         assert!(screen.contains("12/20"));
         assert!(screen.contains("muxa-sandbox"));
-        assert!(screen.contains("muxa-sandbox가선택"));
+        assert!(screen.contains("cursor는muxa-sandbox에있습니다"));
     }
 
     #[test]
@@ -1883,8 +1883,8 @@ mod tests {
         assert!(work.contains("WORKSPACE › WORK"));
         assert!(!work.contains("AGENTS  STATE"));
         assert!(work.contains("muxa-onboarding"));
-        assert!(work.contains("one window = one work"));
-        assert!(work.contains("MOVE THE REAL WATCH CURSOR"));
+        assert!(work.contains("navigate between work windows"));
+        assert!(work.contains("MOVE BETWEEN WORK WINDOWS"));
 
         app.step = TourStep::ALL
             .iter()
@@ -1892,7 +1892,7 @@ mod tests {
             .unwrap();
         let preview = rendered(&app, 120, 34);
         assert!(preview.contains("Inspector"));
-        assert!(preview.contains("INSPECT WITHOUT ATTACHING"));
+        assert!(preview.contains("CHECK A PANE WITHOUT ATTACHING"));
     }
 
     #[test]
@@ -2059,7 +2059,7 @@ mod tests {
         let mut app = TourApp::with_language(false, UiLanguage::Ko);
         let korean = rendered(&app, 120, 34);
         let compact_korean = korean.replace(' ', "");
-        assert!(compact_korean.contains("실제WATCHCURSOR를움직여보세요"));
+        assert!(compact_korean.contains("WORKWINDOW사이를이동합니다"));
         assert!(korean.contains("F2 English"));
 
         handle_key(
@@ -2067,7 +2067,7 @@ mod tests {
             KeyEvent::new(KeyCode::F(2), crossterm::event::KeyModifiers::NONE),
         );
         assert_eq!(app.language, UiLanguage::En);
-        assert!(rendered(&app, 120, 34).contains("MOVE THE REAL WATCH CURSOR"));
+        assert!(rendered(&app, 120, 34).contains("MOVE BETWEEN WORK WINDOWS"));
     }
 
     #[test]
@@ -2079,6 +2079,6 @@ mod tests {
         let compact = rendered(&TourApp::new(false), 80, 24);
         assert!(compact.contains("muxa watch"));
         assert!(compact.contains("muxa-onboarding"));
-        assert!(compact.contains("one window = one work"));
+        assert!(compact.contains("navigate between work windows"));
     }
 }

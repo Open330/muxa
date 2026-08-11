@@ -35,8 +35,9 @@ the tmux client to the agent blocked longest.
 request/reply mailbox; `m` addressing whatever row the cursor is on; `a`
 asking claude a headless question and `A` browsing the answers.
 
-**`demo-onboard.tape` — learning tmux and Muxa as one model.** The inert shell
-accepts real `tmux new-session` and `tmux attach` input, preserves the visible
+**`demo-onboard.tape` — learning tmux and Muxa as one model.** The welcome first
+explains why the practice session is needed. The safe shell simulation then accepts
+real `tmux new-session` and `tmux attach` input, preserves the visible
 window, pane, detach, and reattach transitions, demonstrates the managed `s`,
 `q`, and `D` surfaces as step 11, then continues directly at step 12 through
 watch's workspace/work state gutter, inspector, overlays, collaboration, and footer.

@@ -47,8 +47,9 @@ Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 
    닫습니다. Muxa는 unmanaged tmux 객체를 종료하지 않습니다.
 
 요약하면 **workspace/session → work/window → agent/pane → 관측·협업 → 명시적 종료**입니다.
-`muxa onboard` 하나에서 가상 shell의 `tmux new-session`부터 tmux 계층과 조작,
-detach/attach, Muxa prefix binding, watch workflow까지 연속해서 익힐 수 있습니다.
+`muxa onboard`는 먼저 환영 인사와 연습용 session을 만드는 이유를 설명합니다.
+이어서 가상 shell의 `tmux new-session`부터 tmux 계층과 조작, detach/attach,
+Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 있습니다.
 실제 tmux session은 변경하지 않습니다.
 
 <div align="center">
@@ -161,9 +162,11 @@ AIR 1.0 artifact 참조를 첨부할 수 있고, watch/dashboard mailbox가 prof
 기본 tmux 운영 정책은 session 하나가 workspace/project, window 하나가
 work/ticket, pane 하나가 agent라는 것입니다. `muxa onboard`는 Muxa를 소개하기
 전까지 tmux 자체의 기본 개념과 조작에 집중합니다. 가상
-기본 shell에서 시작해 `tmux new-session -s muxa-onboarding`을 직접 입력하게 하고,
-window/pane 조작과 detach 뒤에는 `tmux attach -t muxa-onboarding`도 직접 입력하게
-합니다. 이어서 같은 fullscreen 화면에서 현재 `muxa watch` workflow로
+기본 shell에서 시작하되, 먼저 환영 인사와 session이 terminal 화면을 하나의 작업
+공간으로 유지한다는 이유를 설명합니다. 그다음 `tmux new-session -s muxa-onboarding`을
+입력해 연습용 session을 만들고, window/pane 조작과 detach 뒤에는
+`tmux attach -t muxa-onboarding`을 입력해 다시 들어갑니다. 이어서 같은 fullscreen
+화면에서 현재 `muxa watch` workflow로
 전환합니다. watch와 같은 왼쪽 session-state gutter, 열, 50/50 inspector,
 overlay, 한 줄 footer를 보여주며 `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 `Backspace`, `M`을 실제로 누르고 마지막에는 `q`로 마칩니다. 전체 과정은 하나의

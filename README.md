@@ -53,9 +53,10 @@ The intended workflow is equally direct:
    Muxa refuses to terminate unmanaged tmux objects.
 
 In short: **workspace/session → work/window → agent/pane → observe and
-collaborate → explicit close**. Run `muxa onboard` for one continuous safe scenario: type
-`tmux new-session`, learn the hierarchy, windows, panes, detach/attach, and
-managed prefix bindings, then continue directly into the Muxa watch workflow.
+collaborate → explicit close**. Run `muxa onboard` for one continuous safe scenario.
+It welcomes you with the reason for creating a practice tmux session, then lets
+you type `tmux new-session`, learn the hierarchy, windows, panes, detach/attach,
+and managed prefix bindings before continuing directly into the Muxa watch workflow.
 Nothing in the tour mutates a live tmux session.
 
 <div align="center">
@@ -190,7 +191,8 @@ work/ticket, and each pane is an agent. `muxa onboard` teaches tmux first and
 introduces this Muxa mapping only after the tmux exercises, as one
 continuous scenario. It starts at a blank virtual shell, accepts the real
 `tmux new-session -s muxa-onboarding` and `tmux attach -t muxa-onboarding`
-commands, preserves every virtual window/pane transition, then continues without
+commands, and explains why each session command is needed before asking for it.
+It preserves every virtual window/pane transition, then continues without
 leaving fullscreen into the current `muxa watch` workflow. The watch half mirrors
 the left-edge session-state gutter, columns, 50/50 inspector, overlays, and
 footer. You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
@@ -202,7 +204,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 <div align="center">
   <img src="docs/demo-onboard.gif" alt="Unified Korean onboarding: virtual shell and tmux practice flowing directly into the Muxa watch workflow" width="900" />
   <br />
-  <sub><code>muxa onboard</code> — shell, tmux, and Muxa in one inert interactive scenario.</sub>
+  <sub><code>muxa onboard</code> — shell, tmux, and Muxa in one safe interactive scenario.</sub>
 </div>
 
 | Command | Purpose |

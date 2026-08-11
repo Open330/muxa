@@ -3,7 +3,8 @@
 #   vhs docs/demo-onboard.tape   →   docs/demo-onboard.gif
 #
 # Unlike the fleet recordings, this needs no daemon or tmux fixture. It starts
-# at an inert shell, teaches tmux by preserving each virtual layout transition,
+# with a welcome that explains the practice session, then teaches tmux in a
+# safe shell simulation while preserving each virtual layout transition,
 # then continues in the same fullscreen client into the Muxa watch workflow.
 #
 # Arc:
@@ -37,10 +38,10 @@ Show
 
 Type "muxa onboard --lang ko"
 Enter
-Sleep 1800ms
+Sleep 2600ms
 
-# Type the real commands into the virtual shell rather than accepting a
-# pre-filled prompt.
+# The welcome explains why this creates a practice session. Type the real
+# command into the virtual shell rather than accepting a pre-filled prompt.
 Type "tmux new-session -s muxa-onboarding"
 Enter
 Sleep 900ms

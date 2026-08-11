@@ -40,9 +40,11 @@ watch처럼 Works와 Inspector를 50/50으로 나눕니다.
 
 ![한글 통합 onboarding: 가상 shell과 tmux 조작에서 Muxa watch workflow로 이어지는 단일 시나리오](demo-onboard.gif)
 
-첫 shell에서는 `tmux new-session -s muxa-onboarding`을 직접 입력합니다. tmux 구간과
-watch 구간도 설명을 읽고 Enter만 누르는 방식이 아니라 실제 키를 눌러야
-진행됩니다.
+1/20은 환영 인사로 시작해 Muxa가 왜 tmux 기초부터 안내하는지 설명합니다.
+tmux session이 관련 terminal을 하나의 작업 공간으로 유지한다는 의미를 이해한 뒤
+`tmux new-session -s muxa-onboarding`을 입력해 연습용 session으로 들어갑니다.
+tmux 구간과 watch 구간도 설명을 읽고 Enter만 누르는 방식이 아니라 실제 키를
+눌러야 진행됩니다.
 
 - `j`/`↓`: 다음 work로 이동
 - `l`/`→`: 선택한 work의 child agent로 진입
@@ -81,8 +83,10 @@ prefix만 직접 누르게 합니다. tmux 안에서는 현재 client가 prefix 
 가상 prefix와 실제 suffix key로 진행하므로 live window 생성, pane 분할,
 client detach가 일어나지 않습니다.
 
-가상 기본 shell의 빈 prompt에서 `tmux new-session -s muxa-onboarding`을 직접 입력해
-가상 tmux client로 들어갑니다. 실제 키를 다음 순서로 눌러 진행합니다.
+환영 dialog에서 연습용 session을 만드는 이유와 이 실습이 실제 tmux 설정을 바꾸지
+않는다는 점을 먼저 확인합니다. 이어 가상 기본 shell의 빈 prompt에서
+`tmux new-session -s muxa-onboarding`을 입력해 가상 tmux client로 들어갑니다.
+실제 키를 다음 순서로 눌러 진행합니다.
 
 - `w`: session/window tree와 session → window → pane 계층
 - `c`: 현재 session 안에 새 window를 만들고 그 window의 shell 화면으로 전환
