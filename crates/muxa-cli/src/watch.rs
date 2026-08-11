@@ -399,7 +399,7 @@ pub(crate) enum WatchColumn {
     Workload,
     Prompt,
     Activity,
-    SessionTime,
+    WorkspaceTime,
 }
 
 impl WatchColumn {
@@ -418,7 +418,7 @@ impl WatchColumn {
             "workload" => Self::Workload,
             "prompt" => Self::Prompt,
             "activity" => Self::Activity,
-            "session_time" => Self::SessionTime,
+            "workspace_time" => Self::WorkspaceTime,
             _ => return None,
         })
     }
@@ -436,7 +436,7 @@ impl WatchColumn {
             Self::Workload => "TREE",
             Self::Prompt => "LAST PROMPT",
             Self::Activity => "ACT",
-            Self::SessionTime => "DUR",
+            Self::WorkspaceTime => "DUR",
         }
     }
 
@@ -450,7 +450,7 @@ impl WatchColumn {
             Self::State => Constraint::Length(3),
             Self::Model => Constraint::Length(16),
             Self::Ctx => Constraint::Length(5),
-            Self::Activity | Self::SessionTime => Constraint::Length(6),
+            Self::Activity | Self::WorkspaceTime => Constraint::Length(6),
             Self::Cost => Constraint::Length(7),
             // LIMITS — widest realistic payload is `⛔ 7d in 23h 59m`
             // (~17 cells with a wide-cell emoji). Wider columns crowd the
@@ -512,7 +512,7 @@ impl WatchColumn {
             Self::Workload => workload_text(a),
             Self::Prompt => summary_line(a, summary).into(),
             Self::Activity => relative_time(a.last_activity_at, now).into(),
-            Self::SessionTime => Text::from(Span::styled(
+            Self::WorkspaceTime => Text::from(Span::styled(
                 "-",
                 Style::default()
                     .fg(Color::DarkGray)
@@ -549,13 +549,13 @@ impl WatchColumn {
             | Self::Limits
             | Self::Workload
             | Self::Activity
-            | Self::SessionTime => Text::from(Span::styled("-", dim)),
+            | Self::WorkspaceTime => Text::from(Span::styled("-", dim)),
         }
     }
 
-    fn session_text<'a>(
+    fn work_text<'a>(
         self,
-        s: &'a SessionRow,
+        s: &'a WorkRow,
         now: OffsetDateTime,
         panes: &'a [PaneInfo],
         theme: WatchThemeSpec,
@@ -568,14 +568,14 @@ impl WatchColumn {
         }
         let Some(agent) = s.latest_agent.as_ref() else {
             return match self {
-                Self::Pane => session_label(s, theme, spin),
+                Self::Pane => work_label(s, theme, spin),
                 Self::Prompt => Text::from(Span::styled(
                     s.bare_summary.clone().unwrap_or_else(|| {
                         format!("{} pane{}", s.pane_count, plural(s.pane_count))
                     }),
                     dim,
                 )),
-                Self::SessionTime => session_time_text(s, now),
+                Self::WorkspaceTime => workspace_time_text(s, now),
                 Self::Kind | Self::State | Self::StateAge => Text::from(Span::styled("—", dim)),
                 Self::Model | Self::Ctx | Self::Cost | Self::Limits | Self::Activity => {
                     Text::from(Span::styled("-", dim))
@@ -585,7 +585,7 @@ impl WatchColumn {
         };
 
         match self {
-            Self::Pane => session_label(s, theme, spin),
+            Self::Pane => work_label(s, theme, spin),
             Self::Kind
             | Self::State
             | Self::StateAge
@@ -595,8 +595,8 @@ impl WatchColumn {
             | Self::Limits
             | Self::Prompt
             | Self::Activity => self.agent_text(agent, now, panes, theme, spin, summary),
-            Self::Workload => session_workload_text(s),
-            Self::SessionTime => session_time_text(s, now),
+            Self::Workload => work_workload_text(s),
+            Self::WorkspaceTime => workspace_time_text(s, now),
         }
     }
 }
@@ -623,14 +623,14 @@ pub(crate) fn resolve_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
     out
 }
 
-/// Resolve columns and apply the session-view duration default. This is used
+/// Resolve columns and apply the work-view duration default. This is used
 /// both at startup and when `:view` changes granularity at runtime so the two
 /// paths cannot drift into different table shapes.
 fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
     let mut columns = resolve_columns(cfg);
-    if cfg.view == WatchView::Session && !columns.contains(&WatchColumn::SessionTime) {
-        // The default layout carries STATE (glyph + state + age). In session
-        // view the leftmost cluster of the SESSION cell already shows every
+    if cfg.view == WatchView::Work && !columns.contains(&WatchColumn::WorkspaceTime) {
+        // The default layout carries STATE (glyph + state + age). In work
+        // view the leftmost cluster of the WORK cell already shows every
         // state as icon-with-count, so a STATE column is the same fact
         // twice — and 12 columns wide. Swap it for DUR rather than keeping
         // both; DUR + ACT is the whole timing story.
@@ -651,7 +651,7 @@ fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
         {
             columns = vec![
                 WatchColumn::Pane,
-                WatchColumn::SessionTime,
+                WatchColumn::WorkspaceTime,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
             ];
@@ -660,7 +660,7 @@ fn resolve_display_columns(cfg: &WatchConfig) -> Vec<WatchColumn> {
                 .iter()
                 .position(|c| matches!(c, WatchColumn::Prompt | WatchColumn::Activity))
                 .unwrap_or(columns.len());
-            columns.insert(insert_at, WatchColumn::SessionTime);
+            columns.insert(insert_at, WatchColumn::WorkspaceTime);
         }
     }
     columns
@@ -696,7 +696,7 @@ impl WatchColumn {
             Self::Workload => "workload",
             Self::Prompt => "prompt",
             Self::Activity => "activity",
-            Self::SessionTime => "session_time",
+            Self::WorkspaceTime => "workspace_time",
         }
     }
 }
@@ -707,26 +707,26 @@ impl WatchColumn {
 pub(crate) enum WatchRow {
     Agent(Box<Agent>),
     BarePane(Box<PaneInfo>),
-    Session(Box<SessionRow>),
+    Work(Box<WorkRow>),
 }
 
 /// Stable identity of a table row, used to keep the cursor pinned to the
-/// same session / agent / pane across refreshes and re-sorts.
+/// same work / agent / pane across refreshes and re-sorts.
 ///
-/// Deliberately *not* based on `pane_id`: a session row's
+/// Deliberately *not* based on `pane_id`: a work row's
 /// `representative_pane` is whichever of its agents was most recently
-/// active, so it changes on its own as the session works. Identity has to
+/// active, so it changes on its own as the work progresses. Identity has to
 /// survive that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RowIdentity {
     Agent(AgentKind, String),
     BarePane(String),
-    Session(String),
+    Work(String),
 }
 
-/// One selectable line after runtime filtering and optional session
+/// One selectable line after runtime filtering and optional work
 /// expansion have been applied. `agent_idx` points at a child agent inside a
-/// session row; `None` is the ordinary top-level row.
+/// work row; `None` is the ordinary top-level row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VisibleTarget {
     row_idx: usize,
@@ -752,20 +752,15 @@ struct WatchEventEntry {
 const MAX_WATCH_EVENTS: usize = 50;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SessionRow {
-    /// Raw session id — `PaneInfo.session` (tmux session name / herdr
-    /// `workspace_id`). This is the ledger/display key: activity lookups and
-    /// `display_name` resolution key off it (host id-spaces are disjoint, so a
-    /// raw id is unambiguous for those lookups). NOT the grouping key — a tmux
-    /// session and a herdr workspace can share a raw id (both "w1"), so
-    /// grouping/identity use `group_key` instead.
+pub(crate) struct WorkRow {
+    /// Parent workspace id: tmux session name or herdr workspace id. Activity
+    /// remains session/workspace-scoped even though each tmux row is one window.
     pub session: String,
-    /// Host-namespaced grouping/identity key (`"{host}:{session}"`, e.g.
-    /// `"tmux:w1"` vs `"herdr:w1"`). Keeps a tmux session and a herdr workspace
-    /// with the same raw id in distinct rows. Internal only — never displayed.
+    /// Host-namespaced work identity. tmux keys include stable session and
+    /// window ids; other hosts keep their native workspace grouping.
     pub group_key: String,
-    /// Human-facing name shown in the session view. Equals `session` on tmux;
-    /// resolves to the workspace label on herdr.
+    /// Human-facing `workspace › work` label on tmux; native workspace label
+    /// on hosts that do not expose a window-level work unit.
     pub display_name: String,
     pub pane_ids: Vec<String>,
     pub representative_pane: Option<String>,
@@ -779,7 +774,7 @@ pub(crate) struct SessionRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchSortPreset {
-    Session,
+    Workspace,
     Latest,
     Duration,
     State,
@@ -788,16 +783,16 @@ pub(crate) enum WatchSortPreset {
 impl WatchSortPreset {
     fn keys(self) -> Vec<WatchSortKey> {
         match self {
-            Self::Session => vec![WatchSortKey::Session, WatchSortKey::Activity],
+            Self::Workspace => vec![WatchSortKey::Workspace, WatchSortKey::Activity],
             Self::Latest => vec![WatchSortKey::Activity],
-            Self::Duration => vec![WatchSortKey::SessionTime],
+            Self::Duration => vec![WatchSortKey::WorkspaceTime],
             Self::State => vec![WatchSortKey::State, WatchSortKey::Activity],
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::Session => "SESSION",
+            Self::Workspace => "WORKSPACE",
             Self::Latest => "LATEST",
             Self::Duration => "DUR",
             Self::State => "ST",
@@ -807,9 +802,9 @@ impl WatchSortPreset {
 
 fn sort_label(keys: &[WatchSortKey]) -> &'static str {
     match keys.first().copied() {
-        Some(WatchSortKey::Session) | None => "SESSION",
+        Some(WatchSortKey::Workspace) | None => "WORKSPACE",
         Some(WatchSortKey::Activity) => "LATEST",
-        Some(WatchSortKey::SessionTime) => "DUR",
+        Some(WatchSortKey::WorkspaceTime) => "DUR",
         Some(WatchSortKey::State) => "ST",
         Some(WatchSortKey::Pane) => "PANE",
         Some(WatchSortKey::PaneId) => "PANE ID",
@@ -818,9 +813,9 @@ fn sort_label(keys: &[WatchSortKey]) -> &'static str {
 
 fn sort_key_toml_name(key: WatchSortKey) -> &'static str {
     match key {
-        WatchSortKey::Session => "session",
+        WatchSortKey::Workspace => "workspace",
         WatchSortKey::Activity => "latest",
-        WatchSortKey::SessionTime => "session_time",
+        WatchSortKey::WorkspaceTime => "workspace_time",
         WatchSortKey::State => "state",
         WatchSortKey::Pane => "pane",
         WatchSortKey::PaneId => "pane_id",
@@ -874,7 +869,7 @@ impl WatchRow {
         match self {
             Self::Agent(a) => a.pane.as_deref(),
             Self::BarePane(p) => Some(&p.pane_id),
-            Self::Session(s) => s.representative_pane.as_deref(),
+            Self::Work(s) => s.representative_pane.as_deref(),
         }
     }
 
@@ -883,7 +878,7 @@ impl WatchRow {
         match self {
             Self::Agent(a) => RowIdentity::Agent(a.kind, a.session_id.clone()),
             Self::BarePane(p) => RowIdentity::BarePane(p.pane_id.clone()),
-            Self::Session(s) => RowIdentity::Session(s.group_key.clone()),
+            Self::Work(s) => RowIdentity::Work(s.group_key.clone()),
         }
     }
 
@@ -891,7 +886,7 @@ impl WatchRow {
         match self {
             Self::Agent(a) => a.pane.as_deref() == Some(pane_id),
             Self::BarePane(p) => p.pane_id == pane_id,
-            Self::Session(s) => {
+            Self::Work(s) => {
                 s.representative_pane.as_deref() == Some(pane_id)
                     || s.pane_ids.iter().any(|id| id == pane_id)
                     || s.agents.iter().any(|a| a.pane.as_deref() == Some(pane_id))
@@ -936,16 +931,16 @@ pub(crate) enum QuickAction {
     SendPrompt { pane_id: String, text: String },
     /// Toggle the `?` help overlay. Pure UI — no side-effects.
     ShowHelp,
-    /// Create a detached tmux session at `dir` and start an agent in it
-    /// with its first prompt already on the command line. The launch
+    /// Create or reuse a workspace session and work window at `dir`, then
+    /// start an agent pane with its first prompt on the command line. The launch
     /// string is fully assembled (and shell-quoted) by the spawn form so
     /// the dispatcher stays a dumb pipe.
-    SpawnSession {
+    SpawnWork {
         dir: String,
         agent_label: &'static str,
         launch: String,
         /// Explicit work/ticket id; `None` derives one from the directory.
-        session: Option<String>,
+        work: Option<String>,
     },
 }
 
@@ -996,19 +991,114 @@ pub(crate) trait Effects {
     /// Enter after a short grace delay. Return Ok only if both tmux
     /// calls succeed.
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String>;
-    /// Create or reuse one managed work session and start an agent pane.
+    /// Create or reuse one managed workspace/work and start an agent pane.
     /// The explicit name is the work/ticket id; otherwise cwd derives it.
-    fn spawn_session(
+    fn spawn_work(
         &mut self,
         dir: &str,
         launch: &str,
-        session: Option<&str>,
+        work: Option<&str>,
     ) -> std::result::Result<String, String>;
 }
 
 /// Real-world `Effects` impl — shells out to tmux and the system
 /// clipboard helpers. Unit tests use a recorder stub instead.
 pub(crate) struct RealEffects;
+
+struct SpawnWorkPlan {
+    session: String,
+    created_workspace: bool,
+    created_work: bool,
+    args: Vec<String>,
+}
+
+fn plan_spawn_work(
+    cwd: &Path,
+    workspace: &str,
+    work: &str,
+    launch: &str,
+) -> std::result::Result<SpawnWorkPlan, String> {
+    let existing_workspace =
+        crate::tmux_work::find_workspace(workspace).map_err(|error| error.to_string())?;
+    if let Some(existing) =
+        crate::tmux_work::find_work_in(work, Some(workspace)).map_err(|error| error.to_string())?
+    {
+        let existing_cwd = std::fs::canonicalize(&existing.cwd)
+            .map_err(|error| format!("resolve {}: {error}", existing.cwd.display()))?;
+        if existing_cwd != cwd {
+            return Err(format!(
+                "work {} already uses {}; requested {}",
+                existing.work,
+                existing_cwd.display(),
+                cwd.display()
+            ));
+        }
+        return Ok(SpawnWorkPlan {
+            session: existing.session,
+            created_workspace: false,
+            created_work: false,
+            args: vec![
+                "split-window".to_string(),
+                "-h".into(),
+                "-d".into(),
+                "-P".into(),
+                "-F".into(),
+                "#{pane_id}".into(),
+                "-t".into(),
+                existing.window,
+                "-c".into(),
+                cwd.display().to_string(),
+                launch.to_string(),
+            ],
+        });
+    }
+
+    let window_name =
+        crate::tmux_work::window_name_for_work(work).map_err(|error| error.to_string())?;
+    if let Some(existing) = existing_workspace {
+        return Ok(SpawnWorkPlan {
+            session: existing.session.clone(),
+            created_workspace: false,
+            created_work: true,
+            args: vec![
+                "new-window".to_string(),
+                "-d".into(),
+                "-P".into(),
+                "-F".into(),
+                "#{pane_id}".into(),
+                "-t".into(),
+                existing.session,
+                "-n".into(),
+                window_name,
+                "-c".into(),
+                cwd.display().to_string(),
+                launch.to_string(),
+            ],
+        });
+    }
+
+    let session = crate::tmux_work::session_name_for_workspace(workspace)
+        .map_err(|error| error.to_string())?;
+    Ok(SpawnWorkPlan {
+        session: session.clone(),
+        created_workspace: true,
+        created_work: true,
+        args: vec![
+            "new-session".to_string(),
+            "-d".into(),
+            "-P".into(),
+            "-F".into(),
+            "#{pane_id}".into(),
+            "-s".into(),
+            session,
+            "-n".into(),
+            window_name,
+            "-c".into(),
+            cwd.display().to_string(),
+            launch.to_string(),
+        ],
+    })
+}
 
 impl Effects for RealEffects {
     fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String> {
@@ -1029,66 +1119,20 @@ impl Effects for RealEffects {
         )
     }
 
-    fn spawn_session(
+    fn spawn_work(
         &mut self,
         dir: &str,
         launch: &str,
-        session: Option<&str>,
+        explicit_work: Option<&str>,
     ) -> std::result::Result<String, String> {
-        let base = session.map_or_else(|| session_base_name(dir), str::to_string);
+        let base = explicit_work.map_or_else(|| session_base_name(dir), str::to_string);
         let work = crate::tmux_work::normalize_work_id(&base).map_err(|error| error.to_string())?;
         let cwd = std::fs::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
-        let existing = crate::tmux_work::find_work(&work).map_err(|error| error.to_string())?;
-        let (name, created, args) = if let Some(existing) = existing {
-            let existing_cwd = std::fs::canonicalize(&existing.cwd)
-                .map_err(|error| format!("resolve {}: {error}", existing.cwd.display()))?;
-            if existing_cwd != cwd {
-                return Err(format!(
-                    "work {} already uses {}; requested {}",
-                    existing.work,
-                    existing_cwd.display(),
-                    cwd.display()
-                ));
-            }
-            (
-                existing.session.clone(),
-                false,
-                vec![
-                    "split-window".to_string(),
-                    "-h".into(),
-                    "-d".into(),
-                    "-P".into(),
-                    "-F".into(),
-                    "#{pane_id}".into(),
-                    "-t".into(),
-                    existing.session,
-                    "-c".into(),
-                    cwd.display().to_string(),
-                    launch.to_string(),
-                ],
-            )
-        } else {
-            let name = crate::tmux_work::session_name_for_work(&work)
-                .map_err(|error| error.to_string())?;
-            (
-                name.clone(),
-                true,
-                vec![
-                    "new-session".to_string(),
-                    "-d".into(),
-                    "-P".into(),
-                    "-F".into(),
-                    "#{pane_id}".into(),
-                    "-s".into(),
-                    name,
-                    "-c".into(),
-                    cwd.display().to_string(),
-                    launch.to_string(),
-                ],
-            )
-        };
-        let output = muxa::tmux::tmux_command()
-            .args(&args)
+        let workspace =
+            crate::tmux_work::workspace_id_for_cwd(&cwd).map_err(|error| error.to_string())?;
+        let plan = plan_spawn_work(&cwd, &workspace, &work, launch)?;
+        let output = muxa::tmux::tmux_command_scoped()
+            .args(&plan.args)
             .output()
             .map_err(|error| format!("tmux: {error}"))?;
         if !output.status.success() {
@@ -1101,17 +1145,22 @@ impl Effects for RealEffects {
             .ok_or_else(|| "tmux returned no pane id".to_string())?
             .to_string();
         let agent = launch.split_whitespace().next().unwrap_or("unknown");
-        let marked = if created {
-            crate::tmux_work::mark_work(&name, &work, &cwd)
-                .and_then(|()| crate::tmux_work::mark_agent(&pane, agent, Some(&work), None, None))
-        } else {
-            crate::tmux_work::mark_agent(&pane, agent, Some(&work), None, None)
-        };
+        let window =
+            crate::tmux_work::window_id_for_pane(&pane).map_err(|error| error.to_string())?;
+        let marked = (|| {
+            if plan.created_workspace {
+                crate::tmux_work::mark_workspace(&plan.session, &workspace, &cwd)?;
+            }
+            if plan.created_work {
+                crate::tmux_work::mark_work(&window, &workspace, &work, &cwd)?;
+            }
+            crate::tmux_work::mark_agent(&pane, agent, Some(&workspace), Some(&work), None, None)
+        })();
         if let Err(error) = marked {
             crate::tmux_work::cleanup_pane(&pane);
             return Err(format!("record muxa tmux metadata: {error}"));
         }
-        Ok(name)
+        Ok(format!("{workspace}/{work}"))
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> std::result::Result<String, String> {
@@ -1292,14 +1341,14 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             Ok(via) => ActionOutcome::Ok(format!("✔ copied prompt via {via}")),
             Err(e) => ActionOutcome::Err(format!("✗ copy failed: {e}")),
         },
-        QuickAction::SpawnSession {
+        QuickAction::SpawnWork {
             dir,
             agent_label,
             launch,
-            session,
-        } => match fx.spawn_session(&dir, &launch, session.as_deref()) {
+            work,
+        } => match fx.spawn_work(&dir, &launch, work.as_deref()) {
             Ok(name) => ActionOutcome::Ok(format!(
-                "started {agent_label} in work/session {name} — Enter on its row to attach"
+                "started {agent_label} in workspace/work {name} — Enter on its row to attach"
             )),
             Err(e) => ActionOutcome::Err(format!("spawn failed: {e}")),
         },
@@ -1336,12 +1385,12 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  type or /       filter; / allows reserved first characters",
         "  Backspace/C-W   edit filter / delete previous word",
         "  Ctrl-U / Esc    clear filter; Esc again backs out / quits",
-        "  ↑/↓ · j/k       move sessions/children while browsing",
+        "  ↑/↓ · j/k       move works/agents while browsing",
         "  ←/→ · h/l       return to parent / enter first child agent",
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach to selected pane",
-        "  n              new/reused work session + agent (dir · ticket · prompt)",
+        "  n              new/reused workspace/work + agent (dir · ticket · prompt)",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -1356,7 +1405,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  i / e          (in mailbox) claim inbox / reply",
         "",
         "Sorting",
-        "  Alt-S/L/D/T    session / latest / duration / state",
+        "  Alt-S/L/D/T    workspace / latest / duration / state",
         "State markers",
         match crate::icon_set() {
             IconSet::Unicode => {
@@ -1615,7 +1664,7 @@ enum SpawnField {
     Prompt,
 }
 
-/// `n` launches or reuses one work/ticket session and adds an agent pane.
+/// `n` launches or reuses one workspace session and work window, then adds an agent pane.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SpawnComposer {
     dir: String,
@@ -2117,10 +2166,10 @@ pub(crate) struct App {
     table_page_rows: usize,
     /// When true, only error / input / choice targets remain visible.
     pub attention_only: bool,
-    /// Session group currently expanded into individually-selectable child
-    /// rows. Selection keeps this to at most one group: the selected session,
-    /// or the parent session of the selected child agent.
-    expanded_sessions: HashSet<String>,
+    /// Work group currently expanded into individually-selectable child rows.
+    /// Selection keeps this to at most one group: the selected work, or the
+    /// parent work of the selected child agent.
+    expanded_works: HashSet<String>,
     /// Wide terminals show a persistent live inspector unless explicitly
     /// disabled with Alt-I.
     pub inspector_enabled: bool,
@@ -2294,9 +2343,9 @@ impl App {
     pub(crate) fn new() -> Self {
         // Pin pane view for the pane-level tests built around this helper
         // (sorting, grouping, per-row actions, single-agent updates). The
-        // *production* default is `session` (see `WatchConfig::default`);
-        // session-view behavior is covered separately by config-crate tests
-        // and the explicit `view: Session` cases below. Pinning here keeps
+        // *production* default is `work` (see `WatchConfig::default`);
+        // work-view behavior is covered separately by config-crate tests and
+        // the explicit `view: Work` cases below. Pinning here keeps
         // those pane-mechanics assertions stable regardless of the default.
         Self::with_config(WatchConfig {
             view: WatchView::Pane,
@@ -2326,7 +2375,7 @@ impl App {
             pending_g: false,
             table_page_rows: 10,
             attention_only: false,
-            expanded_sessions: HashSet::new(),
+            expanded_works: HashSet::new(),
             inspector_enabled: true,
             inspector_visible: false,
             events: VecDeque::new(),
@@ -2379,14 +2428,14 @@ impl App {
     }
 
     /// Clone the lightweight agent records needed for transition detection.
-    /// A session row also keeps a cloned agent list, so this is independent of
+    /// A work row also keeps a cloned agent list, so this is independent of
     /// the current table granularity.
     fn current_agents(&self) -> Vec<Agent> {
         self.rows
             .iter()
             .flat_map(|r| match r {
                 WatchRow::Agent(a) => vec![(**a).clone()],
-                WatchRow::Session(s) => s.agents.clone(),
+                WatchRow::Work(s) => s.agents.clone(),
                 WatchRow::BarePane(_) => Vec::new(),
             })
             .collect()
@@ -2496,7 +2545,7 @@ impl App {
     ) {
         // Remember *which row* the cursor is on before the row set is
         // rebuilt from scratch below. Every refresh re-sorts, and the
-        // default `sort = ["state", "session", "latest"]` reorders as
+        // default `sort = ["state", "workspace", "latest"]` reorders as
         // agents flip state, so holding the raw table index would silently
         // slide the highlight onto a neighbouring session.
         let selected = self.selected_identity();
@@ -2526,7 +2575,7 @@ impl App {
         }
 
         if self.watch_cfg.view != WatchView::Pane {
-            self.rows = build_session_rows(
+            self.rows = build_work_rows(
                 agents,
                 &panes,
                 &sessions,
@@ -2609,7 +2658,7 @@ impl App {
 
         self.watch_cfg.view = view;
         self.columns = resolve_display_columns(&self.watch_cfg);
-        self.expanded_sessions.clear();
+        self.expanded_works.clear();
         self.set_data_with_sessions(agents, panes, sessions, session_activity);
         // Hidden paneless agents are not present in `current_agents()`, so a
         // cache-only view rebuild cannot recount them. Preserve the counts
@@ -2638,13 +2687,13 @@ impl App {
         );
         let sort_keys = &self.watch_cfg.sort;
 
-        if self.watch_cfg.view == WatchView::Session {
+        if self.watch_cfg.view == WatchView::Work {
             self.rows.sort_by(|a, b| match (a, b) {
-                (WatchRow::Session(a), WatchRow::Session(b)) => {
-                    sort_sessions(a, b, sort_keys, &sort_context)
+                (WatchRow::Work(a), WatchRow::Work(b)) => {
+                    sort_works(a, b, sort_keys, &sort_context)
                 }
-                (WatchRow::Session(_), _) => std::cmp::Ordering::Less,
-                (_, WatchRow::Session(_)) => std::cmp::Ordering::Greater,
+                (WatchRow::Work(_), _) => std::cmp::Ordering::Less,
+                (_, WatchRow::Work(_)) => std::cmp::Ordering::Greater,
                 _ => std::cmp::Ordering::Equal,
             });
         } else {
@@ -2670,7 +2719,7 @@ impl App {
 
     fn identity_for_target(&self, target: VisibleTarget) -> Option<RowIdentity> {
         if let Some(agent_idx) = target.agent_idx {
-            let WatchRow::Session(session) = self.rows.get(target.row_idx)? else {
+            let WatchRow::Work(session) = self.rows.get(target.row_idx)? else {
                 return None;
             };
             let agent = session.agents.get(agent_idx)?;
@@ -2680,18 +2729,18 @@ impl App {
         }
     }
 
-    fn session_group_for_identity(&self, identity: &RowIdentity) -> Option<String> {
-        if self.watch_cfg.view != WatchView::Session {
+    fn work_group_for_identity(&self, identity: &RowIdentity) -> Option<String> {
+        if self.watch_cfg.view != WatchView::Work {
             return None;
         }
         match identity {
-            RowIdentity::Session(group_key) => self
+            RowIdentity::Work(group_key) => self
                 .rows
                 .iter()
                 .any(|row| {
                     matches!(
                         row,
-                        WatchRow::Session(session)
+                        WatchRow::Work(session)
                             if &session.group_key == group_key
                                 && session.pane_count > 1
                                 && !session.agents.is_empty()
@@ -2699,7 +2748,7 @@ impl App {
                 })
                 .then(|| group_key.clone()),
             RowIdentity::Agent(kind, session_id) => self.rows.iter().find_map(|row| {
-                let WatchRow::Session(session) = row else {
+                let WatchRow::Work(session) = row else {
                     return None;
                 };
                 (session.pane_count > 1
@@ -2715,10 +2764,10 @@ impl App {
     }
 
     fn set_auto_expansion(&mut self, identity: Option<&RowIdentity>) {
-        let group_key = identity.and_then(|id| self.session_group_for_identity(id));
-        self.expanded_sessions.clear();
+        let group_key = identity.and_then(|id| self.work_group_for_identity(id));
+        self.expanded_works.clear();
         if let Some(group_key) = group_key {
-            self.expanded_sessions.insert(group_key);
+            self.expanded_works.insert(group_key);
         }
     }
 
@@ -2729,9 +2778,9 @@ impl App {
         })
     }
 
-    /// Keep the selected session open without requiring a separate expand
+    /// Keep the selected work open without requiring a separate expand
     /// keystroke. Selecting one of its child agents keeps the same parent open;
-    /// moving to another session folds the previous one and opens the new one.
+    /// moving to another work folds the previous one and opens the new one.
     fn sync_auto_expansion(&mut self) {
         let identity = self.selected_identity();
         self.set_auto_expansion(identity.as_ref());
@@ -2746,17 +2795,17 @@ impl App {
     ///
     /// **Why identity and not the table index**: rows are re-sorted on
     /// every refresh (~2 Hz, plus one per pushed transition), and the
-    /// default sort leads with `state`. When a *neighbouring* session
+    /// default sort leads with `state`. When a *neighbouring* work
     /// starts working or goes blocked it jumps past the highlighted row,
     /// which shifts everything below it down one. Keeping the raw index
-    /// then leaves the highlight sitting on a different session than the
-    /// one the user aimed at — the "list looks shifted by one, Enter
-    /// opened the wrong session" report. Pinning by identity makes the
+    /// then leaves the highlight sitting on a different work than the one
+    /// the user aimed at — the "list looks shifted by one, Enter opened the
+    /// wrong work" report. Pinning by identity makes the
     /// highlight travel *with* its row, so Enter always targets what the
     /// user is looking at.
     ///
     /// Falls back to the index clamp only when the row genuinely
-    /// disappeared (session killed, agent exited).
+    /// disappeared (work window closed, agent exited).
     fn restore_selection(&mut self, previous: Option<RowIdentity>) {
         if let Some(prev) = previous.as_ref() {
             self.set_auto_expansion(Some(prev));
@@ -2772,7 +2821,7 @@ impl App {
         let targets = self.visible_targets();
         if targets.is_empty() {
             self.table_state.select(None);
-            self.expanded_sessions.clear();
+            self.expanded_works.clear();
             return;
         }
         match self.table_state.selected() {
@@ -2841,11 +2890,11 @@ impl App {
         isize::try_from(rows).unwrap_or(isize::MAX)
     }
 
-    /// Move across session parents by default, even though the selected
-    /// session's children are already visible. Once `→` enters a child, the
-    /// same keys cycle only that session's visible children until `←` returns
+    /// Move across work parents by default, even though the selected work's
+    /// children are already visible. Once `→` enters a child, the same keys
+    /// cycle only that work's visible children until `←` returns
     /// to the parent. This keeps a long child roster from slowing down the
-    /// common case of scanning between sessions.
+    /// common case of scanning between work items.
     fn move_vertical(&mut self, delta: isize) {
         let targets = self.visible_targets();
         if targets.is_empty() {
@@ -2921,7 +2970,7 @@ impl App {
         selected: Option<usize>,
     ) -> Vec<usize> {
         let current = selected.and_then(|index| targets.get(index));
-        if self.watch_cfg.view == WatchView::Session {
+        if self.watch_cfg.view == WatchView::Work {
             match current {
                 Some(target) if target.agent_idx.is_some() => targets
                     .iter()
@@ -2942,7 +2991,7 @@ impl App {
         }
     }
 
-    fn move_into_session(&mut self) {
+    fn move_into_work(&mut self) {
         self.sync_auto_expansion();
         let Some(index) = self.table_state.selected() else {
             return;
@@ -2963,17 +3012,17 @@ impl App {
         }
     }
 
-    fn move_to_session_parent(&mut self) {
+    fn move_to_work_parent(&mut self) {
         let Some(target) = self.selected_target() else {
             return;
         };
         if target.agent_idx.is_none() {
             return;
         }
-        let Some(WatchRow::Session(session)) = self.rows.get(target.row_idx) else {
+        let Some(WatchRow::Work(session)) = self.rows.get(target.row_idx) else {
             return;
         };
-        self.restore_selection(Some(RowIdentity::Session(session.group_key.clone())));
+        self.restore_selection(Some(RowIdentity::Work(session.group_key.clone())));
     }
 
     /// `pane_id` of the currently selected row, if any.
@@ -2999,7 +3048,7 @@ impl App {
         let target = self.selected_target()?;
         match self.rows.get(target.row_idx)? {
             WatchRow::Agent(agent) => Some(agent),
-            WatchRow::Session(session) => target
+            WatchRow::Work(session) => target
                 .agent_idx
                 .and_then(|idx| session.agents.get(idx))
                 .or(session.latest_agent.as_ref()),
@@ -3027,12 +3076,12 @@ impl App {
                 });
             }
 
-            let WatchRow::Session(session) = row else {
+            let WatchRow::Work(session) = row else {
                 continue;
             };
             if self.watch_cfg.view == WatchView::Swarm
                 || session.pane_count <= 1
-                || !self.expanded_sessions.contains(&session.group_key)
+                || !self.expanded_works.contains(&session.group_key)
             {
                 continue;
             }
@@ -3142,7 +3191,7 @@ impl App {
 
 fn target_pane(app: &App, target: VisibleTarget) -> Option<String> {
     match app.rows.get(target.row_idx)? {
-        WatchRow::Session(session) => target
+        WatchRow::Work(session) => target
             .agent_idx
             .and_then(|idx| session.agents.get(idx))
             .and_then(|agent| agent.pane.clone())
@@ -3194,7 +3243,7 @@ fn row_matches_query(row: &WatchRow, panes: &[PaneInfo], query: &str) -> bool {
         ]
         .into_iter()
         .any(|value| contains_ci(value, query)),
-        WatchRow::Session(session) => {
+        WatchRow::Work(session) => {
             contains_ci(&session.display_name, query)
                 || contains_ci(&session.session, query)
                 || session
@@ -3212,7 +3261,7 @@ fn row_matches_query(row: &WatchRow, panes: &[PaneInfo], query: &str) -> bool {
 fn row_needs_attention(row: &WatchRow) -> bool {
     match row {
         WatchRow::Agent(agent) => agent_needs_attention(agent.state),
-        WatchRow::Session(session) => session
+        WatchRow::Work(session) => session
             .agents
             .iter()
             .any(|agent| agent_needs_attention(agent.state)),
@@ -3353,7 +3402,7 @@ fn sort_agents(
 
     for key in keys {
         let cmp = match key {
-            WatchSortKey::Session => info_a
+            WatchSortKey::Workspace => info_a
                 .map(|p| p.session.as_str())
                 .cmp(&info_b.map(|p| p.session.as_str())),
             WatchSortKey::Activity => {
@@ -3361,7 +3410,7 @@ fn sort_agents(
                 b.last_activity_at.cmp(&a.last_activity_at)
             }
             WatchSortKey::State => state_sort_rank(a.state).cmp(&state_sort_rank(b.state)),
-            WatchSortKey::SessionTime => sort_context
+            WatchSortKey::WorkspaceTime => sort_context
                 .agent_session_duration_secs(b)
                 .cmp(&sort_context.agent_session_duration_secs(a)),
             WatchSortKey::Pane => {
@@ -3385,7 +3434,7 @@ fn sort_agents(
     a.pane.as_deref().cmp(&b.pane.as_deref())
 }
 
-/// Host-namespaced grouping/identity key for a session row.
+/// Host-namespaced fallback grouping key for a workspace-level row.
 ///
 /// A tmux session and a herdr workspace can share a raw session id (both
 /// named "w1"); grouping by the raw id alone merges them into one corrupted
@@ -3401,6 +3450,41 @@ fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
         Some(muxa::HostKind::Herdr) => format!("herdr:{session}"),
         Some(muxa::HostKind::Zellij) => format!("zellij:{session}"),
         None => session.to_string(),
+    }
+}
+
+/// Stable grouping key for one visible work unit. tmux exposes the complete
+/// three-level topology, so the work identity is its window inside a session.
+/// Other backends currently expose only a workspace/session level.
+fn pane_work_group_key(pane: &PaneInfo) -> String {
+    match muxa::backend::pane_id_host_kind(&pane.pane_id) {
+        Some(muxa::HostKind::Tmux) => {
+            let session = if pane.session_id.is_empty() {
+                pane.session.as_str()
+            } else {
+                pane.session_id.as_str()
+            };
+            let window = if pane.window_id.is_empty() {
+                pane.window_index.as_str()
+            } else {
+                pane.window_id.as_str()
+            };
+            format!("tmux:{session}:{window}")
+        }
+        host => session_group_key(host, &pane.session),
+    }
+}
+
+fn pane_work_display_name(pane: &PaneInfo) -> Option<String> {
+    if muxa::backend::pane_id_host_kind(&pane.pane_id) == Some(muxa::HostKind::Tmux) {
+        let work = if pane.window_name.trim().is_empty() {
+            format!("window {}", pane.window_index)
+        } else {
+            pane.window_name.clone()
+        };
+        Some(format!("{} › {work}", pane.session))
+    } else {
+        None
     }
 }
 
@@ -3427,56 +3511,123 @@ fn agent_session_group(
         })
 }
 
-fn build_session_rows(
+#[derive(Default)]
+struct WorkRowBuilder {
+    /// Raw session id (display/ledger key).
+    session: String,
+    /// Host-namespaced grouping/identity key.
+    group_key: String,
+    display_name: Option<String>,
+    panes: Vec<PaneInfo>,
+    agents: Vec<Agent>,
+    activity: Option<SessionActivity>,
+}
+
+fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) -> WorkRow {
+    builder.panes.sort_by(sort_panes);
+    builder.agents.sort_by(|a, b| {
+        b.last_activity_at
+            .cmp(&a.last_activity_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    let latest_agent = builder.agents.first().cloned();
+    let representative_pane = latest_agent
+        .as_ref()
+        .and_then(|a| a.pane.clone())
+        .or_else(|| builder.panes.first().map(|p| p.pane_id.clone()));
+    let bare_summary = if latest_agent.is_none() {
+        builder.panes.first().map(|p| {
+            let first = if p.title.is_empty() || p.title == p.current_command {
+                p.current_command.clone()
+            } else {
+                format!("{}  {}", p.current_command, p.title)
+            };
+            if builder.panes.len() > 1 {
+                format!("{first} · {} panes", builder.panes.len())
+            } else {
+                first
+            }
+        })
+    } else {
+        None
+    };
+    let agent_states = builder
+        .agents
+        .iter()
+        .map(|agent| ((agent.kind, agent.session_id.clone()), agent.state))
+        .collect();
+    WorkRow {
+        display_name: builder
+            .display_name
+            .unwrap_or_else(|| sort_context.display_name(&builder.session)),
+        group_key: builder.group_key,
+        session: builder.session,
+        pane_ids: builder
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id.clone())
+            .collect(),
+        representative_pane,
+        latest_agent,
+        agents: builder.agents,
+        pane_count: builder.panes.len(),
+        bare_summary,
+        activity: builder.activity,
+        agent_states,
+    }
+}
+
+fn build_work_rows(
     agents: Vec<Agent>,
     panes: &[PaneInfo],
     sessions: &[SessionInfo],
     session_activity: &[SessionActivity],
     sort_keys: &[WatchSortKey],
 ) -> Vec<WatchRow> {
-    #[derive(Default)]
-    struct Builder {
-        /// Raw session id (display/ledger key).
-        session: String,
-        /// Host-namespaced grouping/identity key.
-        group_key: String,
-        panes: Vec<PaneInfo>,
-        agents: Vec<Agent>,
-        activity: Option<SessionActivity>,
-    }
-
     let sort_context =
         SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
-    // Keyed by the host-namespaced `group_key`, not the raw session, so a tmux
-    // session "w1" and a herdr workspace "w1" build two rows.
-    let mut builders: HashMap<String, Builder> = HashMap::new();
+    // tmux groups each window as one work row. A session with three ticket
+    // windows therefore renders three parents, each expanding to its agents.
+    let mut builders: HashMap<String, WorkRowBuilder> = HashMap::new();
     for p in panes {
-        let host = muxa::backend::pane_id_host_kind(&p.pane_id);
-        let key = session_group_key(host, &p.session);
-        let entry = builders.entry(key.clone()).or_insert_with(|| Builder {
-            session: p.session.clone(),
-            group_key: key,
-            ..Builder::default()
-        });
+        let key = pane_work_group_key(p);
+        let entry = builders
+            .entry(key.clone())
+            .or_insert_with(|| WorkRowBuilder {
+                session: p.session.clone(),
+                group_key: key,
+                display_name: pane_work_display_name(p),
+                ..WorkRowBuilder::default()
+            });
         entry.panes.push(p.clone());
     }
 
     for agent in agents {
-        let (session, host) = agent_session_group(&agent, |id| {
-            sort_context.pane(id).map(|p| {
+        let located = agent
+            .pane
+            .as_deref()
+            .and_then(|id| sort_context.pane(id))
+            .map(|pane| {
                 (
-                    p.session.clone(),
-                    muxa::backend::pane_id_host_kind(&p.pane_id),
+                    pane.session.clone(),
+                    pane_work_group_key(pane),
+                    pane_work_display_name(pane),
                 )
-            })
+            });
+        let (session, key, display_name) = located.unwrap_or_else(|| {
+            let (session, host) = agent_session_group(&agent, |_| None);
+            let key = session_group_key(host, &session);
+            (session, key, None)
         });
-        let key = session_group_key(host, &session);
-        let entry = builders.entry(key.clone()).or_insert_with(|| Builder {
-            session,
-            group_key: key,
-            ..Builder::default()
-        });
+        let entry = builders
+            .entry(key.clone())
+            .or_insert_with(|| WorkRowBuilder {
+                session,
+                group_key: key,
+                display_name,
+                ..WorkRowBuilder::default()
+            });
         entry.agents.push(agent);
     }
 
@@ -3486,60 +3637,14 @@ fn build_session_rows(
         }
     }
 
-    let mut rows: Vec<SessionRow> = builders
+    let mut rows: Vec<WorkRow> = builders
         .into_values()
-        .map(|mut b| {
-            b.panes.sort_by(sort_panes);
-            b.agents.sort_by(|a, b| {
-                b.last_activity_at
-                    .cmp(&a.last_activity_at)
-                    .then_with(|| a.session_id.cmp(&b.session_id))
-            });
-            let latest_agent = b.agents.first().cloned();
-            let representative_pane = latest_agent
-                .as_ref()
-                .and_then(|a| a.pane.clone())
-                .or_else(|| b.panes.first().map(|p| p.pane_id.clone()));
-            let bare_summary = if latest_agent.is_none() {
-                b.panes.first().map(|p| {
-                    let first = if p.title.is_empty() || p.title == p.current_command {
-                        p.current_command.clone()
-                    } else {
-                        format!("{}  {}", p.current_command, p.title)
-                    };
-                    if b.panes.len() > 1 {
-                        format!("{first} · {} panes", b.panes.len())
-                    } else {
-                        first
-                    }
-                })
-            } else {
-                None
-            };
-            let agent_states = b
-                .agents
-                .iter()
-                .map(|agent| ((agent.kind, agent.session_id.clone()), agent.state))
-                .collect();
-            SessionRow {
-                display_name: sort_context.display_name(&b.session),
-                group_key: b.group_key,
-                session: b.session,
-                pane_ids: b.panes.iter().map(|p| p.pane_id.clone()).collect(),
-                representative_pane,
-                latest_agent,
-                agents: b.agents,
-                pane_count: b.panes.len(),
-                bare_summary,
-                activity: b.activity,
-                agent_states,
-            }
-        })
+        .map(|builder| finish_work_row(builder, &sort_context))
         .collect();
 
-    rows.sort_by(|a, b| sort_sessions(a, b, sort_keys, &sort_context));
+    rows.sort_by(|a, b| sort_works(a, b, sort_keys, &sort_context));
     rows.into_iter()
-        .map(|row| WatchRow::Session(Box::new(row)))
+        .map(|row| WatchRow::Work(Box::new(row)))
         .collect()
 }
 
@@ -3551,7 +3656,7 @@ fn row_host(row: &WatchRow) -> Option<muxa::HostKind> {
     let pane_id = match row {
         WatchRow::Agent(a) => a.pane.as_deref(),
         WatchRow::BarePane(p) => Some(p.pane_id.as_str()),
-        WatchRow::Session(s) => s
+        WatchRow::Work(s) => s
             .representative_pane
             .as_deref()
             .or_else(|| s.pane_ids.first().map(String::as_str)),
@@ -3625,35 +3730,35 @@ fn sort_panes(a: &PaneInfo, b: &PaneInfo) -> std::cmp::Ordering {
         .then_with(|| a.pane_id.cmp(&b.pane_id))
 }
 
-fn sort_sessions(
-    a: &SessionRow,
-    b: &SessionRow,
+fn sort_works(
+    a: &WorkRow,
+    b: &WorkRow,
     keys: &[WatchSortKey],
     sort_context: &SortContext<'_>,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let pane_info = |row: &SessionRow| {
+    let pane_info = |row: &WorkRow| {
         row.representative_pane
             .as_deref()
             .and_then(|id| sort_context.pane(id))
     };
     for key in keys {
         let cmp = match key {
-            WatchSortKey::Session => a.session.cmp(&b.session),
+            WatchSortKey::Workspace => a.session.cmp(&b.session),
             WatchSortKey::Activity => b
                 .latest_agent
                 .as_ref()
                 .map(|agent| agent.last_activity_at)
                 .cmp(&a.latest_agent.as_ref().map(|agent| agent.last_activity_at)),
             WatchSortKey::State => {
-                let rank = |row: &SessionRow| {
+                let rank = |row: &WorkRow| {
                     row.latest_agent
                         .as_ref()
                         .map_or(u8::MAX, |agent| state_sort_rank(agent.state))
                 };
                 rank(a).cmp(&rank(b))
             }
-            WatchSortKey::SessionTime => sort_context
+            WatchSortKey::WorkspaceTime => sort_context
                 .session_duration_secs(&b.session)
                 .cmp(&sort_context.session_duration_secs(&a.session)),
             WatchSortKey::Pane => {
@@ -3713,8 +3818,8 @@ const STATE_SUMMARY_ORDER: [AgentState; 7] = [
     AgentState::Stopped,
 ];
 
-const SESSION_STATE_GUTTER_WIDTH: usize = 6;
-const SESSION_STATE_GUTTER_CONTENT_WIDTH: usize = SESSION_STATE_GUTTER_WIDTH - 1;
+const WORK_STATE_GUTTER_WIDTH: usize = 6;
+const WORK_STATE_GUTTER_CONTENT_WIDTH: usize = WORK_STATE_GUTTER_WIDTH - 1;
 
 #[derive(Clone)]
 struct StateSummaryPart {
@@ -3795,7 +3900,7 @@ fn state_summary_gutter_spans(
     spin: Spinner,
 ) -> Vec<Span<'static>> {
     let parts = state_summary_parts(states, theme, spin);
-    let fitted = if state_summary_parts_width(&parts) <= SESSION_STATE_GUTTER_CONTENT_WIDTH {
+    let fitted = if state_summary_parts_width(&parts) <= WORK_STATE_GUTTER_CONTENT_WIDTH {
         parts
     } else {
         let total_count = parts.iter().map(|part| part.count).sum::<usize>();
@@ -3810,11 +3915,11 @@ fn state_summary_gutter_spans(
                 0
             } else {
                 let separator = usize::from(!candidate.is_empty());
-                let label = overflow_label(remaining_count, SESSION_STATE_GUTTER_CONTENT_WIDTH);
+                let label = overflow_label(remaining_count, WORK_STATE_GUTTER_CONTENT_WIDTH);
                 separator + unicode_width::UnicodeWidthStr::width(label.as_str())
             };
             if state_summary_parts_width(&candidate) + overflow_width
-                <= SESSION_STATE_GUTTER_CONTENT_WIDTH
+                <= WORK_STATE_GUTTER_CONTENT_WIDTH
             {
                 kept = candidate;
                 omitted_count = remaining_count;
@@ -3825,7 +3930,7 @@ fn state_summary_gutter_spans(
 
         if omitted_count > 0 {
             kept.push(StateSummaryPart {
-                label: overflow_label(omitted_count, SESSION_STATE_GUTTER_CONTENT_WIDTH),
+                label: overflow_label(omitted_count, WORK_STATE_GUTTER_CONTENT_WIDTH),
                 style: theme.dim_style(),
                 count: omitted_count,
             });
@@ -3838,8 +3943,8 @@ fn state_summary_gutter_spans(
         .iter()
         .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
         .sum::<usize>();
-    if width < SESSION_STATE_GUTTER_WIDTH {
-        spans.push(Span::raw(" ".repeat(SESSION_STATE_GUTTER_WIDTH - width)));
+    if width < WORK_STATE_GUTTER_WIDTH {
+        spans.push(Span::raw(" ".repeat(WORK_STATE_GUTTER_WIDTH - width)));
     }
     spans
 }
@@ -3859,7 +3964,7 @@ fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'stati
         .collect()
 }
 
-fn session_label(s: &SessionRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static> {
+fn work_label(s: &WorkRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static> {
     let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme, spin);
     spans.push(Span::raw(s.display_name.clone()));
 
@@ -3937,7 +4042,7 @@ fn state_age_text(
 }
 
 fn session_state_age_text(
-    session: &SessionRow,
+    session: &WorkRow,
     now: OffsetDateTime,
     theme: WatchThemeSpec,
     spin: Spinner,
@@ -4019,7 +4124,7 @@ fn resolve_row_pulses(app: &App) -> Vec<Option<PulseKind>> {
         .map(|r| {
             let who = match r {
                 WatchRow::Agent(a) => Some((a.kind, a.session_id.as_str())),
-                WatchRow::Session(s) => s
+                WatchRow::Work(s) => s
                     .latest_agent
                     .as_ref()
                     .map(|a| (a.kind, a.session_id.as_str())),
@@ -4039,12 +4144,12 @@ fn rows_have_active_spinner(rows: &[WatchRow]) -> bool {
     }
     rows.iter().any(|r| match r {
         WatchRow::Agent(a) => is_spinner_state(a.state),
-        WatchRow::Session(s) => s.agents.iter().any(|a| is_spinner_state(a.state)),
+        WatchRow::Work(s) => s.agents.iter().any(|a| is_spinner_state(a.state)),
         WatchRow::BarePane(_) => false,
     })
 }
 
-fn session_time_text(s: &SessionRow, now: OffsetDateTime) -> Text<'static> {
+fn workspace_time_text(s: &WorkRow, now: OffsetDateTime) -> Text<'static> {
     let Some(activity) = s.activity.as_ref() else {
         return Text::from(Span::styled(
             "-",
@@ -4302,8 +4407,8 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
 /// "first event for this session" case, where the next fallback
 /// tick will reconcile sort order and pane labels.
 fn apply_single_agent(app: &mut App, agent: Agent) {
-    if app.watch_cfg.view == WatchView::Session {
-        apply_single_agent_to_session(app, agent);
+    if app.watch_cfg.view == WatchView::Work {
+        apply_single_agent_to_work(app, agent);
         return;
     }
 
@@ -4328,32 +4433,35 @@ fn apply_single_agent(app: &mut App, agent: Agent) {
     // merge in isolation.
 }
 
-fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
-    // Resolve the agent's raw session (display/ledger) and its pane host, then
-    // match rows on the host-namespaced group key — the same keying
-    // `build_session_rows` uses — so a herdr "w1" agent never merges into a
-    // tmux "w1" row.
-    let (session, host) = agent
-        .pane
-        .as_deref()
-        .and_then(|id| {
-            app.panes.iter().find(|p| p.pane_id == id).map(|p| {
-                (
-                    p.session.clone(),
-                    muxa::backend::pane_id_host_kind(&p.pane_id),
-                )
-            })
+fn apply_single_agent_to_work(app: &mut App, agent: Agent) {
+    // Match the same session+window work key used by the full refresh. This
+    // keeps a pushed transition inside its ticket window instead of merging
+    // every agent in the workspace session.
+    let located = agent.pane.as_deref().and_then(|id| {
+        app.panes.iter().find(|p| p.pane_id == id).map(|p| {
+            (
+                p.session.clone(),
+                pane_work_group_key(p),
+                pane_work_display_name(p),
+            )
         })
-        .unwrap_or_else(|| {
-            let session = agent
-                .pane
-                .as_deref()
-                .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"));
-            (session, None)
-        });
-    let group_key = session_group_key(host, &session);
+    });
+    let (session, group_key, display_name) = located.unwrap_or_else(|| {
+        let session = agent
+            .pane
+            .as_deref()
+            .map_or_else(|| "(no session)".to_string(), |p| format!("(stale {p})"));
+        let group_key = session_group_key(None, &session);
+        (session.clone(), group_key, Some(session))
+    });
+    let display_name = display_name.unwrap_or_else(|| {
+        app.sessions
+            .iter()
+            .find(|item| item.session_id == session || item.name == session)
+            .map_or_else(|| session.clone(), |item| item.name.clone())
+    });
     for row in &mut app.rows {
-        let WatchRow::Session(s) = row else {
+        let WatchRow::Work(s) = row else {
             continue;
         };
         if s.group_key != group_key {
@@ -4394,15 +4502,7 @@ fn apply_single_agent_to_session(app: &mut App, agent: Agent) {
 
     let mut agent_states = HashMap::new();
     agent_states.insert((agent.kind, agent.session_id.clone()), agent.state);
-    // Resolve the workspace label from the last full refresh's session list
-    // (herdr); on tmux and for an unknown key this is the key itself. The next
-    // `Full` tick rebuilds the row via `build_session_rows` regardless.
-    let display_name = app
-        .sessions
-        .iter()
-        .find(|s| s.session_id == session || s.name == session)
-        .map_or_else(|| session.clone(), |s| s.name.clone());
-    app.rows.push(WatchRow::Session(Box::new(SessionRow {
+    app.rows.push(WatchRow::Work(Box::new(WorkRow {
         display_name,
         group_key,
         session,
@@ -4431,15 +4531,15 @@ fn apply_full(app: &mut App, full: FullRefresh) {
     // Build a lookup of the previously-known agents so the merge can
     // distinguish a genuine daemon-driven change from a transient
     // `Starting` placeholder that also regressed optional fields to
-    // None. In session view, this must include every collapsed agent,
-    // not just the session's latest representative.
+    // None. In work view, this must include every collapsed agent, not just
+    // the work's latest representative.
     let mut prev_rows: HashMap<(AgentKind, String), &Agent> = HashMap::new();
     for row in &app.rows {
         match row {
             WatchRow::Agent(a) => {
                 prev_rows.insert((a.kind, a.session_id.clone()), a);
             }
-            WatchRow::Session(s) => {
+            WatchRow::Work(s) => {
                 for agent in &s.agents {
                     prev_rows.insert((agent.kind, agent.session_id.clone()), agent);
                 }
@@ -4961,7 +5061,7 @@ pub async fn run(
                     app.apply_view(view);
                     let label = match view {
                         WatchView::Pane => "pane",
-                        WatchView::Session => "session",
+                        WatchView::Work => "work",
                         WatchView::Swarm => "swarm",
                     };
                     app.set_hint(format!("view: {label}"), HintLevel::Ok);
@@ -5228,7 +5328,10 @@ pub async fn run(
         }
     }
 
-    let watch_pane = app.selected_pane().or(initial_pane);
+    // Attribute the interaction to the pane that launched watch. The cursor
+    // may finish on an unrelated session; recording that selected pane made
+    // operator activity look as though another window had invoked the TUI.
+    let watch_pane = initial_pane;
     append_human_interaction(
         activity_path.as_deref(),
         HumanInteractionKind::MuxaWatch,
@@ -5419,8 +5522,8 @@ fn peer_choice_hint(labels: &[String]) -> String {
 }
 
 /// The recipient under host scope: the tracked agent selected in any window.
-/// On a collapsed session row, prefer its sole non-origin agent; that makes a
-/// one-agent session addressable without expanding it.
+/// On a collapsed work row, prefer its sole non-origin agent; that makes a
+/// one-agent work addressable without expanding it.
 /// The origin — and thus where the reply lands, this watch's `M` mailbox —
 /// stays the launch agent; only the target leaves the room.
 fn host_scope_target(app: &App) -> Option<(String, String)> {
@@ -5435,7 +5538,7 @@ fn host_scope_target(app: &App) -> Option<(String, String)> {
         .map(|origin| origin.pane.as_str());
     let agent = match app.rows.get(selected.row_idx)? {
         WatchRow::Agent(agent) => Some(agent.as_ref()),
-        WatchRow::Session(session) => selected
+        WatchRow::Work(session) => selected
             .agent_idx
             .and_then(|index| session.agents.get(index))
             .or_else(|| {
@@ -5496,15 +5599,15 @@ fn open_watch_collaboration_composer(app: &mut App) {
         // startup — not the row under the cursor. Name the room and say
         // the cursor is not the lever, because the table spans every
         // session on the host and an unqualified "no peer here" reads as
-        // plainly false to someone pointing at a two-agent session.
+        // plainly false to someone pointing at a two-agent work.
         Some(room) if room.peers.is_empty() => Err(empty_room_hint(&room.current)),
         Some(room) => {
             let selected_pane = app.selected_pane();
             selected_pane
                 .as_deref()
                 .and_then(|pane| app.collaboration.peer_for_pane(pane))
-                // A session row is a whole tmux session, and the pane it
-                // resolves to drifts with agent activity. Accept the row
+                // A work row is a whole tmux window, and the pane it resolves
+                // to drifts with agent activity. Accept the row
                 // when exactly one peer lives in it; more than one is
                 // genuinely ambiguous and still asks.
                 .or_else(|| peer_inside_selected_row(app, room))
@@ -5963,19 +6066,19 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "sort duration",
-        description: "sort by session duration",
+        description: "sort by workspace duration",
     },
     CommandSpec {
-        command: "sort session",
-        description: "sort by session name",
+        command: "sort workspace",
+        description: "sort by workspace name",
     },
     CommandSpec {
         command: "sort state",
         description: "sort by attention state",
     },
     CommandSpec {
-        command: "view session",
-        description: "group by session",
+        command: "view work",
+        description: "group agents by work window",
     },
     CommandSpec {
         command: "view pane",
@@ -6052,9 +6155,9 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         }
         "sort latest" => Action::SetSort(WatchSortPreset::Latest),
         "sort duration" => Action::SetSort(WatchSortPreset::Duration),
-        "sort session" => Action::SetSort(WatchSortPreset::Session),
+        "sort workspace" => Action::SetSort(WatchSortPreset::Workspace),
         "sort state" | "sort attention" => Action::SetSort(WatchSortPreset::State),
-        "view session" | "view sessions" => Action::SetView(WatchView::Session),
+        "view work" | "view works" => Action::SetView(WatchView::Work),
         "view pane" | "view panes" => Action::SetView(WatchView::Pane),
         "view swarm" => Action::SetView(WatchView::Swarm),
         "" => {
@@ -6197,7 +6300,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => Action::OpenPreview,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => Action::Refresh,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
-                Action::SetSort(WatchSortPreset::Session)
+                Action::SetSort(WatchSortPreset::Workspace)
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'l') => {
                 Action::SetSort(WatchSortPreset::Latest)
@@ -6257,11 +6360,11 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Right => {
-            app.move_into_session();
+            app.move_into_work();
             Action::None
         }
         KeyCode::Left => {
-            app.move_to_session_parent();
+            app.move_to_work_parent();
             Action::None
         }
         KeyCode::Home => {
@@ -6344,11 +6447,11 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('a') if app.browse_keys_active() => Action::OpenAsk,
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
-            app.move_to_session_parent();
+            app.move_to_work_parent();
             Action::None
         }
         KeyCode::Char('l') if app.browse_keys_active() => {
-            app.move_into_session();
+            app.move_into_work();
             Action::None
         }
         KeyCode::Char('G') if app.browse_keys_active() => {
@@ -6689,13 +6792,13 @@ fn handle_spawn_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> 
             }
             let agent = spawn.agent;
             let name = spawn.name.trim().to_string();
-            let session = (!name.is_empty()).then_some(name);
+            let work = (!name.is_empty()).then_some(name);
             app.spawn = None;
-            Action::Quick(QuickAction::SpawnSession {
+            Action::Quick(QuickAction::SpawnWork {
                 launch: agent.launch_command(&prompt),
                 agent_label: agent.label(),
                 dir,
-                session,
+                work,
             })
         }
         other => {
@@ -7025,11 +7128,11 @@ fn preview_targets_for_pane(app: &App, pane_id: &str) -> Vec<String> {
     match row {
         WatchRow::Agent(a) => a.pane.clone().into_iter().collect(),
         WatchRow::BarePane(p) => vec![p.pane_id.clone()],
-        WatchRow::Session(s) => session_preview_targets(s),
+        WatchRow::Work(s) => work_preview_targets(s),
     }
 }
 
-fn session_preview_targets(s: &SessionRow) -> Vec<String> {
+fn work_preview_targets(s: &WorkRow) -> Vec<String> {
     let agent_panes: HashSet<String> = s.agents.iter().filter_map(|a| a.pane.clone()).collect();
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
@@ -7186,7 +7289,7 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
             ),
             on_confirm: ConfirmAction::Quick(QuickAction::KillPane(p.pane_id.clone())),
         }),
-        Some(WatchRow::Session(s)) => match s.representative_pane.as_deref() {
+        Some(WatchRow::Work(s)) => match s.representative_pane.as_deref() {
             Some(pane_id) => Action::AskConfirm(ConfirmPopup {
                 message: format!("Kill pane {}?", app.pane_label(pane_id)),
                 on_confirm: ConfirmAction::Quick(QuickAction::KillPane(pane_id.to_string())),
@@ -7201,7 +7304,7 @@ pub(crate) fn quick_kill_action(app: &App) -> Action {
 /// but the destructive verb in the popup says "Abort" instead of "Kill".
 pub(crate) fn quick_abort_action(app: &App) -> Action {
     match app.selected_row() {
-        Some(WatchRow::Agent(_) | WatchRow::Session(_)) => {
+        Some(WatchRow::Agent(_) | WatchRow::Work(_)) => {
             match app.selected_agent().and_then(|agent| agent.pane.as_deref()) {
                 Some(pane_id) => Action::AskConfirm(ConfirmPopup {
                     message: format!("Abort current turn in {}?", app.pane_label(pane_id)),
@@ -8572,7 +8675,7 @@ fn build_preview_lines<'a>(app: &'a App, pane_id: &str) -> Vec<Line<'a>> {
 
     let agent = app.rows.iter().find_map(|r| match r {
         WatchRow::Agent(a) if a.pane.as_deref() == Some(pane_id) => Some(a.as_ref()),
-        WatchRow::Session(s) => s
+        WatchRow::Work(s) => s
             .agents
             .iter()
             .find(|a| a.pane.as_deref() == Some(pane_id))
@@ -8667,7 +8770,7 @@ fn app_agent_states(app: &App) -> Vec<AgentState> {
     for row in &app.rows {
         match row {
             WatchRow::Agent(agent) => states.push(agent.state),
-            WatchRow::Session(session) => states.extend(session.agent_states.values().copied()),
+            WatchRow::Work(session) => states.extend(session.agent_states.values().copied()),
             WatchRow::BarePane(_) => {}
         }
     }
@@ -8694,7 +8797,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .filter(|r| match r {
             WatchRow::Agent(_) => true,
-            WatchRow::Session(s) => s.latest_agent.is_some(),
+            WatchRow::Work(s) => s.latest_agent.is_some(),
             WatchRow::BarePane(_) => false,
         })
         .count();
@@ -8719,9 +8822,9 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  "),
     ];
 
-    if app.watch_cfg.view == WatchView::Session {
+    if matches!(app.watch_cfg.view, WatchView::Work | WatchView::Swarm) {
         spans.push(Span::styled(
-            format!("{} session{}", app.rows.len(), plural(app.rows.len())),
+            format!("{} work{}", app.rows.len(), plural(app.rows.len())),
             Style::default().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("  "));
@@ -9029,9 +9132,9 @@ fn swarm_load(agent: &Agent) -> String {
     parts.join(" ")
 }
 
-/// One cluster header line: `▐ session [n]  <state spinners>  n⬆ n⊂`.
+/// One cluster header line: `▐ workspace › work [n]  <state spinners>  n⬆ n⊂`.
 fn swarm_cluster_header(
-    sr: &SessionRow,
+    sr: &WorkRow,
     theme: WatchThemeSpec,
     frame: usize,
     is_sel: bool,
@@ -9048,7 +9151,7 @@ fn swarm_cluster_header(
             Style::default().fg(theme.accent),
         ),
         Span::styled(
-            sr.session.clone(),
+            sr.display_name.clone(),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -9141,9 +9244,9 @@ fn swarm_agent_lines(
     out
 }
 
-/// The swarm console: one cluster per tmux session, animated dot spinners
+/// The swarm console: one cluster per tmux work window, animated dot spinners
 /// for working/starting agents, and an indented subagent tree under each
-/// agent. Selection (j/k) highlights the session cluster.
+/// agent. Selection (j/k) highlights the work cluster.
 fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let frame = app.anim_frame;
@@ -9155,7 +9258,7 @@ fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
     let visible_targets = app.visible_targets();
     for (i, target) in visible_targets.iter().enumerate() {
         let row = &app.rows[target.row_idx];
-        let WatchRow::Session(sr) = row else {
+        let WatchRow::Work(sr) = row else {
             continue;
         };
         let is_sel = selected == Some(i);
@@ -9243,8 +9346,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let header_cells = columns.iter().map(|c| {
-        let header = if app.watch_cfg.view == WatchView::Session && matches!(c, WatchColumn::Pane) {
-            "SESSION"
+        let header = if app.watch_cfg.view == WatchView::Work && matches!(c, WatchColumn::Pane) {
+            "WORKSPACE › WORK"
         } else if matches!(c, WatchColumn::Prompt) && app.watch_cfg.summary != WatchSummary::Prompt
         {
             // The column still falls back to the last prompt, but its
@@ -9287,7 +9390,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             target
                 .agent_idx
                 .map_or(row_pulses[target.row_idx], |agent_idx| {
-                    let WatchRow::Session(session) = &app.rows[target.row_idx] else {
+                    let WatchRow::Work(session) = &app.rows[target.row_idx] else {
                         return None;
                     };
                     let agent = session.agents.get(agent_idx)?;
@@ -9302,7 +9405,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|(i, target)| {
             let r = &app.rows[target.row_idx];
             let child_agent = match (r, target.agent_idx) {
-                (WatchRow::Session(session), Some(agent_idx)) => session.agents.get(agent_idx),
+                (WatchRow::Work(session), Some(agent_idx)) => session.agents.get(agent_idx),
                 _ => None,
             };
             let mut texts: Vec<Text> = if let Some(agent) = child_agent {
@@ -9321,10 +9424,10 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                         })
                         .collect(),
                     WatchRow::BarePane(p) => columns.iter().map(|c| c.bare_text(p)).collect(),
-                    WatchRow::Session(s) => columns
+                    WatchRow::Work(s) => columns
                         .iter()
                         .map(|c| {
-                            c.session_text(s, now, &app.panes, theme, spin, app.watch_cfg.summary)
+                            c.work_text(s, now, &app.panes, theme, spin, app.watch_cfg.summary)
                         })
                         .collect(),
                 }
@@ -9338,7 +9441,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             if let Some(pc) = pane_col {
                 if target.agent_idx.is_some() {
                     prepend_tree_prefix(&mut texts[pc], "  └─ ", theme.dim_style());
-                } else if matches!(r, WatchRow::Session(_)) {
+                } else if matches!(r, WatchRow::Work(_)) {
                     // Parent rows use one stable, glyph-free gutter. Triangle
                     // markers are East-Asian-width ambiguous in some macOS
                     // terminal fonts and made single/multi-pane labels appear
@@ -9358,7 +9461,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             if Some(i) == selected && app.watch_cfg.detail.enabled {
                 // Child rows used to suppress the selected-row detail entirely.
                 // Resolve against the exact selected agent instead, while parent
-                // session rows continue to use their latest-agent fallback.
+                // work rows continue to use their latest-agent fallback.
                 let child_row = child_agent.cloned().map(WatchRow::agent);
                 let detail_row = child_row.as_ref().unwrap_or(r);
                 let configured_detail =
@@ -9422,8 +9525,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(theme.border_style())
                 .border_type(theme.border_type)
-                .title(if app.watch_cfg.view == WatchView::Session {
-                    " Sessions "
+                .title(if app.watch_cfg.view == WatchView::Work {
+                    " Works "
                 } else {
                     " Agents "
                 }),
@@ -9443,8 +9546,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 /// from "everything visible is hidden as paneless" so the hint is
 /// actionable in both cases.
 fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
-    let title = if app.watch_cfg.view == WatchView::Session {
-        " Sessions "
+    let title = if app.watch_cfg.view == WatchView::Work {
+        " Works "
     } else {
         " Agents "
     };
@@ -9464,7 +9567,7 @@ fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpe
                 truncate_chars(&app.search_query, 60)
             ),
             (false, false) => format!(
-                "No sessions or agents match ‘{}’.",
+                "No work or agents match ‘{}’.",
                 truncate_chars(&app.search_query, 60)
             ),
             (true, true) => "No agents currently need attention.".to_string(),
@@ -9713,13 +9816,13 @@ fn resolve_var(
             | "rate_limit_scope" => "—".into(),
             _ => return None,
         }),
-        WatchRow::Session(s) => {
+        WatchRow::Work(s) => {
             if let Some(a) = s.latest_agent.as_ref() {
                 return resolve_var(name, &WatchRow::agent(a.clone()), panes, now);
             }
             Some(match name {
                 "pane" => s.session.clone(),
-                "kind" => "session".into(),
+                "kind" => "work".into(),
                 "last_prompt" => s.bare_summary.clone().unwrap_or_else(|| "—".into()),
                 "activity" => s.activity.as_ref().map_or_else(
                     || "—".into(),
@@ -9819,8 +9922,8 @@ fn workload_text(a: &Agent) -> Text<'static> {
     Text::from(Span::styled(label, Style::default().fg(Color::Cyan)))
 }
 
-fn session_workload_text(s: &SessionRow) -> Text<'static> {
-    let label = session_workload_badge(s).unwrap_or_else(|| "-".into());
+fn work_workload_text(s: &WorkRow) -> Text<'static> {
+    let label = work_workload_badge(s).unwrap_or_else(|| "-".into());
     if label == "-" {
         return Text::from(Span::styled(
             "-",
@@ -9835,7 +9938,7 @@ fn session_workload_text(s: &SessionRow) -> Text<'static> {
 fn row_workload_badge(row: &WatchRow) -> Option<String> {
     match row {
         WatchRow::Agent(a) => agent_workload_badge(a),
-        WatchRow::Session(s) => session_workload_badge(s),
+        WatchRow::Work(s) => work_workload_badge(s),
         WatchRow::BarePane(_) => None,
     }
 }
@@ -9859,7 +9962,7 @@ fn agent_workload_badge(a: &Agent) -> Option<String> {
     }
 }
 
-fn session_workload_badge(s: &SessionRow) -> Option<String> {
+fn work_workload_badge(s: &WorkRow) -> Option<String> {
     let (subagents, shells, other) = s.agents.iter().fold((0u32, 0u32, 0u32), |acc, a| {
         (
             acc.0 + u32::from(a.workload.subagent_count),
@@ -10703,6 +10806,7 @@ mod tests {
             id: id.into(),
             from,
             to,
+            provenance: None,
             kind: RequestKind::Review,
             body: "review the auth change".into(),
             expects_reply: true,
@@ -10916,13 +11020,13 @@ mod tests {
         let action = handle_spawn_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
         assert!(app.spawn.is_none(), "a successful launch closes the form");
         match action {
-            Action::Quick(QuickAction::SpawnSession {
+            Action::Quick(QuickAction::SpawnWork {
                 dir,
                 agent_label,
                 launch,
-                session,
+                work,
             }) => {
-                assert_eq!(session, None, "no name typed — derive from dir");
+                assert_eq!(work, None, "no name typed — derive from dir");
                 assert_eq!(dir, "/tmp");
                 assert_eq!(agent_label, "codex");
                 assert_eq!(
@@ -10930,7 +11034,7 @@ mod tests {
                     "codex --dangerously-bypass-approvals-and-sandbox '리뷰해줘'"
                 );
             }
-            other => panic!("expected SpawnSession, got {other:?}"),
+            other => panic!("expected SpawnWork, got {other:?}"),
         }
     }
 
@@ -10958,7 +11062,7 @@ mod tests {
         let action = handle_spawn_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
         assert!(matches!(
             action,
-            Action::Quick(QuickAction::SpawnSession { session: Some(ref s), .. })
+            Action::Quick(QuickAction::SpawnWork { work: Some(ref s), .. })
                 if s == "my.review:run"
         ));
     }
@@ -11059,7 +11163,7 @@ mod tests {
     fn narrow_tables_fold_the_summary_column_before_the_name() {
         let cols = vec![
             WatchColumn::Pane,
-            WatchColumn::SessionTime,
+            WatchColumn::WorkspaceTime,
             WatchColumn::Activity,
             WatchColumn::Prompt,
         ];
@@ -11071,7 +11175,7 @@ mod tests {
             effective_columns(&cols, 59),
             vec![
                 WatchColumn::Pane,
-                WatchColumn::SessionTime,
+                WatchColumn::WorkspaceTime,
                 WatchColumn::Activity,
             ]
         );
@@ -11272,7 +11376,7 @@ mod tests {
     }
 
     #[test]
-    fn host_scope_selected_session_beats_the_only_launch_window_peer() {
+    fn host_scope_selected_work_beats_the_only_launch_window_peer() {
         let mut app = collaboration_watch_app();
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.set_data(
@@ -11314,13 +11418,11 @@ mod tests {
                 fake_pane("%913", "cal-7041", 0, 0, "claude"),
             ],
         );
-        app.apply_view(WatchView::Session);
+        app.apply_view(WatchView::Work);
         let row_index = app
             .rows
             .iter()
-            .position(
-                |row| matches!(row, WatchRow::Session(session) if session.session == "cal-7041"),
-            )
+            .position(|row| matches!(row, WatchRow::Work(session) if session.session == "cal-7041"))
             .unwrap();
         let visible_index = app
             .visible_targets()
@@ -11486,11 +11588,11 @@ mod tests {
     }
 
     #[test]
-    fn m_resolves_a_peer_from_the_session_row_that_holds_it() {
+    fn m_resolves_a_peer_from_the_work_row_that_holds_it() {
         // Pointing at the session the peer lives in is enough; the user
         // should not have to expand it to the exact pane first.
         let mut app = collaboration_watch_app();
-        app.apply_view(WatchView::Session);
+        app.apply_view(WatchView::Work);
         app.table_state.select(Some(0));
 
         open_watch_collaboration_composer(&mut app);
@@ -11502,7 +11604,7 @@ mod tests {
                     .map(|composer| &composer.target),
                 Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%2"
             ),
-            "expected the peer inside the selected session row"
+            "expected the peer inside the selected work row"
         );
     }
 
@@ -11785,19 +11887,19 @@ mod tests {
     }
 
     #[test]
-    fn agents_group_by_session_then_window_pane_index() {
+    fn agents_group_by_work_window_then_pane_index() {
         // Agents from sessions "alpha" and "beta" interleaved by pane id,
         // plus one stale agent whose pane no longer exists. Expect:
         //   1. all alpha agents grouped, then all beta agents grouped
         //   2. within a session, ordered by window then pane index
         //   3. stale agent at the end
         //
-        // Uses an explicit `[Session, Pane]` sort so the assertion stays
+        // Uses an explicit `[Workspace, Pane]` sort so the assertion stays
         // independent of `last_activity_at` jitter from `fake_agent`. The
-        // default `[Session, Activity]` is exercised by separate tests.
+        // default `[Workspace, Activity]` is exercised by separate tests.
         let cfg = WatchConfig {
             view: WatchView::Pane,
-            sort: vec![WatchSortKey::Session, WatchSortKey::Pane],
+            sort: vec![WatchSortKey::Workspace, WatchSortKey::Pane],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -11834,7 +11936,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
 
@@ -11852,7 +11954,7 @@ mod tests {
         // Uses explicit `Pane` sort so activity-jitter doesn't matter.
         let cfg = WatchConfig {
             view: WatchView::Pane,
-            sort: vec![WatchSortKey::Session, WatchSortKey::Pane],
+            sort: vec![WatchSortKey::Workspace, WatchSortKey::Pane],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -11882,7 +11984,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%1", "%2", "%10"]);
@@ -11938,10 +12040,10 @@ mod tests {
     }
 
     #[test]
-    fn default_sort_keeps_session_grouping_and_floats_latest_activity_in_each_group() {
-        // Default config = [Session, Activity]. Two sessions with two
+    fn default_sort_keeps_work_grouping_and_floats_latest_activity_in_each_group() {
+        // Default config = [Workspace, Activity]. Two workspaces with two
         // agents each at staggered timestamps. Expect:
-        //   - alpha group first, then beta group (session asc)
+        //   - alpha group first, then beta group (workspace asc)
         //   - newest agent at top within each group
         let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
@@ -11969,7 +12071,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         // alpha: %11 (newer t2) before %10 (older t0); then beta: %21
@@ -12006,7 +12108,7 @@ mod tests {
                 .iter()
                 .filter_map(|r| match r {
                     WatchRow::Agent(a) => a.pane.clone(),
-                    WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                    WatchRow::BarePane(_) | WatchRow::Work(_) => None,
                 })
                 .collect()
         };
@@ -12024,12 +12126,12 @@ mod tests {
     }
 
     #[test]
-    fn session_view_collapses_panes_to_latest_active_agent() {
+    fn work_view_collapses_panes_to_latest_active_agent() {
         let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12048,8 +12150,8 @@ mod tests {
         );
 
         assert_eq!(app.rows.len(), 2);
-        let WatchRow::Session(main) = &app.rows[0] else {
-            panic!("expected session row");
+        let WatchRow::Work(main) = &app.rows[0] else {
+            panic!("expected work row");
         };
         assert_eq!(main.session, "main");
         assert_eq!(main.representative_pane.as_deref(), Some("%2"));
@@ -12069,13 +12171,13 @@ mod tests {
     /// leads with `state`; when `amux` goes Error it jumps above `muxa`, so
     /// holding the raw table index left the cursor on `amux`.
     #[test]
-    fn full_refresh_reorder_keeps_the_cursor_on_the_same_session() {
+    fn full_refresh_reorder_keeps_the_cursor_on_the_same_work() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             sort: vec![
                 WatchSortKey::State,
-                WatchSortKey::Session,
+                WatchSortKey::Workspace,
                 WatchSortKey::Activity,
             ],
             ..WatchConfig::default()
@@ -12093,7 +12195,7 @@ mod tests {
             app.rows
                 .iter()
                 .filter_map(|r| match r {
-                    WatchRow::Session(s) => Some(s.session.clone()),
+                    WatchRow::Work(s) => Some(s.session.clone()),
                     WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
                 })
                 .collect()
@@ -12134,7 +12236,7 @@ mod tests {
         );
     }
 
-    /// A session row's `representative_pane` is whichever of its agents was
+    /// A work row's `representative_pane` is whichever of its agents was
     /// most recently active, so it changes on its own. Pinning the cursor by
     /// pane id alone would lose the row; identity is pinned by session name.
     #[test]
@@ -12143,7 +12245,7 @@ mod tests {
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             sort: vec![WatchSortKey::Activity],
             ..WatchConfig::default()
         };
@@ -12182,19 +12284,19 @@ mod tests {
             vec![],
         );
         assert_eq!(app.table_state.selected(), Some(1));
-        let WatchRow::Session(selected) = app.selected_row().expect("selection survives") else {
-            panic!("expected session row");
+        let WatchRow::Work(selected) = app.selected_row().expect("selection survives") else {
+            panic!("expected work row");
         };
         assert_eq!(selected.session, "muxa");
         assert_eq!(selected.representative_pane.as_deref(), Some("%3"));
     }
 
     #[test]
-    fn session_view_label_summarizes_agent_states() {
+    fn work_view_label_summarizes_agent_states() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12222,10 +12324,10 @@ mod tests {
             vec![],
         );
 
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
-        let text = WatchColumn::Pane.session_text(
+        let text = WatchColumn::Pane.work_text(
             row,
             now,
             &app.panes,
@@ -12233,15 +12335,15 @@ mod tests {
             Spinner::OFF,
             app.watch_cfg.summary,
         );
-        assert_eq!(plain_text(&text), "■ +4  main");
+        assert_eq!(plain_text(&text), "■ +4  main › window 0");
     }
 
     #[test]
-    fn session_view_state_summary_survives_long_session_name() {
+    fn work_view_state_summary_survives_long_session_name() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             // Assert the static gutter layout, not an animation frame.
             spinner: false,
             ..WatchConfig::default()
@@ -12284,7 +12386,7 @@ mod tests {
     fn swarm_view_renders_cluster_spinner_and_subagent_tree() {
         let cfg = WatchConfig {
             view: WatchView::Swarm,
-            sort: vec![WatchSortKey::Session],
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12319,20 +12421,17 @@ mod tests {
             .join("\n");
 
         assert!(screen.contains("Swarm"), "swarm title:\n{screen}");
-        assert!(
-            screen.contains("worker"),
-            "session cluster header:\n{screen}"
-        );
+        assert!(screen.contains("worker"), "work cluster header:\n{screen}");
         assert!(screen.contains("Explore"), "subagent tree row:\n{screen}");
         assert!(screen.contains("◇1"), "subagent load badge:\n{screen}");
     }
 
     #[test]
-    fn session_view_shows_single_agent_state_summary() {
+    fn work_view_shows_single_agent_state_summary() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12349,10 +12448,10 @@ mod tests {
         agent.last_activity_at = now + time::Duration::seconds(1);
         apply_single_agent(&mut app, agent);
 
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
-        let text = WatchColumn::Pane.session_text(
+        let text = WatchColumn::Pane.work_text(
             row,
             now + time::Duration::seconds(1),
             &app.panes,
@@ -12360,15 +12459,15 @@ mod tests {
             Spinner::OFF,
             app.watch_cfg.summary,
         );
-        assert_eq!(plain_text(&text), "▶     main");
+        assert_eq!(plain_text(&text), "▶     main › window 0");
     }
 
     #[test]
-    fn session_view_state_gutter_keeps_names_aligned() {
+    fn work_view_state_gutter_keeps_names_aligned() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12397,8 +12496,8 @@ mod tests {
             .rows
             .iter()
             .filter_map(|row| match row {
-                WatchRow::Session(row) => {
-                    let text = WatchColumn::Pane.session_text(
+                WatchRow::Work(row) => {
+                    let text = WatchColumn::Pane.work_text(
                         row,
                         now,
                         &app.panes,
@@ -12414,22 +12513,22 @@ mod tests {
 
         assert_eq!(
             display_col_of(&labels["multi"], "multi"),
-            Some(SESSION_STATE_GUTTER_WIDTH)
+            Some(WORK_STATE_GUTTER_WIDTH)
         );
         assert_eq!(
             display_col_of(&labels["single"], "single"),
-            Some(SESSION_STATE_GUTTER_WIDTH)
+            Some(WORK_STATE_GUTTER_WIDTH)
         );
-        assert_eq!(labels["multi"], "▶ ●   multi");
-        assert_eq!(labels["single"], "○     single");
+        assert_eq!(labels["multi"], "▶ ●   multi › window 0");
+        assert_eq!(labels["single"], "○     single › window 0");
     }
 
     #[test]
-    fn session_view_state_gutter_compresses_overflow_before_name() {
+    fn work_view_state_gutter_compresses_overflow_before_name() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12470,10 +12569,10 @@ mod tests {
             vec![],
         );
 
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
-        let text = WatchColumn::Pane.session_text(
+        let text = WatchColumn::Pane.work_text(
             row,
             now,
             &app.panes,
@@ -12484,16 +12583,16 @@ mod tests {
         let label = plain_text(&text);
         assert_eq!(
             display_col_of(&label, "crowded"),
-            Some(SESSION_STATE_GUTTER_WIDTH)
+            Some(WORK_STATE_GUTTER_WIDTH)
         );
-        assert_eq!(label, "■ +6  crowded");
+        assert_eq!(label, "■ +6  crowded › window 0");
     }
 
     #[test]
-    fn session_view_adds_attached_time_column_and_renders_total() {
+    fn work_view_adds_attached_time_column_and_renders_total() {
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12509,11 +12608,11 @@ mod tests {
             )],
         );
 
-        assert!(app.columns.contains(&WatchColumn::SessionTime));
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+        assert!(app.columns.contains(&WatchColumn::WorkspaceTime));
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
-        let text = WatchColumn::SessionTime.session_text(
+        let text = WatchColumn::WorkspaceTime.work_text(
             row,
             now,
             &app.panes,
@@ -12538,7 +12637,7 @@ mod tests {
         // session-id fallback even though no session *name* matches `w1`.
         let now = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12554,13 +12653,13 @@ mod tests {
             )],
         );
 
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
         assert_eq!(row.session, "w1", "group key stays the workspace id");
         assert_eq!(row.display_name, "muxa", "display name is the label");
 
-        let label = plain_text(&session_label(
+        let label = plain_text(&work_label(
             row,
             watch_theme(WatchTheme::Classic),
             Spinner::OFF,
@@ -12570,7 +12669,7 @@ mod tests {
             "label renders the workspace label: {label}"
         );
 
-        let text = WatchColumn::SessionTime.session_text(
+        let text = WatchColumn::WorkspaceTime.work_text(
             row,
             now,
             &app.panes,
@@ -12591,7 +12690,7 @@ mod tests {
         // No SessionInfo for the pane's workspace (e.g. the workspace list
         // was unreachable this refresh): the display name degrades to the id.
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12602,8 +12701,8 @@ mod tests {
             vec![],
         );
 
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
         assert_eq!(row.display_name, "w1", "display name falls back to the id");
     }
@@ -12615,7 +12714,7 @@ mod tests {
         // into one corrupted row (panes from both hosts, wrong count); the
         // host-namespaced group key keeps them apart.
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12632,11 +12731,11 @@ mod tests {
             vec![],
         );
 
-        let session_rows: Vec<&SessionRow> = app
+        let session_rows: Vec<&WorkRow> = app
             .rows
             .iter()
             .filter_map(|r| match r {
-                WatchRow::Session(s) => Some(s.as_ref()),
+                WatchRow::Work(s) => Some(s.as_ref()),
                 _ => None,
             })
             .collect();
@@ -12648,8 +12747,8 @@ mod tests {
 
         let tmux_row = session_rows
             .iter()
-            .find(|s| s.group_key == "tmux:w1")
-            .expect("tmux:w1 row present");
+            .find(|s| s.group_key == "tmux:w1:0")
+            .expect("tmux:w1:0 work row present");
         let herdr_row = session_rows
             .iter()
             .find(|s| s.group_key == "herdr:w1")
@@ -12712,7 +12811,7 @@ mod tests {
         // A tmux session and a herdr workspace with colliding-looking keys
         // ("main" vs "w1") stay separate rows, each classified to its host.
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12725,7 +12824,7 @@ mod tests {
             vec![fake_session("w1", "muxa", 0)],
             vec![],
         );
-        assert_eq!(app.rows.len(), 2, "one row per host session");
+        assert_eq!(app.rows.len(), 2, "one row per host work unit");
         let hosts: std::collections::HashSet<_> = app.rows.iter().filter_map(row_host).collect();
         assert!(hosts.contains(&muxa::HostKind::Tmux));
         assert!(hosts.contains(&muxa::HostKind::Herdr));
@@ -12751,7 +12850,7 @@ mod tests {
         // session names ("main"/"w1") don't contain those words, so a match
         // can only come from the badge.
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut multi = App::with_config(cfg.clone());
@@ -12791,9 +12890,9 @@ mod tests {
     }
 
     #[test]
-    fn session_view_keeps_duration_column_visible_at_80_cols() {
+    fn work_view_keeps_duration_column_visible_at_80_cols() {
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12805,7 +12904,7 @@ mod tests {
             app.columns,
             vec![
                 WatchColumn::Pane,
-                WatchColumn::SessionTime,
+                WatchColumn::WorkspaceTime,
                 WatchColumn::Activity,
                 WatchColumn::Prompt,
             ]
@@ -12830,9 +12929,9 @@ mod tests {
     }
 
     #[test]
-    fn session_view_explicit_state_column_is_preserved() {
+    fn work_view_explicit_state_column_is_preserved() {
         let cfg = WatchConfig {
-            view: WatchView::Session,
+            view: WatchView::Work,
             columns: vec!["pane".into(), "state".into(), "prompt".into()],
             ..WatchConfig::default()
         };
@@ -12842,7 +12941,7 @@ mod tests {
             vec![
                 WatchColumn::Pane,
                 WatchColumn::State,
-                WatchColumn::SessionTime,
+                WatchColumn::WorkspaceTime,
                 WatchColumn::Prompt,
             ]
         );
@@ -12850,8 +12949,8 @@ mod tests {
 
     #[test]
     fn activity_only_sort_floats_globally_newest_agent_to_the_top() {
-        // sort = [Activity] — drops session grouping entirely. Expected
-        // order is strict newest-first across all sessions.
+        // sort = [Activity] — drops workspace grouping entirely. Expected
+        // order is strict newest-first across all work rows.
         let t0 = time::macros::datetime!(2026-04-28 09:00:00 UTC);
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let t2 = time::macros::datetime!(2026-04-28 11:00:00 UTC);
@@ -12880,7 +12979,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%20", "%30", "%10"]);
@@ -12919,17 +13018,17 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%40", "%30", "%20", "%10"]);
     }
 
     #[test]
-    fn session_view_duration_sort_orders_longest_session_first() {
+    fn work_view_duration_sort_orders_longest_session_first() {
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::SessionTime],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::WorkspaceTime],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12953,7 +13052,7 @@ mod tests {
             .rows
             .iter()
             .filter_map(|r| match r {
-                WatchRow::Session(s) => Some(s.session.as_str()),
+                WatchRow::Work(s) => Some(s.session.as_str()),
                 WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
             })
             .collect();
@@ -12966,7 +13065,7 @@ mod tests {
         let t1 = time::macros::datetime!(2026-04-28 10:00:00 UTC);
         let cfg = WatchConfig {
             view: WatchView::Pane,
-            sort: vec![WatchSortKey::Session],
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -12989,7 +13088,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%20", "%10"]);
@@ -13000,7 +13099,7 @@ mod tests {
     fn sort_keybindings_switch_sort_presets() {
         let mut app = App::new();
         for (key, preset) in [
-            ('s', WatchSortPreset::Session),
+            ('s', WatchSortPreset::Workspace),
             ('l', WatchSortPreset::Latest),
             ('d', WatchSortPreset::Duration),
             ('t', WatchSortPreset::State),
@@ -13152,7 +13251,7 @@ sort = ["state"]
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         // Lexicographic — "%1" < "%200" < "%30" because '2' < '3'.
@@ -13187,7 +13286,7 @@ sort = ["state"]
             .iter()
             .filter_map(|r| match r {
                 WatchRow::Agent(a) => a.pane.as_deref(),
-                WatchRow::BarePane(_) | WatchRow::Session(_) => None,
+                WatchRow::BarePane(_) | WatchRow::Work(_) => None,
             })
             .collect();
         assert_eq!(order, vec!["%10", "%999"]);
@@ -13619,7 +13718,7 @@ sort = ["state"]
             WatchColumn::Limits,
             WatchColumn::Prompt,
             WatchColumn::Activity,
-            WatchColumn::SessionTime,
+            WatchColumn::WorkspaceTime,
         ] {
             let _ = col.agent_text(
                 &a,
@@ -15161,7 +15260,7 @@ sort = ["state"]
     /// column with three rows of agents. Returns the constructed app.
     fn three_agent_app(detail: muxa::config::DetailConfig) -> App {
         // Pin sort to PaneId so the assertions about which row is at
-        // which index don't drift with the default [Session, Activity]
+        // which index don't drift with the default [Workspace, Activity]
         // sort once `fake_agent` timestamps differ across runs.
         let cfg = WatchConfig {
             view: WatchView::Pane,
@@ -15690,10 +15789,10 @@ sort = ["state"]
         assert_eq!(app.table_state.selected(), Some(0));
     }
 
-    fn session_preview_app() -> App {
+    fn work_preview_app() -> App {
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             preview: muxa::config::PreviewConfig {
                 default_content: PreviewContent::PromptResponse,
             },
@@ -15722,23 +15821,23 @@ sort = ["state"]
     }
 
     #[test]
-    fn session_preview_keeps_all_agent_panes_available() {
-        let app = session_preview_app();
-        let WatchRow::Session(row) = &app.rows[0] else {
-            panic!("expected session row");
+    fn work_preview_keeps_all_agent_panes_available() {
+        let app = work_preview_app();
+        let WatchRow::Work(row) = &app.rows[0] else {
+            panic!("expected work row");
         };
         assert_eq!(row.representative_pane.as_deref(), Some("%2"));
         assert_eq!(row.agents.len(), 2);
         assert_eq!(
-            session_preview_targets(row),
+            work_preview_targets(row),
             vec!["%1".to_string(), "%2".to_string()]
         );
         assert_eq!(preview_target_position(&app, "%2"), Some((2, 2)));
     }
 
     #[test]
-    fn preview_brackets_cycle_session_agents_and_reset_cache() {
-        let mut app = session_preview_app();
+    fn preview_brackets_cycle_work_agents_and_reset_cache() {
+        let mut app = work_preview_app();
         app.preview = Some(PreviewState {
             pane_id: "%2".into(),
             scroll: 7,
@@ -15779,8 +15878,8 @@ sort = ["state"]
     }
 
     #[test]
-    fn preview_lines_show_non_representative_session_agent() {
-        let app = session_preview_app();
+    fn preview_lines_show_non_representative_work_agent() {
+        let app = work_preview_app();
         let lines = build_preview_lines(&app, "%1");
         let dump = lines
             .iter()
@@ -16293,14 +16392,14 @@ sort = ["state"]
     }
 
     impl Effects for RecorderEffects {
-        fn spawn_session(
+        fn spawn_work(
             &mut self,
             dir: &str,
             launch: &str,
-            session: Option<&str>,
+            work: Option<&str>,
         ) -> std::result::Result<String, String> {
             self.spawn_calls.push((dir.to_string(), launch.to_string()));
-            let _ = session;
+            let _ = work;
             Ok("spawned-test".into())
         }
 
@@ -16628,10 +16727,10 @@ sort = ["state"]
         let body = help_overlay_text().join("\n");
         assert!(body.contains("type or /       filter"));
         assert!(body.contains("gg/G · Home/End first / last selectable row"));
-        assert!(body.contains("↑/↓ · j/k       move sessions/children"));
+        assert!(body.contains("↑/↓ · j/k       move works/agents"));
         assert!(body.contains(":              command palette"));
         assert!(body.contains("Alt-A          attention-only filter"));
-        assert!(body.contains("Alt-S/L/D/T    session / latest / duration / state"));
+        assert!(body.contains("Alt-S/L/D/T    workspace / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
@@ -17099,12 +17198,9 @@ sort = ["state"]
         app.paneless_attention = 1;
         let selected = app.selected_pane();
 
-        app.apply_view(WatchView::Session);
-        assert!(app
-            .rows
-            .iter()
-            .all(|row| matches!(row, WatchRow::Session(_))));
-        assert!(app.columns.contains(&WatchColumn::SessionTime));
+        app.apply_view(WatchView::Work);
+        assert!(app.rows.iter().all(|row| matches!(row, WatchRow::Work(_))));
+        assert!(app.columns.contains(&WatchColumn::WorkspaceTime));
         assert_eq!(app.selected_pane(), selected);
         assert_eq!(app.paneless_hidden, 2);
         assert_eq!(app.paneless_attention, 1);
@@ -17150,19 +17246,19 @@ sort = ["state"]
     }
 
     #[test]
-    fn selected_session_auto_expands_and_children_are_exact_action_targets() {
-        let mut app = session_preview_app();
+    fn selected_work_auto_expands_and_children_are_exact_action_targets() {
+        let mut app = work_preview_app();
         assert_eq!(app.visible_targets().len(), 3);
         assert!(matches!(
             app.selected_identity(),
-            Some(RowIdentity::Session(_))
+            Some(RowIdentity::Work(_))
         ));
         let expected_child_pane = match &app.rows[0] {
-            WatchRow::Session(session) => session.agents[0].pane.clone(),
+            WatchRow::Work(session) => session.agents[0].pane.clone(),
             _ => None,
         };
         let expected_second_child_pane = match &app.rows[0] {
-            WatchRow::Session(session) => session.agents[1].pane.clone(),
+            WatchRow::Work(session) => session.agents[1].pane.clone(),
             _ => None,
         };
 
@@ -17185,15 +17281,15 @@ sort = ["state"]
         assert_eq!(app.visible_targets().len(), 3);
         assert!(matches!(
             app.selected_identity(),
-            Some(RowIdentity::Session(_))
+            Some(RowIdentity::Work(_))
         ));
     }
 
     #[test]
-    fn moving_to_another_session_folds_the_previous_and_opens_the_new_one() {
+    fn moving_to_another_work_folds_the_previous_and_opens_the_new_one() {
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -17224,7 +17320,7 @@ sort = ["state"]
 
         app.move_down();
 
-        let selected = app.selected_target().expect("second session selected");
+        let selected = app.selected_target().expect("second work selected");
         assert_eq!(selected.row_idx, 1);
         assert_eq!(selected.agent_idx, None);
         let switched = app.visible_targets();
@@ -17238,10 +17334,10 @@ sort = ["state"]
     }
 
     #[test]
-    fn single_pane_session_keeps_detail_without_a_redundant_child_row() {
+    fn single_pane_work_keeps_detail_without_a_redundant_child_row() {
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -17256,11 +17352,11 @@ sort = ["state"]
         );
 
         assert_eq!(app.visible_targets().len(), 1);
-        app.move_into_session();
+        app.move_into_work();
         assert_eq!(app.visible_targets().len(), 1);
         assert!(matches!(
             app.selected_identity(),
-            Some(RowIdentity::Session(_))
+            Some(RowIdentity::Work(_))
         ));
 
         let backend = TestBackend::new(110, 14);
@@ -17285,10 +17381,10 @@ sort = ["state"]
     }
 
     #[test]
-    fn single_and_multi_pane_session_names_start_in_the_same_column() {
+    fn single_and_multi_pane_work_names_start_in_the_same_column() {
         let cfg = WatchConfig {
-            view: WatchView::Session,
-            sort: vec![WatchSortKey::Session],
+            view: WatchView::Work,
+            sort: vec![WatchSortKey::Workspace],
             ..WatchConfig::default()
         };
         let mut app = App::with_config(cfg);
@@ -17327,19 +17423,19 @@ sort = ["state"]
         assert_eq!(
             one.find("one-pane"),
             two.find("two-pane"),
-            "session labels must share one left edge: {one:?} / {two:?}"
+            "work labels must share one left edge: {one:?} / {two:?}"
         );
     }
 
     #[test]
-    fn selected_session_and_selected_child_both_render_detail() {
-        let mut app = session_preview_app();
+    fn selected_work_and_selected_child_both_render_detail() {
+        let mut app = work_preview_app();
         let expected_detail = match &app.rows[0] {
-            WatchRow::Session(session) => session.agents[0]
+            WatchRow::Work(session) => session.agents[0]
                 .last_response
                 .clone()
                 .expect("first child response"),
-            _ => panic!("expected session row"),
+            _ => panic!("expected work row"),
         };
         let backend = TestBackend::new(140, 16);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -17351,7 +17447,7 @@ sort = ["state"]
             "parent detail missing above children: {parent_detail:?}"
         );
 
-        app.move_into_session();
+        app.move_into_work();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let child_detail = row_text(terminal.backend().buffer(), 7);
         assert!(
@@ -17590,7 +17686,7 @@ sort = ["state"]
         // and disable hide_paneless so the paneless row stays visible in
         // the mixed-list snapshot. Pin pane view too so these row-rendering
         // snapshots stay focused on per-row visuals (state glyphs, columns,
-        // selection) independent of the production default (`session`).
+        // selection) independent of the production default (`work`).
         let cfg = WatchConfig {
             view: WatchView::Pane,
             sort: vec![WatchSortKey::PaneId],

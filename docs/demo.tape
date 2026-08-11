@@ -2,13 +2,13 @@
 #
 #   vhs docs/demo.tape   →   docs/demo.gif
 #
-# This one is about *triage*: sixteen sessions, who needs you, and getting
+# This one is about *triage*: workspace/work rows, who needs you, and getting
 # there. The collaboration surfaces — mailbox, messaging, ask — have their
 # own recording in demo-collab.tape, because cramming both into one GIF
 # produced 45 seconds nobody watches to the end of.
 #
 # Arc:
-#   0–7s     the fleet     — every session on one screen, sorted so the
+#   0–7s     the fleet     — every work on one screen, sorted so the
 #                            agents that need you float to the top
 #   7–13s    the inspector — `|` cycles the split; the wide inspector
 #                            carries the selected agent's full detail
@@ -42,7 +42,7 @@ Hide
 Set TypingSpeed 1ms
 Type "export MUXA_DEMO_TMUX=$(command -v tmux)"
 Enter
-Type "export PATH=$HOME/.cargo/bin:$PATH"
+Type "export PATH=$PWD/target/debug:$HOME/.cargo/bin:$PATH"
 Enter
 Type "export LANG=C.UTF-8"
 Enter
@@ -61,13 +61,13 @@ Set TypingSpeed 45ms
 Show
 
 # ── 1. The fleet (0–7s) ──────────────────────────────────────────────────
-# Sixteen sessions, one screen. The sort floats needs-attention rows —
+# Workspace › work rows on one screen. The sort floats needs-attention rows —
 # error, rate-limited, choice, input — above the ones that are just busy,
 # so the top of the list is always the work queue.
 Type "muxa watch"
 Enter
 Sleep 3500ms
-# `gg` rather than a bare `Down`: the cursor opens on whatever session the
+# `gg` rather than a bare `Down`: the cursor opens on whatever work the
 # TUI is running in, so every later move would be relative to a position
 # that shifts with the fixture. From the top the walk is deterministic —
 # and the top is where the attention rows are.
@@ -92,7 +92,7 @@ Type "q"
 Sleep 500ms
 
 # ── 3. The swarm (13–20s) ────────────────────────────────────────────────
-# One cluster per session, animated spinners on the working agents, and an
+# One cluster per work, animated spinners on the working agents, and an
 # expandable tree under the agents that spawned Task subagents.
 Type "muxa watch --view swarm"
 Enter

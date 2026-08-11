@@ -180,9 +180,10 @@ fn onboarding_prints_even_when_config_is_invalid() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Muxa unified onboarding"));
-    assert!(stdout.contains("1 · Shell, tmux, and managed bindings"));
+    assert!(stdout.contains("1 · Shell and tmux fundamentals"));
     assert!(stdout.contains("tmux new-session -s muxa-onboarding"));
-    assert!(stdout.contains("session = work/ticket"));
+    assert!(stdout.contains("session = workspace/project"));
+    assert!(stdout.contains("window  = work/ticket"));
     assert!(stdout.contains("muxa watch shortcuts"));
 
     let korean = Command::new(bin("muxa"))
@@ -199,7 +200,7 @@ fn onboarding_prints_even_when_config_is_invalid() {
     assert!(korean.status.success());
     let stdout = String::from_utf8_lossy(&korean.stdout);
     assert!(stdout.contains("Muxa 통합 온보딩"));
-    assert!(stdout.contains("1 · shell, tmux, managed binding"));
+    assert!(stdout.contains("1 · shell과 tmux 기본 사용법"));
     assert!(stdout.contains("muxa watch 단축키"));
 
     let compatibility_alias = Command::new(bin("muxa"))
@@ -217,7 +218,7 @@ fn onboarding_prints_even_when_config_is_invalid() {
     assert!(compatibility_alias.status.success());
     let stdout = String::from_utf8_lossy(&compatibility_alias.stdout);
     assert!(stdout.contains("Muxa 통합 온보딩"));
-    assert!(stdout.contains("1 · shell, tmux, managed binding"));
+    assert!(stdout.contains("1 · shell과 tmux 기본 사용법"));
     assert!(stdout.contains("prefix+s"));
     assert!(stdout.contains("suffix key만"));
 }

@@ -1,4 +1,4 @@
-//! Safe tmux steps 1–11 of the unified `muxa onboard` scenario.
+//! Safe tmux-first steps 1–11 of the unified `muxa onboard` scenario.
 //!
 //! The tour begins in an inert shell, enters a virtual tmux session, then
 //! detects one real prefix-only press. Inside tmux, the mock observes the
@@ -99,11 +99,11 @@ fn prefix_key_matches(prefix: &str, key: KeyEvent) -> bool {
 pub(super) fn print_guide(language: UiLanguage) {
     let prefix = detect_tmux_prefix();
     if language == UiLanguage::Ko {
-        println!("\n1 · shell, tmux, managed binding");
-        println!("--------------------------------");
+        println!("\n1 · shell과 tmux 기본 사용법");
+        println!("---------------------------");
         println!("\n현재 prefix: {}", prefix.display);
         println!("\n가상 기본 shell에서 tmux new-session -s muxa-onboarding을 직접 입력합니다.");
-        println!("\nsession = work/ticket\nwindow = layout/room\npane = process/agent");
+        println!("\nsession = persistent terminal workspace\nwindow = independent screen\npane = split terminal region");
         println!("\n기본 조합");
         println!("  prefix+w       session/window tree");
         println!("  prefix+c       새 window");
@@ -113,21 +113,17 @@ pub(super) fn print_guide(language: UiLanguage) {
         println!("  prefix+[       copy mode, q로 종료");
         println!("  prefix+d       client detach; session은 계속 실행");
         println!("  tmux attach -t muxa-onboarding  detach 뒤 가상 session에 재접속");
-        println!("\nMuxa binding");
-        println!("  prefix+s       muxa watch");
-        println!("  prefix+q       muxa peek");
-        println!("  prefix+D       muxa dashboard");
         println!("\ntmux 명령은 prefix를 누르고 뗀 뒤 명령 키를 누르는 순서로 실행합니다.");
         println!("동시에 누르는 조합이 아닙니다. 예: prefix → c, prefix → %, prefix → d");
         println!("\nsession 진입 후 감지된 prefix만 직접 누르고 확인을 기다립니다.");
         println!("이후에는 live binding 실행을 막기 위해 suffix key만 입력합니다.");
         println!("c, %, \" 및 d의 결과는 shell/window/pane 장면에 누적되어 표시됩니다.");
     } else {
-        println!("\n1 · Shell, tmux, and managed bindings");
-        println!("-------------------------------------");
+        println!("\n1 · Shell and tmux fundamentals");
+        println!("-------------------------------");
         println!("\nCurrent prefix: {}", prefix.display);
         println!("\nType tmux new-session -s muxa-onboarding in the virtual shell.");
-        println!("\nsession = work/ticket\nwindow = layout/room\npane = process/agent");
+        println!("\nsession = persistent terminal workspace\nwindow = independent screen\npane = split terminal region");
         println!("\nCore combinations");
         println!("  prefix+w       session/window tree");
         println!("  prefix+c       new window");
@@ -137,10 +133,6 @@ pub(super) fn print_guide(language: UiLanguage) {
         println!("  prefix+[       copy mode; q exits");
         println!("  prefix+d       detach the client; sessions keep running");
         println!("  tmux attach -t muxa-onboarding  reattach after the detach drill");
-        println!("\nMuxa bindings");
-        println!("  prefix+s       muxa watch");
-        println!("  prefix+q       muxa peek");
-        println!("  prefix+D       muxa dashboard");
         println!(
             "\nEvery tmux command starts by pressing and releasing the prefix, then its command key."
         );
@@ -1017,7 +1009,7 @@ fn render_muxa_watch_header(frame: &mut Frame<'_>, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  2 sessions  ",
+                "  2 works  ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -1065,7 +1057,7 @@ fn render_muxa_watch_sessions(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) 
     );
     let lines = vec![
         Line::from(Span::styled(
-            "  SESSION                 DUR    ACT    SUMMARY",
+            "  WORKSPACE › WORK         DUR    ACT    SUMMARY",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(vec![
@@ -1074,7 +1066,7 @@ fn render_muxa_watch_sessions(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) 
             Span::styled(" ", selected),
             watch_state_span_with_bg(AgentState::Working, selected),
             Span::styled(
-                format!("   muxa-onboarding   18m    14m    {summary}"),
+                format!("   muxa › onboarding  18m    14m    {summary}"),
                 selected,
             ),
         ]),
@@ -1086,14 +1078,14 @@ fn render_muxa_watch_sessions(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) 
         Line::from(vec![
             Span::raw("  "),
             watch_state_span(AgentState::Idle),
-            Span::raw(format!("     muxa-sandbox      7m     2m     {done}")),
+            Span::raw(format!("     muxa › sandbox     7m     2m     {done}")),
         ]),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
-                    .title(" Sessions ")
+                    .title(" Workspace › work › agent ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Rgb(43, 57, 78))),
@@ -1294,8 +1286,8 @@ fn render_muxa_dashboard(frame: &mut Frame<'_>, area: Rect, app: &TmuxApp) {
         ]
     };
     for (area, title, lines) in [
-        (cards[0], " muxa-onboarding · session card ", first),
-        (cards[1], " muxa-sandbox · session card ", second),
+        (cards[0], " muxa › onboarding · work card ", first),
+        (cards[1], " muxa › sandbox · work card ", second),
     ] {
         frame.render_widget(
             Paragraph::new(Text::from(lines)).block(
@@ -1408,18 +1400,18 @@ fn step_lines(app: &TmuxApp) -> Vec<Line<'static>> {
         Step::Model => vec![
             label("↓ READ TMUX AS A HIERARCHY"),
             Line::from(""),
-            mapping_line("SESSION", "work / ticket"),
-            mapping_line("WINDOW", "layout / room"),
-            mapping_line("PANE", "process / agent"),
+            mapping_line("SESSION", "persistent terminal workspace"),
+            mapping_line("WINDOW", "independent screen in a session"),
+            mapping_line("PANE", "split terminal region in a window"),
             Line::from(""),
             Line::from("prefix+w opens the session/window tree. Press w."),
         ],
         Step::Windows => vec![
             label("↓ WINDOWS ORGANIZE A SESSION"),
             Line::from(""),
-            Line::from("prefix+c creates another window in the current session."),
-            Line::from("A window is layout, not another Muxa work identity."),
-            Line::from("Press c; a new 1:review shell will fill the client."),
+            Line::from("A window is an independent work screen inside one session."),
+            Line::from("Press c to create a new window and move to that screen."),
+            Line::from("The new 1:review shell will fill the virtual client."),
         ],
         Step::Splits if app.split_stage == SplitStage::LeftRight => vec![
             label("SPLIT LEFT AND RIGHT"),
@@ -1498,18 +1490,18 @@ fn step_lines_ko(app: &TmuxApp) -> Vec<Line<'static>> {
         Step::Model => vec![
             label("↓ TMUX를 계층 구조로 이해하세요"),
             Line::from(""),
-            mapping_line("SESSION", "work / ticket"),
-            mapping_line("WINDOW", "layout / room"),
-            mapping_line("PANE", "process / agent"),
+            mapping_line("SESSION", "계속 실행되는 terminal 작업 공간"),
+            mapping_line("WINDOW", "session 안의 독립된 작업 화면"),
+            mapping_line("PANE", "window를 나눈 terminal 영역"),
             Line::from(""),
             Line::from("prefix+w는 session/window tree를 엽니다. w를 누르세요."),
         ],
         Step::Windows => vec![
             label("↓ WINDOW는 SESSION 안을 구성합니다"),
             Line::from(""),
-            Line::from("prefix+c는 현재 session에 window를 하나 만듭니다."),
-            Line::from("window는 layout이며 별도의 Muxa work identity가 아닙니다."),
-            Line::from("c를 누르면 새 1:review shell이 client 전체에 표시됩니다."),
+            Line::from("window는 한 session 안의 독립된 작업 화면입니다."),
+            Line::from("c를 눌러 새 window를 만들고 그 화면으로 이동하세요."),
+            Line::from("새 1:review shell이 가상 client 전체에 표시됩니다."),
         ],
         Step::Splits if app.split_stage == SplitStage::LeftRight => vec![
             label("좌우로 분할하세요"),
@@ -1643,23 +1635,33 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
         MuxaStage::Dashboard => (
             "✓ prefix+s  ✓ prefix+q  ",
             "D",
-            "prefix+D opens the richer session-card dashboard.",
-            "prefix+D는 상세한 session-card dashboard를 엽니다.",
+            "prefix+D opens the richer work-card dashboard.",
+            "prefix+D는 상세한 work-card dashboard를 엽니다.",
         ),
         MuxaStage::Complete => (
             "✓ prefix+s  ✓ prefix+q  ✓ prefix+D",
             "Enter",
-            "The mock now shows session cards with agent state and ACT/WACT.",
-            "mock에 agent 상태와 ACT/WACT가 있는 session card가 표시됩니다.",
+            "The mock now shows work cards with agent state and ACT/WACT.",
+            "mock에 agent 상태와 ACT/WACT가 있는 work card가 표시됩니다.",
         ),
     };
-    vec![
+    let mut lines = vec![
         label(tr(
             app.language,
             "MUXA ADDS THREE MANAGED PREFIX KEYS",
             "MUXA가 세 개의 MANAGED PREFIX KEY를 추가합니다",
         )),
         Line::from(""),
+    ];
+    if app.muxa_stage == MuxaStage::Watch {
+        lines.extend([
+            mapping_line("SESSION", "workspace / project"),
+            mapping_line("WINDOW", "work / ticket"),
+            mapping_line("PANE", "agent"),
+            Line::from(""),
+        ]);
+    }
+    lines.extend([
         Line::from(Span::styled(
             done,
             Style::default()
@@ -1681,7 +1683,8 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
                 key
             )
         }),
-    ]
+    ]);
+    lines
 }
 
 fn expected_key(app: &TmuxApp) -> String {
@@ -1974,9 +1977,9 @@ mod tests {
 
         model.step = 2;
         let screen = rendered(&model, 130, 32).replace(' ', "");
-        assert!(screen.contains("SESSION=work/ticket"));
-        assert!(screen.contains("WINDOW=layout/room"));
-        assert!(screen.contains("PANE=process/agent"));
+        assert!(screen.contains("SESSION=계속실행되는terminal작업공간"));
+        assert!(screen.contains("WINDOW=session안의독립된작업화면"));
+        assert!(screen.contains("PANE=window를나눈terminal영역"));
     }
 
     #[test]
@@ -2078,7 +2081,7 @@ mod tests {
         press(&mut app, KeyCode::Char('s'));
         let watch = rendered(&app, 130, 32);
         assert!(watch.contains("muxa watch"));
-        assert!(watch.contains("SESSION                 DUR    ACT    SUMMARY"));
+        assert!(watch.contains("WORKSPACE › WORK"));
         assert!(watch.contains("Inspector · muxa-onboarding:1.0 · WORK 8s"));
         assert!(watch.contains("j/k move"));
         assert!(!watch.contains("prefix Ctrl-b · 3 panes"));
@@ -2092,7 +2095,7 @@ mod tests {
         assert_eq!(app.muxa_stage, MuxaStage::Complete);
         let dashboard = rendered(&app, 130, 32);
         assert!(dashboard.replace(' ', "").contains("11/20"));
-        assert!(dashboard.contains("muxa-onboarding · session card"));
+        assert!(dashboard.contains("muxa › onboarding · work card"));
         assert!(dashboard.contains("ACT 14m · WACT 9m"));
         assert!(!dashboard.contains("Muxa 계속"));
     }

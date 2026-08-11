@@ -6,13 +6,22 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 
 ## 이것만 기억하세요
 
-- tmux window 하나가 협업 room 하나입니다.
-- `prefix+s`로 watch를 열 때 보고 있던 agent가 발신자입니다.
-- 같은 window의 다른 agent를 선택하고 `m`으로 보내며 `b`로 mailbox를 엽니다.
+- tmux window 하나가 협업 room 하나입니다. Muxa managed model에서 이 window는
+  workspace session 안의 work/ticket 경계이기도 합니다.
+- `prefix+s`로 watch를 열 때 보고 있던 agent가 **대행 발신자**입니다.
+- 같은 window의 다른 agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다
+  (`b`는 alias로 유지됩니다).
 
 즉, 같은 window에 agent 둘을 실행하고, 보낼 agent를 선택해 `prefix+s`로 watch를
 연 뒤 상대를 선택하고 `m`을 누르면 됩니다. 일반 shell pane은 agent가 아니므로
 발신자가 될 수 없습니다. Dashboard는 선택 사항입니다.
+
+여기서 `from`은 IPC를 실제 호출한 프로세스라는 뜻이 아니라, 요청이 누구의
+mailbox 권한으로 생성됐고 응답이 어디로 돌아갈지를 나타내는 represented agent
+identity입니다. watch에서 사람이 보낸 요청도 예전에는 이 agent가 직접 보낸 것처럼
+보였지만, 이제 request의 `provenance`와 wake 문구가 `watch/MCP/CLI/dashboard`, OS가
+확인한 PID/UID, process environment 또는 ancestry로 관찰한 pane과 evidence 종류,
+주장한 origin과의 일치 여부를 따로 표시합니다.
 
 ## 활성화
 
@@ -79,7 +88,8 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 - agent가 정확히 둘이면 상대를 `peer`로 지정할 수 있습니다.
 - 셋 이상이면 `%12` 또는 `pane:%12`처럼 pane을 명시합니다.
 - identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
-- 다른 window의 pane은 명시해도 거부됩니다.
+- `scope = "window"`에서는 다른 window의 pane을 거부합니다. `scope = "host"`는
+  명시적 `pane:%12` 대상을 다른 window/session까지 넓힙니다.
 - 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
   재사용해도 이전 요청을 받지 않습니다.
 
@@ -142,7 +152,7 @@ muxa msg cancel req_...
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
 사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는
 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. `muxa dashboard`는
-같은 기능을 더 상세한 session-card 화면으로 제공합니다.
+같은 기능을 더 상세한 workspace-card 화면으로 제공합니다.
 
 composer 안에서 `Ctrl-E`는 전달 방식을 순환합니다. `read-only`와 `execute`는
 durable request에 실리는 계약이고, `just send`는 본문을 키스트로크로 pane에 그대로
@@ -242,6 +252,18 @@ participant나 자동 wake 대상이 아닙니다. `wake = "never"`로 설정하
 
 요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다. wake prompt가 중복돼도
 동일 request id의 작업을 새 요청으로 만들지 않습니다.
+
+모든 collaboration IPC 호출(context, identity, send, inbox, list, reply, get,
+cancel)은 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`에도 append-only로
+기록됩니다. 이 로그는 `0600`이며 message/reply 본문을 중복 저장하지 않고 operation,
+request id, 대상, 결과, represented origin/session과 OS-observed caller만 담습니다.
+`muxa msg list --json`과 `muxa_list_messages`에서는 각 request의 생성 provenance를 바로
+볼 수 있습니다. 업그레이드 전 요청은 `provenance`가 없을 수 있습니다.
+
+origin과 observed caller pane이 다르더라도 기존의 자유로운 대행 권한을 유지하기 위해
+전송을 거부하지 않습니다. `mismatched`는 조사 가능한 감사 신호이지 authorization
+실패가 아닙니다. 같은 UID의 다른 로컬 프로세스가 IPC를 호출할 수 있다는 기존
+owner-only socket 모델도 그대로입니다.
 
 발신자가 `muxa_wait_reply`/`muxa msg wait`로 terminal 응답을 읽으면 이를 확인한
 것으로 기록해 이후 reply wake를 생략합니다. 먼저 reply wake가 전달된 경우에도

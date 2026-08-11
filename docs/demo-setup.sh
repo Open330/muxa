@@ -39,7 +39,14 @@ TMUX_LBL=muxa-demo
 SHIM_DIR=/tmp/muxa-demo-shim
 PID_FILE=/tmp/muxa-demo.pid
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PAINT="$SCRIPT_DIR/demo-paint.sh"  # believable agent frames instead of bare `cat`
+MUXAD_BIN="${MUXA_DEMO_MUXAD:-$REPO_DIR/target/debug/muxad}"
+MUXAD_LOG=/tmp/muxa-demo-muxad.log
+
+if [ ! -x "$MUXAD_BIN" ]; then
+  MUXAD_BIN=$(command -v muxad)
+fi
 
 # Real tmux binary, resolved absolutely so it bypasses the PATH shim below.
 # Docker/CI has it at /usr/bin/tmux; a Homebrew mac has it elsewhere, so the
@@ -109,7 +116,7 @@ cwd = '/tmp'
 
 [watch]
 theme = 'oh-my-muxa'
-view = 'session'
+view = 'work'
 sort = ['state']
 
 [watch.preview]
@@ -157,7 +164,7 @@ JSON
 EOF
 chmod +x "$SHIM_DIR/codex"
 
-export PATH="$SHIM_DIR:$PATH"
+export PATH="$SHIM_DIR:$REPO_DIR/target/debug:$PATH"
 
 # Ask history, written before muxad starts because the ask store is read
 # once at boot. Statuses and field names mirror ask.rs.
@@ -260,10 +267,12 @@ frame() { # <slug> <agent> <state> <prompt> [tool]... → echoes the pane comman
 # the collaboration mailbox is scoped to its origin pane and `b`/`m` need
 # one.
 "$TM" -u -L "$TMUX_LBL" new-session -d -s ctl -x 220 -y 46 \
+  -n fleet \
   "bash --rcfile /tmp/muxa-demo-bashrc"
 
 "$TM" -u -L "$TMUX_LBL" new-session -d -s main -x 220 -y 46 \
-  "$(frame main claude working 'continue with protocol compatibility tests and update the watch session summary docs' \
+  -n ipc \
+  "$(frame main claude working 'continue with protocol compatibility tests and update the watch work summary docs' \
       'editing  crates/muxa/src/ipc.rs' 'Task ×3  Explore, general-purpose, code-reviewer')"
 # `-d` keeps the current window as main:0 — without it new-window switches
 # focus to itself, so attach would land on `vim` (cat-stdin) instead of
@@ -277,12 +286,16 @@ frame() { # <slug> <agent> <state> <prompt> [tool]... → echoes the pane comman
 "$TM" -u -L "$TMUX_LBL" new-window -d -t main: -n vim cat
 
 mk() { # <session> [command] → echoes the pane id
-  "$TM" -u -L "$TMUX_LBL" new-session -d -s "$1" -x 220 -y 46 "${2:-cat}"
+  "$TM" -u -L "$TMUX_LBL" new-session -d -s "$1" -n "$1" -x 220 -y 46 "${2:-cat}"
   "$TM" -u -L "$TMUX_LBL" display-message -p -t "$1:0.0" '#{pane_id}'
 }
 mkwin() { # <session> <window> [command] → echoes the pane id
   "$TM" -u -L "$TMUX_LBL" new-window -d -t "$1:" -n "$2" "${3:-cat}"
   "$TM" -u -L "$TMUX_LBL" display-message -p -t "$1:$2.0" '#{pane_id}'
+}
+mkpane() { # <session> <window> [command] → echoes the new pane id
+  "$TM" -u -L "$TMUX_LBL" split-window -h -d -P -F '#{pane_id}' \
+    -t "$1:$2" "${3:-cat}"
 }
 
 P_OPS=$(mk ops "$(frame ops gemini done 'review PR #482 — the new sorting knob in muxa watch' \
@@ -314,12 +327,12 @@ P_CRM=$(mk crm "$(frame crm claude rate-limit 'migrate the contact importer off 
   'editing  app/importers/contacts.rb')")
 mk lab >/dev/null   # bare session — no agent, proves muxa tracks the whole server
 
-# Second agents inside existing sessions. A session row that expands into
-# two children is what the session view is *for*; a fleet of singletons
-# never shows it.
-P_API_REV=$(mkwin api reviewer "$(frame api-rev codex working 'review the PaneBackend port' \
+# Second agents inside existing work windows. A work row that expands into
+# two child agents is the hierarchy the work view teaches; a fleet of
+# singletons never shows it.
+P_API_REV=$(mkpane api 0 "$(frame api-rev codex working 'review the PaneBackend port' \
   'read  crates/muxa/src/reconcile.rs' 'ran  cargo clippy -p muxa')")
-P_WEB_E2E=$(mkwin web e2e "$(frame web-e2e claude done 're-record the playwright traces for the timeline view' \
+P_WEB_E2E=$(mkpane web 0 "$(frame web-e2e claude done 're-record the playwright traces for the timeline view' \
   'ran  npx playwright test --update-snapshots')")
 
 # Belt-and-suspenders: be explicit about which window the recording
@@ -344,13 +357,26 @@ PB=$("$TM" -u -L "$TMUX_LBL" display-message -p -t main:1.0 '#{pane_id}')
 # disabled for the demo, so the restart would drop the whole seeded fleet.
 seed_ask_history
 
-rm -f "$MUXA_SOCKET"
+rm -f "$MUXA_SOCKET" "$MUXAD_LOG"
 # `nohup` so the daemon outlives this script's shell. Without it, running
 # setup on its own — seed now, render later — leaves you with a fleet and
 # no daemon to serve it. demo-teardown.sh kills it by pid.
-nohup muxad --config "$MUXA_CONFIG" >/dev/null 2>&1 &
+nohup "$MUXAD_BIN" --config "$MUXA_CONFIG" >"$MUXAD_LOG" 2>&1 &
 echo $! > "$PID_FILE"
-until [ -S "$MUXA_SOCKET" ]; do sleep 0.1; done
+for _ in $(seq 1 100); do
+  [ -S "$MUXA_SOCKET" ] && break
+  if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "demo muxad exited before creating its socket" >&2
+    cat "$MUXAD_LOG" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [ ! -S "$MUXA_SOCKET" ]; then
+  echo "demo muxad did not create $MUXA_SOCKET within 10 seconds" >&2
+  cat "$MUXAD_LOG" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 4) Seed the fleet
@@ -389,7 +415,7 @@ hook "$PB" codex user_prompt_submit \
   '{"session_id":"s-b","prompt":"audit the legacy auth middleware for token handling — flag anything that stores raw bearer tokens at rest, and propose a redaction layer that survives the `pre_tool_use` hook fan-out."}'
 hook "$PB" codex permission_request '{"session_id":"s-b","tool_name":"shell"}'
 
-# Seed Claude last so the initial session row preview opens on the current
+# Seed Claude last so the initial work row preview opens on the current
 # pane. The final PromptSubmitted leaves the row Working while preserving the
 # captured response from the previous Stop, which makes both the status line
 # and preview richer in the README GIF.
@@ -398,7 +424,7 @@ hook "$PA" claude user_prompt_submit \
 hook "$PA" claude stop \
   "{\"session_id\":\"s-a\",\"transcript_path\":\"$CLAUDE_TRANSCRIPT\"}"
 hook "$PA" claude user_prompt_submit \
-  '{"session_id":"s-a","prompt":"continue with protocol compatibility tests and update the watch session summary docs"}'
+  '{"session_id":"s-a","prompt":"continue with protocol compatibility tests and update the watch work summary docs"}'
 
 # In-flight Task subagents so `muxa watch --view swarm` renders a populated
 # subagent tree (each is a pre_tool_use{Task} with no matching post, so they
@@ -415,7 +441,7 @@ subagents "$PA" s-a \
   "general-purpose:write the round-trip tests" \
   "code-reviewer:review the framing diff"
 
-# --- api: two agents in one session, the claude one with its own tree ------
+# --- api: two agents in one work window, the claude one with its own tree --
 hook "$P_API" claude user_prompt_submit \
   '{"session_id":"s-api","prompt":"port the reconciler onto the new PaneBackend trait"}'
 subagents "$P_API" s-api \
@@ -493,7 +519,7 @@ hook "$P_DATA" claude stop '{"session_id":"s-data"}'
 
 # --- ops: gemini, idle -----------------------------------------------------
 hook "$P_OPS" gemini before_agent \
-  '{"session_id":"s-c","prompt":"review PR #482 — focus on the new sorting knob in muxa watch and whether the [Session, Activity] default surprises power users with many short-lived panes."}'
+  '{"session_id":"s-c","prompt":"review PR #482 — focus on the new sorting knob in muxa watch and whether the [Workspace, Activity] default surprises power users with many short-lived panes."}'
 hook "$P_OPS" gemini after_agent '{"session_id":"s-c"}'
 
 # ---------------------------------------------------------------------------

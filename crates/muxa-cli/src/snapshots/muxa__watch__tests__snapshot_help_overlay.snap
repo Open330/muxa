@@ -10,12 +10,12 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │> alpha:0.0              ○ │  type or /       filter; / allows reserved first characters                      │                           │
 │                           │  Backspace/C-W   edit filter / delete previous word                              │                           │
 │                           │  Ctrl-U / Esc    clear filter; Esc again backs out / quits                       │                           │
-│                           │  ↑/↓ · j/k       move sessions/children while browsing                           │                           │
+│                           │  ↑/↓ · j/k       move works/agents while browsing                                │                           │
 │                           │  ←/→ · h/l       return to parent / enter first child agent                      │                           │
 │                           │  gg/G · Home/End first / last selectable row                                     │                           │
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
 │                           │  Enter          attach to selected pane                                          │                           │
-│                           │  n              new/reused work session + agent (dir · ticket · prompt)          │                           │
+│                           │  n              new/reused workspace/work + agent (dir · ticket · prompt)        │                           │
 │                           │  a / A          ask / history; d deletes one · D clears all in A                 │                           │
 │                           │                                                                                  │                           │
 │                           │Commands & inspection                                                             │                           │
@@ -30,7 +30,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
 │                           │                                                                                  │                           │
 │                           │Sorting                                                                           │                           │
-│                           │  Alt-S/L/D/T    session / latest / duration / state                              │                           │
+│                           │  Alt-S/L/D/T    workspace / latest / duration / state                            │                           │
 │                           │State markers                                                                     │                           │
 │                           │  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped            │                           │
 │                           │  TREE: ◇ subagent  ▸ shell  + process; helper-only trees hidden                  │                           │

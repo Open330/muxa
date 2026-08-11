@@ -211,7 +211,7 @@ fn tmux_output(args: &[&str]) -> Result<Output, TmuxError> {
 /// one. Unset ⇒ no `-S`, byte-identical to `tmux_command()`. This is the
 /// *env-scoped* fallback; a control op that knows the pane's server prefers
 /// [`tmux_command_targeting`], which pins the exact server the pane lives on.
-fn tmux_command_scoped() -> Command {
+pub fn tmux_command_scoped() -> Command {
     let mut cmd = tmux_command();
     if let Ok(sock) = std::env::var("MUXA_TMUX_SOCKET") {
         let trimmed = sock.trim();

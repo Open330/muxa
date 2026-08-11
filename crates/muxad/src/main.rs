@@ -12,7 +12,11 @@ use muxa::activity::{
     ActivityEntry, ActivityLog, ActivityOptions, StateTransitionEntry, StateTransitionInput,
 };
 use muxa::ask::{AskOptions, AskStore};
-use muxa::collaboration::{CollaborationOptions, CollaborationStore};
+use muxa::collaboration::{
+    CollaborationClientKind, CollaborationOptions, CollaborationOriginMatch, CollaborationRequest,
+    CollaborationStore,
+};
+use muxa::collaboration_audit::CollaborationAuditLog;
 use muxa::config::CollaborationWake;
 use muxa::config::{DashboardAuthMode, NotifierBackend};
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
@@ -149,6 +153,7 @@ async fn main() -> Result<()> {
         build_history(&cfg, &writer_shutdown_tx, pane_session_cache.clone()).await;
     let store = Store::shared_with_history(history.clone());
     let collaboration = build_collaboration(&cfg).await;
+    let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg).await;
 
     // The set of backends this daemon observes simultaneously — tmux + herdr
@@ -340,6 +345,7 @@ async fn main() -> Result<()> {
         .with_backends(backends.clone())
         .with_sessions(sessions)
         .with_collaboration(collaboration)
+        .with_collaboration_audit(collaboration_audit)
         .with_ask(ask);
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -496,6 +502,22 @@ async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {
     }
 }
 
+fn build_collaboration_audit(cfg: &Config) -> Arc<CollaborationAuditLog> {
+    if cfg.collaboration.enabled {
+        let path = cfg
+            .collaboration
+            .path
+            .as_ref()
+            .map(|mailbox| mailbox.with_file_name(paths::COLLABORATION_AUDIT_FILENAME))
+            .or_else(paths::default_collaboration_audit_file);
+        if let Some(path) = path {
+            tracing::info!(path = %path.display(), "collaboration audit enabled");
+            return CollaborationAuditLog::at_path(path);
+        }
+    }
+    CollaborationAuditLog::in_memory()
+}
+
 fn spawn_collaboration_waker_task(
     cfg: &Config,
     collaboration: Arc<CollaborationStore>,
@@ -549,10 +571,10 @@ async fn wake_idle_collaboration_peers(
             continue;
         };
         let prompt = format!(
-            "[muxa:{}] New {:?} request from {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond with muxa_reply or `muxa msg reply`.",
+            "[muxa:{}] New {:?} request {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond with muxa_reply or `muxa msg reply`.",
             request.id,
             request.kind,
-            request.from.label(),
+            collaboration_request_source(&request),
         );
         let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends).await;
         if sent {
@@ -596,6 +618,32 @@ async fn wake_idle_collaboration_peers(
             );
         }
     }
+}
+
+fn collaboration_request_source(request: &CollaborationRequest) -> String {
+    let represented = request.from.label();
+    let Some(provenance) = request.provenance.as_ref() else {
+        return format!("from {represented}");
+    };
+    let surface = match provenance.client_kind {
+        CollaborationClientKind::Watch => "muxa watch",
+        CollaborationClientKind::Mcp => "muxa MCP",
+        CollaborationClientKind::Dashboard => "muxa dashboard",
+        CollaborationClientKind::Cli => "muxa CLI",
+        CollaborationClientKind::Unknown => "an unclassified muxa client",
+    };
+    let actor = match (&provenance.observed_pane, provenance.caller_pid) {
+        (Some(pane), Some(pid)) => format!("caller {pane}, pid {pid}"),
+        (Some(pane), None) => format!("caller {pane}"),
+        (None, Some(pid)) => format!("caller pid {pid}"),
+        (None, None) => "caller location unavailable".into(),
+    };
+    let mismatch = match provenance.origin_match {
+        CollaborationOriginMatch::Matched => "",
+        CollaborationOriginMatch::Mismatched => "; origin mismatch",
+        CollaborationOriginMatch::Unverifiable => "; origin unverified",
+    };
+    format!("via {surface} representing {represented} ({actor}{mismatch})")
 }
 
 fn idle_collaboration_participant<'a>(
@@ -1658,7 +1706,10 @@ fn spawn_periodic_discovery(
 mod tests {
     use super::*;
     use muxa::backend::{BackendCaps, HostKind, PaneBackend};
-    use muxa::collaboration::{NewRequest, RequestKind, RequestStatus, WorkMode};
+    use muxa::collaboration::{
+        CollaborationPaneEvidence, CollaborationProvenance, NewRequest, RequestKind, RequestStatus,
+        WorkMode,
+    };
     use muxa::config::DiscoveryConfig;
     use muxa::event::{AgentEvent, AgentId, AgentKind};
     use muxa::tmux::PaneInfo;
@@ -1782,7 +1833,7 @@ mod tests {
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
         let request = mailbox
-            .create(
+            .create_with_provenance(
                 sender,
                 recipient.clone(),
                 NewRequest {
@@ -1793,6 +1844,16 @@ mod tests {
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
+                Some(CollaborationProvenance {
+                    client_kind: CollaborationClientKind::Watch,
+                    caller_pid: Some(4242),
+                    caller_uid: Some(1000),
+                    caller_gid: Some(1000),
+                    executable: Some("muxa".into()),
+                    observed_pane: Some("%1".into()),
+                    pane_evidence: Some(CollaborationPaneEvidence::ProcessAncestry),
+                    origin_match: CollaborationOriginMatch::Matched,
+                }),
             )
             .await
             .unwrap();
@@ -1810,6 +1871,8 @@ mod tests {
             assert!(sends[0].1.contains("muxa_inbox"));
             assert!(sends[0].1.contains("muxa msg inbox --json"));
             assert!(sends[0].1.contains("kind/work_mode/paths"));
+            assert!(sends[0].1.contains("via muxa watch representing codex@%1"));
+            assert!(sends[0].1.contains("caller %1, pid 4242"));
             assert!(!sends[0].1.contains("secret request body"));
             assert_eq!(sends[1], ("%2".into(), "\r".into()));
             sends.clear();

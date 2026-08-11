@@ -93,10 +93,10 @@ it:
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `muxa_status` | `pane?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Snapshot all agents, or observe one pane with its screen and recent prompts in one call. |
+| `muxa_status` | `pane?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Snapshot all agents plus managed workspace → work → agent topology, or observe one pane. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
-| `muxa_start_agent` | `agent`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a work session or start an allowlisted agent in a detached tmux surface. |
-| `muxa_manage_tmux` | `action`, `pane?`, `work?`, `confirm?` | List/show managed work, interrupt/terminate an agent pane, or close a work session. |
+| `muxa_start_agent` | `agent`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. |
+| `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
@@ -128,28 +128,35 @@ returns the new pane id for later `muxa_capture_pane`, `muxa_send_prompt`, and
 ```text
 muxa_start_agent {
   "agent": "codex",
-  "work": "CAL-7041",
+  "workspace": "muxa",
+  "work": "TEST-0001",
   "role": "reviewer",
   "cwd": "/home/june/personal/muxa",
   "prompt": "Review the current changes and report findings only"
 }
-→ { "pane": "%24", "work": "CAL-7041", "created_work": false, ... }
+→ { "pane": "%24", "workspace": "muxa", "work": "TEST-0001",
+    "session": "muxa", "window": "@7", "created_work": false, ... }
 ```
 
-The managed policy is **tmux session = work/ticket, pane = agent, window =
-layout only**. With `work`, muxa creates the session once and stores the exact
-work id and cwd in tmux user options. Later calls reuse that session and add an
-agent pane; a conflicting cwd is refused. `role` and `task` become durable pane
-metadata. Without `work`, `placement` retains the lower-level detached
-pane/window/session behavior. `cwd` must already exist.
+The managed policy is **tmux session = workspace/project, window = work/ticket,
+pane = agent**. With `work`, muxa derives `workspace` from the cwd basename when
+it is omitted, creates the session and first work window when needed, and stores
+identity in tmux user options at the matching scope. Later calls reuse that work
+window and add an agent pane; a conflicting cwd is refused. Different work IDs
+can use different worktree paths inside one workspace session. `role` and `task`
+become durable pane metadata. Without `work`, `placement` retains the lower-level
+detached pane/window/session behavior. `cwd` must already exist.
 
 Lifecycle operations stay in this same MCP server:
 
 ```text
-muxa_manage_tmux(action="list_work")
+muxa_manage_tmux(action="list_workspace")
+muxa_manage_tmux(action="show_workspace", workspace="muxa")
+muxa_manage_tmux(action="list_work", workspace="muxa")
 muxa_manage_tmux(action="interrupt_agent", pane="%24")
 muxa_manage_tmux(action="terminate_agent", pane="%24", confirm=true)
-muxa_manage_tmux(action="close_work", work="CAL-7041", confirm=true)
+muxa_manage_tmux(action="close_work", workspace="muxa", work="TEST-0001", confirm=true)
+muxa_manage_tmux(action="close_workspace", workspace="muxa", confirm=true)
 ```
 
 Terminate and close refuse unconfirmed or unmanaged targets. Muxa does not
@@ -273,7 +280,8 @@ pane. `muxa_start_agent` is also a control action: it creates a tmux surface
 and starts an allowlisted CLI in bypass/yolo mode. It does not accept arbitrary
 commands, but callers should still provide trusted paths and prompts.
 `muxa_manage_tmux` accepts exact managed identities only; terminating a pane or
-closing a whole work session additionally requires `confirm=true`. The IPC
+closing a work window or whole workspace session additionally requires
+`confirm=true`. The IPC
 socket is owner-only (`0600`), so only your user can reach it and there is no
 network exposure; treat socket and MCP access as equivalent to shell access.
 The server never starts against an absent daemon. See `PROTOCOL.md` (Control

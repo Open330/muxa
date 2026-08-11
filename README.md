@@ -37,24 +37,23 @@ terminal panes:
 
 | tmux object | Muxa meaning | How it is used |
 | --- | --- | --- |
-| **session** | One work item or ticket | Stable work identity, cwd, and managed lifecycle. Starting the same work again reuses this session. |
-| **pane** | One agent | An implementer, reviewer, or other agent working inside that work session. |
-| **window** | Layout and collaboration room | Organizes panes visually and scopes nearby collaboration; it does not create another work identity. |
+| **session** | One workspace or project | Durable project context containing several independent work windows. |
+| **window** | One work item or ticket | Stable work identity and cwd. Starting the same work again reuses this window. |
+| **pane** | One agent | An implementer, reviewer, or helper working inside that work window. |
 
 The intended workflow is equally direct:
 
-1. Start a work ID once; Muxa creates or reuses its managed tmux session and
-   starts the first agent pane.
+1. Start a work ID once; Muxa creates or reuses the workspace session, creates
+   its work window, and starts the first agent pane.
 2. Add implementer, reviewer, or helper agents as additional panes in that
-   same session.
+   same work window. Other tickets become sibling windows.
 3. Observe, preview, message, and control those agents through `muxa watch`,
    or let an agent use the same policy through `muxa mcp`.
-4. Close the pane or work explicitly when it is complete. Muxa refuses to
-   silently split one ticket into suffixed sessions or terminate unmanaged
-   tmux objects.
+4. Close an agent pane, work window, or whole workspace session explicitly.
+   Muxa refuses to terminate unmanaged tmux objects.
 
-In short: **work/ticket → session → agent panes → observe and collaborate →
-explicit close**. Run `muxa onboard` for one continuous safe scenario: type
+In short: **workspace/session → work/window → agent/pane → observe and
+collaborate → explicit close**. Run `muxa onboard` for one continuous safe scenario: type
 `tmux new-session`, learn the hierarchy, windows, panes, detach/attach, and
 managed prefix bindings, then continue directly into the Muxa watch workflow.
 Nothing in the tour mutates a live tmux session.
@@ -76,7 +75,7 @@ Nothing in the tour mutates a live tmux session.
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
 | `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its agent's state, summary, and latest prompt/response — including how long ago you last prompted it; press a digit to jump. |
 | `muxa watch` | Main TUI for agents, prompts, live previews, and same-window collaboration. |
-| `muxa dashboard` | Session-card TUI console for pane operations and authenticated same-room agent collaboration. |
+| `muxa dashboard` | Workspace-card TUI console for pane operations and authenticated same-work agent collaboration. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
@@ -174,7 +173,7 @@ Then:
 1. Run two agents in two panes of the same tmux window.
 2. Focus the agent that should send, then press `prefix+s`.
 3. Select the other agent in watch, press `m`, type the request, and press
-   `Enter`. Press `b` to read and reply from the mailbox.
+   `Enter`. Press `M` to read and reply from the mailbox (`b` remains an alias).
 
 Do not open watch from a spare shell pane when you want to collaborate: that
 shell is not an agent. `muxa dashboard` remains an optional richer console,
@@ -186,8 +185,9 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Core Commands
 
-Managed tmux policy: one session is one work/ticket, each pane is one agent,
-and windows are layout only. `muxa onboard` now teaches tmux and Muxa as one
+Managed tmux policy: one session is a workspace/project, each window is a
+work/ticket, and each pane is an agent. `muxa onboard` teaches tmux first and
+introduces this Muxa mapping only after the tmux exercises, as one
 continuous scenario. It starts at a blank virtual shell, accepts the real
 `tmux new-session -s muxa-onboarding` and `tmux attach -t muxa-onboarding`
 commands, preserves every virtual window/pane transition, then continues without
@@ -195,7 +195,7 @@ leaving fullscreen into the current `muxa watch` workflow. The watch half mirror
 the left-edge session-state gutter, columns, 50/50 inspector, overlays, and
 footer. You advance with the real `j`, `l`, `Alt-T`, `o`, `?`, `n`, `m`,
 `Backspace`, `M`, and `q` actions. One 20-step counter covers the whole scenario:
-managed prefix bindings are step 11 and session navigation follows as step 12.
+managed prefix bindings are step 11 and work navigation follows as step 12.
 Korean is selected automatically for a Korean locale, can be requested with
 `--lang ko`, and can be toggled with `F2` during the tour.
 
@@ -208,8 +208,8 @@ Korean is selected automatically for a Korean locale, can be requested with
 | Command | Purpose |
 | --- | --- |
 | `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
-| `muxa watch [--view pane\|session]` | Live TUI picker/dashboard. |
-| `muxa dashboard [--since today]` | Session-card TUI with live capture, prompt/actions, ACT/WACT totals, and collaboration mailbox controls. |
+| `muxa watch [--view pane\|work]` | Live workspace → work → agent TUI picker/dashboard. |
+| `muxa dashboard [--since today]` | Workspace-card TUI with live capture, prompt/actions, ACT/WACT totals, and collaboration mailbox controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
 | `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
@@ -222,9 +222,10 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa sync` | Backfill the registry by scanning tmux panes. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
-| `muxa work start muxa-onboarding --agent codex ...` | Create one managed tmux session per work/ticket, or reuse it and add another agent pane. |
-| `muxa work list/show/close` | Inspect and explicitly close managed work sessions. |
-| `muxa agent start --work muxa-onboarding ...` | Add an allowlisted managed agent pane to a work; also exposed as MCP `muxa_start_agent`. |
+| `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
+| `muxa workspace list/show/close` | Inspect or explicitly close workspace/project sessions. |
+| `muxa work list/show/close [--workspace muxa]` | Inspect or explicitly close work/ticket windows. |
+| `muxa agent start --workspace muxa --work muxa-onboarding ...` | Add an allowlisted agent pane to one work window; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
 | `muxa onboard [--lang auto\|en\|ko]` | Unified shell → tmux → Muxa fullscreen walkthrough. `F2` switches language, `--no-quiz` skips gates, and `--print` emits the combined guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |

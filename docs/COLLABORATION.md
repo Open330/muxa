@@ -7,13 +7,23 @@ mailbox, not through terminal screen scraping.
 
 ## The whole model
 
-- One tmux window is one collaboration room.
-- The focused agent is the sender when you open `prefix+s` watch.
-- Select another agent in that window; `m` sends and `b` opens the mailbox.
+- One tmux window is one collaboration room. In the managed Muxa model, that
+  window is also the work/ticket boundary inside its workspace session.
+- The focused agent is the **represented sender** when you open `prefix+s` watch.
+- Select another agent in that window; `m` sends and `M` opens the mailbox
+  (`b` remains an alias).
 
 So the normal workflow is simply: put two agents in one window, focus the
 sender, press `prefix+s`, choose the peer, and press `m`. A normal shell pane is
 not an agent and cannot be the sender. The Dashboard is optional.
+
+`from` therefore identifies whose mailbox authority created the request and
+where its reply returns; it does not claim that the represented agent process
+made the IPC call itself. Requests now carry separate `provenance`: the local
+surface (`watch`, MCP, CLI, or dashboard), OS-observed PID/UID, pane recovered
+from the process environment or ancestry (with the evidence type), and whether
+that pane matches the asserted origin. Wake prompts make the same distinction
+explicit.
 
 ## Enable
 
@@ -74,9 +84,10 @@ tools do not accept an arbitrary sender pane.
 
 Agents sharing `(tmux socket, stable window id)` are peers. `peer` selects the
 only other agent; with three or more participants use `%N` or `pane:%N`.
-Cross-window targets are refused. Requests are also pinned to the target's
-current agent session, so a new process reusing that pane cannot inherit old
-work.
+`scope = "window"` refuses cross-window targets; `scope = "host"` widens an
+explicit `pane:%N` target to other windows and sessions. Requests are also
+pinned to the target's current agent session, so a new process reusing that
+pane cannot inherit old work.
 
 An exact agent session can register a room-local alias and advisory roles:
 
@@ -106,7 +117,7 @@ muxa msg cancel req_... # queued requests only
 
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
 selected room peer, `b` opens non-claiming mailbox history, `i` claims the
-inbox, and `e` replies. `muxa dashboard` provides the richer session-card form
+inbox, and `e` replies. `muxa dashboard` provides the richer workspace-card form
 of the same controls.
 
 Inside the composer, `Ctrl-E` cycles how the text leaves: `read-only` and
@@ -191,3 +202,16 @@ prevents a later reply wake. Room context reports incoming unread requests and
 unacknowledged replies separately. `muxa_list_messages` is non-claiming history;
 the sender may cancel only while a request remains `queued`, before the
 recipient has claimed it.
+
+Every collaboration IPC operation (context, identity, send, inbox, list,
+reply, get, and cancel) is also appended to
+`$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`. The `0600` ledger records the
+represented origin/session, OS-observed caller, target/request id, and outcome,
+but never duplicates message or reply bodies. `muxa msg list --json` and
+`muxa_list_messages` expose the creation provenance stored on each request;
+requests created before this field existed simply omit it.
+
+Provenance remains audit evidence, not a permission gate. An observed/asserted
+pane mismatch is recorded as `mismatched` but does not block the operation, so
+host-scoped explicit-pane routing and the existing high-authority owner-only
+socket workflow remain unchanged.

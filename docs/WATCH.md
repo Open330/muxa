@@ -4,7 +4,7 @@
 plain tmux panes, lets you jump to panes, composes prompts, and exchanges
 durable collaboration requests between agents in the same tmux window.
 
-For the session-card console that keeps you inside the TUI while sending
+For the workspace-card console that keeps you inside the TUI while sending
 prompts, aborting turns, and inspecting live captures, use
 [`muxa dashboard`](DASHBOARD_CLI.md).
 
@@ -12,28 +12,29 @@ prompts, aborting turns, and inspecting live captures, use
 
 ```bash
 muxa watch
-muxa watch --view session
+muxa watch --view work
 muxa watch --view pane
 muxa watch --include-paneless
 ```
 
-`view = "session"` groups panes by tmux session. For managed tmux work, one
-session is one work/ticket and each child pane is one agent; windows are layout
-only. `view = "pane"` shows one row per pane.
+`view = "work"` groups tmux panes by window and labels each parent as
+`workspace › work`. One session is a workspace/project, one window is a
+work/ticket, and each child pane is an agent. `view = "pane"` shows one row per
+pane.
 
 ## Common Keys
 
 | Key | Action |
 | --- | --- |
-| Printable text | Immediately filter by session, agent, cwd, model, or prompt. |
+| Printable text | Immediately filter by workspace, work, agent, cwd, model, or prompt. |
 | `/` | Explicitly start filtering, including queries beginning with a reserved key. |
 | `Backspace` / `Ctrl-W` / `Ctrl-U` | Delete a character / word / the whole filter. |
-| `j` / `k`, `↑` / `↓` | Move between sessions; after entering a child, move between agents. |
-| `h` / `l`, `←` / `→` | Return to the parent session / select the first child agent. |
+| `j` / `k`, `↑` / `↓` | Move between works; after entering a child, move between agents. |
+| `h` / `l`, `←` / `→` | Return to the parent work / select the first child agent. |
 | `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
-| `n` | Create a work session with its first agent, or add an agent pane when that work already exists. |
+| `n` | Create/reuse a workspace session and work window, then add an agent pane. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
 | `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
@@ -46,10 +47,10 @@ only. `view = "pane"` shows one row per pane.
 | `Alt-I` | Toggle the persistent wide-screen inspector. |
 | `Alt-E` | Open the completion/error/attention event inbox. |
 | `Alt-A` | Toggle attention-only filtering. |
-| `[` / `]` | In preview, show the previous / next agent in the selected session. |
+| `[` / `]` | In preview, show the previous / next agent in the selected work. |
 | `c` | Toggle preview content. |
 | `f` | Toggle popup/fullscreen preview. |
-| `Alt-L/D/S/T` | Sort by latest / duration / session / attention state. |
+| `Alt-L/D/S/T` | Sort by latest / workspace duration / workspace / attention state. |
 
 ### If `Alt` does nothing on macOS
 
@@ -86,12 +87,12 @@ and returns to browsing. Search and the `Alt-A` attention-only filter compose.
 With no query, `Esc` disables attention-only mode before a subsequent `Esc`
 quits.
 
-In session view, the selected session's children appear automatically, but
+In work view, the selected work window's child agents appear automatically, but
 `↑`/`↓` (and `j`/`k` while browsing) skip them and continue moving between
-session rows. Press `→` or `l` to enter child selection; then the same vertical
-keys cycle that session's agents, and `←` or `h` returns to the parent. Moving
-to another session folds the previous one and opens the new one in its place.
-A single-pane session does not add a redundant child row.
+work rows. Press `→` or `l` to enter child selection; then the same vertical
+keys cycle that work's agents, and `←` or `h` returns to the parent. Moving
+to another work folds the previous one and opens the new one in its place.
+A single-pane work does not add a redundant child row.
 The existing `↳ detail` line remains visible for both selected parents and
 selected children; process-tree detail shares the same secondary row when
 available.
@@ -193,8 +194,8 @@ reply output, plus its short digest, label, and display-only locator.
 
 ## Preview
 
-Press `o` or `Alt-P` to preview the selected pane. In session view, if the selected
-session has multiple agent panes, press `]` for the next agent or `[` for the
+Press `o` or `Alt-P` to preview the selected pane. In work view, if the selected
+work window has multiple agent panes, press `]` for the next agent or `[` for the
 previous agent. `Tab` and `Shift+Tab` work as aliases. The preview title shows
 the current position, such as `2/3`, when more than one agent is available.
 
@@ -236,7 +237,7 @@ Columns are configured under `[watch]`:
 
 ```toml
 [watch]
-view = "session"
+view = "work"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
 
 [watch.widths]
@@ -246,7 +247,7 @@ activity = 6
 ```
 
 Available column keys include `pane`, `state`, `state_age`, `kind`, `model`, `ctx`,
-`cost`, `limits`, `workload`, `prompt`, `activity`, and `session_time`.
+`cost`, `limits`, `workload`, `prompt`, `activity`, and `workspace_time`.
 The default `state_age` column renders values such as `▶ WAIT 3m` and
 `● WORK 42s`; use `state` when only the compact glyph is wanted.
 By default, child shell/subagent work is shown only on the selected row's
@@ -258,18 +259,18 @@ means other visible process.
 
 ```toml
 [watch]
-sort = ["state", "session", "latest"]
+sort = ["state", "workspace", "latest"]
 # sort = ["latest"]
-# sort = ["session_time"]
+# sort = ["workspace_time"]
 # sort = ["state", "latest"]
-# sort = ["session", "pane"]
+# sort = ["workspace", "pane"]
 # sort = ["pane_id"]
 ```
 
 Runtime sort keys mirror these presets and save the selected preset back to
 `[watch].sort`. The `--sort` flag remains a one-shot launch override until
 you press a runtime sort key. The default floats attention states first,
-then groups by tmux session and floats the most recently active agent in each
+then groups by workspace and floats the most recently active work in each
 group. `activity` and `act` remain accepted aliases for `latest`.
 
 ## Detail Row

@@ -2,15 +2,15 @@
 
 Muxa는 다음 작업 단위 tmux workflow에 맞춰 설계되고 최적화되어 있습니다.
 
-- tmux session = 하나의 work 또는 ticket
+- tmux session = 하나의 workspace 또는 project
+- tmux window = 하나의 work 또는 ticket
 - tmux pane = 하나의 agent
-- tmux window = 화면 배치용 컨테이너
 - Muxa = tmux lifecycle, 위치, 상태, 협업 routing 관리
 - Agent = 파일, 코드, Git, 테스트, 추론 수행
 
-같은 ticket은 같은 managed session을 재사용합니다. muxa-onboarding이 이미
-존재할 때 muxa-onboarding-2를 자동으로 만들어 작업을 분리하지 않습니다.
-기존 work와 다른 cwd를 지정하면 조용히 재사용하지 않고 오류를 냅니다.
+같은 workspace의 같은 ticket은 같은 managed window를 재사용합니다. 기존
+work와 다른 cwd를 지정하면 조용히 재사용하지 않고 오류를 냅니다. 한 workspace
+session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존할 수 있습니다.
 
 ## 온보딩 실행
 
@@ -19,12 +19,12 @@ pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮
 dashboard로 이어집니다. 모든 장면은 설명용이므로 실제 tmux session을 변경하지
 않습니다.
 
-mock은 실제 session view처럼 `SESSION · DUR · ACT · SUMMARY` 열을 사용하고,
+mock은 실제 work view처럼 `WORKSPACE › WORK · DUR · ACT · SUMMARY` 열을 사용하고,
 상태를 별도 오른쪽 열에 두지 않습니다. 각 session 이름 왼쪽의 고정 gutter에
 상태를 모아 표시합니다. 기본 Unicode 설정에서는 `●` working, `▶`
 waiting-input, `◆` choice, `○` idle, `■` error이며 `[ui] icons = "ascii"`
 환경에서는 대응하는 ASCII marker가 사용됩니다. 120열 이상에서는 실제
-watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
+watch처럼 Works와 Inspector를 50/50으로 나눕니다.
 
     muxa onboard
 
@@ -35,7 +35,7 @@ watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
     muxa onboard --lang en
 
 온보딩 도중에는 어느 단계에서든 `F2`로 한글과 영어를 즉시 전환할 수 있습니다.
-실제 watch를 재현하는 `SESSION`, `DUR`, `ACT`, `SUMMARY` 같은 UI label은
+실제 watch를 재현하는 `WORKSPACE › WORK`, `DUR`, `ACT`, `SUMMARY` label은
 그대로 유지하고 안내 dialog, 도움말, footer 설명은 선택한 언어로 표시합니다.
 
 ![한글 통합 onboarding: 가상 shell과 tmux 조작에서 Muxa watch workflow로 이어지는 단일 시나리오](demo-onboard.gif)
@@ -44,8 +44,8 @@ watch처럼 Sessions와 Inspector를 50/50으로 나눕니다.
 watch 구간도 설명을 읽고 Enter만 누르는 방식이 아니라 실제 키를 눌러야
 진행됩니다.
 
-- `j`/`↓`: 다음 session으로 이동
-- `l`/`→`: 선택한 session의 child agent로 진입
+- `j`/`↓`: 다음 work로 이동
+- `l`/`→`: 선택한 work의 child agent로 진입
 - `Alt-T`: state/attention 순으로 정렬
 - `o`: pane preview 열기와 닫기
 - `?`/`F1`: 전체 단축키 도움말 열기와 닫기
@@ -96,9 +96,9 @@ client detach가 일어나지 않습니다.
 
 `w`의 tree, `c`의 활성 window, `%`와 `"`의 pane layout은 다음 단계에서도
 사라지지 않고 누적됩니다. `s` 화면은 기본 onboarding과 같은 live watch형
-header, 왼쪽 state gutter, session tree, 50/50 inspector, footer를 사용합니다.
+header, 왼쪽 state gutter, work tree, 50/50 inspector, footer를 사용합니다.
 별도의 tmux 완료 화면이나 Muxa 시작 화면은 없습니다. managed binding을 익히는
-11단계 다음 번호에서 같은 watch 화면의 session 이동 실습이 바로 계속되며,
+11단계 다음 번호에서 같은 watch 화면의 work 이동 실습이 바로 계속되며,
 처음부터 마지막까지 하나의 단계 수와 진행률을 사용합니다.
 
 여기서도 `F2`로 한글/영문을 전환하고, `Esc`로 종료하며, `--no-quiz`로 키
@@ -120,6 +120,7 @@ tmux 설정을 설치했다면 prefix+s로 watch를 열 수 있습니다.
 muxa-onboarding을 첫 agent와 함께 시작합니다.
 
     muxa work start muxa-onboarding \
+      --workspace muxa \
       --cwd /path/to/repo \
       --agent codex \
       --role implementer \
@@ -128,6 +129,7 @@ muxa-onboarding을 첫 agent와 함께 시작합니다.
 같은 work에 reviewer pane을 추가합니다.
 
     muxa agent start \
+      --workspace muxa \
       --work muxa-onboarding \
       --agent claude \
       --role reviewer \
@@ -135,25 +137,27 @@ muxa-onboarding을 첫 agent와 함께 시작합니다.
 
 work와 agent pane을 조회합니다.
 
-    muxa work list
-    muxa work show muxa-onboarding
+    muxa workspace list
+    muxa work list --workspace muxa
+    muxa work show muxa-onboarding --workspace muxa
 
 현재 turn만 중단할 때는 interrupt를 사용합니다.
 
     muxa agent control --pane %42 --action interrupt
 
-agent pane 또는 work 전체를 닫는 동작은 확인을 요구합니다.
+agent pane, work window 또는 workspace session을 닫는 동작은 확인을 요구합니다.
 
     muxa agent control --pane %42 --action terminate
-    muxa work close muxa-onboarding
+    muxa work close muxa-onboarding --workspace muxa
+    muxa workspace close muxa
 
-Muxa가 managed metadata를 기록하지 않은 pane과 session은 종료하지
+Muxa가 managed metadata를 기록하지 않은 pane, window, session은 종료하지
 않습니다.
 
 ## muxa watch
 
-muxa watch는 session 중심 화면을 기본으로 사용합니다. session row는
-work를 나타내고, 펼친 child row는 agent pane을 나타냅니다.
+muxa watch는 work 중심 화면을 기본으로 사용합니다. `workspace › work` parent
+row는 tmux window를, 펼친 child row는 agent pane을 나타냅니다.
 
 주요 단축키:
 
@@ -169,7 +173,7 @@ work를 나타내고, 펼친 child row는 agent pane을 나타냅니다.
 - Alt-A: attention 상태만 보기
 - Alt-K: 선택한 managed pane 종료 확인
 - Alt-X: 현재 turn 중단 확인
-- Alt-S/L/D/T: session, latest, duration, state 정렬
+- Alt-S/L/D/T: workspace, latest, duration, state 정렬
 - ? 또는 F1: 전체 단축키 도움말
 
 onboarding의 한글 도움말은 watch의 실제 키 구성을 같은 순서로 설명합니다.
@@ -179,6 +183,7 @@ onboarding의 한글 도움말은 watch의 실제 키 구성을 같은 순서로
 별도 tmux MCP 서버를 추가하지 않고 기존 muxa mcp를 사용합니다.
 
     muxa_start_agent(
+      workspace="muxa",
       work="muxa-onboarding",
       agent="codex",
       role="reviewer",
@@ -206,11 +211,12 @@ tmux lifecycle 제어는 하나의 muxa_manage_tmux 도구로 묶여 있습니�
 
     muxa_manage_tmux(action="interrupt_agent", pane="%42")
     muxa_manage_tmux(action="terminate_agent", pane="%42", confirm=true)
-    muxa_manage_tmux(action="close_work", work="muxa-onboarding", confirm=true)
+    muxa_manage_tmux(action="close_work", workspace="muxa", work="muxa-onboarding", confirm=true)
+    muxa_manage_tmux(action="close_workspace", workspace="muxa", confirm=true)
 
 ## 경계
 
 Muxa는 범용 shell이나 임의 tmux command를 제공하지 않습니다. 파일
-수정, Git, 테스트 실행은 agent가 담당합니다. Muxa는 work/session과
-agent/pane을 안전하고 반복 가능한 방식으로 생성·관찰·제어하는 control
+수정, Git, 테스트 실행은 agent가 담당합니다. Muxa는 workspace/session,
+work/window, agent/pane을 안전하고 반복 가능한 방식으로 생성·관찰·제어하는 control
 plane에 집중합니다.
