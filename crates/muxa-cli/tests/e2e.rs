@@ -45,6 +45,7 @@ fn wait_for_socket(path: &Path, deadline: Duration) {
 struct Daemon {
     child: Child,
     socket: PathBuf,
+    config: PathBuf,
     /// Per-test history NDJSON path. Tests that want to verify on-disk
     /// persistence read this directly; tests that don't care about
     /// history simply ignore it.
@@ -115,6 +116,7 @@ enabled = false
         Self {
             child,
             socket,
+            config: cfg_path,
             history: history_path,
             activity: activity_path,
         }
@@ -123,6 +125,10 @@ enabled = false
     fn cli(&self) -> Command {
         let mut c = Command::new(bin("muxa"));
         c.env("MUXA_SOCKET", &self.socket);
+        // Keep the client half of each E2E test isolated too. Without this,
+        // the daemon reads the temporary config while the CLI can pick up an
+        // operator's real ~/.config/muxa/config.toml.
+        c.env("MUXA_CONFIG", &self.config);
         c
     }
 
@@ -527,6 +533,7 @@ path = "{}"
         daemon: Daemon {
             child,
             socket,
+            config: cfg_path,
             history: history_path,
             activity: activity_path,
         },

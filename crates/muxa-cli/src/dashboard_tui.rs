@@ -33,7 +33,6 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Stdout};
-use std::path::Path;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -486,6 +485,7 @@ fn push_action_target(targets: &mut Vec<ActionTarget>, target: ActionTarget) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardHost {
     Tmux,
+    Rmux,
     Zellij,
     Herdr,
     Pty,
@@ -497,6 +497,7 @@ impl CardHost {
     fn label(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
+            Self::Rmux => "rmux",
             Self::Zellij => "zellij",
             Self::Herdr => "herdr",
             Self::Pty => "pty",
@@ -1317,27 +1318,29 @@ async fn refresh_collaboration_data(client: &Client, app: &mut DashboardApp) {
 }
 
 fn dashboard_collaboration_origin() -> Option<CollaborationOrigin> {
+    let pane = muxa::default_backend().current_pane();
     dashboard_collaboration_origin_from(
-        std::env::var("TMUX_PANE").ok(),
+        pane,
+        std::env::var("RMUX").ok(),
         std::env::var("TMUX").ok(),
-        muxa::tmux::current_pane,
     )
 }
 
 fn dashboard_collaboration_origin_from(
     pane: Option<String>,
+    rmux: Option<String>,
     tmux: Option<String>,
-    fallback_pane: impl FnOnce() -> Option<String>,
 ) -> Option<CollaborationOrigin> {
-    let pane = pane
-        .filter(|pane| !pane.is_empty())
-        .or_else(fallback_pane)?;
-    let socket = tmux.and_then(|value| {
+    let pane = pane.filter(|pane| !pane.is_empty())?;
+    let kind = muxa::backend::pane_id_host_kind(&pane)?;
+    let endpoint = match kind {
+        HostKind::Rmux => rmux,
+        HostKind::Tmux => tmux,
+        HostKind::Zellij | HostKind::Herdr => return None,
+    };
+    let socket = endpoint.and_then(|value| {
         let path = value.split(',').next()?.trim();
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
+        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
     });
     Some(CollaborationOrigin { pane, socket })
 }
@@ -1387,6 +1390,7 @@ fn build_dashboard_data(
     for pane in &panes {
         let card_host = match host {
             HostKind::Tmux => CardHost::Tmux,
+            HostKind::Rmux => CardHost::Rmux,
             HostKind::Zellij => CardHost::Zellij,
             HostKind::Herdr => CardHost::Herdr,
         };
@@ -1535,6 +1539,7 @@ fn card_identity(
         if let Some(info) = pane_by_id.get(pane) {
             let card_host = match host {
                 HostKind::Tmux => CardHost::Tmux,
+                HostKind::Rmux => CardHost::Rmux,
                 HostKind::Zellij => CardHost::Zellij,
                 HostKind::Herdr => CardHost::Herdr,
             };
@@ -2708,7 +2713,7 @@ fn compact_card_lines(
 
 fn card_title(card: &SessionCard) -> String {
     let prefix = match card.host {
-        CardHost::Tmux | CardHost::Zellij | CardHost::Herdr => "",
+        CardHost::Tmux | CardHost::Rmux | CardHost::Zellij | CardHost::Herdr => "",
         CardHost::Pty => "pty:",
         CardHost::Pane => "pane:",
         CardHost::Agent => "agent:",
@@ -4566,11 +4571,11 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_origin_falls_back_to_tmux_active_pane() {
+    fn collaboration_origin_uses_tmux_pane_and_short_socket() {
         let origin = dashboard_collaboration_origin_from(
+            Some("%9".into()),
             None,
             Some("/tmp/tmux-1000/custom,42,7".into()),
-            || Some("%9".into()),
         )
         .unwrap();
 
@@ -4582,13 +4587,26 @@ mod tests {
     fn collaboration_origin_prefers_nonempty_tmux_pane_env() {
         let origin = dashboard_collaboration_origin_from(
             Some("%3".into()),
+            None,
             Some("/tmp/tmux-1000/default,42,7".into()),
-            || panic!("fallback must not run when TMUX_PANE is available"),
         )
         .unwrap();
 
         assert_eq!(origin.pane, "%3");
         assert_eq!(origin.socket.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn collaboration_origin_preserves_rmux_endpoint() {
+        let origin = dashboard_collaboration_origin_from(
+            Some("rmux:%3".into()),
+            Some("/tmp/rmux-1000/default,42,7".into()),
+            Some("/tmp/rmux-compat,42,7".into()),
+        )
+        .unwrap();
+
+        assert_eq!(origin.pane, "rmux:%3");
+        assert_eq!(origin.socket.as_deref(), Some("/tmp/rmux-1000/default"));
     }
 
     #[test]

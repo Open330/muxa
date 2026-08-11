@@ -60,7 +60,7 @@ Codex는 허용 목록에 지정한 환경 변수만 stdio MCP process로 전달
 추가하세요.
 
 ```toml
-env_vars = ["TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 ```
 
 이미 실행 중인 agent는 등록된 MCP 목록을 다시 읽도록 종료 후 재실행합니다.
@@ -76,9 +76,9 @@ prompt를 한 번 제출해 hook event를 발생시키고, 계속 synthetic이�
 
 기존 `prefix+s` watch 단축키가 있다면 업그레이드 후 추가 단축키가 필요 없습니다.
 
-Claude MCP process는 agent와 같은 pane의 `TMUX_PANE`/`TMUX` 환경을 상속하고,
-Codex는 위 `env_vars` 허용 목록을 통해 전달합니다. 기존 default-socket Codex
-등록에는 muxa가 process ancestry를 따라 pane을 복구하는 fallback도 적용합니다.
+Claude MCP process는 agent와 같은 pane host의 native 환경 변수를 상속하고,
+Codex는 위 `env_vars` 허용 목록을 통해 전달합니다. 기존 default-endpoint Codex
+등록에는 muxa가 active backend의 process ancestry를 따라 pane을 복구하는 fallback도 적용합니다.
 해석된 값과 daemon의 live agent/pane registry를 대조해 발신자를 결정하므로 tool
 argument로 발신 pane을 임의 지정하지 않습니다.
 

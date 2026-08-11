@@ -1179,13 +1179,13 @@ fn spawn_session_activity_task(
             muxa::HostKind::Herdr => sources.push(muxa::SessionActivitySource::Herdr {
                 socket_path: muxa::backend::herdr::default_socket_path(),
             }),
-            muxa::HostKind::Zellij => {}
+            muxa::HostKind::Rmux | muxa::HostKind::Zellij => {}
         }
     }
     let source_kinds: Vec<muxa::HostKind> = backends
         .iter()
         .map(|b| b.kind())
-        .filter(|k| *k != muxa::HostKind::Zellij)
+        .filter(|kind| matches!(kind, muxa::HostKind::Tmux | muxa::HostKind::Herdr))
         .collect();
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),

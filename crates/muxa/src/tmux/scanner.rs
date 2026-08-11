@@ -12,34 +12,15 @@
 //! a wedged `attach-session` losing the controlling terminal) cannot
 //! stall the dashboard.
 //!
-//! ## Herdr hosts
+//! ## Non-tmux hosts
 //!
-//! Herdr is a single-server-per-user model too, but — unlike zellij — it
-//! ships a socket API that enumerates every pane out of the box. On a herdr
-//! host the dashboard's `/api/panes` refresh runs [`scan`] **and** asks the
-//! daemon's active [`HerdrBackend`] for `pane.list`, then concatenates the
-//! two: the herdr panes (folded into this [`ScanResult`] shape by
-//! [`herdr_scan_result`]) are appended onto the tmux scan. Running only the
-//! herdr side would drop live tmux panes during a mixed-host migration, so
-//! the merge keeps both. That branch lives in the dashboard's pane-cache
-//! refresh closure (see `crate::dashboard::server`); the tmux path here is
-//! untouched. The `MUXA_TMUX_SOCKET` scope is a *tmux-socket* concept and
-//! never applies to herdr panes (consistent with the ingest scope gate
-//! treating a socket-less herdr event as in-scope).
+//! The dashboard runs [`scan`] together with every active non-tmux backend and
+//! merges their common pane rows into one [`ScanResult`]. Herdr rows are folded
+//! by [`herdr_scan_result`]; rmux retains its full endpoint path; zellij can
+//! contribute its plugin snapshot. Running only one side would drop panes in a
+//! mixed-host migration. `MUXA_TMUX_SOCKET` remains a tmux-only scope.
 //!
 //! [`HerdrBackend`]: crate::backend::herdr::HerdrBackend
-//!
-//! ## Zellij hosts
-//!
-//! Zellij is a single-server-per-user model with no multi-socket
-//! analog, so the dashboard's `/api/panes` route — which calls
-//! [`scan`] to populate its rows — naturally returns an empty result
-//! on a zellij-only host. Cross-host enumeration in the dashboard
-//! waits on the WASM plugin landing (the plugin is the only surface
-//! that exposes zellij pane metadata at all); until then the
-//! dashboard's panes view is tmux-only and the agents view (`/api/agents`,
-//! `/api/events`) is host-agnostic. This is intentional and matches
-//! the design doc's "Zellij has no multi-server enumeration" note.
 
 use crate::tmux::{PaneInfo, PANE_FMT};
 use serde::Serialize;

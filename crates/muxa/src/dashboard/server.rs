@@ -99,14 +99,12 @@ pub struct AppState {
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
-    /// Active pane backend, threaded in so the `/api/panes` refresh can
-    /// source panes from the herdr socket when the host is herdr (the tmux
-    /// multi-socket [`scanner::scan`] sees nothing there). `None` keeps the
-    /// historical tmux-scanner path — the default for tests and any caller
-    /// that doesn't supply one (behaviour is byte-identical to before).
+    /// Primary pane backend retained for compatibility with callers that
+    /// inspect it directly. Pane scans use `backends` below so every active
+    /// host contributes to one dashboard inventory.
     pub backend: Option<SharedBackend>,
-    /// Every active backend, used to route PAT-gated pane control actions by
-    /// pane-id namespace. `backend` above remains the primary scan source.
+    /// Every active backend, used both for pane scans and to route PAT-gated
+    /// control actions by pane-id namespace.
     pub backends: Arc<Vec<SharedBackend>>,
     /// Lock-free runtime counters surfaced via `/api/metrics`. Cloned
     /// from the [`Store`](crate::state::Store)'s metrics so SSE
@@ -201,54 +199,98 @@ impl AppState {
         self
     }
 
-    /// Refresh the pane inventory through the pane cache, sourcing from the
-    /// herdr socket when the active backend is herdr and from the tmux
-    /// multi-socket scanner otherwise. Both `/api/panes` and the timeline's
-    /// pane→session map go through here so they agree on a herdr host.
+    /// Refresh the pane inventory through the pane cache. tmux keeps its
+    /// multi-socket scanner; every active non-tmux backend contributes its
+    /// own pane inventory. `/api/panes`, control routing, and the timeline's
+    /// pane→session map therefore see the same multi-host set.
     async fn refresh_pane_scan(&self) -> scanner::ScanResult {
-        let backend = self.backend.clone();
+        let backends = self.backends.clone();
         self.pane_cache
-            .get_or_refresh(|| refresh_pane_scan(backend))
+            .get_or_refresh(|| refresh_pane_scan(backends))
             .await
     }
 }
 
-/// Pull one pane inventory for the pane cache. On a herdr host we run BOTH
-/// the tmux multi-socket [`scanner::scan`] *and* the daemon's [`HerdrBackend`]
-/// `pane.list` (a blocking socket round-trip, hence `spawn_blocking`), then
-/// concat the two into one [`ScanResult`]. Running only the herdr side would
-/// drop live tmux panes during a mixed-host migration (tmux panes vanish from
-/// `/api/panes` and the timeline); merging keeps both. tmux per-socket
-/// failures keep flowing through `errors` as before. Every other backend — and
-/// the `None`/no-backend test path — runs the unchanged tmux scanner alone.
-async fn refresh_pane_scan(backend: Option<SharedBackend>) -> scanner::ScanResult {
-    match backend {
-        Some(backend) if backend.kind() == HostKind::Herdr => {
-            let herdr_panes = tokio::task::spawn_blocking(move || backend.list_panes())
-                .await
-                .unwrap_or_default();
-            merge_pane_scans(
-                scanner::scan().await,
-                scanner::herdr_scan_result(herdr_panes),
-            )
+/// Pull one multi-host inventory for the pane cache. The tmux scanner and
+/// non-tmux backend calls run concurrently; each backend is sync-blocking, so
+/// the latter stay on Tokio's blocking pool.
+async fn refresh_pane_scan(backends: Arc<Vec<SharedBackend>>) -> scanner::ScanResult {
+    let non_tmux = backends
+        .iter()
+        .filter(|backend| backend.kind() != HostKind::Tmux)
+        .cloned()
+        .collect::<Vec<_>>();
+    let backend_scan = tokio::task::spawn_blocking(move || {
+        non_tmux
+            .into_iter()
+            .map(|backend| (backend.kind(), backend.list_panes()))
+            .collect::<Vec<_>>()
+    });
+    let (mut scan, backend_rows) = tokio::join!(scanner::scan(), backend_scan);
+    if let Ok(backend_rows) = backend_rows {
+        for (kind, panes) in backend_rows {
+            let additional = if kind == HostKind::Herdr {
+                scanner::herdr_scan_result(panes)
+            } else {
+                backend_scan_result(kind, panes)
+            };
+            scan = merge_pane_scans(scan, additional);
         }
-        _ => scanner::scan().await,
+    }
+    scan
+}
+
+/// Convert a non-tmux backend's common `PaneInfo` rows to the dashboard wire
+/// shape. rmux retains its full socket path; hosts without endpoint paths use
+/// a stable host label. Bare-terminal attach commands remain tmux-only.
+fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> scanner::ScanResult {
+    let panes = panes
+        .into_iter()
+        .map(|pane| {
+            let socket = match kind {
+                HostKind::Rmux => pane
+                    .socket
+                    .as_deref()
+                    .map_or_else(|| PathBuf::from("rmux"), PathBuf::from),
+                HostKind::Herdr => PathBuf::from("herdr"),
+                HostKind::Zellij => PathBuf::from("zellij"),
+                HostKind::Tmux => pane
+                    .socket
+                    .as_deref()
+                    .map_or_else(|| PathBuf::from("tmux"), PathBuf::from),
+            };
+            PaneSummary {
+                pane_id: pane.pane_id,
+                session_id: pane.session_id,
+                session: pane.session,
+                window_id: pane.window_id,
+                window_name: pane.window_name,
+                window_index: pane.window_index,
+                pane_index: pane.pane_index,
+                tty: pane.tty,
+                current_command: pane.current_command,
+                title: pane.title,
+                socket,
+                attach_command: String::new(),
+            }
+        })
+        .collect();
+    scanner::ScanResult {
+        panes,
+        errors: Vec::new(),
+        fetched_at: OffsetDateTime::now_utc(),
     }
 }
 
-/// Concat a herdr pane inventory onto a tmux scan result. herdr panes are
-/// appended after the tmux panes; the tmux side's `errors` (per-socket partial
-/// failures) are preserved and any herdr-side errors folded in too (there are
-/// none today — a single in-process backend call has no per-socket failures).
-/// The `fetched_at` of the tmux scan is kept as the result timestamp (both are
-/// captured within the same refresh, so the difference is immaterial).
+/// Append one backend inventory while preserving earlier scan errors and the
+/// original fetch timestamp.
 fn merge_pane_scans(
-    mut tmux: scanner::ScanResult,
-    herdr: scanner::ScanResult,
+    mut base: scanner::ScanResult,
+    additional: scanner::ScanResult,
 ) -> scanner::ScanResult {
-    tmux.panes.extend(herdr.panes);
-    tmux.errors.extend(herdr.errors);
-    tmux
+    base.panes.extend(additional.panes);
+    base.errors.extend(additional.errors);
+    base
 }
 
 /// Build the dashboard router. Public so `muxad`'s integration tests
@@ -684,6 +726,44 @@ async fn control_socket(
     pane: &str,
     requested: Option<&str>,
 ) -> Result<Option<String>, ControlFailure> {
+    if backend.kind() == HostKind::Rmux {
+        let mut candidates = state
+            .store
+            .by_pane(pane)
+            .await
+            .into_iter()
+            .filter_map(|agent| agent.tmux_socket)
+            .map(|endpoint| crate::backend::pane_endpoint_identity(Some(pane), &endpoint))
+            .collect::<Vec<_>>();
+        let scan = state.refresh_pane_scan().await;
+        candidates.extend(
+            scan.panes
+                .into_iter()
+                .filter(|candidate| candidate.pane_id == pane)
+                .filter_map(|candidate| candidate.socket.to_str().map(str::to_string)),
+        );
+        candidates.sort();
+        candidates.dedup();
+
+        if let Some(requested) = requested {
+            let requested = crate::backend::pane_endpoint_identity(Some(pane), requested);
+            if candidates.iter().any(|candidate| candidate == &requested) {
+                return Ok(Some(requested));
+            }
+            return Err(ControlFailure::new(
+                StatusCode::BAD_REQUEST,
+                format!("pane {pane} is not present on rmux endpoint {requested}"),
+            ));
+        }
+        return match candidates.as_slice() {
+            [] => Ok(None),
+            [endpoint] => Ok(Some(endpoint.clone())),
+            _ => Err(ControlFailure::new(
+                StatusCode::CONFLICT,
+                format!("pane {pane} exists on multiple rmux endpoints; specify socket"),
+            )),
+        };
+    }
     if backend.kind() != HostKind::Tmux {
         return Ok(None);
     }
@@ -1528,6 +1608,48 @@ mod tests {
         sent: Arc<Mutex<Vec<(String, String)>>>,
     }
 
+    struct InventoryBackend {
+        kind: HostKind,
+        panes: Vec<PaneInfo>,
+    }
+
+    impl PaneBackend for InventoryBackend {
+        fn kind(&self) -> HostKind {
+            self.kind
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> bool {
+            false
+        }
+    }
+
     impl PaneBackend for RecordingControlBackend {
         fn kind(&self) -> HostKind {
             HostKind::Herdr
@@ -1856,6 +1978,75 @@ mod tests {
         assert_eq!(ids, ["%1", "herdr:p1"], "tmux first, herdr appended");
         assert_eq!(merged.errors.len(), 1, "tmux scan errors preserved");
         assert_eq!(merged.errors[0].socket, PathBuf::from("wedged"));
+    }
+
+    #[test]
+    fn rmux_dashboard_rows_preserve_full_endpoint() {
+        let scan = backend_scan_result(
+            HostKind::Rmux,
+            vec![crate::tmux::PaneInfo {
+                socket: Some("/tmp/rmux-user/default".into()),
+                pane_id: "rmux:%4".into(),
+                session_id: "$1".into(),
+                session: "work".into(),
+                window_id: "@2".into(),
+                window_name: "editor".into(),
+                window_index: "0".into(),
+                pane_index: "0".into(),
+                tty: "/dev/pts/4".into(),
+                current_command: "zsh".into(),
+                title: "work".into(),
+                pane_pid: 42,
+                current_path: "/tmp/project".into(),
+            }],
+        );
+        assert_eq!(scan.panes.len(), 1);
+        assert_eq!(scan.panes[0].pane_id, "rmux:%4");
+        assert_eq!(
+            scan.panes[0].socket,
+            PathBuf::from("/tmp/rmux-user/default")
+        );
+        assert!(scan.panes[0].attach_command.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_scan_includes_non_primary_rmux_backend() {
+        let rmux: SharedBackend = Arc::new(InventoryBackend {
+            kind: HostKind::Rmux,
+            panes: vec![crate::tmux::PaneInfo {
+                socket: Some("/tmp/rmux-secondary/default".into()),
+                pane_id: "rmux:%8".into(),
+                session_id: "$2".into(),
+                session: "secondary".into(),
+                window_id: "@3".into(),
+                window_name: "shell".into(),
+                window_index: "0".into(),
+                pane_index: "0".into(),
+                tty: "/dev/pts/8".into(),
+                current_command: "zsh".into(),
+                title: "secondary".into(),
+                pane_pid: 88,
+                current_path: "/tmp/project".into(),
+            }],
+        });
+
+        let scan = refresh_pane_scan(Arc::new(vec![rmux.clone()])).await;
+        let pane = scan
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == "rmux:%8")
+            .expect("secondary rmux backend should contribute to dashboard scan");
+        assert_eq!(pane.socket, PathBuf::from("/tmp/rmux-secondary/default"));
+
+        let state = fresh_state().with_backend(rmux.clone());
+        let endpoint = match control_socket(&state, &rmux, "rmux:%8", None).await {
+            Ok(endpoint) => endpoint,
+            Err(failure) => panic!(
+                "untracked pane should resolve from the dashboard scan: {}",
+                failure.message
+            ),
+        };
+        assert_eq!(endpoint.as_deref(), Some("/tmp/rmux-secondary/default"));
     }
 
     #[tokio::test]

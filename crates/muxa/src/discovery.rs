@@ -257,7 +257,7 @@ pub fn synthetic_session_id(pane: &PaneInfo) -> String {
         // Length-prefix the socket so the identity stays unambiguous even if
         // a custom socket name contains the separator.
         Some(socket) => {
-            let socket = crate::tmux::socket_short_name(socket);
+            let socket = crate::backend::pane_endpoint_identity(Some(&pane.pane_id), socket);
             format!(
                 "{}{len}:{socket}:{}",
                 SYNTHETIC_SESSION_PREFIX,
@@ -278,9 +278,7 @@ fn pane_identity_matches(
         return false;
     }
     match (known_socket, discovered.socket.as_deref()) {
-        (Some(left), Some(right)) => {
-            crate::tmux::socket_short_name(left) == crate::tmux::socket_short_name(right)
-        }
+        (Some(left), Some(right)) => crate::backend::pane_endpoints_match(known_pane, left, right),
         (None, None) => true,
         (Some(_), None) | (None, Some(_)) => false,
     }
@@ -646,6 +644,22 @@ mod tests {
         ));
         assert!(!pane_identity_matches(Some("%42"), Some("amux"), &default,));
         assert!(!pane_identity_matches(Some("%42"), None, &default));
+    }
+
+    #[test]
+    fn rmux_synthetic_identity_preserves_full_endpoint() {
+        let mut first = pane("rmux:%42", "claude");
+        first.socket = Some("/tmp/rmux-one/default".into());
+        let mut second = first.clone();
+        second.socket = Some("/tmp/rmux-two/default".into());
+
+        assert_ne!(synthetic_session_id(&first), synthetic_session_id(&second));
+        assert!(synthetic_session_id(&first).contains("/tmp/rmux-one/default"));
+        assert!(!pane_identity_matches(
+            Some("rmux:%42"),
+            Some("/tmp/rmux-two/default"),
+            &first,
+        ));
     }
 
     #[test]

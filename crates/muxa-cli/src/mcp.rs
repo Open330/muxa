@@ -34,7 +34,6 @@ use muxa::ipc::Client;
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -343,7 +342,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "string", "description": "Pane id to filter to (e.g. %12 or herdr:p1). Omit for all panes." },
+                    "pane": { "type": "string", "description": "Pane id to filter to (e.g. %12, rmux:%12, or herdr:p1). Omit for all panes." },
                     "limit": { "type": "integer", "minimum": 0, "description": "Max entries. 0 or omitted = all retained." },
                 },
                 "additionalProperties": false,
@@ -406,7 +405,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "string", "description": "Target pane id (e.g. %12 or herdr:p1)." },
+                    "pane": { "type": "string", "description": "Target pane id (e.g. %12, rmux:%12, or herdr:p1)." },
                     "text": { "type": "string", "description": "Literal text to type into the pane." },
                     "submit": { "type": "boolean", "description": "Press Enter after the text. Default true." },
                 },
@@ -421,7 +420,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "string", "description": "Pane id to capture (e.g. %12 or herdr:p1)." },
+                    "pane": { "type": "string", "description": "Pane id to capture (e.g. %12, rmux:%12, or herdr:p1)." },
                 },
                 "required": ["pane"],
                 "additionalProperties": false,
@@ -991,39 +990,43 @@ fn collaboration_guide(room: RoomContext) -> Value {
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
-    let pane = std::env::var("TMUX_PANE")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(current_process_tmux_pane)
+    let pane = muxa::default_backend()
+        .current_pane()
+        .or_else(current_process_host_pane)
         .ok_or_else(|| {
-            "collaboration could not identify this MCP server's tmux pane; \
-             TMUX_PANE is unset and process ancestry did not reach a pane shell. \
-             For Codex, add env_vars = [\"TMUX\", \"TMUX_PANE\", \"MUXA_SOCKET\"] \
+            "collaboration could not identify this MCP server's pane; \
+             native pane variables are unset and process ancestry did not reach a pane shell. \
+             For Codex, add env_vars = [\"RMUX\", \"RMUX_PANE\", \"TMUX\", \"TMUX_PANE\", \"MUXA_SOCKET\"] \
              under [mcp_servers.muxa] and restart Codex"
                 .to_string()
         })?;
-    let socket = std::env::var("TMUX").ok().and_then(|value| {
+    let endpoint = match muxa::backend::pane_id_host_kind(&pane) {
+        Some(muxa::HostKind::Rmux) => std::env::var("RMUX").ok(),
+        Some(muxa::HostKind::Tmux) => std::env::var("TMUX").ok(),
+        Some(muxa::HostKind::Zellij | muxa::HostKind::Herdr) | None => None,
+    };
+    let socket = endpoint.and_then(|value| {
         let path = value.split(',').next()?.trim();
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
+        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
     });
     Ok(CollaborationOrigin { pane, socket })
 }
 
-/// Recover the owning tmux pane when an MCP host sanitizes subprocess
+/// Recover the owning pane when an MCP host sanitizes subprocess
 /// environment variables. Current Codex releases only forward variables
 /// explicitly listed in `mcp_servers.<name>.env_vars`, so an existing muxa
-/// registration may launch with neither `TMUX_PANE` nor `TMUX` even though
+/// registration may launch without the host's native variables even though
 /// Codex itself is running in a pane.
 ///
 /// The MCP process is still a descendant of the pane shell. Match the first
-/// ancestor whose PID appears in `tmux list-panes` and use that pane as a
-/// local/default-socket fallback. Explicit env remains authoritative because
-/// it also identifies non-default tmux sockets without ambiguity.
-fn current_process_tmux_pane() -> Option<String> {
-    let pane_pids = muxa::tmux::pane_pid_map();
+/// ancestor whose PID appears in an active backend's pane inventory. Explicit
+/// env remains authoritative because it also identifies the endpoint without
+/// ambiguity.
+fn current_process_host_pane() -> Option<String> {
+    let pane_pids = muxa::active_backends()
+        .into_iter()
+        .flat_map(|backend| backend.pane_pid_map())
+        .collect::<HashMap<_, _>>();
     pane_from_ancestry(std::process::id(), &pane_pids, |pid| {
         muxa::adapters::proc_ancestry::parent_pid(pid)
     })

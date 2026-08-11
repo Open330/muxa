@@ -18,7 +18,7 @@
 //!   `Store` methods such as [`Store::with_history`] and
 //!   [`Store::recent_prompts`])
 //! - The pane backend abstraction: [`PaneBackend`], [`SharedBackend`],
-//!   [`BackendCaps`], [`HostKind`], [`TmuxBackend`], [`ZellijBackend`],
+//!   [`BackendCaps`], [`HostKind`], [`RmuxBackend`], [`TmuxBackend`], [`ZellijBackend`],
 //!   [`default_backend`]
 //!
 //! Everything else re-exported from this crate is internal task wiring used
@@ -67,8 +67,8 @@ pub mod tmux;
 // ---------------------------------------------------------------------------
 
 pub use backend::{
-    active_backends, default_backend, tmux::TmuxBackend, zellij::ZellijBackend, BackendCaps,
-    HostKind, PaneBackend, SharedBackend,
+    active_backends, default_backend, rmux::RmuxBackend, tmux::TmuxBackend, zellij::ZellijBackend,
+    BackendCaps, HostKind, PaneBackend, SharedBackend,
 };
 pub use config::Config;
 pub use error::CoreError as Error;

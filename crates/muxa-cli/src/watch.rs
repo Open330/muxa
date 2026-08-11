@@ -3347,7 +3347,13 @@ impl<'a> SortContext<'a> {
             .pane
             .as_deref()
             .and_then(|id| self.pane(id))
-            .map_or(0, |p| self.session_duration_secs(&p.session))
+            .map_or(0, |pane| {
+                if muxa::backend::pane_id_host_kind(&pane.pane_id) == Some(muxa::HostKind::Rmux) {
+                    0
+                } else {
+                    self.session_duration_secs(&pane.session)
+                }
+            })
     }
 }
 
@@ -3447,6 +3453,7 @@ fn sort_agents(
 fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
     match host {
         Some(muxa::HostKind::Tmux) => format!("tmux:{session}"),
+        Some(muxa::HostKind::Rmux) => format!("rmux:{session}"),
         Some(muxa::HostKind::Herdr) => format!("herdr:{session}"),
         Some(muxa::HostKind::Zellij) => format!("zellij:{session}"),
         None => session.to_string(),
@@ -3632,8 +3639,13 @@ fn build_work_rows(
     }
 
     for builder in builders.values_mut() {
-        if let Some(activity) = sort_context.activity_for_session_name(&builder.session) {
-            builder.activity = Some(activity.clone());
+        // rmux session ids intentionally mirror tmux's `$N` shape, but the
+        // activity ledger has no rmux source yet. Never borrow a same-numbered
+        // tmux duration for an rmux row.
+        if !builder.group_key.starts_with("rmux:") {
+            if let Some(activity) = sort_context.activity_for_session_name(&builder.session) {
+                builder.activity = Some(activity.clone());
+            }
         }
     }
 
@@ -3687,6 +3699,7 @@ fn rows_multi_host(rows: &[WatchRow]) -> bool {
 fn host_badge_label(host: muxa::HostKind) -> &'static str {
     match host {
         muxa::HostKind::Tmux => "tmux",
+        muxa::HostKind::Rmux => "rmux",
         muxa::HostKind::Zellij => "zellij",
         muxa::HostKind::Herdr => "herdr",
     }
@@ -4568,6 +4581,9 @@ fn apply_full(app: &mut App, full: FullRefresh) {
 fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
     match host {
         muxa::HostKind::Tmux => muxa::tmux::list_sessions().unwrap_or_default(),
+        // rmux pane rows already carry the human session name. Until rmux
+        // session-activity sampling lands, emitting tmux-shaped `$N`
+        // SessionInfo ids here would collide with tmux's activity ledger.
         muxa::HostKind::Herdr => {
             let socket = muxa::backend::herdr::default_socket_path();
             muxa::backend::herdr::herdr_list_workspaces(&socket)
@@ -4582,7 +4598,7 @@ fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
                 })
                 .collect()
         }
-        muxa::HostKind::Zellij => Vec::new(),
+        muxa::HostKind::Rmux | muxa::HostKind::Zellij => Vec::new(),
     }
 }
 
@@ -5363,20 +5379,28 @@ pub async fn run(
 }
 
 fn watch_collaboration_origin(initial_pane: Option<String>) -> Option<CollaborationOrigin> {
-    watch_collaboration_origin_from(initial_pane, std::env::var("TMUX").ok())
+    watch_collaboration_origin_from(
+        initial_pane,
+        std::env::var("RMUX").ok(),
+        std::env::var("TMUX").ok(),
+    )
 }
 
 fn watch_collaboration_origin_from(
     initial_pane: Option<String>,
+    rmux: Option<String>,
     tmux: Option<String>,
 ) -> Option<CollaborationOrigin> {
-    let pane = initial_pane.filter(|pane| pane.starts_with('%'))?;
-    let socket = tmux.and_then(|value| {
+    let pane = initial_pane?;
+    let kind = muxa::backend::pane_id_host_kind(&pane)?;
+    let endpoint = match kind {
+        muxa::HostKind::Rmux => rmux,
+        muxa::HostKind::Tmux => tmux,
+        muxa::HostKind::Zellij | muxa::HostKind::Herdr => return None,
+    };
+    let socket = endpoint.and_then(|value| {
         let path = value.split(',').next()?.trim();
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
+        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
     });
     Some(CollaborationOrigin { pane, socket })
 }
@@ -10881,13 +10905,27 @@ mod tests {
     fn watch_collaboration_origin_uses_launch_pane_and_socket() {
         let origin = watch_collaboration_origin_from(
             Some("%9".into()),
+            None,
             Some("/tmp/tmux-1000/custom,42,7".into()),
         )
         .unwrap();
 
         assert_eq!(origin.pane, "%9");
         assert_eq!(origin.socket.as_deref(), Some("custom"));
-        assert!(watch_collaboration_origin_from(Some("zellij:3".into()), None).is_none());
+        assert!(watch_collaboration_origin_from(Some("zellij:3".into()), None, None).is_none());
+    }
+
+    #[test]
+    fn watch_collaboration_origin_preserves_rmux_endpoint() {
+        let origin = watch_collaboration_origin_from(
+            Some("rmux:%9".into()),
+            Some("/tmp/rmux-1000/default,42,7".into()),
+            Some("/tmp/rmux-compat,42,7".into()),
+        )
+        .unwrap();
+
+        assert_eq!(origin.pane, "rmux:%9");
+        assert_eq!(origin.socket.as_deref(), Some("/tmp/rmux-1000/default"));
     }
 
     #[test]

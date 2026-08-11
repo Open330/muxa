@@ -26,8 +26,8 @@ and correlates it all with multiplexer panes and sessions. Through `muxa
 mcp` a coding agent can also orchestrate the others — inspect state, send
 prompts, wait for changes.
 
-It does not fork the multiplexer or modify agent binaries. tmux and
-[herdr](https://herdr.dev) are full backends and can be observed at the
+It does not fork the multiplexer or modify agent binaries. tmux,
+[rmux](https://rmux.io), and [herdr](https://herdr.dev) can be observed at the
 same time; zellij has a CLI baseline. See the Hosts table below.
 
 ## Optimized for work-oriented tmux
@@ -152,12 +152,12 @@ servers. Add this line to the generated `[mcp_servers.muxa]` table in
 `~/.codex/config.toml` (especially when using a custom muxa/tmux socket):
 
 ```toml
-env_vars = ["TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 ```
 
-Muxa also recovers the pane from process ancestry for existing default-socket
-Codex registrations, so older setups fail safely rather than appearing
-paneless.
+Muxa also recovers the pane from process ancestry across active pane backends
+for existing default-endpoint Codex registrations, so older setups fail safely
+rather than appearing paneless.
 
 Connected agents are told that room peers can serve as read-only reviewers or
 narrowly scoped execution subagents. Requests and replies can also carry
@@ -219,7 +219,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
-| `muxa sync` | Backfill the registry by scanning tmux panes. |
+| `muxa sync` | Backfill the registry by scanning active pane hosts. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
@@ -289,6 +289,7 @@ several at once (e.g. during a tmux→herdr migration):
 | Host | Status | Notes |
 | --- | --- | --- |
 | tmux | Full | The default backend. |
+| [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). |
 | [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
 | zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/ZELLIJ.md). |
 
@@ -303,6 +304,7 @@ simultaneously.
 | Onboarding and work/agent policy (한국어) | [docs/ONBOARDING.ko.md](docs/ONBOARDING.ko.md) |
 | MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
 | herdr host support | [docs/HERDR.md](docs/HERDR.md) |
+| rmux host support | [docs/RMUX.md](docs/RMUX.md) |
 | Multi-host observation | [docs/MULTI_HOST.md](docs/MULTI_HOST.md) |
 | Screen-manifest detection | [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |

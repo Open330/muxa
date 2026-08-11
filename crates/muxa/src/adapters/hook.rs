@@ -37,12 +37,13 @@ pub trait HookAdapter {
 /// Reads stdin to EOF, parses as `A::Input`, normalizes to `AgentEvent`.
 ///
 /// `pane` resolution, in order (see [`host_pane_env`] for the tie-break
-/// rationale — herdr wins presence ties over tmux, `MUXA_HOST` overrides):
+/// rationale — native rmux wins its tmux-compatibility tie, `MUXA_HOST` overrides):
 /// 1. `$MUXA_HOST` override — forces the named host's pane var when present.
-/// 2. `$ZELLIJ_PANE_ID` (zellij's "this pane" var).
-/// 3. `$HERDR_PANE_ID` (herdr's analog), namespaced to `herdr:<id>`.
-/// 4. `$TMUX_PANE` (tmux sets this on every shell inside a pane).
-/// 5. Walk the parent-pid chain and match against the active backend's
+/// 2. `$RMUX_PANE`, namespaced to `rmux:%N`.
+/// 3. `$ZELLIJ_PANE_ID` (zellij's "this pane" var).
+/// 4. `$HERDR_PANE_ID` (herdr's analog), namespaced to `herdr:<id>`.
+/// 5. `$TMUX_PANE` (tmux and rmux compatibility set this).
+/// 6. Walk the parent-pid chain and match against the active backend's
 ///    `pane_pid_map()`. Linux reads `/proc`; macOS/BSD take one `ps` process
 ///    snapshot and walk it in memory. Useful when an agent hook subprocess
 ///    didn't inherit the host env var. Skipped when the backend's
@@ -74,7 +75,7 @@ where
         ev.id_mut().surface = Some(surface);
     }
     if ev.id_mut().tmux_socket.is_none() {
-        ev.id_mut().tmux_socket = tmux_socket_env();
+        ev.id_mut().tmux_socket = host_endpoint_env();
     }
     Ok(ev)
 }
@@ -88,6 +89,16 @@ fn tmux_socket_env() -> Option<String> {
         None
     } else {
         Some(path.to_string())
+    }
+}
+
+/// Control endpoint for the detected pane host. The persisted field retains
+/// its historical `tmux_socket` name for protocol compatibility, but rmux
+/// rows carry rmux's native socket path from `$RMUX` here.
+fn host_endpoint_env() -> Option<String> {
+    match crate::backend::detect_host_env() {
+        Some(crate::backend::HostKind::Rmux) => crate::backend::rmux::endpoint_from_env(),
+        _ => tmux_socket_env(),
     }
 }
 
@@ -105,7 +116,7 @@ fn muxa_session_env() -> Option<SurfaceRef> {
 }
 
 /// Read whichever host-set "this pane" env var identifies the *innermost*
-/// host, in `MUXA_HOST` override → `ZELLIJ_PANE_ID` → `HERDR_PANE_ID` →
+/// host, in `MUXA_HOST` override → `RMUX_PANE` → `ZELLIJ_PANE_ID` → `HERDR_PANE_ID` →
 /// `TMUX_PANE` order. Empty string is treated as unset. This mirrors
 /// `crate::backend::detect_from`'s host-selection precedence exactly, so the
 /// pane a hook is stamped onto and the backend that observes it always agree.
@@ -145,6 +156,7 @@ fn host_pane_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
     if let Some(raw) = read("MUXA_HOST") {
         let forced = match raw.trim().to_ascii_lowercase().as_str() {
             "tmux" => Some(HostKind::Tmux),
+            "rmux" => Some(HostKind::Rmux),
             "zellij" => Some(HostKind::Zellij),
             "herdr" => Some(HostKind::Herdr),
             _ => None,
@@ -156,10 +168,11 @@ fn host_pane_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
         }
     }
 
-    // Auto-detect: zellij, then herdr (wins over tmux on nested ties — see the
-    // `host_pane_env` doc), then tmux. Byte-for-byte the same order as
+    // Auto-detect: native rmux first (it also sets TMUX_PANE), then zellij,
+    // herdr, and finally tmux. Byte-for-byte the same order as
     // `detect_from`, so hook stamping and backend observation never disagree.
-    pane_env_for(HostKind::Zellij, &read)
+    pane_env_for(HostKind::Rmux, &read)
+        .or_else(|| pane_env_for(HostKind::Zellij, &read))
         .or_else(|| pane_env_for(HostKind::Herdr, &read))
         .or_else(|| pane_env_for(HostKind::Tmux, &read))
 }
@@ -174,6 +187,9 @@ fn pane_env_for(
     use crate::backend::HostKind;
     match host {
         HostKind::Tmux => read("TMUX_PANE").filter(|v| !v.is_empty()),
+        HostKind::Rmux => read("RMUX_PANE")
+            .filter(|v| !v.is_empty())
+            .map(|v| format!("{}{v}", crate::backend::rmux::PANE_ID_PREFIX)),
         HostKind::Zellij => read("ZELLIJ_PANE_ID").filter(|v| !v.is_empty()),
         HostKind::Herdr => read("HERDR_PANE_ID")
             .filter(|v| !v.is_empty())
@@ -265,6 +281,28 @@ mod tests {
         assert_eq!(
             host_pane_env_from(env_reader(&[("HERDR_PANE_ID", "42")])),
             Some(format!("{}42", crate::backend::herdr::PANE_ID_PREFIX)),
+        );
+    }
+
+    /// rmux's native pane id has the same `%N` shape as the compatibility
+    /// `TMUX_PANE`, so muxa adds a namespace and prefers it on a presence tie.
+    #[test]
+    fn host_pane_env_prefixes_and_prefers_rmux_pane_id() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("RMUX_PANE", "%7"), ("TMUX_PANE", "%7"),])),
+            Some(format!("{}%7", crate::backend::rmux::PANE_ID_PREFIX)),
+        );
+    }
+
+    #[test]
+    fn host_pane_env_muxa_host_tmux_can_override_rmux() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[
+                ("MUXA_HOST", "tmux"),
+                ("RMUX_PANE", "%7"),
+                ("TMUX_PANE", "%4"),
+            ])),
+            Some("%4".to_string()),
         );
     }
 
