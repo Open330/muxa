@@ -153,10 +153,17 @@
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
 # theme = "classic"   # optional watch-only override for [ui].theme
-# view = "work"       # one row per tmux work window; children are agent panes (default)
-# view = "pane"       # one row per agent/pane
-# view = "swarm"      # k9s-style console: work clusters, animated dot spinners
-#                     # for working/starting agents, and an expandable subagent tree
+# view = "window"     # session + window depth (default)
+# view = "session"    # session roots only
+# view = "pane"       # full session → window → pane depth
+# layout = "tree"     # selectable hierarchy (default)
+# layout = "swarm"    # dense collaboration-room clusters
+# How tree children open:
+#   focus  — selected session reveals windows; selected window reveals panes
+#            in pane view, while sibling paths stay folded (default)
+#   always — show every node through the configured view depth
+#   manual — start collapsed and change expansion only with h/l or arrows
+# tree_expansion = "focus"
 # columns = ["pane", "state_age", "model", "ctx", "cost", "workload", "prompt", "activity"]
 
 # What the summary ("prompt") column leads with. Each value names the highest

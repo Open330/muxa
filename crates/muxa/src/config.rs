@@ -1058,6 +1058,11 @@ pub struct WatchConfig {
     /// Presentation of the same canonical topology. Defaults to `tree`.
     #[serde(default)]
     pub layout: WatchLayout,
+    /// How tree children are revealed. `focus` keeps only the selected path
+    /// open, `always` expands every node through the configured `view`, and
+    /// `manual` changes expansion only through the tree navigation keys.
+    #[serde(default)]
+    pub tree_expansion: WatchTreeExpansion,
     /// Expanded detail line shown under the currently-selected row.
     pub detail: DetailConfig,
     /// Ordered list of sort keys applied to the agent rows in `muxa watch`.
@@ -1157,6 +1162,22 @@ pub enum WatchLayout {
     /// Dense animated collaboration-room clusters. Node identities and the
     /// requested topology depth remain unchanged.
     Swarm,
+}
+
+/// Expansion policy for the selectable watch topology tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchTreeExpansion {
+    /// Accordion-style navigation: the selected session reveals its windows;
+    /// in pane view, the selected window also reveals its panes. Moving to a
+    /// sibling folds the previous path.
+    #[default]
+    Focus,
+    /// Expand all nodes down to [`WatchConfig::view`], matching the original
+    /// canonical-tree presentation.
+    Always,
+    /// Start collapsed and change expansion only with `h`/`l` or arrows.
+    Manual,
 }
 
 /// Priority chain for the `muxa watch` summary column.
@@ -1279,6 +1300,7 @@ impl Default for WatchConfig {
             widths,
             view: WatchView::Window,
             layout: WatchLayout::Tree,
+            tree_expansion: WatchTreeExpansion::Focus,
             summary: WatchSummary::default(),
             detail: DetailConfig::default(),
             // Lead with State so needs-attention rows (error / input /
@@ -1674,6 +1696,23 @@ sort = ["activity", "act", "latest", "st", "dur", "duration"]
         let cfg: Config = toml::from_str("[watch]\nview = \"pane\"\nlayout = \"swarm\"\n").unwrap();
         assert_eq!(cfg.watch.view, WatchView::Pane);
         assert_eq!(cfg.watch.layout, WatchLayout::Swarm);
+    }
+
+    #[test]
+    fn watch_tree_expansion_defaults_to_focus_and_parses_all_policies() {
+        assert_eq!(
+            WatchConfig::default().tree_expansion,
+            WatchTreeExpansion::Focus
+        );
+        for (raw, expected) in [
+            ("focus", WatchTreeExpansion::Focus),
+            ("always", WatchTreeExpansion::Always),
+            ("manual", WatchTreeExpansion::Manual),
+        ] {
+            let cfg: Config =
+                toml::from_str(&format!("[watch]\ntree_expansion = \"{raw}\"\n")).unwrap();
+            assert_eq!(cfg.watch.tree_expansion, expected);
+        }
     }
 
     /// `pane` is now the opt-in (non-default) granularity; setting it

@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Watch sessions now reveal windows on focus instead of all at once.** The
+  default `tree_expansion = "focus"` behaves like an accordion: focusing a
+  session opens its windows and folds the previous session; pane view likewise
+  opens the focused window's panes. Set it to `"always"` for the original fully
+  expanded depth or `"manual"` for navigation-key-only disclosure.
 - **Watch no longer repeats one status down a single-child hierarchy.** An
   expanded session with one window, or window with one pane, leaves its state
   cell empty and lets the child carry the same information. Collapsed parents

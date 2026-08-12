@@ -22,11 +22,17 @@ muxa watch --include-paneless
 work/ticket, and each child pane is an agent. `view = "pane"` shows one row per
 pane.
 
-The hierarchy keeps session, window, and pane rows independently selectable,
-but does not repeat an identical state marker down a single-child chain. An
-expanded parent with one child leaves its state cell empty; the deepest visible
-row carries the state. Collapsed parents and nodes with multiple children keep
-their aggregate state markers.
+The default tree is an accordion: selecting a session reveals its windows and
+folds the previously selected session. In pane view, selecting a window also
+reveals its panes. Set `[watch].tree_expansion = "always"` to keep every node
+through the configured `view` depth visible, or `"manual"` to start collapsed
+and expand only with `l`/Right. The default is `"focus"`.
+
+Session, window, and pane rows remain independently selectable. The tree also
+avoids repeating an identical state marker down a single-child chain: an
+expanded parent with one child leaves its state cell empty and the deepest
+visible row carries the state. Collapsed parents and nodes with multiple
+children keep their aggregate state markers.
 
 ## Common Keys
 

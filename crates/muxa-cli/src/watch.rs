@@ -42,7 +42,7 @@ use muxa::collaboration::{
 };
 use muxa::config::{
     IconSet, WatchCollaborationMode, WatchConfig, WatchLayout, WatchSortKey, WatchSummary,
-    WatchTheme, WatchView, WidthSpec,
+    WatchTheme, WatchTreeExpansion, WatchView, WidthSpec,
 };
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
@@ -3094,6 +3094,9 @@ impl App {
     fn reconcile_tree_expansion(&mut self, previous_keys: &HashSet<TopologyNodeKey>) {
         let current = topology_keys(&self.topology);
         self.expanded_nodes.retain(|key| current.contains(key));
+        if self.watch_cfg.tree_expansion != WatchTreeExpansion::Always {
+            return;
+        }
         let initialize_all = !self.tree_expansion_initialized && !self.topology.sessions.is_empty();
         for session in &self.topology.sessions {
             let session_key = session.node_key();
@@ -3113,6 +3116,62 @@ impl App {
         }
         if initialize_all {
             self.tree_expansion_initialized = true;
+        }
+    }
+
+    /// Apply the accordion expansion implied by `key`, then return the same
+    /// key so callers can re-pin the cursor after the visible indices change.
+    ///
+    /// Focus mode opens one level below the selected node, bounded by `view`:
+    /// a selected session reveals windows, and in pane view a selected window
+    /// reveals panes. Only its ancestry stays open, so moving to another
+    /// session folds the previous one.
+    fn set_focused_tree_expansion(&mut self, key: Option<&TopologyNodeKey>) {
+        if self.watch_cfg.tree_expansion != WatchTreeExpansion::Focus {
+            return;
+        }
+        self.expanded_nodes.clear();
+        let Some(key) = key else {
+            return;
+        };
+        match key {
+            TopologyNodeKey::Session(session) => {
+                if matches!(self.watch_cfg.view, WatchView::Window | WatchView::Pane) {
+                    self.expanded_nodes
+                        .insert(TopologyNodeKey::Session(session.clone()));
+                }
+            }
+            TopologyNodeKey::Window(window) => {
+                if matches!(self.watch_cfg.view, WatchView::Window | WatchView::Pane) {
+                    self.expanded_nodes
+                        .insert(TopologyNodeKey::Session(window.session.clone()));
+                }
+                if self.watch_cfg.view == WatchView::Pane {
+                    self.expanded_nodes
+                        .insert(TopologyNodeKey::Window(window.clone()));
+                }
+            }
+            TopologyNodeKey::Pane(pane) => {
+                if matches!(self.watch_cfg.view, WatchView::Window | WatchView::Pane) {
+                    self.expanded_nodes
+                        .insert(TopologyNodeKey::Session(pane.window.session.clone()));
+                }
+                if self.watch_cfg.view == WatchView::Pane {
+                    self.expanded_nodes
+                        .insert(TopologyNodeKey::Window(pane.window.clone()));
+                }
+            }
+        }
+    }
+
+    fn sync_focused_tree_expansion(&mut self, key: TopologyNodeKey) {
+        self.set_focused_tree_expansion(Some(&key));
+        if let Some(index) = self
+            .tree_targets()
+            .iter()
+            .position(|target| target.key == key)
+        {
+            self.table_state.select(Some(index));
         }
     }
 
@@ -3350,6 +3409,11 @@ impl App {
 
     fn set_auto_expansion(&mut self, identity: Option<&RowIdentity>) {
         if self.uses_tree() {
+            let key = identity.and_then(|identity| match identity {
+                RowIdentity::Topology(key) => Some(key),
+                RowIdentity::Agent(_, _) | RowIdentity::BarePane(_) | RowIdentity::Work(_) => None,
+            });
+            self.set_focused_tree_expansion(key);
             return;
         }
         let group_key = identity.and_then(|id| self.work_group_for_identity(id));
@@ -3475,6 +3539,18 @@ impl App {
         hint: &InitialPaneHint,
         targets: &[TreeTarget],
     ) -> Option<usize> {
+        let pane = self.initial_tree_pane_key(hint)?;
+
+        [
+            TopologyNodeKey::Pane(pane.clone()),
+            TopologyNodeKey::Window(pane.window.clone()),
+            TopologyNodeKey::Session(pane.window.session.clone()),
+        ]
+        .into_iter()
+        .find_map(|key| targets.iter().position(|target| target.key == key))
+    }
+
+    fn initial_tree_pane_key(&self, hint: &InitialPaneHint) -> Option<PaneKey> {
         let mut matches = self
             .topology
             .sessions
@@ -3492,18 +3568,11 @@ impl App {
         if matches.next().is_some() {
             return None;
         }
-
-        [
-            pane.node_key(),
-            TopologyNodeKey::Window(pane.key.window.clone()),
-            TopologyNodeKey::Session(pane.key.window.session.clone()),
-        ]
-        .into_iter()
-        .find_map(|key| targets.iter().position(|target| target.key == key))
+        Some(pane.key.clone())
     }
 
     fn clamp_tree_selection(&mut self) {
-        let targets = self.tree_targets();
+        let mut targets = self.tree_targets();
         if targets.is_empty() {
             self.table_state.select(None);
             return;
@@ -3514,6 +3583,15 @@ impl App {
             }
             None => {
                 let hint = self.initial_pane.take();
+                if self.watch_cfg.tree_expansion == WatchTreeExpansion::Focus {
+                    if let Some(pane) = hint
+                        .as_ref()
+                        .and_then(|hint| self.initial_tree_pane_key(hint))
+                    {
+                        self.set_focused_tree_expansion(Some(&TopologyNodeKey::Pane(pane)));
+                        targets = self.tree_targets();
+                    }
+                }
                 let initial = hint
                     .as_ref()
                     .and_then(|hint| self.initial_tree_target_index(hint, &targets))
@@ -3521,6 +3599,11 @@ impl App {
                 self.table_state.select(Some(initial));
             }
             Some(_) => {}
+        }
+        if self.watch_cfg.tree_expansion == WatchTreeExpansion::Focus {
+            if let Some(key) = self.selected_node_key() {
+                self.sync_focused_tree_expansion(key);
+            }
         }
     }
 
@@ -3627,8 +3710,10 @@ impl App {
         if self.uses_tree() {
             let targets = self.tree_targets();
             if !targets.is_empty() {
-                self.table_state
-                    .select(Some(if last { targets.len() - 1 } else { 0 }));
+                let index = if last { targets.len() - 1 } else { 0 };
+                let key = targets[index].key.clone();
+                self.table_state.select(Some(index));
+                self.sync_focused_tree_expansion(key);
                 self.pin_filtered_tree_selection();
             }
             return;
@@ -3657,7 +3742,8 @@ impl App {
     }
 
     fn move_tree_vertical(&mut self, delta: isize, wrap: bool) {
-        let len = self.tree_targets().len();
+        let targets = self.tree_targets();
+        let len = targets.len();
         if len == 0 {
             return;
         }
@@ -3673,7 +3759,9 @@ impl App {
         } else {
             current.saturating_add(delta.unsigned_abs()).min(len - 1)
         };
+        let key = targets[next].key.clone();
         self.table_state.select(Some(next));
+        self.sync_focused_tree_expansion(key);
         self.pin_filtered_tree_selection();
     }
 
@@ -3776,7 +3864,9 @@ impl App {
             .get(index + 1)
             .is_some_and(|child| child.depth == target.depth + 1)
         {
+            let key = targets[index + 1].key.clone();
             self.table_state.select(Some(index + 1));
+            self.sync_focused_tree_expansion(key);
             self.pin_filtered_tree_selection();
         }
     }
@@ -13279,6 +13369,7 @@ mod tests {
         let mut app = App::with_config(WatchConfig {
             view,
             layout: WatchLayout::Tree,
+            tree_expansion: WatchTreeExpansion::Always,
             sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
             hide_paneless: false,
             ..WatchConfig::default()
@@ -13339,6 +13430,127 @@ mod tests {
                 expected_depths
             );
         }
+    }
+
+    #[test]
+    fn focus_expansion_opens_only_the_selected_session() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("default", "$2", "beta", "@2", "DOCS", 0, "%2", 0),
+        ];
+        let agents = vec![
+            topology_agent("auth", "%1", "default", AgentState::Working, "auth", 1),
+            topology_agent("docs", "%2", "default", AgentState::Idle, "docs", 2),
+        ];
+        let mut app = App::with_config(WatchConfig {
+            view: WatchView::Window,
+            layout: WatchLayout::Tree,
+            tree_expansion: WatchTreeExpansion::Focus,
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_data(agents, panes);
+
+        let labels = |app: &App| {
+            app.tree_targets()
+                .iter()
+                .map(|target| match app.topology.find(&target.key).unwrap() {
+                    TopologyNodeRef::Session(session) => format!("s:{}", session.name),
+                    TopologyNodeRef::Window(window) => format!("w:{}", window.name),
+                    TopologyNodeRef::Pane(pane) => format!("p:{}", pane.key.pane_id),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&app), vec!["s:alpha", "w:AUTH", "s:beta"]);
+
+        // Walk through alpha's window to beta. Focusing beta folds alpha and
+        // reveals only beta's window, preserving the selected key even though
+        // the visible row indices changed under it.
+        app.move_down();
+        assert!(matches!(
+            app.selected_node_key(),
+            Some(TopologyNodeKey::Window(_))
+        ));
+        app.move_down();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Session(session)) if session.name == "beta"
+        ));
+        assert_eq!(labels(&app), vec!["s:alpha", "s:beta", "w:DOCS"]);
+    }
+
+    #[test]
+    fn tree_expansion_policy_supports_always_and_manual() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("default", "$2", "beta", "@2", "DOCS", 0, "%2", 0),
+        ];
+        let agents = vec![
+            topology_agent("auth", "%1", "default", AgentState::Working, "auth", 1),
+            topology_agent("docs", "%2", "default", AgentState::Idle, "docs", 2),
+        ];
+
+        for (policy, expected_depths) in [
+            (WatchTreeExpansion::Always, vec![0, 1, 0, 1]),
+            (WatchTreeExpansion::Manual, vec![0, 0]),
+        ] {
+            let mut app = App::with_config(WatchConfig {
+                view: WatchView::Window,
+                layout: WatchLayout::Tree,
+                tree_expansion: policy,
+                sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+                hide_paneless: false,
+                ..WatchConfig::default()
+            });
+            app.set_data(agents.clone(), panes.clone());
+            assert_eq!(
+                app.tree_targets()
+                    .iter()
+                    .map(|target| target.depth)
+                    .collect::<Vec<_>>(),
+                expected_depths
+            );
+        }
+    }
+
+    #[test]
+    fn pane_focus_reveals_panes_only_after_window_focus() {
+        let panes = vec![fake_topology_pane(
+            "default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0,
+        )];
+        let agents = vec![topology_agent(
+            "auth",
+            "%1",
+            "default",
+            AgentState::Working,
+            "auth",
+            1,
+        )];
+        let mut app = App::with_config(WatchConfig {
+            view: WatchView::Pane,
+            layout: WatchLayout::Tree,
+            tree_expansion: WatchTreeExpansion::Focus,
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_data(agents, panes);
+        assert_eq!(
+            app.tree_targets()
+                .iter()
+                .map(|target| target.depth)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        app.move_down();
+        assert_eq!(
+            app.tree_targets()
+                .iter()
+                .map(|target| target.depth)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -13713,6 +13925,7 @@ mod tests {
         let mut app = App::with_config(WatchConfig {
             view: WatchView::Pane,
             layout: WatchLayout::Tree,
+            tree_expansion: WatchTreeExpansion::Always,
             sort: vec![WatchSortKey::Duration],
             hide_paneless: false,
             ..WatchConfig::default()
