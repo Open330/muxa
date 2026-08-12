@@ -73,7 +73,7 @@ Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 �
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답과 마지막으로 프롬프트를 보낸 시점을 얹음. 숫자 키로 이동. |
+| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | pane 조작과 같은 work window의 agent 협업을 제공하는 workspace-card TUI. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |

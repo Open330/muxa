@@ -22,6 +22,12 @@ muxa watch --include-paneless
 work/ticket, and each child pane is an agent. `view = "pane"` shows one row per
 pane.
 
+The hierarchy keeps session, window, and pane rows independently selectable,
+but does not repeat an identical state marker down a single-child chain. An
+expanded parent with one child leaves its state cell empty; the deepest visible
+row carries the state. Collapsed parents and nodes with multiple children keep
+their aggregate state markers.
+
 ## Common Keys
 
 | Key | Action |

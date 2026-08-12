@@ -110,7 +110,7 @@ pub(crate) struct PeekCell {
     /// When the human last sent this agent a prompt, from the daemon's
     /// prompt history. `None` when history holds nothing for this
     /// agent's session — a fresh session, or history switched off — in
-    /// which case the prompt line simply carries no age.
+    /// which case the box simply carries no age.
     pub last_prompt_at: Option<OffsetDateTime>,
     /// The pane's visible screen, one entry per row, painted dim behind
     /// the info box. Taken once when the overlay opens and re-taken only
@@ -494,6 +494,11 @@ impl From<Option<WindowFrame>> for Placement {
 
 fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool, pending: &str) {
     let area = f.area();
+    // Relative ages deliberately collapse into coarse buckets (`1h ago`,
+    // `2h ago`, ...). Keep the exact timestamp for ranking so two panes
+    // that display the same age still reveal which one the human touched
+    // last.
+    let latest_prompt_at = latest_prompt_at(cells);
     f.render_widget(Clear, area);
     for cell in cells {
         // A zoomed window still reports the *unzoomed* rectangles for the
@@ -503,7 +508,12 @@ fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool, p
             continue;
         }
         if let Some(rect) = cell_rect(&cell.geo, placement.origin_y, area) {
-            render_cell(f, cell, rect);
+            render_cell(
+                f,
+                cell,
+                rect,
+                cell.last_prompt_at == latest_prompt_at && latest_prompt_at.is_some(),
+            );
         }
     }
     if area.height > 0 {
@@ -550,7 +560,7 @@ pub(crate) fn cell_rect(geo: &PaneGeometry, origin_y: u16, area: Rect) -> Option
     })
 }
 
-fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect) {
+fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect, is_latest_prompt: bool) {
     // The pane's own screen goes down first, dimmed, so the overlay reads
     // as something laid *over* your terminal rather than instead of it.
     // tmux popups have no transparency, so this redraw is the only way to
@@ -602,16 +612,27 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect) {
     // narrow to hold both would render them overlapping, so the stamp
     // yields to the identity that makes the pane jumpable.
     //
-    // Plain `Gray`, deliberately: the box has a legibility ladder —
+    // Ordinary ages use plain `Gray`: the box has a legibility ladder —
     // summary (Cyan+BOLD) → prompt (White) → response (Gray+DIM) →
     // backdrop (DarkGray+DIM, the tier that means "ignore me"). The
     // stamp used to carry that last style, so the one number telling you
     // whether a prompt landed a minute or a day ago read as noise. It
     // belongs a notch under the prompt it annotates, not under the
-    // dimmed capture.
-    let block = match age_stamp(cell) {
+    // dimmed capture. The exact newest stamp is Cyan+BOLD because its
+    // purpose is to break otherwise indistinguishable relative-age ties.
+    let block = match age_stamp(cell, is_latest_prompt) {
         Some(stamp) if fits_alongside_header(&header, &stamp, rect.width) => block.title_top(
-            Line::from(Span::styled(stamp, Style::default().fg(Color::Gray))).right_aligned(),
+            Line::from(Span::styled(
+                stamp,
+                if is_latest_prompt {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ))
+            .right_aligned(),
         ),
         _ => block,
     };
@@ -850,18 +871,31 @@ fn push_tier(
     }
 }
 
-/// ` 5m ago ` for the box's top-right corner — how long since the human
-/// last prompted this agent.
+/// Exact newest prompt timestamp across the current window.
+///
+/// More than one cell may carry this value when the history source cannot
+/// distinguish prompts that landed at the same instant. Callers should mark
+/// all of them rather than inventing an ordering.
+fn latest_prompt_at(cells: &[PeekCell]) -> Option<OffsetDateTime> {
+    cells.iter().filter_map(|cell| cell.last_prompt_at).max()
+}
+
+/// ` 5m ago `, or ` last · 5m ` for the newest prompt in the window.
+/// This sits in the box's top-right corner.
 ///
 /// It lives on the border rather than inline with the prompt text, where
 /// it broke the reading flow of the very line it was annotating. The
 /// border is chrome; a timestamp is chrome.
-pub(crate) fn age_stamp(cell: &PeekCell) -> Option<String> {
+pub(crate) fn age_stamp(cell: &PeekCell, is_latest_prompt: bool) -> Option<String> {
     let at = cell.last_prompt_at?;
-    Some(format!(
-        " {} ",
-        crate::relative_time(OffsetDateTime::now_utc(), at)
-    ))
+    let age = crate::relative_time(OffsetDateTime::now_utc(), at);
+    Some(if is_latest_prompt {
+        // `last` already supplies the temporal context, so dropping `ago`
+        // keeps the distinguishing label usable in narrower pane titles.
+        format!(" last · {} ", age.strip_suffix(" ago").unwrap_or(&age))
+    } else {
+        format!(" {age} ")
+    })
 }
 
 fn glyph_prompt() -> &'static str {
@@ -965,6 +999,7 @@ pub(crate) fn hint_line(cells: &[PeekCell], pending: &str) -> Line<'static> {
 
 /// Plain-text rendering used by `--plain`, one line per pane.
 pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
+    let latest_prompt_at = latest_prompt_at(cells);
     cells
         .iter()
         .map(|cell| {
@@ -979,10 +1014,17 @@ pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
                 .map_or_else(|| "-".to_string(), collapse);
             let age = cell.last_prompt_at.map_or_else(
                 || "-".to_string(),
-                |at| crate::relative_time(OffsetDateTime::now_utc(), at),
+                |at| {
+                    let age = crate::relative_time(OffsetDateTime::now_utc(), at);
+                    if Some(at) == latest_prompt_at {
+                        format!("last · {}", age.strip_suffix(" ago").unwrap_or(&age))
+                    } else {
+                        age
+                    }
+                },
             );
             format!(
-                "{} {} {} {:<8} {:>8}  {}",
+                "{} {} {} {:<8} {:>15}  {}",
                 cell.geo.pane_index, cell.geo.pane_id, glyph, label, age, summary
             )
         })
@@ -1781,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn age_stamp_sits_on_the_border_not_in_the_prompt() {
+    fn latest_age_stamp_sits_on_the_border_not_in_the_prompt() {
         let mut a = agent("%0", AgentState::Working);
         a.ai_title = Some("auth refactor".into());
         a.last_prompt = Some("fix the token check".into());
@@ -1795,7 +1837,7 @@ mod tests {
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
 
         // On the border, hugging the right corner.
-        assert!(rows[0].contains("5m ago"), "{rows:#?}");
+        assert!(rows[0].contains("last · 5m"), "{rows:#?}");
         assert!(rows[0].trim_end().ends_with('╗'), "{rows:#?}");
         // Not wedged into the prompt line, which broke the reading flow of
         // the very text it annotated.
@@ -1816,7 +1858,7 @@ mod tests {
         a.last_prompt = Some("fix the token check".into());
         let cells = build_cells(vec![geo("0", 0, 0, 40, 12, true)], &[a]);
         assert!(cells[0].last_prompt_at.is_none());
-        assert!(age_stamp(&cells[0]).is_none());
+        assert!(age_stamp(&cells[0], false).is_none());
 
         let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
         terminal
@@ -1836,7 +1878,7 @@ mod tests {
         cells[0].last_prompt_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(5));
 
         let header = header_spans(&cells[0]);
-        let stamp = age_stamp(&cells[0]).unwrap();
+        let stamp = age_stamp(&cells[0], true).unwrap();
         assert!(!fits_alongside_header(&header, &stamp, 16));
         assert!(fits_alongside_header(&header, &stamp, 40));
 
@@ -1847,6 +1889,64 @@ mod tests {
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(!rows[0].contains("ago"), "{rows:#?}");
         assert!(rows[0].contains(" 0 "), "the digit survives: {rows:#?}");
+    }
+
+    #[test]
+    fn latest_prompt_uses_exact_time_when_display_ages_tie() {
+        let mut left = agent("%0", AgentState::Working);
+        left.last_prompt = Some("older prompt".into());
+        let mut right = agent("%1", AgentState::Working);
+        right.last_prompt = Some("newer prompt".into());
+        let mut cells = build_cells(
+            vec![geo("0", 0, 0, 40, 6, true), geo("1", 0, 6, 40, 6, false)],
+            &[left, right],
+        );
+        let now = OffsetDateTime::now_utc();
+        cells[0].last_prompt_at = Some(now - time::Duration::minutes(70));
+        cells[1].last_prompt_at = Some(now - time::Duration::minutes(65));
+
+        // Both round down to the same human-facing bucket, but the exact
+        // timestamps still identify pane 1 as the most recently prompted.
+        assert_eq!(
+            crate::relative_time(now, cells[0].last_prompt_at.unwrap()),
+            "1h ago"
+        );
+        assert_eq!(
+            crate::relative_time(now, cells[1].last_prompt_at.unwrap()),
+            "1h ago"
+        );
+        let latest = latest_prompt_at(&cells);
+        assert_ne!(cells[0].last_prompt_at, latest);
+        assert_eq!(cells[1].last_prompt_at, latest);
+        assert!(!age_stamp(&cells[0], false).unwrap().contains("last"));
+        assert!(age_stamp(&cells[1], true).unwrap().contains("last · 1h"));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+        assert!(rows[0].contains("1h ago"), "{rows:#?}");
+        assert!(!rows[0].contains("last"), "{rows:#?}");
+        assert!(rows[6].contains("last · 1h"), "{rows:#?}");
+    }
+
+    #[test]
+    fn equally_recent_prompts_are_both_marked_last() {
+        let cells_at = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let mut cells = build_cells(
+            vec![geo("0", 0, 0, 40, 6, true), geo("1", 0, 6, 40, 6, false)],
+            &[
+                agent("%0", AgentState::Working),
+                agent("%1", AgentState::Working),
+            ],
+        );
+        cells[0].last_prompt_at = Some(cells_at);
+        cells[1].last_prompt_at = Some(cells_at);
+
+        let latest = latest_prompt_at(&cells);
+        assert_eq!(cells[0].last_prompt_at, latest);
+        assert_eq!(cells[1].last_prompt_at, latest);
     }
 
     #[test]

@@ -82,7 +82,7 @@ Nothing in the tour mutates a live tmux session.
 | Surface | What it does |
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
-| `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its agent's state, summary, and latest prompt/response — including how long ago you last prompted it; press a digit to jump. |
+| `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its agent's state, summary, and latest prompt/response — including how long ago you last prompted it and which pane was prompted most recently; press a digit to jump. |
 | `muxa watch` | Main TUI for agents, prompts, live previews, and same-window collaboration. |
 | `muxa dashboard` | Workspace-card TUI console for pane operations and authenticated same-work agent collaboration. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |

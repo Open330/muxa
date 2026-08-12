@@ -12,7 +12,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │> ◆ ●       ├─ ▼ TEST-0001                                  <rel> 2 agents · reviewing changes / editing middlewar│
 │  ●         │ ├─   %12  codex                               <rel> editing middleware                              │
 │  ◆         │ └─   %13  codex                               <rel> reviewing changes                               │
-│  ○         └─ ▼ TEST-0002                                  <rel> docs update                                     │
+│            └─ ▼ TEST-0002                                  <rel> docs update                                     │
 │  ○           └─   %18  codex                               <rel> docs update                                     │
 │                                                                                                                    │
 │                                                                                                                    │

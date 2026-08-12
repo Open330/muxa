@@ -11372,15 +11372,36 @@ fn tree_node_states(node: TopologyNodeRef<'_>) -> Vec<AgentState> {
 }
 
 fn tree_state_cell(
+    target: &TreeTarget,
     node: TopologyNodeRef<'_>,
     theme: WatchThemeSpec,
     spin: Spinner,
 ) -> Text<'static> {
+    // An expanded parent with exactly one child rolls up the exact same state
+    // set as the row immediately below it. Leaving both visible turns the
+    // common session -> window -> pane shape into three identical markers.
+    // Keep the hierarchy selectable, but let the deepest visible owner carry
+    // the status. Collapsed parents and real branch points still need their
+    // aggregate because it adds information not otherwise visible.
+    if tree_state_is_redundant(target, node) {
+        return Text::default();
+    }
     let states = tree_node_states(node);
     if states.is_empty() {
         return Text::from(Span::styled("○", theme.dim_style()));
     }
     Text::from(Line::from(state_summary_gutter_spans(states, theme, spin)))
+}
+
+fn tree_state_is_redundant(target: &TreeTarget, node: TopologyNodeRef<'_>) -> bool {
+    if !target.expanded {
+        return false;
+    }
+    match node {
+        TopologyNodeRef::Session(session) => session.windows.len() == 1,
+        TopologyNodeRef::Window(window) => window.panes.len() == 1,
+        TopologyNodeRef::Pane(_) => false,
+    }
 }
 
 fn tree_node_label(
@@ -11689,7 +11710,9 @@ fn render_topology_table(f: &mut Frame, area: Rect, app: &mut App, title: &'stat
             let cells = columns
                 .iter()
                 .map(|column| match column {
-                    TopologyTableColumn::State => Cell::from(tree_state_cell(node, theme, spin)),
+                    TopologyTableColumn::State => {
+                        Cell::from(tree_state_cell(target, node, theme, spin))
+                    }
                     TopologyTableColumn::Node => {
                         Cell::from(tree_node_label(target, node, endpoint_count > 1, theme))
                     }
@@ -13316,6 +13339,71 @@ mod tests {
                 expected_depths
             );
         }
+    }
+
+    #[test]
+    fn expanded_single_child_chain_shows_state_only_on_the_deepest_row() {
+        let panes = vec![fake_topology_pane(
+            "default", "$1", "muxa", "@1", "AUTH", 0, "%1", 0,
+        )];
+        let agents = vec![topology_agent(
+            "agent-1",
+            "%1",
+            "default",
+            AgentState::Working,
+            "edit auth",
+            1,
+        )];
+        let app = topology_watch(WatchView::Pane, agents, panes);
+        let targets = app.tree_targets();
+        assert_eq!(targets.len(), 3);
+
+        let redundant = targets
+            .iter()
+            .map(|target| {
+                let node = app.topology.find(&target.key).unwrap();
+                tree_state_is_redundant(target, node)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(redundant, vec![true, true, false]);
+
+        let theme = watch_theme(WatchTheme::default());
+        let state_cells = targets
+            .iter()
+            .map(|target| {
+                let node = app.topology.find(&target.key).unwrap();
+                tree_state_cell(target, node, theme, Spinner::OFF)
+            })
+            .collect::<Vec<_>>();
+        assert!(state_cells[0].lines.is_empty());
+        assert!(state_cells[1].lines.is_empty());
+        assert!(!state_cells[2].lines.is_empty());
+    }
+
+    #[test]
+    fn collapsed_parents_and_branch_points_keep_aggregate_state() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "muxa", "@1", "AUTH", 0, "%2", 1),
+        ];
+        let agents = vec![
+            topology_agent("agent-1", "%1", "default", AgentState::Working, "one", 1),
+            topology_agent("agent-2", "%2", "default", AgentState::Idle, "two", 2),
+        ];
+
+        let session_app = topology_watch(WatchView::Session, agents.clone(), panes.clone());
+        let session_target = &session_app.tree_targets()[0];
+        let session = session_app.topology.find(&session_target.key).unwrap();
+        assert!(!tree_state_is_redundant(session_target, session));
+
+        let pane_app = topology_watch(WatchView::Pane, agents, panes);
+        let targets = pane_app.tree_targets();
+        let session = pane_app.topology.find(&targets[0].key).unwrap();
+        let window = pane_app.topology.find(&targets[1].key).unwrap();
+        // The expanded session merely repeats its only window, while the
+        // two-pane window is a meaningful aggregation boundary.
+        assert!(tree_state_is_redundant(&targets[0], session));
+        assert!(!tree_state_is_redundant(&targets[1], window));
     }
 
     #[test]

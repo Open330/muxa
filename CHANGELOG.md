@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.32] - 2026-08-12
+
 ### Changed
 
+- **Watch no longer repeats one status down a single-child hierarchy.** An
+  expanded session with one window, or window with one pane, leaves its state
+  cell empty and lets the child carry the same information. Collapsed parents
+  and real branch points keep their aggregate state, while all hierarchy rows
+  remain independently selectable for attach, spawn, inspect, and close.
+- **Peek identifies the most recently prompted pane even when ages tie.**
+  Relative labels intentionally collapse exact timestamps into buckets such as
+  `1h ago`, which made several panes look equally recent. `prefix + q` now
+  marks the pane with the exact newest prompt timestamp as `last · 1h`;
+  exact ties are all marked instead of being ordered arbitrarily.
 - **The curl onboarding preview no longer downloads Muxa.**
   `scripts/onboard.sh` is now the entire 20-step fullscreen shell tour. ANSI
   rendering preserves the virtual shell, tmux status line, window/pane layout,
