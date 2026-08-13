@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`muxa upgrade` no longer strands an old daemon when no service manager is
+  usable.** A capable muxad now drains and re-execs itself on the exact socket
+  being upgraded, preserving its pid and launch context. The CLI confirms the
+  replacement by an IPC generation advance instead of a connect-only timing
+  guess, and source, Homebrew, and release-binary upgrades share the same
+  restart path. Native service managers remain the compatibility fallback for
+  older or stopped daemons. SIGTERM/SIGINT wins atomically over any in-flight
+  restart request, so an explicit stop cannot be accidentally re-armed.
 - **A stale or non-participant row no longer disables watch's messaging.**
   `muxa register` task rows and just-stopped agents look like agents in the
   topology but are not collaboration participants; pointing at one now costs

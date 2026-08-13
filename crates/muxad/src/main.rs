@@ -21,7 +21,7 @@ use muxa::config::CollaborationWake;
 use muxa::config::{DashboardAuthMode, NotifierBackend};
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PaneSessionCache, PromptHistory};
-use muxa::ipc::{harden_permissions, Client, Server};
+use muxa::ipc::{harden_permissions, Client, RestartController, Server};
 use muxa::notify::Notifier;
 use muxa::reconcile::Reconciler;
 use muxa::sinks::{webhook as webhook_sink, OhMyPromptSink, WebhookSink};
@@ -45,6 +45,8 @@ const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
 const PANE_SESSION_CACHE_INTERVAL_SECONDS: u64 = 5;
 const SHUTDOWN_TASK_TIMEOUT_SECONDS: u64 = 2;
+/// Carries the daemon image identity across an in-place re-exec.
+const RESTART_GENERATION_ENV: &str = "MUXA_RESTART_GENERATION";
 
 #[derive(Debug, Parser)]
 #[command(name = "muxad", version, about = "muxa daemon")]
@@ -144,7 +146,11 @@ async fn main() -> Result<()> {
     let (activity_transition_shutdown_tx, _) = broadcast::channel::<()>(1);
     let (writer_shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    install_shutdown_signal_handler(shutdown_tx.clone());
+    let restart = Arc::new(RestartController::new(
+        restart_generation(),
+        shutdown_tx.clone(),
+    ));
+    install_shutdown_signal_handler(Arc::clone(&restart));
 
     // Prompt history must exist before the store: every PromptSubmitted
     // event fans out into history alongside the live agent record.
@@ -346,7 +352,8 @@ async fn main() -> Result<()> {
         .with_sessions(sessions)
         .with_collaboration(collaboration)
         .with_collaboration_audit(collaboration_audit)
-        .with_ask(ask);
+        .with_ask(ask)
+        .with_restart_controller(Arc::clone(&restart));
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
     // Harden socket permissions once the listener exists. We poll briefly
@@ -409,7 +416,37 @@ async fn main() -> Result<()> {
     let _ = snap_shutdown_tx.send(());
     await_shutdown_task("state snapshotter", snap_handle).await;
     server_result??;
+    if restart.restart_requested() {
+        return Err(reexec_self().into());
+    }
     Ok(())
+}
+
+/// Image generation advertised in IPC `hello`: zero on a fresh process and
+/// incremented for each successful self-reexec.
+fn restart_generation() -> u64 {
+    std::env::var(RESTART_GENERATION_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Replace this process with the binary now resolved by its original argv[0].
+/// `exec` preserves pid, argv, environment, working directory and the service
+/// manager's ownership while loading the newly installed inode.
+fn reexec_self() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+
+    let mut argv = std::env::args_os();
+    let Some(program) = argv.next() else {
+        return std::io::Error::other("cannot restart: argv[0] is missing");
+    };
+    let next = restart_generation().saturating_add(1);
+    tracing::info!(?program, generation = next, "restarting: re-executing self");
+    std::process::Command::new(&program)
+        .args(argv)
+        .env(RESTART_GENERATION_ENV, next.to_string())
+        .exec()
 }
 
 async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::JoinHandle<()>>) {
@@ -725,7 +762,7 @@ fn spawn_gc_task(
     })
 }
 
-fn install_shutdown_signal_handler(shutdown_tx: broadcast::Sender<()>) {
+fn install_shutdown_signal_handler(restart: Arc<RestartController>) {
     tokio::spawn(async move {
         let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
@@ -733,7 +770,9 @@ fn install_shutdown_signal_handler(shutdown_tx: broadcast::Sender<()>) {
             _ = term.recv() => tracing::info!("SIGTERM received"),
             _ = int.recv()  => tracing::info!("SIGINT received"),
         }
-        let _ = shutdown_tx.send(());
+        // Monotonic stop state: once a signal wins, an already-open IPC
+        // handler cannot re-arm a restart during the drain.
+        restart.stop();
     });
 }
 
