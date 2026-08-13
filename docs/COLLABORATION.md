@@ -9,21 +9,47 @@ mailbox, not through terminal screen scraping.
 
 - One tmux window is one collaboration room. In the managed Muxa model, that
   window is also the work/ticket boundary inside its workspace session.
-- The focused agent is the **represented sender** when you open `prefix+s` watch.
-- Select another agent in that window; `m` sends and `M` opens the mailbox
-  (`b` remains an alias).
+- An **agent** speaking through MCP or `muxa msg` is the represented sender: it
+  is the pane it runs in, and the reply routes back there and wakes it.
+- `muxa watch` is not an agent. It is the **operator console** — the human at
+  the keyboard is the sender, whatever the pane the popup was opened from
+  happens to contain.
+- Select any agent; `m` sends and `M` opens the mailbox (`b` remains an alias).
 
-So the normal workflow is simply: put two agents in one window, focus the
-sender, press `prefix+s`, choose the peer, and press `m`. A normal shell pane is
-not an agent and cannot be the sender. The Dashboard is optional.
+So the normal agent-to-agent workflow is: put two agents in one window and let
+them message each other over MCP. The operator workflow is separate and needs
+no setup: press `prefix+s` anywhere, point at a row, press `m`.
+
+### The console
+
+`muxa watch` sends as `console`, a sender with a fixed identity and no pane of
+its own. That has three consequences worth knowing:
+
+- **Every row is a target, including the pane you opened watch from.** There is
+  no self-send to guard against, because the sender is you and not that pane's
+  agent.
+- **It works from a bare shell.** The launch pane no longer has to host a
+  tracked agent for messaging to be available.
+- **Replies are not routed back to you.** A console has no pane to wake, so a
+  reply simply lives on the request in the recipient's mailbox. Read it by
+  putting the cursor on that row and pressing `M` — the `incoming` tab is the
+  selected agent's mailbox, and `sent` is the console's own dispatch log across
+  every target. `i` (claim) and `e` (reply) likewise act *as* the selected
+  agent, since claiming and replying are the recipient's moves.
+
+The console borrows the room of the window it was opened from, so window-scoped
+peer selection still resolves the agents in front of you, but its identity does
+not change with it — one operator, one `sent` thread.
 
 `from` therefore identifies whose mailbox authority created the request and
 where its reply returns; it does not claim that the represented agent process
 made the IPC call itself. Requests now carry separate `provenance`: the local
 surface (`watch`, MCP, CLI, or dashboard), OS-observed PID/UID, pane recovered
 from the process environment or ancestry (with the evidence type), and whether
-that pane matches the asserted origin. Wake prompts make the same distinction
-explicit.
+that pane matches the asserted origin. A console request records the pane the
+operator dialled from, so the audit trail still says where it came from. Wake
+prompts make the same distinction explicit: a recipient sees `from console via
+muxa watch (caller %N, pid …)`.
 
 ## Enable
 

@@ -730,7 +730,13 @@ fn collaboration_origin() -> Result<CollaborationOrigin> {
             .and_then(|name| name.to_str())
             .map(str::to_string)
     });
-    Ok(CollaborationOrigin { pane, socket })
+    // `muxa msg` speaks for the agent whose pane it runs in — same reasoning as
+    // the MCP origin.
+    Ok(CollaborationOrigin {
+        pane,
+        socket,
+        console: false,
+    })
 }
 
 fn collaboration_request_kind(value: &str) -> Result<RequestKind> {

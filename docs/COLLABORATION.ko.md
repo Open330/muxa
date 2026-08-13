@@ -8,20 +8,44 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 
 - tmux window 하나가 협업 room 하나입니다. Muxa managed model에서 이 window는
   workspace session 안의 work/ticket 경계이기도 합니다.
-- `prefix+s`로 watch를 열 때 보고 있던 agent가 **대행 발신자**입니다.
-- 같은 window의 다른 agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다
-  (`b`는 alias로 유지됩니다).
+- MCP나 `muxa msg`로 말하는 **agent**는 자기 pane을 대행하는 발신자입니다. 응답은
+  그 pane으로 돌아가 agent를 깨웁니다.
+- `muxa watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이
+  들어 있든, 발신자는 키보드 앞의 사람입니다.
+- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다(`b`는 alias로
+  유지됩니다).
 
-즉, 같은 window에 agent 둘을 실행하고, 보낼 agent를 선택해 `prefix+s`로 watch를
-연 뒤 상대를 선택하고 `m`을 누르면 됩니다. 일반 shell pane은 agent가 아니므로
-발신자가 될 수 없습니다. Dashboard는 선택 사항입니다.
+즉 agent 간 협업은 같은 window에 agent 둘을 두고 MCP로 주고받는 흐름이고, 사람의
+흐름은 그와 별개로 준비가 필요 없습니다. 어디서든 `prefix+s`를 누르고, 행을
+가리키고, `m`을 누르면 됩니다. Dashboard는 선택 사항입니다.
+
+### console
+
+`muxa watch`는 고정된 identity를 가지며 자기 pane이 없는 `console`로 보냅니다.
+알아둘 결과가 셋 있습니다.
+
+- **watch를 띄운 그 pane을 포함해 모든 행이 대상입니다.** 발신자는 그 pane의
+  agent가 아니라 사람이므로 자기 자신에게 보내는 문제가 애초에 없습니다.
+- **일반 shell에서도 동작합니다.** 이제 watch를 연 pane이 tracked agent를 담고
+  있어야 할 이유가 없습니다.
+- **응답은 되돌아오지 않습니다.** console에는 깨울 pane이 없으므로 응답은 수신
+  agent의 mailbox에 request와 함께 남습니다. 그 행에 커서를 두고 `M`을 누르면
+  읽을 수 있고, `incoming` 탭이 선택한 agent의 mailbox, `sent`가 console이 모든
+  대상에게 보낸 기록입니다. claim(`i`)과 응답(`e`)도 수신자의 행위이므로 선택한
+  agent를 대행합니다.
+
+console은 watch를 연 window의 room을 빌려 쓰므로 window scope의 peer 선택도 눈앞의
+agent로 그대로 해석되지만, identity는 함께 바뀌지 않습니다 — 사람 하나에 `sent`
+스레드 하나입니다.
 
 여기서 `from`은 IPC를 실제 호출한 프로세스라는 뜻이 아니라, 요청이 누구의
 mailbox 권한으로 생성됐고 응답이 어디로 돌아갈지를 나타내는 represented agent
 identity입니다. watch에서 사람이 보낸 요청도 예전에는 이 agent가 직접 보낸 것처럼
 보였지만, 이제 request의 `provenance`와 wake 문구가 `watch/MCP/CLI/dashboard`, OS가
 확인한 PID/UID, process environment 또는 ancestry로 관찰한 pane과 evidence 종류,
-주장한 origin과의 일치 여부를 따로 표시합니다.
+주장한 origin과의 일치 여부를 따로 표시합니다. console 요청도 사람이 어느 pane에서
+걸었는지를 함께 남기므로 audit은 그대로 유지되고, 수신자는 wake 문구에서
+`from console via muxa watch (caller %N, pid …)`를 봅니다.
 
 ## 활성화
 

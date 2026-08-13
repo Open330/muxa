@@ -33,6 +33,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child immediately and keeps that path visible even below the configured
   automatic `view` depth, so panes remain directly selectable. The `always`
   and `manual` policies retain visible-row traversal.
+- **`muxa watch` now messages as the operator console, not as the pane it was
+  opened from.** Previously the launch pane's agent was the represented sender,
+  so `m` silently refused on exactly one row — the row you were sitting on when
+  you pressed `prefix+s` — and messaging was unavailable altogether when watch
+  was opened from a shell pane. The human at the keyboard is the sender now, so
+  every row is addressable from anywhere and no agent has to occupy the launch
+  pane. `--caller-pane` still lands the cursor on your current pane and still
+  travels with the request as audit provenance; it just no longer supplies the
+  sender's identity. MCP and `muxa msg` are unchanged: an agent calling them
+  still speaks for its own pane, and its replies still route back and wake it.
+- **Watch's `M` mailbox follows the cursor.** A console has no pane for a reply
+  to be delivered to, so replies live on the request in the recipient's
+  mailbox. `incoming` is now the selected agent's mailbox and `sent` is the
+  console's dispatch log across every target; `i` and `e` act as the selected
+  agent, since claiming and replying are the recipient's moves.
+- **Under host scope, `m` on a row with no agent no longer guesses.** The
+  lone-peer shortcut is a room convenience; with the cursor as the selector and
+  the table spanning the host, it degrades to keystrokes and says which row is
+  the problem instead of quietly addressing the launch window's agent.
+
+### Fixed
+
+- **A stale or non-participant row no longer disables watch's messaging.**
+  `muxa register` task rows and just-stopped agents look like agents in the
+  topology but are not collaboration participants; pointing at one now costs
+  that row its mailbox instead of dropping the room and downgrading `m` to
+  keystrokes for the rest of the session.
+- **Console replies no longer accumulate forever.** With no pane to wake, a
+  console-sent reply used to stay in muxad's pending set and be re-scanned every
+  two seconds, and to count toward an unread badge nothing could clear.
+- **Watch's inspector no longer prints a permanent `0 unread`.** Nothing is ever
+  addressed to a console, so the sender-side unread count is dropped there
+  rather than rendered as a zero that reads as "no mail anywhere".
 
 ## [0.8.32] - 2026-08-12
 

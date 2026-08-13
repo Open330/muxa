@@ -1059,11 +1059,29 @@ fn unique_pane_endpoint(pane: &str, agents: &[Agent]) -> Result<Option<String>, 
     }
 }
 
+/// The pane inventory a collaboration call is resolved against, plus the
+/// participants derived from it. The raw panes travel alongside because an
+/// operator console origin has no participant row — its room comes from the
+/// pane it was opened from, which need not host an agent.
+struct CollaborationTopology {
+    participants: Vec<collaboration::Participant>,
+    panes: Vec<crate::tmux::PaneInfo>,
+}
+
+impl CollaborationTopology {
+    fn resolve_origin(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<collaboration::Participant, collaboration::CollaborationError> {
+        collaboration::resolve_origin(origin, &self.participants, &self.panes)
+    }
+}
+
 async fn collaboration_participants(
     store: &SharedStore,
     backends: &[SharedBackend],
     collaboration: &CollaborationStore,
-) -> Vec<collaboration::Participant> {
+) -> CollaborationTopology {
     let agents = store.snapshot().await;
     let backends = backends.to_vec();
     let panes = tokio::task::spawn_blocking(move || {
@@ -1076,7 +1094,10 @@ async fn collaboration_participants(
     .unwrap_or_default();
     let mut participants = collaboration::participants_from(&agents, &panes);
     collaboration.enrich_participants(&mut participants).await;
-    participants
+    CollaborationTopology {
+        participants,
+        panes,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1626,14 +1647,14 @@ async fn handle(
                         origin.clone(),
                     );
                     let response = if collaboration.enabled() {
-                        let participants =
+                        let topology =
                             collaboration_participants(&store, &backends, &collaboration).await;
-                        match collaboration::resolve_origin(&origin, &participants) {
+                        match topology.resolve_origin(&origin) {
                             Ok(current) => Response::with_room(
                                 collaboration::room_context(
                                     collaboration.as_ref(),
                                     current,
-                                    &participants,
+                                    &topology.participants,
                                 )
                                 .await,
                             ),
@@ -1664,18 +1685,18 @@ async fn handle(
                         CollaborationAuditOperation::SetIdentity,
                         origin.clone(),
                     );
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let response = match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
-                            .set_identity(&current, &participants, alias, roles)
+                            .set_identity(&current, &topology.participants, alias, roles)
                             .await
                         {
                             Ok(current) => Response::with_room(
                                 collaboration::room_context(
                                     collaboration.as_ref(),
                                     current,
-                                    &participants,
+                                    &topology.participants,
                                 )
                                 .await,
                             ),
@@ -1739,18 +1760,17 @@ async fn handle(
                     );
                     audit_context.target = Some(target.clone());
                     audit_context.message_bytes = Some(request.body.len());
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let result =
-                        collaboration::resolve_origin(&origin, &participants).and_then(|sender| {
-                            collaboration::resolve_target(
-                                &sender,
-                                &target,
-                                &participants,
-                                collaboration.scope(),
-                            )
-                            .map(|recipient| (sender, recipient))
-                        });
+                    let result = topology.resolve_origin(&origin).and_then(|sender| {
+                        collaboration::resolve_target(
+                            &sender,
+                            &target,
+                            &topology.participants,
+                            collaboration.scope(),
+                        )
+                        .map(|recipient| (sender, recipient))
+                    });
                     let response = match result {
                         Ok((sender, recipient)) => {
                             let provenance = collaboration_actor.provenance(&origin);
@@ -1785,9 +1805,9 @@ async fn handle(
                         CollaborationAuditOperation::Inbox,
                         origin.clone(),
                     );
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let response = match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration.claim_for(&current).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
                             Err(error) => Response::err(error.to_string()),
@@ -1811,9 +1831,9 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.mailbox = Some(mailbox);
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let response = match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration.list_for(&current, mailbox).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
                             Err(error) => Response::err(error.to_string()),
@@ -1846,9 +1866,9 @@ async fn handle(
                     audit_context.request_id = Some(request_id.clone());
                     audit_context.status = Some(status);
                     audit_context.message_bytes = Some(body.len());
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let response = match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
                             .reply(
                                 &current,
@@ -1882,9 +1902,9 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.request_id = Some(request_id.clone());
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let response = match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration.get_for(&current, &request_id).await {
                             Ok(request) => Response::with_collaboration_request(request),
                             Err(error) => Response::err(error.to_string()),
@@ -1908,9 +1928,9 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.request_id = Some(request_id.clone());
-                    let participants =
+                    let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
-                    let response = match collaboration::resolve_origin(&origin, &participants) {
+                    let response = match topology.resolve_origin(&origin) {
                         Ok(current) => {
                             match collaboration.cancel_for(&current, &request_id).await {
                                 Ok(request) => Response::with_collaboration_request(request),
@@ -2971,6 +2991,7 @@ mod tests {
         let provenance = actor.provenance(&CollaborationOrigin {
             pane: "%1".into(),
             socket: Some("default".into()),
+            console: false,
         });
         assert_eq!(
             provenance.origin_match,
@@ -3009,14 +3030,17 @@ mod tests {
         let sender = CollaborationOrigin {
             pane: "%1".into(),
             socket: Some("default".into()),
+            console: false,
         };
         let recipient = CollaborationOrigin {
             pane: "%2".into(),
             socket: Some("default".into()),
+            console: false,
         };
         let verifier = CollaborationOrigin {
             pane: "%3".into(),
             socket: Some("default".into()),
+            console: false,
         };
         client
             .collaboration_set_identity(

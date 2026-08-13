@@ -1919,6 +1919,91 @@ mod tests {
         );
     }
 
+    /// A console dispatches but never receives. The recipient still gets its
+    /// wake; the reply has nowhere to be typed, and the wake loop must reach
+    /// that conclusion by finding no participant rather than by trying to
+    /// address a pane called "console".
+    #[tokio::test]
+    async fn a_console_sender_is_woken_for_nothing() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%2", "1")];
+        let agents = store.snapshot().await;
+        let participants = muxa::collaboration::participants_from(&agents, &panes);
+        let recipient = participants[0].clone();
+        let console = muxa::collaboration::resolve_origin(
+            &muxa::collaboration::CollaborationOrigin {
+                pane: "%2".into(),
+                socket: None,
+                console: true,
+            },
+            &participants,
+            &panes,
+        )
+        .unwrap();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = mailbox
+            .create(
+                console.clone(),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Task,
+                    body: "dispatched by a human".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
+        {
+            let mut sends = sends.lock().unwrap();
+            assert_eq!(sends[0].0, "%2");
+            assert!(sends[0].1.contains("from console"));
+            sends.clear();
+        }
+
+        mailbox.claim_for(&recipient).await.unwrap();
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        wake_idle_collaboration_peers(&mailbox, &store, &[backend]).await;
+
+        assert!(
+            sends.lock().unwrap().is_empty(),
+            "a console has no pane to wake"
+        );
+        // Unread stays pending because nothing consumed it, and the reply is
+        // readable from the recipient's own mailbox — which is where `muxa
+        // watch` reads it, by pointing the cursor at that row.
+        assert_eq!(
+            mailbox
+                .list_for(&recipient, muxa::collaboration::RequestMailbox::Incoming)
+                .await
+                .unwrap()[0]
+                .reply
+                .as_ref()
+                .map(|reply| reply.body.as_str()),
+            Some("done")
+        );
+    }
+
     #[test]
     fn heals_canonical_default_or_configured_socket() {
         let default = Path::new("/run/user/1000/muxa.sock");

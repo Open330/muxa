@@ -232,6 +232,7 @@ mod tests {
             CollaborationOrigin {
                 pane: "%3".into(),
                 socket: Some("default".into()),
+                console: false,
             },
         )
         .finish(

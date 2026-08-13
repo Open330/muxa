@@ -40,11 +40,28 @@ impl Default for CollaborationOptions {
     }
 }
 
+/// The stable pane-shaped identity of the operator console. It is not a real
+/// pane id — `pane_id_host_kind` rejects it, which is what keeps the wake path
+/// from ever trying to type at a human.
+pub const CONSOLE_PANE: &str = "console";
+/// The console's agent session id. Fixed, so every request a human dispatches
+/// shares one sender identity no matter which pane the console was opened from.
+pub const CONSOLE_SESSION_ID: &str = "console";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollaborationOrigin {
     pub pane: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
+    /// Act as the operator console rather than as the agent occupying `pane`.
+    ///
+    /// A human pressing a key in `muxa watch` is the sender; the agent that
+    /// happens to sit in the pane the popup was opened from is not. `pane`
+    /// still travels with the origin — it names the room the console is
+    /// looking at and is the provenance evidence for who dialled — but it no
+    /// longer supplies the identity, so the console can address that pane too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console: bool,
 }
 
 /// Local IPC surface that initiated a collaboration call. This describes the
@@ -178,10 +195,41 @@ pub struct Participant {
     /// Advisory capabilities/responsibilities used by `role:<name>` routing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// This participant is the operator console, not a pane-hosted agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console: bool,
 }
 
 impl Participant {
+    /// The human driving `muxa watch` (or another operator surface).
+    ///
+    /// Identity is fixed so the sent mailbox stays one coherent thread across
+    /// popups, while `room` follows the window the console was opened from so
+    /// room-scoped peer selection still resolves the agents in front of the
+    /// operator. `room` is deliberately outside `same_endpoint`, so moving the
+    /// console to another window does not fork its identity.
+    pub fn console(room: RoomId) -> Self {
+        Self {
+            agent_kind: AgentKind::Unknown,
+            agent_session_id: CONSOLE_SESSION_ID.to_string(),
+            pane: CONSOLE_PANE.to_string(),
+            socket: None,
+            room,
+            tmux_session_id: None,
+            tmux_session_name: None,
+            window_name: None,
+            state: AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: true,
+        }
+    }
+
     pub fn label(&self) -> String {
+        if self.console {
+            return CONSOLE_PANE.to_string();
+        }
         self.alias.as_ref().map_or_else(
             || format!("{}@{}", self.agent_kind, self.pane),
             |alias| format!("{alias}@{}", self.pane),
@@ -462,6 +510,8 @@ pub enum CollaborationError {
     TooManyRoles,
     #[error("collaboration alias {0:?} is already used by a live peer in this room")]
     AliasInUse(String),
+    #[error("the operator console has no agent session to name; run `muxa identity` from the agent's own pane")]
+    ConsoleIdentity,
     #[error("persistence error: {0}")]
     Persistence(#[from] std::io::Error),
     #[error("invalid persisted mailbox: {0}")]
@@ -566,6 +616,12 @@ impl CollaborationStore {
         roles: Vec<String>,
     ) -> Result<Participant, CollaborationError> {
         self.ensure_enabled()?;
+        // Aliases are room-local and a console borrows the room it was opened
+        // from, so letting it register one would squat a name the agents in
+        // that window route by.
+        if caller.console {
+            return Err(CollaborationError::ConsoleIdentity);
+        }
         let alias = normalize_alias(alias)?;
         let roles = normalize_roles(roles)?;
         let _transaction = self.transaction_lock.lock().await;
@@ -868,6 +924,12 @@ impl CollaborationStore {
             .collect()
     }
 
+    /// Replies still owed a wake to their sender.
+    ///
+    /// A console sender is excluded rather than skipped downstream: it has no
+    /// pane to type into, so it would never be marked notified and would be
+    /// re-scanned on every daemon tick for the life of the mailbox. Its reply
+    /// is delivered by being readable in the recipient's mailbox.
     pub async fn pending_reply_unnotified(&self) -> Vec<CollaborationRequest> {
         let _transaction = self.transaction_lock.lock().await;
         self.requests
@@ -878,6 +940,7 @@ impl CollaborationStore {
                 request.status.is_terminal()
                     && request.reply.is_some()
                     && request.reply_notified_at.is_none()
+                    && !request.from.console
             })
             .cloned()
             .collect()
@@ -938,7 +1001,15 @@ impl CollaborationStore {
             .count()
     }
 
+    /// Replies the participant has not read yet.
+    ///
+    /// "Unread" is cleared by the sender fetching the reply, which an operator
+    /// console never does — it reads replies off the recipient's row. Counting
+    /// them would give watch a `mail 0/N` badge that only ever grows.
     pub async fn unread_reply_count(&self, participant: &Participant) -> usize {
+        if participant.console {
+            return 0;
+        }
         let _transaction = self.transaction_lock.lock().await;
         self.requests
             .read()
@@ -1040,24 +1111,13 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
             continue;
         }
         let pane = candidates[0];
-        let host = crate::backend::pane_id_host_kind(pane_id)
-            .map_or_else(|| "unknown".to_string(), |kind| kind.to_string());
-        let window_id = if pane.window_id.is_empty() {
-            format!("{}:{}", pane.session, pane.window_index)
-        } else {
-            pane.window_id.clone()
-        };
         let socket = pane.socket.clone().or(agent_socket);
         let participant = Participant {
             agent_kind: agent.kind,
             agent_session_id: agent.session_id.clone(),
             pane: pane_id.clone(),
             socket: socket.clone(),
-            room: RoomId {
-                host,
-                socket: socket.clone(),
-                window_id,
-            },
+            room: pane_room(pane_id, pane, socket.clone()),
             tmux_session_id: (!pane.session_id.is_empty()).then(|| pane.session_id.clone()),
             tmux_session_name: Some(pane.session.clone()),
             window_name: (!pane.window_name.is_empty()).then(|| pane.window_name.clone()),
@@ -1065,6 +1125,7 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
             cwd: agent.cwd.clone(),
             alias: None,
             roles: Vec::new(),
+            console: false,
         };
         let key = (socket, pane_id.clone());
         let replace = resolved
@@ -1082,10 +1143,67 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
     participants
 }
 
+/// The durable room identity of a pane: `(host, socket, window_id)`, never the
+/// mutable window name or index.
+fn pane_room(pane_id: &str, pane: &PaneInfo, socket: Option<String>) -> RoomId {
+    RoomId {
+        host: crate::backend::pane_id_host_kind(pane_id)
+            .map_or_else(|| "unknown".to_string(), |kind| kind.to_string()),
+        socket,
+        window_id: if pane.window_id.is_empty() {
+            format!("{}:{}", pane.session, pane.window_index)
+        } else {
+            pane.window_id.clone()
+        },
+    }
+}
+
+/// The console looking out from the window it was opened in.
+///
+/// Unlike an agent origin the pane need not host an agent — an operator can
+/// open the console from a bare shell — so this reads the pane inventory
+/// directly. A pane the backend cannot list still yields a console, just one
+/// with no room peers; host-scoped pane targets keep working from there.
+///
+/// The session/window names are carried for hints only. They sit outside
+/// `same_endpoint`, so a console that moves to another window keeps one
+/// identity and one sent mailbox.
+fn console_participant(origin: &CollaborationOrigin, panes: &[PaneInfo]) -> Participant {
+    let Some(pane) = panes.iter().find(|pane| {
+        pane.pane_id == origin.pane
+            && match origin.socket.as_deref() {
+                Some(socket) => pane.socket.as_deref().is_some_and(|candidate| {
+                    crate::backend::pane_endpoints_match(Some(&origin.pane), candidate, socket)
+                }),
+                None => true,
+            }
+    }) else {
+        return Participant::console(RoomId {
+            host: CONSOLE_PANE.to_string(),
+            socket: None,
+            window_id: CONSOLE_PANE.to_string(),
+        });
+    };
+    let socket = pane.socket.clone().or_else(|| origin.socket.clone());
+    let mut console = Participant::console(pane_room(&origin.pane, pane, socket));
+    console.tmux_session_id = (!pane.session_id.is_empty()).then(|| pane.session_id.clone());
+    console.tmux_session_name = Some(pane.session.clone());
+    console.window_name = (!pane.window_name.is_empty()).then(|| pane.window_name.clone());
+    console
+}
+
 pub fn resolve_origin(
     origin: &CollaborationOrigin,
     participants: &[Participant],
+    panes: &[PaneInfo],
 ) -> Result<Participant, CollaborationError> {
+    // A console never has to exist in the participant table: it is the
+    // operator, not a tracked agent. That is what lets `muxa watch` address
+    // every pane uniformly — including the one it was opened from, and
+    // including the case where that pane hosts no agent at all.
+    if origin.console {
+        return Ok(console_participant(origin, panes));
+    }
     let matches: Vec<_> = participants
         .iter()
         .filter(|participant| {
@@ -1333,6 +1451,7 @@ mod tests {
             cwd: Some("/repo".into()),
             alias: None,
             roles: Vec::new(),
+            console: false,
         }
     }
 
@@ -1709,6 +1828,243 @@ mod tests {
                 .pane,
             "%2"
         );
+    }
+
+    /// The bug this whole console notion exists for: pressing `m` on the row
+    /// you happened to be sitting in when you opened `muxa watch` used to find
+    /// no recipient, because the launch pane's agent *was* the sender.
+    #[test]
+    fn a_console_can_address_the_pane_it_was_opened_from() {
+        let launch = participant("%1", "the-agent-under-the-cursor");
+        let peers = vec![launch.clone(), participant("%2", "s2")];
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+        };
+        let console = resolve_origin(&origin, &peers, &[pane_info("%1")]).unwrap();
+
+        assert!(console.console);
+        assert_eq!(console.label(), "console");
+        assert_eq!(
+            resolve_target(&console, "pane:%1", &peers, CollaborationScope::Host)
+                .unwrap()
+                .agent_session_id,
+            "the-agent-under-the-cursor"
+        );
+        // The same origin without the console flag is the old behaviour: the
+        // launch pane resolves to itself and is filtered out as the sender.
+        let agent = resolve_origin(
+            &CollaborationOrigin {
+                console: false,
+                ..origin
+            },
+            &peers,
+            &[pane_info("%1")],
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_target(&agent, "pane:%1", &peers, CollaborationScope::Host),
+            Err(CollaborationError::UnknownTarget(_))
+        ));
+    }
+
+    /// A console keeps working from a pane that hosts no agent, and from a
+    /// pane the backend cannot even list — messaging must not depend on where
+    /// the popup was opened.
+    #[test]
+    fn a_console_resolves_without_a_tracked_launch_pane() {
+        let peers = vec![participant("%2", "s2")];
+
+        let shell = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%77".into(),
+                socket: None,
+                console: true,
+            },
+            &peers,
+            &[pane_info("%77")],
+        )
+        .unwrap();
+        assert_eq!(shell.room.window_id, "@1");
+        assert_eq!(
+            resolve_target(&shell, "pane:%2", &peers, CollaborationScope::Host)
+                .unwrap()
+                .pane,
+            "%2"
+        );
+
+        let unlisted = resolve_origin(
+            &CollaborationOrigin {
+                pane: String::new(),
+                socket: None,
+                console: true,
+            },
+            &peers,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(unlisted.room.window_id, CONSOLE_PANE);
+        assert_eq!(
+            resolve_target(&unlisted, "pane:%2", &peers, CollaborationScope::Host)
+                .unwrap()
+                .pane,
+            "%2"
+        );
+    }
+
+    /// Console identity is fixed, so one operator's dispatch log stays a
+    /// single thread no matter which window each popup was opened from.
+    #[tokio::test]
+    async fn console_sent_mailbox_survives_moving_between_windows() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let recipient = participant("%2", "recipient");
+        let from_here = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%1".into(),
+                socket: None,
+                console: true,
+            },
+            &[],
+            &[pane_info("%1")],
+        )
+        .unwrap();
+        let mut elsewhere = pane_info("%9");
+        elsewhere.window_id = "@other".into();
+        let other_window = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%9".into(),
+                socket: None,
+                console: true,
+            },
+            &[],
+            std::slice::from_ref(&elsewhere),
+        )
+        .unwrap();
+        assert_ne!(from_here.room, other_window.room);
+
+        for console in [&from_here, &other_window] {
+            mailbox
+                .create(
+                    console.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Task,
+                        body: "do the thing".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        paths: Vec::new(),
+                        air_artifacts: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            mailbox
+                .list_for(&from_here, RequestMailbox::Sent)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // And the replies land in the recipient's mailbox, which is where the
+        // operator reads them — by pointing the cursor at that row.
+        assert_eq!(
+            mailbox
+                .list_for(&recipient, RequestMailbox::Incoming)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A console has no pane to be woken at, so its replies must leave the
+    /// wake queue on their own — otherwise every reply a human ever collected
+    /// is re-scanned on each daemon tick — and must not accumulate in an
+    /// unread badge that nothing can clear.
+    #[tokio::test]
+    async fn console_replies_leave_no_permanent_wake_or_unread_debt() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let agent = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let console = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%1".into(),
+                socket: None,
+                console: true,
+            },
+            &[],
+            &[pane_info("%1")],
+        )
+        .unwrap();
+
+        let mut ids = Vec::new();
+        for sender in [console.clone(), agent.clone()] {
+            let request = mailbox
+                .create(
+                    sender,
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Question,
+                        body: "who sent this".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        paths: Vec::new(),
+                        air_artifacts: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            ids.push(request.id);
+        }
+        mailbox.claim_for(&recipient).await.unwrap();
+        for id in &ids {
+            mailbox
+                .reply(
+                    &recipient,
+                    id,
+                    RequestStatus::Completed,
+                    "answered".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Only the pane-backed sender is still owed a wake.
+        let pending = mailbox.pending_reply_unnotified().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].from.pane, "%1");
+        assert!(!pending[0].from.console);
+
+        assert_eq!(mailbox.unread_reply_count(&console).await, 0);
+        assert_eq!(mailbox.unread_reply_count(&agent).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_console_cannot_squat_an_alias_in_the_room_it_borrows() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let console = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%1".into(),
+                socket: None,
+                console: true,
+            },
+            &[],
+            &[pane_info("%1")],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            mailbox
+                .set_identity(&console, &[], Some("reviewer".into()), Vec::new())
+                .await,
+            Err(CollaborationError::ConsoleIdentity)
+        ));
     }
 
     #[tokio::test]

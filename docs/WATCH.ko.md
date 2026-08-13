@@ -150,15 +150,22 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 
 ## Agent 협업
 
-메시지를 보낼 agent pane을 선택하고 `prefix+s`로 watch를 엽니다. 같은 tmux
-window의 상대 agent를 선택한 뒤 `m`을 누릅니다. room에 peer가 하나뿐이면 watch가
-자동으로 선택합니다. composer에서 `Tab`은 request kind를 바꾸고 `Enter`는
+어디서든 `prefix+s`로 watch를 열고, agent를 선택한 뒤 `m`을 누릅니다. watch는
+**operator console**로서 보냅니다 — 발신자는 watch를 연 pane에 들어 있던 agent가
+아니라 키보드 앞의 사람입니다. 따라서 watch를 띄운 그 pane도 다른 행과 똑같은
+수신 대상이고, 일반 shell pane에서 열어도 문제없습니다. room에 peer가 하나뿐이면
+watch가 자동으로 선택합니다. composer에서 `Tab`은 request kind를 바꾸고 `Enter`는
 전송합니다. `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수
 있습니다. 마지막 kind와 mode는 즉시 저장되어 다음 `m`과 watch 재실행 후에도
 복원됩니다.
 
+console에는 자기 pane이 없으므로 응답은 발신자에게 되돌아오지 않고 **수신 agent의
+mailbox**에 request와 함께 남습니다. `M`은 커서가 놓인 agent의 mailbox를 보여주며
+`incoming`은 그 agent의 것, `sent`는 console이 모든 대상에게 보낸 기록입니다.
+claim(`i`)과 응답(`e`)은 수신자의 행위이므로 선택한 agent를 대행해 동작합니다.
+
 `[collaboration].scope = "host"`이면 선택한 agent가 watch를 연 window의 유일한
-peer보다 우선합니다. origin 자신을 제외한 agent가 하나인 접힌 session도 바로
+peer보다 우선합니다. agent가 하나인 접힌 session도 바로
 지정할 수 있으므로 해당 session을 선택하고 `m`을 누르면 펼치지 않아도 그 agent가
 대상이 됩니다. “`cx` alias로 새 pane에서 codex를 시작한 뒤 변경사항을
 리뷰해줘” 같은 요청은 `TASK`와 `EXECUTE`를 선택해 보내면 raw keystroke가 아니라
@@ -181,9 +188,9 @@ peer보다 우선합니다. origin 자신을 제외한 agent가 하나인 접힌
 
 `M`은 incoming/sent mailbox를 엽니다(`b`도 alias로 유지됩니다). mailbox 안에서
 `m`은 새 메시지를 작성하고 `M`은 mailbox를 닫습니다. `Tab`으로 mailbox를 전환하고
-`j`/`k`로 request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다. 일반
-shell에서 watch를 열었다면 조회는 가능하지만, 협업하려면 agent pane에서
-`prefix+s`로 다시 열라는 안내가 표시됩니다.
+`j`/`k`로 request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다.
+console이 발신자이므로 일반 shell pane에서 watch를 열어도 협업이 그대로
+동작합니다.
 
 AIR artifact 참조가 첨부된 request는 mailbox에서 profile별 색상 배지로
 표시됩니다. `AIR WORKFLOW`는 파랑, `AIR PLAN`은 자홍, `AIR TRACE`는 청록,

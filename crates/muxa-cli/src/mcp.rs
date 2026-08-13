@@ -1025,7 +1025,13 @@ fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, St
         let path = value.split(',').next()?.trim();
         (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
     });
-    Ok(CollaborationOrigin { pane, socket })
+    // An MCP caller *is* the agent in the pane, so it keeps the pane identity:
+    // replies must route back to it and wake it.
+    Ok(CollaborationOrigin {
+        pane,
+        socket,
+        console: false,
+    })
 }
 
 /// Recover the owning pane when an MCP host sanitizes subprocess

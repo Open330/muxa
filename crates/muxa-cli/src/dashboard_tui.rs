@@ -1342,7 +1342,15 @@ fn dashboard_collaboration_origin_from(
         let path = value.split(',').next()?.trim();
         (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
     });
-    Some(CollaborationOrigin { pane, socket })
+    // Still an agent origin. The dashboard has the same operator-console shape
+    // as `muxa watch` and probably wants `console: true` too, but its mailbox
+    // and peer panels are wired to the launch pane's identity, so flipping it
+    // is a separate change.
+    Some(CollaborationOrigin {
+        pane,
+        socket,
+        console: false,
+    })
 }
 
 async fn load_session_activities(cfg: &Config) -> Vec<SessionActivity> {
@@ -4393,6 +4401,7 @@ mod tests {
             cwd: Some("/tmp/project".into()),
             alias: alias.map(str::to_string),
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
+            console: false,
         }
     }
 
@@ -4433,6 +4442,7 @@ mod tests {
             origin: Some(CollaborationOrigin {
                 pane: current.pane.clone(),
                 socket: current.socket.clone(),
+                console: false,
             }),
             room: Some(RoomContext {
                 current,

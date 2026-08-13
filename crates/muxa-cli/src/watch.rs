@@ -2125,9 +2125,24 @@ fn persist_watch_collaboration_defaults(
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
     room: Option<RoomContext>,
+    /// The agent whose inbox `incoming` holds — the row under the cursor when
+    /// the mailbox was last refreshed. `None` when that row hosts no agent.
+    inbox: Option<MailboxAnchor>,
     incoming: Vec<CollaborationRequest>,
     sent: Vec<CollaborationRequest>,
     unavailable: Option<String>,
+}
+
+/// The agent the mailbox overlay is acting as.
+///
+/// Claiming and replying are things a *recipient* does, so the `i` and `e`
+/// keys speak for this agent rather than for the console — the console is only
+/// ever a sender. Keeping it beside the fetched requests guarantees the keys
+/// act on the same mailbox the panel is showing.
+#[derive(Debug, Clone)]
+struct MailboxAnchor {
+    origin: CollaborationOrigin,
+    label: String,
 }
 
 impl WatchCollaboration {
@@ -6440,7 +6455,7 @@ pub async fn run(
         .as_deref()
         .and_then(|pane_id| initial_host.and_then(|host| current_backend_endpoint(host, pane_id)));
     app.set_initial_pane_on(initial_pane.clone(), initial_endpoint);
-    app.collaboration.origin = watch_collaboration_origin(initial_pane.clone());
+    app.collaboration.origin = Some(watch_collaboration_origin(initial_pane.clone()));
     app.collaboration_scope = collaboration_scope;
     let watch_started_at = OffsetDateTime::now_utc();
 
@@ -6806,19 +6821,26 @@ pub async fn run(
                     }
                 }
                 Action::ClaimCollaborationInbox => {
-                    let outcome = match app.collaboration.origin.clone() {
-                        Some(origin) => match client.collaboration_inbox(&origin).await {
-                            Ok(requests) if requests.is_empty() => {
-                                ActionOutcome::Ok("collaboration inbox is empty".into())
-                            }
+                    // Claiming is the recipient's move, so `i` acts for the
+                    // agent whose inbox is on screen — never for the console,
+                    // which is only ever a sender.
+                    let outcome = match app.collaboration.inbox.clone() {
+                        Some(anchor) => match client.collaboration_inbox(&anchor.origin).await {
+                            Ok(requests) if requests.is_empty() => ActionOutcome::Ok(format!(
+                                "{}'s collaboration inbox is empty",
+                                anchor.label
+                            )),
                             Ok(requests) => ActionOutcome::Ok(format!(
-                                "claimed {} collaboration request{}",
+                                "claimed {} collaboration request{} for {}",
                                 requests.len(),
-                                if requests.len() == 1 { "" } else { "s" }
+                                if requests.len() == 1 { "" } else { "s" },
+                                anchor.label
                             )),
                             Err(error) => ActionOutcome::Err(format!("inbox failed: {error}")),
                         },
-                        None => ActionOutcome::Err(collaboration_open_hint().into()),
+                        None => ActionOutcome::Err(
+                            "select a row with an agent to claim its inbox".into(),
+                        ),
                     };
                     apply_outcome_to_app(&mut app, outcome);
                     refresh_watch_collaboration(client, &mut app).await;
@@ -7100,7 +7122,7 @@ pub async fn run(
     Ok(jump_target)
 }
 
-fn watch_collaboration_origin(initial_pane: Option<String>) -> Option<CollaborationOrigin> {
+fn watch_collaboration_origin(initial_pane: Option<String>) -> CollaborationOrigin {
     watch_collaboration_origin_from(
         initial_pane,
         std::env::var("RMUX").ok(),
@@ -7108,35 +7130,55 @@ fn watch_collaboration_origin(initial_pane: Option<String>) -> Option<Collaborat
     )
 }
 
+/// `muxa watch` sends as the operator console.
+///
+/// The human at the keyboard is the sender — not whichever agent happens to
+/// occupy the pane the popup was opened from. The pane still rides along: it
+/// names the room the console is looking at and is the provenance evidence for
+/// who dialled. But it no longer supplies the *identity*, which is why the
+/// console can address that pane too, and why a console opened from a bare
+/// shell still messages. A pane we cannot resolve therefore degrades to a
+/// pane-less console rather than to no collaboration at all.
 fn watch_collaboration_origin_from(
     initial_pane: Option<String>,
     rmux: Option<String>,
     tmux: Option<String>,
-) -> Option<CollaborationOrigin> {
-    let pane = initial_pane?;
-    let kind = muxa::backend::pane_id_host_kind(&pane)?;
-    let endpoint = match kind {
-        muxa::HostKind::Rmux => rmux,
-        muxa::HostKind::Tmux => tmux,
-        muxa::HostKind::Zellij | muxa::HostKind::Herdr => return None,
-    };
-    let socket = endpoint.and_then(|value| {
-        let path = value.split(',').next()?.trim();
-        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
+) -> CollaborationOrigin {
+    let pane = initial_pane.filter(|pane| !pane.is_empty());
+    let socket = pane.as_deref().and_then(|pane| {
+        let endpoint = match muxa::backend::pane_id_host_kind(pane)? {
+            muxa::HostKind::Rmux => rmux,
+            muxa::HostKind::Tmux => tmux,
+            muxa::HostKind::Zellij | muxa::HostKind::Herdr => None,
+        }?;
+        let path = endpoint.split(',').next()?.trim();
+        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(pane), path))
     });
-    Some(CollaborationOrigin { pane, socket })
+    CollaborationOrigin {
+        pane: pane.unwrap_or_default(),
+        socket,
+        console: true,
+    }
 }
 
 fn collaboration_open_hint() -> &'static str {
-    "collaboration unavailable here — focus an agent pane and open muxa watch with prefix+s"
+    "collaboration unavailable — enable [collaboration].enabled and restart muxad"
 }
 
+/// Translate a daemon error into something the operator can act on.
+///
+/// Matched against the substring the error actually carries: it reads
+/// "collaboration origin is not a **hook-correlated** tracked pane agent", so
+/// the old pattern never fired and the raw wording reached the hint area. A
+/// console origin does not need a tracked agent, so seeing this at all now
+/// means the daemon predates the console — say that rather than repeating
+/// advice about focusing an agent pane.
 fn friendly_watch_collaboration_error(error: &str) -> String {
-    if error.contains("collaboration origin is not a tracked pane agent") {
-        collaboration_open_hint().into()
-    } else {
-        error.into()
+    if error.contains("origin is not") && error.contains("tracked pane agent") {
+        return "muxad is too old to accept console messages — restart it after `muxa upgrade`"
+            .into();
     }
+    error.into()
 }
 
 async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
@@ -7158,34 +7200,93 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
             return;
         }
     };
+    // Incoming is the *selected row's* mailbox, not the console's: the console
+    // dispatches and never receives, and a reply belongs to the session that
+    // was commanded. Sent stays the console's own dispatch log across targets.
+    let anchor = mailbox_anchor(app);
     let (incoming, sent) = tokio::join!(
-        client.collaboration_list(&origin, RequestMailbox::Incoming),
+        async {
+            match anchor.as_ref() {
+                Some(anchor) => {
+                    client
+                        .collaboration_list(&anchor.origin, RequestMailbox::Incoming)
+                        .await
+                }
+                None => Ok(Vec::new()),
+            }
+        },
         client.collaboration_list(&origin, RequestMailbox::Sent),
     );
-    match (incoming, sent) {
-        (Ok(incoming), Ok(sent)) => {
+    // A row that carries an agent in the topology is not necessarily a
+    // collaboration participant — `muxa register` task rows and just-stopped
+    // agents both look like one and resolve to nothing. That is a fact about
+    // the cursor, not about the console, so it costs this row its inbox and
+    // nothing else. Letting it fall through to the shared failure branch would
+    // drop the room and downgrade `m` to keystrokes for the whole session.
+    let (inbox, incoming) = match incoming {
+        Ok(incoming) => (anchor, incoming),
+        Err(_) => (None, Vec::new()),
+    };
+    match sent {
+        Ok(sent) => {
             app.collaboration = WatchCollaboration {
                 origin: Some(origin),
                 room: Some(room),
+                inbox,
                 incoming,
                 sent,
                 unavailable: None,
             };
         }
-        (incoming, sent) => {
-            let error = incoming
-                .err()
-                .or_else(|| sent.err())
-                .expect("at least one mailbox request failed");
+        Err(error) => {
             app.collaboration = WatchCollaboration {
                 origin: Some(origin),
                 room: Some(room),
+                inbox,
+                incoming,
                 unavailable: Some(format!("mailbox unavailable: {error}")),
                 ..WatchCollaboration::default()
             };
         }
     }
     clamp_collaboration_mailbox(app);
+}
+
+/// Whose inbox `M` shows: the agent under the cursor.
+///
+/// The mailbox overlay is modal, so the row cannot move while it is open — one
+/// fetch per open is enough. The socket is deliberately left unset: the
+/// topology's endpoint string and a participant's socket are only comparable
+/// through `pane_endpoints_match`, while origin resolution compares them
+/// exactly, so pinning it here would silently miss. Pane ids are unique per
+/// host, and the ambiguous case (one id on two tmux servers) surfaces as an
+/// error rather than the wrong mailbox.
+fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
+    let (pane, label) = if app.uses_tree() {
+        let pane = app.selected_action_pane()?;
+        let agent = pane.agent.as_ref()?;
+        (
+            pane.key.pane_id.clone(),
+            format!("{}@{}", agent.kind, pane.key.pane_id),
+        )
+    } else {
+        // Both halves come from the same agent. `selected_pane` falls back to a
+        // work row's representative pane while `selected_agent` falls back to
+        // its latest agent, and those are not always the same pane — pairing
+        // them would label one agent's mailbox with another's name.
+        let agent = app.selected_agent()?;
+        let pane = agent.pane.clone()?;
+        let label = format!("{}@{pane}", agent.kind);
+        (pane, label)
+    };
+    Some(MailboxAnchor {
+        origin: CollaborationOrigin {
+            pane,
+            socket: None,
+            console: false,
+        },
+        label,
+    })
 }
 
 /// A request needs a peer; keystrokes only need a pane. When the full
@@ -7305,10 +7406,11 @@ fn participant_pane_key(app: &App, participant: &Participant) -> Option<PaneKey>
 
 /// Name the room, so "no peer here" points somewhere.
 ///
-/// The room is the window `muxa watch` was opened from and is fixed for
-/// the lifetime of the process. Selecting a different row cannot change
-/// it, and the message has to say so — otherwise the obvious reading of
-/// "here" is "the row I am looking at".
+/// Only reachable under window scope. The room is the window `muxa watch` was
+/// opened from and is fixed for the lifetime of the process; selecting a
+/// different row cannot change it, and the message has to say so — otherwise
+/// the obvious reading of "here" is "the row I am looking at". The fix is
+/// usually host scope rather than another agent, so name that.
 fn empty_room_hint(current: &Participant) -> String {
     let where_ = match (&current.tmux_session_name, &current.window_name) {
         (Some(session), Some(window)) => format!("{session}:{window}"),
@@ -7316,8 +7418,30 @@ fn empty_room_hint(current: &Participant) -> String {
         _ => current.room.window_id.clone(),
     };
     format!(
-        "no peer in {where_} — the room is the window watch was opened from, not the selected row; start another agent there"
+        "no agent in {where_} — the room is the window watch was opened from, not the selected row; set [collaboration] scope = \"host\" to reach every window"
     )
+}
+
+/// Why `m` could not name a recipient.
+///
+/// Under host scope the room is not the reason: the cursor is the selector and
+/// the table spans every session on the host, so `host_scope_target` has
+/// already had its say and the only thing left to report is that this row does
+/// not resolve to exactly one agent. Naming the launch window's peers there
+/// would point the operator at an unrelated window.
+fn no_target_hint(app: &App, room: &RoomContext) -> String {
+    if app.collaboration_scope == muxa::config::CollaborationScope::Host {
+        return "this row has no single agent to message — select an agent row, or one pane of it, and press m".into();
+    }
+    if room.peers.is_empty() {
+        return empty_room_hint(&room.current);
+    }
+    let labels = room
+        .peers
+        .iter()
+        .map(|peer| format!("{} · {}", peer.label(), app.pane_label(&peer.pane)))
+        .collect::<Vec<_>>();
+    peer_choice_hint(&labels)
 }
 
 /// Name the rows that can actually receive a request.
@@ -7341,25 +7465,22 @@ fn peer_choice_hint(labels: &[String]) -> String {
 }
 
 /// The recipient under host scope: the tracked agent selected in any window.
-/// On a collapsed work row, prefer its sole non-origin agent; that makes a
-/// one-agent work addressable without expanding it.
-/// The origin — and thus where the reply lands, this watch's `M` mailbox —
-/// stays the launch agent; only the target leaves the room.
+/// On a collapsed work row, prefer its sole agent; that makes a one-agent work
+/// addressable without expanding it.
+///
+/// Every row is a candidate, including the pane watch was opened from. The
+/// sender is the operator console, not that pane's agent, so there is no
+/// self-send to guard against — and the row the operator was sitting on when
+/// they hit the key is a likely thing to want to poke.
 fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
     if app.collaboration_scope != muxa::config::CollaborationScope::Host {
         return None;
     }
-    let origin_pane = app
-        .collaboration
-        .origin
-        .as_ref()
-        .map(|origin| origin.pane.as_str());
     if app.uses_tree() {
         let mut candidates = app
             .selected_topology_panes()
             .into_iter()
-            .filter(|pane| pane.agent.is_some())
-            .filter(|pane| Some(pane.key.pane_id.as_str()) != origin_pane);
+            .filter(|pane| pane.agent.is_some());
         let pane = candidates.next()?;
         if candidates.next().is_some() {
             return None;
@@ -7380,10 +7501,7 @@ fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
             .agent_idx
             .and_then(|index| session.agents.get(index))
             .or_else(|| {
-                let mut candidates = session
-                    .agents
-                    .iter()
-                    .filter(|agent| agent.pane.as_deref() != origin_pane);
+                let mut candidates = session.agents.iter();
                 let only = candidates.next()?;
                 candidates.next().is_none().then_some(only)
             })
@@ -7391,9 +7509,6 @@ fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
         WatchRow::BarePane(_) => None,
     }?;
     let pane = agent.pane.clone()?;
-    if origin_pane == Some(pane.as_str()) {
-        return None;
-    }
     let label = format!("{}@{} · {}", agent.kind, pane, app.pane_label(&pane));
     Some((pane, label, None))
 }
@@ -7433,12 +7548,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
             .unavailable
             .clone()
             .unwrap_or_else(|| collaboration_open_hint().into())),
-        // "here" is the window `muxa watch` was launched from, fixed at
-        // startup — not the row under the cursor. Name the room and say
-        // the cursor is not the lever, because the table spans every
-        // session on the host and an unqualified "no peer here" reads as
-        // plainly false to someone pointing at a two-agent work.
-        Some(room) if room.peers.is_empty() => Err(empty_room_hint(&room.current)),
+        Some(room) if room.peers.is_empty() => Err(no_target_hint(app, room)),
         Some(room) => {
             let selected_peer = if app.uses_tree() {
                 app.selected_action_pane().and_then(|pane| {
@@ -7457,7 +7567,17 @@ fn open_watch_collaboration_composer(app: &mut App) {
                 // when exactly one peer lives in it; more than one is
                 // genuinely ambiguous and still asks.
                 .or_else(|| peer_inside_selected_row(app, room))
-                .or_else(|| (room.peers.len() == 1).then(|| &room.peers[0]))
+                // The lone-peer shortcut is a *room* convenience: with one
+                // agent beside you, "send" is unambiguous. Under host scope the
+                // cursor is the selector and the table spans the host, so a row
+                // that names no agent must not silently become the launch
+                // window's agent — which it now would, since the console no
+                // longer occupies that pane and it counts as a peer.
+                .or_else(|| {
+                    (app.collaboration_scope != muxa::config::CollaborationScope::Host
+                        && room.peers.len() == 1)
+                        .then(|| &room.peers[0])
+                })
                 .map(|peer| {
                     (
                         peer.pane.clone(),
@@ -7465,14 +7585,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
                         participant_pane_key(app, peer),
                     )
                 })
-                .ok_or_else(|| {
-                    let labels = room
-                        .peers
-                        .iter()
-                        .map(|p| format!("{} · {}", p.label(), app.pane_label(&p.pane)))
-                        .collect::<Vec<_>>();
-                    peer_choice_hint(&labels)
-                })
+                .ok_or_else(|| no_target_hint(app, room))
         }
     };
     // In host scope the selected tracked agent/session is the explicit
@@ -8990,8 +9103,10 @@ fn open_watch_collaboration_reply_composer(app: &mut App) {
         app.set_hint("switch to incoming requests to reply", HintLevel::Err);
         return;
     }
-    let Some(origin) = app.collaboration.origin.clone() else {
-        app.set_hint(collaboration_open_hint(), HintLevel::Err);
+    // A reply comes from the recipient. The console never receives, so `e`
+    // speaks for the agent whose inbox the panel is showing.
+    let Some(anchor) = app.collaboration.inbox.clone() else {
+        app.set_hint("select a row with an agent to reply as", HintLevel::Err);
         return;
     };
     let Some(request) = selected_collaboration_request(app) else {
@@ -9017,7 +9132,7 @@ fn open_watch_collaboration_reply_composer(app: &mut App) {
     );
     app.collaboration_composer = Some(CollaborationComposer::new(
         CollaborationComposeTarget::Reply {
-            origin,
+            origin: anchor.origin,
             request_id,
             status: RequestStatus::Completed,
         },
@@ -10235,11 +10350,23 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
 
 fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
     let tab = app.collaboration_mailbox.tab;
+    // The two tabs belong to different participants now — the row's inbox and
+    // the console's outbox — so each badge names its owner. Without that,
+    // "incoming 0" reads as "nobody messaged me" instead of "nothing was sent
+    // to the row I am pointing at".
+    let incoming_owner = app
+        .collaboration
+        .inbox
+        .as_ref()
+        .map_or("no agent selected", |anchor| anchor.label.as_str());
     Line::from(vec![
         Span::styled(" collaboration ", theme.accent_badge()),
         Span::raw(" "),
         Span::styled(
-            format!(" incoming {} ", app.collaboration.incoming.len()),
+            format!(
+                " incoming {} · {incoming_owner} ",
+                app.collaboration.incoming.len()
+            ),
             if tab == CollaborationMailboxTab::Incoming {
                 theme.action_badge()
             } else {
@@ -10248,7 +10375,7 @@ fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static
         ),
         Span::raw(" "),
         Span::styled(
-            format!(" sent {} ", app.collaboration.sent.len()),
+            format!(" sent {} · console ", app.collaboration.sent.len()),
             if tab == CollaborationMailboxTab::Sent {
                 theme.action_badge()
             } else {
@@ -11917,10 +12044,19 @@ fn render_topology_inspector(
                 .map_or_else(
                     || format!("not loaded · {incoming} incoming · {sent} sent"),
                     |room| {
+                        // `unread` counts what was addressed to the sender.
+                        // Nothing is ever addressed to a console, so printing
+                        // it there is a permanent `0 unread` that reads as
+                        // "no mail anywhere" — drop it and let the incoming
+                        // and sent counts carry the line.
+                        let unread = if room.current.console {
+                            String::new()
+                        } else {
+                            format!(" · {} unread", room.unread)
+                        };
                         format!(
-                            "{} peers · {} unread · {incoming} incoming · {sent} sent",
-                            room.peers.len(),
-                            room.unread
+                            "{} peers{unread} · {incoming} incoming · {sent} sent",
+                            room.peers.len()
                         )
                     },
                 );
@@ -15567,6 +15703,7 @@ mod tests {
             cwd: Some("/tmp/project".into()),
             alias: alias.map(str::to_string),
             roles: Vec::new(),
+            console: false,
         }
     }
 
@@ -15640,6 +15777,7 @@ mod tests {
             origin: Some(CollaborationOrigin {
                 pane: "%1".into(),
                 socket: Some("default".into()),
+                console: true,
             }),
             room: Some(RoomContext {
                 current,
@@ -15653,17 +15791,16 @@ mod tests {
     }
 
     #[test]
-    fn watch_collaboration_origin_uses_launch_pane_and_socket() {
+    fn watch_collaboration_origin_is_a_console_that_carries_the_launch_pane() {
         let origin = watch_collaboration_origin_from(
             Some("%9".into()),
             None,
             Some("/tmp/tmux-1000/custom,42,7".into()),
-        )
-        .unwrap();
+        );
 
+        assert!(origin.console);
         assert_eq!(origin.pane, "%9");
         assert_eq!(origin.socket.as_deref(), Some("custom"));
-        assert!(watch_collaboration_origin_from(Some("zellij:3".into()), None, None).is_none());
     }
 
     #[test]
@@ -15672,11 +15809,26 @@ mod tests {
             Some("rmux:%9".into()),
             Some("/tmp/rmux-1000/default,42,7".into()),
             Some("/tmp/rmux-compat,42,7".into()),
-        )
-        .unwrap();
+        );
 
+        assert!(origin.console);
         assert_eq!(origin.pane, "rmux:%9");
         assert_eq!(origin.socket.as_deref(), Some("/tmp/rmux-1000/default"));
+    }
+
+    /// A backend whose panes carry no collaboration endpoint, and a watch with
+    /// no caller pane at all, both still produce a console. Messaging must not
+    /// depend on where the popup was opened.
+    #[test]
+    fn watch_collaboration_origin_survives_an_unusable_launch_pane() {
+        let zellij = watch_collaboration_origin_from(Some("zellij:3".into()), None, None);
+        assert!(zellij.console);
+        assert_eq!(zellij.pane, "zellij:3");
+        assert!(zellij.socket.is_none());
+
+        let paneless = watch_collaboration_origin_from(None, None, None);
+        assert!(paneless.console);
+        assert!(paneless.pane.is_empty());
     }
 
     #[test]
@@ -16145,6 +16297,7 @@ mod tests {
         app.collaboration.origin = Some(CollaborationOrigin {
             pane: "%1".into(),
             socket: None,
+            console: true,
         });
         let pane_idx = app
             .rows
@@ -16161,6 +16314,96 @@ mod tests {
                 Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%42"
             ),
             "host scope must open the contract composer for the cursor's agent"
+        );
+    }
+
+    /// The reported bug: `m` worked on every row except the one the popup was
+    /// opened from, because that pane's agent was the sender. The console is
+    /// the sender now, so the launch row is an ordinary recipient — and it
+    /// gets the full contract composer, not the keystroke fallback.
+    #[test]
+    fn m_targets_the_pane_watch_was_opened_from() {
+        let mut app = app_with_paneless_and_pane();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "%42".into(),
+            socket: None,
+            console: true,
+        });
+        let pane_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, WatchRow::Agent(a) if a.pane.as_deref() == Some("%42")))
+            .unwrap();
+        app.table_state.select(Some(pane_idx));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(
+            matches!(
+                app.collaboration_composer.as_ref().map(|c| &c.target),
+                Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%42"
+            ),
+            "the launch pane must be addressable like any other row"
+        );
+    }
+
+    /// Now that the console does not occupy the launch pane, that pane's agent
+    /// is an ordinary room peer — and a single-agent launch window is the
+    /// common shape. Under host scope the cursor is the selector, so a row
+    /// naming no agent must degrade to keystrokes rather than quietly
+    /// redirecting the message to the launch window.
+    #[test]
+    fn host_scope_never_redirects_an_agentless_row_to_the_lone_room_peer() {
+        let mut app = collaboration_watch_app();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.set_data(
+            vec![fake_agent(
+                "peer",
+                Some("%2"),
+                AgentKind::Codex,
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![
+                fake_pane("%2", "main", 0, 1, "codex"),
+                fake_pane("%7", "other", 0, 0, "zsh"),
+            ],
+        );
+        let bare_idx = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, WatchRow::BarePane(pane) if pane.pane_id == "%7"))
+            .expect("the shell pane must show as a bare row");
+        app.table_state.select(Some(bare_idx));
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(
+            matches!(
+                app.collaboration_composer.as_ref().map(|c| &c.target),
+                Some(
+                    CollaborationComposeTarget::Prompt { .. }
+                        | CollaborationComposeTarget::PromptTopology { .. }
+                )
+            ),
+            "a row with no agent must not resolve to the launch window's agent"
+        );
+        // And the reason names the row, not the room: under host scope the
+        // launch window is not why this failed, and pointing at its peers
+        // would send the operator to an unrelated window.
+        let hint = app
+            .footer_hint
+            .as_ref()
+            .expect("a reason was set")
+            .message
+            .clone();
+        assert!(
+            hint.contains("this row has no single agent"),
+            "host-scope hint must be about the row, got {hint:?}"
         );
     }
 
@@ -16526,6 +16769,17 @@ mod tests {
                 room.current.clone(),
                 RequestStatus::Claimed,
             ));
+        // The panel shows %1's inbox, so `e` must reply *as* %1. The origin is
+        // the console and can never be a recipient, so sourcing the reply from
+        // it would be rejected as a non-participant.
+        app.collaboration.inbox = Some(MailboxAnchor {
+            origin: CollaborationOrigin {
+                pane: "%1".into(),
+                socket: None,
+                console: false,
+            },
+            label: "codex@%1".into(),
+        });
         app.collaboration_mailbox.open = true;
 
         assert!(matches!(
@@ -16536,8 +16790,8 @@ mod tests {
             app.collaboration_composer
                 .as_ref()
                 .map(|composer| &composer.target),
-            Some(CollaborationComposeTarget::Reply { request_id, .. })
-                if request_id == "req_watch_123456"
+            Some(CollaborationComposeTarget::Reply { request_id, origin, .. })
+                if request_id == "req_watch_123456" && origin.pane == "%1" && !origin.console
         ));
     }
 

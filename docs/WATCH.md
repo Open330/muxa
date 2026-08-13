@@ -204,16 +204,25 @@ controls. Symlink targets outside the configured `cwd` must also be listed in
 
 ## Agent collaboration
 
-Focus the sending agent pane and open watch with `prefix+s`. Select another
-agent in the same tmux window and press `m`. When the room has exactly one
-peer, watch selects it automatically. `Tab` changes request kind; `Enter`
-sends; `Esc` cancels. Backspace also cancels when the input is already empty.
-The last kind and mode are saved immediately and restored by the next `m`,
-including after watch restarts.
+Open watch with `prefix+s` from anywhere, select an agent, and press `m`. Watch
+sends as the **operator console** — you are the sender, not whichever agent
+occupies the pane you opened the popup from — so the launch pane is an ordinary
+recipient like every other row, and a bare shell is a perfectly good place to
+open watch from. When the room has exactly one peer, watch selects it
+automatically. `Tab` changes request kind; `Enter` sends; `Esc` cancels.
+Backspace also cancels when the input is already empty. The last kind and mode
+are saved immediately and restored by the next `m`, including after watch
+restarts.
+
+A console has no pane of its own, so replies are not routed back to it: they
+stay on the request in the recipient's mailbox. `M` shows the mailbox of the
+agent under the cursor — `incoming` is that agent's, `sent` is the console's
+dispatch log across every target — and `i` (claim) and `e` (reply) act as that
+agent, because both are the recipient's move.
 
 With `[collaboration].scope = "host"`, the selected agent takes precedence
 over the launch window's only peer. A collapsed session containing one
-non-origin agent is directly addressable, so selecting it and pressing `m`
+agent is directly addressable, so selecting it and pressing `m`
 targets that agent without expanding the session. For a request such as
 “create a new pane, start codex with the `cx` alias, then review our changes”,
 choose `TASK` and `EXECUTE`; the receiving agent gets an explicit executable
