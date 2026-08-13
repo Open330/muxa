@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.33] - 2026-08-13
+
 ### Changed
 
 - **Session and window inspectors are now operational rollups.** A selected
