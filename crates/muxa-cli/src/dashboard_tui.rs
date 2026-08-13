@@ -375,9 +375,23 @@ struct DashboardData {
 struct CollaborationData {
     origin: Option<CollaborationOrigin>,
     room: Option<RoomContext>,
+    /// The agent `incoming` belongs to — the card under the cursor when the
+    /// data was loaded. `None` when that card names no resolvable agent.
+    ///
+    /// The dashboard sends as the operator console, which is never a
+    /// recipient, so claiming and replying have to speak for this agent
+    /// instead. Keeping it beside the requests guarantees the keys act on the
+    /// mailbox actually on screen.
+    inbox: Option<CollaborationAnchor>,
     incoming: Vec<CollaborationRequest>,
     sent: Vec<CollaborationRequest>,
     unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollaborationAnchor {
+    origin: CollaborationOrigin,
+    label: String,
 }
 
 impl CollaborationData {
@@ -1094,7 +1108,9 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 }
 
 pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<OpenTarget>> {
-    let initial = load_dashboard_data(client, cfg, &args).await?;
+    // No app, therefore no cursor, therefore no anchor on the very first load.
+    // The first `b` fills it in.
+    let initial = load_dashboard_data(client, cfg, &args, None).await?;
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
     let theme = args.theme.map_or(cfg.ui.theme, WatchTheme::from);
@@ -1125,11 +1141,19 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
                     if refresh_task.is_some() {
                         app.set_hint("refresh already running", HintLevel::Info);
                     } else {
-                        refresh_task =
-                            Some(spawn_refresh(client, cfg, &args, RefreshSource::Manual));
+                        refresh_task = Some(spawn_refresh(
+                            client,
+                            cfg,
+                            &args,
+                            RefreshSource::Manual,
+                            dashboard_mailbox_anchor(&app),
+                        ));
                         last_refresh = Instant::now();
                         app.set_hint("refreshing", HintLevel::Info);
                     }
+                }
+                UiAction::RefreshCollaboration => {
+                    refresh_collaboration_data(client, &mut app).await;
                 }
                 UiAction::Open(target) => {
                     if let Some(refresh) = refresh_task.take() {
@@ -1163,7 +1187,13 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
             refresh_capture(client, &mut app).await;
             last_refresh = Instant::now();
         } else if last_refresh.elapsed() >= REFRESH_INTERVAL && refresh_task.is_none() {
-            refresh_task = Some(spawn_refresh(client, cfg, &args, RefreshSource::Automatic));
+            refresh_task = Some(spawn_refresh(
+                client,
+                cfg,
+                &args,
+                RefreshSource::Automatic,
+                dashboard_mailbox_anchor(&app),
+            ));
             last_refresh = Instant::now();
         } else {
             refresh_capture(client, &mut app).await;
@@ -1188,29 +1218,56 @@ struct DashboardRefresh {
     source: RefreshSource,
 }
 
+/// The background refresh cannot see the cursor once it is running, so the
+/// mailbox anchor is captured at spawn time. A refresh that lands after the
+/// cursor moved shows the previous card's inbox for one cycle; `b` re-reads it
+/// on open, which is when it matters.
 fn spawn_refresh(
     client: &Client,
     cfg: &Config,
     args: &Args,
     source: RefreshSource,
+    anchor: Option<CollaborationAnchor>,
 ) -> DashboardRefresh {
     let client = client.clone();
     let cfg = cfg.clone();
     let args = args.clone();
     DashboardRefresh {
-        task: tokio::spawn(async move { load_dashboard_data(&client, &cfg, &args).await }),
+        task: tokio::spawn(async move { load_dashboard_data(&client, &cfg, &args, anchor).await }),
         source,
     }
 }
 
 fn apply_refresh_data(app: &mut DashboardApp, data: DashboardData, source: RefreshSource) {
+    // The mailbox anchor was captured when this refresh was spawned, and
+    // refreshes land every second. If the cursor has moved since — or `b`
+    // re-read the mailbox on open — this snapshot's inbox belongs to a
+    // different card, and applying it would swap the mailbox out from under
+    // the overlay: the list changes while the selection index stays put, so
+    // `e` would reply to a request the operator never looked at. Keep what is
+    // on screen and let the next refresh, which carries the current anchor,
+    // bring it forward.
+    let anchor_pane =
+        |anchor: Option<&CollaborationAnchor>| anchor.map(|anchor| anchor.origin.pane.clone());
+    let stale_inbox = anchor_pane(dashboard_mailbox_anchor(app).as_ref())
+        != anchor_pane(data.collaboration.inbox.as_ref());
+    let on_screen = stale_inbox.then(|| app.data.collaboration.clone());
     app.replace_data(data);
+    if let Some(collaboration) = on_screen {
+        app.data.collaboration = collaboration;
+        app.clamp_collaboration_request();
+    }
     if source == RefreshSource::Manual {
         app.set_hint("refreshed", HintLevel::Ok);
     }
 }
 
-async fn load_dashboard_data(client: &Client, cfg: &Config, args: &Args) -> Result<DashboardData> {
+async fn load_dashboard_data(
+    client: &Client,
+    cfg: &Config,
+    args: &Args,
+    anchor: Option<CollaborationAnchor>,
+) -> Result<DashboardData> {
     let now = OffsetDateTime::now_utc();
     let agents = client
         .snapshot()
@@ -1252,17 +1309,15 @@ async fn load_dashboard_data(client: &Client, cfg: &Config, args: &Args) -> Resu
         host,
         notes,
     );
-    data.collaboration = load_collaboration_data(client).await;
+    data.collaboration = load_collaboration_data(client, anchor).await;
     Ok(data)
 }
 
-async fn load_collaboration_data(client: &Client) -> CollaborationData {
-    let Some(origin) = dashboard_collaboration_origin() else {
-        return CollaborationData {
-            unavailable: Some(collaboration_open_hint().into()),
-            ..CollaborationData::default()
-        };
-    };
+async fn load_collaboration_data(
+    client: &Client,
+    anchor: Option<CollaborationAnchor>,
+) -> CollaborationData {
+    let origin = dashboard_collaboration_origin();
     let room = match client.collaboration_context(&origin).await {
         Ok(room) => room,
         Err(error) => {
@@ -1273,51 +1328,68 @@ async fn load_collaboration_data(client: &Client) -> CollaborationData {
             };
         }
     };
+    // Incoming belongs to the selected card, not to the console: the console
+    // dispatches and never receives, so a reply lives in the mailbox of the
+    // agent that was commanded. Sent stays the console's own dispatch log.
     let (incoming, sent) = tokio::join!(
-        client.collaboration_list(&origin, RequestMailbox::Incoming),
+        async {
+            match anchor.as_ref() {
+                Some(anchor) => {
+                    client
+                        .collaboration_list(&anchor.origin, RequestMailbox::Incoming)
+                        .await
+                }
+                None => Ok(Vec::new()),
+            }
+        },
         client.collaboration_list(&origin, RequestMailbox::Sent),
     );
-    match (incoming, sent) {
-        (Ok(incoming), Ok(sent)) => CollaborationData {
+    // A card can name a pane that is not a collaboration participant — PTY
+    // sessions, `muxa register` task rows, agents that just stopped. That is a
+    // fact about the cursor, so it costs that card its inbox and nothing else.
+    let (inbox, incoming) = match incoming {
+        Ok(incoming) => (anchor, incoming),
+        Err(_) => (None, Vec::new()),
+    };
+    match sent {
+        Ok(sent) => CollaborationData {
             origin: Some(origin),
             room: Some(room),
+            inbox,
             incoming,
             sent,
             unavailable: None,
         },
-        (incoming, sent) => {
-            let error = incoming
-                .err()
-                .or_else(|| sent.err())
-                .expect("at least one mailbox request failed");
-            CollaborationData {
-                origin: Some(origin),
-                room: Some(room),
-                unavailable: Some(format!("mailbox unavailable: {error}")),
-                ..CollaborationData::default()
-            }
-        }
+        Err(error) => CollaborationData {
+            origin: Some(origin),
+            room: Some(room),
+            inbox,
+            incoming,
+            unavailable: Some(format!("mailbox unavailable: {error}")),
+            ..CollaborationData::default()
+        },
     }
 }
 
-fn collaboration_open_hint() -> &'static str {
-    "collaboration unavailable here — focus an agent pane and press prefix+D"
-}
-
+/// Matched against the substring the daemon error actually carries — it reads
+/// "origin is not a **hook-correlated** tracked pane agent", so the old
+/// pattern never fired. A console origin needs no tracked agent, so reaching
+/// this now means the daemon predates the console.
 fn friendly_collaboration_error(error: &str) -> String {
-    if error.contains("collaboration origin is not a tracked pane agent") {
-        collaboration_open_hint().into()
-    } else {
-        error.into()
+    if error.contains("origin is not") && error.contains("tracked pane agent") {
+        return "muxad is too old to accept console messages — restart it after `muxa upgrade`"
+            .into();
     }
+    error.into()
 }
 
 async fn refresh_collaboration_data(client: &Client, app: &mut DashboardApp) {
-    app.data.collaboration = load_collaboration_data(client).await;
+    let anchor = dashboard_mailbox_anchor(app);
+    app.data.collaboration = load_collaboration_data(client, anchor).await;
     app.clamp_collaboration_request();
 }
 
-fn dashboard_collaboration_origin() -> Option<CollaborationOrigin> {
+fn dashboard_collaboration_origin() -> CollaborationOrigin {
     let pane = muxa::default_backend().current_pane();
     dashboard_collaboration_origin_from(
         pane,
@@ -1326,30 +1398,56 @@ fn dashboard_collaboration_origin() -> Option<CollaborationOrigin> {
     )
 }
 
+/// `muxa dashboard` sends as the operator console, for the same reason
+/// `muxa watch` does: the human at the keyboard is the sender, not whichever
+/// agent occupies the pane the dashboard was launched from. The pane still
+/// rides along as the room it is looking at and as audit provenance, so a
+/// pane we cannot resolve degrades to a pane-less console rather than to no
+/// collaboration at all — the dashboard runs from anywhere, including outside
+/// tmux entirely.
 fn dashboard_collaboration_origin_from(
     pane: Option<String>,
     rmux: Option<String>,
     tmux: Option<String>,
-) -> Option<CollaborationOrigin> {
-    let pane = pane.filter(|pane| !pane.is_empty())?;
-    let kind = muxa::backend::pane_id_host_kind(&pane)?;
-    let endpoint = match kind {
-        HostKind::Rmux => rmux,
-        HostKind::Tmux => tmux,
-        HostKind::Zellij | HostKind::Herdr => return None,
-    };
-    let socket = endpoint.and_then(|value| {
-        let path = value.split(',').next()?.trim();
-        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(&pane), path))
+) -> CollaborationOrigin {
+    let pane = pane.filter(|pane| !pane.is_empty());
+    let socket = pane.as_deref().and_then(|pane| {
+        let endpoint = match muxa::backend::pane_id_host_kind(pane)? {
+            HostKind::Rmux => rmux,
+            HostKind::Tmux => tmux,
+            HostKind::Zellij | HostKind::Herdr => None,
+        }?;
+        let path = endpoint.split(',').next()?.trim();
+        (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(pane), path))
     });
-    // Still an agent origin. The dashboard has the same operator-console shape
-    // as `muxa watch` and probably wants `console: true` too, but its mailbox
-    // and peer panels are wired to the launch pane's identity, so flipping it
-    // is a separate change.
-    Some(CollaborationOrigin {
-        pane,
+    CollaborationOrigin {
+        pane: pane.unwrap_or_default(),
         socket,
-        console: false,
+        console: true,
+    }
+}
+
+/// Whose inbox the mailbox overlay shows: the agent on the selected card.
+///
+/// The socket is deliberately left unset — see the same call in `watch`: the
+/// dashboard's pane strings and a participant's socket are not comparable by
+/// equality, and pane ids are unique per host anyway.
+fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
+    let ActionTarget::Pane(pane) = app.selected_action_target()? else {
+        return None;
+    };
+    let label = app
+        .data
+        .collaboration
+        .peer_for_pane(&pane)
+        .map_or_else(|| pane.clone(), Participant::label);
+    Some(CollaborationAnchor {
+        origin: CollaborationOrigin {
+            pane,
+            socket: None,
+            console: false,
+        },
+        label,
     })
 }
 
@@ -1737,6 +1835,11 @@ enum UiAction {
     None,
     Quit,
     Refresh,
+    /// Re-read the mailbox before showing it. The overlay is anchored to the
+    /// selected card, and the cursor moves between refreshes, so opening it
+    /// has to fetch rather than render whatever the last tick happened to
+    /// capture.
+    RefreshCollaboration,
     Open(OpenTarget),
     Run(PendingAction),
 }
@@ -1850,7 +1953,7 @@ fn handle_normal_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
         KeyCode::Char('m') => open_collaboration_composer(app),
         KeyCode::Char('b') => {
             app.overlay = Overlay::Collaboration;
-            UiAction::None
+            UiAction::RefreshCollaboration
         }
         KeyCode::Char('i') => claim_collaboration_inbox(app),
         KeyCode::Char('o') => app.selected_action_target().map_or_else(
@@ -2044,14 +2147,27 @@ fn collaboration_origin_for_action(app: &mut DashboardApp) -> Option<Collaborati
     app.data.collaboration.origin.clone()
 }
 
+/// Claiming is the recipient's move and the console is only ever a sender, so
+/// `i` speaks for the agent on the selected card. It reads the cursor rather
+/// than the stored anchor because it also opens the overlay: the refresh that
+/// follows re-anchors to the same cursor, so the two agree.
 fn claim_collaboration_inbox(app: &mut DashboardApp) -> UiAction {
-    let Some(origin) = collaboration_origin_for_action(app) else {
+    if collaboration_origin_for_action(app).is_none() {
+        return UiAction::None;
+    }
+    let Some(anchor) = dashboard_mailbox_anchor(app) else {
+        app.set_hint(
+            "select a card with an agent to claim its inbox",
+            HintLevel::Err,
+        );
         return UiAction::None;
     };
     app.overlay = Overlay::Collaboration;
     app.collaboration_mailbox.tab = CollaborationTab::Incoming;
     app.collaboration_mailbox.selected = 0;
-    UiAction::Run(PendingAction::CollaborationInbox { origin })
+    UiAction::Run(PendingAction::CollaborationInbox {
+        origin: anchor.origin,
+    })
 }
 
 fn open_collaboration_composer(app: &mut DashboardApp) -> UiAction {
@@ -2066,14 +2182,14 @@ fn open_collaboration_composer(app: &mut DashboardApp) -> UiAction {
         .is_some_and(|room| room.peers.is_empty())
     {
         app.set_hint(
-            "no peer here yet — run another agent in this tmux window",
+            "no agent in this tmux window — the room is the window the dashboard was opened from",
             HintLevel::Err,
         );
         return UiAction::None;
     }
     let Some(peer) = app.selected_collaboration_peer() else {
         app.set_hint(
-            "choose another agent in this window with Tab, [ or ], then press m",
+            "select an agent in this window with Tab, [ or ], then press m",
             HintLevel::Err,
         );
         return UiAction::None;
@@ -2097,7 +2213,13 @@ fn open_collaboration_reply_composer(app: &mut DashboardApp) -> UiAction {
         app.set_hint("switch to incoming requests to reply", HintLevel::Err);
         return UiAction::None;
     }
-    let Some(origin) = collaboration_origin_for_action(app) else {
+    if collaboration_origin_for_action(app).is_none() {
+        return UiAction::None;
+    }
+    // The *stored* anchor, not the cursor: the listed requests were fetched
+    // for it, and replying as anyone else is rejected as a non-participant.
+    let Some(anchor) = app.data.collaboration.inbox.clone() else {
+        app.set_hint("this mailbox has no agent to reply as", HintLevel::Err);
         return UiAction::None;
     };
     let Some(request) = app.selected_collaboration_request() else {
@@ -2117,13 +2239,14 @@ fn open_collaboration_reply_composer(app: &mut DashboardApp) -> UiAction {
     }
     let request_id = request.id.clone();
     let label = format!(
-        "{} · {}",
+        "{} → {} · {}",
         request.from.label(),
+        anchor.label,
         short_request_id(&request_id)
     );
     app.composer = Some(PromptComposer::new(
         PromptTarget::CollaborationReply {
-            origin,
+            origin: anchor.origin,
             request_id,
             status: RequestStatus::Completed,
         },
@@ -3146,16 +3269,7 @@ fn render_summary_strip(f: &mut Frame, area: Rect, card: &SessionCard, app: &Das
             ),
             app.data.collaboration.room.as_ref().map_or_else(
                 || card.counts.compact(),
-                |room| {
-                    format!(
-                        "{} · room {} · self {} · unread {}/{}",
-                        card.counts.compact(),
-                        room.current.room.window_id,
-                        room.current.label(),
-                        room.unread,
-                        room.unread_replies
-                    )
-                },
+                |room| format!("{} · {}", card.counts.compact(), room_identity(room)),
             ),
         ],
         app.theme,
@@ -3370,20 +3484,30 @@ fn render_detail_panel(f: &mut Frame, area: Rect, card: &SessionCard, app: &Dash
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Who the dashboard is speaking as, and how much mail is waiting for them.
+///
+/// The unread pair counts what was addressed to the sender and what it has not
+/// read back. Nothing is ever addressed to an operator console and it reads
+/// replies off the selected card rather than through the daemon, so both are
+/// permanently zero there — a fixed `unread 0/0` reads as "no mail anywhere".
+fn room_identity(room: &RoomContext) -> String {
+    if room.current.console {
+        return format!("room {} · self console", room.current.room.window_id);
+    }
+    format!(
+        "room {} · self {} · unread {}/{}",
+        room.current.room.window_id,
+        room.current.label(),
+        room.unread,
+        room.unread_replies
+    )
+}
+
 fn collaboration_inspector_lines(app: &DashboardApp, width: usize) -> Vec<Line<'static>> {
     let Some(room) = app.data.collaboration.room.as_ref() else {
         return Vec::new();
     };
-    let mut lines = vec![Line::from(truncate_width(
-        &format!(
-            "room {} · self {} · unread {}/{}",
-            room.current.room.window_id,
-            room.current.label(),
-            room.unread,
-            room.unread_replies
-        ),
-        width,
-    ))];
+    let mut lines = vec![Line::from(truncate_width(&room_identity(room), width))];
     if let Some(peer) = app.selected_collaboration_peer() {
         lines.push(Line::from(truncate_width(
             &format!(
@@ -4438,11 +4562,21 @@ mod tests {
         current: Participant,
         peers: Vec<Participant>,
     ) {
+        // The console dispatches; the mailbox on screen belongs to the card
+        // under the cursor, which these fixtures park on `current`.
+        let inbox = CollaborationAnchor {
+            origin: CollaborationOrigin {
+                pane: current.pane.clone(),
+                socket: None,
+                console: false,
+            },
+            label: current.label(),
+        };
         data.collaboration = CollaborationData {
             origin: Some(CollaborationOrigin {
                 pane: current.pane.clone(),
                 socket: current.socket.clone(),
-                console: false,
+                console: true,
             }),
             room: Some(RoomContext {
                 current,
@@ -4450,6 +4584,7 @@ mod tests {
                 unread: 0,
                 unread_replies: 0,
             }),
+            inbox: Some(inbox),
             ..CollaborationData::default()
         };
     }
@@ -4580,14 +4715,159 @@ mod tests {
         );
     }
 
+    /// The dashboard sends as the console, so the pane it was opened from is
+    /// an ordinary peer rather than "self", and a launch pane the backend
+    /// cannot resolve still yields a console instead of killing collaboration.
+    #[test]
+    fn collaboration_origin_is_a_console_that_carries_the_launch_pane() {
+        let origin = dashboard_collaboration_origin_from(
+            Some("%9".into()),
+            None,
+            Some("/tmp/tmux-1000/custom,42,7".into()),
+        );
+        assert!(origin.console);
+        assert_eq!(origin.pane, "%9");
+
+        let paneless = dashboard_collaboration_origin_from(None, None, None);
+        assert!(paneless.console);
+        assert!(paneless.pane.is_empty());
+    }
+
+    /// A refresh spawned before the cursor moved carries the previous card's
+    /// inbox. Refreshes land every second, so applying one blindly would swap
+    /// the open mailbox for another agent's while the selection index stays
+    /// put — and `e` would then reply to a request the operator never saw.
+    #[test]
+    fn a_refresh_anchored_to_another_card_does_not_replace_the_open_mailbox() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let build = || {
+            build_dashboard_data(
+                now,
+                vec![fake_agent("self", Some("%1"), AgentState::Idle, None, now)],
+                vec![fake_pane("%1", "main")],
+                Vec::new(),
+                Vec::new(),
+                SessionActiveStats::default(),
+                false,
+                DashboardSort::Attention,
+                HostKind::Tmux,
+                Vec::new(),
+            )
+        };
+        let current = fake_participant("%1", "self", Some("builder"), &[]);
+        let peer = fake_participant("%2", "peer", Some("reviewer"), &[]);
+
+        let mut on_screen = build();
+        attach_collaboration(&mut on_screen, current.clone(), vec![peer.clone()]);
+        on_screen
+            .collaboration
+            .incoming
+            .push(fake_collaboration_request(
+                "req_on_screen_1234",
+                peer.clone(),
+                current.clone(),
+                RequestStatus::Claimed,
+                now,
+            ));
+        let mut app = DashboardApp::new(on_screen, WatchTheme::Classic);
+
+        // A refresh that was spawned while the cursor sat on another card.
+        let mut stale = build();
+        attach_collaboration(&mut stale, current.clone(), vec![peer.clone()]);
+        stale.collaboration.inbox = Some(CollaborationAnchor {
+            origin: CollaborationOrigin {
+                pane: "%9".into(),
+                socket: None,
+                console: false,
+            },
+            label: "codex@%9".into(),
+        });
+        stale
+            .collaboration
+            .incoming
+            .push(fake_collaboration_request(
+                "req_other_card_1234",
+                peer,
+                current,
+                RequestStatus::Claimed,
+                now,
+            ));
+
+        apply_refresh_data(&mut app, stale, RefreshSource::Automatic);
+
+        assert_eq!(
+            app.data
+                .collaboration
+                .incoming
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req_on_screen_1234"],
+            "a refresh anchored elsewhere must not replace the open mailbox"
+        );
+        assert_eq!(
+            app.data
+                .collaboration
+                .inbox
+                .as_ref()
+                .map(|anchor| anchor.origin.pane.as_str()),
+            Some("%1")
+        );
+    }
+
+    /// Replying is the recipient's move. The console can never be one, so `e`
+    /// must speak for the agent whose inbox produced the listed request —
+    /// sourcing it from the origin would be rejected as a non-participant.
+    #[test]
+    fn collaboration_reply_speaks_for_the_anchored_agent_not_the_console() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let mut data = build_dashboard_data(
+            now,
+            vec![fake_agent("self", Some("%1"), AgentState::Idle, None, now)],
+            vec![fake_pane("%1", "main")],
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let current = fake_participant("%1", "self", Some("builder"), &[]);
+        let peer = fake_participant("%2", "peer", Some("reviewer"), &[]);
+        attach_collaboration(&mut data, current.clone(), vec![peer.clone()]);
+        data.collaboration.incoming.push(fake_collaboration_request(
+            "req_incoming_123456",
+            peer,
+            current,
+            RequestStatus::Claimed,
+            now,
+        ));
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+        app.collaboration_mailbox.tab = CollaborationTab::Incoming;
+
+        assert!(matches!(
+            open_collaboration_reply_composer(&mut app),
+            UiAction::None
+        ));
+        assert!(
+            matches!(
+                app.composer.as_ref().map(|composer| &composer.target),
+                Some(PromptTarget::CollaborationReply { origin, .. })
+                    if origin.pane == "%1" && !origin.console
+            ),
+            "reply must come from the mailbox's agent, got {:?}",
+            app.composer.as_ref().map(|composer| &composer.target)
+        );
+    }
+
     #[test]
     fn collaboration_origin_uses_tmux_pane_and_short_socket() {
         let origin = dashboard_collaboration_origin_from(
             Some("%9".into()),
             None,
             Some("/tmp/tmux-1000/custom,42,7".into()),
-        )
-        .unwrap();
+        );
 
         assert_eq!(origin.pane, "%9");
         assert_eq!(origin.socket.as_deref(), Some("custom"));
@@ -4599,8 +4879,7 @@ mod tests {
             Some("%3".into()),
             None,
             Some("/tmp/tmux-1000/default,42,7".into()),
-        )
-        .unwrap();
+        );
 
         assert_eq!(origin.pane, "%3");
         assert_eq!(origin.socket.as_deref(), Some("default"));
@@ -4612,8 +4891,7 @@ mod tests {
             Some("rmux:%3".into()),
             Some("/tmp/rmux-1000/default,42,7".into()),
             Some("/tmp/rmux-compat,42,7".into()),
-        )
-        .unwrap();
+        );
 
         assert_eq!(origin.pane, "rmux:%3");
         assert_eq!(origin.socket.as_deref(), Some("/tmp/rmux-1000/default"));
@@ -4622,8 +4900,10 @@ mod tests {
     #[test]
     fn collaboration_error_explains_the_single_user_action() {
         assert_eq!(
-            friendly_collaboration_error("collaboration origin is not a tracked pane agent: %12"),
-            "collaboration unavailable here — focus an agent pane and press prefix+D"
+            friendly_collaboration_error(
+                "collaboration origin is not a hook-correlated tracked pane agent: %12"
+            ),
+            "muxad is too old to accept console messages — restart it after `muxa upgrade`"
         );
         assert_eq!(
             friendly_collaboration_error("agent collaboration is disabled"),
@@ -4716,7 +4996,7 @@ mod tests {
         ));
         assert_eq!(
             app.hint.as_ref().map(|hint| hint.message.as_str()),
-            Some("no peer here yet — run another agent in this tmux window")
+            Some("no agent in this tmux window — the room is the window the dashboard was opened from")
         );
     }
 

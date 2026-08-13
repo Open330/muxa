@@ -80,13 +80,19 @@ destructive action 확인창은 실행 전 정확한 pane 또는 PTY session을 
 
 평소 사용 순서는 세 단계입니다.
 
-1. 같은 tmux window의 두 pane에서 agent를 실행합니다.
-2. 메시지를 보낼 agent pane을 선택하고 `prefix+D`를 누릅니다.
-3. `Tab`으로 상대 agent를 고른 뒤 `m`을 눌러 메시지를 보냅니다.
+1. 어디서든 `prefix+D`를 누릅니다.
+2. `Tab`으로 같은 window의 agent를 고릅니다.
+3. `m`을 눌러 메시지를 보냅니다.
 
-window 하나가 room 하나입니다. Dashboard를 열 때 선택한 agent가 발신자이고,
-Dashboard 안에서 card/target을 바꾸는 것은 수신자만 바꿉니다. 일반 shell에서
-연 Dashboard는 조회에는 쓸 수 있지만 agent로 메시지를 보낼 수 없습니다.
+window 하나가 room 하나이고, dashboard는 **operator console**로서 보냅니다 —
+발신자는 dashboard를 연 pane에 들어 있던 agent가 아니라 키보드 앞의 사람입니다.
+그래서 그 pane의 agent도 다른 행과 똑같은 수신 대상이고, 일반 shell pane에서
+열어도 agent pane에서 연 것과 똑같이 메시지를 보낼 수 있습니다.
+
+console에는 자기 pane이 없으므로 응답은 발신자에게 되돌아오지 않고 **수신
+agent의 mailbox**에 request와 함께 남습니다. `b`는 커서가 놓인 card의 mailbox를
+보여주며 `incoming`은 그 agent의 것, `sent`는 console이 모든 대상에게 보낸
+기록입니다. claim(`i`)과 응답(`e`)은 수신자의 행위이므로 그 agent를 대행합니다.
 
 Header와 inspector에는 현재 room, 호출 agent의 alias, room participant의 role,
 읽지 않은 request/reply 수가 표시됩니다. `Tab`, `[`, `]`로 peer pane을 선택한
@@ -103,10 +109,12 @@ mailbox를 바꾸고 화살표로 request를 선택합니다. `i`는 pending inc
 발신 request의 취소 확인창을 엽니다. reply composer의 `Tab`은 `completed`,
 `blocked`, `declined`, `failed`를 전환합니다.
 
-room에 다른 agent가 없다면 같은 window의 새 pane에서 agent를 하나 더
-실행합니다. 협업 불가 안내가 나오면 Dashboard를 닫고 agent pane을 선택한 뒤
-`prefix+D`로 다시 엽니다. 내부적으로 muxad가 해당 pane을 확인해 CLI/MCP와 같은
-same-window 보안 경계를 유지합니다.
+window에 agent가 하나도 없다면 같은 window의 새 pane에서 하나 실행합니다 —
+`muxa watch`와 달리 dashboard의 사정권은 여전히 room이라
+`[collaboration].scope = "host"`를 따라 다른 window로 넘어가지 않습니다. 협업
+불가 안내가 나오면 `[collaboration].enabled` 설정과 muxad 재시작 여부를
+확인하세요. 내부적으로 muxad가 사람이 호출한 pane을 provenance로 남기고
+CLI/MCP와 같은 same-window 경계를 유지합니다.
 
 ## ACT/WACT
 

@@ -80,13 +80,21 @@ running destructive actions.
 
 The everyday flow is:
 
-1. Put two agents in panes of the same tmux window.
-2. Focus the sender and press `prefix+D`.
-3. Select the other agent with `Tab`, press `m`, and send the request.
+1. Press `prefix+D` from anywhere.
+2. Select an agent in the same tmux window with `Tab`.
+3. Press `m` and send the request.
 
-One window is one room. The focused agent is the sender; selecting a card only
-changes the recipient. A popup opened from a normal shell can inspect sessions
-but cannot send as an agent.
+One window is one room, and the dashboard sends as the **operator console**:
+you are the sender, not whichever agent occupies the pane the popup was opened
+from. That pane's agent is therefore an ordinary recipient like any other, and
+a popup opened from a normal shell messages just as well as one opened from an
+agent.
+
+A console has no pane of its own, so replies are not routed back to it: they
+stay on the request in the recipient's mailbox. `b` shows the mailbox of the
+card under the cursor — `incoming` is that agent's, `sent` is the console's
+dispatch log across every target — and `i` and `e` act as that agent, because
+claiming and replying are the recipient's moves.
 
 The header and inspector show the current room, the calling agent's alias,
 roles on room participants, and unread request/reply counts. Select a peer's
@@ -103,10 +111,12 @@ mailbox, arrows select a request, `i` atomically claims pending incoming work,
 request that is still queued. The reply composer uses `Tab` to cycle
 `completed`, `blocked`, `declined`, and `failed`.
 
-If the room has no other agent, start one in another pane of the same window.
-If collaboration says it is unavailable, close the popup, focus an agent pane,
-and press `prefix+D` again. Under the hood muxad validates that pane and keeps
-the same-window security boundary used by the CLI and MCP helpers.
+If the window has no agent at all, start one in another pane of it — unlike
+`muxa watch`, the dashboard's reach is still the room, so it does not follow
+`[collaboration].scope = "host"` to other windows. If collaboration says it is
+unavailable, check that `[collaboration].enabled` is set and that muxad has
+been restarted since. Under the hood muxad records the pane you dialled from as
+provenance and keeps the same-window boundary used by the CLI and MCP helpers.
 
 ## ACT/WACT
 

@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lone-peer shortcut is a room convenience; with the cursor as the selector and
   the table spanning the host, it degrades to keystrokes and says which row is
   the problem instead of quietly addressing the launch window's agent.
+- **`muxa dashboard` sends as the operator console too.** Same reasoning and
+  same consequences as watch: the launch pane's agent is an ordinary recipient,
+  a dashboard opened from a shell can message, and `b` shows the mailbox of the
+  card under the cursor while `i`/`e` act as that agent. Its reach is still the
+  room — the dashboard does not follow `[collaboration].scope = "host"`.
 
 ### Fixed
 
