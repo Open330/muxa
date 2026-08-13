@@ -40,6 +40,7 @@ use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -145,6 +146,11 @@ enum RequestBody {
         limit: Option<usize>,
     },
     Health,
+    /// Ask the daemon to drain and re-exec itself onto the binary currently
+    /// installed at its argv[0]. Opt-in: only the real daemon installs a
+    /// restart controller; embedders refuse rather than shutting down with no
+    /// way to come back.
+    Restart,
     /// Capability handshake. Optional first message; opts the connection
     /// into negotiated-protocol mode. The server replies with its
     /// `[min, max]` supported range and a list of capability tags, then
@@ -358,6 +364,10 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_provenance",
 ];
 
+/// Advertised only when the server has the controller required to come back
+/// after draining. A server without one refuses `restart`.
+const RESTART_CAPABILITY: &str = "restart";
+
 #[derive(Debug, Serialize)]
 pub struct Response {
     pub ok: bool,
@@ -376,6 +386,11 @@ pub struct Response {
     pub max_protocol: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<&'static str>>,
+    /// Present only when the daemon can restart itself. It increments across
+    /// each re-exec so a client can distinguish the replacement image from
+    /// the old daemon still finishing an in-flight response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<SessionRef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -436,6 +451,7 @@ impl Response {
             min_protocol: None,
             max_protocol: None,
             capabilities: None,
+            generation: None,
             sessions: None,
             session: None,
             terminal: None,
@@ -546,12 +562,81 @@ impl Response {
         r.ask_entry = Some(entry);
         r
     }
-    fn hello() -> Self {
+    fn hello(restart: Option<&RestartController>) -> Self {
         let mut r = Self::ok();
         r.min_protocol = Some(MIN_PROTOCOL_VERSION);
         r.max_protocol = Some(PROTOCOL_VERSION);
-        r.capabilities = Some(CAPABILITIES.to_vec());
+        let mut capabilities = CAPABILITIES.to_vec();
+        if restart.is_some() {
+            capabilities.push(RESTART_CAPABILITY);
+        }
+        r.capabilities = Some(capabilities);
+        r.generation = restart.map(RestartController::generation);
         r
+    }
+}
+
+const RESTART_RUNNING: u8 = 0;
+const RESTART_REQUESTED: u8 = 1;
+const RESTART_STOPPING: u8 = 2;
+
+/// Coordinates daemon shutdown and self-restart without allowing an already
+/// open IPC handler to undo an operator's later SIGTERM/SIGINT.
+///
+/// The state transition is monotonic: `running -> restart_requested ->
+/// stopping`, while a signal may move `running -> stopping` directly. Once
+/// stopping, a restart request is refused permanently. This closes the race
+/// in which a signal cleared a boolean and a draining handler set it again.
+#[derive(Debug)]
+pub struct RestartController {
+    generation: u64,
+    state: AtomicU8,
+    trigger: broadcast::Sender<()>,
+}
+
+impl RestartController {
+    #[must_use]
+    pub fn new(generation: u64, trigger: broadcast::Sender<()>) -> Self {
+        Self {
+            generation,
+            state: AtomicU8::new(RESTART_RUNNING),
+            trigger,
+        }
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Commit to a normal stop and wake every shutdown subscriber. A later
+    /// IPC request cannot move the state back to restart-requested.
+    pub fn stop(&self) {
+        self.state.store(RESTART_STOPPING, AtomicOrdering::SeqCst);
+        let _ = self.trigger.send(());
+    }
+
+    #[must_use]
+    pub fn restart_requested(&self) -> bool {
+        self.state.load(AtomicOrdering::SeqCst) == RESTART_REQUESTED
+    }
+
+    /// Returns false only after an explicit stop has won. Repeated restart
+    /// requests are idempotently accepted while the first request drains.
+    fn request_restart(&self) -> bool {
+        match self.state.compare_exchange(
+            RESTART_RUNNING,
+            RESTART_REQUESTED,
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+        ) {
+            Ok(_) => {
+                let _ = self.trigger.send(());
+                true
+            }
+            Err(RESTART_REQUESTED) => true,
+            Err(_) => false,
+        }
     }
 }
 
@@ -571,6 +656,7 @@ pub struct Server {
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    restart: Option<Arc<RestartController>>,
     handler_limit: usize,
 }
 
@@ -586,6 +672,7 @@ impl Server {
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             collaboration_audit: CollaborationAuditLog::in_memory(),
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            restart: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -637,6 +724,14 @@ impl Server {
     #[must_use]
     pub fn with_collaboration_audit(mut self, audit: Arc<CollaborationAuditLog>) -> Self {
         self.collaboration_audit = audit;
+        self
+    }
+
+    /// Allow this server to accept the restart control method. Kept opt-in so
+    /// embedded servers and tests never drain unless they can re-exec.
+    #[must_use]
+    pub fn with_restart_controller(mut self, restart: Arc<RestartController>) -> Self {
+        self.restart = Some(restart);
         self
     }
 
@@ -732,6 +827,7 @@ impl Server {
                     let collaboration = self.collaboration.clone();
                     let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
+                    let restart = self.restart.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -745,6 +841,7 @@ impl Server {
                                 collaboration,
                                 collaboration_audit,
                                 ask,
+                                restart,
                             ))
                             .await
                         {
@@ -1348,7 +1445,8 @@ async fn record_collaboration_audit(
         sessions,
         collaboration,
         collaboration_audit,
-        ask
+        ask,
+        restart
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -1361,6 +1459,7 @@ async fn handle(
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    restart: Option<Arc<RestartController>>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -1455,7 +1554,7 @@ async fn handle(
                             protocol = requested,
                             "hello"
                         );
-                        let mut r = Response::hello();
+                        let mut r = Response::hello(restart.as_deref());
                         r.protocol = requested;
                         r
                     } else {
@@ -1548,6 +1647,24 @@ async fn handle(
                 RequestBody::Health => {
                     kind = "health";
                     Response::health()
+                }
+                RequestBody::Restart => {
+                    kind = "restart";
+                    match &restart {
+                        Some(controller) if controller.request_restart() => {
+                            tracing::info!(
+                                generation = controller.generation(),
+                                "restart requested over IPC",
+                            );
+                            Response::ok()
+                        }
+                        Some(_) => {
+                            Response::err("daemon is already stopping; restart request refused")
+                        }
+                        None => Response::err(
+                            "this server cannot restart itself (no restart controller installed)",
+                        ),
+                    }
                 }
                 RequestBody::BackendPaneSnapshot { panes } => {
                     kind = "backend_pane_snapshot";
@@ -2119,6 +2236,13 @@ pub struct Client {
     collaboration_client_kind: CollaborationClientKind,
 }
 
+/// Identity and feature information returned by the daemon's `hello` method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    pub capabilities: Vec<String>,
+    pub generation: Option<u64>,
+}
+
 /// The result of a [`Client::send_prompt`]: the two non-atomic keystroke
 /// injections (the text, then the optional submit CR) reported distinctly.
 ///
@@ -2249,6 +2373,50 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
         Ok(decode_agents(&resp))
+    }
+
+    /// Ask the daemon which additive features it supports and, when it can
+    /// self-restart, which process-image generation is currently serving.
+    pub async fn hello(&self, deadline: Duration) -> Result<Hello, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "hello",
+            "client": self.collaboration_client_kind.hello_label(),
+        });
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(format!(
+                "hello rejected: {}",
+                resp["error"].as_str().unwrap_or("(no error message)")
+            ))));
+        }
+        Ok(Hello {
+            capabilities: resp["capabilities"]
+                .as_array()
+                .map(|capabilities| {
+                    capabilities
+                        .iter()
+                        .filter_map(|capability| capability.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            generation: resp["generation"].as_u64(),
+        })
+    }
+
+    /// Ask the daemon on this socket to drain and re-exec itself. Acceptance
+    /// is not completion; callers confirm completion by waiting for `hello`'s
+    /// generation to advance.
+    pub async fn restart(&self, deadline: Duration) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "restart" });
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(format!(
+                "restart rejected: {}",
+                resp["error"].as_str().unwrap_or("(no error message)")
+            ))));
+        }
+        Ok(())
     }
 
     /// Ask the daemon to delete fully orphaned rows (no pane, surface, or
@@ -3497,6 +3665,7 @@ mod tests {
             CollaborationStore::in_memory(CollaborationOptions::default()),
             CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            None,
         ));
 
         let req = serde_json::json!({
@@ -3660,6 +3829,114 @@ mod tests {
         assert!(caps.contains(&"waiting_choice"));
         assert!(caps.contains(&"needs_choice"));
         assert!(caps.contains(&"rate_limited"));
+        assert!(!caps.contains(&RESTART_CAPABILITY));
+        assert!(resp["generation"].is_null());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_is_advertised_accepted_and_drained() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-restart.sock");
+        let store = Store::shared();
+        let (tx, rx) = broadcast::channel(1);
+        let restart = Arc::new(RestartController::new(7, tx));
+        let server = Server::new(sock.clone(), store).with_restart_controller(Arc::clone(&restart));
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock.clone());
+        let hello = client
+            .hello(Duration::from_secs(2))
+            .await
+            .expect("hello answers");
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == RESTART_CAPABILITY));
+        assert_eq!(hello.generation, Some(7));
+
+        client
+            .restart(Duration::from_secs(2))
+            .await
+            .expect("daemon accepts restart");
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("daemon drains after accepting restart")
+            .unwrap();
+        assert!(restart.restart_requested());
+        assert!(!sock.exists(), "drained server removes its socket");
+    }
+
+    #[tokio::test]
+    async fn signal_stop_cannot_be_rearmed_by_an_inflight_restart() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-stopping.sock");
+        let store = Store::shared();
+        let (tx, rx) = broadcast::channel(1);
+        let restart = Arc::new(RestartController::new(0, tx));
+        let server = Server::new(sock.clone(), store).with_restart_controller(Arc::clone(&restart));
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        // Get a handler accepted and parked mid-request before the stop. This
+        // is the exact ordering that could re-arm the old AtomicBool design.
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "restart",
+        }))
+        .unwrap();
+        request.push(b'\n');
+        let split = request.len() - 1;
+        stream.write_all(&request[..split]).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        restart.stop();
+        stream.write_all(&request[split..]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response["ok"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("already stopping"));
+        drop(reader);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("normal stop drains the in-flight handler")
+            .unwrap();
+        assert!(
+            !restart.restart_requested(),
+            "an in-flight restart must not override SIGTERM/SIGINT",
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_is_refused_without_a_controller() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-no-restart.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock.clone());
+        let error = client
+            .restart(Duration::from_secs(2))
+            .await
+            .expect_err("embedded server refuses restart");
+        assert!(error.to_string().contains("restart"));
+        assert!(UnixStream::connect(&sock).await.is_ok());
 
         tx.send(()).unwrap();
         handle.await.unwrap();

@@ -116,6 +116,32 @@ Response:
   "health": { "version": "0.0.1", "protocol": 1 } }
 ```
 
+#### `restart`
+
+Ask the daemon to drain and re-execute itself onto the binary now resolved by
+its original `argv[0]`.
+
+```json
+{ "protocol": 4, "kind": "restart" }
+```
+
+The daemon commits to the restart before replying. An `ok` response therefore
+means accepted, not that the replacement image is already serving:
+
+```json
+{ "ok": true, "protocol": 4 }
+```
+
+Only a server advertising the `restart` capability accepts this method. An
+embedded server without a restart controller refuses instead of draining. A
+daemon that has already received SIGTERM/SIGINT refuses too; an in-flight IPC
+handler cannot reverse an operator-requested stop.
+
+Re-exec preserves the pid, argv, environment and working directory, and the
+old listener may finish an already accepted request during the drain. Clients
+must therefore confirm completion by observing `hello.generation` advance,
+not by checking the pid or merely connecting to the socket.
+
 #### `hello`
 
 Capability handshake. Optional, but clients SHOULD send it as the first
@@ -144,7 +170,8 @@ Response:
   "protocol": 2,
   "min_protocol": 1,
   "max_protocol": 2,
-  "capabilities": ["waiting_choice", "needs_choice", "rate_limited"]
+  "capabilities": ["waiting_choice", "needs_choice", "rate_limited", "restart"],
+  "generation": 0
 }
 ```
 
@@ -157,6 +184,8 @@ Response:
   features the server supports. Clients SHOULD feature-gate on these
   rather than comparing `protocol` integers, so adding a new tag is
   always non-breaking.
+- `generation`: present only with the `restart` capability. It starts at zero
+  for a fresh daemon and increments across each self-reexec.
 
 Capability tags currently advertised:
 
@@ -165,6 +194,7 @@ Capability tags currently advertised:
 | `waiting_choice` | server emits `AgentState::waiting_choice` (otherwise: `waiting_input`). |
 | `needs_choice`   | server emits `NotificationLevel::needs_choice` (otherwise: `needs_input`). |
 | `rate_limited`   | server emits the `rate_limited` event type and the `rate_limit_*` fields on `Agent`. |
+| `restart`        | server accepts `restart` and can re-exec itself in place. |
 
 #### v1-compat downgrade
 

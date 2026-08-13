@@ -32,8 +32,10 @@
 //!   `muxad` in place (previous binaries kept as `.bak`), restart.
 //!
 //! The daemon restart + socket verification tail is shared by all three.
+//! The running daemon is asked to drain and re-exec itself first; the native
+//! service manager is retained as a compatibility fallback for an older or
+//! absent daemon.
 
-use crate::init::util::wait_for_muxad;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -65,11 +67,9 @@ pub struct Args {
 
 /// Entry point dispatched from `main.rs`.
 ///
-/// Async to match the rest of the CLI's command-dispatch shape (we
-/// `.await` it in `main.rs` next to `init::run`); the body itself
-/// is synchronous because cargo / git / launchctl are all blocking
-/// child processes.
-#[allow(clippy::unused_async)]
+/// Async because the shared restart tail performs bounded IPC round trips.
+/// Build/install commands remain blocking: this command is interactive and
+/// has no other useful work to schedule while they run.
 pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let _ = cliclack::intro("muxa upgrade");
 
@@ -81,7 +81,7 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let Some(repo) = find_repo_root(&cwd) else {
         // No checkout in sight — most users. Resolve the channel from the
         // running binary instead of sending them off to clone a repo.
-        return run_without_repo(&args, &socket);
+        return run_without_repo(&args, &socket).await;
     };
     let _ = cliclack::log::info(format!("repo: {}", repo.display()));
 
@@ -110,53 +110,21 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let _ = cliclack::log::step("building muxa-cli");
     cargo_install(&repo, "crates/muxa-cli").context("cargo install muxa-cli")?;
 
-    let restart_completed = if plan.do_restart {
+    let restart = if plan.do_restart {
         let _ = cliclack::log::step("restarting daemon");
-        match restart_daemon() {
-            RestartOutcome::Restarted => true,
-            RestartOutcome::ManualRequired(reason) => {
-                let _ = cliclack::log::warning(format!(
-                    "{reason}; restart muxad manually to load the upgraded daemon"
-                ));
-                false
-            }
-        }
+        restart_daemon(&socket).await
     } else {
         let _ = cliclack::log::info("daemon restart skipped (--no-restart)");
-        false
+        RestartOutcome::Skipped
     };
 
-    // Verification only makes sense after a service manager reported
-    // a successful restart. Otherwise we'd be reporting on a stale
-    // process that the user still needs to restart manually.
-    if restart_completed {
-        let _ = cliclack::log::step("verifying");
-        if wait_for_muxad(&socket, Duration::from_secs(3)) {
-            let _ = cliclack::log::success(format!("muxad responsive on {}", socket.display()));
-        } else {
-            let _ = cliclack::log::warning(format!(
-                "muxad did not respond on {} within 3s — check /tmp/muxad.log",
-                socket.display()
-            ));
-        }
-    }
-
     let head = current_head(&repo).unwrap_or_else(|| "HEAD".into());
-    if plan.do_restart && !restart_completed {
-        let _ = cliclack::outro(format!(
-            "Upgraded to {head} — manual muxad restart required."
-        ));
-    } else {
-        let _ = cliclack::outro(format!(
-            "Upgraded to {head} — try `muxa doctor` for a health check."
-        ));
-    }
-    Ok(())
+    finish(&restart, &head, &socket)
 }
 
 /// Upgrade without a source checkout: Homebrew delegation or GitHub
 /// release self-update, chosen from where the running binary lives.
-fn run_without_repo(args: &Args, socket: &Path) -> Result<()> {
+async fn run_without_repo(args: &Args, socket: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
 
@@ -166,8 +134,8 @@ fn run_without_repo(args: &Args, socket: &Path) -> Result<()> {
             let _ = cliclack::note(
                 "Plan",
                 "brew upgrade muxa
-restart muxad
-verify IPC socket",
+ask muxad to re-exec itself (service-manager fallback for an older/stopped daemon)
+verify IPC generation/socket",
             );
             let _ = cliclack::outro("Dry run — no changes made.");
             return Ok(());
@@ -175,8 +143,8 @@ verify IPC socket",
         let _ = cliclack::log::step("brew upgrade muxa");
         run_streaming(Command::new("brew").args(["upgrade", "muxa"]))
             .context("brew upgrade muxa")?;
-        finish_with_restart(args, socket, &format!("v{}", latest_installed_version()));
-        return Ok(());
+        return finish_with_restart(args, socket, &format!("v{}", latest_installed_version()))
+            .await;
     }
 
     let triple = release_target_triple(std::env::consts::OS, std::env::consts::ARCH)
@@ -212,8 +180,8 @@ verify IPC socket",
                 "download muxa-{latest}-{triple}.tar.gz + .sha256
 verify checksum
 replace muxa + muxad in {}
-restart muxad
-verify IPC socket",
+ask muxad to re-exec itself (service-manager fallback for an older/stopped daemon)
+verify IPC generation/socket",
                 install_dir.display()
             ),
         );
@@ -260,45 +228,52 @@ verify IPC socket",
     }
     let _ = std::fs::remove_dir_all(&staging);
 
-    finish_with_restart(args, socket, &latest);
-    Ok(())
+    finish_with_restart(args, socket, &latest).await
 }
 
 /// Shared tail: restart the daemon (unless opted out), verify the
 /// socket, and close the flow with the version we ended on.
-fn finish_with_restart(args: &Args, socket: &Path, version: &str) {
-    let restart_completed = if args.no_restart {
+async fn finish_with_restart(args: &Args, socket: &Path, version: &str) -> Result<()> {
+    let restart = if args.no_restart {
         let _ = cliclack::log::info("daemon restart skipped (--no-restart)");
-        false
+        RestartOutcome::Skipped
     } else {
         let _ = cliclack::log::step("restarting daemon");
-        match restart_daemon() {
-            RestartOutcome::Restarted => true,
-            RestartOutcome::ManualRequired(reason) => {
-                let _ = cliclack::log::warning(format!(
-                    "{reason}; restart muxad manually to load the upgraded daemon"
-                ));
-                false
-            }
-        }
+        restart_daemon(socket).await
     };
-    if restart_completed {
-        let _ = cliclack::log::step("verifying");
-        if wait_for_muxad(socket, Duration::from_secs(3)) {
-            let _ = cliclack::log::success(format!("muxad responsive on {}", socket.display()));
-        } else {
+    finish(&restart, version, socket)
+}
+
+/// Convert the restart result into honest user messaging and an exit status.
+fn finish(restart: &RestartOutcome, version: &str, socket: &Path) -> Result<()> {
+    match restart {
+        RestartOutcome::ManualRequired(reason) => {
             let _ = cliclack::log::warning(format!(
-                "muxad did not respond on {} within 3s — check /tmp/muxad.log",
+                "{reason}. Start muxad yourself to run the new build:\n    muxad --socket {}",
                 socket.display()
             ));
+            let _ = cliclack::outro(format!(
+                "Upgraded to {version} — muxad needs a manual restart."
+            ));
+            Ok(())
         }
-        let _ = cliclack::outro(format!(
-            "Upgraded to {version} — try `muxa doctor` for a health check."
-        ));
-    } else {
-        let _ = cliclack::outro(format!(
-            "Upgraded to {version} — manual muxad restart required."
-        ));
+        RestartOutcome::Failed(reason) => {
+            let _ = cliclack::outro(format!("Upgraded to {version} — muxad is down."));
+            Err(anyhow!("{reason}"))
+        }
+        RestartOutcome::Restarted => {
+            let _ = cliclack::log::success(format!("muxad responsive on {}", socket.display()));
+            let _ = cliclack::outro(format!(
+                "Upgraded to {version} — try `muxa doctor` for a health check."
+            ));
+            Ok(())
+        }
+        RestartOutcome::Skipped => {
+            let _ = cliclack::outro(format!(
+                "Upgraded to {version} — try `muxa doctor` for a health check."
+            ));
+            Ok(())
+        }
     }
 }
 
@@ -455,10 +430,13 @@ fn render_plan_for_os(plan: &Plan, os: &str) -> String {
     if plan.do_restart {
         let cmd = restart_command_args(os).join(" ");
         if cmd.is_empty() {
-            lines.push("restart: manual restart required (no supported service manager)".into());
+            lines.push(
+                "restart: ask muxad to re-exec itself (older/stopped daemon requires a manual restart)"
+                    .into(),
+            );
         } else {
             lines.push(format!(
-                "restart: {cmd} (manual restart required if unavailable or unsuccessful)"
+                "restart: ask muxad to re-exec itself (fallback: `{cmd}` for an older/stopped daemon)"
             ));
         }
     } else {
@@ -574,29 +552,129 @@ fn uid_string() -> String {
 
 enum RestartOutcome {
     Restarted,
+    /// Nothing was stopped. The new binary is installed, but an older daemon
+    /// (or no daemon) could not be started automatically.
     ManualRequired(String),
+    /// A restart was accepted or a service manager claimed success, but no
+    /// replacement daemon became responsive.
+    Failed(String),
+    /// `--no-restart`: preserve the caller's daemon state exactly.
+    Skipped,
 }
 
-/// Restart through the OS-native service manager. If the manager is
-/// unavailable or unsuccessful, leave all muxad processes untouched
-/// and tell the caller that a manual restart is required.
-fn restart_daemon() -> RestartOutcome {
+/// Prefer an in-place daemon re-exec and prove it by observing a higher image
+/// generation. The service manager remains the compatibility path for a daemon
+/// that predates the restart capability, or when no daemon is running.
+async fn restart_daemon(socket: &Path) -> RestartOutcome {
+    let client = muxa::ipc::Client::new(socket.to_path_buf());
+    let before = match client.hello(Duration::from_secs(5)).await {
+        Ok(hello)
+            if hello.capabilities.iter().any(|cap| cap == "restart")
+                && hello.generation.is_some() =>
+        {
+            hello.generation.expect("checked above")
+        }
+        Ok(_) => {
+            let _ = cliclack::log::info(
+                "the running daemon predates self-restart; trying the service manager",
+            );
+            return via_service_manager(socket).await;
+        }
+        Err(muxa::ipc::RuntimeError::NotConnected(_)) => {
+            let _ = cliclack::log::info("no daemon was running on that socket");
+            return via_service_manager(socket).await;
+        }
+        Err(error) => {
+            let _ = cliclack::log::info(format!(
+                "could not identify the daemon on {} ({error}); trying the service manager",
+                socket.display()
+            ));
+            return via_service_manager(socket).await;
+        }
+    };
+
+    if let Err(error) = client.restart(Duration::from_secs(5)).await {
+        // The daemon commits to restart before replying, so a lost response is
+        // ambiguous. Falling back here could race the re-exec for the socket;
+        // the generation check below is the authoritative outcome.
+        let _ = cliclack::log::info(format!(
+            "no answer to the restart request ({error}); waiting for a new generation"
+        ));
+    }
+
+    match wait_for_new_generation(socket, before, Duration::from_secs(30)).await {
+        Some(after) => {
+            let _ = cliclack::log::info(format!("muxad came back as generation {after}"));
+            RestartOutcome::Restarted
+        }
+        None => RestartOutcome::Failed(format!(
+            "muxad did not come back on {} — check /tmp/muxad.log and start it manually",
+            socket.display()
+        )),
+    }
+}
+
+/// Wait until a daemon with an image identity newer than `before` answers.
+/// Socket connectability and pid are insufficient: a draining listener can
+/// still accept one more request, while `exec` deliberately preserves pid.
+async fn wait_for_new_generation(socket: &Path, before: u64, deadline: Duration) -> Option<u64> {
+    let client = muxa::ipc::Client::new(socket.to_path_buf());
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if let Ok(hello) = client.hello(Duration::from_secs(1)).await {
+            if let Some(now) = hello.generation.filter(|now| *now > before) {
+                return Some(now);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// Use the OS service manager for an older or absent daemon, then require a
+/// real IPC round trip before reporting success.
+async fn via_service_manager(socket: &Path) -> RestartOutcome {
+    match restart_via_service_manager() {
+        Ok(()) if wait_for_daemon_serving(socket, Duration::from_secs(30)).await => {
+            RestartOutcome::Restarted
+        }
+        Ok(()) => RestartOutcome::Failed(format!(
+            "the service manager reported success but muxad is not answering on {} — check /tmp/muxad.log",
+            socket.display()
+        )),
+        Err(reason) => RestartOutcome::ManualRequired(reason),
+    }
+}
+
+fn restart_via_service_manager() -> std::result::Result<(), String> {
     let args = restart_command_args(std::env::consts::OS);
     let Some((prog, rest)) = args.split_first() else {
-        return RestartOutcome::ManualRequired(
-            "no supported service manager for this operating system".into(),
-        );
+        return Err("no supported service manager for this operating system".into());
     };
 
     if which::which(prog).is_err() {
-        return RestartOutcome::ManualRequired(format!("`{prog}` is not available"));
+        return Err(format!("`{prog}` is not available"));
     }
 
     match Command::new(prog).args(rest).status() {
-        Ok(status) if status.success() => RestartOutcome::Restarted,
-        Ok(status) => RestartOutcome::ManualRequired(format!("`{prog}` exited with {status}")),
-        Err(error) => RestartOutcome::ManualRequired(format!("could not run `{prog}`: {error}")),
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("`{prog}` exited with {status}")),
+        Err(error) => Err(format!("could not run `{prog}`: {error}")),
     }
+}
+
+/// A serving daemon must complete a `hello` round trip; a connect-only probe
+/// is fooled by a bound Unix socket whose process has stopped accepting.
+async fn wait_for_daemon_serving(socket: &Path, deadline: Duration) -> bool {
+    let client = muxa::ipc::Client::new(socket.to_path_buf());
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if client.hello(Duration::from_secs(1)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Short SHA of HEAD in `repo`. None when `git` is missing or the
@@ -814,23 +892,24 @@ version = "0.1.0"
         assert!(s.contains("git pull"));
         assert!(s.contains("cargo install --path crates/muxad --locked --force"));
         assert!(s.contains("cargo install --path crates/muxa-cli --locked --force"));
-        assert!(s.contains("manual restart required"));
+        assert!(s.contains("re-exec"));
+        assert!(s.contains("systemctl --user restart muxad"));
         assert!(!s.contains("pkill"));
         assert!(!s.contains("SIGUSR1"));
     }
 
     #[test]
-    fn dry_run_requires_manual_restart_without_service_manager() {
+    fn dry_run_uses_self_restart_without_service_manager() {
         let plan = Plan {
             repo: PathBuf::from("/tmp/fake-muxa"),
             do_pull: true,
             do_restart: true,
         };
         let s = render_plan_for_os(&plan, "plan9");
-        assert!(s.contains("manual restart required"));
-        assert!(s.contains("no supported service manager"));
+        assert!(s.contains("re-exec"));
+        assert!(s.contains("older/stopped daemon requires a manual restart"));
         assert!(!s.contains("pkill"));
-        assert!(!s.contains("spawn"));
+        assert!(!s.contains("SIGUSR1"));
     }
 
     #[test]
@@ -843,5 +922,73 @@ version = "0.1.0"
         let s = render_plan(&plan);
         assert!(s.contains("git pull (skipped)"));
         assert!(s.contains("restart (skipped)"));
+    }
+
+    async fn serve_at_generation(
+        socket: &Path,
+        generation: u64,
+    ) -> (
+        tokio::sync::broadcast::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+        let restart = std::sync::Arc::new(muxa::ipc::RestartController::new(
+            generation,
+            shutdown.clone(),
+        ));
+        let server = muxa::ipc::Server::new(socket.to_path_buf(), muxa::Store::shared())
+            .with_restart_controller(restart);
+        let handle = tokio::spawn(async move {
+            let _ = server.run(receiver).await;
+        });
+        for _ in 0..100 {
+            if muxa::ipc::Client::new(socket.to_path_buf())
+                .hello(Duration::from_millis(100))
+                .await
+                .is_ok()
+            {
+                return (shutdown, handle);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test server never came up on {}", socket.display());
+    }
+
+    #[tokio::test]
+    async fn same_generation_does_not_satisfy_restart_verification() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("same.sock");
+        let (shutdown, handle) = serve_at_generation(&socket, 4).await;
+
+        let observed = wait_for_new_generation(&socket, 4, Duration::from_millis(300)).await;
+        assert_eq!(observed, None);
+
+        let _ = shutdown.send(());
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn newer_generation_satisfies_restart_verification() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("newer.sock");
+        let (shutdown, handle) = serve_at_generation(&socket, 5).await;
+
+        let observed = wait_for_new_generation(&socket, 4, Duration::from_secs(2)).await;
+        assert_eq!(observed, Some(5));
+
+        let _ = shutdown.send(());
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn serving_probe_requires_an_ipc_answer() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("bound-but-silent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        assert!(
+            !wait_for_daemon_serving(&socket, Duration::from_millis(300)).await,
+            "a listener with nobody accepting must not count as muxad",
+        );
     }
 }
