@@ -7255,18 +7255,19 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
 /// Whose inbox `M` shows: the agent under the cursor.
 ///
 /// The mailbox overlay is modal, so the row cannot move while it is open — one
-/// fetch per open is enough. The socket is deliberately left unset: the
-/// topology's endpoint string and a participant's socket are only comparable
-/// through `pane_endpoints_match`, while origin resolution compares them
-/// exactly, so pinning it here would silently miss. Pane ids are unique per
-/// host, and the ambiguous case (one id on two tmux servers) surfaces as an
-/// error rather than the wrong mailbox.
+/// fetch per open is enough. Preserve the backend endpoint whenever the host
+/// exposes one: tmux pane ids repeat on every server, so `%1` alone is not a
+/// mailbox identity. Origin resolution normalizes full and short endpoint
+/// spellings with the same rules as canonical topology.
 fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
-    let (pane, label) = if app.uses_tree() {
+    let (pane, socket, label) = if app.uses_tree() {
         let pane = app.selected_action_pane()?;
         let agent = pane.agent.as_ref()?;
+        let endpoint = &pane.key.window.session.endpoint;
         (
             pane.key.pane_id.clone(),
+            matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
+                .then(|| endpoint.socket.clone()),
             format!("{}@{}", agent.kind, pane.key.pane_id),
         )
     } else {
@@ -7276,13 +7277,17 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
         // them would label one agent's mailbox with another's name.
         let agent = app.selected_agent()?;
         let pane = agent.pane.clone()?;
+        let socket = agent
+            .tmux_socket
+            .as_deref()
+            .map(|endpoint| muxa::backend::pane_endpoint_identity(Some(&pane), endpoint));
         let label = format!("{}@{pane}", agent.kind);
-        (pane, label)
+        (pane, socket, label)
     };
     Some(MailboxAnchor {
         origin: CollaborationOrigin {
             pane,
-            socket: None,
+            socket,
             console: false,
         },
         label,

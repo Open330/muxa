@@ -1286,6 +1286,16 @@ fn represented_participant(
         .collaboration_request
         .iter()
         .chain(response.collaboration_requests.iter().flatten());
+    if origin.console {
+        // The origin pane is provenance (where the operator opened the
+        // console), not the represented identity. In particular, when the
+        // console sends to that same pane, matching by `origin.pane` would
+        // incorrectly record the recipient as the represented sender.
+        return requests
+            .flat_map(|request| [&request.from, &request.to])
+            .find(|participant| participant.console)
+            .cloned();
+    }
     for request in requests {
         for participant in [&request.from, &request.to] {
             if participant.pane == origin.pane
@@ -3186,6 +3196,29 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        // The console may target the pane it was opened from. That pane stays
+        // audit provenance, but the represented identity must remain the
+        // console rather than being inferred from the matching recipient.
+        let console_request = client
+            .collaboration_send(
+                &CollaborationOrigin {
+                    pane: "%1".into(),
+                    socket: Some("default".into()),
+                    console: true,
+                },
+                "pane:%1",
+                &NewRequest {
+                    kind: collaboration::RequestKind::Task,
+                    body: "dispatch to launch pane".into(),
+                    expects_reply: true,
+                    work_mode: collaboration::WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
         let audit_entries = audit.entries().await;
         assert!(audit_entries.iter().any(|entry| {
             entry.operation == CollaborationAuditOperation::Send
@@ -3196,6 +3229,12 @@ mod tests {
         assert!(audit_entries
             .iter()
             .any(|entry| entry.operation == CollaborationAuditOperation::Reply));
+        assert!(audit_entries.iter().any(|entry| {
+            entry.operation == CollaborationAuditOperation::Send
+                && entry.request_id.as_deref() == Some(console_request.id.as_str())
+                && entry.represented_session_id.as_deref()
+                    == Some(collaboration::CONSOLE_SESSION_ID)
+        }));
 
         tx.send(()).unwrap();
         handle.await.unwrap();

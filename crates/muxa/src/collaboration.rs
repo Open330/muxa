@@ -1168,8 +1168,11 @@ fn pane_room(pane_id: &str, pane: &PaneInfo, socket: Option<String>) -> RoomId {
 /// The session/window names are carried for hints only. They sit outside
 /// `same_endpoint`, so a console that moves to another window keeps one
 /// identity and one sent mailbox.
-fn console_participant(origin: &CollaborationOrigin, panes: &[PaneInfo]) -> Participant {
-    let Some(pane) = panes.iter().find(|pane| {
+fn console_participant(
+    origin: &CollaborationOrigin,
+    panes: &[PaneInfo],
+) -> Result<Participant, CollaborationError> {
+    let mut matches = panes.iter().filter(|pane| {
         pane.pane_id == origin.pane
             && match origin.socket.as_deref() {
                 Some(socket) => pane.socket.as_deref().is_some_and(|candidate| {
@@ -1177,19 +1180,23 @@ fn console_participant(origin: &CollaborationOrigin, panes: &[PaneInfo]) -> Part
                 }),
                 None => true,
             }
-    }) else {
-        return Participant::console(RoomId {
+    });
+    let Some(pane) = matches.next() else {
+        return Ok(Participant::console(RoomId {
             host: CONSOLE_PANE.to_string(),
             socket: None,
             window_id: CONSOLE_PANE.to_string(),
-        });
+        }));
     };
+    if matches.next().is_some() {
+        return Err(CollaborationError::AmbiguousOrigin(origin.pane.clone()));
+    }
     let socket = pane.socket.clone().or_else(|| origin.socket.clone());
     let mut console = Participant::console(pane_room(&origin.pane, pane, socket));
     console.tmux_session_id = (!pane.session_id.is_empty()).then(|| pane.session_id.clone());
     console.tmux_session_name = Some(pane.session.clone());
     console.window_name = (!pane.window_name.is_empty()).then(|| pane.window_name.clone());
-    console
+    Ok(console)
 }
 
 pub fn resolve_origin(
@@ -1202,16 +1209,17 @@ pub fn resolve_origin(
     // every pane uniformly — including the one it was opened from, and
     // including the case where that pane hosts no agent at all.
     if origin.console {
-        return Ok(console_participant(origin, panes));
+        return console_participant(origin, panes);
     }
     let matches: Vec<_> = participants
         .iter()
         .filter(|participant| {
             participant.pane == origin.pane
-                && origin
-                    .socket
-                    .as_deref()
-                    .is_none_or(|socket| participant.socket.as_deref() == Some(socket))
+                && origin.socket.as_deref().is_none_or(|socket| {
+                    participant.socket.as_deref().is_some_and(|candidate| {
+                        crate::backend::pane_endpoints_match(Some(&origin.pane), candidate, socket)
+                    })
+                })
         })
         .cloned()
         .collect();
@@ -1911,6 +1919,58 @@ mod tests {
                 .pane,
             "%2"
         );
+    }
+
+    #[test]
+    fn a_console_requires_an_endpoint_when_pane_ids_repeat_across_servers() {
+        let first = pane_info("%1");
+        let mut second = pane_info("%1");
+        second.socket = Some("other".into());
+        second.window_id = "@other".into();
+        let panes = [first, second];
+
+        let ambiguous = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%1".into(),
+                socket: None,
+                console: true,
+            },
+            &[],
+            &panes,
+        );
+        assert!(matches!(
+            ambiguous,
+            Err(CollaborationError::AmbiguousOrigin(pane)) if pane == "%1"
+        ));
+
+        let resolved = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%1".into(),
+                socket: Some("/tmp/tmux-1000/default".into()),
+                console: true,
+            },
+            &[],
+            &panes,
+        )
+        .unwrap();
+        assert_eq!(resolved.room.socket.as_deref(), Some("default"));
+        assert_eq!(resolved.room.window_id, "@1");
+    }
+
+    #[test]
+    fn agent_origin_normalizes_full_and_short_tmux_socket_names() {
+        let agent = participant("%1", "sender");
+        let resolved = resolve_origin(
+            &CollaborationOrigin {
+                pane: "%1".into(),
+                socket: Some("/tmp/tmux-1000/default".into()),
+                console: false,
+            },
+            std::slice::from_ref(&agent),
+            &[pane_info("%1")],
+        )
+        .unwrap();
+        assert_eq!(resolved, agent);
     }
 
     /// Console identity is fixed, so one operator's dispatch log stays a
