@@ -1178,9 +1178,13 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
             .as_ref()
             .is_some_and(|refresh| refresh.task.is_finished())
         {
-            let refresh = refresh_task.take().expect("checked above");
-            match refresh.task.await {
-                Ok(Ok(data)) => apply_refresh_data(&mut app, data, refresh.source),
+            let DashboardRefresh {
+                task,
+                source,
+                anchor,
+            } = refresh_task.take().expect("checked above");
+            match task.await {
+                Ok(Ok(data)) => apply_refresh_data(&mut app, data, source, anchor.as_ref()),
                 Ok(Err(e)) => app.set_hint(format!("refresh failed: {e}"), HintLevel::Err),
                 Err(e) => app.set_hint(format!("refresh task failed: {e}"), HintLevel::Err),
             }
@@ -1216,6 +1220,7 @@ enum RefreshSource {
 struct DashboardRefresh {
     task: tokio::task::JoinHandle<Result<DashboardData>>,
     source: RefreshSource,
+    anchor: Option<CollaborationAnchor>,
 }
 
 /// The background refresh cannot see the cursor once it is running, so the
@@ -1232,13 +1237,22 @@ fn spawn_refresh(
     let client = client.clone();
     let cfg = cfg.clone();
     let args = args.clone();
+    let task_anchor = anchor.clone();
     DashboardRefresh {
-        task: tokio::spawn(async move { load_dashboard_data(&client, &cfg, &args, anchor).await }),
+        task: tokio::spawn(
+            async move { load_dashboard_data(&client, &cfg, &args, task_anchor).await },
+        ),
         source,
+        anchor,
     }
 }
 
-fn apply_refresh_data(app: &mut DashboardApp, data: DashboardData, source: RefreshSource) {
+fn apply_refresh_data(
+    app: &mut DashboardApp,
+    data: DashboardData,
+    source: RefreshSource,
+    loaded_anchor: Option<&CollaborationAnchor>,
+) {
     // The mailbox anchor was captured when this refresh was spawned, and
     // refreshes land every second. If the cursor has moved since — or `b`
     // re-read the mailbox on open — this snapshot's inbox belongs to a
@@ -1247,14 +1261,22 @@ fn apply_refresh_data(app: &mut DashboardApp, data: DashboardData, source: Refre
     // `e` would reply to a request the operator never looked at. Keep what is
     // on screen and let the next refresh, which carries the current anchor,
     // bring it forward.
-    let anchor_pane =
-        |anchor: Option<&CollaborationAnchor>| anchor.map(|anchor| anchor.origin.pane.clone());
-    let stale_inbox = anchor_pane(dashboard_mailbox_anchor(app).as_ref())
-        != anchor_pane(data.collaboration.inbox.as_ref());
-    let on_screen = stale_inbox.then(|| app.data.collaboration.clone());
+    let current_anchor = dashboard_mailbox_anchor(app);
+    let stale_inbox = current_anchor.as_ref().map(|anchor| &anchor.origin)
+        != loaded_anchor.map(|anchor| &anchor.origin);
+    let on_screen = stale_inbox.then(|| {
+        (
+            app.data.collaboration.inbox.clone(),
+            app.data.collaboration.incoming.clone(),
+        )
+    });
     app.replace_data(data);
-    if let Some(collaboration) = on_screen {
-        app.data.collaboration = collaboration;
+    if let Some((inbox, incoming)) = on_screen {
+        // Only these fields belong to the cursor captured by the refresh.
+        // Room, sent mail, and availability describe the console itself and
+        // must continue updating even while an older inbox result is ignored.
+        app.data.collaboration.inbox = inbox;
+        app.data.collaboration.incoming = incoming;
         app.clamp_collaboration_request();
     }
     if source == RefreshSource::Manual {
@@ -1429,22 +1451,39 @@ fn dashboard_collaboration_origin_from(
 
 /// Whose inbox the mailbox overlay shows: the agent on the selected card.
 ///
-/// The socket is deliberately left unset — see the same call in `watch`: the
-/// dashboard's pane strings and a participant's socket are not comparable by
-/// equality, and pane ids are unique per host anyway.
+/// Preserve the endpoint whenever it is known. Tmux pane ids repeat on every
+/// server, so `%1` alone is not enough to identify an inbox. Prefer the
+/// daemon's participant because it is already normalized; cards outside the
+/// launch room fall back to the selected agent's recorded endpoint.
 fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
     let ActionTarget::Pane(pane) = app.selected_action_target()? else {
         return None;
     };
-    let label = app
-        .data
-        .collaboration
-        .peer_for_pane(&pane)
-        .map_or_else(|| pane.clone(), Participant::label);
+    let participant = app.data.collaboration.peer_for_pane(&pane);
+    let agent = app.selected_card().and_then(|card| {
+        card.agents
+            .iter()
+            .filter(|agent| agent.pane.as_deref() == Some(&pane))
+            .max_by_key(|agent| agent.last_activity_at)
+    });
+    let label = participant
+        .map(Participant::label)
+        .or_else(|| agent.map(|agent| format!("{}@{pane}", agent.kind)))
+        .unwrap_or_else(|| pane.clone());
+    let socket = participant
+        .and_then(|participant| participant.socket.clone())
+        .or_else(|| {
+            agent.and_then(|agent| {
+                agent
+                    .tmux_socket
+                    .as_deref()
+                    .map(|endpoint| muxa::backend::pane_endpoint_identity(Some(&pane), endpoint))
+            })
+        });
     Some(CollaborationAnchor {
         origin: CollaborationOrigin {
             pane,
-            socket: None,
+            socket,
             console: false,
         },
         label,
@@ -4702,13 +4741,13 @@ mod tests {
         let mut app = DashboardApp::new(data.clone(), WatchTheme::Classic);
         app.set_hint("request sent", HintLevel::Ok);
 
-        apply_refresh_data(&mut app, data.clone(), RefreshSource::Automatic);
+        apply_refresh_data(&mut app, data.clone(), RefreshSource::Automatic, None);
         assert_eq!(
             app.hint.as_ref().map(|hint| hint.message.as_str()),
             Some("request sent")
         );
 
-        apply_refresh_data(&mut app, data, RefreshSource::Manual);
+        apply_refresh_data(&mut app, data, RefreshSource::Manual, None);
         assert_eq!(
             app.hint.as_ref().map(|hint| hint.message.as_str()),
             Some("refreshed")
@@ -4787,13 +4826,26 @@ mod tests {
             .incoming
             .push(fake_collaboration_request(
                 "req_other_card_1234",
-                peer,
-                current,
+                peer.clone(),
+                current.clone(),
                 RequestStatus::Claimed,
                 now,
             ));
+        stale.collaboration.sent.push(fake_collaboration_request(
+            "req_new_sent_123456",
+            current,
+            peer,
+            RequestStatus::Queued,
+            now,
+        ));
 
-        apply_refresh_data(&mut app, stale, RefreshSource::Automatic);
+        let loaded_anchor = stale.collaboration.inbox.clone();
+        apply_refresh_data(
+            &mut app,
+            stale,
+            RefreshSource::Automatic,
+            loaded_anchor.as_ref(),
+        );
 
         assert_eq!(
             app.data
@@ -4813,6 +4865,93 @@ mod tests {
                 .map(|anchor| anchor.origin.pane.as_str()),
             Some("%1")
         );
+        assert_eq!(
+            app.data
+                .collaboration
+                .sent
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req_new_sent_123456"],
+            "a stale inbox must not freeze console-wide sent mail"
+        );
+    }
+
+    #[test]
+    fn a_failed_current_inbox_load_clears_the_previous_cards_mailbox() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let build = || {
+            build_dashboard_data(
+                now,
+                vec![fake_agent("self", Some("%1"), AgentState::Idle, None, now)],
+                vec![fake_pane("%1", "main")],
+                Vec::new(),
+                Vec::new(),
+                SessionActiveStats::default(),
+                false,
+                DashboardSort::Attention,
+                HostKind::Tmux,
+                Vec::new(),
+            )
+        };
+        let current = fake_participant("%1", "self", Some("builder"), &[]);
+        let peer = fake_participant("%2", "peer", Some("reviewer"), &[]);
+        let mut on_screen = build();
+        attach_collaboration(&mut on_screen, current.clone(), vec![peer.clone()]);
+        on_screen
+            .collaboration
+            .incoming
+            .push(fake_collaboration_request(
+                "req_previous_card_1234",
+                peer,
+                current,
+                RequestStatus::Claimed,
+                now,
+            ));
+        let mut app = DashboardApp::new(on_screen, WatchTheme::Classic);
+
+        // The request was made for the current card, but that pane stopped
+        // being a collaboration participant before the daemon answered.
+        let requested = dashboard_mailbox_anchor(&app).expect("current pane anchor");
+        let mut refreshed = build();
+        refreshed.collaboration.origin = app.data.collaboration.origin.clone();
+        refreshed.collaboration.room = app.data.collaboration.room.clone();
+        refreshed.collaboration.inbox = None;
+        refreshed.collaboration.incoming.clear();
+
+        apply_refresh_data(
+            &mut app,
+            refreshed,
+            RefreshSource::Automatic,
+            Some(&requested),
+        );
+
+        assert!(app.data.collaboration.inbox.is_none());
+        assert!(app.data.collaboration.incoming.is_empty());
+    }
+
+    #[test]
+    fn dashboard_mailbox_anchor_preserves_the_selected_agents_socket() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let mut agent = fake_agent("self", Some("%1"), AgentState::Idle, None, now);
+        agent.tmux_socket = Some("/tmp/tmux-1000/custom".into());
+        let data = build_dashboard_data(
+            now,
+            vec![agent],
+            vec![fake_pane("%1", "main")],
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let app = DashboardApp::new(data, WatchTheme::Classic);
+
+        let anchor = dashboard_mailbox_anchor(&app).expect("selected agent anchor");
+        assert_eq!(anchor.origin.pane, "%1");
+        assert_eq!(anchor.origin.socket.as_deref(), Some("custom"));
     }
 
     /// Replying is the recipient's move. The console can never be one, so `e`
