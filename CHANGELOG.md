@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Session and window inspectors are now operational rollups.** A selected
+  session shows scope, presence, the highest-priority attention item, latest
+  activity, and a compact window roster with its pane children. A selected
+  window adds aggregate process/shell/subagent load, peak context, total cost,
+  collaboration mailbox state, and a live one-second snapshot that preserves
+  the window's real pane split geometry. Active and attention panes are
+  highlighted; zoomed windows fill the canvas with the active pane. Small
+  inspectors and backends without geometry retain the responsive pane roster,
+  while an explicitly selected pane still provides the full single-pane view.
+- **Watch Inspector work is bounded and stays off the input path.** Each frame
+  now builds and sorts the topology once, session rosters stop at the visible
+  height, and a ready window mosaic skips its duplicate text roster. Window
+  captures run asynchronously with bounded pane parallelism and cache parsed
+  ANSI until the next one-second snapshot. Tree spinners redraw at 4 fps and
+  only while an active state is actually visible.
+- **Focused watch trees navigate by hierarchy level.** In the default
+  `tree_expansion = "focus"` mode, `j`/`k` now move between sibling sessions,
+  windows, or panes instead of stopping on every visible descendant. A
+  one-node sibling group automatically falls back to its parent's siblings, so
+  a lone window or pane never traps navigation. Use `l`/Right to descend and
+  `h`/Left to return to the parent. Each explicit descent selects the first
+  child immediately and keeps that path visible even below the configured
+  automatic `view` depth, so panes remain directly selectable. The `always`
+  and `manual` policies retain visible-row traversal.
+
 ## [0.8.32] - 2026-08-12
 
 ### Changed

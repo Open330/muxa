@@ -1,10 +1,9 @@
 //! On-screen geometry of the client's current window.
 //!
 //! Everything else in this crate cares about *which* panes exist. `muxa
-//! peek` is the one consumer that cares *where they are*: it paints a
-//! borderless full-client `display-popup` and redraws each pane's box at
-//! the pane's own coordinates, so the overlay lines up with what the user
-//! is looking at.
+//! peek` and the watch window inspector also care *where they are*: peek
+//! paints a borderless full-client `display-popup`, while watch projects an
+//! arbitrary selected window into its inspector canvas.
 //!
 //! The geometry columns are deliberately kept out of [`super::PANE_FMT`].
 //! That format runs on every reconciler tick, against every socket; peek
@@ -217,6 +216,33 @@ pub fn current_window_panes(target: &WindowTarget) -> (Vec<PaneGeometry>, bool) 
         cmd,
         TMUX_COMMAND_TIMEOUT,
         "tmux list-panes (geometry)".into(),
+    ) else {
+        return (Vec::new(), false);
+    };
+    if !out.status.success() {
+        return (Vec::new(), false);
+    }
+    match String::from_utf8(out.stdout) {
+        Ok(stdout) => parse_pane_geometry_lines(&stdout),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+/// Panes of an explicitly identified window on an explicitly identified tmux
+/// server.
+///
+/// Unlike [`current_window_panes`], this does not consult the popup's `$TMUX`
+/// context. It is intended for global surfaces such as `muxa watch`, where the
+/// selected window can belong to a different session or tmux socket than the
+/// client that opened the UI. A supplied socket that no longer exists fails
+/// closed through [`super::tmux_command_on`].
+pub fn window_panes_on(socket: Option<&str>, window_id: &str) -> (Vec<PaneGeometry>, bool) {
+    let mut cmd = super::tmux_command_on(socket);
+    cmd.args(["list-panes", "-F", PANE_GEOMETRY_FMT, "-t", window_id]);
+    let Ok(out) = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux list-panes (geometry) -t {window_id}"),
     ) else {
         return (Vec::new(), false);
     };

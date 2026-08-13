@@ -24,9 +24,18 @@ pane.
 
 The default tree is an accordion: selecting a session reveals its windows and
 folds the previously selected session. In pane view, selecting a window also
-reveals its panes. Set `[watch].tree_expansion = "always"` to keep every node
-through the configured `view` depth visible, or `"manual"` to start collapsed
-and expand only with `l`/Right. The default is `"focus"`.
+reveals its panes. In this focus mode, `j`/`k` move between siblings at the
+current level, so visible child context does not add extra stops while scanning
+sessions. If that level contains only one node, navigation automatically falls
+back to the parent's sibling group: a lone pane advances between windows, and
+a lone window advances between sessions. Use `l`/Right to descend into a window
+or pane and `h`/Left to return one level. Each `l` selects the first child
+immediately; an explicitly selected pane keeps its session/window ancestry
+visible even when the automatic `view` depth is `"session"` or `"window"`. Set
+`[watch].tree_expansion = "always"` to keep every node through the configured
+`view` depth visible, or `"manual"` to start collapsed and expand only with
+`l`/Right; those two policies retain visible-row traversal. The default is
+`"focus"`.
 
 Session, window, and pane rows remain independently selectable. The tree also
 avoids repeating an identical state marker down a single-child chain: an
@@ -41,9 +50,9 @@ children keep their aggregate state markers.
 | Printable text | Immediately filter by workspace, work, agent, cwd, model, or prompt. |
 | `/` | Explicitly start filtering, including queries beginning with a reserved key. |
 | `Backspace` / `Ctrl-W` / `Ctrl-U` | Delete a character / word / the whole filter. |
-| `j` / `k`, `↑` / `↓` | Move between works; after entering a child, move between agents. |
-| `h` / `l`, `←` / `→` | Return to the parent work / select the first child agent. |
-| `gg` / `G`, `Home` / `End` | Jump to the first / last selectable row. |
+| `j` / `k`, `↑` / `↓` | In focus mode, move between siblings at the current hierarchy level; otherwise move visible rows. |
+| `h` / `l`, `←` / `→` | Return to the parent / descend into the first child. |
+| `gg` / `G`, `Home` / `End` | Jump to the first / last sibling in focus mode, or visible row otherwise. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
@@ -109,14 +118,47 @@ The existing `↳ detail` line remains visible for both selected parents and
 selected children; process-tree detail shares the same secondary row when
 available.
 
-At 120 columns or wider, the selected pane's live capture stays visible in a
-right-hand inspector. `Alt-I` toggles it. That 120 is the width `muxa watch`
-itself receives, not your terminal's: an inset `display-popup` subtracts its
-own inset *and* its border, so a 134-column terminal hands a `-w 90%` popup
-only 118. This is why the bundled `prefix + s` binding is borderless and
-full-client (`-B -w 100% -h 100%`). Completion, error, and input/choice
-transitions remain in a 50-entry in-process inbox opened with `Alt-E`; the
-header shows the unread count.
+The canonical session/window/pane tree uses the same principle in focus mode:
+expanded descendants provide context, while vertical keys stay in the current
+sibling group. For example, one `j` moves directly from a selected session to
+the next session even though the first session's windows are visible. `l` then
+enters that session's first window; window-level `j`/`k` stay among its windows,
+and pane-level `j`/`k` stay within the selected window. At a hierarchy level
+with only one sibling, the movement bubbles upward until it finds a real
+sibling group, preventing a single window or pane from becoming a dead end.
+To act on that singleton pane itself, press `l` while its window is selected;
+the pane becomes the selected row immediately and stays visible until movement
+leaves it or `h` returns to the window.
+
+At 120 columns or wider, the selected hierarchy node stays visible in a
+right-hand inspector. A session selection rolls up scope, client presence,
+cumulative attached time, the most urgent attention item, latest activity, and
+compact window rows with their pane children nested underneath. The available
+Inspector height is filled in topology order, with any remainder summarized as
+`+N more`.
+
+A window selection adds process/shell/subagent load, peak context, total cost,
+and collaboration mailbox state above a live miniature of the selected tmux
+window. The miniature maps `pane_left`, `pane_top`, `pane_width`, and
+`pane_height` into the Inspector canvas, so horizontal and vertical splits
+keep their real proportions. Each cell shows the pane's captured terminal,
+with a double border for the active pane and a state-colored border when an
+agent needs attention. Captures refresh at most once per second; a zoomed
+window shows only its active pane. Geometry and pane reads happen in a bounded
+background capture, so changing selection and typing remain responsive; ANSI
+is parsed once per snapshot rather than once per redraw. Small Inspector areas
+and backends without tmux-compatible geometry fall back to the responsive pane
+roster. Selecting an individual pane still opens its denser metadata and full
+single-pane capture.
+
+`Alt-I` toggles the inspector, and `|` cycles 50/50, 70/30, and 30/70
+list/inspector splits. That 120 is the width `muxa watch` itself receives, not
+your terminal's: an inset `display-popup` subtracts its own inset *and* its
+border, so a 134-column terminal hands a `-w 90%` popup only 118. This is why
+the bundled `prefix + s` binding is borderless and full-client
+(`-B -w 100% -h 100%`). Completion, error, and input/choice transitions remain
+in a 50-entry in-process inbox opened with `Alt-E`; the header shows the unread
+count.
 
 ## Command Palette
 

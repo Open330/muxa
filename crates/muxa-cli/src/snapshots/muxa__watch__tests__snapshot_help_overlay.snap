@@ -10,8 +10,8 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │> alpha:0.0              ○ │  type or /       filter; / allows reserved first characters                      │                           │
 │                           │  Backspace/C-W   edit filter / delete previous word                              │                           │
 │                           │  Ctrl-U / Esc    clear filter; Esc again backs out / quits                       │                           │
-│                           │  ↑/↓ · j/k       move visible session/window/pane nodes                          │                           │
-│                           │  ←/→ · h/l       collapse/parent · expand/first child                            │                           │
+│                           │  ↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise            │                           │
+│                           │  ←/→ · h/l       parent/child in focus mode; collapse/expand otherwise           │                           │
 │                           │  gg/G · Home/End first / last selectable row                                     │                           │
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
 │                           │  Enter          attach via active window/pane or exact pane                      │                           │

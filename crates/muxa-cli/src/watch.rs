@@ -49,6 +49,7 @@ use muxa::ipc::{Client, RuntimeError};
 use muxa::process_tree::WorkloadProcessKind;
 use muxa::session_activity::SessionActivity;
 use muxa::state::Agent;
+use muxa::tmux::layout::PaneGeometry;
 use muxa::tmux::{PaneInfo, SessionInfo};
 use muxa::{
     ActivityEntry, BackendEndpoint, HumanInteractionEntry, HumanInteractionInput,
@@ -93,9 +94,22 @@ const INPUT_POLL: Duration = Duration::from_millis(16);
 /// `relative_time` at second granularity — without the old behaviour of one
 /// full render per `INPUT_POLL` tick (~62 fps) even on a completely idle UI.
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
+/// Multi-pane window captures are more expensive than the selected-pane
+/// preview. One snapshot per second keeps the layout alive without launching
+/// one `capture-pane` subprocess per pane on every animation frame.
+const WINDOW_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
+const WINDOW_CAPTURE_PARALLELISM: usize = 8;
+/// Below these dimensions a tiled terminal preview is less legible than the
+/// pane roster it replaces.
+const WINDOW_MOSAIC_MIN_WIDTH: u16 = 42;
+const WINDOW_MOSAIC_MIN_HEIGHT: u16 = 6;
 /// Faster idle repaint cadence for the swarm view so its dot spinners
 /// animate smoothly (~8 fps) even with no input.
 const SWARM_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
+/// Tree rows need motion to distinguish active states, but 8 fps made large
+/// Inspector frames needlessly expensive. Four frames per second stays visibly
+/// animated while halving steady-state topology and terminal rendering work.
+const TREE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long a transient action hint stays visible in the footer before
 /// the renderer falls back to the default keybinding strip. 2 s is the
@@ -1649,8 +1663,8 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  type or /       filter; / allows reserved first characters",
         "  Backspace/C-W   edit filter / delete previous word",
         "  Ctrl-U / Esc    clear filter; Esc again backs out / quits",
-        "  ↑/↓ · j/k       move visible session/window/pane nodes",
-        "  ←/→ · h/l       collapse/parent · expand/first child",
+        "  ↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise",
+        "  ←/→ · h/l       parent/child in focus mode; collapse/expand otherwise",
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach via active window/pane or exact pane",
@@ -2493,6 +2507,10 @@ pub(crate) struct App {
     /// Set by the last render pass; lets the capture loop avoid polling a
     /// live pane when the terminal is too narrow to show the inspector.
     pub inspector_visible: bool,
+    /// Whether the last rendered viewport contains a working/starting state.
+    /// Computed from the already-built frame model so the 16 ms input loop does
+    /// not rebuild the hierarchy just to choose an animation cadence.
+    visible_spinner_active: bool,
     /// Persistent transition inbox for this watch process.
     events: VecDeque<WatchEventEntry>,
     pub unread_events: usize,
@@ -2549,6 +2567,15 @@ pub(crate) struct App {
     /// tick while the preview stays open in that mode. `None` when the
     /// preview is closed or showing prompt/response content.
     pub pane_capture: Option<CapturedPane>,
+    /// Geometry and visible screen contents for the selected tmux window.
+    /// Unlike `pane_capture`, this owns one capture per visible pane and is
+    /// refreshed at most once per second. Non-tmux windows leave it unused and
+    /// retain the textual pane roster.
+    pub window_capture: Option<CapturedWindow>,
+    /// Exact selected tmux window for which the last render exposed a mosaic.
+    /// The async capture scheduler reads this O(1) field instead of rebuilding
+    /// the full topology on every input-poll iteration.
+    window_capture_target: Option<WindowKey>,
     /// `Some` when a destructive action (`Alt-K`, `Alt-X`, or a `:` command)
     /// is waiting on a
     /// y/N reply. Suppresses table input and renders a centred popup;
@@ -2653,9 +2680,94 @@ pub struct CapturedPane {
     /// Decoded to ratatui `Text` lazily at render time so a stale row
     /// re-render never re-parses the same bytes.
     pub text: String,
+    /// ANSI decoded once when the capture arrives; redraws clone the compact
+    /// Ratatui model instead of reparsing escape sequences at animation rate.
+    parsed: Option<Text<'static>>,
     /// Monotonic timestamp; the main loop uses `elapsed()` to gate the
     /// next re-capture so we don't shell out every frame.
     pub fetched_at: std::time::Instant,
+}
+
+impl CapturedPane {
+    fn new(pane_id: String, socket: Option<String>, text: String) -> Self {
+        use ansi_to_tui::IntoText;
+
+        let parsed = (!text.is_empty())
+            .then(|| text.as_bytes().into_text().ok())
+            .flatten();
+        Self {
+            pane_id,
+            socket,
+            text,
+            parsed,
+            fetched_at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// One pane inside a cached window mosaic.
+#[derive(Debug, Clone)]
+pub struct CapturedWindowPane {
+    pub geometry: PaneGeometry,
+    /// ANSI-decoded visible terminal, prepared off the input thread.
+    pub text: Option<Text<'static>>,
+}
+
+/// Cached geometry and terminal contents for one selected window.
+#[derive(Debug, Clone)]
+pub struct CapturedWindow {
+    pub key: WindowKey,
+    pub panes: Vec<CapturedWindowPane>,
+    pub zoomed: bool,
+    pub fetched_at: std::time::Instant,
+}
+
+fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
+    use ansi_to_tui::IntoText;
+
+    let socket = key.session.endpoint.socket.clone();
+    let (geometries, zoomed) = muxa::tmux::layout::window_panes_on(Some(&socket), &key.window_id);
+    let backend = crate::backend_for_kind(muxa::HostKind::Tmux);
+
+    // A slow or wedged pane must not make N panes cost N timeout windows.
+    // Each capture is independent, so run them concurrently inside the one
+    // blocking task owned by the watch loop.
+    let visible = geometries
+        .into_iter()
+        .filter(|geometry| !zoomed || geometry.active)
+        .collect::<Vec<_>>();
+    let mut panes = Vec::with_capacity(visible.len());
+    for batch in visible.chunks(WINDOW_CAPTURE_PARALLELISM) {
+        panes.extend(std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .cloned()
+                .map(|geometry| {
+                    let backend = backend.clone();
+                    let socket = socket.clone();
+                    scope.spawn(move || {
+                        let pane_id = geometry.pane_id.clone();
+                        let text = backend
+                            .capture_pane_on(Some(&socket), &pane_id)
+                            .filter(|raw| !raw.is_empty())
+                            .and_then(|raw| raw.as_bytes().into_text().ok());
+                        CapturedWindowPane { geometry, text }
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect::<Vec<_>>()
+        }));
+    }
+
+    CapturedWindow {
+        key,
+        panes,
+        zoomed,
+        fetched_at: std::time::Instant::now(),
+    }
 }
 
 impl App {
@@ -2712,6 +2824,7 @@ impl App {
             expanded_works: HashSet::new(),
             inspector_enabled: true,
             inspector_visible: false,
+            visible_spinner_active: false,
             events: VecDeque::new(),
             unread_events: 0,
             event_inbox_open: false,
@@ -2728,6 +2841,8 @@ impl App {
             paneless_hidden: 0,
             paneless_attention: 0,
             pane_capture: None,
+            window_capture: None,
+            window_capture_target: None,
             confirm: None,
             collaboration: WatchCollaboration::default(),
             collaboration_scope: muxa::config::CollaborationScope::default(),
@@ -3124,8 +3239,9 @@ impl App {
     ///
     /// Focus mode opens one level below the selected node, bounded by `view`:
     /// a selected session reveals windows, and in pane view a selected window
-    /// reveals panes. Only its ancestry stays open, so moving to another
-    /// session folds the previous one.
+    /// reveals panes. Explicitly selected descendants always keep their full
+    /// ancestry open even when they are deeper than the automatic view depth.
+    /// Moving to another session folds the previous path.
     fn set_focused_tree_expansion(&mut self, key: Option<&TopologyNodeKey>) {
         if self.watch_cfg.tree_expansion != WatchTreeExpansion::Focus {
             return;
@@ -3142,24 +3258,18 @@ impl App {
                 }
             }
             TopologyNodeKey::Window(window) => {
-                if matches!(self.watch_cfg.view, WatchView::Window | WatchView::Pane) {
-                    self.expanded_nodes
-                        .insert(TopologyNodeKey::Session(window.session.clone()));
-                }
+                self.expanded_nodes
+                    .insert(TopologyNodeKey::Session(window.session.clone()));
                 if self.watch_cfg.view == WatchView::Pane {
                     self.expanded_nodes
                         .insert(TopologyNodeKey::Window(window.clone()));
                 }
             }
             TopologyNodeKey::Pane(pane) => {
-                if matches!(self.watch_cfg.view, WatchView::Window | WatchView::Pane) {
-                    self.expanded_nodes
-                        .insert(TopologyNodeKey::Session(pane.window.session.clone()));
-                }
-                if self.watch_cfg.view == WatchView::Pane {
-                    self.expanded_nodes
-                        .insert(TopologyNodeKey::Window(pane.window.clone()));
-                }
+                self.expanded_nodes
+                    .insert(TopologyNodeKey::Session(pane.window.session.clone()));
+                self.expanded_nodes
+                    .insert(TopologyNodeKey::Window(pane.window.clone()));
             }
         }
     }
@@ -3178,8 +3288,7 @@ impl App {
     fn tree_targets(&self) -> Vec<TreeTarget> {
         let query = self.search_query.trim().to_lowercase();
         let filtering = !query.is_empty() || self.attention_only;
-        let mut sessions: Vec<&SessionNode> = self.topology.sessions.iter().collect();
-        sessions.sort_by(|left, right| self.compare_sessions(left, right));
+        let sessions = self.sorted_sessions();
 
         let mut targets = Vec::new();
         let matching_sessions: Vec<_> = sessions
@@ -3188,12 +3297,9 @@ impl App {
             .collect();
         let session_count = matching_sessions.len();
         for (session_index, session) in matching_sessions.into_iter().enumerate() {
-            let mut windows: Vec<&WindowNode> = session
-                .windows
-                .iter()
-                .filter(|window| tree_window_relevant(window, session, &query, self.attention_only))
-                .collect();
-            windows.sort_by(|left, right| self.compare_windows(left, right));
+            let windows = self.sorted_windows(session.windows.iter().filter(|window| {
+                tree_window_relevant(window, session, &query, self.attention_only)
+            }));
             let session_key = session.node_key();
             let session_expanded =
                 self.expanded_nodes.contains(&session_key) || (filtering && !windows.is_empty());
@@ -3211,14 +3317,9 @@ impl App {
 
             let window_count = windows.len();
             for (window_index, window) in windows.into_iter().enumerate() {
-                let mut panes: Vec<&PaneNode> = window
-                    .panes
-                    .iter()
-                    .filter(|pane| {
-                        tree_pane_relevant(pane, session, window, &query, self.attention_only)
-                    })
-                    .collect();
-                panes.sort_by(|left, right| self.compare_panes(left, right));
+                let panes = self.sorted_panes(window.panes.iter().filter(|pane| {
+                    tree_pane_relevant(pane, session, window, &query, self.attention_only)
+                }));
                 let window_key = window.node_key();
                 let window_expanded =
                     self.expanded_nodes.contains(&window_key) || (filtering && !panes.is_empty());
@@ -3249,35 +3350,49 @@ impl App {
         targets
     }
 
-    fn compare_sessions(&self, left: &SessionNode, right: &SessionNode) -> Ordering {
+    fn sorted_sessions(&self) -> Vec<&SessionNode> {
         let now = OffsetDateTime::now_utc();
-        compare_topology_siblings(
-            &self.watch_cfg.sort,
-            TopologySortFacts::for_session(
-                left,
-                unambiguous_session_activity_secs(self, left, now).unwrap_or(0),
-            ),
-            TopologySortFacts::for_session(
-                right,
-                unambiguous_session_activity_secs(self, right, now).unwrap_or(0),
-            ),
-        )
+        let mut decorated = self
+            .topology
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session,
+                    TopologySortFacts::for_session(
+                        session,
+                        unambiguous_session_activity_secs(self, session, now).unwrap_or(0),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        decorated.sort_by(|(_, left), (_, right)| {
+            compare_topology_siblings(&self.watch_cfg.sort, left, right)
+        });
+        decorated.into_iter().map(|(session, _)| session).collect()
     }
 
-    fn compare_windows(&self, left: &WindowNode, right: &WindowNode) -> Ordering {
-        compare_topology_siblings(
-            &self.watch_cfg.sort,
-            TopologySortFacts::for_window(left),
-            TopologySortFacts::for_window(right),
-        )
+    fn sorted_windows<'a>(
+        &self,
+        windows: impl Iterator<Item = &'a WindowNode>,
+    ) -> Vec<&'a WindowNode> {
+        let mut decorated = windows
+            .map(|window| (window, TopologySortFacts::for_window(window)))
+            .collect::<Vec<_>>();
+        decorated.sort_by(|(_, left), (_, right)| {
+            compare_topology_siblings(&self.watch_cfg.sort, left, right)
+        });
+        decorated.into_iter().map(|(window, _)| window).collect()
     }
 
-    fn compare_panes(&self, left: &PaneNode, right: &PaneNode) -> Ordering {
-        compare_topology_siblings(
-            &self.watch_cfg.sort,
-            TopologySortFacts::for_pane(left),
-            TopologySortFacts::for_pane(right),
-        )
+    fn sorted_panes<'a>(&self, panes: impl Iterator<Item = &'a PaneNode>) -> Vec<&'a PaneNode> {
+        let mut decorated = panes
+            .map(|pane| (pane, TopologySortFacts::for_pane(pane)))
+            .collect::<Vec<_>>();
+        decorated.sort_by(|(_, left), (_, right)| {
+            compare_topology_siblings(&self.watch_cfg.sort, left, right)
+        });
+        decorated.into_iter().map(|(pane, _)| pane).collect()
     }
 
     fn selected_tree_target(&self) -> Option<TreeTarget> {
@@ -3588,7 +3703,14 @@ impl App {
                         .as_ref()
                         .and_then(|hint| self.initial_tree_pane_key(hint))
                     {
-                        self.set_focused_tree_expansion(Some(&TopologyNodeKey::Pane(pane)));
+                        let initial_key = match self.watch_cfg.view {
+                            WatchView::Session => {
+                                TopologyNodeKey::Session(pane.window.session.clone())
+                            }
+                            WatchView::Window => TopologyNodeKey::Window(pane.window.clone()),
+                            WatchView::Pane => TopologyNodeKey::Pane(pane),
+                        };
+                        self.set_focused_tree_expansion(Some(&initial_key));
                         targets = self.tree_targets();
                     }
                 }
@@ -3710,7 +3832,17 @@ impl App {
         if self.uses_tree() {
             let targets = self.tree_targets();
             if !targets.is_empty() {
-                let index = if last { targets.len() - 1 } else { 0 };
+                let current = self
+                    .table_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(targets.len() - 1);
+                let (candidates, _) = self.tree_vertical_navigation(&targets, current);
+                let index = if last {
+                    *candidates.last().unwrap_or(&current)
+                } else {
+                    *candidates.first().unwrap_or(&current)
+                };
                 let key = targets[index].key.clone();
                 self.table_state.select(Some(index));
                 self.sync_focused_tree_expansion(key);
@@ -3743,26 +3875,80 @@ impl App {
 
     fn move_tree_vertical(&mut self, delta: isize, wrap: bool) {
         let targets = self.tree_targets();
-        let len = targets.len();
-        if len == 0 {
+        if targets.is_empty() {
             return;
         }
-        let current = self.table_state.selected().unwrap_or(0).min(len - 1);
-        let next = if wrap {
+        let current = self
+            .table_state
+            .selected()
+            .unwrap_or(0)
+            .min(targets.len() - 1);
+        let (candidates, current_position) = self.tree_vertical_navigation(&targets, current);
+        if candidates.is_empty() {
+            return;
+        }
+        let step = delta.unsigned_abs();
+        let next_position = if wrap {
             if delta.is_negative() {
-                current.checked_sub(delta.unsigned_abs()).unwrap_or(len - 1)
+                (current_position + candidates.len() - (step % candidates.len())) % candidates.len()
             } else {
-                current.saturating_add(delta.unsigned_abs()) % len
+                (current_position + (step % candidates.len())) % candidates.len()
             }
         } else if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs())
+            current_position.saturating_sub(step)
         } else {
-            current.saturating_add(delta.unsigned_abs()).min(len - 1)
+            current_position
+                .saturating_add(step)
+                .min(candidates.len() - 1)
         };
+        let next = candidates[next_position];
         let key = targets[next].key.clone();
         self.table_state.select(Some(next));
         self.sync_focused_tree_expansion(key);
         self.pin_filtered_tree_selection();
+    }
+
+    /// In the accordion presentation, visible descendants are context rather
+    /// than mandatory cursor stops. Vertical movement stays within the
+    /// selected node's sibling group; `h`/`l` cross hierarchy levels. A
+    /// one-node sibling group bubbles to its parent's siblings so vertical
+    /// navigation never gets trapped at a single window or pane. The other
+    /// expansion policies retain the conventional visible-row order.
+    fn tree_vertical_navigation(
+        &self,
+        targets: &[TreeTarget],
+        current: usize,
+    ) -> (Vec<usize>, usize) {
+        if self.watch_cfg.tree_expansion != WatchTreeExpansion::Focus {
+            return ((0..targets.len()).collect(), current);
+        }
+
+        let mut anchor = targets[current].key.clone();
+        loop {
+            let candidates = targets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, target)| {
+                    same_topology_parent(&anchor, &target.key).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let anchor_index = targets
+                .iter()
+                .position(|target| target.key == anchor)
+                .unwrap_or(current);
+            let anchor_position = candidates
+                .iter()
+                .position(|candidate| *candidate == anchor_index)
+                .unwrap_or(0);
+
+            if candidates.len() != 1 {
+                return (candidates, anchor_position);
+            }
+            let Some(parent) = topology_parent_key(&anchor) else {
+                return (candidates, anchor_position);
+            };
+            anchor = parent;
+        }
     }
 
     fn vertical_candidates(
@@ -3843,15 +4029,20 @@ impl App {
         };
         if target.has_children && !self.expanded_nodes.contains(&target.key) {
             self.expanded_nodes.insert(target.key.clone());
-            if let Some(index) = self
-                .tree_targets()
-                .iter()
-                .position(|candidate| candidate.key == target.key)
-            {
-                self.table_state.select(Some(index));
-                self.pin_filtered_tree_selection();
+            // In focus mode Right/l means "enter": reveal and select the
+            // first child in one step. Manual/always retain conventional
+            // two-step expand-then-enter tree navigation.
+            if self.watch_cfg.tree_expansion != WatchTreeExpansion::Focus {
+                if let Some(index) = self
+                    .tree_targets()
+                    .iter()
+                    .position(|candidate| candidate.key == target.key)
+                {
+                    self.table_state.select(Some(index));
+                    self.pin_filtered_tree_selection();
+                }
+                return;
             }
-            return;
         }
         let targets = self.tree_targets();
         let Some(index) = targets
@@ -3875,6 +4066,19 @@ impl App {
         let Some(target) = self.selected_tree_target() else {
             return;
         };
+        let parent = topology_parent_key(&target.key);
+
+        // Focus mode expands the selected path automatically, so collapsing
+        // that same node would be immediately undone on refresh. Treat left
+        // as a direct one-level ascent instead.
+        if self.watch_cfg.tree_expansion == WatchTreeExpansion::Focus {
+            if let Some(parent) = parent {
+                self.sync_focused_tree_expansion(parent);
+                self.pin_filtered_tree_selection();
+            }
+            return;
+        }
+
         if target.has_children && self.expanded_nodes.remove(&target.key) {
             if let Some(index) = self
                 .tree_targets()
@@ -3886,11 +4090,6 @@ impl App {
             }
             return;
         }
-        let parent = match &target.key {
-            TopologyNodeKey::Session(_) => None,
-            TopologyNodeKey::Window(key) => Some(TopologyNodeKey::Session(key.session.clone())),
-            TopologyNodeKey::Pane(key) => Some(TopologyNodeKey::Window(key.window.clone())),
-        };
         if let Some(parent) = parent {
             if let Some(index) = self
                 .tree_targets()
@@ -4193,6 +4392,29 @@ fn default_tree_expanded(key: &TopologyNodeKey, view: WatchView) -> bool {
     )
 }
 
+fn same_topology_parent(left: &TopologyNodeKey, right: &TopologyNodeKey) -> bool {
+    match (left, right) {
+        (TopologyNodeKey::Session(_), TopologyNodeKey::Session(_)) => true,
+        (TopologyNodeKey::Window(left), TopologyNodeKey::Window(right)) => {
+            left.session == right.session
+        }
+        (TopologyNodeKey::Pane(left), TopologyNodeKey::Pane(right)) => left.window == right.window,
+        _ => false,
+    }
+}
+
+fn topology_parent_key(key: &TopologyNodeKey) -> Option<TopologyNodeKey> {
+    match key {
+        TopologyNodeKey::Session(_) => None,
+        TopologyNodeKey::Window(key) => Some(TopologyNodeKey::Session(key.session.clone())),
+        TopologyNodeKey::Pane(key) => Some(TopologyNodeKey::Window(key.window.clone())),
+    }
+}
+
+fn selected_tree_target_from<'a>(app: &App, targets: &'a [TreeTarget]) -> Option<&'a TreeTarget> {
+    targets.get(app.table_state.selected()?)
+}
+
 fn distribution_rank(states: &StateDistribution) -> u8 {
     if states.error > 0 {
         state_sort_rank(AgentState::Error)
@@ -4316,7 +4538,7 @@ struct TopologySortFacts {
     duration_secs: u64,
     native_index: u64,
     pane_id: String,
-    stable: String,
+    stable: TopologyNodeKey,
 }
 
 impl TopologySortFacts {
@@ -4333,28 +4555,31 @@ impl TopologySortFacts {
             duration_secs,
             native_index: 0,
             pane_id: String::new(),
-            stable: serde_json::to_string(&session.key).unwrap_or_default(),
+            stable: session.node_key(),
         }
     }
 
     fn for_window(window: &WindowNode) -> Self {
-        let agents: Vec<&Agent> = window
+        let now = OffsetDateTime::now_utc();
+        let earliest = window
             .panes
             .iter()
-            .filter_map(|pane| pane.agent.as_ref())
-            .collect();
-        let now = OffsetDateTime::now_utc();
-        let earliest = agents.iter().map(|agent| agent.started_at).min();
+            .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.started_at))
+            .min();
         Self {
             label: window.name.clone(),
             state_rank: distribution_rank(&window.states),
-            activity: agents.iter().map(|agent| agent.last_activity_at).max(),
+            activity: window
+                .panes
+                .iter()
+                .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.last_activity_at))
+                .max(),
             duration_secs: earliest.map_or(0, |at| {
                 u64::try_from((now - at).whole_seconds().max(0)).unwrap_or(u64::MAX)
             }),
             native_index: window.index.parse().unwrap_or(u64::MAX),
             pane_id: String::new(),
-            stable: serde_json::to_string(&window.key).unwrap_or_default(),
+            stable: window.node_key(),
         }
     }
 
@@ -4376,15 +4601,15 @@ impl TopologySortFacts {
             }),
             native_index: pane.index.parse().unwrap_or(u64::MAX),
             pane_id: pane.key.pane_id.clone(),
-            stable: serde_json::to_string(&pane.key).unwrap_or_default(),
+            stable: pane.node_key(),
         }
     }
 }
 
 fn compare_topology_siblings(
     keys: &[WatchSortKey],
-    left: TopologySortFacts,
-    right: TopologySortFacts,
+    left: &TopologySortFacts,
+    right: &TopologySortFacts,
 ) -> Ordering {
     for key in keys {
         let ordering = match key {
@@ -6246,6 +6471,8 @@ pub async fn run(
     let sub_client = client.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     let (outcome_tx, mut outcome_rx) = mpsc::channel::<RefreshOutcome>(OUTCOME_CAPACITY);
+    let (window_capture_tx, mut window_capture_rx) = mpsc::channel::<CapturedWindow>(1);
+    let mut window_capture_task: Option<(WindowKey, tokio::task::JoinHandle<()>)> = None;
 
     // Subscribe lazily inside the refresh task so its `await` doesn't
     // block the first paint. Falls back to polling on any error
@@ -6295,10 +6522,14 @@ pub async fn run(
         // the calm 1 s idle repaint.
         let spinning = (app.watch_cfg.layout == WatchLayout::Swarm || app.watch_cfg.spinner)
             && icons_unicode()
-            && rows_have_active_spinner(&app.rows);
+            && app.visible_spinner_active;
         let animating = spinning || app.has_active_pulse(std::time::Instant::now());
         let redraw_interval = if animating {
-            SWARM_REDRAW_INTERVAL
+            if app.watch_cfg.layout == WatchLayout::Swarm {
+                SWARM_REDRAW_INTERVAL
+            } else {
+                TREE_REDRAW_INTERVAL
+            }
         } else {
             IDLE_REDRAW_INTERVAL
         };
@@ -6752,15 +6983,58 @@ pub async fn run(
                     .await
                     .ok()
                     .flatten();
-                    app.pane_capture = Some(CapturedPane {
-                        pane_id: capture_pane,
-                        socket: capture_socket,
-                        text: captured.unwrap_or_default(),
-                        fetched_at: std::time::Instant::now(),
-                    });
+                    app.pane_capture = Some(CapturedPane::new(
+                        capture_pane,
+                        capture_socket,
+                        captured.unwrap_or_default(),
+                    ));
                     // Fresh preview bytes — repaint to show them.
                     needs_render = true;
                 }
+            }
+        }
+
+        // Accept completed snapshots without ever awaiting capture on the
+        // input loop. A stale result from a window the cursor already left is
+        // discarded; the next selected target is scheduled immediately.
+        while let Ok(captured) = window_capture_rx.try_recv() {
+            window_capture_task = None;
+            if app.window_capture_target.as_ref() == Some(&captured.key) {
+                app.window_capture = Some(captured);
+                needs_render = true;
+            }
+        }
+
+        // A panic or an early sender failure produces no channel item. Reap
+        // such a finished wrapper as well so one failed capture cannot leave
+        // window previews permanently disabled for the rest of the run.
+        if window_capture_task
+            .as_ref()
+            .is_some_and(|(_, task)| task.is_finished())
+        {
+            let (_, task) = window_capture_task.take().expect("task checked above");
+            let _ = task.await;
+        }
+
+        // Geometry and pane captures run in a detached blocking task. Keep at
+        // most one in flight across all selections; spawn_blocking work cannot
+        // be cancelled once started, so waiting for that one result is what
+        // prevents rapid navigation from piling up subprocess batches.
+        if let Some(window_key) = app.window_capture_target.clone() {
+            let stale = app.window_capture.as_ref().is_none_or(|capture| {
+                capture.key != window_key || capture.fetched_at.elapsed() >= WINDOW_CAPTURE_INTERVAL
+            });
+            if stale && window_capture_task.is_none() {
+                let requested = window_key.clone();
+                let tx = window_capture_tx.clone();
+                let task = tokio::spawn(async move {
+                    if let Ok(captured) =
+                        tokio::task::spawn_blocking(move || capture_tmux_window(requested)).await
+                    {
+                        let _ = tx.send(captured).await;
+                    }
+                });
+                window_capture_task = Some((window_key, task));
             }
         }
 
@@ -6813,6 +7087,9 @@ pub async fn run(
     // usual fetch latency (sub-50 ms) so a healthy run never hits it.
     drop(wake_tx);
     drop(outcome_rx);
+    if let Some((_, task)) = window_capture_task.take() {
+        task.abort();
+    }
     if tokio::time::timeout(Duration::from_secs(2), bg)
         .await
         .is_err()
@@ -9081,6 +9358,22 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // spinners cycle. Harmless for the table views (which ignore it).
     app.anim_frame = app.anim_frame.wrapping_add(1);
     app.sync_auto_expansion();
+    // Sorting/filtering the canonical hierarchy is the most expensive pure
+    // render calculation. Build it once and share it across header, table,
+    // inspector, and footer instead of rebuilding it for every surface.
+    let tree_targets = app.uses_tree().then(|| app.tree_targets());
+    let tree_targets = tree_targets.as_deref();
+    app.visible_spinner_active = if let Some(targets) = tree_targets {
+        targets.iter().any(|target| {
+            app.topology.find(&target.key).is_some_and(|node| {
+                tree_node_states(node)
+                    .into_iter()
+                    .any(|state| matches!(state, AgentState::Working | AgentState::Starting))
+            })
+        })
+    } else {
+        rows_have_active_spinner(&app.rows)
+    };
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -9091,7 +9384,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    render_header(f, chunks[0], app);
+    render_header(f, chunks[0], app, tree_targets);
     match app.preview.as_ref().map(|p| p.mode) {
         Some(PreviewMode::Fullscreen) => {
             render_preview(f, chunks[1], app);
@@ -9101,13 +9394,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             // "where am I in the list" — then `Clear` the popup area
             // (wipes the cells under it so the popup paints clean) and
             // render the preview on top.
-            render_body(f, chunks[1], app);
+            render_body(f, chunks[1], app, tree_targets);
             let popup_area = centered_rect(80, 70, chunks[1]);
             f.render_widget(Clear, popup_area);
             render_preview(f, popup_area, app);
         }
         None => {
-            render_body(f, chunks[1], app);
+            render_body(f, chunks[1], app, tree_targets);
         }
     }
     // Overlays land on top of either the preview or the table —
@@ -9166,7 +9459,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_confirm(f, popup_area, app);
     }
-    render_footer(f, chunks[2], app);
+    render_footer(f, chunks[2], app, tree_targets);
 }
 
 fn command_popup_rect(r: Rect) -> Rect {
@@ -10397,8 +10690,6 @@ fn build_pane_capture_body_on<'a>(
     pane_id: &str,
     socket: Option<&str>,
 ) -> ratatui::text::Text<'a> {
-    use ansi_to_tui::IntoText;
-
     let placeholder = |msg: &str| {
         ratatui::text::Text::from(ratatui::text::Line::from(Span::styled(
             msg.to_string(),
@@ -10420,10 +10711,9 @@ fn build_pane_capture_body_on<'a>(
         return placeholder("(pane gone or capture failed)");
     }
     cached
-        .text
-        .as_bytes()
-        .into_text()
-        .unwrap_or_else(|_| placeholder("(could not parse pane content)"))
+        .parsed
+        .clone()
+        .unwrap_or_else(|| placeholder("(could not parse pane content)"))
 }
 
 /// Compose the textual body of the preview pane. Pulled out so unit tests
@@ -10576,7 +10866,7 @@ fn header_state_summary_spans(
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_header(f: &mut Frame, area: Rect, app: &App) {
+fn render_header(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[TreeTarget]>) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let agents = app
         .rows
@@ -10730,7 +11020,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(text, Style::default().fg(Color::Red)))
     } else if app.explicit_search || !app.search_query.is_empty() || app.attention_only {
         let visible = if app.uses_tree() {
-            app.tree_targets().len()
+            tree_targets.map_or(0, <[TreeTarget]>::len)
         } else {
             app.visible_targets().len()
         };
@@ -10766,11 +11056,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 
 /// Dispatch the main body according to presentation; granularity remains a
 /// separate [`WatchView`] concern.
-fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_body(f: &mut Frame, area: Rect, app: &mut App, tree_targets: Option<&[TreeTarget]>) {
     let split_inspector = app.inspector_enabled
         && area.width >= 120
         && if app.uses_tree() {
-            app.selected_node_key().is_some()
+            selected_tree_target_from(app, tree_targets.unwrap_or_default()).is_some()
         } else {
             app.selected_pane().is_some()
         }
@@ -10787,6 +11077,22 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
     // asking it for something. The mailbox and help stay in the list
     // because those are full-height panels that need the width.
     app.inspector_visible = split_inspector;
+    app.window_capture_target = if split_inspector && app.uses_tree() {
+        selected_tree_target_from(app, tree_targets.unwrap_or_default()).and_then(|target| {
+            match &target.key {
+                TopologyNodeKey::Window(key)
+                    if key.session.endpoint.host == muxa::HostKind::Tmux =>
+                {
+                    Some(key.clone())
+                }
+                TopologyNodeKey::Session(_)
+                | TopologyNodeKey::Window(_)
+                | TopologyNodeKey::Pane(_) => None,
+            }
+        })
+    } else {
+        None
+    };
     if split_inspector {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -10795,28 +11101,33 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Percentage(100 - app.inspector_split.list_pct()),
             ])
             .split(area);
-        render_primary_body(f, columns[0], app);
-        render_inspector(f, columns[1], app);
+        render_primary_body(f, columns[0], app, tree_targets);
+        render_inspector(f, columns[1], app, tree_targets);
         return;
     }
-    render_primary_body(f, area, app);
+    render_primary_body(f, area, app, tree_targets);
 }
 
-fn render_primary_body(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_primary_body(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    tree_targets: Option<&[TreeTarget]>,
+) {
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
     if app.legacy_flat_table {
         render_table(f, area, app);
     } else if app.watch_cfg.layout == WatchLayout::Swarm {
-        render_swarm(f, area, app);
+        render_swarm(f, area, app, tree_targets.unwrap_or_default());
     } else {
-        render_tree_table(f, area, app);
+        render_tree_table(f, area, app, tree_targets.unwrap_or_default());
     }
 }
 
-fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
+fn render_inspector(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[TreeTarget]>) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     if app.uses_tree() {
-        render_topology_inspector(f, area, app, theme);
+        render_topology_inspector(f, area, app, tree_targets.unwrap_or_default(), theme);
         return;
     }
     let Some(pane_id) = app.selected_pane() else {
@@ -10952,12 +11263,469 @@ fn inspector_rule(width: u16, theme: WatchThemeSpec) -> Line<'static> {
     ))
 }
 
+fn inspector_agent_summary(agent: &Agent) -> String {
+    agent
+        .last_notification
+        .as_deref()
+        .or(agent.recap.as_deref())
+        .or(agent.ai_title.as_deref())
+        .or(agent.last_prompt.as_deref())
+        .unwrap_or("—")
+        .replace('\n', " ")
+}
+
+fn inspector_latest_agent<'a>(
+    panes: impl Iterator<Item = &'a PaneNode>,
+) -> Option<(&'a PaneNode, &'a Agent)> {
+    panes
+        .filter_map(|pane| pane.agent.as_ref().map(|agent| (pane, agent)))
+        .max_by_key(|(_, agent)| agent.last_activity_at)
+}
+
+fn inspector_priority_agent<'a>(
+    panes: impl Iterator<Item = &'a PaneNode>,
+) -> Option<(&'a PaneNode, &'a Agent)> {
+    panes
+        .filter_map(|pane| pane.agent.as_ref().map(|agent| (pane, agent)))
+        .min_by(|(_, left), (_, right)| {
+            state_sort_rank(left.state)
+                .cmp(&state_sort_rank(right.state))
+                .then_with(|| left.state_entered_at.cmp(&right.state_entered_at))
+                .then_with(|| right.last_activity_at.cmp(&left.last_activity_at))
+        })
+}
+
+#[derive(Default)]
+struct InspectorLoad {
+    processes: u32,
+    shells: u32,
+    subagents: u32,
+    max_context: Option<f32>,
+    cost: f64,
+    has_cost: bool,
+}
+
+fn inspector_load(panes: &[PaneNode]) -> InspectorLoad {
+    let mut load = InspectorLoad::default();
+    for agent in panes.iter().filter_map(|pane| pane.agent.as_ref()) {
+        load.processes += u32::from(agent.workload.process_count);
+        load.shells += u32::from(agent.workload.shell_count);
+        load.subagents += u32::from(agent.workload.subagent_count)
+            .max(u32::try_from(agent.subagents.len()).unwrap_or(u32::MAX));
+        if let Some(context) = agent.context_used_pct {
+            load.max_context = Some(load.max_context.map_or(context, |old| old.max(context)));
+        }
+        if let Some(cost) = agent.cost_usd {
+            load.cost += cost;
+            load.has_cost = true;
+        }
+    }
+    load
+}
+
+fn inspector_field_line(
+    label: &'static str,
+    value: String,
+    width: usize,
+    theme: WatchThemeSpec,
+) -> Line<'static> {
+    let value_width = width.saturating_sub(label.chars().count() + 2);
+    Line::from(vec![
+        Span::styled(format!("{label}  "), theme.dim_style()),
+        Span::raw(truncate_chars(&value, value_width)),
+    ])
+}
+
+fn inspector_attention_line(
+    location: String,
+    agent: &Agent,
+    now: OffsetDateTime,
+    width: usize,
+    theme: WatchThemeSpec,
+) -> Line<'static> {
+    let value = format!(
+        "{location} · {} {} · {}",
+        state_age_label(agent.state),
+        relative_time(agent.state_entered_at, now),
+        inspector_agent_summary(agent)
+    );
+    let value_width = width.saturating_sub(11);
+    Line::from(vec![
+        Span::styled("attention  ", theme.state_style(agent.state)),
+        Span::styled(
+            truncate_chars(&value, value_width),
+            theme.state_style(agent.state),
+        ),
+    ])
+}
+
+fn inspector_window_roster_line(
+    window: &WindowNode,
+    width: usize,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) -> Line<'static> {
+    let priority = inspector_priority_agent(window.panes.iter());
+    let latest = inspector_latest_agent(window.panes.iter());
+    let name = format!("{}:{}", window.index, window.name);
+    let counts = format!("{}/{}", window.states.total(), window.panes.len());
+    let summary = latest.map_or_else(
+        || "no tracked agents".into(),
+        |(_, agent)| inspector_agent_summary(agent),
+    );
+    let (glyph, style, state, age) = priority.map_or_else(
+        || ("○", theme.dim_style(), "—", "—".into()),
+        |(_, agent)| {
+            let (glyph, style) = state_marker(agent.state, theme, spin);
+            (
+                glyph,
+                style,
+                state_age_label(agent.state),
+                relative_time(agent.state_entered_at, now),
+            )
+        },
+    );
+    let name_width = if width >= 68 { 18 } else { 12 };
+    let body = if width >= 56 {
+        format!(" {name:<name_width$} {counts:>5} {state:<6} {age:<4} {summary}")
+    } else {
+        format!(" {name:<name_width$} {counts:>5} {state:<6} {summary}")
+    };
+    Line::from(vec![
+        Span::styled(glyph.to_string(), style),
+        Span::raw(truncate_chars(&body, width.saturating_sub(1))),
+    ])
+}
+
+fn inspector_pane_roster_line(
+    pane: &PaneNode,
+    width: usize,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) -> Line<'static> {
+    inspector_pane_roster_line_with_prefix(pane, width, now, theme, spin, "")
+}
+
+fn inspector_pane_roster_line_with_prefix(
+    pane: &PaneNode,
+    width: usize,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+    prefix: &'static str,
+) -> Line<'static> {
+    let prefix_width = prefix.chars().count();
+    let body_width = width.saturating_sub(prefix_width.saturating_add(1));
+    let Some(agent) = pane.agent.as_ref() else {
+        let body = format!(
+            " {:<5} {:<8} {} · {}",
+            pane.key.pane_id, pane.current_command, pane.title, pane.cwd
+        );
+        return Line::from(vec![
+            Span::styled(prefix, theme.dim_style()),
+            Span::styled("○", theme.dim_style()),
+            Span::styled(truncate_chars(&body, body_width), theme.dim_style()),
+        ]);
+    };
+
+    let (glyph, style) = state_marker(agent.state, theme, spin);
+    let age = relative_time(agent.state_entered_at, now);
+    let summary = inspector_agent_summary(agent);
+    let body = if width >= 68 {
+        let model = agent.model.as_deref().unwrap_or("—");
+        let context = agent
+            .context_used_pct
+            .map_or_else(|| "—".into(), |value| format!("{value:.0}%"));
+        format!(
+            " {:<5} {:<8} {:<6} {:<4} {:<10} {:>4} {}",
+            pane.key.pane_id,
+            agent_kind_short(agent.kind),
+            state_age_label(agent.state),
+            age,
+            model,
+            context,
+            summary
+        )
+    } else {
+        format!(
+            " {:<5} {:<8} {:<6} {:<4} {}",
+            pane.key.pane_id,
+            agent_kind_short(agent.kind),
+            state_age_label(agent.state),
+            age,
+            summary
+        )
+    };
+    Line::from(vec![
+        Span::styled(prefix, theme.dim_style()),
+        Span::styled(glyph.to_string(), style),
+        Span::raw(truncate_chars(&body, body_width)),
+    ])
+}
+
+fn extend_inspector_roster(
+    lines: &mut Vec<Line<'static>>,
+    rows: Vec<Line<'static>>,
+    total_rows: usize,
+    area_height: u16,
+    theme: WatchThemeSpec,
+) {
+    // Subtract the border and the aggregate status line inserted by the
+    // caller after this body is built.
+    let available =
+        usize::from(area_height.saturating_sub(2)).saturating_sub(lines.len().saturating_add(1));
+    if total_rows <= available {
+        lines.extend(rows);
+        return;
+    }
+    if available == 0 {
+        return;
+    }
+    let visible = available.saturating_sub(1);
+    let hidden = total_rows.saturating_sub(visible);
+    lines.extend(rows.into_iter().take(visible));
+    lines.push(Line::from(Span::styled(
+        format!("+{hidden} more"),
+        theme.dim_style(),
+    )));
+}
+
+fn matching_window_capture<'a>(app: &'a App, window: &WindowNode) -> Option<&'a CapturedWindow> {
+    app.window_capture
+        .as_ref()
+        .filter(|capture| capture.key == window.key && !capture.panes.is_empty())
+}
+
+fn window_mosaic_area(area: Rect, window: &WindowNode) -> Option<Rect> {
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let has_attention = inspector_priority_agent(window.panes.iter())
+        .is_some_and(|(_, agent)| agent_needs_attention(agent.state));
+    // status + scope/load/room/cwd + optional attention + latest + rule.
+    // The mosaic replaces the textual `panes` header and every roster row
+    // below it, while those lines remain the no-cache fallback.
+    let summary_height = 7_u16 + u16::from(has_attention);
+    let mosaic = Rect::new(
+        inner.x,
+        inner.y.saturating_add(summary_height),
+        inner.width,
+        inner.height.saturating_sub(summary_height),
+    );
+    (mosaic.width >= WINDOW_MOSAIC_MIN_WIDTH && mosaic.height >= WINDOW_MOSAIC_MIN_HEIGHT)
+        .then_some(mosaic)
+}
+
+fn scaled_window_pane_rect(
+    geometry: &PaneGeometry,
+    source_width: u32,
+    source_height: u32,
+    area: Rect,
+) -> Option<Rect> {
+    if source_width == 0 || source_height == 0 || area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let scale = |position: u32, source: u32, target: u16| -> u16 {
+        let value = position
+            .saturating_mul(u32::from(target))
+            .saturating_div(source)
+            .min(u32::from(target));
+        u16::try_from(value).unwrap_or(target)
+    };
+    let left = scale(u32::from(geometry.left), source_width, area.width);
+    let top = scale(u32::from(geometry.top), source_height, area.height);
+    let mut right = scale(
+        u32::from(geometry.left) + u32::from(geometry.width),
+        source_width,
+        area.width,
+    );
+    let mut bottom = scale(
+        u32::from(geometry.top) + u32::from(geometry.height),
+        source_height,
+        area.height,
+    );
+    right = right.max(left.saturating_add(1)).min(area.width);
+    bottom = bottom.max(top.saturating_add(1)).min(area.height);
+    if left >= area.width || top >= area.height || right <= left || bottom <= top {
+        return None;
+    }
+    Some(Rect::new(
+        area.x.saturating_add(left),
+        area.y.saturating_add(top),
+        right - left,
+        bottom - top,
+    ))
+}
+
+fn render_window_mosaic_cell(
+    f: &mut Frame,
+    rect: Rect,
+    window: &WindowNode,
+    captured: &CapturedWindowPane,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) {
+    let pane = window
+        .panes
+        .iter()
+        .find(|pane| pane.key.pane_id == captured.geometry.pane_id);
+    let agent = pane.and_then(|pane| pane.agent.as_ref());
+    let (glyph, state_style) = agent.map_or_else(
+        || ("○", theme.dim_style()),
+        |agent| state_marker(agent.state, theme, spin),
+    );
+    let mut title = vec![
+        Span::raw(" "),
+        Span::styled(glyph.to_string(), state_style),
+        Span::styled(
+            format!(" {}", captured.geometry.pane_id),
+            if captured.geometry.active {
+                theme.accent_badge()
+            } else {
+                Style::default()
+            },
+        ),
+    ];
+    if rect.width >= 18 {
+        let detail = agent.map_or_else(
+            || captured.geometry.command.clone(),
+            |agent| {
+                format!(
+                    " · {} {}",
+                    agent_kind_short(agent.kind),
+                    state_age_label(agent.state)
+                )
+            },
+        );
+        title.push(Span::styled(detail, theme.dim_style()));
+    }
+    title.push(Span::raw(" "));
+
+    if rect.width < 5 || rect.height < 3 {
+        f.render_widget(Clear, rect);
+        f.render_widget(Paragraph::new(Line::from(title)), rect);
+        return;
+    }
+
+    let border_style = agent.map_or_else(
+        || theme.border_style(),
+        |agent| {
+            if agent_needs_attention(agent.state) || captured.geometry.active {
+                theme.state_style(agent.state).add_modifier(Modifier::BOLD)
+            } else {
+                theme.border_style()
+            }
+        },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if captured.geometry.active {
+            BorderType::Double
+        } else {
+            theme.border_type
+        })
+        .border_style(border_style)
+        .title(Line::from(title));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let Some(text) = captured.text.as_ref() else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "(capture unavailable)",
+                theme.dim_style().add_modifier(Modifier::ITALIC),
+            ))),
+            inner,
+        );
+        return;
+    };
+    let scroll = text.lines.len().saturating_sub(usize::from(inner.height));
+    f.render_widget(
+        Paragraph::new(text.clone()).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        inner,
+    );
+}
+
+fn render_window_mosaic(
+    f: &mut Frame,
+    area: Rect,
+    window: &WindowNode,
+    capture: &CapturedWindow,
+    theme: WatchThemeSpec,
+    spin: Spinner,
+) {
+    f.render_widget(Clear, area);
+    let header = Rect { height: 1, ..area };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("live layout", theme.accent_badge()),
+            Span::styled("  pane geometry · 1s refresh", theme.dim_style()),
+        ])),
+        header,
+    );
+    let canvas = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    if canvas.height == 0 {
+        return;
+    }
+
+    let source_width = capture
+        .panes
+        .iter()
+        .map(|pane| u32::from(pane.geometry.left) + u32::from(pane.geometry.width))
+        .max()
+        .unwrap_or(0);
+    let source_height = capture
+        .panes
+        .iter()
+        .map(|pane| u32::from(pane.geometry.top) + u32::from(pane.geometry.height))
+        .max()
+        .unwrap_or(0);
+
+    for captured in &capture.panes {
+        let rect = if capture.zoomed && captured.geometry.active {
+            Some(canvas)
+        } else {
+            scaled_window_pane_rect(&captured.geometry, source_width, source_height, canvas)
+        };
+        let Some(rect) = rect else {
+            continue;
+        };
+        render_window_mosaic_cell(f, rect, window, captured, theme, spin);
+    }
+}
+
 #[allow(clippy::too_many_lines)] // one hierarchy-specific inspector body per match arm
-fn render_topology_inspector(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
-    let Some(node) = app.selected_node() else {
+fn render_topology_inspector(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    tree_targets: &[TreeTarget],
+    theme: WatchThemeSpec,
+) {
+    let Some(node) = selected_tree_target_from(app, tree_targets)
+        .and_then(|target| app.topology.find(&target.key))
+    else {
         return;
     };
     let now = OffsetDateTime::now_utc();
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let spin = Spinner {
+        frame: app.anim_frame,
+        enabled: app.watch_cfg.spinner && icons_unicode(),
+    };
     let (title, mut lines) = match node {
         TopologyNodeRef::Session(session) => {
             let attached = session
@@ -10965,52 +11733,164 @@ fn render_topology_inspector(f: &mut Frame, area: Rect, app: &App, theme: WatchT
                 .map_or_else(|| "unknown".into(), |count| count.to_string());
             let duration = unambiguous_session_activity_secs(app, session, now)
                 .map_or_else(|| "—".into(), format_duration);
+            let latest = inspector_latest_agent(
+                session
+                    .windows
+                    .iter()
+                    .flat_map(|window| window.panes.iter()),
+            )
+            .map_or_else(
+                || "—".into(),
+                |(pane, agent)| {
+                    let window_name = session
+                        .windows
+                        .iter()
+                        .find(|window| window.key == pane.key.window)
+                        .map_or("?", |window| window.name.as_str());
+                    format!(
+                        "{} · {} · {window_name}/{} · {}",
+                        relative_time(agent.last_activity_at, now),
+                        agent_kind_short(agent.kind),
+                        pane.key.pane_id,
+                        inspector_agent_summary(agent)
+                    )
+                },
+            );
+            let mut session_lines = vec![
+                inspector_field_line(
+                    "scope",
+                    format!(
+                        "{} windows · {} panes · {} agents",
+                        session.windows.len(),
+                        session.pane_count(),
+                        session.states.total()
+                    ),
+                    width,
+                    theme,
+                ),
+                inspector_field_line(
+                    "presence",
+                    format!("{attached} clients · {duration} attached"),
+                    width,
+                    theme,
+                ),
+            ];
+            if let Some((pane, agent)) = inspector_priority_agent(
+                session
+                    .windows
+                    .iter()
+                    .flat_map(|window| window.panes.iter()),
+            ) {
+                if agent_needs_attention(agent.state) {
+                    let window_name = session
+                        .windows
+                        .iter()
+                        .find(|window| window.key == pane.key.window)
+                        .map_or("?", |window| window.name.as_str());
+                    session_lines.push(inspector_attention_line(
+                        format!("{window_name}/{}", pane.key.pane_id),
+                        agent,
+                        now,
+                        width,
+                        theme,
+                    ));
+                }
+            }
+            session_lines.extend([
+                inspector_field_line("latest", latest, width, theme),
+                inspector_field_line(
+                    "identity",
+                    format!(
+                        "{}:{} · session {}",
+                        session.key.endpoint.host,
+                        session.key.endpoint.socket,
+                        session.key.session_id
+                    ),
+                    width,
+                    theme,
+                ),
+                inspector_rule(area.width, theme),
+                Line::from(vec![
+                    Span::styled("topology", theme.accent_badge()),
+                    Span::styled(
+                        if width >= 68 {
+                            "  WINDOWS / PANES · A/P · STATE · AGE · MODEL/CTX · LATEST"
+                        } else if width >= 56 {
+                            "  WINDOWS / PANES · A/P · STATE · AGE · LATEST"
+                        } else {
+                            "  WINDOWS / PANES · STATE · LATEST"
+                        },
+                        theme.dim_style(),
+                    ),
+                ]),
+            ]);
+            let windows = app.sorted_windows(session.windows.iter());
+            let total_rows = windows
+                .iter()
+                .map(|window| 1_usize.saturating_add(window.panes.len()))
+                .sum::<usize>();
+            let available = usize::from(area.height.saturating_sub(2))
+                .saturating_sub(session_lines.len().saturating_add(1));
+            let row_limit = if total_rows > available {
+                available.saturating_sub(1)
+            } else {
+                available
+            };
+            let mut rows = Vec::with_capacity(row_limit);
+            for window in windows {
+                if rows.len() >= row_limit {
+                    break;
+                }
+                rows.push(inspector_window_roster_line(
+                    window, width, now, theme, spin,
+                ));
+                if rows.len() >= row_limit {
+                    break;
+                }
+                let panes = app.sorted_panes(window.panes.iter());
+                let pane_count = panes.len();
+                for (index, pane) in panes.into_iter().enumerate() {
+                    if rows.len() >= row_limit {
+                        break;
+                    }
+                    let last = index + 1 == pane_count;
+                    let branch = if icons_unicode() {
+                        if last {
+                            "  └─"
+                        } else {
+                            "  ├─"
+                        }
+                    } else if last {
+                        "  `-"
+                    } else {
+                        "  +-"
+                    };
+                    rows.push(inspector_pane_roster_line_with_prefix(
+                        pane, width, now, theme, spin, branch,
+                    ));
+                }
+            }
+            extend_inspector_roster(&mut session_lines, rows, total_rows, area.height, theme);
             (
                 format!(" Inspector · session {} ", session.name),
-                vec![
-                    Line::from(format!(
-                        "endpoint  {}:{}",
-                        session.key.endpoint.host, session.key.endpoint.socket
-                    )),
-                    Line::from(format!(
-                        "{} session id  {}",
-                        session.key.endpoint.host, session.key.session_id
-                    )),
-                    Line::from(format!(
-                        "topology  {} windows · {} panes",
-                        session.windows.len(),
-                        session.pane_count()
-                    )),
-                    Line::from(format!("attached clients  {attached}")),
-                    Line::from(format!("cumulative attached time  {duration}")),
-                ],
+                session_lines,
             )
         }
         TopologyNodeRef::Window(window) => {
-            let recent = window
-                .panes
-                .iter()
-                .filter_map(|pane| pane.agent.as_ref())
-                .max_by_key(|agent| agent.last_activity_at)
-                .map_or_else(
-                    || "—".into(),
-                    |agent| {
-                        let summary = agent
-                            .last_notification
-                            .as_deref()
-                            .or(agent.recap.as_deref())
-                            .or(agent.ai_title.as_deref())
-                            .or(agent.last_prompt.as_deref())
-                            .unwrap_or("—")
-                            .replace('\n', " ");
-                        format!(
-                            "{} · {} · {}",
-                            agent_kind_short(agent.kind),
-                            relative_time(agent.last_activity_at, now),
-                            truncate_chars(&summary, usize::from(area.width.saturating_sub(8)))
-                        )
-                    },
-                );
+            let mosaic_ready = matching_window_capture(app, window).is_some()
+                && window_mosaic_area(area, window).is_some();
+            let recent = inspector_latest_agent(window.panes.iter()).map_or_else(
+                || "—".into(),
+                |(pane, agent)| {
+                    format!(
+                        "{} · {} · {} · {}",
+                        relative_time(agent.last_activity_at, now),
+                        agent_kind_short(agent.kind),
+                        pane.key.pane_id,
+                        inspector_agent_summary(agent)
+                    )
+                },
+            );
             let incoming = app
                 .collaboration
                 .incoming
@@ -11029,13 +11909,13 @@ fn render_topology_inspector(f: &mut Frame, area: Rect, app: &App, theme: WatchT
                         || participant_matches_window(&request.to, window)
                 })
                 .count();
-            let room_status = app
+            let mailbox = app
                 .collaboration
                 .room
                 .as_ref()
                 .filter(|room| participant_matches_window(&room.current, window))
                 .map_or_else(
-                    || "not loaded for selected window".into(),
+                    || format!("not loaded · {incoming} incoming · {sent} sent"),
                     |room| {
                         format!(
                             "{} peers · {} unread · {incoming} incoming · {sent} sent",
@@ -11044,33 +11924,82 @@ fn render_topology_inspector(f: &mut Frame, area: Rect, app: &App, theme: WatchT
                         )
                     },
                 );
-            let mut window_lines = vec![
-                Line::from(format!("window id  {}", window.key.window_id)),
-                Line::from(format!(
-                    "room  {}:{}:{}",
-                    window.key.session.endpoint.host,
-                    window.key.session.endpoint.socket,
-                    window.key.window_id
-                )),
-                Line::from(format!("mailbox  {room_status}")),
-                Line::from(format!(
-                    "cwd  {}",
-                    window.cwd.as_deref().unwrap_or("mixed/unknown")
-                )),
-                Line::from(format!("recent  {recent}")),
-                inspector_rule(area.width, theme),
-                Line::from(Span::styled("pane roster", theme.accent_badge())),
+            let load = inspector_load(&window.panes);
+            let mut load_parts = vec![
+                format!("{} processes", load.processes),
+                format!("{} shells", load.shells),
+                format!("{} subagents", load.subagents),
             ];
-            for pane in &window.panes {
-                let owner = pane.agent.as_ref().map_or("untracked".into(), |agent| {
-                    format!("{} · {}", agent_kind_short(agent.kind), agent.state)
-                });
-                window_lines.push(Line::from(format!(
-                    "{}  {:<18}  {}",
-                    pane.key.pane_id,
-                    owner,
-                    truncate_chars(&pane.cwd, usize::from(area.width.saturating_sub(28)))
-                )));
+            if let Some(context) = load.max_context {
+                load_parts.push(format!("ctx max {context:.0}%"));
+            }
+            if load.has_cost {
+                load_parts.push(format!("cost ${:.2}", load.cost));
+            }
+            let mut window_lines = vec![
+                inspector_field_line(
+                    "scope",
+                    format!(
+                        "{} panes · {} agents",
+                        window.panes.len(),
+                        window.states.total()
+                    ),
+                    width,
+                    theme,
+                ),
+                inspector_field_line("load", load_parts.join(" · "), width, theme),
+                inspector_field_line(
+                    "room",
+                    format!(
+                        "{}:{}:{} · {mailbox}",
+                        window.key.session.endpoint.host,
+                        window.key.session.endpoint.socket,
+                        window.key.window_id
+                    ),
+                    width,
+                    theme,
+                ),
+                inspector_field_line(
+                    "cwd",
+                    window.cwd.as_deref().unwrap_or("mixed/unknown").into(),
+                    width,
+                    theme,
+                ),
+            ];
+            if let Some((pane, agent)) = inspector_priority_agent(window.panes.iter()) {
+                if agent_needs_attention(agent.state) {
+                    window_lines.push(inspector_attention_line(
+                        pane.key.pane_id.clone(),
+                        agent,
+                        now,
+                        width,
+                        theme,
+                    ));
+                }
+            }
+            window_lines.extend([
+                inspector_field_line("latest", recent, width, theme),
+                inspector_rule(area.width, theme),
+            ]);
+            if !mosaic_ready {
+                window_lines.push(Line::from(vec![
+                    Span::styled("panes", theme.accent_badge()),
+                    Span::styled(
+                        if width >= 68 {
+                            "  AGENT    STATE  AGE  MODEL      CTX  LATEST"
+                        } else {
+                            "  AGENT    STATE  AGE  LATEST"
+                        },
+                        theme.dim_style(),
+                    ),
+                ]));
+                let panes = app.sorted_panes(window.panes.iter());
+                let rows = panes
+                    .into_iter()
+                    .map(|pane| inspector_pane_roster_line(pane, width, now, theme, spin))
+                    .collect::<Vec<_>>();
+                let total_rows = rows.len();
+                extend_inspector_roster(&mut window_lines, rows, total_rows, area.height, theme);
             }
             (
                 format!(" Inspector · window {} ", window.name),
@@ -11182,6 +12111,14 @@ fn render_topology_inspector(f: &mut Frame, area: Rect, app: &App, theme: WatchT
         .border_type(theme.border_type)
         .title(Span::styled(title, theme.accent_badge()));
     f.render_widget(Paragraph::new(lines).block(block), area);
+    if let TopologyNodeRef::Window(window) = node {
+        if let (Some(capture), Some(mosaic_area)) = (
+            matching_window_capture(app, window),
+            window_mosaic_area(area, window),
+        ) {
+            render_window_mosaic(f, mosaic_area, window, capture, theme, spin);
+        }
+    }
 }
 
 // cli-spinners frames: `dots` for parent agents, `dots2` (denser) for
@@ -11381,9 +12318,9 @@ fn swarm_agent_lines(
 /// The swarm console: one cluster per tmux work window, animated dot spinners
 /// for working/starting agents, and an indented subagent tree under each
 /// agent. Selection (j/k) highlights the work cluster.
-fn render_swarm(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_swarm(f: &mut Frame, area: Rect, app: &mut App, tree_targets: &[TreeTarget]) {
     if app.uses_tree() {
-        render_topology_table(f, area, app, " Swarm topology ");
+        render_topology_table(f, area, app, tree_targets, " Swarm topology ");
         return;
     }
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
@@ -11726,8 +12663,8 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
     parts.join(" · ")
 }
 
-fn render_tree_table(f: &mut Frame, area: Rect, app: &mut App) {
-    render_topology_table(f, area, app, " Topology ");
+fn render_tree_table(f: &mut Frame, area: Rect, app: &mut App, tree_targets: &[TreeTarget]) {
+    render_topology_table(f, area, app, tree_targets, " Topology ");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11771,9 +12708,14 @@ fn topology_table_columns(width: u16) -> Vec<TopologyTableColumn> {
     columns
 }
 
-fn render_topology_table(f: &mut Frame, area: Rect, app: &mut App, title: &'static str) {
+fn render_topology_table(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    targets: &[TreeTarget],
+    title: &'static str,
+) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
-    let targets = app.tree_targets();
     if targets.is_empty() {
         render_empty_table(f, area, app, theme);
         return;
@@ -12739,7 +13681,7 @@ fn relative_time(at: OffsetDateTime, now: OffsetDateTime) -> String {
     format!("{days}d")
 }
 
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+fn render_footer(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[TreeTarget]>) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     // Transient action hint takes priority over keybinding strips —
     // the user just pressed a key and wants to see the result. Falls
@@ -12768,7 +13710,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
     // Put row-specific warnings first so they survive footer clipping on
     // narrow popup layouts.
-    if selected_has_no_pane(app) {
+    if selected_has_no_pane(app, tree_targets) {
         spans.push(Span::styled(
             "no tmux pane — attach unavailable",
             Style::default()
@@ -13029,9 +13971,21 @@ fn render_preview_footer(
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn selected_has_no_pane(app: &App) -> bool {
+fn selected_has_no_pane(app: &App, tree_targets: Option<&[TreeTarget]>) -> bool {
     if app.uses_tree() {
-        app.selected_node_key().is_some() && app.selected_pane().is_none()
+        let node = tree_targets
+            .and_then(|targets| selected_tree_target_from(app, targets))
+            .and_then(|target| app.topology.find(&target.key));
+        let has_pane = match node {
+            Some(TopologyNodeRef::Session(session)) => session
+                .active_window()
+                .and_then(WindowNode::active_pane)
+                .is_some(),
+            Some(TopologyNodeRef::Window(window)) => window.active_pane().is_some(),
+            Some(TopologyNodeRef::Pane(_)) => true,
+            None => false,
+        };
+        node.is_some() && !has_pane
     } else {
         app.selected_row().is_some() && app.selected_pane().is_none()
     }
@@ -13464,20 +14418,167 @@ mod tests {
         };
         assert_eq!(labels(&app), vec!["s:alpha", "w:AUTH", "s:beta"]);
 
-        // Walk through alpha's window to beta. Focusing beta folds alpha and
-        // reveals only beta's window, preserving the selected key even though
-        // the visible row indices changed under it.
-        app.move_down();
-        assert!(matches!(
-            app.selected_node_key(),
-            Some(TopologyNodeKey::Window(_))
-        ));
+        // Alpha's window is visible as context, but vertical movement stays
+        // at session depth. One keypress reaches beta and folds alpha.
         app.move_down();
         assert!(matches!(
             app.selected_node(),
             Some(TopologyNodeRef::Session(session)) if session.name == "beta"
         ));
         assert_eq!(labels(&app), vec!["s:alpha", "s:beta", "w:DOCS"]);
+
+        app.move_up();
+        app.move_into_work();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(window)) if window.name == "AUTH"
+        ));
+        app.move_to_work_parent();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Session(session)) if session.name == "alpha"
+        ));
+
+        // A single window has no useful sibling stop, so j bubbles to the
+        // session group instead of wrapping onto the same window forever.
+        app.move_into_work();
+        app.move_down();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Session(session)) if session.name == "beta"
+        ));
+        app.move_into_work();
+        app.move_up();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Session(session)) if session.name == "alpha"
+        ));
+    }
+
+    #[test]
+    fn focus_navigation_moves_within_each_sibling_group() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%2", 1),
+            fake_topology_pane("default", "$1", "alpha", "@2", "DOCS", 1, "%3", 0),
+            fake_topology_pane("default", "$2", "beta", "@3", "REVIEW", 0, "%4", 0),
+        ];
+        let agents = vec![
+            topology_agent("auth-1", "%1", "default", AgentState::Working, "auth", 1),
+            topology_agent("auth-2", "%2", "default", AgentState::Idle, "auth", 2),
+            topology_agent("docs", "%3", "default", AgentState::Idle, "docs", 3),
+            topology_agent("review", "%4", "default", AgentState::Idle, "review", 4),
+        ];
+        let mut app = App::with_config(WatchConfig {
+            view: WatchView::Pane,
+            layout: WatchLayout::Tree,
+            tree_expansion: WatchTreeExpansion::Focus,
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_data(agents, panes);
+
+        // l descends into alpha's first window. j skips the visible pane
+        // context and selects the next window in the same session.
+        app.move_into_work();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(window)) if window.name == "AUTH"
+        ));
+        app.move_down();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(window)) if window.name == "DOCS"
+        ));
+
+        // DOCS has one pane, so descending and pressing j bubbles back to the
+        // window siblings and advances to AUTH instead of getting stuck.
+        app.move_into_work();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Pane(pane)) if pane.key.pane_id == "%3"
+        ));
+        app.move_down();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(window)) if window.name == "AUTH"
+        ));
+
+        // AUTH has two panes, so pane-level j stays within that real sibling
+        // group. h then ascends one level per keypress.
+        app.move_into_work();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Pane(pane)) if pane.key.pane_id == "%1"
+        ));
+        app.move_down();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Pane(pane)) if pane.key.pane_id == "%2"
+        ));
+        app.move_to_work_parent();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(_))
+        ));
+        app.move_to_work_parent();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Session(_))
+        ));
+    }
+
+    #[test]
+    fn focus_explicit_descent_selects_and_keeps_a_pane_beyond_auto_depth() {
+        let panes = vec![fake_topology_pane(
+            "default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0,
+        )];
+        let agents = vec![topology_agent(
+            "auth",
+            "%1",
+            "default",
+            AgentState::Working,
+            "auth",
+            1,
+        )];
+
+        for view in [WatchView::Session, WatchView::Window] {
+            let mut app = App::with_config(WatchConfig {
+                view,
+                layout: WatchLayout::Tree,
+                tree_expansion: WatchTreeExpansion::Focus,
+                hide_paneless: false,
+                ..WatchConfig::default()
+            });
+            app.set_data(agents.clone(), panes.clone());
+
+            // Each l enters one hierarchy level even when that child sits
+            // below the configured automatic expansion depth.
+            app.move_into_work();
+            assert!(matches!(
+                app.selected_node(),
+                Some(TopologyNodeRef::Window(_))
+            ));
+            app.move_into_work();
+            assert!(matches!(
+                app.selected_node(),
+                Some(TopologyNodeRef::Pane(pane)) if pane.key.pane_id == "%1"
+            ));
+
+            // A refresh must not fold the selected pane out of the target
+            // list merely because view=session/window.
+            app.set_data(agents.clone(), panes.clone());
+            assert!(matches!(
+                app.selected_node(),
+                Some(TopologyNodeRef::Pane(pane)) if pane.key.pane_id == "%1"
+            ));
+            app.move_to_work_parent();
+            assert!(matches!(
+                app.selected_node(),
+                Some(TopologyNodeRef::Window(_))
+            ));
+        }
     }
 
     #[test]
@@ -13511,6 +14612,13 @@ mod tests {
                     .collect::<Vec<_>>(),
                 expected_depths
             );
+            if policy == WatchTreeExpansion::Always {
+                app.move_down();
+                assert!(matches!(
+                    app.selected_node_key(),
+                    Some(TopologyNodeKey::Window(_))
+                ));
+            }
         }
     }
 
@@ -13543,7 +14651,7 @@ mod tests {
             vec![0, 1]
         );
 
-        app.move_down();
+        app.move_into_work();
         assert_eq!(
             app.tree_targets()
                 .iter()
@@ -14026,12 +15134,11 @@ mod tests {
     fn parent_inspector_never_renders_a_representative_pane_capture() {
         let (agents, panes) = basic_topology_fixture();
         let mut app = topology_watch(WatchView::Pane, agents, panes);
-        app.pane_capture = Some(CapturedPane {
-            pane_id: "%1".into(),
-            socket: Some("default".into()),
-            text: "SHOULD-NOT-LEAK".into(),
-            fetched_at: std::time::Instant::now(),
-        });
+        app.pane_capture = Some(CapturedPane::new(
+            "%1".into(),
+            Some("default".into()),
+            "SHOULD-NOT-LEAK".into(),
+        ));
         app.table_state.select(Some(0));
 
         let backend = TestBackend::new(150, 24);
@@ -14044,6 +15151,264 @@ mod tests {
         assert!(screen.contains("Inspector · session muxa"));
         assert!(screen.contains("2 panes"));
         assert!(!screen.contains("SHOULD-NOT-LEAK"));
+    }
+
+    #[test]
+    fn session_inspector_rolls_up_attention_activity_and_windows() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Inspector · session muxa"));
+        assert!(screen.contains("scope  1 windows · 2 panes · 2 agents"));
+        assert!(screen.contains("attention  TEST-1/%2 · WAIT"));
+        assert!(screen.contains("latest"));
+        assert!(screen.contains("codex · TEST-1/%2 · review auth"));
+        assert!(
+            screen.contains("topology  WINDOWS / PANES · A/P · STATE · AGE · MODEL/CTX · LATEST")
+        );
+        assert!(screen.contains("0:TEST-1"));
+        assert!(screen.contains("2/2"));
+        assert!(screen.contains("├─● %1"));
+        assert!(screen.contains("└─▶ %2"));
+        assert!(screen.contains("gpt-5"));
+        assert!(screen.contains("edit auth"));
+    }
+
+    #[test]
+    fn session_inspector_fills_available_height_then_summarizes_hidden_nodes() {
+        let panes = (0..12)
+            .map(|index| {
+                fake_topology_pane(
+                    "default",
+                    "$1",
+                    "muxa",
+                    "@1",
+                    "TEST-1",
+                    0,
+                    &format!("%{index}"),
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        let agents = (0..12)
+            .map(|index| {
+                topology_agent(
+                    &format!("agent-{index}"),
+                    &format!("%{index}"),
+                    "default",
+                    AgentState::Working,
+                    &format!("task {index}"),
+                    i64::from(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+
+        let backend = TestBackend::new(170, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let inspector = (0..terminal.backend().buffer().area().height)
+            .map(|y| {
+                row_text(terminal.backend().buffer(), y)
+                    .chars()
+                    .skip(51)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(inspector.contains("0:TEST-1"));
+        assert!(inspector.contains("├─●"));
+        assert!(inspector.contains("more"));
+    }
+
+    #[test]
+    fn window_inspector_rolls_up_load_and_keeps_panes_actionable() {
+        let (mut agents, panes) = basic_topology_fixture();
+        agents[0].workload.process_count = 7;
+        agents[0].workload.shell_count = 2;
+        agents[0].workload.subagent_count = 1;
+        agents[0].context_used_pct = Some(82.0);
+        agents[0].cost_usd = Some(1.25);
+        agents[1].cost_usd = Some(0.50);
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let window_key = app.topology.sessions[0].windows[0].node_key();
+        select_tree_key(&mut app, &window_key);
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Inspector · window TEST-1"));
+        assert!(screen.contains("scope  2 panes · 2 agents"));
+        assert!(screen
+            .contains("load  7 processes · 2 shells · 1 subagents · ctx max 82% · cost $1.75"));
+        assert!(screen.contains("attention  %2 · WAIT"));
+        assert!(screen.contains("panes  AGENT    STATE  AGE  MODEL      CTX  LATEST"));
+        assert!(screen.contains("%1"));
+        assert!(screen.contains("codex"));
+        assert!(screen.contains("gpt-5"));
+        assert!(screen.contains("82%"));
+        assert!(screen.contains("edit auth"));
+        assert!(screen.contains("review auth"));
+    }
+
+    #[test]
+    fn scaled_window_pane_rect_preserves_split_proportions() {
+        let left = PaneGeometry {
+            pane_id: "%1".into(),
+            pane_index: "0".into(),
+            left: 0,
+            top: 0,
+            width: 49,
+            height: 20,
+            active: true,
+            command: "codex".into(),
+        };
+        let right = PaneGeometry {
+            pane_id: "%2".into(),
+            pane_index: "1".into(),
+            left: 50,
+            top: 0,
+            width: 50,
+            height: 20,
+            active: false,
+            command: "codex".into(),
+        };
+        let area = Rect::new(10, 4, 80, 12);
+
+        assert_eq!(
+            scaled_window_pane_rect(&left, 100, 20, area),
+            Some(Rect::new(10, 4, 39, 12))
+        );
+        assert_eq!(
+            scaled_window_pane_rect(&right, 100, 20, area),
+            Some(Rect::new(50, 4, 40, 12))
+        );
+    }
+
+    #[test]
+    fn window_inspector_renders_live_capture_in_real_pane_layout() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let window_key = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window_key.clone()));
+        app.window_capture = Some(CapturedWindow {
+            key: window_key,
+            zoomed: false,
+            fetched_at: std::time::Instant::now(),
+            panes: vec![
+                CapturedWindowPane {
+                    geometry: PaneGeometry {
+                        pane_id: "%1".into(),
+                        pane_index: "0".into(),
+                        left: 0,
+                        top: 0,
+                        width: 49,
+                        height: 20,
+                        active: true,
+                        command: "codex".into(),
+                    },
+                    text: Some(Text::from("LEFT CAPTURE")),
+                },
+                CapturedWindowPane {
+                    geometry: PaneGeometry {
+                        pane_id: "%2".into(),
+                        pane_index: "1".into(),
+                        left: 50,
+                        top: 0,
+                        width: 50,
+                        height: 20,
+                        active: false,
+                        command: "codex".into(),
+                    },
+                    text: Some(Text::from("RIGHT CAPTURE")),
+                },
+            ],
+        });
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>();
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("live layout  pane geometry · 1s refresh"));
+        assert!(screen.contains("LEFT CAPTURE"));
+        assert!(screen.contains("RIGHT CAPTURE"));
+        let capture_row = rows
+            .iter()
+            .find(|row| row.contains("LEFT CAPTURE") && row.contains("RIGHT CAPTURE"))
+            .expect("both horizontal pane captures should share one visual row");
+        assert!(
+            capture_row.find("LEFT CAPTURE").unwrap() < capture_row.find("RIGHT CAPTURE").unwrap()
+        );
+    }
+
+    #[test]
+    fn compact_window_inspector_drops_secondary_columns_first() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        let window_key = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window_key.clone()));
+        app.window_capture = Some(CapturedWindow {
+            key: window_key,
+            zoomed: false,
+            fetched_at: std::time::Instant::now(),
+            panes: vec![CapturedWindowPane {
+                geometry: PaneGeometry {
+                    pane_id: "%1".into(),
+                    pane_index: "0".into(),
+                    left: 0,
+                    top: 0,
+                    width: 100,
+                    height: 30,
+                    active: true,
+                    command: "codex".into(),
+                },
+                text: Some(Text::from("SHOULD USE ROSTER WHEN TOO SHORT")),
+            }],
+        });
+
+        // Balanced at 120 columns leaves roughly 58 usable Inspector columns;
+        // 18 rows leave too little height for a legible mosaic.
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("panes  AGENT    STATE  AGE  LATEST"));
+        assert!(!screen.contains("MODEL      CTX"));
+        assert!(screen.contains("%1"));
+        assert!(screen.contains("codex"));
+        assert!(screen.contains("edit auth"));
+        assert!(!screen.contains("SHOULD USE ROSTER WHEN TOO SHORT"));
     }
 
     #[test]
@@ -19358,12 +20723,7 @@ sort = ["state"]
             mode: PreviewMode::Popup,
             content: PreviewContent::LivePane,
         });
-        app.pane_capture = Some(CapturedPane {
-            pane_id: "%2".into(),
-            socket: None,
-            text: "old screen".into(),
-            fetched_at: std::time::Instant::now(),
-        });
+        app.pane_capture = Some(CapturedPane::new("%2".into(), None, "old screen".into()));
 
         let action = handle_event(
             Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
@@ -19764,12 +21124,7 @@ sort = ["state"]
         // Stuff the cache by hand — the actual capture path needs a real
         // tmux server, but the close-clears-cache invariant is purely
         // about the App field's lifecycle.
-        app.pane_capture = Some(CapturedPane {
-            pane_id: "%1".into(),
-            socket: None,
-            text: "old screen".into(),
-            fetched_at: std::time::Instant::now(),
-        });
+        app.pane_capture = Some(CapturedPane::new("%1".into(), None, "old screen".into()));
         press(&mut app, 'q');
         assert!(app.preview.is_none());
         assert!(app.pane_capture.is_none(), "cache must drop with preview");
@@ -19787,12 +21142,7 @@ sort = ["state"]
         app.table_state.select(Some(0));
         press(&mut app, 'p');
         press(&mut app, 'c'); // → LivePane
-        app.pane_capture = Some(CapturedPane {
-            pane_id: "%1".into(),
-            socket: None,
-            text: "old".into(),
-            fetched_at: std::time::Instant::now(),
-        });
+        app.pane_capture = Some(CapturedPane::new("%1".into(), None, "old".into()));
         press(&mut app, 'c'); // → PromptResponse
         assert!(
             app.pane_capture.is_none(),
@@ -19817,12 +21167,7 @@ sort = ["state"]
         assert!(dump.contains("capturing pane"));
 
         // Cache present but for a different pane → still placeholder.
-        app.pane_capture = Some(CapturedPane {
-            pane_id: "%999".into(),
-            socket: None,
-            text: "irrelevant".into(),
-            fetched_at: std::time::Instant::now(),
-        });
+        app.pane_capture = Some(CapturedPane::new("%999".into(), None, "irrelevant".into()));
         let body = build_pane_capture_body(&app, "%1");
         let dump: String = body
             .lines
@@ -19832,12 +21177,7 @@ sort = ["state"]
         assert!(dump.contains("capturing pane"));
 
         // Cache present, correct pane, but empty text → pane-gone hint.
-        app.pane_capture = Some(CapturedPane {
-            pane_id: "%1".into(),
-            socket: None,
-            text: String::new(),
-            fetched_at: std::time::Instant::now(),
-        });
+        app.pane_capture = Some(CapturedPane::new("%1".into(), None, String::new()));
         let body = build_pane_capture_body(&app, "%1");
         let dump: String = body
             .lines
@@ -20251,7 +21591,9 @@ sort = ["state"]
         let body = help_overlay_text().join("\n");
         assert!(body.contains("type or /       filter"));
         assert!(body.contains("gg/G · Home/End first / last selectable row"));
-        assert!(body.contains("↑/↓ · j/k       move visible session/window/pane nodes"));
+        assert!(
+            body.contains("↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise")
+        );
         assert!(body.contains(":              command palette"));
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
