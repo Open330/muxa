@@ -37,7 +37,7 @@ muxa dashboard --include-paneless
 | `n` | Open dashboard notes when diagnostics are available. |
 | `Enter` | Toggle the selected workspace inspector. |
 | `p` | Open the prompt composer for the selected pane or muxa PTY session. |
-| `m` | Compose a structured request for the selected same-room agent. |
+| `m` | Compose a structured request for the selected same-room agent; press `/` anywhere in the draft to insert a registered message skill at the cursor. |
 | `b` | Open incoming/sent collaboration mailbox history without claiming requests. |
 | `i` | Claim pending collaboration requests and open the incoming mailbox. |
 | `c` | Copy the selected workspace's latest prompt. |

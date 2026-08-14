@@ -173,7 +173,8 @@ for subsequent refreshes in the current watch process.
 ## Ask
 
 `a` composes a headless question for the agent named in the composer title;
-`Tab` switches between claude and codex, `Ctrl-V` pastes, `Enter` sends.
+`Tab` switches between claude and codex, `Ctrl-V` pastes, `/` opens the shared
+skill palette at any point in the draft, and `Enter` sends.
 muxad runs the agent in print mode and captures the answer, so nothing is
 typed into a pane and no session has to be managed. `Esc` cancels; Backspace
 also cancels when the input is already empty.
@@ -202,6 +203,10 @@ send trusted prompts. Select `edit` or `default` to restore stricter agent
 controls. Symlink targets outside the configured `cwd` must also be listed in
 `[ask].additional_dirs`.
 
+An inserted skill is only question text. It never changes the selected agent,
+`permission_mode`, cwd, additional directories, or timeout; those remain the
+daemon-owned `[ask]` contract.
+
 ## Agent collaboration
 
 Open watch with `prefix+s` from anywhere, select an agent, and press `m`. Watch
@@ -214,16 +219,33 @@ Backspace also cancels when the input is already empty. The last kind and mode
 are saved immediately and restored by the next `m`, including after watch
 restarts.
 
+From any point in an `m` composer, `/` opens the reusable message-skill palette.
+Typing filters names and prompt text, arrows or `Tab` move the selection, and
+`Enter` inserts the selected template at the current cursor without replacing
+existing text. Adjacent content is separated as paragraphs, and more skills
+can be inserted into the same draft. Insertion never sends: edit or verify the
+expanded body, then press `Enter` again. Register templates with
+`muxa skill add <name> <prompt>` or `[message.skills]` in config. Inside either
+watch palette, `F2` opens the add/update form and `Delete` confirms removal of
+the selected skill. `Ctrl-A` and `Ctrl-D` remain compatibility aliases.
+
+Skills are outside neither request kind nor send mode: they contain text only.
+The kind badge selected with `Tab` and the mode selected with `Ctrl-E` remain
+unchanged when a skill is inserted and are applied only when the expanded text
+is explicitly sent with the second `Enter`.
+
 A console has no pane of its own, so replies are not routed back to it: they
 stay on the request in the recipient's mailbox. `M` shows the mailbox of the
 agent under the cursor — `incoming` is that agent's, `sent` is the console's
 dispatch log across every target — and `i` (claim) and `e` (reply) act as that
 agent, because both are the recipient's move.
 
-With `[collaboration].scope = "host"`, the selected agent takes precedence
-over the launch window's only peer. A collapsed session containing one
-agent is directly addressable, so selecting it and pressing `m`
-targets that agent without expanding the session. For a request such as
+With `[collaboration].scope = "host"`, the selected session, window, or pane
+takes precedence over the launch window's only peer. Parent nodes are directly
+messageable without descending with `l`: a window chooses its lowest-index
+live tracked agent, while a session chooses by lowest numeric window index and
+then pane index. The composer title shows the exact resolved agent and pane
+before send. For a request such as
 “create a new pane, start codex with the `cx` alias, then review our changes”,
 choose `TASK` and `EXECUTE`; the receiving agent gets an explicit executable
 work contract rather than raw keystrokes.

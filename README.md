@@ -138,8 +138,10 @@ muxa watch
   <sub><code>b</code> mailbox · <code>m</code> message the row under the cursor · <code>a</code>/<code>A</code> headless ask.</sub>
 </div>
 
-The model is simple: **one tmux window is one room**. The agent pane that is
-focused when `muxa watch` opens is the sender.
+The model is simple: **one tmux window is one room**. Interactive watch and
+dashboard messages are sent by the operator console, so either popup can be
+opened from an agent or a spare shell pane. Agent-initiated MCP and `muxa msg`
+requests still use that agent's pane identity.
 
 One-time setup: add the following to `~/.config/muxa/config.toml`, restart
 `muxad`, and run `muxa init` to install the `prefix+s` watch popup.
@@ -182,13 +184,17 @@ restart that agent, then check again.
 Then:
 
 1. Run two agents in two panes of the same tmux window.
-2. Focus the agent that should send, then press `prefix+s`.
-3. Select the other agent in watch, press `m`, type the request, and press
-   `Enter`. Press `M` to read and reply from the mailbox (`b` remains an alias).
+2. Press `prefix+s` from any pane and select the recipient's session, window,
+   or pane. Parent rows resolve to the lowest numeric live agent and show the
+   exact target in the composer title.
+3. Press `m`, type the request, and press `Enter`. At any point in the draft,
+   `/` opens reusable skills registered with `muxa skill add`; selection inserts
+   at the cursor and a second `Enter` sends. Press `M` to read and reply from
+   the mailbox (`b` remains an alias).
 
-Do not open watch from a spare shell pane when you want to collaborate: that
-shell is not an agent. Continue the collaboration workflow in watch. For
-request/reply details, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
+For request/reply details, see
+[docs/COLLABORATION.md](docs/COLLABORATION.md); for skill registration and
+composer controls, see [docs/WATCH.md](docs/WATCH.md).
 
 For install modes, `muxa init` presets, systemd, manual hook wiring, and
 rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
@@ -228,6 +234,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
+| `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages and watch ask. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |

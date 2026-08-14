@@ -125,7 +125,8 @@ inbox를 열면 확인 처리됩니다.
 ## Ask
 
 `a`는 컴포저 제목에 표시된 agent에게 보낼 headless 질의를 작성합니다. `Tab`으로
-claude ↔ codex를 바꾸고, `Ctrl-V`로 붙여넣고, `Enter`로 보냅니다. muxad가 agent를
+claude ↔ codex를 바꾸고, `Ctrl-V`로 붙여넣으며, 초안 어느 위치에서든 `/`로 공용
+스킬 팔레트를 열어 현재 커서에 삽입하고, `Enter`로 보냅니다. muxad가 agent를
 print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 관리할 세션도 없습니다.
 `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수 있습니다.
 
@@ -148,6 +149,10 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 `edit` 또는 `default`를 선택할 수 있습니다. 또한 `cwd` 밖의 symlink target은
 `[ask].additional_dirs`에 real path를 추가해야 합니다.
 
+삽입된 스킬은 질문 본문일 뿐입니다. 선택한 agent, `permission_mode`, cwd,
+additional directories, timeout은 바꾸지 않으며 daemon이 가진 기존 `[ask]` 계약을
+그대로 사용합니다.
+
 ## Agent 협업
 
 어디서든 `prefix+s`로 watch를 열고, agent를 선택한 뒤 `m`을 누릅니다. watch는
@@ -159,15 +164,32 @@ watch가 자동으로 선택합니다. composer에서 `Tab`은 request kind를 �
 있습니다. 마지막 kind와 mode는 즉시 저장되어 다음 `m`과 watch 재실행 후에도
 복원됩니다.
 
+`m` composer의 어느 위치에서든 `/`를 누르면 재사용 메시지 스킬 목록이 열립니다.
+이름이나 본문을 입력해 검색하고, 방향키 또는 `Tab`으로 선택한 뒤 `Enter`를 누르면
+기존 입력을 지우지 않고 현재 커서 위치에 템플릿이 삽입됩니다. 인접한 내용과는
+문단으로 구분되며 같은 초안에 여러 스킬을 넣을 수도 있습니다. 선택만으로는
+전송되지 않습니다. 확장된 내용을 확인·수정한 뒤 `Enter`를 한 번 더 눌러 보냅니다.
+`muxa skill add <name> <prompt>` 또는 설정의
+`[message.skills]`로 템플릿을 등록할 수 있습니다. watch의 두 팔레트 모두에서
+`F2`는 추가/갱신 form을 열고, `Delete`는 선택한 스킬을 확인 후 삭제합니다. 기존
+`Ctrl-A`, `Ctrl-D`도 호환 alias로 유지합니다.
+
+스킬은 request kind나 send mode의 범위를 벗어나지 않습니다. 본문 텍스트만
+담으며, `Tab`으로 고른 kind와 `Ctrl-E`로 고른 mode는 스킬을 삽입해도 바뀌지
+않습니다. 확장된 본문을 두 번째 `Enter`로 명시적으로 보낼 때 기존 계약이
+적용됩니다.
+
 console에는 자기 pane이 없으므로 응답은 발신자에게 되돌아오지 않고 **수신 agent의
 mailbox**에 request와 함께 남습니다. `M`은 커서가 놓인 agent의 mailbox를 보여주며
 `incoming`은 그 agent의 것, `sent`는 console이 모든 대상에게 보낸 기록입니다.
 claim(`i`)과 응답(`e`)은 수신자의 행위이므로 선택한 agent를 대행해 동작합니다.
 
-`[collaboration].scope = "host"`이면 선택한 agent가 watch를 연 window의 유일한
-peer보다 우선합니다. agent가 하나인 접힌 session도 바로
-지정할 수 있으므로 해당 session을 선택하고 `m`을 누르면 펼치지 않아도 그 agent가
-대상이 됩니다. “`cx` alias로 새 pane에서 codex를 시작한 뒤 변경사항을
+`[collaboration].scope = "host"`이면 선택한 session, window, pane이 watch를 연
+window의 유일한 peer보다 우선합니다. `l`로 하위 pane까지 내려가지 않아도 parent
+node에서 바로 `m`을 사용할 수 있습니다. window는 pane index가 가장 낮은 live
+tracked agent를, session은 window index와 pane index가 낮은 순서의 agent를 자동
+대상으로 삼습니다. composer 제목에는 전송 전에 실제 agent와 pane이 표시됩니다.
+“`cx` alias로 새 pane에서 codex를 시작한 뒤 변경사항을
 리뷰해줘” 같은 요청은 `TASK`와 `EXECUTE`를 선택해 보내면 raw keystroke가 아니라
 실행 권한이 명시된 작업 계약으로 전달됩니다.
 

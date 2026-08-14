@@ -65,10 +65,16 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
 };
 use ratatui::{Frame, Terminal};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+
+use crate::message_skill::{
+    insert_prompt as insert_message_skill_prompt, matching_skills, remove as remove_message_skill,
+    upsert as upsert_message_skill, validate_name as validate_message_skill_name,
+    Palette as MessageSkillPalette,
+};
 
 /// Polling cadence when no streaming `Subscribe` is active. We still
 /// fall back to this if the daemon doesn't speak the streaming
@@ -1027,6 +1033,7 @@ pub(crate) enum ConfirmAction {
     Quick(QuickAction),
     DeleteAskHistory(String),
     ClearAskHistory,
+    DeleteMessageSkill(String),
 }
 
 /// Outcome of running a [`QuickAction`] — surfaced to the run loop
@@ -1734,6 +1741,43 @@ pub(crate) struct ConfirmPopup {
 struct AskComposer {
     input: String,
     cursor: usize,
+    /// Ask shares the reusable text palette with message composition, but
+    /// selection never changes the daemon-owned agent/permission contract.
+    skill_palette: Option<MessageSkillPalette>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum MessageSkillEditorField {
+    #[default]
+    Name,
+    Prompt,
+}
+
+/// In-watch registration form opened from either `/` palette. Persistence is
+/// dispatched by the run loop so input handling stays side-effect free.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MessageSkillEditor {
+    name: String,
+    name_cursor: usize,
+    prompt: String,
+    prompt_cursor: usize,
+    field: MessageSkillEditorField,
+}
+
+impl MessageSkillEditor {
+    fn field_mut(&mut self) -> (&mut String, &mut usize) {
+        match self.field {
+            MessageSkillEditorField::Name => (&mut self.name, &mut self.name_cursor),
+            MessageSkillEditorField::Prompt => (&mut self.prompt, &mut self.prompt_cursor),
+        }
+    }
+
+    fn cycle_field(&mut self) {
+        self.field = match self.field {
+            MessageSkillEditorField::Name => MessageSkillEditorField::Prompt,
+            MessageSkillEditorField::Prompt => MessageSkillEditorField::Name,
+        };
+    }
 }
 
 /// History filter. Reading past answers and choosing the next agent are
@@ -2287,6 +2331,10 @@ struct CollaborationComposer {
     label: String,
     input: String,
     cursor: usize,
+    /// `/` owns input while this is set. Choosing a skill inserts it at the
+    /// saved composer cursor; it never sends without a second, deliberate
+    /// Enter.
+    skill_palette: Option<MessageSkillPalette>,
 }
 
 impl CollaborationComposer {
@@ -2296,6 +2344,7 @@ impl CollaborationComposer {
             label,
             input: String::new(),
             cursor: 0,
+            skill_palette: None,
         }
     }
 
@@ -2607,6 +2656,11 @@ pub(crate) struct App {
     inspector_split: InspectorSplit,
     collaboration_mailbox: CollaborationMailboxState,
     collaboration_composer: Option<CollaborationComposer>,
+    /// Reusable templates loaded once from `[message.skills]`; palette
+    /// filtering never touches disk or the daemon.
+    message_skills: BTreeMap<String, String>,
+    /// Add/update form layered over an active message or ask skill palette.
+    message_skill_editor: Option<MessageSkillEditor>,
     /// Last kind/mode chosen in a request composer. Seeded from `[watch]`
     /// and updated immediately as its badges cycle.
     collaboration_compose_defaults: CollaborationComposeDefaults,
@@ -2864,6 +2918,8 @@ impl App {
             inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
             collaboration_composer: None,
+            message_skills: BTreeMap::new(),
+            message_skill_editor: None,
             collaboration_compose_defaults,
             spawn: None,
             ask_composer: None,
@@ -5872,6 +5928,11 @@ pub(crate) struct FullRefresh {
     pub error: Option<DaemonError>,
 }
 
+pub(crate) struct MessageComposerConfig {
+    pub skills: BTreeMap<String, String>,
+    pub collaboration_scope: muxa::config::CollaborationScope,
+}
+
 /// Apply a `RefreshOutcome` to `App`.
 ///
 /// **Anti-flicker merge invariant** (added 2026-04-30): when a fresh
@@ -6414,16 +6475,17 @@ fn current_backend_endpoint(host: muxa::HostKind, pane_id: &str) -> Option<Backe
 pub async fn run(
     client: &Client,
     watch_cfg: WatchConfig,
+    message_composer: MessageComposerConfig,
     session_activity_path: Option<PathBuf>,
     activity_path: Option<PathBuf>,
     sort_persist_path: Option<PathBuf>,
     caller_pane: Option<String>,
-    collaboration_scope: muxa::config::CollaborationScope,
 ) -> Result<Option<WatchOpenTarget>> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
     let mut app = App::with_config(watch_cfg);
+    app.message_skills = message_composer.skills;
     // The unified console observes every active host. The set threads
     // through the priming refresh and the background task; the live
     // capture path resolves a backend per pane-id namespace instead.
@@ -6456,7 +6518,7 @@ pub async fn run(
         .and_then(|pane_id| initial_host.and_then(|host| current_backend_endpoint(host, pane_id)));
     app.set_initial_pane_on(initial_pane.clone(), initial_endpoint);
     app.collaboration.origin = Some(watch_collaboration_origin(initial_pane.clone()));
-    app.collaboration_scope = collaboration_scope;
+    app.collaboration_scope = message_composer.collaboration_scope;
     let watch_started_at = OffsetDateTime::now_utc();
 
     // Paint the first frame **before** any IPC. The popup
@@ -6804,6 +6866,33 @@ pub async fn run(
                         refresh_watch_collaboration(client, &mut app).await;
                     }
                 }
+                Action::SaveMessageSkill { name, prompt } => {
+                    let Some(path) = sort_persist_path.as_deref() else {
+                        app.set_hint(
+                            "message skill save failed: no config path is available",
+                            HintLevel::Err,
+                        );
+                        continue;
+                    };
+                    match upsert_message_skill(path, &name, &prompt) {
+                        Ok(()) => {
+                            let existed = app.message_skills.insert(name.clone(), prompt).is_some();
+                            app.message_skill_editor = None;
+                            focus_active_message_skill(&mut app, &name);
+                            app.set_hint(
+                                format!(
+                                    "{} message skill /{name}",
+                                    if existed { "updated" } else { "added" }
+                                ),
+                                HintLevel::Ok,
+                            );
+                        }
+                        Err(error) => app.set_hint(
+                            format!("message skill save failed: {error}"),
+                            HintLevel::Err,
+                        ),
+                    }
+                }
                 Action::CancelCollaborationComposer => {
                     app.collaboration_composer = None;
                 }
@@ -6897,6 +6986,29 @@ pub async fn run(
                                     }
                                     Err(error) => app.set_hint(
                                         format!("ask history delete failed: {error}"),
+                                        HintLevel::Err,
+                                    ),
+                                }
+                            }
+                            ConfirmAction::DeleteMessageSkill(name) => {
+                                let Some(path) = sort_persist_path.as_deref() else {
+                                    app.set_hint(
+                                        "message skill delete failed: no config path is available",
+                                        HintLevel::Err,
+                                    );
+                                    continue;
+                                };
+                                match remove_message_skill(path, &name) {
+                                    Ok(()) => {
+                                        app.message_skills.remove(&name);
+                                        clamp_active_message_skill(&mut app);
+                                        app.set_hint(
+                                            format!("removed message skill /{name}"),
+                                            HintLevel::Ok,
+                                        );
+                                    }
+                                    Err(error) => app.set_hint(
+                                        format!("message skill delete failed: {error}"),
                                         HintLevel::Err,
                                     ),
                                 }
@@ -7333,35 +7445,43 @@ fn open_prompt_only_composer(app: &mut App, reason: String) {
     );
 }
 
-/// The one room peer the selected row contains, if it contains exactly
-/// one.
+/// The primary room peer contained by the selected row.
 ///
-/// Lets `m` work at session granularity: the user points at the session
-/// their peer is in without first expanding it to the exact pane. Two
-/// peers in the same row stays ambiguous — picking one for the user
-/// would silently address the wrong agent.
+/// Canonical tree panes are already sorted by numeric window index and then
+/// pane index. Choosing the first live tracked peer makes session/window `m`
+/// deterministic, while the composer title still exposes the exact resolved
+/// recipient before anything is sent.
 fn peer_inside_selected_row<'a>(app: &'a App, room: &'a RoomContext) -> Option<&'a Participant> {
     if app.uses_tree() {
         let panes = app.selected_topology_panes();
-        let mut inside = room.peers.iter().filter(|peer| {
-            panes.iter().any(|pane| {
-                pane.key.pane_id == peer.pane
-                    && peer.socket.as_deref().is_none_or(|socket| {
-                        muxa::backend::pane_endpoint_identity(Some(&peer.pane), socket)
-                            == pane.key.window.session.endpoint.socket
-                    })
+        return panes
+            .into_iter()
+            .filter(|pane| {
+                pane.agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.state != AgentState::Stopped)
             })
-        });
-        let first = inside.next()?;
-        return inside.next().is_none().then_some(first);
+            .find_map(|pane| {
+                room.peers
+                    .iter()
+                    .find(|peer| participant_matches_pane(peer, pane))
+            });
     }
     let row = app.selected_row()?;
-    let mut inside = room
-        .peers
+    room.peers
         .iter()
-        .filter(|peer| row.contains_pane(&peer.pane));
-    let first = inside.next()?;
-    inside.next().is_none().then_some(first)
+        .filter(|peer| row.contains_pane(&peer.pane))
+        .min_by_key(|peer| {
+            app.panes
+                .iter()
+                .find(|pane| pane.pane_id == peer.pane)
+                .map_or((u32::MAX, u32::MAX), |pane| {
+                    (
+                        pane.window_index.parse::<u32>().unwrap_or(u32::MAX),
+                        pane.pane_index.parse::<u32>().unwrap_or(u32::MAX),
+                    )
+                })
+        })
 }
 
 fn participant_matches_pane(participant: &Participant, pane: &PaneNode) -> bool {
@@ -7432,11 +7552,11 @@ fn empty_room_hint(current: &Participant) -> String {
 /// Under host scope the room is not the reason: the cursor is the selector and
 /// the table spans every session on the host, so `host_scope_target` has
 /// already had its say and the only thing left to report is that this row does
-/// not resolve to exactly one agent. Naming the launch window's peers there
+/// does not contain a live tracked agent. Naming the launch window's peers there
 /// would point the operator at an unrelated window.
 fn no_target_hint(app: &App, room: &RoomContext) -> String {
     if app.collaboration_scope == muxa::config::CollaborationScope::Host {
-        return "this row has no single agent to message — select an agent row, or one pane of it, and press m".into();
+        return "this row has no live tracked agent to message".into();
     }
     if room.peers.is_empty() {
         return empty_room_hint(&room.current);
@@ -7470,8 +7590,8 @@ fn peer_choice_hint(labels: &[String]) -> String {
 }
 
 /// The recipient under host scope: the tracked agent selected in any window.
-/// On a collapsed work row, prefer its sole agent; that makes a one-agent work
-/// addressable without expanding it.
+/// Parent nodes resolve to the first live tracked pane in canonical numeric
+/// window/pane order, so messaging never requires explicit `l l` descent.
 ///
 /// Every row is a candidate, including the pane watch was opened from. The
 /// sender is the operator console, not that pane's agent, so there is no
@@ -7482,14 +7602,11 @@ fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
         return None;
     }
     if app.uses_tree() {
-        let mut candidates = app
-            .selected_topology_panes()
-            .into_iter()
-            .filter(|pane| pane.agent.is_some());
-        let pane = candidates.next()?;
-        if candidates.next().is_some() {
-            return None;
-        }
+        let pane = app.selected_topology_panes().into_iter().find(|pane| {
+            pane.agent
+                .as_ref()
+                .is_some_and(|agent| agent.state != AgentState::Stopped)
+        })?;
         let agent = pane.agent.as_ref()?;
         let label = format!(
             "{}@{} · {}",
@@ -7556,21 +7673,28 @@ fn open_watch_collaboration_composer(app: &mut App) {
         Some(room) if room.peers.is_empty() => Err(no_target_hint(app, room)),
         Some(room) => {
             let selected_peer = if app.uses_tree() {
-                app.selected_action_pane().and_then(|pane| {
+                app.selected_exact_pane().and_then(|pane| {
                     room.peers
                         .iter()
                         .find(|peer| participant_matches_pane(peer, pane))
                 })
             } else {
-                app.selected_pane()
-                    .as_deref()
-                    .and_then(|pane| app.collaboration.peer_for_pane(pane))
+                app.selected_target().and_then(|selected| {
+                    let exact = match app.rows.get(selected.row_idx)? {
+                        WatchRow::Agent(agent) => agent.pane.as_deref(),
+                        WatchRow::Work(session) => selected
+                            .agent_idx
+                            .and_then(|index| session.agents.get(index))
+                            .and_then(|agent| agent.pane.as_deref()),
+                        WatchRow::BarePane(_) => None,
+                    }?;
+                    app.collaboration.peer_for_pane(exact)
+                })
             };
             selected_peer
-                // A work row is a whole tmux window, and the pane it resolves
-                // to drifts with agent activity. Accept the row
-                // when exactly one peer lives in it; more than one is
-                // genuinely ambiguous and still asks.
+                // Parent rows deliberately do not reuse selected_action_pane:
+                // that follows latest activity and would make `m` drift between
+                // agents. Resolve them by stable numeric hierarchy instead.
                 .or_else(|| peer_inside_selected_row(app, room))
                 // The lone-peer shortcut is a *room* convenience: with one
                 // agent beside you, "send" is unambiguous. Under host scope the
@@ -7958,6 +8082,11 @@ pub(crate) enum Action {
     OpenCollaborationMailbox,
     /// Submit the active collaboration request or reply composer.
     SubmitCollaboration,
+    /// Persist a reusable prompt registered from the in-watch skill editor.
+    SaveMessageSkill {
+        name: String,
+        prompt: String,
+    },
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
     /// `Tab` / `Ctrl-E` changed the request defaults; persist them next to
@@ -8169,12 +8298,28 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
-        if let Some(composer) = app.collaboration_composer.as_mut() {
-            for c in pasted.chars() {
-                composer.insert(c);
+        if let Some(editor) = app.message_skill_editor.as_mut() {
+            let pasted = pasted.replace(['\r', '\n'], " ");
+            let (text, cursor) = editor.field_mut();
+            insert_str_at(text, cursor, &pasted);
+        } else if let Some(composer) = app.collaboration_composer.as_mut() {
+            if let Some(palette) = composer.skill_palette.as_mut() {
+                for c in pasted.replace(['\r', '\n'], " ").chars() {
+                    palette.insert(c);
+                }
+            } else {
+                for c in pasted.chars() {
+                    composer.insert(c);
+                }
             }
         } else if let Some(ask) = app.ask_composer.as_mut() {
-            insert_str_at(&mut ask.input, &mut ask.cursor, &pasted);
+            if let Some(palette) = ask.skill_palette.as_mut() {
+                for c in pasted.replace(['\r', '\n'], " ").chars() {
+                    palette.insert(c);
+                }
+            } else {
+                insert_str_at(&mut ask.input, &mut ask.cursor, &pasted);
+            }
         } else if let Some(spawn) = app.spawn.as_mut() {
             // The spawn form was the one input surface missing here, so a
             // paste while it was open fell through to the search fallback
@@ -8228,6 +8373,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // someone to accidentally drop one — fall through.
             _ => Action::ConfirmCancel,
         };
+    }
+
+    if app.message_skill_editor.is_some() {
+        return handle_message_skill_editor_event(code, modifiers, app);
     }
 
     if app.collaboration_composer.is_some() {
@@ -8576,9 +8725,16 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
     }
 }
 
-/// Ask composer: one field, Enter submits, `Ctrl-V` pastes. No contract
-/// row — which agent and where it runs are config, decided once.
+/// Ask composer: one field, Enter submits, `Ctrl-V` pastes. `/` opens the
+/// shared text-skill palette; it does not alter the daemon-owned ask contract.
 fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    if app
+        .ask_composer
+        .as_ref()
+        .is_some_and(|ask| ask.skill_palette.is_some())
+    {
+        return handle_message_skill_palette_event(code, modifiers, app);
+    }
     if code == KeyCode::Backspace
         && app
             .ask_composer
@@ -8608,6 +8764,10 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
         // composer title names the agent, so Tab changes what the title
         // says before Enter commits to it.
         KeyCode::Tab | KeyCode::BackTab => Action::CycleAskAgent,
+        KeyCode::Char('/') if !modifiers.contains(KeyModifiers::CONTROL) => {
+            ask.skill_palette = Some(MessageSkillPalette::default());
+            Action::None
+        }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(pasted) = system_clipboard_text() {
                 insert_str_at(&mut ask.input, &mut ask.cursor, &pasted);
@@ -8981,11 +9141,245 @@ fn composer_submit_action(app: &mut App) -> Action {
     }
 }
 
+fn active_message_skill_palette(app: &App) -> Option<&MessageSkillPalette> {
+    app.collaboration_composer
+        .as_ref()
+        .and_then(|composer| composer.skill_palette.as_ref())
+        .or_else(|| {
+            app.ask_composer
+                .as_ref()
+                .and_then(|ask| ask.skill_palette.as_ref())
+        })
+}
+
+fn active_message_skill_palette_mut(app: &mut App) -> Option<&mut MessageSkillPalette> {
+    if app
+        .collaboration_composer
+        .as_ref()
+        .is_some_and(|composer| composer.skill_palette.is_some())
+    {
+        return app
+            .collaboration_composer
+            .as_mut()
+            .and_then(|composer| composer.skill_palette.as_mut());
+    }
+    app.ask_composer
+        .as_mut()
+        .and_then(|ask| ask.skill_palette.as_mut())
+}
+
+fn close_active_message_skill_palette(app: &mut App) {
+    if let Some(composer) = app.collaboration_composer.as_mut() {
+        if composer.skill_palette.is_some() {
+            composer.skill_palette = None;
+            return;
+        }
+    }
+    if let Some(ask) = app.ask_composer.as_mut() {
+        ask.skill_palette = None;
+    }
+}
+
+fn focus_active_message_skill(app: &mut App, name: &str) {
+    if let Some(palette) = active_message_skill_palette_mut(app) {
+        palette.query = name.to_string();
+        palette.selected = 0;
+    }
+}
+
+fn clamp_active_message_skill(app: &mut App) {
+    if let Some(palette) = app
+        .collaboration_composer
+        .as_mut()
+        .and_then(|composer| composer.skill_palette.as_mut())
+    {
+        palette.move_selection(0, &app.message_skills);
+    } else if let Some(palette) = app
+        .ask_composer
+        .as_mut()
+        .and_then(|ask| ask.skill_palette.as_mut())
+    {
+        palette.move_selection(0, &app.message_skills);
+    }
+}
+
+fn move_message_skill_selection(app: &mut App, delta: isize) {
+    if let Some(palette) = app
+        .collaboration_composer
+        .as_mut()
+        .and_then(|composer| composer.skill_palette.as_mut())
+    {
+        palette.move_selection(delta, &app.message_skills);
+    } else if let Some(palette) = app
+        .ask_composer
+        .as_mut()
+        .and_then(|ask| ask.skill_palette.as_mut())
+    {
+        palette.move_selection(delta, &app.message_skills);
+    }
+}
+
+fn selected_message_skill(app: &App) -> Option<(String, String)> {
+    let palette = active_message_skill_palette(app)?;
+    matching_skills(&app.message_skills, &palette.query)
+        .get(palette.selected)
+        .map(|(name, prompt)| ((*name).clone(), (*prompt).clone()))
+}
+
+fn insert_into_active_composer(app: &mut App, prompt: &str) {
+    if app
+        .collaboration_composer
+        .as_ref()
+        .is_some_and(|composer| composer.skill_palette.is_some())
+    {
+        if let Some(composer) = app.collaboration_composer.as_mut() {
+            insert_message_skill_prompt(&mut composer.input, &mut composer.cursor, prompt);
+            composer.skill_palette = None;
+        }
+        return;
+    }
+    if let Some(ask) = app.ask_composer.as_mut() {
+        insert_message_skill_prompt(&mut ask.input, &mut ask.cursor, prompt);
+        ask.skill_palette = None;
+    }
+}
+
+fn handle_message_skill_editor_event(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    app: &mut App,
+) -> Action {
+    match code {
+        KeyCode::Esc => {
+            app.message_skill_editor = None;
+            Action::None
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(editor) = app.message_skill_editor.as_mut() {
+                editor.cycle_field();
+            }
+            Action::None
+        }
+        KeyCode::Enter => {
+            let Some(editor) = app.message_skill_editor.as_mut() else {
+                return Action::None;
+            };
+            if editor.field == MessageSkillEditorField::Name {
+                match validate_message_skill_name(&editor.name) {
+                    Ok(()) => editor.field = MessageSkillEditorField::Prompt,
+                    Err(error) => app.set_hint(error.to_string(), HintLevel::Warn),
+                }
+                return Action::None;
+            }
+            if editor.prompt.trim().is_empty() {
+                app.set_hint("skill prompt cannot be empty", HintLevel::Warn);
+                return Action::None;
+            }
+            Action::SaveMessageSkill {
+                name: editor.name.clone(),
+                prompt: editor.prompt.clone(),
+            }
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let (Some(pasted), Some(editor)) =
+                (system_clipboard_text(), app.message_skill_editor.as_mut())
+            {
+                let pasted = pasted.replace(['\r', '\n'], " ");
+                let (text, cursor) = editor.field_mut();
+                insert_str_at(text, cursor, &pasted);
+            }
+            Action::None
+        }
+        other => {
+            if let Some(editor) = app.message_skill_editor.as_mut() {
+                let (text, cursor) = editor.field_mut();
+                spawn_edit_text(other, modifiers, text, cursor);
+            }
+            Action::None
+        }
+    }
+}
+
+fn handle_message_skill_palette_event(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    app: &mut App,
+) -> Action {
+    let control = modifiers.contains(KeyModifiers::CONTROL);
+    if code == KeyCode::F(2) || (code == KeyCode::Char('a') && control) {
+        app.message_skill_editor = Some(MessageSkillEditor::default());
+        return Action::None;
+    }
+    if code == KeyCode::Delete || (code == KeyCode::Char('d') && control) {
+        if let Some((name, _)) = selected_message_skill(app) {
+            return Action::AskConfirm(ConfirmPopup {
+                message: format!("Delete message skill /{name}?"),
+                on_confirm: ConfirmAction::DeleteMessageSkill(name),
+            });
+        }
+        app.set_hint("no message skill selected", HintLevel::Warn);
+        return Action::None;
+    }
+
+    match code {
+        KeyCode::Esc => {
+            close_active_message_skill_palette(app);
+        }
+        KeyCode::Backspace => {
+            let close =
+                active_message_skill_palette(app).is_some_and(|palette| palette.query.is_empty());
+            if close {
+                close_active_message_skill_palette(app);
+            } else if let Some(palette) = active_message_skill_palette_mut(app) {
+                palette.backspace();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some((_, prompt)) = selected_message_skill(app) {
+                insert_into_active_composer(app, &prompt);
+                app.set_hint(
+                    "skill inserted — edit or press Enter to send",
+                    HintLevel::Ok,
+                );
+            } else if app.message_skills.is_empty() {
+                app.set_hint(
+                    "no message skills — run: muxa skill add <name> <prompt>",
+                    HintLevel::Warn,
+                );
+            } else {
+                app.set_hint("no matching message skill", HintLevel::Warn);
+            }
+        }
+        KeyCode::Up | KeyCode::BackTab => move_message_skill_selection(app, -1),
+        KeyCode::Down | KeyCode::Tab => move_message_skill_selection(app, 1),
+        KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+            move_message_skill_selection(app, -1);
+        }
+        KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+            move_message_skill_selection(app, 1);
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(palette) = active_message_skill_palette_mut(app) {
+                palette.insert(c);
+            }
+        }
+        _ => {}
+    }
+    Action::None
+}
+
 fn handle_collaboration_composer_event(
     code: KeyCode,
     modifiers: KeyModifiers,
     app: &mut App,
 ) -> Action {
+    if app
+        .collaboration_composer
+        .as_ref()
+        .is_some_and(|composer| composer.skill_palette.is_some())
+    {
+        return handle_message_skill_palette_event(code, modifiers, app);
+    }
     match code {
         KeyCode::Esc => Action::CancelCollaborationComposer,
         KeyCode::Backspace
@@ -9020,6 +9414,12 @@ fn handle_collaboration_composer_event(
             } else {
                 Action::None
             }
+        }
+        KeyCode::Char('/') if !modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.skill_palette = Some(MessageSkillPalette::default());
+            }
+            Action::None
         }
         KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
@@ -9547,7 +9947,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         render_collaboration_mailbox(f, popup_area, app);
     }
     if app.collaboration_composer.is_some() {
-        let popup_area = bottom_prompt_rect(chunks[1]);
+        let skills_open = app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_some());
+        let popup_area = message_composer_rect(chunks[1], skills_open);
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
@@ -9557,7 +9961,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         render_ask_panel(f, popup_area, app);
     }
     if app.ask_composer.is_some() {
-        let popup_area = bottom_prompt_rect(chunks[1]);
+        let skills_open = app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.skill_palette.is_some());
+        let popup_area = message_composer_rect(chunks[1], skills_open);
         f.render_widget(Clear, popup_area);
         render_ask_composer(f, popup_area, app);
     }
@@ -9570,6 +9978,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         let popup_area = command_popup_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
         render_command_palette(f, popup_area, app);
+    }
+    if app.message_skill_editor.is_some() {
+        let popup_area = message_skill_editor_rect(chunks[1]);
+        f.render_widget(Clear, popup_area);
+        render_message_skill_editor(f, popup_area, app);
     }
     if app.confirm.is_some() {
         // Confirmation is always the top-most overlay, including when it was
@@ -9822,6 +10235,11 @@ fn render_ask_composer(f: &mut Frame, area: Rect, app: &App) {
     let Some(ask) = app.ask_composer.as_ref() else {
         return;
     };
+    if let Some(palette) = ask.skill_palette.as_ref() {
+        let target = format!("ask · {}", app.ask_agent);
+        render_message_skill_palette(f, area, app, &target, palette, theme);
+        return;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.action))
@@ -10164,6 +10582,10 @@ fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
         .collaboration_composer
         .as_ref()
         .expect("render_collaboration_composer without composer");
+    if let Some(palette) = composer.skill_palette.as_ref() {
+        render_message_skill_palette(f, area, app, &composer.label, palette, theme);
+        return;
+    }
     let (title, border_color) = collaboration_composer_title(composer, theme);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -10190,6 +10612,161 @@ fn render_collaboration_composer(f: &mut Frame, area: Rect, app: &App) {
         .saturating_add(u16::try_from(before_cursor.width()).unwrap_or(u16::MAX));
     if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
         f.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+fn render_message_skill_palette(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    target: &str,
+    palette: &MessageSkillPalette,
+    theme: WatchThemeSpec,
+) {
+    use unicode_width::UnicodeWidthStr;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Line::from(vec![
+            Span::styled(" skills ", theme.action_badge()),
+            Span::styled(
+                format!(" → {target} · text only · Enter inserts "),
+                theme.table_header_style(),
+            ),
+        ]));
+    let inner = block.inner(area);
+    let visible_query =
+        truncate_prompt_input(&palette.query, inner.width.saturating_sub(2) as usize);
+    let matches = matching_skills(&app.message_skills, &palette.query);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("/ ", theme.accent_badge()),
+            Span::raw(visible_query.text.clone()),
+        ]),
+        Line::from(""),
+    ];
+    let available = usize::from(inner.height).saturating_sub(lines.len());
+    if app.message_skills.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no skills · F2 add · or muxa skill add <name> <prompt>",
+            theme.dim_style().add_modifier(Modifier::ITALIC),
+        )));
+    } else if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching skill",
+            theme.dim_style().add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        let start = palette
+            .selected
+            .saturating_add(1)
+            .saturating_sub(available.max(1));
+        for (offset, (name, prompt)) in matches.into_iter().skip(start).take(available).enumerate()
+        {
+            let index = start + offset;
+            let name_style = if index == palette.selected {
+                theme.selected_style()
+            } else {
+                theme.table_header_style()
+            };
+            let prefix = format!("  /{name}");
+            let prompt_width = usize::from(inner.width)
+                .saturating_sub(prefix.width())
+                .saturating_sub(3);
+            let summary = prompt.lines().next().unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(prefix, name_style),
+                Span::styled("  ", theme.dim_style()),
+                Span::styled(
+                    truncate_prompt_input(summary, prompt_width).text,
+                    theme.dim_style(),
+                ),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    let cursor_x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(visible_query.text.width()).unwrap_or(u16::MAX));
+    if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
+        f.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+fn render_message_skill_editor(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(editor) = app.message_skill_editor.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Line::from(vec![
+            Span::styled(" skill add/update ", theme.action_badge()),
+            Span::styled(
+                " text only · keeps kind/mode/ask permissions ",
+                theme.dim_style(),
+            ),
+        ]));
+    let inner = block.inner(area);
+    let field_width = usize::from(inner.width.saturating_sub(10));
+    let name = truncate_prompt_input(&editor.name, field_width);
+    let prompt = truncate_prompt_input(&editor.prompt, field_width);
+    let name_style = if editor.field == MessageSkillEditorField::Name {
+        theme.selected_style()
+    } else {
+        theme.table_header_style()
+    };
+    let prompt_style = if editor.field == MessageSkillEditorField::Prompt {
+        theme.selected_style()
+    } else {
+        theme.table_header_style()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" name   ", name_style),
+            Span::raw("/"),
+            Span::raw(name.text.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(" prompt ", prompt_style),
+            Span::raw(prompt.text.clone()),
+        ]),
+        Line::from(Span::styled(
+            " Tab field · Enter next/save · Esc back",
+            theme.dim_style(),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    let (row, prefix, visible, cursor, skipped) = match editor.field {
+        MessageSkillEditorField::Name => (0, 9, &name.text, editor.name_cursor, name.skipped_chars),
+        MessageSkillEditorField::Prompt => (
+            1,
+            8,
+            &prompt.text,
+            editor.prompt_cursor,
+            prompt.skipped_chars,
+        ),
+    };
+    let before: String = visible
+        .chars()
+        .take(cursor.saturating_sub(skipped))
+        .collect();
+    let x = inner
+        .x
+        .saturating_add(prefix)
+        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
+    let y = inner.y.saturating_add(row);
+    if x < inner.x.saturating_add(inner.width) && y < inner.y.saturating_add(inner.height) {
+        f.set_cursor_position((x, y));
     }
 }
 
@@ -10670,6 +11247,24 @@ fn bottom_prompt_rect(r: Rect) -> Rect {
         width: r.width,
         height,
     }
+}
+
+fn message_composer_rect(r: Rect, skills_open: bool) -> Rect {
+    if !skills_open {
+        return bottom_prompt_rect(r);
+    }
+    let height = r.height.min(12);
+    Rect {
+        x: r.x,
+        y: r.y.saturating_add(r.height.saturating_sub(height)),
+        width: r.width,
+        height,
+    }
+}
+
+fn message_skill_editor_rect(r: Rect) -> Rect {
+    let width = r.width.saturating_mul(80).saturating_div(100).max(52);
+    centered_rect_by_size(width, r.height.min(7), r)
 }
 
 struct VisiblePromptInput {
@@ -13898,6 +14493,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
 #[allow(clippy::too_many_lines)] // one arm per overlay; a dispatch table
                                  // of closures would hide which key set wins
 fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) -> bool {
+    if app.message_skill_editor.is_some() {
+        let spans = vec![
+            Span::styled(" Enter ", theme.action_badge()),
+            Span::raw("next/save  "),
+            Span::styled(" Tab ", theme.key_badge()),
+            Span::raw("field  "),
+            Span::styled(" Ctrl-V ", theme.key_badge()),
+            Span::raw("paste  "),
+            Span::styled(" Esc ", theme.key_badge()),
+            Span::raw("back"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
     if app.command_palette.is_some() {
         let spans = vec![
             Span::styled(" Enter ", theme.action_badge()),
@@ -13914,6 +14524,14 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
     }
 
     if app.ask_composer.is_some() {
+        if app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.skill_palette.is_some())
+        {
+            render_message_skill_palette_footer(f, area, theme);
+            return true;
+        }
         let spans = vec![
             Span::styled(" Enter ", theme.action_badge()),
             Span::raw("ask  "),
@@ -13921,6 +14539,8 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Span::raw("agent  "),
             Span::styled(" Ctrl-V ", theme.key_badge()),
             Span::raw("paste  "),
+            Span::styled(" / ", theme.key_badge()),
+            Span::raw("skills  "),
             Span::styled(" Esc/empty ⌫ ", theme.key_badge()),
             Span::raw("cancel"),
         ];
@@ -14027,10 +14647,12 @@ fn render_collaboration_composer_footer(
     app: &App,
     theme: WatchThemeSpec,
 ) {
-    let target = app
-        .collaboration_composer
-        .as_ref()
-        .map(|composer| &composer.target);
+    let composer = app.collaboration_composer.as_ref();
+    if composer.is_some_and(|composer| composer.skill_palette.is_some()) {
+        render_message_skill_palette_footer(f, area, theme);
+        return;
+    }
+    let target = composer.map(|composer| &composer.target);
     // The peerless prompt form advertises no Tab/Ctrl-E: both keys only
     // explain why they do nothing, and a footer that lists dead keys
     // teaches the user to stop reading footers.
@@ -14064,10 +14686,30 @@ fn render_collaboration_composer_footer(
         ]);
     }
     spans.extend([
+        Span::styled(" / ", theme.key_badge()),
+        Span::raw("skills  "),
         Span::styled(" Esc/empty ⌫ ", theme.key_badge()),
         Span::raw("cancel"),
     ]);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_message_skill_palette_footer(f: &mut Frame, area: Rect, theme: WatchThemeSpec) {
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Enter ", theme.action_badge()),
+            Span::raw("insert  "),
+            Span::styled(" ↑/↓/Tab ", theme.key_badge()),
+            Span::raw("select  "),
+            Span::styled(" F2 ", theme.action_badge()),
+            Span::raw("add/update  "),
+            Span::styled(" Del ", theme.key_badge()),
+            Span::raw("delete  "),
+            Span::styled(" Esc/empty ⌫ ", theme.key_badge()),
+            Span::raw("back"),
+        ])),
+        area,
+    );
 }
 
 fn render_preview_footer(
@@ -15921,6 +16563,266 @@ mod tests {
     }
 
     #[test]
+    fn slash_palette_inserts_a_skill_then_requires_a_second_enter_to_send() {
+        let mut app = collaboration_watch_app();
+        app.message_skills.insert(
+            "agent-review".into(),
+            "create a new pane with codex and review our changes".into(),
+        );
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_some()));
+        for c in "review".chars() {
+            let _ =
+                handle_collaboration_composer_event(KeyCode::Char(c), KeyModifiers::NONE, &mut app);
+        }
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        let composer = app.collaboration_composer.as_ref().unwrap();
+        assert!(composer.skill_palette.is_none());
+        assert_eq!(
+            composer.input,
+            "create a new pane with codex and review our changes"
+        );
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::SubmitCollaboration
+        ));
+    }
+
+    #[test]
+    fn slash_palette_preserves_a_message_already_being_composed() {
+        let mut app = collaboration_watch_app();
+        app.message_skills
+            .insert("review".into(), "review the current changes".into());
+        open_watch_collaboration_composer(&mut app);
+        let composer = app.collaboration_composer.as_mut().unwrap();
+        composer.input = "Keep this context.".into();
+        composer.cursor = composer.input.chars().count();
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_some()));
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+
+        let composer = app.collaboration_composer.as_ref().unwrap();
+        assert_eq!(
+            composer.input,
+            "Keep this context.\n\nreview the current changes"
+        );
+        assert!(composer.skill_palette.is_none());
+    }
+
+    #[test]
+    fn slash_palette_backspace_returns_to_the_empty_composer() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_none()));
+    }
+
+    #[test]
+    fn slash_palette_renders_registered_skill_and_insert_hint() {
+        let mut app = collaboration_watch_app();
+        app.message_skills.insert(
+            "agent-review".into(),
+            "create a codex pane and review our changes".into(),
+        );
+        open_watch_collaboration_composer(&mut app);
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("skills"));
+        assert!(screen.contains("/agent-review"));
+        assert!(screen.contains("Enter insert"));
+        assert!(screen.contains("F2"));
+        assert!(screen.contains("Del"));
+    }
+
+    #[test]
+    fn ask_slash_palette_inserts_text_without_changing_the_ask_target() {
+        let mut app = app_with_paneless_and_pane();
+        app.ask_agent = "codex".into();
+        app.message_skills.insert(
+            "agent-review".into(),
+            "create a codex pane and review our changes".into(),
+        );
+        app.ask_composer = Some(AskComposer::default());
+
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        for c in "review".chars() {
+            let _ = handle_ask_composer_event(KeyCode::Char(c), KeyModifiers::NONE, &mut app);
+        }
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        let ask = app.ask_composer.as_ref().unwrap();
+        assert_eq!(ask.input, "create a codex pane and review our changes");
+        assert!(ask.skill_palette.is_none());
+        assert_eq!(app.ask_agent, "codex");
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::SubmitAsk
+        ));
+    }
+
+    #[test]
+    fn ask_skill_can_be_inserted_into_an_existing_question() {
+        let mut app = app_with_paneless_and_pane();
+        app.message_skills
+            .insert("review".into(), "review the current changes".into());
+        app.ask_composer = Some(AskComposer {
+            input: "Use this additional context.".into(),
+            cursor: "Use this additional context.".chars().count(),
+            ..AskComposer::default()
+        });
+
+        let _ = handle_ask_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        let _ = handle_ask_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+
+        let ask = app.ask_composer.as_ref().unwrap();
+        assert_eq!(
+            ask.input,
+            "Use this additional context.\n\nreview the current changes"
+        );
+        assert!(ask.skill_palette.is_none());
+    }
+
+    #[test]
+    fn watch_skill_editor_collects_a_name_and_prompt_before_saving() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        assert!(matches!(
+            handle_message_skill_palette_event(KeyCode::F(2), KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app.message_skill_editor.is_some());
+
+        for c in "review".chars() {
+            let _ =
+                handle_message_skill_editor_event(KeyCode::Char(c), KeyModifiers::NONE, &mut app);
+        }
+        let _ = handle_message_skill_editor_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        for c in "ask codex to review".chars() {
+            let _ =
+                handle_message_skill_editor_event(KeyCode::Char(c), KeyModifiers::NONE, &mut app);
+        }
+        let action =
+            handle_message_skill_editor_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(
+            action,
+            Action::SaveMessageSkill { ref name, ref prompt }
+                if name == "review" && prompt == "ask codex to review"
+        ));
+        // Persistence decides whether the editor closes; a failed config write
+        // must leave the user's text available for correction/retry.
+        assert!(app.message_skill_editor.is_some());
+    }
+
+    #[test]
+    fn deleting_a_watch_skill_requires_confirmation() {
+        let mut app = collaboration_watch_app();
+        app.message_skills
+            .insert("agent-review".into(), "review this".into());
+        open_watch_collaboration_composer(&mut app);
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+
+        let action =
+            handle_message_skill_palette_event(KeyCode::Delete, KeyModifiers::NONE, &mut app);
+        assert!(matches!(
+            action,
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::DeleteMessageSkill(ref name),
+                ..
+            }) if name == "agent-review"
+        ));
+        assert!(app.message_skills.contains_key("agent-review"));
+    }
+
+    #[test]
+    fn watch_skill_palette_keeps_the_ctrl_management_aliases() {
+        let mut app = collaboration_watch_app();
+        app.message_skills
+            .insert("agent-review".into(), "review this".into());
+        open_watch_collaboration_composer(&mut app);
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+
+        assert!(matches!(
+            handle_message_skill_palette_event(KeyCode::Char('a'), KeyModifiers::CONTROL, &mut app),
+            Action::None
+        ));
+        assert!(app.message_skill_editor.take().is_some());
+        assert!(matches!(
+            handle_message_skill_palette_event(KeyCode::Char('d'), KeyModifiers::CONTROL, &mut app),
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::DeleteMessageSkill(ref name),
+                ..
+            }) if name == "agent-review"
+        ));
+    }
+
+    #[test]
+    fn ask_skill_palette_and_editor_render_as_overlays() {
+        let mut app = app_with_paneless_and_pane();
+        app.message_skills
+            .insert("agent-review".into(), "review our changes".into());
+        app.ask_composer = Some(AskComposer {
+            skill_palette: Some(MessageSkillPalette::default()),
+            ..AskComposer::default()
+        });
+        app.message_skill_editor = Some(MessageSkillEditor::default());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("skill add/update"));
+        assert!(screen.contains("keeps kind/mode/ask permissions"));
+    }
+
+    #[test]
     fn backspace_cancels_the_message_composer_only_when_already_empty() {
         let mut app = collaboration_watch_app();
         open_watch_collaboration_composer(&mut app);
@@ -16322,6 +17224,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_and_window_message_target_the_lowest_index_live_agent() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        let session = app.topology.sessions[0].node_key();
+        let window = app.topology.sessions[0].windows[0].node_key();
+
+        for parent in [session, window] {
+            select_tree_key(&mut app, &parent);
+            open_watch_collaboration_composer(&mut app);
+            assert!(matches!(
+                app.collaboration_composer
+                    .as_ref()
+                    .map(|composer| &composer.target),
+                Some(CollaborationComposeTarget::Send { target, .. })
+                    if target == "pane:%1"
+            ));
+            assert!(app
+                .collaboration_composer
+                .as_ref()
+                .is_some_and(|composer| composer.label.contains("%1")));
+            app.collaboration_composer = None;
+        }
+    }
+
+    #[test]
+    fn window_scope_parent_message_uses_the_same_stable_primary_peer() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let first = fake_collaboration_participant("%1", "agent-1", None);
+        let second = fake_collaboration_participant("%2", "agent-2", None);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        app.collaboration.room = Some(RoomContext {
+            current: first.clone(),
+            // Reverse mailbox order to prove topology order, not peer order,
+            // defines the automatic target.
+            peers: vec![second, first],
+            unread: 0,
+            unread_replies: 0,
+        });
+        let window = app.topology.sessions[0].windows[0].node_key();
+        select_tree_key(&mut app, &window);
+
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            app.collaboration_composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(CollaborationComposeTarget::Send { target, .. }) if target == "pane:%1"
+        ));
+    }
+
     /// The reported bug: `m` worked on every row except the one the popup was
     /// opened from, because that pane's agent was the sender. The console is
     /// the sender now, so the launch row is an ordinary recipient — and it
@@ -16407,7 +17372,7 @@ mod tests {
             .message
             .clone();
         assert!(
-            hint.contains("this row has no single agent"),
+            hint.contains("this row has no live tracked agent"),
             "host-scope hint must be about the row, got {hint:?}"
         );
     }
@@ -20796,6 +21761,7 @@ sort = ["state"]
             | Action::OpenCollaborationMessage
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
+            | Action::SaveMessageSkill { .. }
             | Action::CancelCollaborationComposer
             | Action::CollaborationDefaultsChanged
             | Action::InspectorSplitChanged
@@ -21258,6 +22224,15 @@ sort = ["state"]
 
         let short = Rect::new(2, 3, 100, 2);
         assert_eq!(bottom_prompt_rect(short), short);
+
+        assert_eq!(
+            message_composer_rect(parent, true),
+            Rect::new(2, 3, 100, 10)
+        );
+        assert_eq!(
+            message_composer_rect(parent, false),
+            bottom_prompt_rect(parent)
+        );
     }
 
     /// `c` toggles the preview content axis: `PromptResponse` → `LivePane`

@@ -37,6 +37,9 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::message_skill::{
+    insert_prompt as insert_message_skill_prompt, matching_skills, Palette as MessageSkillPalette,
+};
 use crate::stats::{self, ActiveDuration, SessionActiveStats};
 use crate::theme::ThemeArg;
 use crate::watch::{self, ActionOutcome, QuickAction, RealEffects};
@@ -658,6 +661,7 @@ struct DashboardApp {
     hint: Option<FooterHint>,
     confirm: Option<ConfirmPopup>,
     composer: Option<PromptComposer>,
+    message_skills: BTreeMap<String, String>,
     collaboration_mailbox: CollaborationMailbox,
     capture: CaptureCache,
     capture_scroll: usize,
@@ -676,6 +680,7 @@ impl DashboardApp {
             hint: None,
             confirm: None,
             composer: None,
+            message_skills: BTreeMap::new(),
             collaboration_mailbox: CollaborationMailbox::default(),
             capture: CaptureCache::default(),
             capture_scroll: 0,
@@ -968,6 +973,7 @@ struct PromptComposer {
     label: String,
     input: String,
     cursor: usize,
+    skill_palette: Option<MessageSkillPalette>,
 }
 
 impl PromptComposer {
@@ -977,6 +983,7 @@ impl PromptComposer {
             label,
             input: String::new(),
             cursor: 0,
+            skill_palette: None,
         }
     }
 
@@ -1115,6 +1122,7 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<Option<Ope
     let mut guard = TerminalGuard::new(terminal);
     let theme = args.theme.map_or(cfg.ui.theme, WatchTheme::from);
     let mut app = DashboardApp::new(initial, theme);
+    app.message_skills = cfg.message.skills.clone();
     let mut last_refresh = Instant::now();
     let mut refresh_task: Option<DashboardRefresh> = None;
 
@@ -2029,6 +2037,13 @@ fn handle_confirm_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
 }
 
 fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
+    if app
+        .composer
+        .as_ref()
+        .is_some_and(|composer| composer.skill_palette.is_some())
+    {
+        return handle_message_skill_key(app, key);
+    }
     let composer = app.composer.as_mut().expect("composer checked above");
     match key.code {
         KeyCode::Esc => {
@@ -2080,6 +2095,10 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
             toggle_composer_execute(composer);
             UiAction::None
         }
+        KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            composer.skill_palette = Some(MessageSkillPalette::default());
+            UiAction::None
+        }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             composer.insert(c);
             UiAction::None
@@ -2110,6 +2129,83 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
         }
         _ => UiAction::None,
     }
+}
+
+fn move_message_skill(app: &mut DashboardApp, delta: isize) {
+    if let Some(palette) = app
+        .composer
+        .as_mut()
+        .and_then(|composer| composer.skill_palette.as_mut())
+    {
+        palette.move_selection(delta, &app.message_skills);
+    }
+}
+
+fn handle_message_skill_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(composer) = app.composer.as_mut() {
+                composer.skill_palette = None;
+            }
+        }
+        KeyCode::Backspace => {
+            let close = app
+                .composer
+                .as_ref()
+                .and_then(|composer| composer.skill_palette.as_ref())
+                .is_some_and(|palette| palette.query.is_empty());
+            if let Some(composer) = app.composer.as_mut() {
+                if close {
+                    composer.skill_palette = None;
+                } else if let Some(palette) = composer.skill_palette.as_mut() {
+                    palette.backspace();
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let prompt = app
+                .composer
+                .as_ref()
+                .and_then(|composer| composer.skill_palette.as_ref())
+                .and_then(|palette| palette.selected_prompt(&app.message_skills));
+            if let Some(prompt) = prompt {
+                if let Some(composer) = app.composer.as_mut() {
+                    insert_message_skill_prompt(&mut composer.input, &mut composer.cursor, &prompt);
+                    composer.skill_palette = None;
+                }
+                app.set_hint(
+                    "skill inserted — edit or press Enter to send",
+                    HintLevel::Ok,
+                );
+            } else if app.message_skills.is_empty() {
+                app.set_hint(
+                    "no message skills — run: muxa skill add <name> <prompt>",
+                    HintLevel::Info,
+                );
+            } else {
+                app.set_hint("no matching message skill", HintLevel::Info);
+            }
+        }
+        KeyCode::Up | KeyCode::BackTab => move_message_skill(app, -1),
+        KeyCode::Down | KeyCode::Tab => move_message_skill(app, 1),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_message_skill(app, -1);
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_message_skill(app, 1);
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(palette) = app
+                .composer
+                .as_mut()
+                .and_then(|composer| composer.skill_palette.as_mut())
+            {
+                palette.insert(c);
+            }
+        }
+        _ => {}
+    }
+    UiAction::None
 }
 
 fn cycle_composer_option(composer: &mut PromptComposer) {
@@ -2636,7 +2732,11 @@ fn render(f: &mut Frame, app: &mut DashboardApp) {
         render_confirm(f, popup, app);
     }
     if app.composer.is_some() {
-        let popup = bottom_prompt_rect(area);
+        let skills_open = app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_some());
+        let popup = message_composer_rect(area, skills_open);
         f.render_widget(Clear, popup);
         render_composer(f, popup, app);
     }
@@ -4152,12 +4252,20 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &DashboardApp) {
 
 fn render_composer(f: &mut Frame, area: Rect, app: &DashboardApp) {
     let composer = app.composer.as_ref().expect("composer checked by caller");
+    if let Some(palette) = composer.skill_palette.as_ref() {
+        render_message_skill_palette(f, area, app, composer, palette);
+        return;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(app.theme.selected_border())
         .border_type(BorderType::Plain)
         .title(Span::styled(
-            format!(" {} → {} ", composer_title(composer), composer.label),
+            format!(
+                " {} → {} · / skills ",
+                composer_title(composer),
+                composer.label
+            ),
             app.theme.title_style(),
         ));
     let inner = block.inner(area);
@@ -4179,6 +4287,87 @@ fn render_composer(f: &mut Frame, area: Rect, app: &DashboardApp) {
         .x
         .saturating_add(2)
         .saturating_add(u16::try_from(before_cursor.width()).unwrap_or(u16::MAX));
+    if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
+        f.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+fn render_message_skill_palette(
+    f: &mut Frame,
+    area: Rect,
+    app: &DashboardApp,
+    composer: &PromptComposer,
+    palette: &MessageSkillPalette,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(app.theme.selected_border())
+        .border_type(BorderType::Plain)
+        .title(Span::styled(
+            format!(
+                " skills → {} · Enter insert · ↑/↓ select · Esc back ",
+                composer.label
+            ),
+            app.theme.title_style(),
+        ));
+    let inner = block.inner(area);
+    let visible = visible_input(
+        &palette.query,
+        palette.query.chars().count(),
+        inner.width.saturating_sub(2),
+    );
+    let matches = matching_skills(&app.message_skills, &palette.query);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("/ ", app.theme.key_style()),
+            Span::raw(visible.text.clone()),
+        ]),
+        Line::from(""),
+    ];
+    let available = usize::from(inner.height).saturating_sub(lines.len());
+    if app.message_skills.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no skills · muxa skill add <name> <prompt>",
+            app.theme.dim_style(),
+        )));
+    } else if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching skill",
+            app.theme.dim_style(),
+        )));
+    } else {
+        let start = palette
+            .selected
+            .saturating_add(1)
+            .saturating_sub(available.max(1));
+        for (offset, (name, prompt)) in matches.into_iter().skip(start).take(available).enumerate()
+        {
+            let index = start + offset;
+            let name_style = if index == palette.selected {
+                app.theme.key_style()
+            } else {
+                app.theme.title_style()
+            };
+            let prefix = format!("  /{name}");
+            let prompt_width = usize::from(inner.width)
+                .saturating_sub(prefix.width())
+                .saturating_sub(3);
+            lines.push(Line::from(vec![
+                Span::styled(prefix, name_style),
+                Span::raw("  "),
+                Span::styled(
+                    truncate_width(prompt.lines().next().unwrap_or_default(), prompt_width),
+                    app.theme.dim_style(),
+                ),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    let cursor_x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(visible.text.width()).unwrap_or(u16::MAX));
     if inner.height > 0 && cursor_x < inner.x.saturating_add(inner.width) {
         f.set_cursor_position((cursor_x, inner.y));
     }
@@ -4288,6 +4477,19 @@ fn centered_rect_by_size(width: u16, height: u16, area: Rect) -> Rect {
 
 fn bottom_prompt_rect(area: Rect) -> Rect {
     let height = area.height.min(3);
+    Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(height),
+        width: area.width,
+        height,
+    }
+}
+
+fn message_composer_rect(area: Rect, skills_open: bool) -> Rect {
+    if !skills_open {
+        return bottom_prompt_rect(area);
+    }
+    let height = area.height.min(12);
     Rect {
         x: area.x,
         y: area.y + area.height.saturating_sub(height),
@@ -4721,6 +4923,125 @@ mod tests {
         assert_eq!(composer.cursor, 0);
         composer.delete();
         assert_eq!(composer.input, "");
+    }
+
+    #[test]
+    fn dashboard_slash_palette_inserts_without_sending() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let data = build_dashboard_data(
+            now,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+        app.message_skills
+            .insert("review".into(), "ask codex to review our changes".into());
+        app.composer = Some(PromptComposer::new(
+            PromptTarget::Pane("%1".into()),
+            "pane %1".into(),
+        ));
+
+        assert!(matches!(
+            handle_composer_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)
+            ),
+            UiAction::None
+        ));
+        assert!(matches!(
+            handle_composer_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiAction::None
+        ));
+        assert_eq!(
+            app.composer
+                .as_ref()
+                .map(|composer| composer.input.as_str()),
+            Some("ask codex to review our changes")
+        );
+        assert!(matches!(
+            handle_composer_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiAction::Run(PendingAction::Quick(QuickAction::SendPrompt { .. }))
+        ));
+    }
+
+    #[test]
+    fn dashboard_skill_insertion_preserves_the_existing_draft() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let data = build_dashboard_data(
+            now,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+        app.message_skills
+            .insert("review".into(), "review the current changes".into());
+        let mut composer = PromptComposer::new(PromptTarget::Pane("%1".into()), "pane %1".into());
+        composer.input = "Keep this context.".into();
+        composer.cursor = composer.input.chars().count();
+        app.composer = Some(composer);
+
+        let _ = handle_composer_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        let _ = handle_composer_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.composer
+                .as_ref()
+                .map(|composer| composer.input.as_str()),
+            Some("Keep this context.\n\nreview the current changes")
+        );
+    }
+
+    #[test]
+    fn dashboard_slash_palette_renders_registered_skill() {
+        let now = datetime!(2026-06-16 00:00 UTC);
+        let data = build_dashboard_data(
+            now,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            false,
+            DashboardSort::Attention,
+            HostKind::Tmux,
+            Vec::new(),
+        );
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+        app.message_skills
+            .insert("agent-review".into(), "ask codex for a review".into());
+        let mut composer = PromptComposer::new(PromptTarget::Pane("%1".into()), "pane %1".into());
+        composer.skill_palette = Some(MessageSkillPalette::default());
+        app.composer = Some(composer);
+        let backend = TestBackend::new(96, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("skills"));
+        assert!(screen.contains("/agent-review"));
+        assert!(screen.contains("Enter insert"));
     }
 
     #[test]

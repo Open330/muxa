@@ -101,6 +101,40 @@ notification을 입력하며 본문은 mailbox에 둡니다.
 agent를 정확한 pane id로 지정할 수 있습니다.
 [COLLABORATION.ko.md](COLLABORATION.ko.md)를 참고하세요.
 
+## 메시지 스킬
+
+반복해서 쓰는 prompt 템플릿은 일반 TOML table에 저장하며 watch와 dashboard의
+`m` composer, watch의 `a` composer가 함께 사용합니다.
+
+```toml
+[message.skills]
+agent-review = "cx alias로 codex pane을 새로 만들고, 우리의 변경사항을 전달해 리뷰해줘"
+```
+
+직접 파일을 편집하지 않고도 관리할 수 있습니다.
+
+```bash
+muxa skill add agent-review 'cx alias로 codex pane을 새로 만들고, 우리의 변경사항을 전달해 리뷰해줘'
+muxa skill list
+muxa skill show agent-review
+muxa skill remove agent-review
+```
+
+초안의 어느 위치에서든 `/`를 누르고 이름이나 본문을 입력해 검색합니다. 방향키나
+`Tab`으로 선택하고 `Enter`를 누르면 기존 입력을 지우지 않고 현재 커서 위치에
+템플릿이 삽입됩니다. 한 초안에 여러 스킬을 조합할 수도 있습니다. 이때 바로
+전송되지 않으므로 내용을 확인·수정한 뒤 `Enter`를 한 번 더 눌러 보냅니다.
+`muxa watch`의 팔레트에서는 `F2`로 추가/갱신 form을 열고 `Delete`로 선택한 스킬을
+확인 후 삭제할 수 있습니다. 기존 `Ctrl-A`, `Ctrl-D`도 호환 alias로 유지합니다.
+multi-line 템플릿은 CLI add 명령의 prompt
+자리에 `-`를 넘겨 stdin으로 등록할 수 있습니다.
+
+스킬은 prompt 본문만 저장합니다. request kind, collaboration mode, agent, cwd,
+timeout, permission scope를 포함하지 않습니다. `m`에서는 현재 선택한 kind/mode가
+그대로 적용되고, `a`에서는 daemon의 `[ask]` agent와 `permission_mode`를 포함한 실행
+설정이 그대로 적용됩니다. 따라서 스킬 삽입만으로 어느 계약의 권한도 넓어지지
+않습니다.
+
 ## Watch
 
 ```toml

@@ -37,7 +37,7 @@ muxa dashboard --include-paneless
 | `n` | 진단 note가 있을 때 notes popup 열기. |
 | `Enter` | 선택 workspace inspector toggle. |
 | `p` | 선택 pane 또는 muxa PTY session에 prompt composer 열기. |
-| `m` | 선택한 same-room agent에게 구조화 요청 작성. |
+| `m` | 선택한 same-room agent에게 구조화 요청 작성. 초안 어디서든 `/`를 눌러 현재 커서 위치에 등록한 메시지 스킬 삽입. |
 | `b` | request를 claim하지 않고 incoming/sent collaboration mailbox 열기. |
 | `i` | pending collaboration request를 claim하고 incoming mailbox 열기. |
 | `c` | 선택 workspace의 최신 prompt 복사. |

@@ -104,6 +104,39 @@ hook-authoritative top-level Idle prompt; message bodies stay in the mailbox.
 tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).
 
+## Message skills
+
+Reusable prompt templates live in a regular TOML table. They are shared by the
+watch and dashboard `m` composers and the watch `a` composer:
+
+```toml
+[message.skills]
+agent-review = "create a new pane with codex (use the cx alias), then pass our changes to it for review"
+```
+
+Manage the table without hand-editing it:
+
+```bash
+muxa skill add agent-review 'create a new pane with codex (use the cx alias), then pass our changes to it for review'
+muxa skill list
+muxa skill show agent-review
+muxa skill remove agent-review
+```
+
+At any point in a draft, press `/`, type to filter, move with arrow keys or
+`Tab`, then press `Enter`. Selection inserts the prompt at the current cursor
+without replacing existing text; inspect or edit it and press `Enter` again to
+send. Multiple skills can be combined in one draft. In `muxa watch`, `F2` opens
+an add/update form inside the palette and `Delete` removes the selected skill
+after confirmation. `Ctrl-A` and `Ctrl-D` remain compatibility aliases.
+Pass `-` as the CLI add prompt to read a multi-line template from stdin.
+
+A skill stores prompt text only. It has no request kind, collaboration mode,
+agent, cwd, timeout, or permission scope of its own. The `m` composer keeps its
+currently selected kind and mode; the `a` composer keeps the daemon's `[ask]`
+agent and execution settings, including `permission_mode`. Inserting a skill
+therefore cannot broaden either contract.
+
 ## Watch
 
 ```toml

@@ -8,6 +8,7 @@ mod doctor;
 mod init;
 mod logs;
 mod mcp;
+mod message_skill;
 mod onboarding;
 mod peek;
 mod stats;
@@ -117,6 +118,8 @@ enum Cmd {
         #[command(subcommand)]
         action: MsgCmd,
     },
+    /// Register reusable `/` templates for the interactive message composer.
+    Skill(message_skill::Args),
     /// Deterministic tmux agent lifecycle operations.
     Agent {
         #[command(subcommand)]
@@ -553,6 +556,7 @@ async fn main() -> Result<()> {
         return onboarding::run(onboard_args.clone());
     }
     let config_path = args.config.clone().or_else(paths::default_config_file);
+    let skill_path = config_path.clone();
     let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
     set_icon_set(cfg.ui.icons);
     let socket = args
@@ -571,6 +575,7 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
+        Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action),
@@ -1289,8 +1294,6 @@ struct WatchInvocation {
     caller_pane: Option<String>,
 }
 
-use muxa::config::CollaborationScope;
-
 async fn cmd_watch(
     client: &Client,
     cfg: Config,
@@ -1309,6 +1312,7 @@ async fn cmd_watch(
     // get here it's safe to exec tmux commands that mutate the client's
     // attached session / pane.
     //
+    let message_skills = cfg.message.skills.clone();
     // CLI flag wins over config — one-shot override for the current
     // invocation without touching the user's ~/.config/muxa/config.toml.
     let mut watch_cfg = WatchConfig {
@@ -1350,15 +1354,18 @@ async fn cmd_watch(
                 .or_else(paths::default_session_activity_file)
         })
         .flatten();
-    let collaboration_scope: CollaborationScope = cfg.collaboration.scope;
+    let message_composer = watch::MessageComposerConfig {
+        skills: message_skills,
+        collaboration_scope: cfg.collaboration.scope,
+    };
     if let Some(target) = watch::run(
         client,
         watch_cfg,
+        message_composer,
         session_activity_path,
         activity_path.clone(),
         config_path,
         caller_pane,
-        collaboration_scope,
     )
     .await?
     {
@@ -2541,6 +2548,21 @@ mod tests {
             assert!(Args::try_parse_from(args).is_err(), "accepted {args:?}");
         }
         assert!(Args::try_parse_from(["muxa", "watch", "--layout", "swarm"]).is_ok());
+    }
+
+    #[test]
+    fn message_skill_cli_is_discoverable() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "skill",
+            "add",
+            "agent-review",
+            "ask codex to review our changes",
+        ])
+        .unwrap();
+        assert!(matches!(args.cmd, Cmd::Skill(_)));
+        assert!(Args::try_parse_from(["muxa", "skill", "list"]).is_ok());
+        assert!(Args::try_parse_from(["muxa", "skill", "remove", "agent-review"]).is_ok());
     }
 
     #[test]

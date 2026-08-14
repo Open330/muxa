@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Session and window rows can send contracted messages without hierarchy
+  descent.** Pressing `m` on a parent deterministically targets the first live
+  tracked agent in numeric window/pane order, with the exact resolved pane
+  shown in the composer title. Exact pane selections remain unchanged.
+
+- **Message composers now have reusable `/` skills.** Register templates with
+  `muxa skill add` or `[message.skills]`, then press `/` in an `m` composer in
+  watch/dashboard or a watch `a` composer to filter and insert one at the
+  current cursor. Existing draft text is preserved, so skills can be added
+  while composing a longer message or combined repeatedly. Watch palettes also
+  add/update with `F2` and confirm removal with `Delete` (`Ctrl-A`/`Ctrl-D`
+  remain aliases). Skills remain text-only: selection never auto-sends or
+  changes request kind, send mode, ask agent, or ask permissions.
+
 ## [0.8.33] - 2026-08-13
 
 ### Changed

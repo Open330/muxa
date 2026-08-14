@@ -6,7 +6,7 @@
 use crate::collaboration::RequestKind;
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -111,6 +111,8 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
     pub collaboration: CollaborationConfig,
+    /// Reusable text templates for the interactive `m` message composer.
+    pub message: MessageConfig,
     #[serde(default)]
     pub ask: AskConfig,
     pub history: HistoryConfig,
@@ -119,6 +121,20 @@ pub struct Config {
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
     pub stats: StatsConfig,
+}
+
+/// `[message.skills]` config — reusable prompt templates for message
+/// composers. A sorted map keeps the `/` palette deterministic while the TOML
+/// remains pleasantly hand-editable:
+///
+/// ```toml
+/// [message.skills]
+/// agent-review = "Create a new pane with codex and review our changes."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessageConfig {
+    pub skills: BTreeMap<String, String>,
 }
 
 /// Default wall-clock ceiling for one headless ask turn.
@@ -1474,6 +1490,27 @@ additional_dirs = ["/nfs/home/june", "/srv/shared"]
                 PathBuf::from("/nfs/home/june"),
                 PathBuf::from("/srv/shared")
             ]
+        );
+    }
+
+    #[test]
+    fn parses_sorted_message_skills() {
+        let cfg: Config = toml::from_str(
+            r#"
+[message.skills]
+summarize = "summarize our changes"
+agent-review = "create a codex pane and pass our changes for review"
+"리뷰" = "다른 에이전트에게 리뷰를 요청해"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.message.skills.keys().cloned().collect::<Vec<_>>(),
+            vec!["agent-review", "summarize", "리뷰"]
+        );
+        assert_eq!(
+            cfg.message.skills.get("agent-review").map(String::as_str),
+            Some("create a codex pane and pass our changes for review")
         );
     }
 
