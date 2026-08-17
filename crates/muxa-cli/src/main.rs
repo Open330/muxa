@@ -647,7 +647,7 @@ async fn main() -> Result<()> {
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
         Cmd::Onboard(onboard_args) => onboarding::run(onboard_args),
-        Cmd::Mcp => mcp::run(client).await,
+        Cmd::Mcp => mcp::run(client, cfg.message.skills.clone()).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune {

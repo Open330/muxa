@@ -171,6 +171,8 @@ worktrees remain the safest choice for concurrent edits.
 | --- | --- |
 | `muxa_collaboration_guide` | Retrieve reviewer, question, delegated-subagent, and AIR handoff contracts. |
 | `muxa_room_context` | Identify self, list same-window peers, and show unread count. |
+| `muxa_call_peer` | Expand a registered skill, select a peer, send a durable request, optionally wait, and explicitly spawn when confirmed. |
+| `muxa_peer_report` | Read the newest completed report from a prior peer request, or retrieve an exact request id. |
 | `muxa_set_identity` | Replace this exact session's room-local alias and roles. |
 | `muxa_send_message` | Create a durable peer request. |
 | `muxa_inbox` | Claim/read requests for this exact agent session. |
@@ -178,6 +180,37 @@ worktrees remain the safest choice for concurrent edits.
 | `muxa_reply` | Return a completed/blocked/declined/failed response. |
 | `muxa_wait_reply` | Wait for the structured terminal response. |
 | `muxa_cancel_message` | Cancel a sent request while it is still queued. |
+
+## Natural calls from an agent conversation
+
+A Claude or Codex agent connected to `muxa mcp` treats `@peer` and
+`@muxa-peer` as reserved Muxa collaboration expressions. Provider mentions such
+as `@codex`, a unique `@alias`, `role:name`, or a natural “call a colleague”
+request for new work map to `muxa_call_peer`. A registered skill can be included
+as `/name`:
+
+```text
+@peer review the current changes
+@codex /review-plan-feedback using commit abc123 as context
+```
+
+Possessive references such as “`@peer`'s report”, “the peer reply”, or “resolve
+the peer findings” map to `muxa_peer_report` first, so the agent evaluates the
+actual structured mailbox response rather than fabricating external review
+state. Without an explicit PR number or GitHub PR URL in user-provided or
+grounded context, peer review language must not invoke GitHub PR/review tools or
+invent a PR; repository/cwd context alone is insufficient. If Muxa tools are
+unavailable, the correct recovery is to restart the agent, never to substitute
+GitHub.
+
+The high-level tool keeps the mailbox semantics below while removing the need
+for the model to compose several low-level calls. It defaults to
+`kind=review`, `work_mode=read_only`, selects a healthy peer deterministically,
+and waits for the structured reply. Execute mode requires an explicit task
+authorization. If no eligible peer exists, Muxa asks for confirmation instead
+of silently creating one; `spawn_if_missing=true` is valid only after that
+confirmation. Restart existing agents after changing skills or upgrading Muxa
+because their MCP process loads tools and templates at startup.
 
 ## Reviewers and delegated subagents
 

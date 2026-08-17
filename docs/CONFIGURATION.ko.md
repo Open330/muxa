@@ -104,7 +104,7 @@ agent를 정확한 pane id로 지정할 수 있습니다.
 ## 메시지 스킬
 
 반복해서 쓰는 prompt 템플릿은 일반 TOML table에 저장하며 watch와 dashboard의
-`m` composer, watch의 `a` composer가 함께 사용합니다.
+`m` composer, watch의 `a` composer, MCP의 `muxa_call_peer`가 함께 사용합니다.
 
 ```toml
 [message.skills]
@@ -128,6 +128,11 @@ muxa skill remove agent-review
 확인 후 삭제할 수 있습니다. 기존 `Ctrl-A`, `Ctrl-D`도 호환 alias로 유지합니다.
 multi-line 템플릿은 CLI add 명령의 prompt
 자리에 `-`를 넘겨 stdin으로 등록할 수 있습니다.
+
+MCP가 연결된 agent 대화에서는 `/name`으로 같은 템플릿을 `muxa_call_peer`에
+선택할 수 있고, 선택적인 body와 context가 템플릿을 바꾸지 않은 채 뒤에
+추가됩니다. MCP process는 시작할 때 스킬 table을 읽으므로 스킬을 추가·수정·삭제한
+뒤에는 실행 중인 agent를 재시작하세요.
 
 스킬은 prompt 본문만 저장합니다. request kind, collaboration mode, agent, cwd,
 timeout, permission scope를 포함하지 않습니다. `m`에서는 현재 선택한 kind/mode가

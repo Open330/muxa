@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agents can call a colleague naturally through Muxa MCP.** Connected Claude
+  and Codex conversations now map `@peer`, provider/alias/role targets, and
+  registered `/skills` to `muxa_call_peer`. The high-level tool expands the
+  template, selects a healthy peer deterministically, sends a durable request,
+  and can wait for its structured reply. Calls default to `REVIEW · READ-ONLY`;
+  execution requires an explicit task authorization, and creating a new pane
+  requires separate user confirmation. `muxa_peer_report` retrieves prior
+  structured replies for phrases such as “`@peer`'s report”; reserved routing
+  refuses to substitute GitHub or invent a PR when no explicit PR number or
+  GitHub PR URL grounds that workflow. Repository/cwd context alone is not
+  sufficient.
+
 ## [0.8.34] - 2026-08-14
 
 ### Changed

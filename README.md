@@ -177,6 +177,25 @@ narrowly scoped execution subagents. Requests and replies can also carry
 validated AIR 1.0 artifact references, which watch visualizes with
 profile-colored mailbox badges.
 
+You can call a colleague directly from a connected Claude or Codex
+conversation. The agent maps the mention to Muxa's durable peer-call tool:
+
+```text
+@peer review the current changes
+@codex /review-plan-feedback using commit abc123 as context
+@peer's report: summarize it and apply only valid advice
+```
+
+`@peer` and `@muxa-peer` are reserved for Muxa collaboration. New requests use
+the peer-call tool; references to an existing peer report use the durable
+mailbox report tool and never imply a GitHub PR without an explicit PR reference.
+`@peer` chooses a healthy same-window agent deterministically; `@claude`,
+`@codex`, `@gemini`, `@alias`, and `role:name` narrow the target. Calls default
+to `REVIEW · READ-ONLY`. Executing changes requires an explicit task
+authorization, and creating a new agent pane requires a separate confirmation.
+Restart an already-running agent after upgrading Muxa or changing registered
+skills so its MCP process loads the new tool and templates.
+
 Agents reported as synthetic by `muxa doctor` are omitted from collaboration
 until a hook event establishes a stable session identity. Submit a prompt or
 restart that agent, then check again.
@@ -234,7 +253,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
-| `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages and watch ask. |
+| `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |

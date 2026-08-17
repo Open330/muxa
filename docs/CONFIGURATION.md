@@ -107,7 +107,8 @@ See [COLLABORATION.md](COLLABORATION.md).
 ## Message skills
 
 Reusable prompt templates live in a regular TOML table. They are shared by the
-watch and dashboard `m` composers and the watch `a` composer:
+watch and dashboard `m` composers, the watch `a` composer, and MCP
+`muxa_call_peer` requests:
 
 ```toml
 [message.skills]
@@ -130,6 +131,11 @@ send. Multiple skills can be combined in one draft. In `muxa watch`, `F2` opens
 an add/update form inside the palette and `Delete` removes the selected skill
 after confirmation. `Ctrl-A` and `Ctrl-D` remain compatibility aliases.
 Pass `-` as the CLI add prompt to read a multi-line template from stdin.
+
+In an MCP-connected agent conversation, `/name` selects the same template for
+`muxa_call_peer`; its optional body and context are appended without changing
+the template. The MCP process loads the skill table at startup, so restart an
+already-running agent after adding, updating, or removing a skill.
 
 A skill stores prompt text only. It has no request kind, collaboration mode,
 agent, cwd, timeout, or permission scope of its own. The `m` composer keeps its

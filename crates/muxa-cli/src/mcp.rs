@@ -26,14 +26,14 @@
 
 use anyhow::{bail, Result};
 use muxa::collaboration::{
-    AirArtifactReference, CollaborationOrigin, NewRequest, RequestKind, RequestMailbox,
-    RequestStatus, RoomContext, WorkMode,
+    AirArtifactReference, CollaborationOrigin, CollaborationRequest, NewRequest, Participant,
+    RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
-use muxa::event::AgentState;
+use muxa::event::{AgentKind, AgentState};
 use muxa::ipc::Client;
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -61,6 +61,23 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     as one work/ticket, and one pane as one agent. Use muxa_start_agent with a work id instead \
     of delegating tmux setup to another model; use muxa_manage_tmux for lifecycle \
     control and never invent raw tmux commands. \
+    Reserved routing: @peer and @muxa-peer always mean Muxa collaboration, never \
+    a GitHub user, pull-request reviewer, issue, or review thread. A request for \
+    @peer's report, reply, previous findings, or conversation must call \
+    muxa_peer_report first. A request that asks @peer, @codex, @claude, @gemini, \
+    an explicit @alias, or a colleague to do new work must call muxa_call_peer. \
+    If these Muxa tools are unavailable, tell the user to restart the agent so \
+    its MCP process reloads; never substitute a GitHub workflow. Use GitHub PR or \
+    review tools only when the user or already-grounded context provides an \
+    explicit PR number or GitHub PR URL; a repository or cwd alone is not enough. \
+    Never invent a PR, issue, or review thread. Resolving peer \
+    feedback means adjudicating the Muxa report and recording accepted/rejected \
+    findings unless an explicit PR establishes GitHub review threads. A /name in \
+    a new peer request selects a registered Muxa message skill; pass the remaining \
+    request-specific details as body or context. Never \
+    set execute=true unless the user explicitly authorizes edits, and never set \
+    spawn_if_missing=true until the user explicitly confirms creating a new \
+    bypass-permission agent pane. By default peer calls are review + read_only. \
     At the start of substantial work, call muxa_collaboration_guide (or \
     muxa_room_context) to discover available peer agents. Improve important work \
     with a peer when useful: use review + read_only after implementation and tests \
@@ -88,7 +105,7 @@ const RECONCILE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run the MCP stdio server until stdin closes. Refuses to start if the
 /// daemon socket is unreachable.
-pub async fn run(client: Client) -> Result<()> {
+pub async fn run(client: Client, message_skills: BTreeMap<String, String>) -> Result<()> {
     // Refuse to start against an absent/dead daemon: a control plane the
     // tools can't reach is worse than a clear failure.
     if let Err(e) = client.snapshot_with_timeout(PROBE_TIMEOUT).await {
@@ -98,10 +115,11 @@ pub async fn run(client: Client) -> Result<()> {
         );
     }
 
-    serve(
+    serve_with_skills(
         client,
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
+        Arc::new(message_skills),
     )
     .await
 }
@@ -125,7 +143,21 @@ pub async fn run(client: Client) -> Result<()> {
 ///
 /// Generic over the transport so tests can drive it through an in-memory
 /// duplex pipe instead of the real stdio handles.
+#[cfg(test)]
 async fn serve<R, W>(client: Client, reader: R, writer: W) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_with_skills(client, reader, writer, Arc::new(BTreeMap::new())).await
+}
+
+async fn serve_with_skills<R, W>(
+    client: Client,
+    reader: R,
+    writer: W,
+    message_skills: Arc<BTreeMap<String, String>>,
+) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -142,9 +174,10 @@ where
         }
         let client = client.clone();
         let writer = Arc::clone(&writer);
+        let message_skills = Arc::clone(&message_skills);
         tasks.spawn(async move {
             let response = match serde_json::from_str::<Value>(&line) {
-                Ok(req) => dispatch(&client, &req).await,
+                Ok(req) => dispatch_with_skills(&client, &req, &message_skills).await,
                 // A line that isn't valid JSON at all: -32700, id unknown.
                 Err(e) => Some(error_response(
                     &Value::Null,
@@ -199,9 +232,18 @@ where
 /// - an **object** is routed by [`dispatch_object`], which still returns a
 ///   proper error for a missing/invalid `jsonrpc` or `method` whenever an
 ///   `id` is present to address the reply to.
+#[cfg(test)]
 async fn dispatch(client: &Client, req: &Value) -> Option<Value> {
+    dispatch_with_skills(client, req, &BTreeMap::new()).await
+}
+
+async fn dispatch_with_skills(
+    client: &Client,
+    req: &Value,
+    message_skills: &BTreeMap<String, String>,
+) -> Option<Value> {
     match req {
-        Value::Object(_) => dispatch_object(client, req).await,
+        Value::Object(_) => dispatch_object(client, req, message_skills).await,
         Value::Array(_) => Some(error_response(
             &Value::Null,
             -32600,
@@ -219,7 +261,11 @@ async fn dispatch(client: &Client, req: &Value) -> Option<Value> {
 
 /// Route a JSON-RPC **object**: split notifications (no `id`) from requests,
 /// validate the envelope, then dispatch by `method`.
-async fn dispatch_object(client: &Client, req: &Value) -> Option<Value> {
+async fn dispatch_object(
+    client: &Client,
+    req: &Value,
+    message_skills: &BTreeMap<String, String>,
+) -> Option<Value> {
     let id = req.get("id").cloned();
 
     // No `id` key at all → notification: never answered (even if malformed,
@@ -245,10 +291,10 @@ async fn dispatch_object(client: &Client, req: &Value) -> Option<Value> {
     };
 
     let response = match method {
-        "initialize" => success(&id, initialize_result()),
+        "initialize" => success(&id, initialize_result(message_skills)),
         "ping" => success(&id, json!({})),
         "tools/list" => success(&id, json!({ "tools": tool_definitions() })),
-        "tools/call" => match call_tool(client, req.get("params")).await {
+        "tools/call" => match call_tool(client, req.get("params"), message_skills).await {
             Ok(result) => success(&id, result),
             // A malformed `tools/call` (missing name / bad args) is a
             // protocol error; a tool that *ran* but failed reports
@@ -260,7 +306,17 @@ async fn dispatch_object(client: &Client, req: &Value) -> Option<Value> {
     Some(response)
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(message_skills: &BTreeMap<String, String>) -> Value {
+    let instructions = if message_skills.is_empty() {
+        MCP_SERVER_INSTRUCTIONS.to_string()
+    } else {
+        let names = message_skills
+            .keys()
+            .map(|name| format!("/{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{MCP_SERVER_INSTRUCTIONS} Registered Muxa message skills available to muxa_call_peer: {names}.")
+    };
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
@@ -268,7 +324,7 @@ fn initialize_result() -> Value {
             "name": "muxa",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": MCP_SERVER_INSTRUCTIONS,
+        "instructions": instructions,
     })
 }
 
@@ -455,6 +511,46 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
+            "name": "muxa_call_peer",
+            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window peer (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. If no peer exists, the default result asks for confirmation; set spawn_if_missing=true only after the user explicitly approves creating a bypass-permission agent pane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/opencode (with or without @), pane:%N/%N, @alias, or role:<name>." },
+                    "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
+                    "body": { "type": "string", "description": "Request-specific instruction. Optional when skill is supplied." },
+                    "skill": { "type": "string", "description": "Registered Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
+                    "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
+                    "execute": { "type": "boolean", "description": "Default false. Requires intent=task and explicit user authorization." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
+                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
+                    "spawn_if_missing": { "type": "boolean", "description": "Default false. Create a same-window bypass-permission peer only after explicit user confirmation." },
+                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
+                    "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "How long to wait for the new pane to register as a collaboration peer. Default 30." },
+                    "air_artifacts": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": air_artifact_reference_schema(),
+                        "description": "Optional validated AIR artifact references carried with the request."
+                    }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_peer_report",
+            "description": "Read the newest completed Muxa peer report/reply sent to this agent, or retrieve an exact request_id. Use this first for possessive requests such as '@peer's report', 'peer findings', 'the peer conversation', or 'resolve the peer feedback'. This is Muxa mailbox data, not a GitHub PR review; never infer a PR number or review thread from it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Optional report author filter: peer/auto/@muxa-peer, provider, pane id, @alias, or role:<name>. Default newest report from any peer." },
+                    "request_id": { "type": "string", "description": "Retrieve one exact prior Muxa request/reply instead of selecting the newest report." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
             "name": "muxa_set_identity",
             "description": "Replace this exact agent session's room-local alias and roles. Aliases enable @alias routing; roles enable role:<name> routing. An empty call clears identity.",
             "inputSchema": {
@@ -496,7 +592,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_list_messages",
-            "description": "List incoming, sent, or all collaboration requests for this exact agent session without claiming them.",
+            "description": "List incoming, sent, or all Muxa collaboration requests for this exact agent session without claiming them. Results are newest first. For the latest completed report addressed to this agent's request, prefer muxa_peer_report.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -557,7 +653,11 @@ fn tool_definitions() -> Vec<Value> {
 /// its job returns an `isError` result so the calling model sees the
 /// message rather than a transport fault.
 #[allow(clippy::too_many_lines)] // one explicit MCP tool dispatch table
-async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
+async fn call_tool(
+    client: &Client,
+    params: Option<&Value>,
+    message_skills: &BTreeMap<String, String>,
+) -> Result<Value> {
     let params = params.ok_or_else(|| anyhow::anyhow!("missing params"))?;
     let name = params
         .get("name")
@@ -792,6 +892,8 @@ async fn call_tool(client: &Client, params: Option<&Value>) -> Result<Value> {
                 Err(error) => error_result(&format!("room context failed: {error}")),
             })
         }
+        "muxa_call_peer" => Ok(call_peer(client, &args, message_skills).await),
+        "muxa_peer_report" => Ok(peer_report(client, &args).await),
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
             let roles = string_array(&args, "roles");
@@ -1003,6 +1105,609 @@ fn collaboration_guide(room: RoomContext) -> Value {
             "Do not delegate merely for ceremony or recursively bounce work without a concrete benefit."
         ]
     })
+}
+
+#[derive(Debug, Clone)]
+struct PeerSelection {
+    peer: Participant,
+    reason: String,
+}
+
+/// Read a prior peer's structured response without asking it to do new work.
+/// Listing is non-claiming; the final exact get records that the sender read
+/// the reply, matching `muxa_wait_reply` semantics.
+async fn peer_report(client: &Client, args: &Value) -> Value {
+    let origin = match current_collaboration_origin() {
+        Ok(origin) => origin,
+        Err(error) => return error_result(&error),
+    };
+    if let Some(request_id) = args.get("request_id").and_then(Value::as_str) {
+        return match client.collaboration_get(&origin, request_id).await {
+            Ok(request) if request.reply.is_some() => json_result(&json!({
+                "selection_reason": "explicit request_id",
+                "request": request,
+            })),
+            Ok(_) => error_result(&format!(
+                "Muxa request {request_id:?} does not have a completed peer report yet"
+            )),
+            Err(error) => error_result(&format!("peer_report failed: {error}")),
+        };
+    }
+
+    let target = args.get("target").and_then(Value::as_str).unwrap_or("peer");
+    let requests = match client
+        .collaboration_list(&origin, RequestMailbox::Sent)
+        .await
+    {
+        Ok(requests) => requests,
+        Err(error) => return error_result(&format!("peer_report list failed: {error}")),
+    };
+    let selected = requests
+        .into_iter()
+        .filter(|request| {
+            request.reply.is_some() && peer_report_target_matches(&request.to, target)
+        })
+        .max_by_key(|request| request.created_at);
+    let Some(selected) = selected else {
+        return error_result(&format!(
+            "no completed Muxa peer report matches {target:?}; use muxa_call_peer only if the user wants a new request"
+        ));
+    };
+    match client.collaboration_get(&origin, &selected.id).await {
+        Ok(request) => json_result(&json!({
+            "selection_reason": format!("newest completed report matching {target:?}"),
+            "request": request,
+        })),
+        Err(error) => error_result(&format!("peer_report failed: {error}")),
+    }
+}
+
+fn peer_report_target_matches(peer: &Participant, target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty()
+        || target.eq_ignore_ascii_case("auto")
+        || target.eq_ignore_ascii_case("peer")
+        || target.eq_ignore_ascii_case("@peer")
+        || target.eq_ignore_ascii_case("@muxa-peer")
+    {
+        return true;
+    }
+    let pane_target = target.strip_prefix("pane:").unwrap_or(target);
+    if peer.pane == pane_target {
+        return true;
+    }
+    if let Some(kind) = provider_kind(target) {
+        return peer.agent_kind == kind;
+    }
+    if let Some(role) = target.strip_prefix("role:") {
+        return peer
+            .roles
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(role));
+    }
+    let alias = target
+        .strip_prefix('@')
+        .or_else(|| target.strip_prefix("alias:"))
+        .unwrap_or(target);
+    peer.alias
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(alias))
+}
+
+/// One high-level colleague call behind the conversational `@peer` protocol.
+/// The model still owns understanding the user's sentence; muxa owns every
+/// deterministic and security-sensitive step after that: prompt expansion,
+/// target selection, contract construction, optional explicit spawn, durable
+/// delivery, and reply correlation.
+#[allow(clippy::too_many_lines)] // keep the security-sensitive call sequence linear and auditable
+async fn call_peer(
+    client: &Client,
+    args: &Value,
+    message_skills: &BTreeMap<String, String>,
+) -> Value {
+    let (body, expanded_skill) = match peer_call_body(args, message_skills) {
+        Ok(body) => body,
+        Err(error) => return error_result(&error),
+    };
+    let (kind, work_mode) = match peer_call_contract(args) {
+        Ok(contract) => contract,
+        Err(error) => return error_result(error),
+    };
+    let air_artifacts = match parse_air_artifact_references(args) {
+        Ok(references) => references,
+        Err(error) => return error_result(&error),
+    };
+    let origin = match current_collaboration_origin() {
+        Ok(origin) => origin,
+        Err(error) => return error_result(&error),
+    };
+    let room = match client.collaboration_context(&origin).await {
+        Ok(room) => room,
+        Err(error) => return error_result(&format!("call_peer context failed: {error}")),
+    };
+    let target = args.get("target").and_then(Value::as_str).unwrap_or("auto");
+    let mut selection = match select_peer(&room, target) {
+        Ok(selection) => selection,
+        Err(error) => return error_result(&error),
+    };
+    let mut spawned = None;
+
+    if selection.is_none() {
+        let suggested = match peer_spawn_program(args, &room.current, target) {
+            Ok(program) => program,
+            Err(error) => return error_result(&error),
+        };
+        if !args
+            .get("spawn_if_missing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return json_result(&json!({
+                "sent": false,
+                "action_required": "confirm_spawn",
+                "message": format!(
+                    "No eligible {target:?} peer is available. Ask the user before creating a new bypass-permission agent pane."
+                ),
+                "suggested_call": {
+                    "target": target,
+                    "spawn_if_missing": true,
+                    "spawn_agent": agent_program_label(suggested),
+                },
+                "available_peers": room.peers,
+            }));
+        }
+        match spawn_peer(client, &origin, &room, args, target, suggested).await {
+            Ok((new_selection, start_result)) => {
+                selection = Some(new_selection);
+                spawned = Some(start_result);
+            }
+            Err(error) => return error_result(&error),
+        }
+    }
+
+    let selection = selection.expect("missing selection handled above");
+    let paths = string_array(args, "paths");
+    let request = NewRequest {
+        kind,
+        body,
+        expects_reply: true,
+        work_mode,
+        paths,
+        air_artifacts,
+    };
+    let selector = format!("pane:{}", selection.peer.pane);
+    let sent = match client
+        .collaboration_send(&origin, &selector, &request)
+        .await
+    {
+        Ok(request) => request,
+        Err(error) => return error_result(&format!("call_peer send failed: {error}")),
+    };
+    let common = json!({
+        "sent": true,
+        "selected_peer": selection.peer,
+        "selection_reason": selection.reason,
+        "expanded_skill": expanded_skill,
+        "spawned": spawned,
+        "request_id": sent.id,
+        "kind": kind,
+        "work_mode": work_mode,
+    });
+    if !args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
+        let mut payload = common;
+        payload["completed"] = json!(false);
+        payload["reason"] = json!("sent_without_waiting");
+        payload["request"] = json!(sent);
+        return json_result(&payload);
+    }
+
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .clamp(1, MAX_WAIT_SECS);
+    match await_collaboration_reply(client, &origin, &sent.id, timeout_secs).await {
+        Ok(Some(request)) => {
+            let mut payload = common;
+            payload["completed"] = json!(true);
+            payload["request"] = json!(request);
+            json_result(&payload)
+        }
+        Ok(None) => {
+            let mut payload = common;
+            payload["completed"] = json!(false);
+            payload["reason"] = json!("timeout");
+            payload["timeout_secs"] = json!(timeout_secs);
+            payload["request"] = json!(sent);
+            json_result(&payload)
+        }
+        Err(error) => error_result(&format!("call_peer wait failed: {error}")),
+    }
+}
+
+fn peer_call_contract(args: &Value) -> std::result::Result<(RequestKind, WorkMode), &'static str> {
+    let kind = match args
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("review")
+    {
+        "review" => RequestKind::Review,
+        "question" => RequestKind::Question,
+        "task" => RequestKind::Task,
+        _ => return Err("call_peer intent must be review, question, or task"),
+    };
+    let execute = args
+        .get("execute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if execute && kind != RequestKind::Task {
+        return Err("call_peer execute=true requires intent=task");
+    }
+    Ok((
+        kind,
+        if execute {
+            WorkMode::Execute
+        } else {
+            WorkMode::ReadOnly
+        },
+    ))
+}
+
+fn peer_call_body(
+    args: &Value,
+    message_skills: &BTreeMap<String, String>,
+) -> std::result::Result<(String, Option<String>), String> {
+    let skill_name = args
+        .get("skill")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.trim_start_matches('/'));
+    let skill = if let Some(name) = skill_name {
+        let found = message_skills
+            .get(name)
+            .or_else(|| {
+                message_skills
+                    .iter()
+                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                    .map(|(_, prompt)| prompt)
+            })
+            .ok_or_else(|| {
+                let available = message_skills
+                    .keys()
+                    .map(|name| format!("/{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "message skill /{name} is not registered{}",
+                    if available.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; available: {available}")
+                    }
+                )
+            })?;
+        Some((name.to_string(), found.trim()))
+    } else {
+        None
+    };
+    let body = args
+        .get("body")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|body| !body.is_empty());
+    let context = args
+        .get("context")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|context| !context.is_empty());
+    let mut sections = Vec::new();
+    if let Some((_, prompt)) = skill.as_ref() {
+        sections.push((*prompt).to_string());
+    }
+    if let Some(body) = body {
+        sections.push(body.to_string());
+    }
+    if let Some(context) = context {
+        sections.push(format!("Invocation context:\n{context}"));
+    }
+    if sections.is_empty() {
+        return Err("call_peer requires body, skill, or context".into());
+    }
+    Ok((
+        sections.join("\n\n"),
+        skill.map(|(name, _)| format!("/{name}")),
+    ))
+}
+
+fn select_peer(
+    room: &RoomContext,
+    target: &str,
+) -> std::result::Result<Option<PeerSelection>, String> {
+    let target = target.trim();
+    let live = room
+        .peers
+        .iter()
+        .filter(|peer| peer_is_eligible(peer))
+        .collect::<Vec<_>>();
+    if target.is_empty()
+        || target.eq_ignore_ascii_case("auto")
+        || target.eq_ignore_ascii_case("@peer")
+        || target.eq_ignore_ascii_case("@muxa-peer")
+        || target.eq_ignore_ascii_case("peer")
+    {
+        return Ok(best_peer(&live, &room.current).map(|peer| PeerSelection {
+            peer: peer.clone(),
+            reason:
+                "auto: healthy different-provider preference, then state and numeric pane order"
+                    .into(),
+        }));
+    }
+    let pane_target = target.strip_prefix("pane:").unwrap_or(target);
+    if let Some(peer) = live.iter().copied().find(|peer| peer.pane == pane_target) {
+        return Ok(Some(PeerSelection {
+            peer: peer.clone(),
+            reason: format!("explicit pane {}", peer.pane),
+        }));
+    }
+    if let Some(kind) = provider_kind(target) {
+        let candidates = live
+            .iter()
+            .copied()
+            .filter(|peer| peer.agent_kind == kind)
+            .collect::<Vec<_>>();
+        return Ok(
+            best_peer(&candidates, &room.current).map(|peer| PeerSelection {
+                peer: peer.clone(),
+                reason: format!("explicit provider {kind}"),
+            }),
+        );
+    }
+    if let Some(role) = target.strip_prefix("role:") {
+        let matches = live
+            .iter()
+            .copied()
+            .filter(|peer| {
+                peer.roles
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(role))
+            })
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [] => Err(format!("no eligible peer has role {role:?}")),
+            [peer] => Ok(Some(PeerSelection {
+                peer: (*peer).clone(),
+                reason: format!("explicit role {role}"),
+            })),
+            _ => Err(format!(
+                "role {role:?} matches multiple peers; use @alias or pane id"
+            )),
+        };
+    }
+    let alias = target
+        .strip_prefix('@')
+        .or_else(|| target.strip_prefix("alias:"))
+        .unwrap_or(target);
+    let matches = live
+        .iter()
+        .copied()
+        .filter(|peer| {
+            peer.alias
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(alias))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "no eligible peer matches {target:?}; use auto, a provider, @alias, role:<name>, or pane id"
+        )),
+        [peer] => Ok(Some(PeerSelection {
+            peer: (*peer).clone(),
+            reason: format!("explicit alias @{alias}"),
+        })),
+        _ => Err(format!(
+            "alias @{alias} matches multiple peers; use an exact pane id"
+        )),
+    }
+}
+
+fn peer_is_eligible(peer: &Participant) -> bool {
+    !matches!(peer.agent_kind, AgentKind::Task | AgentKind::Unknown)
+        && !matches!(peer.state, AgentState::Error | AgentState::Stopped)
+}
+
+fn best_peer<'a>(peers: &[&'a Participant], current: &Participant) -> Option<&'a Participant> {
+    peers.iter().copied().min_by(|left, right| {
+        peer_sort_key(left, current)
+            .cmp(&peer_sort_key(right, current))
+            .then_with(|| left.pane.cmp(&right.pane))
+    })
+}
+
+fn peer_sort_key(peer: &Participant, current: &Participant) -> (bool, u8, u8, u64) {
+    (
+        peer.agent_kind == current.agent_kind,
+        peer_state_rank(peer.state),
+        provider_rank(peer.agent_kind),
+        numeric_pane_index(&peer.pane).unwrap_or(u64::MAX),
+    )
+}
+
+fn peer_state_rank(state: AgentState) -> u8 {
+    match state {
+        AgentState::Idle => 0,
+        AgentState::Working => 1,
+        AgentState::Starting => 2,
+        AgentState::WaitingInput | AgentState::WaitingChoice => 3,
+        AgentState::Error => 4,
+        AgentState::Stopped => 5,
+    }
+}
+
+fn provider_rank(kind: AgentKind) -> u8 {
+    match kind {
+        AgentKind::Codex => 0,
+        AgentKind::ClaudeCode => 1,
+        AgentKind::GeminiCli => 2,
+        AgentKind::Opencode => 3,
+        AgentKind::Task => 4,
+        AgentKind::Unknown => 5,
+    }
+}
+
+fn numeric_pane_index(pane: &str) -> Option<u64> {
+    pane.rsplit_once('%')?.1.parse().ok()
+}
+
+fn provider_kind(target: &str) -> Option<AgentKind> {
+    match target
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "claude" | "claude_code" | "claude-code" => Some(AgentKind::ClaudeCode),
+        "codex" | "cx" => Some(AgentKind::Codex),
+        "gemini" | "gemini_cli" | "gemini-cli" => Some(AgentKind::GeminiCli),
+        "opencode" => Some(AgentKind::Opencode),
+        _ => None,
+    }
+}
+
+fn peer_spawn_program(
+    args: &Value,
+    current: &Participant,
+    target: &str,
+) -> std::result::Result<crate::agent_launch::AgentProgram, String> {
+    let requested = args
+        .get("spawn_agent")
+        .and_then(Value::as_str)
+        .map(crate::agent_launch::AgentProgram::parse)
+        .transpose()?;
+    let targeted = provider_kind(target).map(agent_program_for_kind);
+    if let (Some(requested), Some(targeted)) = (requested, targeted) {
+        if requested != targeted {
+            return Err(format!(
+                "spawn_agent={} conflicts with target={target:?}",
+                agent_program_label(requested)
+            ));
+        }
+    }
+    Ok(requested.or(targeted).unwrap_or(match current.agent_kind {
+        AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Codex,
+        AgentKind::Codex => crate::agent_launch::AgentProgram::Claude,
+        AgentKind::GeminiCli | AgentKind::Opencode | AgentKind::Task | AgentKind::Unknown => {
+            crate::agent_launch::AgentProgram::Codex
+        }
+    }))
+}
+
+fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram {
+    match kind {
+        AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Claude,
+        AgentKind::Codex | AgentKind::Task | AgentKind::Unknown => {
+            crate::agent_launch::AgentProgram::Codex
+        }
+        AgentKind::GeminiCli => crate::agent_launch::AgentProgram::Gemini,
+        AgentKind::Opencode => crate::agent_launch::AgentProgram::Opencode,
+    }
+}
+
+fn agent_program_label(program: crate::agent_launch::AgentProgram) -> &'static str {
+    match program {
+        crate::agent_launch::AgentProgram::Claude => "claude",
+        crate::agent_launch::AgentProgram::Codex => "codex",
+        crate::agent_launch::AgentProgram::Gemini => "gemini",
+        crate::agent_launch::AgentProgram::Opencode => "opencode",
+    }
+}
+
+async fn spawn_peer(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    room: &RoomContext,
+    args: &Value,
+    target: &str,
+    program: crate::agent_launch::AgentProgram,
+) -> std::result::Result<(PeerSelection, crate::agent_launch::StartResult), String> {
+    if room.current.room.host != "tmux" || !room.current.pane.starts_with('%') {
+        return Err("call_peer automatic spawn currently requires a native tmux agent pane".into());
+    }
+    let request = crate::agent_launch::StartRequest {
+        agent: program,
+        placement: crate::agent_launch::Placement::Pane,
+        target: Some(room.current.pane.clone()),
+        cwd: room.current.cwd.as_deref().map(std::path::PathBuf::from),
+        prompt: None,
+        name: None,
+        workspace: None,
+        work: None,
+        role: Some("peer".into()),
+        task: Some("muxa peer call".into()),
+        direction: crate::agent_launch::SplitDirection::Right,
+    };
+    let started = tokio::task::spawn_blocking(move || crate::agent_launch::start(request))
+        .await
+        .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
+        .map_err(|error| format!("call_peer spawn failed: {error}"))?;
+    let timeout_secs = args
+        .get("spawn_timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(30)
+        .clamp(1, 60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let refreshed = client
+            .collaboration_context(origin)
+            .await
+            .map_err(|error| format!("call_peer context after spawn failed: {error}"))?;
+        if let Some(peer) = refreshed
+            .peers
+            .iter()
+            .find(|peer| peer.pane == started.pane && peer_is_eligible(peer))
+        {
+            return Ok((
+                PeerSelection {
+                    peer: peer.clone(),
+                    reason: format!(
+                        "spawned {} in {} after explicit confirmation for target {target:?}",
+                        agent_program_label(program),
+                        started.pane
+                    ),
+                },
+                started,
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "created {} peer pane {} but it did not register for collaboration within {timeout_secs}s; keep the pane, verify its hooks/MCP setup, then call again with target=\"pane:{}\"",
+                agent_program_label(program),
+                started.pane,
+                started.pane
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn await_collaboration_reply(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    request_id: &str,
+    timeout_secs: u64,
+) -> std::result::Result<Option<CollaborationRequest>, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match client.collaboration_get(origin, request_id).await {
+            Ok(request) if request.status.is_terminal() => return Ok(Some(request)),
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -1708,6 +2413,15 @@ mod tests {
         assert!(instructions.contains("review + read_only"));
         assert!(instructions.contains("task + execute + narrow paths"));
         assert!(instructions.contains("verify and integrate the result yourself"));
+        assert!(instructions.contains("@peer"));
+        assert!(instructions.contains("@muxa-peer"));
+        assert!(instructions.contains("muxa_call_peer"));
+        assert!(instructions.contains("muxa_peer_report"));
+        assert!(instructions.contains("never substitute a GitHub workflow"));
+        assert!(instructions.contains("a repository or cwd alone is not enough"));
+        assert!(instructions.contains("Never invent a PR"));
+        assert!(instructions.contains("execute=true"));
+        assert!(instructions.contains("spawn_if_missing=true"));
 
         let list = dispatch(
             &client,
@@ -1729,6 +2443,8 @@ mod tests {
                 "muxa_wait_for_change",
                 "muxa_collaboration_guide",
                 "muxa_room_context",
+                "muxa_call_peer",
+                "muxa_peer_report",
                 "muxa_set_identity",
                 "muxa_send_message",
                 "muxa_inbox",
@@ -1763,9 +2479,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("reviewer/subagent workflows"));
+        assert_peer_tool_definitions(tools);
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    fn assert_peer_tool_definitions(tools: &[Value]) {
+        let call_peer = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_call_peer")
+            .unwrap();
+        assert_eq!(
+            call_peer["inputSchema"]["properties"]["intent"]["enum"],
+            json!(["review", "question", "task"])
+        );
+        assert!(call_peer["description"]
+            .as_str()
+            .unwrap()
+            .contains("Defaults to review + read_only"));
+        let peer_report = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_peer_report")
+            .unwrap();
+        assert!(peer_report["description"]
+            .as_str()
+            .unwrap()
+            .contains("not a GitHub PR review"));
+        assert!(peer_report["inputSchema"]["properties"]["request_id"].is_object());
     }
 
     #[test]
@@ -1807,6 +2548,159 @@ mod tests {
             .unwrap()
             .iter()
             .any(|rule| rule.as_str().unwrap().contains("separate worktrees")));
+    }
+
+    #[test]
+    fn initialize_surfaces_registered_peer_call_skills() {
+        let skills = BTreeMap::from([
+            ("review-plan-feedback".into(), "review it".into()),
+            ("summarize".into(), "summarize it".into()),
+        ]);
+        let result = initialize_result(&skills);
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("/review-plan-feedback"));
+        assert!(instructions.contains("/summarize"));
+    }
+
+    fn peer_participant(kind: AgentKind, pane: &str, state: AgentState) -> Participant {
+        serde_json::from_value(json!({
+            "agent_kind": kind,
+            "agent_session_id": format!("session-{pane}"),
+            "pane": pane,
+            "room": { "host": "tmux", "window_id": "@1" },
+            "tmux_session_name": "cal-7000",
+            "window_name": "agents",
+            "state": state,
+            "cwd": "/tmp/project"
+        }))
+        .unwrap()
+    }
+
+    fn peer_room(current: Participant, peers: Vec<Participant>) -> RoomContext {
+        RoomContext {
+            current,
+            peers,
+            unread: 0,
+            unread_replies: 0,
+        }
+    }
+
+    #[test]
+    fn peer_call_expands_a_registered_skill_without_losing_context() {
+        let skills = BTreeMap::from([(
+            "review-plan-feedback".into(),
+            "Run the iterative peer review workflow.".into(),
+        )]);
+        let (body, skill) = peer_call_body(
+            &json!({
+                "skill": "/review-plan-feedback",
+                "body": "Review commit abc123.",
+                "context": "Tests already passed."
+            }),
+            &skills,
+        )
+        .unwrap();
+
+        assert_eq!(skill.as_deref(), Some("/review-plan-feedback"));
+        assert_eq!(
+            body,
+            "Run the iterative peer review workflow.\n\nReview commit abc123.\n\nInvocation context:\nTests already passed."
+        );
+    }
+
+    #[test]
+    fn peer_call_unknown_skill_lists_available_names() {
+        let skills = BTreeMap::from([("review".into(), "review it".into())]);
+        let error = peer_call_body(&json!({ "skill": "missing" }), &skills).unwrap_err();
+        assert!(error.contains("/missing"), "{error}");
+        assert!(error.contains("/review"), "{error}");
+    }
+
+    #[test]
+    fn peer_call_requires_explicit_task_contract_for_execute() {
+        assert_eq!(
+            peer_call_contract(&json!({})).unwrap(),
+            (RequestKind::Review, WorkMode::ReadOnly)
+        );
+        assert!(peer_call_contract(&json!({ "execute": true })).is_err());
+        assert_eq!(
+            peer_call_contract(&json!({ "intent": "task", "execute": true })).unwrap(),
+            (RequestKind::Task, WorkMode::Execute)
+        );
+    }
+
+    #[test]
+    fn auto_peer_prefers_a_different_provider_then_numeric_pane_order() {
+        let current = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let room = peer_room(
+            current,
+            vec![
+                peer_participant(AgentKind::ClaudeCode, "%2", AgentState::Idle),
+                peer_participant(AgentKind::Codex, "%12", AgentState::Idle),
+                peer_participant(AgentKind::Codex, "%3", AgentState::Idle),
+            ],
+        );
+
+        let selected = select_peer(&room, "auto").unwrap().unwrap();
+        assert_eq!(selected.peer.pane, "%3");
+        assert_eq!(
+            select_peer(&room, "@claude").unwrap().unwrap().peer.pane,
+            "%2"
+        );
+        assert_eq!(
+            select_peer(&room, "@muxa-peer").unwrap().unwrap().peer.pane,
+            "%3"
+        );
+    }
+
+    #[test]
+    fn peer_report_filters_provider_alias_role_and_pane_without_github_inference() {
+        let mut peer = peer_participant(AgentKind::ClaudeCode, "%12", AgentState::Idle);
+        peer.alias = Some("reviewer".into());
+        peer.roles = vec!["rust".into()];
+
+        assert!(peer_report_target_matches(&peer, "peer"));
+        assert!(peer_report_target_matches(&peer, "@muxa-peer"));
+        assert!(peer_report_target_matches(&peer, "@claude"));
+        assert!(peer_report_target_matches(&peer, "pane:%12"));
+        assert!(peer_report_target_matches(&peer, "@reviewer"));
+        assert!(peer_report_target_matches(&peer, "role:RUST"));
+        assert!(!peer_report_target_matches(&peer, "@codex"));
+        assert!(!peer_report_target_matches(&peer, "#2774"));
+    }
+
+    #[test]
+    fn peer_alias_and_role_selection_refuse_ambiguity() {
+        let current = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let mut reviewer = peer_participant(AgentKind::Codex, "%2", AgentState::Idle);
+        reviewer.alias = Some("reviewer".into());
+        reviewer.roles = vec!["rust".into()];
+        let mut other = peer_participant(AgentKind::GeminiCli, "%3", AgentState::Idle);
+        other.roles = vec!["rust".into()];
+        let room = peer_room(current, vec![reviewer, other]);
+
+        assert_eq!(
+            select_peer(&room, "@reviewer").unwrap().unwrap().peer.pane,
+            "%2"
+        );
+        assert!(select_peer(&room, "role:rust")
+            .unwrap_err()
+            .contains("multiple peers"));
+    }
+
+    #[test]
+    fn missing_peer_spawn_defaults_to_the_opposite_provider() {
+        let claude = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let codex = peer_participant(AgentKind::Codex, "%2", AgentState::Idle);
+        assert_eq!(
+            peer_spawn_program(&json!({}), &claude, "auto").unwrap(),
+            crate::agent_launch::AgentProgram::Codex
+        );
+        assert_eq!(
+            peer_spawn_program(&json!({}), &codex, "auto").unwrap(),
+            crate::agent_launch::AgentProgram::Claude
+        );
+        assert!(peer_spawn_program(&json!({ "spawn_agent": "claude" }), &codex, "@codex").is_err());
     }
 
     #[test]
