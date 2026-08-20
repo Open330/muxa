@@ -136,7 +136,13 @@ impl Ticket {
             })
         };
         Ok(Self {
-            id: pick(&["id", "identifier", "key", "number"]).unwrap_or_else(|| id.to_string()),
+            // `identifier`/`key` before `id`: trackers carry both a human
+            // ticket id and an internal UUID, and Linear puts the UUID under
+            // the more obvious name. Getting this backwards is invisible in
+            // a unit test and glaring in a window title.
+            id: pick(&["identifier", "key", "number", "id"])
+                .filter(|value| !looks_like_uuid(value))
+                .unwrap_or_else(|| id.to_string()),
             title: pick(&["title", "name", "summary"]),
             body: pick(&["body", "description", "content"]),
             url: pick(&["url", "html_url", "link", "permalink"]),
@@ -262,6 +268,19 @@ impl Vars {
         out.push_str(rest);
         out
     }
+}
+
+/// A bare RFC 4122-shaped id, which is a database key rather than
+/// something a person would ever type or a window would ever be named.
+/// Preferring `identifier` is not enough on its own: a source that reports
+/// only `id` would still put a UUID everywhere a ticket id belongs.
+fn looks_like_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 /// Whether a template places `{{request}}` itself, tolerating inner
@@ -730,6 +749,29 @@ role = 'reviewer'
         assert_eq!(ticket.title.as_deref(), Some("Title"));
         assert_eq!(ticket.body.as_deref(), Some("Body"));
         assert_eq!(ticket.url.as_deref(), Some("http://x"));
+    }
+
+    #[test]
+    fn the_human_ticket_id_wins_over_the_trackers_internal_uuid() {
+        // Verbatim shape from `linear-issue.sh json CAL-7093`.
+        let reply = r#"{"id":"3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c","identifier":"CAL-7093","title":"마이크 목록 로드 실패","url":"https://linear.app/rtzr/issue/CAL-7093"}"#;
+        let ticket = Ticket::parse_reply("cal-7093", reply).expect("parses");
+        assert_eq!(ticket.id, "CAL-7093");
+    }
+
+    #[test]
+    fn a_uuid_only_reply_falls_back_to_the_id_we_asked_about() {
+        let reply = r#"{"id":"3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c","title":"T"}"#;
+        let ticket = Ticket::parse_reply("cal-7093", reply).expect("parses");
+        assert_eq!(ticket.id, "cal-7093");
+    }
+
+    #[test]
+    fn uuid_detection_does_not_catch_ordinary_ticket_ids() {
+        assert!(looks_like_uuid("3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c"));
+        assert!(!looks_like_uuid("CAL-7093"));
+        assert!(!looks_like_uuid("3f594ef7-8e1e-4586-ae8f-a1fda4a57f0"));
+        assert!(!looks_like_uuid("zzzzzzzz-8e1e-4586-ae8f-a1fda4a57f0c"));
     }
 
     #[test]
