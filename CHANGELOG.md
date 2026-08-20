@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hostname/OS/architecture, while user labels and annotations remain editable
   through `muxa host label local` and `muxa host annotate local`.
 
+  Human host tables are terminal-width aware and concise by default; labels
+  move behind `--show-labels` or explicit `-L` columns, while `-o wide/json`
+  preserve richer output. A Fleet selection containing only `local` now opens
+  the full native `muxa watch` experience without a redundant host row. The
+  multi-node view shares watch themes, view/expansion/sort choices, swarm mode,
+  dense inspectors, `/` message skills, exact capture/send/attach, and uses a
+  Fleet invalidation stream with a slow reconciliation poll instead of fixed
+  high-frequency full redraws.
+
 - **Agents can call a colleague naturally through Muxa MCP.** Connected Claude
   and Codex conversations now map `@peer`, provider/alias/role targets, and
   registered `/skills` to `muxa_call_peer`. The high-level tool expands the

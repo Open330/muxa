@@ -1,6 +1,6 @@
 //! Central host → session → window → pane(agent) Fleet TUI.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use muxa::config::{WatchLayout, WatchSortKey, WatchTheme, WatchTreeExpansion, WatchView};
 use muxa::fleet::{
     FleetCommandResult, FleetHostSnapshot, FleetHostState, FleetOperation, FleetSnapshot,
     FleetWindowCapture, GlobalPaneRef,
@@ -26,25 +27,43 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const POLL_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const STREAM_FALLBACK_INTERVAL: Duration = Duration::from_secs(15);
 const WINDOW_CAPTURE_INTERVAL: Duration = Duration::from_secs(2);
 const INPUT_POLL: Duration = Duration::from_millis(50);
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
 
 type FleetTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+pub(crate) fn uses_native_local_watch(snapshot: &FleetSnapshot) -> bool {
+    snapshot.hosts.len() == 1 && snapshot.hosts[0].local
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NodeKey {
     Host(String),
-    Session { host: String, key: SessionKey },
-    Window { host: String, key: WindowKey },
-    Pane { host: String, key: PaneKey },
+    Session {
+        host: String,
+        key: SessionKey,
+    },
+    Window {
+        host: String,
+        key: WindowKey,
+    },
+    Pane {
+        host: String,
+        key: PaneKey,
+    },
+    PanelessAgent {
+        host: String,
+        kind: String,
+        session_id: String,
+    },
 }
 
 impl NodeKey {
@@ -53,14 +72,17 @@ impl NodeKey {
             Self::Host(host)
             | Self::Session { host, .. }
             | Self::Window { host, .. }
-            | Self::Pane { host, .. } => host,
+            | Self::Pane { host, .. }
+            | Self::PanelessAgent { host, .. } => host,
         }
     }
 
     fn parent(&self) -> Option<Self> {
         match self {
             Self::Host(_) => None,
-            Self::Session { host, .. } => Some(Self::Host(host.clone())),
+            Self::Session { host, .. } | Self::PanelessAgent { host, .. } => {
+                Some(Self::Host(host.clone()))
+            }
             Self::Window { host, key } => Some(Self::Session {
                 host: host.clone(),
                 key: key.session.clone(),
@@ -83,7 +105,7 @@ impl NodeKey {
     }
 
     fn is_parent(&self) -> bool {
-        !matches!(self, Self::Pane { .. })
+        !matches!(self, Self::Pane { .. } | Self::PanelessAgent { .. })
     }
 }
 
@@ -105,6 +127,7 @@ enum InputMode {
     Message,
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent TUI state flags
 struct App {
     snapshot: FleetSnapshot,
     topologies: HashMap<String, TopologySnapshot>,
@@ -123,10 +146,27 @@ struct App {
     window_capture: Option<(String, FleetWindowCapture)>,
     window_capture_pending: bool,
     last_window_capture: Option<Instant>,
+    theme: WatchTheme,
+    message_skills: BTreeMap<String, String>,
+    skill_palette: Option<crate::message_skill::Palette>,
+    layout: WatchLayout,
+    view: WatchView,
+    expansion: WatchTreeExpansion,
+    expansion_initialized: bool,
+    sort: WatchSortKey,
+    show_paneless: bool,
 }
 
 impl App {
-    fn new(selector: Option<String>) -> Self {
+    fn new(
+        selector: Option<String>,
+        theme: WatchTheme,
+        message_skills: BTreeMap<String, String>,
+        layout: WatchLayout,
+        view: WatchView,
+        expansion: WatchTreeExpansion,
+        sort: WatchSortKey,
+    ) -> Self {
         Self {
             snapshot: FleetSnapshot {
                 generated_at: OffsetDateTime::now_utc(),
@@ -148,6 +188,15 @@ impl App {
             window_capture: None,
             window_capture_pending: false,
             last_window_capture: None,
+            theme,
+            message_skills,
+            skill_palette: None,
+            layout,
+            view,
+            expansion,
+            expansion_initialized: false,
+            sort,
+            show_paneless: false,
         }
     }
 
@@ -155,8 +204,9 @@ impl App {
         let selected = self.selected_key().cloned();
         snapshot.hosts.sort_by(|left, right| {
             right
-                .needs_attention()
-                .cmp(&left.needs_attention())
+                .local
+                .cmp(&left.local)
+                .then_with(|| compare_hosts(left, right, self.sort))
                 .then_with(|| left.alias.cmp(&right.alias))
         });
         let mut topologies = HashMap::new();
@@ -179,12 +229,76 @@ impl App {
         self.topologies = topologies;
         self.topology_versions = versions;
         self.snapshot = snapshot;
-        if self.expanded.is_empty() {
-            if let Some(host) = self.snapshot.hosts.first() {
-                self.expanded.insert(NodeKey::Host(host.alias.clone()));
-            }
+        if !self.expansion_initialized && !self.snapshot.hosts.is_empty() {
+            self.initialize_expansion();
+            self.expansion_initialized = true;
         }
         self.rebuild_rows(selected.as_ref());
+        if self.layout == WatchLayout::Swarm
+            && !matches!(
+                self.selected_key(),
+                Some(NodeKey::Pane { .. } | NodeKey::PanelessAgent { .. })
+            )
+        {
+            if let Some(first) = all_swarm_keys(
+                &self.snapshot,
+                &self.topologies,
+                &self.query,
+                self.attention_only,
+                self.sort,
+                self.show_paneless,
+            )
+            .into_iter()
+            .next()
+            {
+                self.focus_key(first);
+            }
+        }
+    }
+
+    fn initialize_expansion(&mut self) {
+        let hosts = if self.expansion == WatchTreeExpansion::Always {
+            self.snapshot.hosts.iter().collect::<Vec<_>>()
+        } else if self.expansion == WatchTreeExpansion::Focus {
+            self.snapshot.hosts.first().into_iter().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for host in hosts {
+            let host_key = NodeKey::Host(host.alias.clone());
+            self.expanded.insert(host_key);
+            if self.view == WatchView::Session {
+                continue;
+            }
+            let Some(topology) = self.topologies.get(&host.alias) else {
+                continue;
+            };
+            let sessions = if self.expansion == WatchTreeExpansion::Always {
+                topology.sessions.iter().collect::<Vec<_>>()
+            } else {
+                topology.sessions.first().into_iter().collect::<Vec<_>>()
+            };
+            for session in sessions {
+                self.expanded.insert(NodeKey::Session {
+                    host: host.alias.clone(),
+                    key: session.key.clone(),
+                });
+                if self.view != WatchView::Pane {
+                    continue;
+                }
+                let windows = if self.expansion == WatchTreeExpansion::Always {
+                    session.windows.iter().collect::<Vec<_>>()
+                } else {
+                    session.windows.first().into_iter().collect::<Vec<_>>()
+                };
+                for window in windows {
+                    self.expanded.insert(NodeKey::Window {
+                        host: host.alias.clone(),
+                        key: window.key.clone(),
+                    });
+                }
+            }
+        }
     }
 
     fn selected_key(&self) -> Option<&NodeKey> {
@@ -217,6 +331,8 @@ impl App {
             &self.expanded,
             &self.query,
             self.attention_only,
+            self.sort,
+            self.show_paneless,
         );
         if let Some(key) = preserve {
             if let Some(index) = self.rows.iter().position(|row| &row.key == key) {
@@ -228,7 +344,9 @@ impl App {
     }
 
     fn focus_key(&mut self, key: NodeKey) {
-        self.expanded.clear();
+        if self.expansion != WatchTreeExpansion::Always {
+            self.expanded.clear();
+        }
         for ancestor in key.ancestors() {
             self.expanded.insert(ancestor);
         }
@@ -260,6 +378,7 @@ impl App {
             &self.topologies,
             &self.query,
             self.attention_only,
+            self.sort,
         );
         if panes.is_empty() {
             self.move_row(delta);
@@ -281,6 +400,29 @@ impl App {
             (None, true) => panes.len() - 1,
         };
         self.focus_key(panes[next].clone());
+    }
+
+    fn move_swarm(&mut self, delta: isize) {
+        let nodes = all_swarm_keys(
+            &self.snapshot,
+            &self.topologies,
+            &self.query,
+            self.attention_only,
+            self.sort,
+            self.show_paneless,
+        );
+        if nodes.is_empty() {
+            return;
+        }
+        let current = self.selected_key();
+        let index = current.and_then(|key| nodes.iter().position(|node| node == key));
+        let next = match (index, delta.is_negative()) {
+            (Some(index), false) => (index + 1).min(nodes.len() - 1),
+            (Some(index), true) => index.saturating_sub(1),
+            (None, false) => 0,
+            (None, true) => nodes.len() - 1,
+        };
+        self.focus_key(nodes[next].clone());
     }
 
     fn toggle_selected(&mut self) {
@@ -346,24 +488,95 @@ enum BackgroundResult {
     Command(std::result::Result<FleetCommandResult, String>),
 }
 
-pub(crate) async fn run(client: Client, cfg: &Config, selector: Option<String>) -> Result<()> {
+#[allow(clippy::too_many_lines)] // one event loop keeps refresh and terminal cleanup auditable
+pub(crate) async fn run(
+    client: Client,
+    cfg: &Config,
+    selector: Option<String>,
+    initial: FleetSnapshot,
+    invocation: crate::WatchInvocation,
+) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
-    let mut app = App::new(selector);
+    let theme = invocation
+        .theme
+        .map(WatchTheme::from)
+        .or(cfg.watch.theme)
+        .unwrap_or(cfg.ui.theme);
+    let layout = invocation
+        .layout
+        .map_or(cfg.watch.layout, WatchLayout::from);
+    let view = invocation.view.map_or(cfg.watch.view, WatchView::from);
+    let sort = invocation.sort.map_or_else(
+        || {
+            cfg.watch
+                .sort
+                .first()
+                .copied()
+                .unwrap_or(WatchSortKey::Name)
+        },
+        |sort| sort.keys()[0],
+    );
+    let mut app = App::new(
+        selector,
+        theme,
+        cfg.message.skills.clone(),
+        layout,
+        view,
+        cfg.watch.tree_expansion,
+        sort,
+    );
+    app.show_paneless = invocation.include_paneless || !cfg.watch.hide_paneless;
+    app.apply_snapshot(initial);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+    let (fleet_update_tx, mut fleet_update_rx) = mpsc::channel(1);
+    let fleet_stream = client.fleet_subscribe().await.ok();
+    let mut streaming = fleet_stream.is_some();
+    let fleet_update_task = fleet_stream.map(|mut stream| {
+        tokio::spawn(async move {
+            loop {
+                match stream.recv().await {
+                    Ok(Some(_)) => {
+                        // One pending invalidation represents the entire cache;
+                        // a fresh snapshot subsumes any burst behind it.
+                        let _ = fleet_update_tx.try_send(());
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        })
+    });
     let now = Instant::now();
-    let mut last_refresh = now.checked_sub(REFRESH_INTERVAL).unwrap_or(now);
+    let mut last_refresh = now;
+    let mut last_render = now.checked_sub(IDLE_REDRAW_INTERVAL).unwrap_or(now);
+    let mut needs_render = true;
     let mut quit = false;
 
     while !quit {
-        if last_refresh.elapsed() >= REFRESH_INTERVAL {
+        let mut invalidated = false;
+        while fleet_update_rx.try_recv().is_ok() {
+            invalidated = true;
+        }
+        if streaming && fleet_update_rx.is_closed() {
+            streaming = false;
+        }
+        let refresh_interval = if streaming {
+            STREAM_FALLBACK_INTERVAL
+        } else {
+            POLL_REFRESH_INTERVAL
+        };
+        if invalidated || last_refresh.elapsed() >= refresh_interval {
             match client.fleet_snapshot(app.selector.as_deref()).await {
-                Ok(snapshot) => app.apply_snapshot(snapshot),
+                Ok(snapshot) => {
+                    app.apply_snapshot(snapshot);
+                    needs_render = true;
+                }
                 Err(error) => app.status(format!("fleet refresh failed: {error}")),
             }
             last_refresh = Instant::now();
         }
 
         while let Ok(result) = background_rx.try_recv() {
+            needs_render = true;
             match result {
                 BackgroundResult::Window {
                     host,
@@ -404,9 +617,14 @@ pub(crate) async fn run(client: Client, cfg: &Config, selector: Option<String>) 
         }
 
         maybe_capture_window(&client, &mut app, &background_tx);
-        terminal.terminal.draw(|frame| render(frame, &app))?;
+        if needs_render || last_render.elapsed() >= IDLE_REDRAW_INTERVAL {
+            terminal.terminal.draw(|frame| render(frame, &app))?;
+            last_render = Instant::now();
+            needs_render = false;
+        }
 
         if event::poll(INPUT_POLL)? {
+            needs_render = true;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     quit = handle_key(key, &client, cfg, &mut terminal, &mut app, &background_tx)?;
@@ -426,6 +644,9 @@ pub(crate) async fn run(client: Client, cfg: &Config, selector: Option<String>) 
                 | Event::Key(_) => {}
             }
         }
+    }
+    if let Some(task) = fleet_update_task {
+        task.abort();
     }
     Ok(())
 }
@@ -461,10 +682,43 @@ fn handle_key(
             return Ok(false);
         }
         InputMode::Message => {
+            if let Some(palette) = app.skill_palette.as_mut() {
+                match key.code {
+                    KeyCode::Esc => app.skill_palette = None,
+                    KeyCode::Enter => {
+                        if let Some(prompt) = palette.selected_prompt(&app.message_skills) {
+                            let mut cursor = app.composer.chars().count();
+                            crate::message_skill::insert_prompt(
+                                &mut app.composer,
+                                &mut cursor,
+                                &prompt,
+                            );
+                            app.skill_palette = None;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        palette.move_selection(1, &app.message_skills);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        palette.move_selection(-1, &app.message_skills);
+                    }
+                    KeyCode::Backspace => {
+                        if !palette.backspace() {
+                            app.skill_palette = None;
+                        }
+                    }
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        palette.insert(character);
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
             match key.code {
                 KeyCode::Esc => {
                     app.mode = InputMode::Normal;
                     app.composer.clear();
+                    app.skill_palette = None;
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     app.composer.push('\n');
@@ -501,6 +755,9 @@ fn handle_key(
                 KeyCode::Backspace => {
                     app.composer.pop();
                 }
+                KeyCode::Char('/') if !app.message_skills.is_empty() => {
+                    app.skill_palette = Some(crate::message_skill::Palette::default());
+                }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.composer.push(character);
                 }
@@ -526,6 +783,8 @@ fn handle_key(
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Down if app.layout == WatchLayout::Swarm => app.move_swarm(1),
+        KeyCode::Up if app.layout == WatchLayout::Swarm => app.move_swarm(-1),
         KeyCode::Down => app.move_row(1),
         KeyCode::Up => app.move_row(-1),
         KeyCode::Char('j') => app.move_pane(1),
@@ -574,7 +833,7 @@ fn handle_key(
                 app.status("connection command requested…");
             }
         }
-        KeyCode::Char('p') => {
+        KeyCode::Char('o' | 'p') => {
             if let Some((host, pane)) = app.selected_pane() {
                 let client = client.clone();
                 let sender = background.clone();
@@ -592,6 +851,7 @@ fn handle_key(
             if app.selected_pane().is_some() {
                 app.mode = InputMode::Message;
                 app.composer.clear();
+                app.skill_palette = None;
             } else {
                 app.status("select a pane before sending a prompt");
             }
@@ -728,6 +988,8 @@ fn build_rows(
     expanded: &HashSet<NodeKey>,
     query: &str,
     attention_only: bool,
+    sort: WatchSortKey,
+    show_paneless: bool,
 ) -> Vec<TreeRow> {
     let mut rows = Vec::new();
     for host in &snapshot.hosts {
@@ -736,6 +998,9 @@ fn build_rows(
             continue;
         }
         let host_key = NodeKey::Host(host.alias.clone());
+        let paneless_count = topology.map_or(0, |topology| {
+            usize::from(show_paneless) * topology.unassigned_agents.len()
+        });
         rows.push(TreeRow {
             key: host_key.clone(),
             depth: 0,
@@ -749,7 +1014,7 @@ fn build_rows(
             ),
             state: dominant_host_state(host),
             attention: host.needs_attention(),
-            children: topology.map_or(0, |topology| topology.sessions.len()),
+            children: topology.map_or(0, |topology| topology.sessions.len()) + paneless_count,
         });
         let show_host = expanded.contains(&host_key) || !query.is_empty() || attention_only;
         if !show_host {
@@ -758,7 +1023,9 @@ fn build_rows(
         let Some(topology) = topology else {
             continue;
         };
-        for session in &topology.sessions {
+        let mut sessions = topology.sessions.iter().collect::<Vec<_>>();
+        sessions.sort_by(|left, right| compare_sessions(left, right, sort));
+        for session in sessions {
             if !session_relevant(session, query, attention_only) {
                 continue;
             }
@@ -784,7 +1051,9 @@ fn build_rows(
             if !show_session {
                 continue;
             }
-            for window in &session.windows {
+            let mut windows = session.windows.iter().collect::<Vec<_>>();
+            windows.sort_by(|left, right| compare_windows(left, right, sort));
+            for window in windows {
                 if !window_relevant(window, query, attention_only) {
                     continue;
                 }
@@ -810,7 +1079,9 @@ fn build_rows(
                 if !show_window {
                     continue;
                 }
-                for pane in &window.panes {
+                let mut panes = window.panes.iter().collect::<Vec<_>>();
+                panes.sort_by(|left, right| compare_panes(left, right, sort));
+                for pane in panes {
                     if !pane_relevant(pane, query, attention_only) {
                         continue;
                     }
@@ -847,8 +1118,181 @@ fn build_rows(
                 }
             }
         }
+        if show_paneless {
+            let mut agents = topology
+                .unassigned_agents
+                .iter()
+                .filter(|agent| agent_relevant(agent, query, attention_only))
+                .collect::<Vec<_>>();
+            agents.sort_by(|left, right| compare_agents(left, right, sort));
+            for agent in agents {
+                rows.push(TreeRow {
+                    key: paneless_agent_key(&host.alias, agent),
+                    depth: 1,
+                    label: format!("[paneless] {}", agent.kind),
+                    detail: format!(
+                        "{} · {} · {}",
+                        agent.session_id,
+                        state_label(agent.state),
+                        agent_summary(agent)
+                    ),
+                    state: Some(agent.state),
+                    attention: usize::from(needs_attention(agent.state)),
+                    children: 0,
+                });
+            }
+        }
     }
     rows
+}
+
+fn paneless_agent_key(host: &str, agent: &muxa::Agent) -> NodeKey {
+    NodeKey::PanelessAgent {
+        host: host.to_string(),
+        kind: agent.kind.to_string(),
+        session_id: agent.session_id.clone(),
+    }
+}
+
+fn compare_agents(
+    left: &muxa::Agent,
+    right: &muxa::Agent,
+    sort: WatchSortKey,
+) -> std::cmp::Ordering {
+    let order = match sort {
+        WatchSortKey::Activity => right.last_activity_at.cmp(&left.last_activity_at),
+        WatchSortKey::Duration => left.state_entered_at.cmp(&right.state_entered_at),
+        WatchSortKey::State => {
+            state_sort_rank(Some(right.state)).cmp(&state_sort_rank(Some(left.state)))
+        }
+        WatchSortKey::Name | WatchSortKey::Pane | WatchSortKey::PaneId => {
+            left.kind.to_string().cmp(&right.kind.to_string())
+        }
+    };
+    order.then_with(|| left.session_id.cmp(&right.session_id))
+}
+
+fn compare_sessions(
+    left: &SessionNode,
+    right: &SessionNode,
+    sort: WatchSortKey,
+) -> std::cmp::Ordering {
+    compare_node_agents(
+        left.windows.iter().flat_map(|window| &window.panes),
+        right.windows.iter().flat_map(|window| &window.panes),
+        sort,
+    )
+    .then_with(|| left.name.cmp(&right.name))
+}
+
+fn compare_hosts(
+    left: &FleetHostSnapshot,
+    right: &FleetHostSnapshot,
+    sort: WatchSortKey,
+) -> std::cmp::Ordering {
+    match sort {
+        WatchSortKey::Activity => host_latest_activity(right).cmp(&host_latest_activity(left)),
+        WatchSortKey::Duration => host_earliest_start(left).cmp(&host_earliest_start(right)),
+        WatchSortKey::State => right
+            .needs_attention()
+            .cmp(&left.needs_attention())
+            .then_with(|| right.agent_count().cmp(&left.agent_count())),
+        WatchSortKey::Name | WatchSortKey::Pane | WatchSortKey::PaneId => {
+            left.alias.cmp(&right.alias)
+        }
+    }
+}
+
+fn host_latest_activity(host: &FleetHostSnapshot) -> Option<OffsetDateTime> {
+    host.remote
+        .as_ref()?
+        .agents
+        .iter()
+        .map(|agent| agent.last_activity_at)
+        .max()
+}
+
+fn host_earliest_start(host: &FleetHostSnapshot) -> Option<OffsetDateTime> {
+    host.remote
+        .as_ref()?
+        .agents
+        .iter()
+        .map(|agent| agent.started_at)
+        .min()
+}
+
+fn compare_windows(
+    left: &WindowNode,
+    right: &WindowNode,
+    sort: WatchSortKey,
+) -> std::cmp::Ordering {
+    let order = match sort {
+        WatchSortKey::Pane => left
+            .index
+            .parse::<u32>()
+            .ok()
+            .cmp(&right.index.parse::<u32>().ok()),
+        _ => compare_node_agents(left.panes.iter(), right.panes.iter(), sort),
+    };
+    order.then_with(|| left.name.cmp(&right.name))
+}
+
+fn compare_node_agents<'a>(
+    left: impl Iterator<Item = &'a PaneNode>,
+    right: impl Iterator<Item = &'a PaneNode>,
+    sort: WatchSortKey,
+) -> std::cmp::Ordering {
+    let left = left
+        .filter_map(|pane| pane.agent.as_ref())
+        .collect::<Vec<_>>();
+    let right = right
+        .filter_map(|pane| pane.agent.as_ref())
+        .collect::<Vec<_>>();
+    match sort {
+        WatchSortKey::Activity => right
+            .iter()
+            .map(|agent| agent.last_activity_at)
+            .max()
+            .cmp(&left.iter().map(|agent| agent.last_activity_at).max()),
+        WatchSortKey::Duration => left
+            .iter()
+            .map(|agent| agent.started_at)
+            .min()
+            .cmp(&right.iter().map(|agent| agent.started_at).min()),
+        WatchSortKey::State => {
+            let rank = |agents: &[&muxa::Agent]| {
+                agents
+                    .iter()
+                    .map(|agent| state_sort_rank(Some(agent.state)))
+                    .max()
+                    .unwrap_or(0)
+            };
+            rank(&right).cmp(&rank(&left))
+        }
+        WatchSortKey::Name | WatchSortKey::Pane | WatchSortKey::PaneId => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_panes(left: &PaneNode, right: &PaneNode, sort: WatchSortKey) -> std::cmp::Ordering {
+    let left_agent = left.agent.as_ref();
+    let right_agent = right.agent.as_ref();
+    match sort {
+        WatchSortKey::Activity => right_agent
+            .map(|agent| agent.last_activity_at)
+            .cmp(&left_agent.map(|agent| agent.last_activity_at)),
+        WatchSortKey::Duration => left_agent
+            .map(|agent| agent.state_entered_at)
+            .cmp(&right_agent.map(|agent| agent.state_entered_at)),
+        WatchSortKey::State => state_sort_rank(right_agent.map(|agent| agent.state))
+            .cmp(&state_sort_rank(left_agent.map(|agent| agent.state))),
+        WatchSortKey::Pane => left
+            .index
+            .parse::<u32>()
+            .ok()
+            .cmp(&right.index.parse::<u32>().ok()),
+        WatchSortKey::PaneId => left.key.pane_id.cmp(&right.key.pane_id),
+        WatchSortKey::Name => left.index.cmp(&right.index),
+    }
 }
 
 fn all_pane_keys(
@@ -856,8 +1300,15 @@ fn all_pane_keys(
     topologies: &HashMap<String, TopologySnapshot>,
     query: &str,
     attention_only: bool,
+    sort: WatchSortKey,
 ) -> Vec<NodeKey> {
-    snapshot
+    let host_order = snapshot
+        .hosts
+        .iter()
+        .enumerate()
+        .map(|(index, host)| (host.alias.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut panes = snapshot
         .hosts
         .iter()
         .filter(|host| host_relevant(host, topologies.get(&host.alias), query, attention_only))
@@ -875,7 +1326,122 @@ fn all_pane_keys(
                 })
                 .collect::<Vec<_>>()
         })
-        .collect()
+        .collect::<Vec<_>>();
+    panes.sort_by(|left, right| {
+        host_order
+            .get(left.host())
+            .cmp(&host_order.get(right.host()))
+            .then_with(|| compare_pane_keys(left, right, topologies, sort))
+    });
+    panes
+}
+
+fn all_swarm_keys(
+    snapshot: &FleetSnapshot,
+    topologies: &HashMap<String, TopologySnapshot>,
+    query: &str,
+    attention_only: bool,
+    sort: WatchSortKey,
+    show_paneless: bool,
+) -> Vec<NodeKey> {
+    let mut nodes = Vec::new();
+    for host in &snapshot.hosts {
+        let Some(topology) = topologies.get(&host.alias) else {
+            continue;
+        };
+        let mut panes = topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .filter(|pane| pane_relevant(pane, query, attention_only))
+            .map(|pane| NodeKey::Pane {
+                host: host.alias.clone(),
+                key: pane.key.clone(),
+            })
+            .collect::<Vec<_>>();
+        panes.sort_by(|left, right| compare_pane_keys(left, right, topologies, sort));
+        nodes.extend(panes);
+        if show_paneless {
+            let mut agents = topology
+                .unassigned_agents
+                .iter()
+                .filter(|agent| agent_relevant(agent, query, attention_only))
+                .collect::<Vec<_>>();
+            agents.sort_by(|left, right| compare_agents(left, right, sort));
+            nodes.extend(
+                agents
+                    .into_iter()
+                    .map(|agent| paneless_agent_key(&host.alias, agent)),
+            );
+        }
+    }
+    nodes
+}
+
+fn compare_pane_keys(
+    left: &NodeKey,
+    right: &NodeKey,
+    topologies: &HashMap<String, TopologySnapshot>,
+    sort: WatchSortKey,
+) -> std::cmp::Ordering {
+    let pane = |key: &NodeKey| match key {
+        NodeKey::Pane { host, key } => topologies
+            .get(host)
+            .and_then(|topology| find_pane(topology, key)),
+        _ => None,
+    };
+    let Some(left_pane) = pane(left) else {
+        return std::cmp::Ordering::Equal;
+    };
+    let Some(right_pane) = pane(right) else {
+        return std::cmp::Ordering::Equal;
+    };
+    let left_agent = left_pane.agent.as_ref();
+    let right_agent = right_pane.agent.as_ref();
+    match sort {
+        WatchSortKey::Activity => right_agent
+            .map(|agent| agent.last_activity_at)
+            .cmp(&left_agent.map(|agent| agent.last_activity_at)),
+        WatchSortKey::Duration => left_agent
+            .map(|agent| agent.state_entered_at)
+            .cmp(&right_agent.map(|agent| agent.state_entered_at)),
+        WatchSortKey::State => state_sort_rank(right_agent.map(|agent| agent.state))
+            .cmp(&state_sort_rank(left_agent.map(|agent| agent.state))),
+        WatchSortKey::Pane => left_pane
+            .index
+            .parse::<u32>()
+            .ok()
+            .cmp(&right_pane.index.parse::<u32>().ok()),
+        WatchSortKey::PaneId => left_pane.key.pane_id.cmp(&right_pane.key.pane_id),
+        WatchSortKey::Name => left_pane
+            .key
+            .window
+            .session
+            .session_id
+            .cmp(&right_pane.key.window.session.session_id)
+            .then(
+                left_pane
+                    .key
+                    .window
+                    .window_id
+                    .cmp(&right_pane.key.window.window_id),
+            )
+            .then(left_pane.index.cmp(&right_pane.index)),
+    }
+}
+
+fn state_sort_rank(state: Option<AgentState>) -> u8 {
+    match state {
+        Some(AgentState::Error) => 7,
+        Some(AgentState::WaitingInput) => 6,
+        Some(AgentState::WaitingChoice) => 5,
+        Some(AgentState::Working) => 4,
+        Some(AgentState::Starting) => 3,
+        Some(AgentState::Idle) => 2,
+        Some(AgentState::Stopped) => 1,
+        None => 0,
+    }
 }
 
 fn host_relevant(
@@ -949,6 +1515,25 @@ fn pane_relevant(pane: &PaneNode, query: &str, attention_only: bool) -> bool {
             }))
 }
 
+fn agent_relevant(agent: &muxa::Agent, query: &str, attention_only: bool) -> bool {
+    (!attention_only || needs_attention(agent.state))
+        && (query.is_empty()
+            || searchable(&agent.kind.to_string(), query)
+            || searchable(&agent.session_id, query)
+            || agent
+                .cwd
+                .as_deref()
+                .is_some_and(|value| searchable(value, query))
+            || agent
+                .last_prompt
+                .as_deref()
+                .is_some_and(|value| searchable(value, query))
+            || agent
+                .ai_title
+                .as_deref()
+                .is_some_and(|value| searchable(value, query)))
+}
+
 fn searchable(value: &str, lowercase_query: &str) -> bool {
     value.to_lowercase().contains(lowercase_query)
 }
@@ -1013,13 +1598,20 @@ fn render(frame: &mut Frame, app: &App) {
         })
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
-    render_tree(frame, chunks[0], app);
+    if app.layout == WatchLayout::Swarm {
+        render_swarm(frame, chunks[0], app);
+    } else {
+        render_tree(frame, chunks[0], app);
+    }
     render_inspector(frame, chunks[1], app);
     if app.mode == InputMode::Message {
         render_composer(frame, area, app);
+        if app.skill_palette.is_some() {
+            render_skill_palette(frame, area, app);
+        }
     }
     if let Some(capture) = &app.popup {
-        render_popup(frame, area, " pane capture ", capture);
+        render_popup(frame, area, " pane capture ", capture, app.theme);
     }
     if app.help {
         render_popup(
@@ -1027,11 +1619,13 @@ fn render(frame: &mut Frame, app: &App) {
             area,
             " fleet keys ",
             "↑/↓ every node    j/k previous/next agent pane\nh/l collapse/expand    Space toggle\nEnter attach pane      p capture pane\nm send prompt          r refresh host\nc connect/disconnect   a attention only\n/ search               ? help    q quit",
+            app.theme,
         );
     }
 }
 
 fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = crate::watch::watch_theme(app.theme);
     let total_agents: usize = app
         .snapshot
         .hosts
@@ -1088,38 +1682,160 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
         |status| format!(" {} ", safe_text(status)),
     );
     let table = Table::new(rows, widths)
-        .header(
-            Row::new(["NODE", "STATE", "DETAIL"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
+        .header(Row::new(["NODE", "STATE", "DETAIL"]).style(theme.table_header_style()))
         .block(
             Block::default()
                 .title(title)
                 .title_bottom(footer)
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(theme.border_type)
+                .border_style(theme.border_style()),
         )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::Rgb(45, 52, 66))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(theme.selected_style())
         .highlight_symbol("› ");
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+fn render_swarm(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = crate::watch::watch_theme(app.theme);
+    let nodes = all_swarm_keys(
+        &app.snapshot,
+        &app.topologies,
+        &app.query,
+        app.attention_only,
+        app.sort,
+        app.show_paneless,
+    );
+    if nodes.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No agents or panes match the current Fleet filter.").block(
+                Block::default()
+                    .title(" muxa fleet · swarm ")
+                    .borders(Borders::ALL)
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
+            ),
+            area,
+        );
+        return;
+    }
+    let now = OffsetDateTime::now_utc();
+    let rows = nodes
+        .iter()
+        .filter_map(|key| swarm_row(key, app, theme, now));
+    let title = format!(
+        " muxa fleet · swarm · {} hosts · {} rows ",
+        app.snapshot.hosts.len(),
+        nodes.len()
+    );
+    let footer = if app.query.is_empty() {
+        " j/k move · Enter attach · o/p capture · m message · / search · ? help ".to_string()
+    } else {
+        format!(" filter: {} · Esc clear ", app.query)
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(14),
+            Constraint::Percentage(30),
+            Constraint::Length(15),
+            Constraint::Length(7),
+            Constraint::Percentage(70),
+        ],
+    )
+    .header(
+        Row::new(["HOST", "AGENT / PANE", "STATE", "AGE", "SUMMARY"])
+            .style(theme.table_header_style()),
+    )
+    .block(
+        Block::default()
+            .title(title)
+            .title_bottom(footer)
+            .borders(Borders::ALL)
+            .border_type(theme.border_type)
+            .border_style(theme.border_style()),
+    )
+    .row_highlight_style(theme.selected_style())
+    .highlight_symbol("> ");
+    let selected = app
+        .selected_key()
+        .and_then(|selected| nodes.iter().position(|key| key == selected))
+        .unwrap_or(0);
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn swarm_row(
+    key: &NodeKey,
+    app: &App,
+    theme: crate::watch::WatchThemeSpec,
+    now: OffsetDateTime,
+) -> Option<Row<'static>> {
+    let host = key.host();
+    let (agent, state, age, summary) = match key {
+        NodeKey::Pane { key, .. } => {
+            let pane = app
+                .topologies
+                .get(host)
+                .and_then(|topology| find_pane(topology, key))?;
+            pane.agent.as_ref().map_or_else(
+                || {
+                    (
+                        safe_text(&pane.current_command),
+                        Line::from(Span::styled("process", theme.dim_style())),
+                        "-".into(),
+                        safe_text(&pane.title),
+                    )
+                },
+                |agent| {
+                    (
+                        format!("{} · {}", agent.kind, pane.key.pane_id),
+                        Line::from(Span::styled(
+                            format!("{} {}", state_marker(agent.state), state_label(agent.state)),
+                            theme.state_style(agent.state),
+                        )),
+                        format_age(agent.state_entered_at, now),
+                        agent_summary(agent),
+                    )
+                },
+            )
+        }
+        NodeKey::PanelessAgent {
+            kind, session_id, ..
+        } => {
+            let agent = app
+                .topologies
+                .get(host)
+                .and_then(|topology| find_paneless_agent(topology, kind, session_id))?;
+            (
+                format!("{} · paneless", agent.kind),
+                Line::from(Span::styled(
+                    format!("{} {}", state_marker(agent.state), state_label(agent.state)),
+                    theme.state_style(agent.state),
+                )),
+                format_age(agent.state_entered_at, now),
+                agent_summary(agent),
+            )
+        }
+        _ => return None,
+    };
+    Some(Row::new(vec![
+        Cell::from(safe_text(host)),
+        Cell::from(agent),
+        Cell::from(state),
+        Cell::from(age),
+        Cell::from(summary),
+    ]))
+}
+
 fn render_inspector(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = crate::watch::watch_theme(app.theme);
     let block = Block::default()
         .title(" inspector ")
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_type(theme.border_type)
+        .border_style(theme.border_style());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(key) = app.selected_key() else {
@@ -1156,6 +1872,15 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &App) {
                 lines.extend(pane_inspector(host, pane));
             }
         }
+        NodeKey::PanelessAgent {
+            kind, session_id, ..
+        } => {
+            if let Some(agent) =
+                topology.and_then(|topology| find_paneless_agent(topology, kind, session_id))
+            {
+                lines.extend(paneless_agent_inspector(host, agent));
+            }
+        }
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
@@ -1169,7 +1894,7 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &App) {
             .filter(|(capture_host, capture)| capture_host == host && &capture.window == key)
         {
             let _ = capture_host;
-            render_window_mosaic(frame, inner, capture);
+            render_window_mosaic(frame, inner, capture, app.theme);
         }
     }
 }
@@ -1232,6 +1957,35 @@ fn session_inspector(
     host: Option<&FleetHostSnapshot>,
     session: &SessionNode,
 ) -> Vec<Line<'static>> {
+    let now = OffsetDateTime::now_utc();
+    let agents = session
+        .windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .filter_map(|pane| pane.agent.as_ref())
+        .collect::<Vec<_>>();
+    let latest = agents
+        .iter()
+        .max_by_key(|agent| agent.last_activity_at)
+        .map_or_else(
+            || "-".into(),
+            |agent| {
+                format!(
+                    "{} · {} · {}",
+                    format_age(agent.last_activity_at, now),
+                    agent.kind,
+                    agent_summary(agent)
+                )
+            },
+        );
+    let processes: usize = agents
+        .iter()
+        .map(|agent| usize::from(agent.workload.process_count))
+        .sum();
+    let subagents: usize = agents
+        .iter()
+        .map(|agent| usize::from(agent.workload.subagent_count).max(agent.subagents.len()))
+        .sum();
     let mut lines = vec![
         heading(format!(
             "{} › {}",
@@ -1250,6 +2004,17 @@ fn session_inspector(
             ),
         ),
         kv("states", &distribution_label(&session.states)),
+        kv(
+            "presence",
+            &session
+                .attached_clients
+                .map_or_else(|| "unknown".into(), |count| format!("{count} clients")),
+        ),
+        kv(
+            "load",
+            &format!("{processes} processes · {subagents} subagents"),
+        ),
+        kv("latest", &latest),
         Line::from(""),
         heading("windows"),
     ];
@@ -1260,14 +2025,17 @@ fn session_inspector(
             window.panes.len(),
             distribution_label(&window.states)
         )));
-        for pane in window.panes.iter().take(3) {
+        for pane in &window.panes {
             lines.push(Line::from(format!(
-                "    {}  {}",
+                "    {}  {} · {}",
                 pane.key.pane_id,
                 pane.agent.as_ref().map_or_else(
                     || safe_text(&pane.current_command),
                     |agent| format!("{} {}", agent.kind, state_label(agent.state))
-                )
+                ),
+                pane.agent
+                    .as_ref()
+                    .map_or_else(|| "-".into(), agent_summary),
             )));
         }
     }
@@ -1275,7 +2043,39 @@ fn session_inspector(
 }
 
 fn window_inspector(host: Option<&FleetHostSnapshot>, window: &WindowNode) -> Vec<Line<'static>> {
-    vec![
+    let now = OffsetDateTime::now_utc();
+    let agents = window
+        .panes
+        .iter()
+        .filter_map(|pane| pane.agent.as_ref())
+        .collect::<Vec<_>>();
+    let latest = agents
+        .iter()
+        .max_by_key(|agent| agent.last_activity_at)
+        .map_or_else(
+            || "-".into(),
+            |agent| {
+                format!(
+                    "{} · {} · {}",
+                    format_age(agent.last_activity_at, now),
+                    agent.kind,
+                    agent_summary(agent)
+                )
+            },
+        );
+    let process_count: usize = agents
+        .iter()
+        .map(|agent| usize::from(agent.workload.process_count))
+        .sum();
+    let shell_count: usize = agents
+        .iter()
+        .map(|agent| usize::from(agent.workload.shell_count))
+        .sum();
+    let subagent_count: usize = agents
+        .iter()
+        .map(|agent| usize::from(agent.workload.subagent_count).max(agent.subagents.len()))
+        .sum();
+    let mut lines = vec![
         heading(format!(
             "{} › {}",
             host.map_or("?", |host| host.alias.as_str()),
@@ -1285,8 +2085,31 @@ fn window_inspector(host: Option<&FleetHostSnapshot>, window: &WindowNode) -> Ve
         kv("index", &window.index),
         kv("panes", &window.panes.len().to_string()),
         kv("states", &distribution_label(&window.states)),
+        kv("cwd", window.cwd.as_deref().unwrap_or("mixed/unknown")),
+        kv(
+            "load",
+            &format!(
+                "{process_count} processes · {shell_count} shells · {subagent_count} subagents"
+            ),
+        ),
+        kv("latest", &latest),
         kv("preview", "live layout · selected window only"),
-    ]
+    ];
+    lines.push(Line::from(""));
+    lines.push(heading("panes"));
+    for pane in &window.panes {
+        lines.push(Line::from(format!(
+            "  {}  {}  {}",
+            pane.key.pane_id,
+            pane.agent
+                .as_ref()
+                .map_or("process", |agent| state_label(agent.state)),
+            pane.agent
+                .as_ref()
+                .map_or_else(|| safe_text(&pane.current_command), agent_summary)
+        )));
+    }
+    lines
 }
 
 fn pane_inspector(host: Option<&FleetHostSnapshot>, pane: &PaneNode) -> Vec<Line<'static>> {
@@ -1306,31 +2129,140 @@ fn pane_inspector(host: Option<&FleetHostSnapshot>, pane: &PaneNode) -> Vec<Line
         kv("title", &pane.title),
     ];
     if let Some(agent) = &pane.agent {
+        let now = OffsetDateTime::now_utc();
         lines.extend([
             kv("agent", &agent.kind.to_string()),
-            kv("state", state_label(agent.state)),
+            kv(
+                "state",
+                &format!(
+                    "{} · {}",
+                    state_label(agent.state),
+                    format_age(agent.state_entered_at, now)
+                ),
+            ),
+            kv("activity", &format_age(agent.last_activity_at, now)),
             kv("agent session", &agent.session_id),
             kv("model", agent.model.as_deref().unwrap_or("-")),
+            kv(
+                "usage",
+                &format!(
+                    "ctx {} · cost {}",
+                    agent
+                        .context_used_pct
+                        .map_or_else(|| "-".into(), |value| format!("{value:.0}%")),
+                    agent
+                        .cost_usd
+                        .map_or_else(|| "-".into(), |value| format!("${value:.2}"))
+                ),
+            ),
+            kv(
+                "workload",
+                &format!(
+                    "{} processes · {} shells · {} subagents",
+                    agent.workload.process_count,
+                    agent.workload.shell_count,
+                    usize::from(agent.workload.subagent_count).max(agent.subagents.len())
+                ),
+            ),
             Line::from(""),
-            heading("latest"),
-            Line::from(safe_text(
-                agent
-                    .last_response
-                    .as_deref()
-                    .or(agent.last_prompt.as_deref())
-                    .or(agent.last_notification.as_deref())
-                    .unwrap_or("(no prompt or response recorded)"),
-            )),
+            heading("last prompt"),
+            Line::from(safe_text(agent.last_prompt.as_deref().unwrap_or("-"))),
+            Line::from(""),
+            heading("last response"),
+            Line::from(safe_text(agent.last_response.as_deref().unwrap_or("-"))),
         ]);
+        if !agent.workload.preview.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(heading("process tree"));
+            lines.extend(agent.workload.preview.iter().map(|process| {
+                Line::from(format!(
+                    "  {}pid {}  {}",
+                    "  ".repeat(usize::from(process.depth.saturating_sub(1))),
+                    process.pid,
+                    safe_text(&process.command)
+                ))
+            }));
+        }
     }
     lines
 }
 
-fn render_window_mosaic(frame: &mut Frame, inner: Rect, capture: &FleetWindowCapture) {
+fn paneless_agent_inspector(
+    host: Option<&FleetHostSnapshot>,
+    agent: &muxa::Agent,
+) -> Vec<Line<'static>> {
+    let now = OffsetDateTime::now_utc();
+    let mut lines = vec![
+        heading(format!(
+            "{} › {} (paneless)",
+            host.map_or("?", |host| host.alias.as_str()),
+            agent.kind
+        )),
+        kv("agent session", &agent.session_id),
+        kv("cwd", agent.cwd.as_deref().unwrap_or("-")),
+        kv(
+            "state",
+            &format!(
+                "{} · {}",
+                state_label(agent.state),
+                format_age(agent.state_entered_at, now)
+            ),
+        ),
+        kv("activity", &format_age(agent.last_activity_at, now)),
+        kv("model", agent.model.as_deref().unwrap_or("-")),
+        kv(
+            "usage",
+            &format!(
+                "ctx {} · cost {}",
+                agent
+                    .context_used_pct
+                    .map_or_else(|| "-".into(), |value| format!("{value:.0}%")),
+                agent
+                    .cost_usd
+                    .map_or_else(|| "-".into(), |value| format!("${value:.2}"))
+            ),
+        ),
+        Line::from(""),
+        heading("last prompt"),
+        Line::from(safe_text(agent.last_prompt.as_deref().unwrap_or("-"))),
+        Line::from(""),
+        heading("last response"),
+        Line::from(safe_text(agent.last_response.as_deref().unwrap_or("-"))),
+    ];
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "No pane is attached; attach, capture, and message actions are unavailable.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn agent_summary(agent: &muxa::Agent) -> String {
+    safe_text(
+        agent
+            .recap
+            .as_deref()
+            .or(agent.ai_title.as_deref())
+            .or(agent.last_prompt.as_deref())
+            .or(agent.last_notification.as_deref())
+            .unwrap_or("-"),
+    )
+    .replace('\n', " ")
+}
+
+fn render_window_mosaic(
+    frame: &mut Frame,
+    inner: Rect,
+    capture: &FleetWindowCapture,
+    watch_theme: WatchTheme,
+) {
     if capture.panes.is_empty() || inner.height < 12 || inner.width < 32 {
         return;
     }
-    let top = inner.y.saturating_add(7).min(inner.bottom());
+    // Keep the dense window summary (scope/cwd/load/latest) readable above
+    // the live mosaic. The previous seven-line offset painted pane captures
+    // over the final inspector fields as soon as they became richer.
+    let top = inner.y.saturating_add(10).min(inner.bottom());
     let area = Rect::new(
         inner.x,
         top,
@@ -1365,10 +2297,11 @@ fn render_window_mosaic(frame: &mut Frame, inner: Rect, capture: &FleetWindowCap
         ) else {
             continue;
         };
+        let theme = crate::watch::watch_theme(watch_theme);
         let border = if pane.geometry.active {
-            Color::Cyan
+            theme.accent_badge()
         } else {
-            Color::DarkGray
+            theme.border_style()
         };
         let body = pane
             .text
@@ -1380,7 +2313,8 @@ fn render_window_mosaic(frame: &mut Frame, inner: Rect, capture: &FleetWindowCap
                     Block::default()
                         .title(format!(" {} ", pane.geometry.pane_id))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(border)),
+                        .border_type(theme.border_type)
+                        .border_style(border),
                 )
                 .wrap(Wrap { trim: false }),
             rect,
@@ -1424,6 +2358,7 @@ fn scale_geometry(
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = crate::watch::watch_theme(app.theme);
     let popup = centered(area, 76, 12);
     frame.render_widget(Clear, popup);
     let title = app.selected_key().map_or_else(
@@ -1435,17 +2370,64 @@ fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .title(title)
-                    .title_bottom(" Enter send · Shift-Enter newline · Esc cancel ")
+                    .title_bottom(" Enter send · Shift-Enter newline · / skills · Esc cancel ")
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
             )
             .wrap(Wrap { trim: false }),
         popup,
     );
 }
 
-fn render_popup(frame: &mut Frame, area: Rect, title: &str, body: &str) {
+fn render_skill_palette(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(palette) = app.skill_palette.as_ref() else {
+        return;
+    };
+    let theme = crate::watch::watch_theme(app.theme);
+    let matches = crate::message_skill::matching_skills(&app.message_skills, &palette.query);
+    let popup = centered(area, 68, 48);
+    frame.render_widget(Clear, popup);
+    let visible = usize::from(popup.height.saturating_sub(3)).max(1);
+    let start = palette.selected.saturating_add(1).saturating_sub(visible);
+    let lines = matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, (name, prompt))| {
+            let marker = if index == palette.selected { ">" } else { " " };
+            let summary = prompt.lines().next().unwrap_or_default();
+            let line = format!("{marker} /{name:<24}  {}", safe_text(summary));
+            if index == palette.selected {
+                Line::from(Span::styled(line, theme.selected_style()))
+            } else {
+                Line::from(line)
+            }
+        })
+        .collect::<Vec<_>>();
+    let query = if palette.query.is_empty() {
+        "all skills".into()
+    } else {
+        format!("/{}", palette.query)
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" skills · {query} "))
+                    .title_bottom(" type filter · ↑/↓ select · Enter insert · Esc back ")
+                    .borders(Borders::ALL)
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_popup(frame: &mut Frame, area: Rect, title: &str, body: &str, watch_theme: WatchTheme) {
+    let theme = crate::watch::watch_theme(watch_theme);
     let popup = centered(area, 82, 70);
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -1455,8 +2437,8 @@ fn render_popup(frame: &mut Frame, area: Rect, title: &str, body: &str) {
                     .title(title.to_string())
                     .title_bottom(" Esc/Enter close ")
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
             )
             .wrap(Wrap { trim: false }),
         popup,
@@ -1502,6 +2484,17 @@ fn find_pane<'a>(topology: &'a TopologySnapshot, key: &PaneKey) -> Option<&'a Pa
         .find(|pane| &pane.key == key)
 }
 
+fn find_paneless_agent<'a>(
+    topology: &'a TopologySnapshot,
+    kind: &str,
+    session_id: &str,
+) -> Option<&'a muxa::Agent> {
+    topology
+        .unassigned_agents
+        .iter()
+        .find(|agent| agent.kind.to_string() == kind && agent.session_id == session_id)
+}
+
 fn key_path(key: &NodeKey) -> String {
     match key {
         NodeKey::Host(host) => host.clone(),
@@ -1513,6 +2506,11 @@ fn key_path(key: &NodeKey) -> String {
             "{host} › {} › {} › {}",
             key.window.session.session_id, key.window.window_id, key.pane_id
         ),
+        NodeKey::PanelessAgent {
+            host,
+            kind,
+            session_id,
+        } => format!("{host} › [paneless] {kind} › {session_id}"),
     }
 }
 
@@ -1699,6 +2697,7 @@ mod tests {
     use super::*;
     use muxa::fleet::{FleetBackendInfo, HostAccessMode, NodeId, RemoteSnapshot};
     use muxa::tmux::PaneInfo;
+    use ratatui::backend::TestBackend;
 
     fn host() -> FleetHostSnapshot {
         FleetHostSnapshot {
@@ -1754,11 +2753,39 @@ mod tests {
         }
     }
 
+    fn paneless_agent() -> muxa::Agent {
+        serde_json::from_value(serde_json::json!({
+            "kind": "codex",
+            "agent_session_id": "detached-review",
+            "pane": null,
+            "cwd": "/repo",
+            "state": "idle",
+            "last_prompt": "review the changes",
+            "last_response": null,
+            "last_notification": null,
+            "model": "gpt-5",
+            "context_used_pct": null,
+            "cost_usd": null,
+            "started_at": "2026-08-20T00:00:00Z",
+            "last_activity_at": "2026-08-20T00:01:00Z",
+            "state_entered_at": "2026-08-20T00:01:00Z"
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn focus_tree_keeps_structural_nodes_but_j_targets_panes() {
         let host = host();
         let topology = host_topology(&host).unwrap();
-        let mut app = App::new(None);
+        let mut app = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Window,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
         app.apply_snapshot(FleetSnapshot {
             generated_at: OffsetDateTime::now_utc(),
             hosts: vec![host],
@@ -1782,5 +2809,130 @@ mod tests {
     fn remote_terminal_sequences_are_removed() {
         assert_eq!(safe_text("ok\u{1b}[31m red\u{1b}[0m"), "ok red");
         assert_eq!(safe_text("title\u{1b}]0;owned\u{7}safe"), "titlesafe");
+    }
+
+    #[test]
+    fn lone_local_host_uses_the_full_native_watch() {
+        let mut local = host();
+        local.alias = "local".into();
+        local.local = true;
+        let local_only = FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![local.clone()],
+        };
+        assert!(uses_native_local_watch(&local_only));
+
+        let mut remote = host();
+        remote.alias = "dev".into();
+        assert!(!uses_native_local_watch(&FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![local, remote],
+        }));
+    }
+
+    #[test]
+    fn multi_host_tree_pins_local_first_and_swarm_uses_shared_renderer() {
+        let mut local = host();
+        local.alias = "local".into();
+        local.local = true;
+        let mut remote = host();
+        remote.alias = "aaa-remote".into();
+
+        let snapshot = FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote, local],
+        };
+        let mut app = App::new(
+            None,
+            WatchTheme::OhMyMuxa,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Window,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        app.apply_snapshot(snapshot.clone());
+        assert_eq!(app.snapshot.hosts[0].alias, "local");
+        assert!(matches!(app.rows[0].key, NodeKey::Host(ref host) if host == "local"));
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let tree = terminal.backend().to_string();
+        assert!(tree.contains("muxa fleet"));
+        assert!(tree.contains("local"));
+        assert!(tree.contains("aaa-remote"));
+
+        let mut swarm = App::new(
+            None,
+            WatchTheme::OhMyMuxa,
+            BTreeMap::new(),
+            WatchLayout::Swarm,
+            WatchView::Pane,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        swarm.apply_snapshot(snapshot);
+        terminal.draw(|frame| render(frame, &swarm)).unwrap();
+        let swarm_screen = terminal.backend().to_string();
+        assert!(swarm_screen.contains("swarm"));
+        assert!(swarm_screen.contains("HOST"));
+        assert!(swarm_screen.contains("AGENT / PANE"));
+    }
+
+    #[test]
+    fn paneless_agents_are_explicit_and_only_shown_when_requested() {
+        let mut remote = host();
+        remote
+            .remote
+            .as_mut()
+            .unwrap()
+            .agents
+            .push(paneless_agent());
+        let snapshot = FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote],
+        };
+
+        let mut hidden = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Window,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        hidden.apply_snapshot(snapshot.clone());
+        assert!(!hidden
+            .rows
+            .iter()
+            .any(|row| matches!(row.key, NodeKey::PanelessAgent { .. })));
+
+        let mut shown = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Swarm,
+            WatchView::Pane,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        shown.show_paneless = true;
+        shown.apply_snapshot(snapshot);
+        assert!(matches!(
+            shown.selected_key(),
+            Some(NodeKey::Pane { .. } | NodeKey::PanelessAgent { .. })
+        ));
+        assert!(all_swarm_keys(
+            &shown.snapshot,
+            &shown.topologies,
+            "detached-review",
+            false,
+            WatchSortKey::Name,
+            true
+        )
+        .iter()
+        .any(|key| matches!(key, NodeKey::PanelessAgent { .. })));
     }
 }

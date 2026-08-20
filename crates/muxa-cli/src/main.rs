@@ -465,7 +465,7 @@ enum HookCmd {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum WatchViewArg {
+pub(crate) enum WatchViewArg {
     Session,
     Window,
     Pane,
@@ -482,7 +482,7 @@ impl From<WatchViewArg> for muxa::config::WatchView {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum WatchLayoutArg {
+pub(crate) enum WatchLayoutArg {
     Tree,
     Swarm,
 }
@@ -497,7 +497,7 @@ impl From<WatchLayoutArg> for muxa::config::WatchLayout {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum WatchSortArg {
+pub(crate) enum WatchSortArg {
     Name,
     #[value(alias = "activity", alias = "act")]
     Latest,
@@ -626,25 +626,27 @@ async fn main() -> Result<()> {
             caller_client,
             caller_pane,
         } => {
-            if fleet {
-                selector
-                    .as_deref()
-                    .map(str::parse::<muxa::LabelSelector>)
-                    .transpose()
-                    .map_err(anyhow::Error::msg)
-                    .context("invalid fleet label selector")?;
-                return fleet_watch::run(client, &cfg, selector).await;
-            }
-            // Pin focus-moving commands to the requesting client; jump_to_pane_tmux reads it.
-            //
-            // A value still containing `#{` is a binding that never expanded
-            // its formats (plain `display-popup` does not expand; only the
-            // `run-shell` wrapper does). Passing it on would aim every
-            // switch-client at a client named `#{client_name}` — a silent
-            // no-op that presents as "Enter does nothing". Drop it and fall
-            // back instead.
+            // Pin focus-moving commands to the requesting client. A value
+            // still containing `#{` is a binding that never expanded.
             if let Some(client_name) = caller_client.filter(|c| !c.contains("#{")) {
                 let _ = CALLER_CLIENT.set(client_name);
+            }
+            if fleet {
+                return cmd_fleet_watch(
+                    &client,
+                    cfg,
+                    config_path.clone(),
+                    selector,
+                    WatchInvocation {
+                        include_paneless,
+                        view,
+                        layout,
+                        sort,
+                        theme,
+                        caller_pane: caller_pane.filter(|p| p.starts_with('%')),
+                    },
+                )
+                .await;
             }
             cmd_watch(
                 &client,
@@ -1329,16 +1331,44 @@ async fn cmd_sync(client: &Client) -> Result<()> {
 /// One-shot per-invocation overrides for `muxa watch`, bundled so the
 /// argument list stays a description of *this run* rather than a flat
 /// parade of options.
-struct WatchInvocation {
-    include_paneless: bool,
-    view: Option<WatchViewArg>,
-    layout: Option<WatchLayoutArg>,
-    sort: Option<WatchSortArg>,
-    theme: Option<ThemeArg>,
-    caller_pane: Option<String>,
+#[derive(Debug, Clone)]
+pub(crate) struct WatchInvocation {
+    pub(crate) include_paneless: bool,
+    pub(crate) view: Option<WatchViewArg>,
+    pub(crate) layout: Option<WatchLayoutArg>,
+    pub(crate) sort: Option<WatchSortArg>,
+    pub(crate) theme: Option<ThemeArg>,
+    pub(crate) caller_pane: Option<String>,
 }
 
-async fn cmd_watch(
+pub(crate) async fn cmd_fleet_watch(
+    client: &Client,
+    cfg: Config,
+    config_path: Option<PathBuf>,
+    selector: Option<String>,
+    invocation: WatchInvocation,
+) -> Result<()> {
+    selector
+        .as_deref()
+        .map(str::parse::<muxa::LabelSelector>)
+        .transpose()
+        .map_err(anyhow::Error::msg)
+        .context("invalid fleet label selector")?;
+    let initial = client
+        .fleet_snapshot(selector.as_deref())
+        .await
+        .context("reading initial fleet state from muxad")?;
+    // A lone local controller is the overwhelmingly common case and should
+    // feel exactly like `muxa watch`: adding the Fleet feature must not insert
+    // a redundant host row or discard the mature inspector and collaboration
+    // surface. Host hierarchy becomes visible only when it carries information.
+    if fleet_watch::uses_native_local_watch(&initial) {
+        return cmd_watch(client, cfg, config_path, invocation.clone()).await;
+    }
+    fleet_watch::run(client.clone(), &cfg, selector, initial, invocation).await
+}
+
+pub(crate) async fn cmd_watch(
     client: &Client,
     cfg: Config,
     config_path: Option<PathBuf>,

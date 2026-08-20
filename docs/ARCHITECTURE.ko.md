@@ -42,6 +42,9 @@ local muxad로 향하는 OpenSSH stdio relay 하나를 소유하고 자신의
 `FleetStore` entry만 갱신합니다. remote agent는 local `Store`에 넣지 않으므로 local
 reconcile, pane-id 재사용, GC가 다른 node의 truth를 손상시키지 않습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
+local-only Fleet watch는 native watch runtime을 그대로 사용합니다. multi-node path는
+IPC로 `FleetStore` invalidation을 구독해 coalesce하고 revision이 바뀐 host topology만
+재구성하며, 느린 full-snapshot reconcile poll을 함께 유지합니다.
 
 ## Components
 

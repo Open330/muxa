@@ -333,11 +333,14 @@ independent last-known cache per node. `observe` is the default, while
 
 ```bash
 muxa fleet status                         # local is already present
+muxa fleet status -L environment,region   # opt-in label columns
+muxa fleet status -o wide                 # hostname/version/latency when space permits
 muxa host label local environment=development
 muxa host add dev muxa-devbox --label environment=development --mode observe
 muxa host doctor dev
 muxa fleet watch
 # equivalent entry point: muxa watch --fleet
+# with only local, this is the full native watch with no redundant host row
 ```
 
 See [docs/FLEET.md](docs/FLEET.md) for selectors, TUI controls, security,

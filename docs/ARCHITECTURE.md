@@ -47,6 +47,10 @@ its own `local` node directly from the in-process Store/backends. With
 remote user's local muxad and writes only to its own `FleetStore` entry. Remote agents are never
 inserted into the local `Store`, so local reconciliation, pane-id reuse, and GC
 cannot corrupt another node's truth. See [FLEET.md](FLEET.md).
+The local-only Fleet watch path reuses the native watch runtime directly. The
+multi-node path subscribes to `FleetStore` invalidations over IPC, coalesces
+them, and reconstructs only revision-changed host topologies while retaining a
+slow full-snapshot reconciliation poll.
 
 ## Components
 

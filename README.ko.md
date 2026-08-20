@@ -290,11 +290,14 @@ SSH stdio relay와 독립적인 last-known cache를 유지합니다. 기본값�
 
 ```bash
 muxa fleet status                         # local은 이미 표시됨
+muxa fleet status -L environment,region   # 필요한 label column만 추가
+muxa fleet status -o wide                 # 공간에 따라 hostname/version/latency
 muxa host label local environment=development
 muxa host add dev muxa-devbox --label environment=development --mode observe
 muxa host doctor dev
 muxa fleet watch
 # 같은 진입점: muxa watch --fleet
+# local 하나뿐이면 불필요한 host row 없이 완전한 native watch 사용
 ```
 
 selector, TUI key, 보안/성능, MCP/dashboard API는

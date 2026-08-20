@@ -90,6 +90,23 @@ operation never opens request-scoped SSH.
 { "protocol": 4, "kind": "fleet_snapshot", "selector": "region=icn" }
 ```
 
+#### `fleet_subscribe`
+
+Long-lived compact invalidation stream for the central Fleet cache. The server
+first acknowledges with `ok`, then writes newline-delimited `FleetUpdate`
+objects containing `host`, `state`, and an optional `revision`. Empty lines are
+keepalives. Updates are hints rather than partial snapshots: clients coalesce a
+burst and issue one selector-filtered `fleet_snapshot`, with a slow fallback
+poll for reconciliation.
+
+```json
+{ "protocol": 4, "kind": "fleet_subscribe" }
+```
+
+```json
+{ "host": "dev", "state": "online", "revision": 42 }
+```
+
 #### `fleet_command`
 
 Dispatch one operation to an exact host. The local adapter rechecks complete

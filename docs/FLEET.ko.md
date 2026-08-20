@@ -131,7 +131,10 @@ local node는 항상 connected/control이며, 아래 설정은 remote inventory�
 ```bash
 muxa fleet status
 muxa fleet status -l 'environment=production,region in (icn,nrt)'
-muxa fleet status --json
+muxa fleet status -o wide
+muxa fleet status -L environment,region
+muxa fleet status --show-labels
+muxa fleet status -o json                 # `--json`도 계속 지원
 muxa fleet watch
 muxa watch --fleet --selector 'accelerator=gpu'
 
@@ -157,7 +160,18 @@ relay가 control 직전에 fresh pane list로 다시 확인합니다.
 local adapter도 같은 exact key 검증을 in-process로 수행하며 attach 시 SSH를 열지 않고
 직접 이동합니다.
 
-Fleet TUI 동작:
+기본 status table은 `HOST/STATE/MODE/AGENTS/PANES/ATTN/AGE`만 표시하며 managed
+label 전체를 보통 터미널 행에 넣지 않습니다. 필요한 label은 `-L`, 전체 label map은
+`--show-labels`, 공간에 맞춘 hostname/version/latency는 `-o wide`, 손실 없는 machine
+interface는 `-o json`으로 봅니다.
+
+selector 결과가 controller의 `local` 하나뿐이면 Fleet watch는 완전한 native
+`muxa watch`로 진입합니다. 불필요한 host row를 추가하지 않으며 기존 Inspector,
+tree/swarm, collaboration/mailbox, ask, preview, command palette, message skill 편집과
+설정 저장을 모두 그대로 사용합니다. 두 번째 physical node가 보일 때만 host 계층을
+표시합니다.
+
+multi-node Fleet TUI 동작:
 
 - Up/Down은 보이는 모든 structural node를 순회합니다.
 - `j`/`k`는 singleton session/window chain에서도 actionable pane 사이를 바로
@@ -165,8 +179,14 @@ Fleet TUI 동작:
 - `h`/`l` 또는 Left/Right는 접기/내리기, Space는 parent toggle입니다.
 - `/` 검색, `a` attention-only, `r` refresh, `c` remote host 연결/해제입니다.
   `local`에서는 항상 연결됐다는 안내만 표시합니다.
-- `p` pane capture, `m` exact-pane prompt composer, Enter는 `local`이면 직접 이동하고
+- `o`/`p` pane capture, `m` exact-pane prompt composer이며 composer의 `/`는 공용
+  message-skill palette를 엽니다. Enter는 `local`이면 직접 이동하고
   remote이면 SSH attach하며, `?`는 help입니다.
+- `--view`, `--layout tree|swarm`, `--sort`, `--theme`은 native watch와 같은 값을
+  사용합니다.
+- 기본 설정이 숨기는 pane 없는 agent는 `--include-paneless`로 표시할 수 있습니다.
+  별도 행과 Inspector로 상태를 볼 수 있지만 pane 대상 attach/capture/message는
+  의도적으로 비활성화됩니다.
 
 session inspector는 window와 하위 pane을 함께 roll-up합니다. window를 선택하면
 필요할 때만 pane을 capture하고 실제 tmux split geometry로 mosaic를 렌더링합니다.
@@ -183,6 +203,12 @@ snapshot/transition에는 monotonic revision이 있습니다. gap은 degraded로
 reconcile하며, subscription을 잃으면 relay를 재연결합니다. keepalive는 조용히 끊긴
 transport를 감지합니다. host마다 task/state/backoff가 독립적이므로 느린 host 하나가
 전체를 막지 않고 `max_parallel_connects`가 동시 SSH handshake를 제한합니다.
+
+central TUI는 작은 Fleet cache invalidation을 구독하고 burst를 coalesce한 다음
+selector가 적용된 coherent snapshot을 한 번만 가져옵니다. 최신 daemon에서는 15초의
+느린 reconcile poll만 유지하고 `fleet_subscribe`가 없는 예전 daemon에서는 1초 polling으로
+fallback합니다. idle 화면은 초당 최대 한 번만 그리고 입력이나 상태 변경은 즉시
+반영합니다.
 
 local adapter는 Store transition을 직접 구독하고 `refresh_secs`마다 backend topology를
 갱신합니다. backend scan은 async IPC executor가 아닌 blocking worker에서 실행되며,

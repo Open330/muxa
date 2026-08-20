@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use comfy_table::{Cell, Table};
+use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::config::{FleetConnectPolicy, FleetHostConfig};
 use muxa::fleet::{
     drain_bounded, read_bounded_line, sanitize_terminal_text, validate_label_key,
@@ -21,6 +21,49 @@ use muxa::ipc::Client;
 use muxa::{Config, PaneKey};
 use tokio::io::BufReader;
 use tokio::process::Command;
+use unicode_width::UnicodeWidthStr;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum HostOutputArg {
+    #[default]
+    Table,
+    Wide,
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct HostTableArgs {
+    #[arg(short = 'l', long = "selector")]
+    selector: Option<String>,
+    /// Output format: table (default), wide, or json.
+    #[arg(short = 'o', long = "output", value_enum, value_name = "FORMAT")]
+    output: Option<HostOutputArg>,
+    /// Backwards-compatible alias for `-o json`.
+    #[arg(long, conflicts_with = "output")]
+    json: bool,
+    /// Append all Kubernetes-style labels to the human table.
+    #[arg(long, conflicts_with = "json")]
+    show_labels: bool,
+    /// Append selected label values as columns, for example `-L environment,region`.
+    #[arg(
+        short = 'L',
+        long = "label-columns",
+        value_delimiter = ',',
+        value_name = "KEYS",
+        conflicts_with = "json"
+    )]
+    label_columns: Vec<String>,
+}
+
+impl HostTableArgs {
+    fn output(&self) -> HostOutputArg {
+        if self.json {
+            HostOutputArg::Json
+        } else {
+            self.output.unwrap_or_default()
+        }
+    }
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct HostArgs {
@@ -52,10 +95,8 @@ enum HostCommand {
     },
     /// List inventory and live connection state.
     List {
-        #[arg(short = 'l', long = "selector")]
-        selector: Option<String>,
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        table: HostTableArgs,
     },
     /// Show one host's full configuration and live metadata.
     Show { alias: String },
@@ -98,15 +139,28 @@ pub(crate) struct FleetArgs {
 enum FleetCommand {
     /// Print the aggregated host/session/window/pane state.
     Status {
-        #[arg(short = 'l', long = "selector")]
-        selector: Option<String>,
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        table: HostTableArgs,
     },
     /// Open the central host/session/window/pane TUI.
     Watch {
         #[arg(short = 'l', long = "selector")]
         selector: Option<String>,
+        /// Show agents without an attached multiplexer pane.
+        #[arg(long)]
+        include_paneless: bool,
+        /// Default hierarchy depth, shared with `muxa watch`.
+        #[arg(long, value_enum)]
+        view: Option<crate::WatchViewArg>,
+        /// Tree or swarm presentation, shared with `muxa watch`.
+        #[arg(long, value_enum)]
+        layout: Option<crate::WatchLayoutArg>,
+        /// One-shot sibling ordering, shared with `muxa watch`.
+        #[arg(long, value_enum)]
+        sort: Option<crate::WatchSortArg>,
+        /// One-shot visual theme override.
+        #[arg(long, value_enum)]
+        theme: Option<crate::theme::ThemeArg>,
     },
     /// Connect an on-demand host.
     Connect { host: String },
@@ -212,14 +266,13 @@ pub(crate) async fn run_host(
             request_reload(client).await;
             Ok(())
         }
-        HostCommand::List { selector, json } => {
-            let selector = parse_selector(selector.as_deref())?;
+        HostCommand::List { table } => {
+            let selector = parse_selector(table.selector.as_deref())?;
             let live = client.fleet_snapshot(selector.as_deref()).await.ok();
             let hosts = inventory_with_live(cfg, live.as_ref(), selector.as_deref())?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&hosts)?);
-            } else {
-                print_hosts(&hosts);
+            match table.output() {
+                HostOutputArg::Json => println!("{}", serde_json::to_string_pretty(&hosts)?),
+                output => print_hosts(&hosts, output, &table.label_columns, table.show_labels),
             }
             Ok(())
         }
@@ -328,29 +381,55 @@ pub(crate) async fn run_host(
     }
 }
 
+#[allow(clippy::too_many_lines)] // explicit subcommand dispatch remains easiest to audit
 pub(crate) async fn run_fleet(
     args: FleetArgs,
     client: &Client,
     cfg: &Config,
-    _config_path: Option<&Path>,
+    config_path: Option<&Path>,
 ) -> Result<()> {
     match args.command {
-        FleetCommand::Status { selector, json } => {
-            let selector = parse_selector(selector.as_deref())?;
+        FleetCommand::Status { table } => {
+            let selector = parse_selector(table.selector.as_deref())?;
             let snapshot = client
                 .fleet_snapshot(selector.as_deref())
                 .await
                 .context("reading fleet state from muxad")?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&snapshot)?);
-            } else {
-                print_hosts(&snapshot.hosts);
+            match table.output() {
+                HostOutputArg::Json => println!("{}", serde_json::to_string_pretty(&snapshot)?),
+                output => print_hosts(
+                    &snapshot.hosts,
+                    output,
+                    &table.label_columns,
+                    table.show_labels,
+                ),
             }
             Ok(())
         }
-        FleetCommand::Watch { selector } => {
+        FleetCommand::Watch {
+            selector,
+            include_paneless,
+            view,
+            layout,
+            sort,
+            theme,
+        } => {
             let selector = parse_selector(selector.as_deref())?;
-            crate::fleet_watch::run(client.clone(), cfg, selector).await
+            crate::cmd_fleet_watch(
+                client,
+                cfg.clone(),
+                config_path.map(Path::to_path_buf),
+                selector,
+                crate::WatchInvocation {
+                    include_paneless,
+                    view,
+                    layout,
+                    sort,
+                    theme,
+                    caller_pane: None,
+                },
+            )
+            .await
         }
         FleetCommand::Connect { host } => {
             execute_simple(client, &host, FleetOperation::Connect).await
@@ -818,36 +897,239 @@ fn reject_local_inventory_mutation(alias: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_hosts(hosts: &[FleetHostSnapshot]) {
-    let mut table = Table::new();
-    table.load_preset(UTF8_BORDERS_ONLY);
-    table.set_header([
-        "HOST",
-        "STATE",
-        "MODE",
-        "LABELS",
-        "AGENTS",
-        "ATTN",
-        "LAST/ERROR",
-    ]);
-    for host in hosts {
-        let last = host.error.clone().unwrap_or_else(|| {
-            host.received_at.map_or_else(
-                || "-".into(),
-                |time| format!("{}", time.replace_nanosecond(0).unwrap_or(time)),
-            )
-        });
-        table.add_row([
-            Cell::new(&host.alias),
-            Cell::new(format!("{:?}", host.state).to_lowercase()),
-            Cell::new(format!("{:?}", host.mode).to_lowercase()),
-            Cell::new(format_map(&host.labels)),
-            Cell::new(host.agent_count()),
-            Cell::new(host.needs_attention()),
-            Cell::new(sanitize_terminal_text(&last)),
-        ]);
+#[derive(Debug, Clone)]
+enum HostColumnKind {
+    Host,
+    State,
+    Mode,
+    Inventory,
+    Agents,
+    Panes,
+    Attention,
+    Age,
+    Hostname,
+    Version,
+    Latency,
+    Label(String),
+    Labels,
+}
+
+#[derive(Debug, Clone)]
+struct HostColumn {
+    header: String,
+    kind: HostColumnKind,
+    width: usize,
+    min_width: usize,
+}
+
+impl HostColumn {
+    fn new(header: impl Into<String>, kind: HostColumnKind, min_width: usize) -> Self {
+        let header = header.into();
+        let width = UnicodeWidthStr::width(header.as_str());
+        Self {
+            header,
+            kind,
+            width,
+            min_width,
+        }
     }
-    println!("{table}");
+
+    fn cap(&self) -> usize {
+        match self.kind {
+            HostColumnKind::Host | HostColumnKind::Label(_) => 24,
+            HostColumnKind::State => 12,
+            HostColumnKind::Mode | HostColumnKind::Age | HostColumnKind::Latency => 8,
+            HostColumnKind::Inventory => 11,
+            HostColumnKind::Agents | HostColumnKind::Panes | HostColumnKind::Attention => 7,
+            HostColumnKind::Hostname => 28,
+            HostColumnKind::Version => 14,
+            HostColumnKind::Labels => 48,
+        }
+    }
+}
+
+fn print_hosts(
+    hosts: &[FleetHostSnapshot],
+    output: HostOutputArg,
+    label_columns: &[String],
+    show_labels: bool,
+) {
+    println!(
+        "{}",
+        render_hosts(
+            hosts,
+            output,
+            label_columns,
+            show_labels,
+            crate::terminal_width()
+        )
+    );
+}
+
+fn render_hosts(
+    hosts: &[FleetHostSnapshot],
+    output: HostOutputArg,
+    label_columns: &[String],
+    show_labels: bool,
+    terminal_width: usize,
+) -> String {
+    let mut columns = host_columns(output, label_columns, show_labels, terminal_width);
+    let now = time::OffsetDateTime::now_utc();
+    for column in &mut columns {
+        let content_width = hosts
+            .iter()
+            .map(|host| UnicodeWidthStr::width(host_column_value(host, &column.kind, now).as_str()))
+            .max()
+            .unwrap_or(0);
+        column.width = column.width.max(content_width).min(column.cap());
+    }
+    fit_host_columns(&mut columns, terminal_width);
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_constraints(columns.iter().map(|column| {
+            ColumnConstraint::Absolute(Width::Fixed(
+                u16::try_from(column.width).unwrap_or(u16::MAX),
+            ))
+        }))
+        .set_header(
+            columns
+                .iter()
+                .map(|column| Cell::new(crate::truncate_cell(&column.header, column.width))),
+        );
+    for host in hosts {
+        table.add_row(columns.iter().map(|column| {
+            Cell::new(crate::truncate_cell(
+                &host_column_value(host, &column.kind, now),
+                column.width,
+            ))
+        }));
+    }
+    format!("{table}")
+}
+
+fn host_columns(
+    output: HostOutputArg,
+    label_columns: &[String],
+    show_labels: bool,
+    terminal_width: usize,
+) -> Vec<HostColumn> {
+    let mut columns = if terminal_width < 64 {
+        vec![
+            HostColumn::new("HOST", HostColumnKind::Host, 8),
+            HostColumn::new("STATE", HostColumnKind::State, 6),
+            HostColumn::new("A/P", HostColumnKind::Inventory, 5),
+            HostColumn::new("ATTN", HostColumnKind::Attention, 4),
+            HostColumn::new("AGE", HostColumnKind::Age, 4),
+        ]
+    } else {
+        vec![
+            HostColumn::new("HOST", HostColumnKind::Host, 8),
+            HostColumn::new("STATE", HostColumnKind::State, 6),
+            HostColumn::new("MODE", HostColumnKind::Mode, 4),
+            HostColumn::new("AGENTS", HostColumnKind::Agents, 3),
+            HostColumn::new("PANES", HostColumnKind::Panes, 3),
+            HostColumn::new("ATTN", HostColumnKind::Attention, 4),
+            HostColumn::new("AGE", HostColumnKind::Age, 4),
+        ]
+    };
+    if output == HostOutputArg::Wide {
+        if terminal_width >= 78 {
+            columns.push(HostColumn::new("HOSTNAME", HostColumnKind::Hostname, 8));
+        }
+        if terminal_width >= 96 {
+            columns.push(HostColumn::new("VERSION", HostColumnKind::Version, 6));
+        }
+        if terminal_width >= 112 {
+            columns.push(HostColumn::new("LATENCY", HostColumnKind::Latency, 4));
+        }
+    }
+    columns.extend(label_columns.iter().map(|key| {
+        HostColumn::new(
+            key.to_ascii_uppercase(),
+            HostColumnKind::Label(key.clone()),
+            4,
+        )
+    }));
+    if show_labels {
+        columns.push(HostColumn::new("LABELS", HostColumnKind::Labels, 8));
+    }
+    columns
+}
+
+fn host_column_value(
+    host: &FleetHostSnapshot,
+    kind: &HostColumnKind,
+    now: time::OffsetDateTime,
+) -> String {
+    match kind {
+        HostColumnKind::Host => sanitize_terminal_text(&host.alias),
+        HostColumnKind::State => format!("{:?}", host.state).to_lowercase(),
+        HostColumnKind::Mode => format!("{:?}", host.mode).to_lowercase(),
+        HostColumnKind::Inventory => format!("{}/{}", host.agent_count(), host.pane_count()),
+        HostColumnKind::Agents => host.agent_count().to_string(),
+        HostColumnKind::Panes => host.pane_count().to_string(),
+        HostColumnKind::Attention => host.needs_attention().to_string(),
+        HostColumnKind::Age => host.received_at.map_or_else(
+            || "-".into(),
+            |seen| {
+                let age = crate::relative_time(now, seen);
+                let age = age.strip_suffix(" ago").unwrap_or(&age);
+                if age == "0s" {
+                    "now".into()
+                } else {
+                    age.into()
+                }
+            },
+        ),
+        HostColumnKind::Hostname => sanitize_terminal_text(host.hostname.as_deref().unwrap_or("-")),
+        HostColumnKind::Version => {
+            sanitize_terminal_text(host.muxa_version.as_deref().unwrap_or("-"))
+        }
+        HostColumnKind::Latency => host
+            .latency_ms
+            .map_or_else(|| "-".into(), |latency| format!("{latency}ms")),
+        HostColumnKind::Label(key) => host
+            .labels
+            .get(key)
+            .map_or_else(|| "<none>".into(), |value| sanitize_terminal_text(value)),
+        HostColumnKind::Labels => format_map(&host.labels),
+    }
+}
+
+fn fit_host_columns(columns: &mut Vec<HostColumn>, terminal_width: usize) {
+    // comfy-table's borders, separators, and one-cell padding consume three
+    // characters per column plus the closing border. Drop optional right-most
+    // columns only in pathologically narrow terminals where even one visible
+    // character per cell would not fit.
+    while columns.len() > 1 && columns.len().saturating_mul(4).saturating_add(1) > terminal_width {
+        columns.pop();
+    }
+    let content_budget = terminal_width
+        .saturating_sub(columns.len().saturating_mul(3).saturating_add(1))
+        .max(columns.len());
+    while columns.iter().map(|column| column.width).sum::<usize>() > content_budget {
+        let candidate = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.width > column.min_width)
+            .max_by_key(|(_, column)| column.width - column.min_width)
+            .map(|(index, _)| index)
+            .or_else(|| {
+                columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column)| column.width > 1)
+                    .max_by_key(|(_, column)| column.width)
+                    .map(|(index, _)| index)
+            });
+        let Some(index) = candidate else {
+            break;
+        };
+        columns[index].width -= 1;
+    }
 }
 
 fn format_map(values: &BTreeMap<String, String>) -> String {
@@ -1153,6 +1435,91 @@ async fn request_reload(client: &Client) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn local_host_for_table() -> FleetHostSnapshot {
+        FleetHostSnapshot {
+            alias: "local".into(),
+            local: true,
+            ssh_target: "local://".into(),
+            labels: BTreeMap::from([
+                ("kubernetes.io/hostname".into(), "june.rtzr.ai".into()),
+                ("muxa.io/local".into(), "true".into()),
+                ("muxa.io/transport".into(), "local".into()),
+            ]),
+            annotations: BTreeMap::new(),
+            mode: HostAccessMode::Control,
+            state: FleetHostState::Online,
+            node_id: None,
+            hostname: Some("june.rtzr.ai".into()),
+            os: Some("linux".into()),
+            arch: Some("x86_64".into()),
+            muxa_version: Some("0.8.34".into()),
+            protocol: Some(FLEET_PROTOCOL_VERSION),
+            capabilities: Vec::new(),
+            daemon_generation: Some(17),
+            boot_id: None,
+            latency_ms: Some(0),
+            last_seen_at: Some(time::OffsetDateTime::now_utc()),
+            received_at: Some(time::OffsetDateTime::now_utc()),
+            error: None,
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn default_host_table_is_compact_and_hides_labels() {
+        let rendered = render_hosts(
+            &[local_host_for_table()],
+            HostOutputArg::Table,
+            &[],
+            false,
+            80,
+        );
+        assert!(rendered.contains("HOST"));
+        assert!(rendered.contains("AGENTS"));
+        assert!(rendered.contains("PANES"));
+        assert!(!rendered.contains("muxa.io/local"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= 80),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn host_table_exposes_wide_and_opt_in_label_views_without_overflow() {
+        let host = local_host_for_table();
+        let wide = render_hosts(
+            std::slice::from_ref(&host),
+            HostOutputArg::Wide,
+            &[],
+            false,
+            140,
+        );
+        assert!(wide.contains("HOSTNAME"));
+        assert!(wide.contains("VERSION"));
+        assert!(wide.contains("LATENCY"));
+
+        let selected = render_hosts(
+            std::slice::from_ref(&host),
+            HostOutputArg::Table,
+            &["muxa.io/local".into()],
+            false,
+            92,
+        );
+        assert!(selected.contains("MUXA.IO/LOCAL"));
+        assert!(selected.contains("true"));
+        assert!(selected
+            .lines()
+            .all(|line| UnicodeWidthStr::width(line) <= 92));
+
+        let labels = render_hosts(&[host], HostOutputArg::Table, &[], true, 92);
+        assert!(labels.contains("LABELS"));
+        assert!(labels
+            .lines()
+            .all(|line| UnicodeWidthStr::width(line) <= 92));
+    }
 
     #[test]
     fn inventory_editor_preserves_unrelated_config_and_validates_labels() {

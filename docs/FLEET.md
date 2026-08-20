@@ -140,7 +140,10 @@ Use `muxa host disable` to keep metadata but suppress all connections, and
 ```bash
 muxa fleet status
 muxa fleet status -l 'environment=production,region in (icn,nrt)'
-muxa fleet status --json
+muxa fleet status -o wide
+muxa fleet status -L environment,region
+muxa fleet status --show-labels
+muxa fleet status -o json                 # `--json` remains compatible
 muxa fleet watch
 muxa watch --fleet --selector 'accelerator=gpu'
 
@@ -167,7 +170,20 @@ that identity again against a fresh pane list before a control action.
 The local adapter performs the same exact-key verification in process; local
 attach jumps directly without opening an SSH TTY.
 
-The Fleet TUI uses the same focused hierarchy developed for local watch:
+The default status table is deliberately compact (`HOST/STATE/MODE/AGENTS/
+PANES/ATTN/AGE`) and never prints the full managed-label set into a normal
+terminal row. Use `-L` for selected Kubernetes-style label columns,
+`--show-labels` for the complete label map, `-o wide` for host/version/latency
+details as space permits, or `-o json` for the lossless machine interface.
+
+When the selector contains only the controller's `local` node, Fleet watch
+delegates to the full native `muxa watch` surface. There is no redundant host
+row, and all existing inspectors, tree/swarm modes, collaboration/mailbox,
+ask, previews, command palette, message-skill editing, and configuration
+persistence remain available. Once a second physical node is visible, the
+host level becomes meaningful and the central Fleet hierarchy is shown.
+
+The multi-node Fleet TUI uses the same focused navigation conventions:
 
 - Arrow Up/Down visits every visible structural node.
 - `j`/`k` jumps directly between actionable panes, including a singleton
@@ -175,9 +191,14 @@ The Fleet TUI uses the same focused hierarchy developed for local watch:
 - `h`/`l` or Left/Right collapses/descends; Space toggles a parent.
 - `/` filters, `a` toggles attention-only, `r` refreshes, and `c` connects or
   disconnects a remote host (`local` reports that it is always connected).
-- `p` captures the selected pane, `m` composes an exact-pane prompt, Enter
+- `o`/`p` captures the selected pane, `m` composes an exact-pane prompt (`/`
+  opens the shared message-skill palette), Enter
   attaches directly on `local` or through a separate remote SSH TTY, and `?`
   shows help.
+- `--view`, `--layout tree|swarm`, `--sort`, and `--theme` use the same values
+  as native watch.
+- `--include-paneless` exposes agents hidden by the default setting as explicit
+  rows with inspectors; pane-only attach/capture/message actions stay disabled.
 
 Session inspectors roll up their windows and panes. A selected window fetches
 its panes on demand and renders their actual tmux split geometry. Captures are
@@ -195,6 +216,13 @@ host degraded and triggers reconciliation; a lost subscription reconnects the
 relay. Keepalives detect a silent transport, while each host's state machine,
 backoff, and task remain independent so one slow host cannot stall the fleet.
 `max_parallel_connects` caps simultaneous SSH handshakes.
+
+The central TUI subscribes to compact Fleet cache invalidations and coalesces
+bursts before fetching one coherent selector-filtered snapshot. With a current
+daemon it performs a slow 15-second reconciliation poll; an older daemon that
+does not advertise `fleet_subscribe` falls back to one-second polling. Idle
+frames redraw at most once per second, while input and state changes repaint
+immediately.
 
 The local adapter consumes Store transitions directly and refreshes backend
 topology at `refresh_secs`; backend scans run on blocking workers rather than
