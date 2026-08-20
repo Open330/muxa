@@ -607,6 +607,10 @@ pub struct FleetUpdate {
     pub host: String,
     pub state: FleetHostState,
     pub revision: Option<u64>,
+    /// The broadcast receiver lagged and the client must reconcile the whole
+    /// selected snapshot rather than infer anything from `host`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resync: bool,
 }
 
 /// Central cache. Remote snapshots remain isolated per node and are never
@@ -664,6 +668,21 @@ impl FleetStore {
         self.updates.subscribe()
     }
 
+    /// Return whether the current cached host matches `selector`. A missing
+    /// host never matches. Fleet streams use this after receiving an update
+    /// so selector-scoped watchers are not woken by unrelated hosts.
+    pub async fn host_matches_selector(
+        &self,
+        alias: &str,
+        selector: Option<&LabelSelector>,
+    ) -> bool {
+        self.hosts
+            .read()
+            .await
+            .get(alias)
+            .is_some_and(|host| selector.is_none_or(|selector| selector.matches(&host.labels)))
+    }
+
     pub async fn upsert_host(&self, host: FleetHostSnapshot) {
         let alias = host.alias.clone();
         let state = host.state;
@@ -673,6 +692,7 @@ impl FleetStore {
             host: alias,
             state,
             revision,
+            resync: false,
         });
     }
 
@@ -686,6 +706,7 @@ impl FleetStore {
             host: alias.to_string(),
             state: host.state,
             revision: host.remote.as_ref().map(|remote| remote.revision),
+            resync: false,
         };
         drop(hosts);
         let _ = self.updates.send(update);

@@ -191,12 +191,15 @@ The multi-node Fleet TUI uses the same focused navigation conventions:
 - `h`/`l` or Left/Right collapses/descends; Space toggles a parent.
 - `/` filters, `a` toggles attention-only, `r` refreshes, and `c` connects or
   disconnects a remote host (`local` reports that it is always connected).
-- `o`/`p` captures the selected pane, `m` composes an exact-pane prompt (`/`
-  opens the shared message-skill palette), Enter
+- `o`/`p` captures the selected pane. `m` works on a session, window, or pane:
+  parent nodes resolve to the lowest-index pane that owns a live agent, while
+  an exact pane stays exact (`/` opens the shared message-skill palette). Enter
   attaches directly on `local` or through a separate remote SSH TTY, and `?`
   shows help.
 - `--view`, `--layout tree|swarm`, `--sort`, and `--theme` use the same values
-  as native watch.
+  as native watch. `focus` expansion follows the selected view depth,
+  `manual` changes only through structural keys, and direct `j`/`k` jumps
+  reveal only the target's ancestors.
 - `--include-paneless` exposes agents hidden by the default setting as explicit
   rows with inspectors; pane-only attach/capture/message actions stay disabled.
 
@@ -217,8 +220,11 @@ relay. Keepalives detect a silent transport, while each host's state machine,
 backoff, and task remain independent so one slow host cannot stall the fleet.
 `max_parallel_connects` caps simultaneous SSH handshakes.
 
-The central TUI subscribes to compact Fleet cache invalidations and coalesces
-bursts before fetching one coherent selector-filtered snapshot. With a current
+The central TUI subscribes to compact, selector-scoped Fleet cache
+invalidations and coalesces bursts before fetching one coherent filtered
+snapshot. The server installs the stream before acknowledging it and the
+client then performs a fresh snapshot, closing the startup race. Refreshes are
+coalesced for 75 ms and capped at four snapshots per second. With a current
 daemon it performs a slow 15-second reconciliation poll; an older daemon that
 does not advertise `fleet_subscribe` falls back to one-second polling. Idle
 frames redraw at most once per second, while input and state changes repaint

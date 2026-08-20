@@ -41,6 +41,7 @@ use crate::session::{
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
@@ -139,7 +140,10 @@ enum RequestBody {
     /// Long-lived notification stream for changes to the central Fleet cache.
     /// Payloads are deliberately tiny; clients fetch one coherent filtered
     /// snapshot after coalescing notifications.
-    FleetSubscribe,
+    FleetSubscribe {
+        #[serde(default)]
+        selector: Option<String>,
+    },
     /// Route one exact operation through the per-host persistent SSH relay.
     FleetCommand {
         host: String,
@@ -1169,9 +1173,11 @@ async fn stream_transitions(
 async fn stream_fleet_updates(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     store: Arc<crate::fleet::FleetStore>,
+    mut rx: broadcast::Receiver<FleetUpdate>,
     protocol: u32,
+    selector: Option<LabelSelector>,
+    mut visible_hosts: HashSet<String>,
 ) -> Result<(), RuntimeError> {
-    let mut rx = store.subscribe();
     let mut keepalive = tokio::time::interval(STREAM_KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive.tick().await;
@@ -1179,6 +1185,24 @@ async fn stream_fleet_updates(
         tokio::select! {
             recv = rx.recv() => match recv {
                 Ok(update) => {
+                    let was_visible = visible_hosts.contains(&update.host);
+                    let is_visible = if selector.is_none() {
+                        true
+                    } else {
+                        store
+                            .host_matches_selector(&update.host, selector.as_ref())
+                            .await
+                    };
+                    if is_visible {
+                        visible_hosts.insert(update.host.clone());
+                    } else {
+                        visible_hosts.remove(&update.host);
+                    }
+                    // A host entering or leaving the selector must invalidate
+                    // the filtered snapshot. Unrelated hosts remain silent.
+                    if !was_visible && !is_visible {
+                        continue;
+                    }
                     let bytes = encode_line(&update, protocol)?;
                     if writer.write_all(&bytes).await.is_err()
                         || writer.flush().await.is_err()
@@ -1189,6 +1213,24 @@ async fn stream_fleet_updates(
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
                     tracing::warn!(dropped, "fleet subscribe lagged; fallback snapshot will reconcile");
+                    let selected = store.snapshot_selected(selector.as_ref()).await;
+                    visible_hosts = selected
+                        .hosts
+                        .into_iter()
+                        .map(|host| host.alias)
+                        .collect();
+                    let update = FleetUpdate {
+                        host: "*".into(),
+                        state: crate::fleet::FleetHostState::Degraded,
+                        revision: None,
+                        resync: true,
+                    };
+                    let bytes = encode_line(&update, protocol)?;
+                    if writer.write_all(&bytes).await.is_err()
+                        || writer.flush().await.is_err()
+                    {
+                        return Ok(());
+                    }
                 }
             },
             _ = keepalive.tick() => {
@@ -1728,7 +1770,7 @@ async fn handle(
                         None => Response::err("fleet is not enabled in muxad"),
                     }
                 }
-                RequestBody::FleetSubscribe => {
+                RequestBody::FleetSubscribe { selector } => {
                     kind = "fleet_subscribe";
                     let Some(fleet) = &fleet else {
                         let response = Response::err("fleet is not enabled in muxad");
@@ -1736,6 +1778,34 @@ async fn handle(
                         let _ = write_line_or_closed(&mut writer, &bytes).await?;
                         return Ok(());
                     };
+                    let selector = match selector
+                        .as_deref()
+                        .map(str::parse::<LabelSelector>)
+                        .transpose()
+                    {
+                        Ok(selector) => selector,
+                        Err(error) => {
+                            let response =
+                                Response::err(format!("invalid label selector: {error}"));
+                            let bytes =
+                                encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                            let _ = write_line_or_closed(&mut writer, &bytes).await?;
+                            return Ok(());
+                        }
+                    };
+                    // Subscribe before observing the initial membership and
+                    // before ACK. The client fetches a fresh snapshot after
+                    // ACK, so every mutation is represented either there or
+                    // in this already-live receiver (duplicates are harmless).
+                    let updates = fleet.store.subscribe();
+                    let visible_hosts = fleet
+                        .store
+                        .snapshot_selected(selector.as_ref())
+                        .await
+                        .hosts
+                        .into_iter()
+                        .map(|host| host.alias)
+                        .collect::<HashSet<_>>();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
                     if !write_line_or_closed(&mut writer, &ack_bytes).await? {
@@ -1747,7 +1817,15 @@ async fn handle(
                         kind,
                         "ipc.handle (fleet stream takeover)",
                     );
-                    return stream_fleet_updates(writer, fleet.store.clone(), stream_proto).await;
+                    return stream_fleet_updates(
+                        writer,
+                        fleet.store.clone(),
+                        updates,
+                        stream_proto,
+                        selector,
+                        visible_hosts,
+                    )
+                    .await;
                 }
                 RequestBody::FleetCommand { host, operation } => {
                     kind = "fleet_command";
@@ -2562,13 +2640,19 @@ impl Client {
     /// Subscribe to compact Fleet cache invalidations. The stream carries no
     /// remote terminal contents and grants no additional authority; callers
     /// fetch a normal selector-filtered snapshot after coalescing updates.
-    pub async fn fleet_subscribe(&self) -> Result<FleetUpdateStream, RuntimeError> {
-        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.fleet_subscribe_inner())
+    pub async fn fleet_subscribe(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<FleetUpdateStream, RuntimeError> {
+        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.fleet_subscribe_inner(selector))
             .await
             .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
     }
 
-    async fn fleet_subscribe_inner(&self) -> Result<FleetUpdateStream, RuntimeError> {
+    async fn fleet_subscribe_inner(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<FleetUpdateStream, RuntimeError> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|error| match error.kind() {
@@ -2584,6 +2668,7 @@ impl Client {
         let mut request = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "fleet_subscribe",
+            "selector": selector,
         }))?;
         request.push(b'\n');
         writer.write_all(&request).await?;
@@ -5090,6 +5175,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one end-to-end flow verifies selector stream membership
     async fn fleet_snapshot_selector_and_command_round_trip_over_ipc() {
         use crate::fleet::{
             FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
@@ -5127,6 +5213,13 @@ mod tests {
                 remote: None,
             })
             .await;
+        let mut production = fleet_store.snapshot().await.hosts[0].clone();
+        production.alias = "prod".into();
+        production.ssh_target = "prodbox".into();
+        production
+            .labels
+            .insert("environment".into(), "production".into());
+        fleet_store.upsert_host(production).await;
         let (runtime, mut commands) = FleetRuntime::new(fleet_store.clone());
         let command_task = tokio::spawn(async move {
             let command = commands.recv().await.expect("fleet command");
@@ -5143,9 +5236,17 @@ mod tests {
 
         let client = Client::new(socket);
         let mut updates = client
-            .fleet_subscribe()
+            .fleet_subscribe(Some("environment=development"))
             .await
             .expect("fleet update subscription");
+        fleet_store
+            .mutate_host("prod", |host| host.latency_ms = Some(8))
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), updates.recv())
+                .await
+                .is_err()
+        );
         fleet_store
             .mutate_host("dev", |host| host.latency_ms = Some(4))
             .await;
@@ -5156,13 +5257,45 @@ mod tests {
             .expect("fleet update stream closed");
         assert_eq!(update.host, "dev");
         assert_eq!(update.state, FleetHostState::Online);
+        fleet_store
+            .mutate_host("dev", |host| {
+                host.labels
+                    .insert("environment".into(), "production".into());
+            })
+            .await;
+        let leaving = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("selector leaving update timeout")
+            .expect("selector leaving update read")
+            .expect("fleet update stream closed");
+        assert_eq!(leaving.host, "dev");
+        fleet_store
+            .mutate_host("dev", |host| host.latency_ms = Some(5))
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), updates.recv())
+                .await
+                .is_err()
+        );
+        fleet_store
+            .mutate_host("dev", |host| {
+                host.labels
+                    .insert("environment".into(), "development".into());
+            })
+            .await;
+        let entering = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("selector entering update timeout")
+            .expect("selector entering update read")
+            .expect("fleet update stream closed");
+        assert_eq!(entering.host, "dev");
         let selected = client
             .fleet_snapshot(Some("environment=development"))
             .await
             .expect("fleet snapshot");
         assert_eq!(selected.hosts.len(), 1);
         let excluded = client
-            .fleet_snapshot(Some("environment=production"))
+            .fleet_snapshot(Some("environment=staging"))
             .await
             .expect("filtered fleet snapshot");
         assert!(excluded.hosts.is_empty());
@@ -5175,7 +5308,7 @@ mod tests {
         command_task.await.unwrap();
         drop(updates);
         fleet_store
-            .mutate_host("dev", |host| host.latency_ms = Some(5))
+            .mutate_host("dev", |host| host.latency_ms = Some(6))
             .await;
         tokio::task::yield_now().await;
         let _ = shutdown_tx.send(());

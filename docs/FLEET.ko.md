@@ -179,11 +179,14 @@ multi-node Fleet TUI 동작:
 - `h`/`l` 또는 Left/Right는 접기/내리기, Space는 parent toggle입니다.
 - `/` 검색, `a` attention-only, `r` refresh, `c` remote host 연결/해제입니다.
   `local`에서는 항상 연결됐다는 안내만 표시합니다.
-- `o`/`p` pane capture, `m` exact-pane prompt composer이며 composer의 `/`는 공용
-  message-skill palette를 엽니다. Enter는 `local`이면 직접 이동하고
+- `o`/`p`는 선택 pane을 capture합니다. `m`은 session/window/pane에서 사용할 수
+  있고 parent에서는 live agent가 있는 가장 낮은 index의 pane을 안정적으로
+  선택합니다. composer의 `/`는 공용 message-skill palette를 엽니다. Enter는
+  `local`이면 직접 이동하고
   remote이면 SSH attach하며, `?`는 help입니다.
 - `--view`, `--layout tree|swarm`, `--sort`, `--theme`은 native watch와 같은 값을
-  사용합니다.
+  사용합니다. `focus` 확장은 선택한 view 깊이를 지키고, `manual`은 구조 키로만
+  바뀌며, `j`/`k` 직접 이동은 대상의 ancestor만 엽니다.
 - 기본 설정이 숨기는 pane 없는 agent는 `--include-paneless`로 표시할 수 있습니다.
   별도 행과 Inspector로 상태를 볼 수 있지만 pane 대상 attach/capture/message는
   의도적으로 비활성화됩니다.
@@ -204,11 +207,13 @@ reconcile하며, subscription을 잃으면 relay를 재연결합니다. keepaliv
 transport를 감지합니다. host마다 task/state/backoff가 독립적이므로 느린 host 하나가
 전체를 막지 않고 `max_parallel_connects`가 동시 SSH handshake를 제한합니다.
 
-central TUI는 작은 Fleet cache invalidation을 구독하고 burst를 coalesce한 다음
-selector가 적용된 coherent snapshot을 한 번만 가져옵니다. 최신 daemon에서는 15초의
-느린 reconcile poll만 유지하고 `fleet_subscribe`가 없는 예전 daemon에서는 1초 polling으로
-fallback합니다. idle 화면은 초당 최대 한 번만 그리고 입력이나 상태 변경은 즉시
-반영합니다.
+central TUI는 selector 범위의 작은 Fleet cache invalidation만 구독하고 burst를
+coalesce한 다음 coherent filtered snapshot을 한 번만 가져옵니다. server는 ACK보다
+먼저 stream을 설치하고 client는 직후 fresh snapshot을 가져와 시작 시점의 event 유실을
+막습니다. refresh는 75ms 동안 합치고 초당 최대 4번으로 제한합니다. 최신 daemon에서는
+15초의 느린 reconcile poll만 유지하고 `fleet_subscribe`가 없는 예전 daemon에서는 1초
+polling으로 fallback합니다. idle 화면은 초당 최대 한 번만 그리고 입력이나 상태 변경은
+즉시 반영합니다.
 
 local adapter는 Store transition을 직접 구독하고 `refresh_secs`마다 backend topology를
 갱신합니다. backend scan은 async IPC executor가 아닌 blocking worker에서 실행되며,
