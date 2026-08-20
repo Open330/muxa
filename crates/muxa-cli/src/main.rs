@@ -701,7 +701,7 @@ async fn main() -> Result<()> {
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
         Cmd::Onboard(onboard_args) => onboarding::run(onboard_args),
-        Cmd::Mcp => mcp::run(client, cfg.message.skills.clone()).await,
+        Cmd::Mcp => mcp::run(client, cfg).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune {
@@ -2719,8 +2719,12 @@ mod tests {
             "cal-1234",
             "--pipeline",
             "triad",
-            "--prompt",
+            "--body",
             "rebase onto main",
+            "--skill",
+            "/review-plan",
+            "--context",
+            "tests pass",
             "--no-ticket",
             "--dry-run",
             "--json",
@@ -2734,10 +2738,25 @@ mod tests {
         };
         assert_eq!(up.work, "cal-1234");
         assert_eq!(up.pipeline.as_deref(), Some("triad"));
-        assert_eq!(up.prompt.as_deref(), Some("rebase onto main"));
+        assert_eq!(up.body.as_deref(), Some("rebase onto main"));
+        assert_eq!(up.skill.as_deref(), Some("/review-plan"));
+        assert_eq!(up.context.as_deref(), Some("tests pass"));
         assert!(up.no_ticket);
         assert!(up.dry_run);
         assert!(up.json);
+    }
+
+    #[test]
+    fn work_up_still_accepts_prompt_as_a_spelling_of_body() {
+        let args =
+            Args::try_parse_from(["muxa", "work", "up", "cal-1234", "--prompt", "do it"]).unwrap();
+        let Cmd::Work {
+            action: WorkCmd::Up(up),
+        } = args.cmd
+        else {
+            panic!("expected work up");
+        };
+        assert_eq!(up.body.as_deref(), Some("do it"));
     }
 
     #[test]

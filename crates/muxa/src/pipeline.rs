@@ -41,6 +41,11 @@ use crate::config::{
 /// URL, and the agent can read the rest itself.
 pub const MAX_BODY_CHARS: usize = 4000;
 
+/// Placeholder key holding the caller's composed request — the skill,
+/// body, and context that `muxa work up` and `muxa_call_peer` both accept
+/// (see [`crate::request`]).
+pub const REQUEST_KEY: &str = "request";
+
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     #[error("no [[route]] matches work id {0:?}; add a catch-all route with match = '.*'")]
@@ -259,6 +264,23 @@ impl Vars {
     }
 }
 
+/// Whether a template places `{{request}}` itself, tolerating inner
+/// whitespace exactly as [`Vars::render`] does.
+fn places_request(template: &str) -> bool {
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open..];
+        let Some(close) = after.find("}}") else {
+            return false;
+        };
+        if after[2..close].trim() == REQUEST_KEY {
+            return true;
+        }
+        rest = &after[close + 2..];
+    }
+    false
+}
+
 /// Truncate on a character boundary, marking the cut so a reader (human or
 /// agent) can tell the text was clipped rather than ended.
 #[must_use]
@@ -424,18 +446,29 @@ fn render_agent(
     vars.set_opt("alias", Some(alias));
     vars.set_opt("role", agent.role.as_deref());
     vars.set_opt("program", Some(&agent.program));
-    // The shared prompt carries the ticket; the agent's own prompt carries
-    // its job. Concatenated so a pipeline states the context once.
-    let prompt = match (shared_prompt, agent.prompt.as_deref()) {
-        (None, None) => None,
-        (Some(shared), None) => Some(vars.render(shared)),
-        (None, Some(own)) => Some(vars.render(own)),
-        (Some(shared), Some(own)) => {
-            Some(format!("{}\n\n{}", vars.render(shared), vars.render(own)))
+    // Three layers, outermost first: what the caller asked for, what the
+    // pipeline says every agent needs, and what this agent's job is.
+    let templates: Vec<&str> = [shared_prompt, agent.prompt.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut sections = Vec::new();
+    // The request leads unless a template placed `{{request}}` itself. A
+    // pipeline written before the caller ever passed a body must not
+    // silently swallow one, and a pipeline that wants it somewhere else
+    // says so.
+    if !templates.iter().any(|template| places_request(template)) {
+        if let Some(request) = vars.get(REQUEST_KEY) {
+            sections.push(request.to_string());
         }
     }
-    .map(|prompt| prompt.trim().to_string())
-    .filter(|prompt| !prompt.is_empty());
+    for template in templates {
+        let rendered = vars.render(template).trim().to_string();
+        if !rendered.is_empty() {
+            sections.push(rendered);
+        }
+    }
+    let prompt = (!sections.is_empty()).then(|| sections.join("\n\n"));
     DesiredAgent {
         alias: alias.to_string(),
         program: agent.program.trim().to_ascii_lowercase(),
@@ -724,6 +757,77 @@ role = 'reviewer'
         // An agent with no prompt of its own still gets the shared context.
         assert_eq!(agents[1].prompt.as_deref(), Some("Fix the reaper"));
         assert_eq!(agents[2].role.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn the_request_leads_when_no_template_places_it() {
+        let config = pipeline_config();
+        let vars = Vars::new()
+            .set("id", "cal-1234")
+            .set(REQUEST_KEY, "Fix the double reap.")
+            .with_ticket(&Ticket {
+                id: "CAL-1234".into(),
+                title: Some("Reaper".into()),
+                ..Ticket::default()
+            });
+        let agents = desired_agents("triad", &config.pipeline["triad"], &vars).unwrap();
+        assert_eq!(
+            agents[0].prompt.as_deref(),
+            Some("Fix the double reap.\n\nReaper\n\nPlan cal-1234.")
+        );
+    }
+
+    #[test]
+    fn a_template_that_places_the_request_is_not_double_fed() {
+        let config: Config = toml::from_str(
+            r"
+[pipeline.p]
+prompt = 'context: {{ticket.title}}'
+
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'codex'
+prompt = 'do this: {{ request }}'
+",
+        )
+        .unwrap();
+        let vars = Vars::new()
+            .set(REQUEST_KEY, "ship it")
+            .with_ticket(&Ticket {
+                id: "X".into(),
+                title: Some("T".into()),
+                ..Ticket::default()
+            });
+        let agents = desired_agents("p", &config.pipeline["p"], &vars).unwrap();
+        // Placed once, by the template — not prepended as well.
+        assert_eq!(
+            agents[0].prompt.as_deref(),
+            Some("context: T\n\ndo this: ship it")
+        );
+    }
+
+    #[test]
+    fn a_request_alone_is_the_whole_prompt_for_a_bare_pipeline() {
+        let config: Config = toml::from_str(
+            r"
+[[pipeline.bare.agent]]
+alias = 'a'
+program = 'claude'
+",
+        )
+        .unwrap();
+        let vars = Vars::new().set(REQUEST_KEY, "just do the thing");
+        let agents = desired_agents("bare", &config.pipeline["bare"], &vars).unwrap();
+        assert_eq!(agents[0].prompt.as_deref(), Some("just do the thing"));
+    }
+
+    #[test]
+    fn places_request_tolerates_whitespace_and_ignores_other_keys() {
+        assert!(places_request("a {{request}} b"));
+        assert!(places_request("a {{  request  }} b"));
+        assert!(!places_request("a {{requested}} b"));
+        assert!(!places_request("a {{ticket.body}} b"));
+        assert!(!places_request("unterminated {{request"));
     }
 
     #[test]

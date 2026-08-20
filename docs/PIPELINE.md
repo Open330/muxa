@@ -150,7 +150,7 @@ window already has:
 
 - alias has no pane → **launch** it
 - alias has a live pane → **keep** it, untouched
-- alias has a live pane and you passed `--prompt` → **send** the message
+- alias has a live pane and you passed a request → **send** it to that pane
 
 ```console
 $ muxa work up cal-1234           # the reviewer's pane was closed
@@ -160,19 +160,48 @@ $ muxa work up cal-1234           # the reviewer's pane was closed
 ```
 
 So the first call stands a team up, the second is a no-op, and a call after
-something died refills exactly the gap. Improving work already in flight is
-the `--prompt` path:
+something died refills exactly the gap.
+
+## The request: `--body`, `--skill`, `--context`
+
+What the work *is* comes in as a request, phrased exactly the way
+`muxa_call_peer` takes one:
 
 ```console
-$ muxa work up cal-1234 --prompt "rebase onto main before you continue"
+$ muxa work up cal-1234 \
+    --skill review-plan \
+    --body "fix the double reap so the reconciler stops eating live panes" \
+    --context "tests already pass on main"
+```
+
+The registered `[message.skills]` entry expands first, then the body, then
+the context under an `Invocation context:` heading — one composer, shared
+with the collaboration tools, so a phrase that works for a peer works for a
+pipeline. Nothing else is attached: muxa never folds in a transcript or a
+diff on your behalf.
+
+The same request has **two deliveries, chosen by what already exists**:
+
+| Pipeline alias | Where the request goes |
+| --- | --- |
+| has no pane | into that agent's launch prompt |
+| has a live pane | typed into that pane |
+
+```console
+$ muxa work up cal-1234 --body "rebase onto main before you continue"
   » plan       prompted               %12
   » impl       prompted               %13
   » review     prompted               %21
 ```
 
-That is opt-in on purpose. Injecting a prompt into an agent that is mid-turn
-is disruptive enough to deserve an explicit ask, so a bare re-run leaves
-live agents alone.
+That is why there is no separate "start" and "steer" command. Starting work
+and redirecting work in flight are the same request against different state
+— which is the part of the k8s analogy that actually holds. `--prompt` is
+kept as a spelling of `--body`.
+
+A bare re-run with no request leaves live agents alone, because injecting a
+prompt into an agent that is mid-turn is disruptive enough to deserve being
+asked for.
 
 A pane that no pipeline alias claims — one you started by hand, or one left
 behind by a pipeline you have since edited — is **reported and never
@@ -199,11 +228,25 @@ typo show up in the prompt instead of silently blanking.
 | `{{workspace}}` | resolved workspace/session |
 | `{{cwd}}` | resolved working directory |
 | `{{alias}}`, `{{role}}`, `{{program}}` | the agent being rendered |
+| `{{request}}` | the composed `--skill` / `--body` / `--context` |
 | `{{ticket.title}}` `{{ticket.body}}` `{{ticket.url}}` `{{ticket.state}}` `{{ticket.id}}` `{{ticket.branch}}` | ticket context, when resolved |
 
 `{{ticket.body}}` is clipped to 4000 characters with a `…[truncated]` marker.
 A launch prompt carries the shape of the task and the URL; the agent can read
 the rest itself.
+
+`{{request}}` is special in one way: if no template in the pipeline places it,
+it is prepended to every agent's prompt. A pipeline written before you ever
+passed a `--body` must not silently swallow one. Place `{{request}}` yourself
+when you want it somewhere else, and it will not be prepended as well.
+
+So an agent's launch prompt is three layers, outermost first:
+
+```text
+<request>            what you asked for, this invocation
+<pipeline.prompt>    what every agent in this pipeline needs (usually the ticket)
+<agent.prompt>       what this agent's job is
+```
 
 ## Command reference
 
@@ -211,7 +254,8 @@ the rest itself.
 muxa work up <id>                    # resolve, route, create what is missing
 muxa work up <id> --dry-run          # print the plan, touch nothing
 muxa work up <id> --pipeline triad   # override the route's pipeline
-muxa work up <id> --prompt "..."     # also message agents already running
+muxa work up <id> --body "..."       # what the work is; launches or steers
+muxa work up <id> --skill review-plan --context "..."   # same composer as muxa_call_peer
 muxa work up <id> --no-ticket        # skip lookup, launch on the id alone
 muxa work up <id> --refresh          # ignore the cached ticket
 muxa work up <id> --json             # structured plan + result
@@ -221,6 +265,24 @@ muxa work down <id>                  # close the window and every agent in it
 `muxa work down` is a spelling of `muxa work close`; both refuse to touch an
 unmanaged window, and both need `--workspace` when the same work id exists in
 more than one workspace.
+
+## Over MCP
+
+The same thing is available to agents as `muxa_start_work`, with the same
+arguments:
+
+```text
+muxa_start_work {
+  "work": "cal-1234",
+  "body": "fix the double reap",
+  "skill": "review-plan",
+  "dry_run": true
+}
+```
+
+Prefer it over several `muxa_start_agent` calls: those cannot tell an agent
+that already exists from one that still has to be created, so they duplicate
+a team instead of converging on it. See [MCP.md](MCP.md).
 
 ## Configuration
 

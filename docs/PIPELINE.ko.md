@@ -139,7 +139,7 @@ pipeline의 `prompt`는 모든 agent에게 필요한 context를 한 번만 적�
 
 - alias에 pane이 없다 → **launch**
 - alias에 살아있는 pane이 있다 → **keep**, 건드리지 않음
-- alias에 살아있는 pane이 있고 `--prompt`를 줬다 → **메시지 전송**
+- alias에 살아있는 pane이 있고 요청을 줬다 → **그 pane에 전송**
 
 ```console
 $ muxa work up cal-1234           # reviewer pane이 닫혀 있던 상태
@@ -149,18 +149,44 @@ $ muxa work up cal-1234           # reviewer pane이 닫혀 있던 상태
 ```
 
 첫 호출은 팀을 세우고, 두 번째는 no-op이고, 무언가 죽은 뒤의 호출은 정확히 그
-구멍만 메웁니다. 진행 중인 일감을 개선하는 경로는 `--prompt`입니다.
+구멍만 메웁니다.
+
+## 요청: `--body`, `--skill`, `--context`
+
+일감이 *무엇인지*는 요청으로 들어옵니다. `muxa_call_peer`가 받는 방식 그대로입니다.
 
 ```console
-$ muxa work up cal-1234 --prompt "이어가기 전에 main으로 rebase해라"
+$ muxa work up cal-1234 \
+    --skill review-plan \
+    --body "reconciler가 살아있는 pane을 먹는 double reap을 고쳐라" \
+    --context "main에서는 테스트 통과함"
+```
+
+등록된 `[message.skills]` 항목이 먼저 펼쳐지고, 그다음 body, 그다음 context가
+`Invocation context:` 머리말 아래 붙습니다. 합성기는 협업 도구와 **한 벌을
+공유**하므로 peer에게 통하는 표현이 pipeline에도 그대로 통합니다. 그 외에는
+아무것도 안 붙습니다 — muxa가 대신 transcript나 diff를 끼워 넣지 않습니다.
+
+같은 요청이 **상태에 따라 두 가지로 배달**됩니다.
+
+| pipeline alias | 요청이 가는 곳 |
+| --- | --- |
+| pane 없음 | 그 agent의 launch prompt |
+| 살아있는 pane 있음 | 그 pane에 타이핑 |
+
+```console
+$ muxa work up cal-1234 --body "이어가기 전에 main으로 rebase해라"
   » plan       prompted               %12
   » impl       prompted               %13
   » review     prompted               %21
 ```
 
-이건 의도적으로 opt-in입니다. turn 중인 agent에게 prompt를 밀어 넣는 건 명시적
-요청을 받을 만큼 방해가 되는 행동이라, 그냥 다시 실행하면 살아있는 agent는
-건드리지 않습니다.
+"시작"과 "진행 중 개선"이 별도 명령이 아닌 이유가 이것입니다. 둘은 상태가 다른
+같은 요청이고, k8s 비유가 실제로 성립하는 지점도 여기입니다. `--prompt`는
+`--body`의 다른 표기로 남아 있습니다.
+
+요청 없이 그냥 다시 실행하면 살아있는 agent는 건드리지 않습니다. turn 중인
+agent에게 prompt를 밀어 넣는 건 명시적으로 요청받을 만큼 방해가 되는 행동이라서요.
 
 어떤 alias도 주장하지 않는 pane — 직접 띄운 것이거나 지금은 수정된 pipeline이
 남긴 것 — 은 **보고만 하고 절대 건드리지 않습니다**.
@@ -185,10 +211,24 @@ desired state로 수렴시키는 건 유용합니다. 하지만 사람이 연 pa
 | `{{workspace}}` | 결정된 workspace/session |
 | `{{cwd}}` | 결정된 작업 디렉터리 |
 | `{{alias}}`, `{{role}}`, `{{program}}` | 렌더링 중인 agent |
+| `{{request}}` | 합성된 `--skill` / `--body` / `--context` |
 | `{{ticket.title}}` `{{ticket.body}}` `{{ticket.url}}` `{{ticket.state}}` `{{ticket.id}}` `{{ticket.branch}}` | 조회된 ticket context |
 
 `{{ticket.body}}`는 4000자에서 `…[truncated]` 표시와 함께 잘립니다. launch
 prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으면 됩니다.
+
+`{{request}}`만 한 가지가 특별합니다. pipeline의 어떤 템플릿도 이걸 배치하지
+않으면 모든 agent의 prompt 맨 앞에 자동으로 붙습니다. `--body`가 생기기 전에
+작성된 pipeline이 body를 조용히 삼키면 안 되기 때문입니다. 직접 `{{request}}`를
+써서 원하는 위치에 두면 앞에 중복으로 붙지 않습니다.
+
+즉 agent의 launch prompt는 바깥부터 세 겹입니다.
+
+```text
+<request>            이번 호출에서 요청한 것
+<pipeline.prompt>    이 pipeline의 모든 agent에게 필요한 것 (보통 티켓)
+<agent.prompt>       이 agent의 역할
+```
 
 ## 명령 정리
 
@@ -196,7 +236,8 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 muxa work up <id>                    # 조회 → routing → 없는 것만 생성
 muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음
 muxa work up <id> --pipeline triad   # route의 pipeline을 덮어씀
-muxa work up <id> --prompt "..."     # 이미 돌고 있는 agent에게도 메시지
+muxa work up <id> --body "..."       # 일감 내용; launch 또는 전달
+muxa work up <id> --skill review-plan --context "..."   # muxa_call_peer와 같은 합성기
 muxa work up <id> --no-ticket        # 조회 없이 id만으로 실행
 muxa work up <id> --refresh          # 캐시된 ticket 무시
 muxa work up <id> --json             # 구조화된 plan + 결과
@@ -205,6 +246,23 @@ muxa work down <id>                  # window와 그 안의 agent 전부 종료
 
 `muxa work down`은 `muxa work close`의 다른 표기입니다. 둘 다 unmanaged window는
 건드리지 않고, 같은 work id가 여러 workspace에 있으면 `--workspace`를 요구합니다.
+
+## MCP
+
+같은 기능이 agent에게는 `muxa_start_work`로 노출되고, 인자도 동일합니다.
+
+```text
+muxa_start_work {
+  "work": "cal-1234",
+  "body": "double reap을 고쳐라",
+  "skill": "review-plan",
+  "dry_run": true
+}
+```
+
+`muxa_start_agent`를 여러 번 부르는 것보다 이쪽이 낫습니다. 그쪽은 이미 있는
+agent와 아직 만들어야 할 agent를 구분하지 못해 수렴 대신 팀을 복제합니다.
+[MCP.md](MCP.md) 참고.
 
 ## 설정
 

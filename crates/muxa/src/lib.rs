@@ -54,6 +54,7 @@ pub mod pipeline;
 mod process_snapshot;
 pub mod process_tree;
 pub mod reconcile;
+pub mod request;
 pub mod scope_filter;
 pub mod screen;
 pub mod session;

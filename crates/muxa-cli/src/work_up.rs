@@ -22,8 +22,9 @@ use std::time::Duration;
 
 use muxa::config::{Config, TicketConfig};
 use muxa::pipeline::{
-    self, DesiredAgent, ExistingAgent, Plan, PlanStep, Ticket, Vars, WorktreePlan,
+    self, DesiredAgent, ExistingAgent, Plan, PlanStep, Ticket, Vars, WorktreePlan, REQUEST_KEY,
 };
+use muxa::request::{ComposedRequest, RequestParts};
 
 use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest};
 
@@ -42,11 +43,20 @@ pub struct UpArgs {
     /// a worktree, which computes its own.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
-    /// Message delivered to every pipeline agent that already has a pane —
-    /// the "improve work already in flight" path. Without it, a re-run
-    /// leaves live agents alone and only fills gaps.
+    /// What the work is. One input, two deliveries: an agent that has no
+    /// pane yet gets it in its launch prompt, and one already running gets
+    /// it typed into its pane. Starting work and steering work in flight
+    /// are the same request against different state.
+    #[arg(long, visible_alias = "prompt")]
+    pub body: Option<String>,
+    /// Registered `[message.skills]` template, with or without a leading
+    /// `/`. Expanded ahead of `--body`, the same as `muxa_call_peer`.
     #[arg(long)]
-    pub prompt: Option<String>,
+    pub skill: Option<String>,
+    /// Bounded extra context, labelled in the prompt so an agent can tell
+    /// it from the instruction.
+    #[arg(long)]
+    pub context: Option<String>,
     /// Resolve and diff, then print what would happen and change nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -89,6 +99,9 @@ pub struct UpResult {
     pub window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
+    /// The composed request, when the caller supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<ComposedRequest>,
     pub plan: Plan,
     pub launched: Vec<LaunchedAgent>,
     /// Aliases that were sent `--prompt`.
@@ -96,7 +109,12 @@ pub struct UpResult {
 }
 
 /// Everything decided before a single tmux command runs.
-struct Resolved {
+///
+/// Split out so the async half (ticket lookup) and the blocking half
+/// (every tmux call) stay separable: the CLI runs them back to back,
+/// while the MCP server hands the blocking half to `spawn_blocking`
+/// rather than stalling its reactor on a subprocess.
+pub(crate) struct Resolved {
     work: String,
     workspace: String,
     pipeline: String,
@@ -105,12 +123,15 @@ struct Resolved {
     worktree: Option<WorktreePlan>,
     created_worktree: bool,
     layout: Option<String>,
+    request: Option<ComposedRequest>,
     desired: Vec<DesiredAgent>,
 }
 
 pub async fn run(args: UpArgs, config: &Config) -> Result<()> {
     let json = args.json;
-    let result = up(args, config).await?;
+    let dry_run = args.dry_run;
+    let resolved = resolve(&args, config).await?;
+    let result = apply(resolved, dry_run)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -119,12 +140,17 @@ pub async fn run(args: UpArgs, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn up(args: UpArgs, config: &Config) -> Result<UpResult> {
-    let resolved = resolve(&args, config).await?;
+/// The blocking half: read the window, diff it against the pipeline, and
+/// act on the difference.
+pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
     let existing = existing_agents(&resolved.work, &resolved.workspace)?;
-    let plan = pipeline::plan(&resolved.desired, &existing, args.prompt.as_deref());
+    let broadcast = resolved
+        .request
+        .as_ref()
+        .map(|request| request.text.as_str());
+    let plan = pipeline::plan(&resolved.desired, &existing, broadcast);
 
-    if args.dry_run {
+    if dry_run {
         return Ok(finish(
             resolved,
             plan,
@@ -194,6 +220,7 @@ fn finish(
         session,
         window,
         layout: resolved.layout,
+        request: resolved.request,
         plan,
         launched,
         reprompted,
@@ -202,7 +229,7 @@ fn finish(
 
 // ---------------------------------------------------------------- resolve
 
-async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
+pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
     let work = crate::tmux_work::normalize_work_id(&args.work)?;
     let id = work.to_ascii_lowercase();
 
@@ -232,6 +259,21 @@ async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
     if let Some(ticket) = &ticket {
         vars = vars.with_ticket(ticket);
     }
+
+    // The caller's request is a var like any other, so a pipeline template
+    // can place it — and so it reaches the ticket-less path unchanged.
+    let request = muxa::request::compose(
+        RequestParts {
+            skill: args.skill.as_deref(),
+            body: args.body.as_deref(),
+            context: args.context.as_deref(),
+        },
+        &config.message.skills,
+    )?;
+    vars.set_opt(
+        REQUEST_KEY,
+        request.as_ref().map(|request| request.text.as_str()),
+    );
 
     let (cwd, worktree, created_worktree) = resolve_cwd(args, route, &vars)?;
     vars.set_opt("cwd", cwd.to_str());
@@ -265,6 +307,7 @@ async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
         worktree,
         created_worktree,
         layout: spec.layout.clone(),
+        request,
         desired,
     })
 }
@@ -596,6 +639,23 @@ fn print_result(result: &UpResult) {
             }
         }
         None => println!("  ticket   (not resolved)"),
+    }
+    if let Some(request) = &result.request {
+        let mut lines = request.text.lines();
+        let first = lines.next().unwrap_or_default();
+        let clipped: String = first.chars().take(58).collect();
+        println!(
+            "  request  {}{clipped}{}",
+            request
+                .skill
+                .as_deref()
+                .map_or_else(String::new, |skill| format!("{skill} ")),
+            if clipped.len() < first.len() || lines.next().is_some() {
+                " …"
+            } else {
+                ""
+            }
+        );
     }
     for step in &result.plan.steps {
         match step {

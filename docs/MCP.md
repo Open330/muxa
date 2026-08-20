@@ -119,6 +119,7 @@ it:
 | `muxa_status` | `pane?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Snapshot all agents plus managed workspace → work → agent topology, or observe one pane. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
 | `muxa_start_agent` | `agent`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. |
+| `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
@@ -194,6 +195,46 @@ muxa_call_peer(target="@codex", intent="task", execute=true,
 The MCP process reads `[message.skills]` at startup. Restart an already-running
 agent after `muxa skill add/remove`, after editing the table, or after upgrading
 Muxa so it loads the current skills and tool definitions.
+
+### Staffing a whole ticket
+
+`muxa_start_agent` creates one pane. `muxa_start_work` creates a *team*, and
+it is the only tool that can tell an agent it already started from one it
+still has to:
+
+```text
+muxa_start_work {
+  "work": "cal-1234",
+  "body": "fix the double reap so the reconciler stops eating live panes",
+  "skill": "review-plan",
+  "context": "tests already pass on main"
+}
+→ { "work": "CAL-1234", "workspace": "callabo", "pipeline": "triad",
+    "cwd": "/home/june/worktrees/cal-1234",
+    "ticket": { "id": "CAL-1234", "title": "...", "url": "..." },
+    "launched": [ { "alias": "plan", "pane": "%12", ... }, ... ],
+    "plan": { "steps": [...], "unclaimed": [] } }
+```
+
+`body`, `skill`, and `context` compose exactly as they do in
+`muxa_call_peer` — the registered skill expands first, then the body, then
+the context under an `Invocation context:` heading. Nothing else is
+attached; muxa never folds in a transcript or a diff on the caller's
+behalf.
+
+The same request has two deliveries, chosen by what already exists:
+
+| Pipeline alias | What happens to `body` |
+| --- | --- |
+| has no pane | goes into that agent's launch prompt |
+| has a live pane | is typed into that pane |
+
+So calling it twice does not duplicate the team — the second call steers it.
+A pane no pipeline alias claims is reported in `plan.unclaimed` and never
+touched. `dry_run: true` returns the same plan without creating or sending
+anything, which is the right first call when you are unsure what a route
+would do. Requires `[[route]]` and `[pipeline.*]` configuration, or an
+explicit `pipeline`. See [PIPELINE.md](PIPELINE.md).
 
 ### Deterministic agent launch
 

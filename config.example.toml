@@ -387,6 +387,17 @@
 # whichever agent panes the pipeline declares but the window does not have
 # yet. Re-running converges — it fills gaps, it does not duplicate a team.
 # Add `--dry-run` to see the plan without touching tmux. See docs/PIPELINE.md.
+#
+# What the work *is* rides in as a request, phrased the same way
+# `muxa_call_peer` takes one — `--skill` expands a [message.skills] entry,
+# then `--body`, then `--context`:
+#
+#     muxa work up cal-1234 --body "fix the double reap"
+#
+# and the same request is delivered two ways depending on what exists: into
+# the launch prompt of an agent that has no pane yet, and typed into the
+# pane of one that is already running. Agents can call this as
+# `muxa_start_work` over MCP.
 # ---------------------------------------------------------------------------
 
 # How a work id becomes ticket context.
@@ -449,8 +460,11 @@
 # muxad, the CLI, and the agent restarting. Keep it unique and stable.
 #
 # Placeholders: {{id}} (lowercase work id, for branches and paths), {{work}}
-# (as muxa stores it), {{workspace}}, {{cwd}}, {{alias}}, {{role}}, and
-# {{ticket.title|body|url|state|id|branch}}.
+# (as muxa stores it), {{workspace}}, {{cwd}}, {{alias}}, {{role}},
+# {{ticket.title|body|url|state|id|branch}}, and {{request}} — the composed
+# --skill/--body/--context. If no template here places {{request}}, it is
+# prepended to every agent's prompt, so a pipeline written before you passed
+# a --body cannot silently swallow one.
 # [pipeline.triad]
 # description = 'planner → implementer → reviewer'
 # layout      = 'main-vertical'   # tmux layout, applied once every pane exists

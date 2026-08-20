@@ -61,6 +61,11 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     as one work/ticket, and one pane as one agent. Use muxa_start_agent with a work id instead \
     of delegating tmux setup to another model; use muxa_manage_tmux for lifecycle \
     control and never invent raw tmux commands. \
+    To staff a whole ticket rather than one pane, call muxa_start_work: it resolves the \
+    ticket, routes it, and creates only the pipeline agents the window is missing, so \
+    re-running converges instead of duplicating the team. Several muxa_start_agent calls \
+    cannot do that. Pass what the work is as body (with an optional /skill and context), \
+    the same phrasing muxa_call_peer takes; the same body steers agents already running. \
     Reserved routing: @peer and @muxa-peer always mean Muxa collaboration, never \
     a GitHub user, pull-request reviewer, issue, or review thread. A request for \
     @peer's report, reply, previous findings, or conversation must call \
@@ -109,7 +114,7 @@ const RECONCILE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run the MCP stdio server until stdin closes. Refuses to start if the
 /// daemon socket is unreachable.
-pub async fn run(client: Client, message_skills: BTreeMap<String, String>) -> Result<()> {
+pub async fn run(client: Client, config: muxa::config::Config) -> Result<()> {
     // Refuse to start against an absent/dead daemon: a control plane the
     // tools can't reach is worse than a clear failure.
     if let Err(e) = client.snapshot_with_timeout(PROBE_TIMEOUT).await {
@@ -119,11 +124,11 @@ pub async fn run(client: Client, message_skills: BTreeMap<String, String>) -> Re
         );
     }
 
-    serve_with_skills(
+    serve_with_config(
         client,
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
-        Arc::new(message_skills),
+        Arc::new(config),
     )
     .await
 }
@@ -153,14 +158,20 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    serve_with_skills(client, reader, writer, Arc::new(BTreeMap::new())).await
+    serve_with_config(
+        client,
+        reader,
+        writer,
+        Arc::new(muxa::config::Config::default()),
+    )
+    .await
 }
 
-async fn serve_with_skills<R, W>(
+async fn serve_with_config<R, W>(
     client: Client,
     reader: R,
     writer: W,
-    message_skills: Arc<BTreeMap<String, String>>,
+    config: Arc<muxa::config::Config>,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -178,10 +189,10 @@ where
         }
         let client = client.clone();
         let writer = Arc::clone(&writer);
-        let message_skills = Arc::clone(&message_skills);
+        let config = Arc::clone(&config);
         tasks.spawn(async move {
             let response = match serde_json::from_str::<Value>(&line) {
-                Ok(req) => dispatch_with_skills(&client, &req, &message_skills).await,
+                Ok(req) => dispatch_with_config(&client, &req, &config).await,
                 // A line that isn't valid JSON at all: -32700, id unknown.
                 Err(e) => Some(error_response(
                     &Value::Null,
@@ -238,16 +249,16 @@ where
 ///   `id` is present to address the reply to.
 #[cfg(test)]
 async fn dispatch(client: &Client, req: &Value) -> Option<Value> {
-    dispatch_with_skills(client, req, &BTreeMap::new()).await
+    dispatch_with_config(client, req, &muxa::config::Config::default()).await
 }
 
-async fn dispatch_with_skills(
+async fn dispatch_with_config(
     client: &Client,
     req: &Value,
-    message_skills: &BTreeMap<String, String>,
+    config: &muxa::config::Config,
 ) -> Option<Value> {
     match req {
-        Value::Object(_) => dispatch_object(client, req, message_skills).await,
+        Value::Object(_) => dispatch_object(client, req, config).await,
         Value::Array(_) => Some(error_response(
             &Value::Null,
             -32600,
@@ -268,7 +279,7 @@ async fn dispatch_with_skills(
 async fn dispatch_object(
     client: &Client,
     req: &Value,
-    message_skills: &BTreeMap<String, String>,
+    config: &muxa::config::Config,
 ) -> Option<Value> {
     let id = req.get("id").cloned();
 
@@ -295,10 +306,10 @@ async fn dispatch_object(
     };
 
     let response = match method {
-        "initialize" => success(&id, initialize_result(message_skills)),
+        "initialize" => success(&id, initialize_result(&config.message.skills)),
         "ping" => success(&id, json!({})),
         "tools/list" => success(&id, json!({ "tools": tool_definitions() })),
-        "tools/call" => match call_tool(client, req.get("params"), message_skills).await {
+        "tools/call" => match call_tool(client, req.get("params"), config).await {
             Ok(result) => success(&id, result),
             // A malformed `tools/call` (missing name / bad args) is a
             // protocol error; a tool that *ran* but failed reports
@@ -432,6 +443,36 @@ fn tool_definitions() -> Vec<Value> {
                     "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Default right." }
                 },
                 "required": ["agent"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_start_work",
+            "description": "Bring one work item's tmux window to the state its configured pipeline declares: \
+                resolve the ticket, route it to a workspace and directory, and create whichever agent panes \
+                are missing. This is the deterministic way to stand up a whole team (planner, implementer, \
+                reviewer) for a ticket — prefer it over several muxa_start_agent calls, which cannot tell an \
+                agent that already exists from one that still has to be created. Re-running converges instead \
+                of duplicating: existing panes are kept, and a body/skill/context is typed into them rather \
+                than launched again, which is also how you steer work already in flight. Panes no pipeline \
+                alias claims are reported and never touched. Requires [[route]] and [pipeline.*] config, or an \
+                explicit pipeline. Use dry_run=true first when you are unsure what it would create. \
+                CLI equivalent: `muxa work up`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "work": { "type": "string", "description": "Work/ticket id, for example cal-1234. One managed tmux window per id." },
+                    "pipeline": { "type": "string", "description": "Pipeline name from [pipeline.*]. Defaults to the matching route's; required when no route matches." },
+                    "workspace": { "type": "string", "description": "Workspace/project session. Defaults to the route's, then the cwd basename." },
+                    "cwd": { "type": "string", "description": "Work directory. Overrides the route; refused when the route creates a git worktree." },
+                    "body": { "type": "string", "description": "What the work is. Launched agents get it in their first prompt; agents already running get it typed into their pane." },
+                    "skill": { "type": "string", "description": "Registered Muxa message skill name, with or without leading /. Expanded ahead of body, exactly as in muxa_call_peer." },
+                    "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
+                    "no_ticket": { "type": "boolean", "description": "Skip ticket lookup and use the work id alone. Default false." },
+                    "refresh": { "type": "boolean", "description": "Ignore the cached ticket and ask the resolver again. Default false." },
+                    "dry_run": { "type": "boolean", "description": "Return the plan without creating panes or sending prompts. Default false." }
+                },
+                "required": ["work"],
                 "additionalProperties": false
             },
         }),
@@ -700,7 +741,7 @@ fn tool_definitions() -> Vec<Value> {
 async fn call_tool(
     client: &Client,
     params: Option<&Value>,
-    message_skills: &BTreeMap<String, String>,
+    config: &muxa::config::Config,
 ) -> Result<Value> {
     let params = params.ok_or_else(|| anyhow::anyhow!("missing params"))?;
     let name = params
@@ -1009,7 +1050,8 @@ async fn call_tool(
                 Err(error) => error_result(&format!("room context failed: {error}")),
             })
         }
-        "muxa_call_peer" => Ok(call_peer(client, &args, message_skills).await),
+        "muxa_call_peer" => Ok(call_peer(client, &args, &config.message.skills).await),
+        "muxa_start_work" => Ok(start_work(&args, config).await),
         "muxa_peer_report" => Ok(peer_report(client, &args).await),
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
@@ -1470,71 +1512,73 @@ fn peer_call_contract(args: &Value) -> std::result::Result<(RequestKind, WorkMod
     ))
 }
 
+/// `muxa work up` over MCP.
+///
+/// Resolution is async (it may spend a headless agent turn looking the
+/// ticket up); everything after it shells out to tmux and is therefore
+/// handed to `spawn_blocking` rather than run on the reactor.
+async fn start_work(args: &Value, config: &muxa::config::Config) -> Value {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let flag = |key: &str| args.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let Some(work) = text("work") else {
+        return error_result("muxa_start_work requires a work argument");
+    };
+    let up = crate::work_up::UpArgs {
+        work,
+        pipeline: text("pipeline"),
+        workspace: text("workspace"),
+        cwd: text("cwd").map(std::path::PathBuf::from),
+        body: text("body"),
+        skill: text("skill"),
+        context: text("context"),
+        dry_run: flag("dry_run"),
+        no_ticket: flag("no_ticket"),
+        refresh: flag("refresh"),
+        json: true,
+    };
+    let resolved = match crate::work_up::resolve(&up, config).await {
+        Ok(resolved) => resolved,
+        Err(error) => return error_result(&format!("{error:#}")),
+    };
+    let dry_run = up.dry_run;
+    let result =
+        match tokio::task::spawn_blocking(move || crate::work_up::apply(resolved, dry_run)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return error_result(&format!("{error:#}")),
+            Err(error) => return error_result(&format!("muxa_start_work worker failed: {error}")),
+        };
+    match serde_json::to_value(&result) {
+        Ok(value) => json_result(&value),
+        Err(error) => error_result(&format!("muxa_start_work could not serialize: {error}")),
+    }
+}
+
+/// Adapter over [`muxa::request::compose`]: read the JSON-RPC argument
+/// shape and turn "nothing supplied" into the error a peer call needs.
+/// `muxa work up` shares the composer but not that rule — a pipeline can
+/// legitimately be driven by its ticket alone.
 fn peer_call_body(
     args: &Value,
     message_skills: &BTreeMap<String, String>,
 ) -> std::result::Result<(String, Option<String>), String> {
-    let skill_name = args
-        .get("skill")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| name.trim_start_matches('/'));
-    let skill = if let Some(name) = skill_name {
-        let found = message_skills
-            .get(name)
-            .or_else(|| {
-                message_skills
-                    .iter()
-                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-                    .map(|(_, prompt)| prompt)
-            })
-            .ok_or_else(|| {
-                let available = message_skills
-                    .keys()
-                    .map(|name| format!("/{name}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "message skill /{name} is not registered{}",
-                    if available.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; available: {available}")
-                    }
-                )
-            })?;
-        Some((name.to_string(), found.trim()))
-    } else {
-        None
-    };
-    let body = args
-        .get("body")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|body| !body.is_empty());
-    let context = args
-        .get("context")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|context| !context.is_empty());
-    let mut sections = Vec::new();
-    if let Some((_, prompt)) = skill.as_ref() {
-        sections.push((*prompt).to_string());
-    }
-    if let Some(body) = body {
-        sections.push(body.to_string());
-    }
-    if let Some(context) = context {
-        sections.push(format!("Invocation context:\n{context}"));
-    }
-    if sections.is_empty() {
-        return Err("call_peer requires body, skill, or context".into());
-    }
-    Ok((
-        sections.join("\n\n"),
-        skill.map(|(name, _)| format!("/{name}")),
-    ))
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    let composed = muxa::request::compose(
+        muxa::request::RequestParts {
+            skill: text("skill"),
+            body: text("body"),
+            context: text("context"),
+        },
+        message_skills,
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or("call_peer requires body, skill, or context")?;
+    Ok((composed.text, composed.skill))
 }
 
 fn select_peer(
@@ -1761,6 +1805,10 @@ async fn spawn_peer(
         work: None,
         role: Some("peer".into()),
         task: Some("muxa peer call".into()),
+        // A peer spawned for one call is not a pipeline pane, so it stays
+        // unaliased and `muxa work up` reports it as unclaimed rather than
+        // mistaking it for a role it should own.
+        alias: None,
         direction: crate::agent_launch::SplitDirection::Right,
     };
     let started = tokio::task::spawn_blocking(move || crate::agent_launch::start(request))
@@ -2556,6 +2604,7 @@ mod tests {
                 "muxa_status",
                 "muxa_recent_prompts",
                 "muxa_start_agent",
+                "muxa_start_work",
                 "muxa_manage_tmux",
                 "muxa_send_prompt",
                 "muxa_capture_pane",
