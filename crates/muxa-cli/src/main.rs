@@ -5,12 +5,15 @@ mod agent_launch;
 mod attend;
 mod dashboard_tui;
 mod doctor;
+mod fleet_cli;
+mod fleet_watch;
 mod init;
 mod logs;
 mod mcp;
 mod message_skill;
 mod onboarding;
 mod peek;
+mod relay;
 mod stats;
 mod theme;
 mod time_range;
@@ -120,6 +123,10 @@ enum Cmd {
     },
     /// Register reusable `/` templates for the interactive message composer.
     Skill(message_skill::Args),
+    /// Manage the SSH host inventory and Kubernetes-style metadata.
+    Host(fleet_cli::HostArgs),
+    /// Observe and control SSH-connected Muxa hosts.
+    Fleet(fleet_cli::FleetArgs),
     /// Deterministic tmux agent lifecycle operations.
     Agent {
         #[command(subcommand)]
@@ -171,6 +178,13 @@ enum Cmd {
     Peek(peek::Args),
     /// Fullscreen nested session/window/pane topology of tracked agents.
     Watch {
+        /// Show the SSH fleet host/session/window/pane hierarchy instead of
+        /// the local topology.
+        #[arg(long)]
+        fleet: bool,
+        /// Kubernetes-style host label selector used with `--fleet`.
+        #[arg(short = 'l', long = "selector", requires = "fleet")]
+        selector: Option<String>,
         /// Show agents that have no tmux pane attached. Default behavior
         /// (governed by `[watch] hide_paneless = true`) hides them
         /// because Enter on the picker can't attach to them anyway —
@@ -247,6 +261,15 @@ enum Cmd {
         #[arg(long)]
         json: String,
     },
+    /// Bridge the owner-only local muxad socket over an authenticated SSH
+    /// stdio channel for Muxa Fleet. Usually launched by another muxad.
+    Relay {
+        #[arg(long, default_value_t = true)]
+        stdio: bool,
+    },
+    /// Exact remote pane attach endpoint used by `muxa fleet attach`.
+    #[command(hide = true)]
+    FleetRemoteAttach { token: String },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
     /// rotates through them (bind it to a tmux key); `--list` prints the
@@ -539,6 +562,7 @@ fn collaboration_client_kind(command: &Cmd) -> CollaborationClientKind {
     }
 }
 
+#[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -576,6 +600,8 @@ async fn main() -> Result<()> {
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
+        Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
+        Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action),
@@ -590,6 +616,8 @@ async fn main() -> Result<()> {
         Cmd::Panes => cmd_panes(),
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
+            fleet,
+            selector,
             include_paneless,
             view,
             layout,
@@ -598,6 +626,15 @@ async fn main() -> Result<()> {
             caller_client,
             caller_pane,
         } => {
+            if fleet {
+                selector
+                    .as_deref()
+                    .map(str::parse::<muxa::LabelSelector>)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)
+                    .context("invalid fleet label selector")?;
+                return fleet_watch::run(client, &cfg, selector).await;
+            }
             // Pin focus-moving commands to the requesting client; jump_to_pane_tmux reads it.
             //
             // A value still containing `#{` is a binding that never expanded
@@ -642,6 +679,13 @@ async fn main() -> Result<()> {
             pane,
         } => cmd_register(&client, name, pid, cwd, pane).await,
         Cmd::ZellijPluginSnapshot { json } => cmd_zellij_plugin_snapshot(&client, &json).await,
+        Cmd::Relay { stdio } => {
+            if !stdio {
+                anyhow::bail!("only --stdio relay transport is supported");
+            }
+            relay::run(client).await
+        }
+        Cmd::FleetRemoteAttach { token } => relay::remote_attach(&token),
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,

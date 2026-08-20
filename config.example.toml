@@ -91,6 +91,39 @@
 # cursor. peer/@alias/role: selectors stay window-scoped either way.
 # scope = "window"
 
+# Central physical-host management over persistent, outbound OpenSSH stdio
+# relays. The remote side needs the same muxa version and an owner-local muxad;
+# no TCP listener is opened on either side. SSH identity, ProxyJump, port, and
+# host-key policy belong in ~/.ssh/config. See docs/FLEET.md.
+[fleet]
+# enabled               = false
+# refresh_secs          = 15
+# keepalive_secs        = 10
+# offline_after_secs    = 30       # must be at least 2 × keepalive_secs
+# connect_timeout_secs  = 10
+# command_timeout_secs  = 10
+# max_parallel_connects = 6
+# capture_policy        = "selected" # selected | never; pane text is fetched on demand only
+
+# [fleet.hosts.devbox]
+# ssh           = "muxa-devbox"    # OpenSSH Host alias; no embedded flags
+# muxa_path     = "muxa"
+# enabled       = true
+# connect       = "auto"           # auto | on_demand
+# mode          = "observe"        # observe | control
+# remote_socket = "/run/user/1000/muxa.sock" # optional
+
+# Kubernetes-style labels are selector/indexing metadata. Values are short
+# identifiers; use annotations for descriptive or URL-like data.
+# [fleet.hosts.devbox.labels]
+# environment = "development"
+# region = "icn"
+# accelerator = "gpu"
+
+# [fleet.hosts.devbox.annotations]
+# "muxa.dev/owner" = "platform-team"
+# "muxa.dev/runbook" = "https://example.invalid/runbooks/devbox"
+
 [history]
 # enabled               = true
 # path                  = "/home/$USER/.local/share/muxa/prompts.ndjson"

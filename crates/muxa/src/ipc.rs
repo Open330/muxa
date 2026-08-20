@@ -31,6 +31,9 @@ use crate::collaboration_audit::{
     CollaborationAuditContext, CollaborationAuditLog, CollaborationAuditOperation,
 };
 use crate::event::{AgentEvent, PROTOCOL_VERSION};
+use crate::fleet::{
+    FleetCommandResult, FleetOperation, FleetRuntime, FleetSnapshot, LabelSelector,
+};
 use crate::session::{
     PtySessionBackend, SessionBackend, SessionOutput, SessionRef, SharedSessionBackend,
     SpawnSession, TerminalSnapshot,
@@ -126,6 +129,18 @@ enum RequestBody {
         event: AgentEvent,
     },
     Snapshot,
+    /// Snapshot of every configured physical SSH host. `selector` follows
+    /// Kubernetes label-selector syntax and is evaluated against central
+    /// inventory metadata, never against untrusted remote data.
+    FleetSnapshot {
+        #[serde(default)]
+        selector: Option<String>,
+    },
+    /// Route one exact operation through the per-host persistent SSH relay.
+    FleetCommand {
+        host: String,
+        operation: FleetOperation,
+    },
     ByPane {
         pane: String,
     },
@@ -362,6 +377,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_lifecycle",
     "collaboration_identity",
     "collaboration_provenance",
+    "fleet_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -431,6 +447,10 @@ pub struct Response {
     pub ask_entry: Option<AskEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<FleetSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fleet_result: Option<FleetCommandResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,6 +486,8 @@ impl Response {
             ask_entries: None,
             ask_entry: None,
             ask_agent: None,
+            fleet: None,
+            fleet_result: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -478,6 +500,16 @@ impl Response {
         let mut r = Self::ok();
         r.agents = Some(agents);
         r
+    }
+    fn with_fleet(fleet: FleetSnapshot) -> Self {
+        let mut response = Self::ok();
+        response.fleet = Some(fleet);
+        response
+    }
+    fn with_fleet_result(result: FleetCommandResult) -> Self {
+        let mut response = Self::ok();
+        response.fleet_result = Some(result);
+        response
     }
     fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
         let mut r = Self::ok();
@@ -657,6 +689,7 @@ pub struct Server {
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
     restart: Option<Arc<RestartController>>,
+    fleet: Option<FleetRuntime>,
     handler_limit: usize,
 }
 
@@ -673,6 +706,7 @@ impl Server {
             collaboration_audit: CollaborationAuditLog::in_memory(),
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             restart: None,
+            fleet: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -732,6 +766,15 @@ impl Server {
     #[must_use]
     pub fn with_restart_controller(mut self, restart: Arc<RestartController>) -> Self {
         self.restart = Some(restart);
+        self
+    }
+
+    /// Install the physical-host fleet cache and command router. Keeping this
+    /// optional preserves embedders/tests and makes a disabled fleet consume
+    /// no SSH processes or background resources.
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: FleetRuntime) -> Self {
+        self.fleet = Some(fleet);
         self
     }
 
@@ -828,6 +871,7 @@ impl Server {
                     let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
                     let restart = self.restart.clone();
+                    let fleet = self.fleet.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -842,6 +886,7 @@ impl Server {
                                 collaboration_audit,
                                 ask,
                                 restart,
+                                fleet,
                             ))
                             .await
                         {
@@ -1446,7 +1491,8 @@ async fn record_collaboration_audit(
         collaboration,
         collaboration_audit,
         ask,
-        restart
+        restart,
+        fleet
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -1460,6 +1506,7 @@ async fn handle(
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
     restart: Option<Arc<RestartController>>,
+    fleet: Option<FleetRuntime>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -1619,6 +1666,35 @@ async fn handle(
                 RequestBody::Snapshot => {
                     kind = "snapshot";
                     Response::with_agents(store.snapshot().await)
+                }
+                RequestBody::FleetSnapshot { selector } => {
+                    kind = "fleet_snapshot";
+                    match &fleet {
+                        Some(fleet) => match selector
+                            .as_deref()
+                            .map(str::parse::<LabelSelector>)
+                            .transpose()
+                        {
+                            Ok(selector) => Response::with_fleet(
+                                fleet.store.snapshot_selected(selector.as_ref()).await,
+                            ),
+                            Err(error) => Response::err(format!("invalid label selector: {error}")),
+                        },
+                        None => Response::err("fleet is not enabled in muxad"),
+                    }
+                }
+                RequestBody::FleetCommand { host, operation } => {
+                    kind = "fleet_command";
+                    match &fleet {
+                        Some(fleet) => match fleet
+                            .execute(host, operation, Duration::from_secs(20))
+                            .await
+                        {
+                            Ok(result) => Response::with_fleet_result(result),
+                            Err(error) => Response::err(error),
+                        },
+                        None => Response::err("fleet is not enabled in muxad"),
+                    }
                 }
                 RequestBody::ByPane { pane } => {
                     kind = "by_pane";
@@ -2373,6 +2449,48 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
         Ok(decode_agents(&resp))
+    }
+
+    /// Read the central physical-host cache. This is a local Unix-socket
+    /// operation; SSH collection runs continuously in muxad's `FleetManager`.
+    pub async fn fleet_snapshot(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<FleetSnapshot, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "fleet_snapshot",
+            "selector": selector,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["fleet"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Execute an exact operation on one configured host. Mutations are
+    /// authorized again by the manager's per-host access mode.
+    pub async fn fleet_execute(
+        &self,
+        host: &str,
+        operation: &FleetOperation,
+    ) -> Result<FleetCommandResult, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "fleet_command",
+            "host": host,
+            "operation": operation,
+        });
+        let response = self
+            .call_with_timeout(&req, Duration::from_secs(25))
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("fleet command failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["fleet_result"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -3666,6 +3784,7 @@ mod tests {
             CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             None,
+            None,
         ));
 
         let req = serde_json::json!({
@@ -4829,5 +4948,78 @@ mod tests {
             .expect("a transition after the skipped marker");
         assert_eq!(got.to, transition.to);
         assert_eq!(got.agent.session_id, "lag");
+    }
+
+    #[tokio::test]
+    async fn fleet_snapshot_selector_and_command_round_trip_over_ipc() {
+        use crate::fleet::{
+            FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
+            HostAccessMode, FLEET_PROTOCOL_VERSION,
+        };
+
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("fleet-ipc.sock");
+        let fleet_store = Arc::new(FleetStore::new());
+        fleet_store
+            .upsert_host(FleetHostSnapshot {
+                alias: "dev".into(),
+                ssh_target: "devbox".into(),
+                labels: std::collections::BTreeMap::from([(
+                    "environment".into(),
+                    "development".into(),
+                )]),
+                annotations: std::collections::BTreeMap::new(),
+                mode: HostAccessMode::Control,
+                state: FleetHostState::Online,
+                node_id: None,
+                hostname: Some("devbox".into()),
+                os: Some("linux".into()),
+                arch: Some("x86_64".into()),
+                muxa_version: Some(env!("CARGO_PKG_VERSION").into()),
+                protocol: Some(FLEET_PROTOCOL_VERSION),
+                capabilities: Vec::new(),
+                daemon_generation: Some(0),
+                boot_id: Some("boot".into()),
+                latency_ms: Some(3),
+                last_seen_at: Some(OffsetDateTime::now_utc()),
+                received_at: Some(OffsetDateTime::now_utc()),
+                error: None,
+                remote: None,
+            })
+            .await;
+        let (runtime, mut commands) = FleetRuntime::new(fleet_store);
+        let command_task = tokio::spawn(async move {
+            let command = commands.recv().await.expect("fleet command");
+            assert_eq!(command.host, "dev");
+            assert!(matches!(command.operation, FleetOperation::Refresh));
+            let _ = command
+                .reply
+                .send(Ok(FleetCommandResult::accepted("refreshed")));
+        });
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let server = Server::new(socket.clone(), Store::shared()).with_fleet(runtime);
+        let server_task = tokio::spawn(async move { server.run(shutdown_rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+
+        let client = Client::new(socket);
+        let selected = client
+            .fleet_snapshot(Some("environment=development"))
+            .await
+            .expect("fleet snapshot");
+        assert_eq!(selected.hosts.len(), 1);
+        let excluded = client
+            .fleet_snapshot(Some("environment=production"))
+            .await
+            .expect("filtered fleet snapshot");
+        assert!(excluded.hosts.is_empty());
+        let result = client
+            .fleet_execute("dev", &FleetOperation::Refresh)
+            .await
+            .expect("fleet command");
+        assert_eq!(result.message.as_deref(), Some("refreshed"));
+
+        command_task.await.unwrap();
+        let _ = shutdown_tx.send(());
+        server_task.await.unwrap();
     }
 }

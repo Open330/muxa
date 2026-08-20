@@ -90,7 +90,10 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     always finish with muxa_reply using completed, blocked, declined, or failed. \
     When work is already represented by a validated AIR 1 workflow, plan, or trace, \
     attach its typed air_artifacts reference for shared identity and visualization; \
-    AIR Workbench remains the validator/editor and muxa never implies conformance.";
+    AIR Workbench remains the validator/editor and muxa never implies conformance. \
+    SSH fleet operations are a separate physical-host control plane: discover hosts \
+    with muxa_fleet_status, always name the host and pane explicitly for capture or \
+    prompt delivery, and remember that observe-mode hosts reject control actions.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -483,6 +486,45 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_fleet_status",
+            "description": "Read the cached SSH fleet hierarchy and health for physical hosts. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "Optional label selector, for example environment=production,region in (icn,nrt)." }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "muxa_fleet_capture",
+            "description": "Capture one exact pane from a named SSH fleet host. The host must have a live cached topology; pane accepts a backend pane id or session/window/pane path and ambiguity is rejected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "Configured fleet host alias." },
+                    "pane": { "type": "string", "description": "Pane id such as %12 or session/window/%12." }
+                },
+                "required": ["host", "pane"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "muxa_fleet_send_prompt",
+            "description": "Send literal text to one exact pane on a named control-mode SSH fleet host. The daemon enforces host authorization and never retries this mutation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "Configured fleet host alias." },
+                    "pane": { "type": "string", "description": "Pane id such as %12 or session/window/%12." },
+                    "text": { "type": "string", "description": "Literal prompt text." },
+                    "submit": { "type": "boolean", "description": "Press Enter after delivery. Default true." }
+                },
+                "required": ["host", "pane", "text"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "muxa_wait_for_change",
             "description": "Block until an agent changes state. Set until=settled \
                 to ignore intermediate working transitions and return only when the \
@@ -870,6 +912,75 @@ async fn call_tool(
                 )),
                 Err(e) => error_result(&format!("capture failed: {e}")),
             })
+        }
+        "muxa_fleet_status" => {
+            let selector = args.get("selector").and_then(Value::as_str);
+            Ok(match client.fleet_snapshot(selector).await {
+                Ok(snapshot) => json_result(&json!(snapshot)),
+                Err(error) => error_result(&format!("fleet status failed: {error}")),
+            })
+        }
+        "muxa_fleet_capture" => {
+            let Some(host) = args.get("host").and_then(Value::as_str) else {
+                return Ok(error_result("fleet_capture requires a `host` argument"));
+            };
+            let Some(pane) = args.get("pane").and_then(Value::as_str) else {
+                return Ok(error_result("fleet_capture requires a `pane` argument"));
+            };
+            let target = match crate::fleet_cli::resolve_pane(client, host, pane).await {
+                Ok(target) => target,
+                Err(error) => return Ok(error_result(&format!("fleet capture failed: {error}"))),
+            };
+            Ok(
+                match client
+                    .fleet_execute(host, &muxa::FleetOperation::Capture { pane: target })
+                    .await
+                {
+                    Ok(result) => match result.capture {
+                        Some(capture) => text_result(&capture),
+                        None => error_result("fleet capture returned no pane contents"),
+                    },
+                    Err(error) => error_result(&format!("fleet capture failed: {error}")),
+                },
+            )
+        }
+        "muxa_fleet_send_prompt" => {
+            let Some(host) = args.get("host").and_then(Value::as_str) else {
+                return Ok(error_result("fleet_send_prompt requires a `host` argument"));
+            };
+            let Some(pane) = args.get("pane").and_then(Value::as_str) else {
+                return Ok(error_result("fleet_send_prompt requires a `pane` argument"));
+            };
+            let Some(text) = args.get("text").and_then(Value::as_str) else {
+                return Ok(error_result("fleet_send_prompt requires a `text` argument"));
+            };
+            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
+            let target = match crate::fleet_cli::resolve_pane(client, host, pane).await {
+                Ok(target) => target,
+                Err(error) => {
+                    return Ok(error_result(&format!("fleet send prompt failed: {error}")));
+                }
+            };
+            Ok(
+                match client
+                    .fleet_execute(
+                        host,
+                        &muxa::FleetOperation::SendPrompt {
+                            pane: target,
+                            text: text.to_string(),
+                            submit,
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) => json_result(&json!({
+                        "host": host,
+                        "pane": pane,
+                        "send": result.send,
+                    })),
+                    Err(error) => error_result(&format!("fleet send prompt failed: {error}")),
+                },
+            )
         }
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
         "muxa_collaboration_guide" => {
@@ -2422,6 +2533,8 @@ mod tests {
         assert!(instructions.contains("Never invent a PR"));
         assert!(instructions.contains("execute=true"));
         assert!(instructions.contains("spawn_if_missing=true"));
+        assert!(instructions.contains("muxa_fleet_status"));
+        assert!(instructions.contains("observe-mode hosts"));
 
         let list = dispatch(
             &client,
@@ -2440,6 +2553,9 @@ mod tests {
                 "muxa_manage_tmux",
                 "muxa_send_prompt",
                 "muxa_capture_pane",
+                "muxa_fleet_status",
+                "muxa_fleet_capture",
+                "muxa_fleet_send_prompt",
                 "muxa_wait_for_change",
                 "muxa_collaboration_guide",
                 "muxa_room_context",

@@ -223,6 +223,47 @@ values of `0` disable that timeout. The same loop also runs the pid-liveness
 sweep that flips registered background tasks (see `muxa register`) to
 `stopped` once their process exits.
 
+## Fleet
+
+```toml
+[fleet]
+enabled = true
+refresh_secs = 15
+keepalive_secs = 10
+offline_after_secs = 30
+connect_timeout_secs = 10
+command_timeout_secs = 10
+max_parallel_connects = 6
+capture_policy = "selected" # selected | never
+
+[fleet.hosts.dev]
+ssh = "muxa-devbox"
+muxa_path = "muxa"
+enabled = true
+connect = "auto"            # auto | on_demand
+mode = "observe"            # observe | control
+# remote_socket = "/run/user/1000/muxa.sock"
+
+[fleet.hosts.dev.labels]
+environment = "development"
+region = "icn"
+
+[fleet.hosts.dev.annotations]
+"muxa.dev/owner" = "platform"
+```
+
+Fleet maintains one persistent OpenSSH stdio relay per enabled physical host.
+`offline_after_secs` must be at least twice `keepalive_secs`, and all timeout
+and concurrency values must be non-zero. `capture_policy = "never"` disables
+both pane and window capture at the manager even on control hosts.
+
+`ssh` is an OpenSSH destination/Host alias, not a place for flags. Put port,
+identity, ProxyJump, and host-key policy in `~/.ssh/config`. `muxa_path` and
+`remote_socket` are validated as fixed remote command tokens. Labels implement
+Kubernetes-style selectors; annotations allow descriptive values but use the
+same namespaced key syntax. Prefer `muxa host add/label/annotate` to edit the
+inventory atomically. See [FLEET.md](FLEET.md).
+
 ## Dashboard
 
 ```toml

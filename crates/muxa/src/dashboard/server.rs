@@ -42,6 +42,7 @@ use crate::backend::{HostKind, SharedBackend};
 use crate::config::{DashboardAuthMode, StatsConfig};
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
+use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
 use crate::metrics::Metrics;
 use crate::scope_filter::ScopeExclusions;
 use crate::session::{SessionBackend, SharedSessionBackend};
@@ -118,6 +119,9 @@ pub struct AppState {
     pub session_activity_path: Option<PathBuf>,
     /// ACTIVE estimate tuning shared with `muxa stats`.
     pub stats_config: StatsConfig,
+    /// Optional SSH fleet runtime. Fleet reads reuse muxad's per-host cache;
+    /// dashboard requests never launch their own SSH processes.
+    pub fleet: Option<FleetRuntime>,
     /// 1-second cache for the `agents_by_state` histogram. See the
     /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
     /// and the eventual plan to replace this with per-state atomics.
@@ -131,11 +135,12 @@ pub struct AppState {
     timeline_summary_cache: Arc<tokio::sync::Mutex<TimelineSummaryCache>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct DashboardRuntimeConfig {
     pub activity_path: Option<PathBuf>,
     pub session_activity_path: Option<PathBuf>,
     pub stats_config: StatsConfig,
+    pub fleet: Option<FleetRuntime>,
 }
 
 impl AppState {
@@ -158,6 +163,7 @@ impl AppState {
             activity_path: None,
             session_activity_path: None,
             stats_config: StatsConfig::default(),
+            fleet: None,
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
             activity_ledger_cache: Arc::new(tokio::sync::Mutex::new(
                 crate::activity::ActivityCache::default(),
@@ -182,6 +188,12 @@ impl AppState {
     #[must_use]
     pub fn with_stats_config(mut self, stats_config: StatsConfig) -> Self {
         self.stats_config = stats_config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: Option<FleetRuntime>) -> Self {
+        self.fleet = fleet;
         self
     }
 
@@ -305,6 +317,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/access", get(access_handler))
         .route("/api/agents", get(agents_handler))
+        .route("/api/fleet", get(fleet_handler))
         .route("/api/panes", get(panes_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
         .route(
@@ -321,6 +334,7 @@ pub fn router(state: AppState) -> Router {
     };
     let write_api = Router::new()
         .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
+        .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
         .route(
             "/api/terminal-sessions/{id}/input",
@@ -391,7 +405,8 @@ pub async fn serve(
     let state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
-        .with_stats_config(runtime.stats_config);
+        .with_stats_config(runtime.stats_config)
+        .with_fleet(runtime.fleet);
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
@@ -592,6 +607,59 @@ async fn agents_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(AgentsResponse {
         agents: state.store.snapshot().await,
     })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FleetQuery {
+    selector: Option<String>,
+}
+
+async fn fleet_handler(State(state): State<AppState>, Query(query): Query<FleetQuery>) -> Response {
+    let Some(fleet) = &state.fleet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "fleet manager is not enabled" })),
+        )
+            .into_response();
+    };
+    let selector = match query
+        .selector
+        .as_deref()
+        .map(str::parse::<LabelSelector>)
+        .transpose()
+    {
+        Ok(selector) => selector,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
+        }
+    };
+    Json(fleet.store.snapshot_selected(selector.as_ref()).await).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetCommandRequest {
+    operation: FleetOperation,
+}
+
+async fn fleet_command_handler(
+    State(state): State<AppState>,
+    Path(host): Path<String>,
+    Json(request): Json<FleetCommandRequest>,
+) -> Response {
+    let Some(fleet) = &state.fleet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "fleet manager is not enabled" })),
+        )
+            .into_response();
+    };
+    match fleet
+        .execute(host, request.operation, Duration::from_secs(20))
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1600,7 +1668,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use tower::ServiceExt;
 
@@ -1759,6 +1827,97 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["protocol"], i64::from(PROTOCOL_VERSION));
         assert!(v["version"].is_string());
+    }
+
+    fn fleet_host(alias: &str, environment: &str) -> crate::fleet::FleetHostSnapshot {
+        crate::fleet::FleetHostSnapshot {
+            alias: alias.into(),
+            ssh_target: alias.into(),
+            labels: BTreeMap::from([("environment".into(), environment.into())]),
+            annotations: BTreeMap::new(),
+            mode: crate::fleet::HostAccessMode::Observe,
+            state: crate::fleet::FleetHostState::Online,
+            node_id: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            muxa_version: None,
+            protocol: None,
+            capabilities: Vec::new(),
+            daemon_generation: None,
+            boot_id: None,
+            latency_ms: None,
+            last_seen_at: None,
+            received_at: None,
+            error: None,
+            remote: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_endpoint_reads_cache_and_applies_label_selector() {
+        let store = Arc::new(crate::fleet::FleetStore::new());
+        store.upsert_host(fleet_host("dev", "development")).await;
+        store.upsert_host(fleet_host("prod", "production")).await;
+        let (runtime, _commands) = FleetRuntime::new(store);
+        let app = router(fresh_state().with_fleet(Some(runtime)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet?selector=environment%3Dproduction")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["hosts"].as_array().unwrap().len(), 1);
+        assert_eq!(body["hosts"][0]["alias"], "prod");
+    }
+
+    #[tokio::test]
+    async fn fleet_command_endpoint_is_pat_gated_and_dispatches() {
+        let (runtime, mut commands) = FleetRuntime::new(Arc::new(crate::fleet::FleetStore::new()));
+        let app = router(state_with_token("secret").with_fleet(Some(runtime)));
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/dev/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"operation":{"kind":"refresh"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            assert_eq!(command.host, "dev");
+            assert!(matches!(command.operation, FleetOperation::Refresh));
+            command
+                .reply
+                .send(Ok(crate::fleet::FleetCommandResult::accepted("refreshed")))
+                .unwrap();
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/dev/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::from(r#"{"operation":{"kind":"refresh"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["message"], "refreshed");
+        responder.await.unwrap();
     }
 
     #[test]

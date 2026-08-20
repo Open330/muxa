@@ -511,7 +511,7 @@ pub fn socket_short_name(path: &str) -> String {
         .to_string()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SessionInfo {
     /// tmux's stable session id (e.g. `$3`). Prefer this over the mutable
     /// session name for persisted counters.

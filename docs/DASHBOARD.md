@@ -20,12 +20,14 @@ machine without explicit public-bind acknowledgement.
 | `GET /api/health`   | `{ ok, version, protocol }`                                                    |
 | `GET /api/access`   | Current read/control access mode and whether the supplied PAT can edit.        |
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
+| `GET /api/fleet?selector=...` | Cached physical-host hierarchy, optionally label-filtered.          |
 | `GET /api/panes`    | Global tmux pane list (every readable socket), with per-socket scan errors.   |
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
+| `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
 | `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
 | `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
 
@@ -33,6 +35,9 @@ machine without explicit public-bind acknowledgement.
 GET/SSE endpoints public but always requires the bearer token for POST control
 actions. `auth = "none"` leaves reads public and disables POST control entirely.
 Static routes are public in every mode — see "Why the HTML is public" below.
+Fleet routes exist only when `[fleet] enabled = true`; reads reuse the daemon's
+per-host cache and never create request-scoped SSH connections. See
+[FLEET.md](FLEET.md).
 
 ## Quick start
 

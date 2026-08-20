@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
+mod fleet_manager;
 mod herdr_bridge;
 mod screen_detect;
 mod synthetic;
@@ -161,6 +162,8 @@ async fn main() -> Result<()> {
     let collaboration = build_collaboration(&cfg).await;
     let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg).await;
+    let (fleet_runtime, fleet_handle) =
+        fleet_manager::start(&cfg.fleet, shutdown_tx.subscribe()).await;
 
     // The set of backends this daemon observes simultaneously — tmux + herdr
     // during a migration (see `docs/MULTI_HOST.md`). Resolution honors
@@ -308,6 +311,7 @@ async fn main() -> Result<()> {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
             stats_config: dashboard_stats_config,
+            fleet: fleet_runtime.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = muxa::dashboard::serve(
@@ -342,7 +346,7 @@ async fn main() -> Result<()> {
         .find(|b| b.kind() == muxa::HostKind::Zellij)
         .cloned()
         .unwrap_or_else(|| primary.clone());
-    let server = Server::new(socket.clone(), store)
+    let mut server = Server::new(socket.clone(), store)
         .with_backend(ipc_backend)
         // The full observed set, so control methods (`send_prompt`,
         // `capture`) resolve the backend per pane-id namespace. `backends`
@@ -354,6 +358,9 @@ async fn main() -> Result<()> {
         .with_collaboration_audit(collaboration_audit)
         .with_ask(ask)
         .with_restart_controller(Arc::clone(&restart));
+    if let Some(fleet) = fleet_runtime {
+        server = server.with_fleet(fleet);
+    }
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
     // Harden socket permissions once the listener exists. We poll briefly
@@ -405,6 +412,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;
     await_shutdown_task("collaboration waker", collaboration_waker_handle).await;
+    await_shutdown_task("fleet manager", fleet_handle).await;
 
     let _ = activity_transition_shutdown_tx.send(());
     await_shutdown_task("activity transition", activity_transition_handle).await;

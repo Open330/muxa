@@ -2310,6 +2310,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "wiremock",
 ]
 
@@ -2335,6 +2336,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "toml",
  "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
@@ -2363,6 +2365,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

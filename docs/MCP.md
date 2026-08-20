@@ -50,7 +50,7 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list eighteen tools). Other MCP
+or `codex mcp list` (the `muxa` server should list twenty-one tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
 At initialization muxa tells the agent how to use same-window peers as a
@@ -58,6 +58,23 @@ reviewer, focused question target, or delegated subagent. The agent can call
 `muxa_collaboration_guide` to retrieve that contract again at any time.
 The same instructions map conversational `@peer`, provider mentions, aliases,
 roles, and registered `/skills` to `muxa_call_peer`.
+
+### Physical-host Fleet tools
+
+When `[fleet] enabled = true`, the same MCP server can operate the cached
+host/session/window/pane hierarchy:
+
+```text
+muxa_fleet_status      { "selector": "environment=production" }
+muxa_fleet_capture     { "host": "dev", "pane": "%12" }
+muxa_fleet_send_prompt { "host": "dev", "pane": "%12",
+                         "text": "Summarize the result", "submit": true }
+```
+
+The host and pane are always explicit. Ambiguous pane ids are rejected, the
+relay verifies the complete identity again, and an observe-mode host rejects
+prompt delivery. Fleet calls use muxad's persistent SSH/cache control plane;
+the MCP subprocess never opens SSH itself. See [FLEET.md](FLEET.md).
 
 ## Implementation
 

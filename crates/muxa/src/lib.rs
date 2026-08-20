@@ -44,6 +44,7 @@ pub mod dashboard;
 pub mod discovery;
 pub mod error;
 pub mod event;
+pub mod fleet;
 pub mod history;
 pub mod ipc;
 pub mod metrics;
@@ -75,6 +76,11 @@ pub use config::Config;
 pub use error::CoreError as Error;
 pub use event::{
     AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, SurfaceKind, SurfaceRef,
+};
+pub use fleet::{
+    FleetCommandResult, FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime,
+    FleetSnapshot, FleetStore, GlobalPaneRef, HostAccessMode, LabelSelector, NodeId,
+    RemoteSnapshot,
 };
 pub use history::{HistoryEntry, PromptHistory};
 pub use process_tree::{WorkloadProcess, WorkloadProcessKind, WorkloadSummary};

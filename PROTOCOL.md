@@ -31,6 +31,14 @@ Post-1.0: the protocol is stable within a major version; breaking changes bump
 Each connection is full-duplex: a client may issue multiple
 request/response pairs over the same stream.
 
+Physical-host Fleet uses a second, versioned JSON-lines protocol over an
+OpenSSH stdio channel. It is intentionally not a network service. The remote
+`muxa relay --stdio` announces a stable node UUID and capabilities, then
+exchanges full snapshots, revisioned transitions/keepalives, exact capture or
+prompt requests, results, errors, and explicit resync markers. See
+[`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
+separately from this local IPC protocol.
+
 ## Request
 
 ```json
@@ -65,6 +73,30 @@ Response:
 
 ```json
 { "ok": true, "protocol": 1, "agents": [ <Agent>, ... ] }
+```
+
+#### `fleet_snapshot`
+
+Read muxad's per-physical-host cache. `selector` is an optional Kubernetes-
+style label selector. This operation never opens request-scoped SSH.
+
+```json
+{ "protocol": 4, "kind": "fleet_snapshot", "selector": "region=icn" }
+```
+
+#### `fleet_command`
+
+Dispatch one operation to an exact configured host. The manager rechecks the
+host's observe/control mode; the relay rechecks complete pane identity. Prompt
+mutations are not retried.
+
+```json
+{
+  "protocol": 4,
+  "kind": "fleet_command",
+  "host": "dev",
+  "operation": { "kind": "refresh" }
+}
 ```
 
 #### `by_pane`

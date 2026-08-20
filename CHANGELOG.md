@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Central SSH fleet management adds a physical host → session → window →
+  pane(agent) control plane.** `muxad` now maintains one isolated persistent
+  OpenSSH stdio relay and last-known cache per configured node, with stable
+  UUID identity, duplicate-node protection, bounded reconnect/concurrency,
+  keepalive health, revision-gap reconciliation, and explicit
+  observe/control authorization. `muxa host` manages inventory plus
+  Kubernetes-style labels/annotations and selectors; `muxa fleet` and
+  `muxa watch --fleet` provide status, focused hierarchy navigation, high
+  density inspectors, lazy pane/window capture with real tmux geometry,
+  exact prompt delivery, and separate-TTY remote attach. The same cache is
+  exposed through authenticated dashboard APIs and three explicit MCP tools.
+  The relay opens no TCP listener, forces SSH forwarding off, keeps prompt
+  bodies out of audit logs, bounds/sanitizes terminal data, and never retries
+  mutations. See [docs/FLEET.md](docs/FLEET.md).
+
 - **Agents can call a colleague naturally through Muxa MCP.** Connected Claude
   and Codex conversations now map `@peer`, provider/alias/role targets, and
   registered `/skills` to `muxa_call_peer`. The high-level tool expands the

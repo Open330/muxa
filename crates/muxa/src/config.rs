@@ -5,6 +5,7 @@
 
 use crate::collaboration::RequestKind;
 use crate::error::{CoreError, Result};
+use crate::fleet::{validate_label_key, validate_label_value, HostAccessMode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{AddrParseError, SocketAddr};
@@ -95,6 +96,9 @@ pub enum ConfigError {
          nor [sinks.webhook].endpoint_env is set (one of the two is required)"
     )]
     WebhookMissingEndpoint,
+
+    #[error("{path}: {message}")]
+    InvalidFleet { path: String, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -107,6 +111,8 @@ pub struct Config {
     pub notifier: NotifierConfig,
     pub watch: WatchConfig,
     pub dashboard: DashboardTomlConfig,
+    /// SSH-connected physical hosts aggregated by the local daemon.
+    pub fleet: FleetConfig,
     pub discovery: DiscoveryConfig,
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
@@ -121,6 +127,86 @@ pub struct Config {
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
     pub stats: StatsConfig,
+}
+
+/// Fleet-wide connection and refresh policy. Inventory keys are stable local
+/// aliases; the remote relay supplies the durable physical [`NodeId`](crate::fleet::NodeId).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FleetConfig {
+    pub enabled: bool,
+    pub refresh_secs: u64,
+    pub keepalive_secs: u64,
+    pub offline_after_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub command_timeout_secs: u64,
+    pub max_parallel_connects: usize,
+    pub capture_policy: FleetCapturePolicy,
+    pub hosts: BTreeMap<String, FleetHostConfig>,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            refresh_secs: 15,
+            keepalive_secs: 10,
+            offline_after_secs: 30,
+            connect_timeout_secs: 10,
+            command_timeout_secs: 10,
+            max_parallel_connects: 6,
+            capture_policy: FleetCapturePolicy::Selected,
+            hosts: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetCapturePolicy {
+    Never,
+    #[default]
+    Selected,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetConnectPolicy {
+    #[default]
+    Auto,
+    OnDemand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FleetHostConfig {
+    /// OpenSSH destination or Host alias. User/port/key/ProxyJump stay in
+    /// `~/.ssh/config` rather than being duplicated in muxa configuration.
+    pub ssh: String,
+    /// Remote binary invoked as a fixed command. Kept shell-token-safe because
+    /// OpenSSH ultimately passes a command string to the remote login shell.
+    pub muxa_path: String,
+    pub remote_socket: Option<PathBuf>,
+    pub enabled: bool,
+    pub connect: FleetConnectPolicy,
+    pub mode: HostAccessMode,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Default for FleetHostConfig {
+    fn default() -> Self {
+        Self {
+            ssh: String::new(),
+            muxa_path: "muxa".into(),
+            remote_socket: None,
+            enabled: true,
+            connect: FleetConnectPolicy::Auto,
+            mode: HostAccessMode::Observe,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+        }
+    }
 }
 
 /// `[message.skills]` config — reusable prompt templates for message
@@ -868,7 +954,7 @@ impl Config {
     /// home, and so the always-on / daemon-only split stays legible to
     /// callers.
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
-        Ok(())
+        validate_fleet(&self.fleet)
     }
 
     /// Run hard semantic checks that only matter when the daemon is
@@ -922,6 +1008,97 @@ impl Config {
             );
         }
     }
+}
+
+fn validate_fleet(cfg: &FleetConfig) -> std::result::Result<(), ConfigError> {
+    let invalid = |path: String, message: String| ConfigError::InvalidFleet { path, message };
+    if cfg.refresh_secs == 0 {
+        return Err(invalid(
+            "fleet.refresh_secs".into(),
+            "must be greater than zero".into(),
+        ));
+    }
+    if cfg.keepalive_secs == 0 {
+        return Err(invalid(
+            "fleet.keepalive_secs".into(),
+            "must be greater than zero".into(),
+        ));
+    }
+    if cfg.offline_after_secs < cfg.keepalive_secs.saturating_mul(2) {
+        return Err(invalid(
+            "fleet.offline_after_secs".into(),
+            "must allow at least two keepalive intervals".into(),
+        ));
+    }
+    if cfg.connect_timeout_secs == 0 || cfg.command_timeout_secs == 0 {
+        return Err(invalid(
+            "fleet".into(),
+            "connect_timeout_secs and command_timeout_secs must be greater than zero".into(),
+        ));
+    }
+    if cfg.max_parallel_connects == 0 || cfg.max_parallel_connects > 128 {
+        return Err(invalid(
+            "fleet.max_parallel_connects".into(),
+            "must be between 1 and 128".into(),
+        ));
+    }
+    for (alias, host) in &cfg.hosts {
+        validate_label_value(alias).map_err(|message| {
+            invalid(
+                format!("fleet.hosts.{alias}"),
+                format!("invalid host alias: {message}"),
+            )
+        })?;
+        if host.ssh.is_empty()
+            || host.ssh.starts_with('-')
+            || host
+                .ssh
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return Err(invalid(
+                format!("fleet.hosts.{alias}.ssh"),
+                "must be a non-empty OpenSSH destination without whitespace and must not start with '-'"
+                    .into(),
+            ));
+        }
+        if host.muxa_path.is_empty()
+            || !host
+                .muxa_path
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '+'))
+        {
+            return Err(invalid(
+                format!("fleet.hosts.{alias}.muxa_path"),
+                "must be a shell-token-safe binary name or path".into(),
+            ));
+        }
+        if let Some(socket) = &host.remote_socket {
+            let value = socket.to_string_lossy();
+            if value.is_empty()
+                || value.chars().any(|ch| {
+                    ch.is_control() || ch.is_whitespace() || "'\"`;|&<>$(){}[]".contains(ch)
+                })
+            {
+                return Err(invalid(
+                    format!("fleet.hosts.{alias}.remote_socket"),
+                    "must be a shell-token-safe remote path without whitespace".into(),
+                ));
+            }
+        }
+        for (key, value) in &host.labels {
+            validate_label_key(key)
+                .map_err(|message| invalid(format!("fleet.hosts.{alias}.labels.{key}"), message))?;
+            validate_label_value(value)
+                .map_err(|message| invalid(format!("fleet.hosts.{alias}.labels.{key}"), message))?;
+        }
+        for key in host.annotations.keys() {
+            validate_label_key(key).map_err(|message| {
+                invalid(format!("fleet.hosts.{alias}.annotations.{key}"), message)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_dashboard(cfg: &DashboardTomlConfig) -> std::result::Result<(), ConfigError> {
@@ -2330,5 +2507,73 @@ template = "{nope} {last_prompt}"
     fn unknown_detail_placeholders_flags_each_unknown_alternative() {
         let unknown = unknown_detail_placeholders("{nope|also_nope|last_prompt}");
         assert_eq!(unknown, vec!["nope".to_string(), "also_nope".to_string()]);
+    }
+
+    #[test]
+    fn parses_fleet_inventory_labels_annotations_and_policy() {
+        let input = r#"
+[fleet]
+enabled = true
+refresh_secs = 12
+keepalive_secs = 5
+offline_after_secs = 15
+
+[fleet.hosts.dev]
+ssh = "devbox"
+mode = "control"
+connect = "on_demand"
+
+[fleet.hosts.dev.labels]
+"muxa.dev/environment" = "development"
+accelerator = "gpu"
+
+[fleet.hosts.dev.annotations]
+"muxa.dev/owner" = "June <june@example.com>"
+"#;
+        let cfg: Config = toml::from_str(input).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.fleet.enabled);
+        assert_eq!(cfg.fleet.hosts["dev"].mode, HostAccessMode::Control);
+        assert_eq!(cfg.fleet.hosts["dev"].connect, FleetConnectPolicy::OnDemand);
+        assert_eq!(cfg.fleet.hosts["dev"].labels["accelerator"], "gpu");
+        assert_eq!(
+            cfg.fleet.hosts["dev"].annotations["muxa.dev/owner"],
+            "June <june@example.com>"
+        );
+    }
+
+    #[test]
+    fn fleet_validation_rejects_unsafe_ssh_and_remote_shell_tokens() {
+        let mut cfg = Config::default();
+        cfg.fleet.hosts.insert(
+            "dev".into(),
+            FleetHostConfig {
+                ssh: "-oProxyCommand=bad".into(),
+                ..FleetHostConfig::default()
+            },
+        );
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFleet { .. })
+        ));
+        cfg.fleet.hosts.get_mut("dev").unwrap().ssh = "devbox".into();
+        cfg.fleet.hosts.get_mut("dev").unwrap().muxa_path = "muxa;bad".into();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFleet { .. })
+        ));
+    }
+
+    #[test]
+    fn fleet_validation_requires_two_keepalive_windows_before_offline() {
+        let mut cfg = Config::default();
+        cfg.fleet.keepalive_secs = 10;
+        cfg.fleet.offline_after_secs = 19;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFleet { .. })
+        ));
+        cfg.fleet.offline_after_secs = 20;
+        assert!(cfg.validate().is_ok());
     }
 }
