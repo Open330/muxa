@@ -1,4 +1,4 @@
-import { buildWorkProjection, normalizeAgent } from "./work-model.mjs";
+import { buildWorkProjection, normalizeAgent, WORK_STAGES } from "./work-model.mjs";
 
 // muxa dashboard frontend.
 //
@@ -33,6 +33,7 @@ const EXPANDED_WORKS_KEY = "muxa.dashboard.expandedWorks";
 const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
 const PANES_REFETCH_INTERVAL_MS = 5000;
+const WORK_METADATA_REFETCH_INTERVAL_MS = 15000;
 const TERMINALS_REFETCH_INTERVAL_MS = 2000;
 const TIMELINE_REFETCH_INTERVAL_MS = 30000;
 const TIMELINE_MIN_REFRESH_INTERVAL_MS = 10000;
@@ -42,7 +43,7 @@ const SESSION_PAGE_SIZE = 40;
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
 const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
 const TIMELINE_RANGES = ["24h", "today", "last week", "month", "last month", "7d", "30d", "12w"];
-const SESSION_SORTS = new Set(["priority", "latest", "name", "active", "human", "tmux"]);
+const SESSION_SORTS = new Set(["priority", "latest", "name"]);
 
 // ── Token bootstrap ────────────────────────────────────────────────
 
@@ -212,12 +213,12 @@ const dom = {
   workItemsMeta: document.getElementById("work-items-meta"),
   workItemsContent: document.getElementById("work-items-content"),
   toggleWorkExecution: document.getElementById("toggle-work-execution"),
-  metricWorking: document.getElementById("metric-working"),
-  metricWaiting: document.getElementById("metric-waiting"),
-  metricErrors: document.getElementById("metric-errors"),
-  metricActive: document.getElementById("metric-active"),
-  metricHuman: document.getElementById("metric-human"),
-  metricTmux: document.getElementById("metric-tmux"),
+  metricAttention: document.getElementById("metric-attention"),
+  metricProgress: document.getElementById("metric-progress"),
+  metricReview: document.getElementById("metric-review"),
+  metricQueued: document.getElementById("metric-queued"),
+  metricDone: document.getElementById("metric-done"),
+  metricParticipants: document.getElementById("metric-participants"),
   agentsBody: document.getElementById("agents-tbody"),
   panesBody: document.getElementById("panes-tbody"),
   terminalsBody: document.getElementById("terminals-tbody"),
@@ -240,6 +241,9 @@ const dom = {
   terminalsTab: document.getElementById("terminals-tab"),
   inspectorBody: document.getElementById("inspector-body"),
   inspectorMeta: document.getElementById("inspector-meta"),
+  workDrawer: document.getElementById("work-drawer"),
+  closeWorkDrawer: document.getElementById("close-work-drawer"),
+  drawerBackdrop: document.getElementById("drawer-backdrop"),
   toast: document.getElementById("toast"),
 };
 
@@ -278,6 +282,7 @@ function renderAccess() {
   if (store.panes.length > 0) renderPanes();
   if (store.terminalSessions.length > 0) renderTerminals();
   renderWorkItems();
+  renderInspector();
 }
 
 async function fetchAccess() {
@@ -366,6 +371,7 @@ const store = {
   },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
+  workMetadata: [], // WorkRecord[]
   terminalSessions: [], // SessionRef[]
   paneErrors: [], // ScanError[]
   timeline: null, // TimelineDocument
@@ -376,9 +382,10 @@ const store = {
     panesById: new Map(),
     timelineSessionByAgent: new Map(),
   },
-  revisions: { agents: 0, panes: 0, timeline: 0 },
+  revisions: { agents: 0, panes: 0, timeline: 0, workMetadata: 0 },
   cache: {
     paneFingerprint: "",
+    workMetadataFingerprint: "",
     terminalFingerprint: "",
     sessionSummariesKey: "",
     sessionSummaries: [],
@@ -442,10 +449,14 @@ function rebuildTimelineIndexes() {
 }
 
 function workspaces() {
-  const cacheKey = `${store.revisions.agents}:${store.revisions.panes}`;
+  const cacheKey = `${store.revisions.agents}:${store.revisions.panes}:${store.revisions.workMetadata}`;
   if (store.cache.workProjectionKey === cacheKey) return store.cache.workspaces;
   store.cache.workProjectionKey = cacheKey;
-  store.cache.workspaces = buildWorkProjection(store.panes, [...store.agents.values()]);
+  store.cache.workspaces = buildWorkProjection(
+    store.panes,
+    [...store.agents.values()],
+    store.workMetadata
+  );
   return store.cache.workspaces;
 }
 
@@ -457,10 +468,7 @@ function selectedWorkspace() {
 function visibleWorks() {
   const selected = selectedWorkspace();
   if (selected) return selected.works;
-  const session = selectedSession();
-  return workspaces()
-    .filter((workspace) => !session || workspace.name === session)
-    .flatMap((workspace) => workspace.works);
+  return workspaces().flatMap((workspace) => workspace.works);
 }
 
 function selectedWork() {
@@ -524,9 +532,6 @@ function setSelectedSession(session) {
   const next = session || "";
   if (store.filters.timelineSession === next && store.timeline) return;
   store.filters.timelineSession = next;
-  const matchingWorkspaces = workspaces().filter((workspace) => workspace.name === next);
-  store.ui.selectedWorkspaceKey = matchingWorkspaces.length === 1 ? matchingWorkspaces[0].key : "";
-  store.ui.selectedWorkKey = "";
   store.ui.selectedSegment = null;
   store.ui.terminalCapture = null;
   store.indexes.timelineSessionByAgent.clear();
@@ -540,16 +545,13 @@ function setSelectedSession(session) {
   fetchTimeline({ force: true }).catch(() => {});
 }
 
-function setSelectedWorkspace(workspaceKey, session) {
+function setSelectedWorkspace(workspaceKey) {
   store.ui.selectedWorkspaceKey = workspaceKey || "";
   store.ui.selectedWorkKey = "";
-  setSelectedSession(session || "");
-  // setSelectedSession resolves name-only selections for timeline consumers;
-  // restore the exact endpoint-aware key supplied by the workspace rail.
-  store.ui.selectedWorkspaceKey = workspaceKey || "";
+  closeWorkDrawer();
   renderSessionSidebar();
+  renderOverview();
   renderWorkItems();
-  renderInspector();
 }
 
 // Copy text to clipboard. Uses the async Clipboard API when available
@@ -602,58 +604,75 @@ function renderCounts() {
 
 function renderOverview() {
   const works = visibleWorks();
-  const active = works.filter((work) => work.working > 0).length;
-  const attention = works.filter((work) => work.attention > 0).length;
-  const errors = works.filter((work) => work.errors > 0).length;
-  const lanes = store.timeline?.lanes || [];
-  const totals = store.timeline?.totals || {};
-  dom.metricWorking.textContent = String(active);
-  dom.metricWaiting.textContent = String(attention);
-  dom.metricErrors.textContent = String(errors);
-  dom.metricActive.textContent = formatDuration(totals.active_secs || 0);
-  dom.metricHuman.textContent = formatDuration(
-    store.timeline?.summary?.human_presence_secs ?? humanPresenceSecs(lanes)
+  dom.metricAttention.textContent = String(works.filter((work) => work.stage === "attention").length);
+  dom.metricProgress.textContent = String(works.filter((work) => work.stage === "in_progress").length);
+  dom.metricReview.textContent = String(works.filter((work) => work.stage === "review").length);
+  dom.metricQueued.textContent = String(works.filter((work) => work.stage === "queued").length);
+  dom.metricDone.textContent = String(works.filter((work) => work.stage === "done").length);
+  dom.metricParticipants.textContent = String(
+    works.reduce((total, work) => total + work.participants.length, 0)
   );
-  dom.metricTmux.textContent = formatDuration(totals.foreground_secs || 0);
 }
 
 function renderSessionSidebar() {
-  const summaries = buildSessionSummaries();
-  const visible = summaries.slice(0, store.ui.sessionLimit);
-  const active = selectedSession();
-  if (active && !visible.some((summary) => summary.label === active)) {
-    const selected = summaries.find((summary) => summary.label === active);
+  const sorted = [...workspaces()].sort(compareWorkspaceRows);
+  const visible = sorted.slice(0, store.ui.sessionLimit);
+  const active = store.ui.selectedWorkspaceKey;
+  if (active && !visible.some((workspace) => workspace.key === active)) {
+    const selected = sorted.find((workspace) => workspace.key === active);
     if (selected) visible.push(selected);
   }
-  dom.sessionsMeta.textContent = `${Math.min(store.ui.sessionLimit, summaries.length)}/${summaries.length}`;
+  dom.sessionsMeta.textContent = `${Math.min(store.ui.sessionLimit, sorted.length)}/${sorted.length}`;
   if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
-  const allWorks = workspaces().flatMap((workspace) => workspace.works);
-  const allWaiting = allWorks.filter((work) => work.attention > 0).length;
-  const allActive = active === "";
-  const allRow = `<button class="session-row${allActive ? " active" : ""}" type="button" data-workspace="" data-session="">
-    <span class="session-dot ${allWaiting > 0 ? "waiting" : "working"}"></span>
+  const allWorks = sorted.flatMap((workspace) => workspace.works);
+  const allAttention = allWorks.filter((work) => work.stage === "attention").length;
+  const allRow = `<button class="session-row${active ? "" : " active"}" type="button" data-workspace="">
+    <span class="session-dot ${allAttention > 0 ? "waiting" : "working"}"></span>
     <span class="session-main">
       <span class="session-name">all workspaces</span>
       <span class="session-detail">${allWorks.length} tickets · ${store.agents.size} agents</span>
     </span>
-    <span class="session-score">${allWaiting}</span>
+    <span class="session-score">${allAttention || "·"}</span>
   </button>`;
-  const rows = visible.map((s) => {
-    const stateClass = s.errorTickets > 0 ? "error" : s.attentionTickets > 0 ? "waiting" : s.activeTickets > 0 ? "working" : "idle";
-    return `<button class="session-row${s.label === active ? " active" : ""}" type="button" data-workspace="${esc(s.workspaceKey || "")}" data-session="${esc(s.label)}">
+  const rows = visible.map((workspace) => {
+    const stateClass = workspace.errors > 0 ? "error" : workspace.attention > 0 ? "waiting" : workspace.active > 0 ? "working" : "idle";
+    const source = workspace.source === "managed" ? "managed" : workspace.source === "inferred" ? "repo" : "session";
+    return `<button class="session-row${workspace.key === active ? " active" : ""}" type="button" data-workspace="${esc(workspace.key)}">
       <span class="session-dot ${stateClass}"></span>
       <span class="session-main">
-        <span class="session-name">${esc(s.label)}</span>
-        <span class="session-detail">${esc(sessionSummaryLine(s))}</span>
+        <span class="session-name">${esc(workspace.name)}</span>
+        <span class="session-detail">${workspace.works.length} tickets · ${workspace.agents} agents · ${source}</span>
       </span>
-      <span class="session-score">${esc(sessionScoreLabel(s, store.ui.sessionSort))}</span>
+      <span class="session-score">${esc(workspaceScoreLabel(workspace))}</span>
     </button>`;
   }).join("");
-  const remaining = Math.max(0, summaries.length - store.ui.sessionLimit);
+  const remaining = Math.max(0, sorted.length - store.ui.sessionLimit);
   const loadMore = remaining > 0
     ? `<button class="session-load-more" type="button" data-load-more-sessions>show ${Math.min(SESSION_PAGE_SIZE, remaining)} more · ${remaining} hidden</button>`
     : "";
   dom.sessionList.innerHTML = allRow + rows + loadMore;
+}
+
+function compareWorkspaceRows(left, right) {
+  if (store.ui.sessionSort === "name") return left.name.localeCompare(right.name);
+  if (store.ui.sessionSort === "latest") {
+    return (right.latest || "").localeCompare(left.latest || "") || left.name.localeCompare(right.name);
+  }
+  return right.errors - left.errors ||
+    right.attention - left.attention ||
+    right.active - left.active ||
+    right.review - left.review ||
+    (right.latest || "").localeCompare(left.latest || "") ||
+    left.name.localeCompare(right.name);
+}
+
+function workspaceScoreLabel(workspace) {
+  if (store.ui.sessionSort === "latest") return relTime(workspace.latest);
+  if (workspace.errors > 0) return String(workspace.errors);
+  if (workspace.attention > 0) return String(workspace.attention);
+  if (workspace.active > 0) return String(workspace.active);
+  if (workspace.review > 0) return String(workspace.review);
+  return "·";
 }
 
 function buildSessionSummaries() {
@@ -823,14 +842,26 @@ function workStateLabel(work) {
   }
 }
 
+function workStageLabel(stage) {
+  switch (stage) {
+    case "attention": return "Attention";
+    case "in_progress": return "In progress";
+    case "review": return "Review";
+    case "done": return "Recently done";
+    default: return "Queued";
+  }
+}
+
 function workSummary(work) {
   return String(work.summary || "No recent work summary").split("\n")[0].slice(0, 180);
 }
 
-function renderWorkParticipant(agent) {
-  return `<span class="participant-pill ${esc(agent.state)}" title="${esc(agent.model || agent.kind)}">
+function renderWorkParticipant(agent, metadata = {}) {
+  const label = metadata.role || metadata.agent || agent.kind;
+  const title = [agent.kind, agent.model, metadata.task].filter(Boolean).join(" · ");
+  return `<span class="participant-pill ${esc(agent.state)}" title="${esc(title)}">
     <span class="state-dot ${esc(agent.state)}"></span>
-    <span>${esc(agent.kind)}</span>
+    <span>${esc(label)}</span>
     <small>${esc(agent.state.replaceAll("_", " "))}</small>
   </span>`;
 }
@@ -839,7 +870,7 @@ function renderWorkExecution(work) {
   const panes = work.panes.map((pane) => {
     const agent = pane.agent;
     const state = agent?.state || "untracked";
-    const identity = `${work.workspaceName}:${work.index}.${pane.pane_index}`;
+    const identity = `${work.sessionName}:${work.index}.${pane.pane_index}`;
     const attach = pane.attach_command
       ? `<button class="attach-btn" type="button" data-cmd="${esc(pane.attach_command)}">copy attach</button>`
       : "";
@@ -854,7 +885,8 @@ function renderWorkExecution(work) {
 
   return `<div class="work-execution">
     <div class="execution-breadcrumb">
-      <span>session</span> ${esc(work.workspaceName)}
+      <span>workspace</span> ${esc(work.workspaceName)}
+      <b>›</b><span>session</span> ${esc(work.sessionName)}
       <b>›</b><span>window</span> ${esc(work.index)} · ${esc(work.name)}
       <small>${esc(work.host)} · ${esc(work.endpoint)}</small>
     </div>
@@ -866,8 +898,8 @@ function renderWorkItems() {
   if (!dom.workItemsContent) return;
   const works = visibleWorks();
   const selected = store.ui.selectedWorkKey;
-  const attention = works.filter((work) => work.attention > 0).length;
-  const scope = selectedWorkspace()?.name || selectedSession() || "all workspaces";
+  const attention = works.filter((work) => work.stage === "attention").length;
+  const scope = selectedWorkspace()?.name || "all workspaces";
   dom.workItemsMeta.textContent = `${scope} · ${works.length} tickets${attention ? ` · ${attention} attention` : ""}`;
 
   if (works.length === 0) {
@@ -879,39 +911,48 @@ function renderWorkItems() {
     return;
   }
 
-  dom.workItemsContent.innerHTML = works.map((work) => {
-    const expanded = store.ui.expandedWorks.has(work.key);
-    const participants = work.participants.length
-      ? work.participants.map(renderWorkParticipant).join("")
-      : `<span class="participant-empty">no tracked agent</span>`;
-    const stateClass = work.state === "needs_attention" ? "waiting" : work.state;
-    return `<article class="work-card state-${esc(stateClass)}${selected === work.key ? " selected" : ""}">
-      <div class="work-card-head">
-        <button class="work-card-select" type="button" data-select-work="${esc(work.key)}">
-          <span class="work-identity">
-            <strong>${esc(work.name)}</strong>
-            <small>${esc(work.workspaceName)} · window ${esc(work.index)}</small>
-          </span>
-          <span class="work-state ${esc(stateClass)}">${esc(workStateLabel(work))}</span>
-        </button>
-        <button class="work-expand" type="button" data-toggle-work="${esc(work.key)}" aria-expanded="${expanded ? "true" : "false"}">
-          <span aria-hidden="true">${expanded ? "⌄" : "›"}</span>
-          ${work.panes.length} pane${work.panes.length === 1 ? "" : "s"}
-        </button>
-      </div>
-      <button class="work-card-body" type="button" data-select-work="${esc(work.key)}">
-        <span class="work-summary">${esc(workSummary(work))}</span>
-        <span class="work-facts">
-          <span>${work.participants.length} agents</span>
-          ${work.working ? `<span>${work.working} working</span>` : ""}
-          ${work.waiting ? `<span class="attention-text">${work.waiting} waiting</span>` : ""}
-          ${work.errors ? `<span class="error-text">${work.errors} error</span>` : ""}
-          <span>${esc(relTime(work.latest))}</span>
+  const columns = ["attention", "in_progress", "review", "queued", "done"];
+  dom.workItemsContent.innerHTML = columns.map((stage) => {
+    const staged = works.filter((work) => work.stage === stage);
+    const cards = staged.map((work) => {
+      const expanded = store.ui.expandedWorks.has(work.key);
+      const participants = work.participants.length
+        ? work.panes.filter((pane) => pane.agent)
+          .map((pane) => renderWorkParticipant(pane.agent, pane.muxa || {})).join("")
+        : `<span class="participant-empty">no tracked agent</span>`;
+      const stateClass = work.state === "needs_attention" ? "waiting" : work.state;
+      const managed = work.managed ? `<span class="managed-badge">managed</span>` : "";
+      const next = work.nextAction
+        ? `<span class="ticket-next"><b>next</b>${esc(work.nextAction)}</span>`
+        : "";
+      return `<article class="work-card board-ticket state-${esc(stateClass)}${selected === work.key ? " selected" : ""}">
+      <button class="work-card-select" type="button" data-select-work="${esc(work.key)}">
+        <span class="ticket-kicker">
+          <span>${esc(work.ticketId)}</span>${managed}
+          <small>${esc(work.workspaceName)}</small>
         </span>
+        <strong class="ticket-title">${esc(work.title)}</strong>
+        <span class="work-summary">${esc(work.goal || workSummary(work))}</span>
+        ${next}
         <span class="participant-list">${participants}</span>
       </button>
+      <div class="ticket-footer">
+        <span>${work.participants.length} agents · ${esc(relTime(work.latest))}</span>
+        <button class="work-expand" type="button" data-toggle-work="${esc(work.key)}" aria-expanded="${expanded ? "true" : "false"}">
+          <span aria-hidden="true">${expanded ? "⌄" : "›"}</span>
+          execution
+        </button>
+      </div>
       ${expanded ? renderWorkExecution(work) : ""}
     </article>`;
+    }).join("");
+    return `<section class="work-lane stage-${stage}">
+      <div class="work-lane-header">
+        <span>${workStageLabel(stage)}</span>
+        <strong>${staged.length}</strong>
+      </div>
+      <div class="work-lane-list">${cards || `<div class="lane-empty">No work</div>`}</div>
+    </section>`;
   }).join("");
 
   const allExpanded = works.every((work) => store.ui.expandedWorks.has(work.key));
@@ -924,6 +965,7 @@ function setSelectedWork(workKey) {
   store.ui.terminalCapture = null;
   renderWorkItems();
   renderInspector();
+  openWorkDrawer();
 }
 
 function toggleWorkExecution(workKey) {
@@ -1768,6 +1810,72 @@ async function runPaneControl(button) {
   }
 }
 
+function sameWorkIdentity(left, right) {
+  return left?.host === right?.host &&
+    left?.socket === right?.socket &&
+    left?.session_id === right?.session_id &&
+    left?.window_id === right?.window_id;
+}
+
+function acceptWorkRecord(record) {
+  const index = store.workMetadata.findIndex((candidate) =>
+    sameWorkIdentity(candidate.key, record.key)
+  );
+  if (index === -1) store.workMetadata.push(record);
+  else store.workMetadata[index] = record;
+  store.revisions.workMetadata += 1;
+  renderOverview();
+  renderSessionSidebar();
+  renderWorkItems();
+  renderInspector();
+}
+
+async function saveWorkMetadata(form) {
+  const work = selectedWork();
+  if (!work) throw new Error("selected work item is no longer present");
+  const data = new FormData(form);
+  const payload = await controlFetch("/api/work-metadata", {
+    method: "PUT",
+    body: JSON.stringify({
+      key: work.identity,
+      metadata: {
+        title: data.get("title") || null,
+        stage: data.get("stage") || "auto",
+        goal: data.get("goal") || null,
+        next_action: data.get("next_action") || null,
+      },
+    }),
+  });
+  acceptWorkRecord(payload.work);
+  showToast(`saved ${work.ticketId}`);
+}
+
+async function runWorkAction(action) {
+  const work = selectedWork();
+  if (!work) throw new Error("selected work item is no longer present");
+  if (action === "abort") {
+    if (!window.confirm(`Abort every live agent in ${work.ticketId}?`)) return;
+    const result = await controlFetch("/api/work-control/abort", {
+      method: "POST",
+      body: JSON.stringify({ key: work.identity }),
+    });
+    showToast(`aborted ${result.succeeded}/${result.attempted} agents`);
+    return;
+  }
+
+  const textarea = document.getElementById("work-batch-prompt");
+  const text = action === "status"
+    ? "Report current progress, blockers, evidence, and the next concrete action in one concise update."
+    : textarea?.value.trim();
+  if (!text) throw new Error("enter a ticket instruction first");
+  const result = await controlFetch("/api/work-control/prompt", {
+    method: "POST",
+    body: JSON.stringify({ key: work.identity, text, submit: true }),
+  });
+  if (textarea && action === "prompt") textarea.value = "";
+  showToast(`prompted ${result.succeeded}/${result.attempted} agents`);
+}
+
 async function runTerminalControl(button) {
   const action = button.getAttribute("data-terminal-action");
   const id = button.getAttribute("data-session");
@@ -1925,7 +2033,12 @@ function initDataTabs() {
 }
 
 function initSessionControls() {
-  dom.showAllSessions.addEventListener("click", () => setSelectedSession(""));
+  dom.showAllSessions.addEventListener("click", () => setSelectedWorkspace(""));
+  dom.closeWorkDrawer.addEventListener("click", closeWorkDrawer);
+  dom.drawerBackdrop.addEventListener("click", closeWorkDrawer);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !dom.workDrawer.hidden) closeWorkDrawer();
+  });
   dom.sessionSort?.addEventListener("change", () => {
     store.ui.sessionSort = normalizeSessionSort(dom.sessionSort.value);
     store.ui.sessionLimit = SESSION_PAGE_SIZE;
@@ -1952,13 +2065,8 @@ function initDynamicEventDelegation() {
       renderSessionSidebar();
       return;
     }
-    const row = event.target.closest("[data-session]");
-    if (row) {
-      setSelectedWorkspace(
-        row.getAttribute("data-workspace") || "",
-        row.getAttribute("data-session") || ""
-      );
-    }
+    const row = event.target.closest("[data-workspace]");
+    if (row) setSelectedWorkspace(row.getAttribute("data-workspace") || "");
   });
 
   dom.workItemsContent.addEventListener("click", async (event) => {
@@ -2053,6 +2161,12 @@ function initDynamicEventDelegation() {
   });
 
   dom.inspectorBody.addEventListener("click", async (event) => {
+    const workAction = event.target.closest("[data-work-action]");
+    if (workAction) {
+      await runWorkAction(workAction.getAttribute("data-work-action") || "")
+        .catch((error) => showToast(error.message));
+      return;
+    }
     const control = event.target.closest("[data-pane-action]");
     if (control) {
       await runPaneControl(control).catch((error) => showToast(error.message));
@@ -2062,6 +2176,13 @@ function initDynamicEventDelegation() {
     if (!copy) return;
     const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
     showToast(ok ? "copied attach command" : "clipboard blocked — copy manually");
+  });
+
+  dom.inspectorBody.addEventListener("submit", async (event) => {
+    const form = event.target.closest("[data-work-metadata-form]");
+    if (!form) return;
+    event.preventDefault();
+    await saveWorkMetadata(form).catch((error) => showToast(error.message));
   });
 }
 
@@ -2097,95 +2218,93 @@ function setPanelCollapsed(panel, btn, collapsed) {
   if (icon) icon.textContent = collapsed ? "›" : "⌄";
 }
 
+function openWorkDrawer() {
+  dom.workDrawer.hidden = false;
+  dom.drawerBackdrop.hidden = false;
+  document.body.classList.add("drawer-open");
+}
+
+function closeWorkDrawer() {
+  store.ui.selectedWorkKey = "";
+  store.ui.selectedSegment = null;
+  store.ui.terminalCapture = null;
+  dom.workDrawer.hidden = true;
+  dom.drawerBackdrop.hidden = true;
+  document.body.classList.remove("drawer-open");
+  renderWorkItems();
+}
+
 function renderInspector() {
   if (store.ui.terminalCapture) {
     renderTerminalCapture(store.ui.terminalCapture);
+    openWorkDrawer();
     return;
   }
   if (store.ui.selectedSegment) {
     renderSegmentInspector(store.ui.selectedSegment);
+    openWorkDrawer();
     return;
   }
   const work = selectedWork();
   if (work) {
     renderWorkInspector(work);
+    openWorkDrawer();
     return;
   }
-
-  const session = selectedSession();
-  const summaries = buildSessionSummaries();
-  const summary = session ? summaries.find((s) => s.label === session) : null;
-  const agents = [...store.agents.values()]
-    .filter(agentMatchesSelectedSession)
-    .sort((a, b) => (b.last_activity_at || "").localeCompare(a.last_activity_at || ""));
-  const panes = store.panes.filter(paneMatchesSelectedSession);
-
-  dom.inspectorMeta.textContent = session || "overview";
-  const title = session || "all workspaces";
-  const activeSummary = summary || {
-    working: agents.filter((a) => a.state === "working").length,
-    waiting: agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length,
-    errors: agents.filter((a) => a.state === "error").length,
-    agents: agents.length,
-    panes: panes.length,
-    totals: store.timeline?.totals || emptyTimelineTotals(),
-    human_presence_secs: store.timeline?.summary?.human_presence_secs ?? humanPresenceSecs(store.timeline?.lanes || []),
-  };
-  const humanSecs = activeSummary.human_presence_secs ??
-    store.timeline?.summary?.human_presence_secs ??
-    humanPresenceSecs(store.timeline?.lanes || []);
-
-  dom.inspectorBody.innerHTML = `
-    <div class="inspector-title">
-      <span>${esc(title)}</span>
-      <small>${esc(sessionSummaryLine(activeSummary))}</small>
-    </div>
-    <div class="inspector-grid">
-      ${inspectorMetric("work", activeSummary.working)}
-      ${inspectorMetric("wait", activeSummary.waiting)}
-      ${inspectorMetric("err", activeSummary.errors)}
-      ${inspectorMetric("act", formatDuration(activeSummary.totals.active_secs || 0))}
-      ${inspectorMetric("human", formatDuration(humanSecs))}
-      ${inspectorMetric("tmux", formatDuration(activeSummary.totals.foreground_secs || 0))}
-      ${inspectorMetric("panes", panes.length)}
-    </div>
-    <div class="inspector-section">
-      <h3>Agents</h3>
-      ${renderInspectorAgents(agents.slice(0, 8))}
-    </div>
-    <div class="inspector-section">
-      <h3>Panes</h3>
-      ${renderInspectorPanes(panes.slice(0, 8))}
-    </div>`;
+  dom.workDrawer.hidden = true;
+  dom.drawerBackdrop.hidden = true;
+  document.body.classList.remove("drawer-open");
 }
 
 function renderWorkInspector(work) {
-  dom.inspectorMeta.textContent = "ticket";
+  dom.inspectorMeta.textContent = `${workStageLabel(work.stage)} · ${work.participants.length} agents`;
   const participants = work.participants.length
-    ? work.participants.map((agent) => `<div class="mini-row participant-row">
-        <span class="state-dot ${esc(agent.state)}"></span>
-        <span>${esc(agent.kind)} · ${esc(agent.model || "default model")}</span>
-        <small>${esc(agent.state.replaceAll("_", " "))}</small>
-      </div>`).join("")
+    ? work.panes.filter((pane) => pane.agent).map((pane) => {
+      const metadata = pane.muxa || {};
+      const identity = metadata.role || metadata.agent || pane.agent.kind;
+      const task = metadata.task || pane.agent.ai_title || pane.agent.last_prompt || "No assigned task";
+      return `<div class="drawer-participant">
+        <span class="state-dot ${esc(pane.agent.state)}"></span>
+        <span><b>${esc(identity)}</b><small>${esc(task)}</small></span>
+        <em>${esc(pane.agent.state.replaceAll("_", " "))}</em>
+      </div>`;
+    }).join("")
     : `<div class="empty-block compact">no tracked agents</div>`;
+  const manualStage = work.metadata?.stage || "auto";
+  const stageOptions = WORK_STAGES.map((stage) =>
+    `<option value="${stage}"${stage === manualStage ? " selected" : ""}>${stage.replaceAll("_", " ")}</option>`
+  ).join("");
+  const disabled = store.access.writeAuthorized ? "" : " disabled";
   dom.inspectorBody.innerHTML = `
-    <div class="inspector-title">
-      <span>${esc(work.name)}</span>
-      <small>${esc(work.workspaceName)} · ${esc(workStateLabel(work))}</small>
+    <div class="drawer-work-heading">
+      <span class="drawer-ticket-id">${esc(work.ticketId)}</span>
+      <h2>${esc(work.title)}</h2>
+      <p>${esc(work.workspaceName)} · ${esc(workStateLabel(work))} · ${esc(work.source)}</p>
     </div>
-    <div class="inspector-grid">
-      ${inspectorMetric("agents", work.participants.length)}
-      ${inspectorMetric("panes", work.panes.length)}
-      ${inspectorMetric("working", work.working)}
-      ${inspectorMetric("attention", work.attention)}
-      ${inspectorMetric("errors", work.errors)}
-      ${inspectorMetric("activity", relTime(work.latest))}
+    <div class="drawer-signal">
+      <span>Latest work signal</span>
+      <p>${esc(workSummary(work))}</p>
+      <small>${esc(relTime(work.latest))}</small>
     </div>
-    <div class="inspector-section">
-      <h3>Latest work signal</h3>
-      <p class="inspector-summary">${esc(workSummary(work))}</p>
+    <form class="work-metadata-form" data-work-metadata-form>
+      <h3>Work definition</h3>
+      <label>Title<input name="title" maxlength="160" value="${esc(work.metadata?.title || "")}" placeholder="Human-readable work title"${disabled}></label>
+      <label>Stage<select name="stage"${disabled}>${stageOptions}</select></label>
+      <label>Goal<textarea name="goal" maxlength="4000" rows="3" placeholder="What outcome defines success?"${disabled}>${esc(work.goal)}</textarea></label>
+      <label>Next action<textarea name="next_action" maxlength="1000" rows="2" placeholder="The next concrete step"${disabled}>${esc(work.nextAction)}</textarea></label>
+      <button class="control-btn primary" type="submit"${disabled}>save work</button>
+      ${store.access.writeAuthorized ? "" : `<small class="locked-note">Unlock edit to change workflow metadata.</small>`}
+    </form>
+    <div class="inspector-section drawer-controls">
+      <h3>Ticket command</h3>
+      <textarea id="work-batch-prompt" rows="3" placeholder="Send one instruction to every live agent in this ticket"${disabled}></textarea>
+      <div class="drawer-action-row">
+        <button class="control-btn primary" type="button" data-work-action="prompt"${disabled}>prompt all</button>
+        <button class="control-btn" type="button" data-work-action="status"${disabled}>request status</button>
+        <button class="control-btn danger" type="button" data-work-action="abort"${disabled}>abort all</button>
+      </div>
     </div>
-    <div class="inspector-section">
+    <div class="inspector-section drawer-participants">
       <h3>Participants</h3>
       ${participants}
     </div>
@@ -2339,6 +2458,26 @@ async function fetchPanes() {
   return panesRequest;
 }
 
+let workMetadataRequest = null;
+async function fetchWorkMetadata() {
+  if (workMetadataRequest) return workMetadataRequest;
+  workMetadataRequest = (async () => {
+    try {
+      const data = await jsonFetch("/api/work-metadata");
+      const works = data.works || [];
+      const fingerprint = JSON.stringify(works);
+      if (fingerprint === store.cache.workMetadataFingerprint) return;
+      store.cache.workMetadataFingerprint = fingerprint;
+      store.workMetadata = works;
+      store.revisions.workMetadata += 1;
+      scheduleLiveRender();
+    } finally {
+      workMetadataRequest = null;
+    }
+  })();
+  return workMetadataRequest;
+}
+
 let terminalsRequest = null;
 async function fetchTerminalSessions() {
   if (terminalsRequest) return terminalsRequest;
@@ -2486,11 +2625,13 @@ async function main() {
   await Promise.all([
     fetchAgentsSnapshot(),
     fetchPanes(),
+    fetchWorkMetadata(),
     store.ui.activeTab === "terminals" ? fetchTerminalSessions() : Promise.resolve(),
     fetchTimeline({ force: true }),
   ]);
 
   setTimeout(pollPanes, PANES_REFETCH_INTERVAL_MS);
+  setTimeout(pollWorkMetadata, WORK_METADATA_REFETCH_INTERVAL_MS);
   setTimeout(pollTerminals, TERMINALS_REFETCH_INTERVAL_MS);
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
 
@@ -2498,6 +2639,7 @@ async function main() {
     if (document.hidden) return;
     scheduleLiveRender({ panes: true, terminals: true });
     fetchPanes().catch(() => {});
+    fetchWorkMetadata().catch(() => {});
     if (store.ui.activeTab === "terminals") fetchTerminalSessions().catch(() => {});
     if (Date.now() - lastTimelineFetchAt >= TIMELINE_MIN_REFRESH_INTERVAL_MS) {
       fetchTimeline().catch(() => {});
@@ -2520,6 +2662,11 @@ async function main() {
 async function pollPanes() {
   if (!document.hidden) await fetchPanes().catch(() => {});
   setTimeout(pollPanes, PANES_REFETCH_INTERVAL_MS);
+}
+
+async function pollWorkMetadata() {
+  if (!document.hidden) await fetchWorkMetadata().catch(() => {});
+  setTimeout(pollWorkMetadata, WORK_METADATA_REFETCH_INTERVAL_MS);
 }
 
 async function pollTerminals() {

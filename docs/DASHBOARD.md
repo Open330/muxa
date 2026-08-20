@@ -29,18 +29,22 @@ machine without explicit public-bind acknowledgement.
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
 | `GET /api/fleet?selector=...` | Cached hierarchy, including the always-present local node.          |
 | `GET /api/panes`    | Global tmux pane list (every readable socket), with per-socket scan errors.   |
+| `GET /api/work-metadata` | Durable titles, goals, next actions, and manual workflow stages.        |
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
+| `PUT /api/work-metadata` | Save the work definition for one exact host/socket/session/window.     |
+| `POST /api/work-control/prompt` | Prompt every live or managed agent pane in one ticket.           |
+| `POST /api/work-control/abort` | Send Ctrl-C to every live or managed agent pane in one ticket.     |
 | `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
 | `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
 
 `auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
-GET/SSE endpoints public but always requires the bearer token for POST control
-actions. `auth = "none"` leaves reads public and disables POST control entirely.
+GET/SSE endpoints public but always requires the bearer token for write/control
+actions. `auth = "none"` leaves reads public and disables writes entirely.
 Static routes are public in every mode — see "Why the HTML is public" below.
 Fleet routes always expose the in-process `local` node. `[fleet] enabled =
 true` adds outbound SSH hosts; reads reuse the daemon's per-host cache and
@@ -209,27 +213,42 @@ hammering refresh loop doesn't fork tmux 60 times a minute.
 
 ## Work-oriented projection
 
-The browser derives its work view from the existing `/api/panes` and
-`/api/agents` snapshots; this version does not introduce another database or
-duplicate tmux state on the server.
+The browser derives execution identity from `/api/panes` and `/api/agents`, then
+overlays the small `/api/work-metadata` annotation store. It does not copy live
+tmux state into another database: host, socket, session, window, pane, and agent
+liveness remain owned by the execution backend.
 
 | Dashboard concept | Execution source | Primary information |
 | ----------------- | ---------------- | ------------------- |
-| Workspace | tmux session, scoped by host/socket | ticket counts, activity, and attention |
-| Work item / ticket | tmux window | state, latest work signal, participants, last activity |
+| Workspace | managed workspace ID, otherwise repository cwd or session fallback | ticket counts, workflow stage, and attention |
+| Work item / ticket | exact host/socket/session/window, labeled by managed work ID or inferred name | title, goal, next action, state, participants |
 | Participant / agent | tracked agent attached to a pane | runtime, model, and agent state |
 | Execution detail | pane plus its session/window coordinates | attach, prompt, and abort controls |
 
 The workspace rail deliberately does not render nested windows and panes.
-Selecting a workspace filters the ticket board. Expanding one ticket—or using
-the board-wide **expand execution** control—reveals only that work item's
-session/window/pane hierarchy. Endpoint-aware keys keep identical pane IDs on
-different tmux sockets from being merged.
+Selecting a workspace filters a five-lane ticket board: **Attention**, **In
+progress**, **Review**, **Queued**, and **Done**. Selecting a ticket opens a
+fixed detail drawer for its work definition, participant status, ticket-level
+commands, and execution hierarchy. Expanding one ticket—or using the
+board-wide **expand execution** control—reveals the session/window/pane
+hierarchy only when it is needed.
 
-Names currently come from the underlying tmux session and window names, so
-unmanaged or legacy sessions may still look process-oriented. A team can get
-useful work labels immediately by naming sessions after workspaces and windows
-after tickets; explicit persisted ticket metadata is a future extension.
+Muxa-managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role,
+and task) are the preferred logical identities. For legacy/unmanaged sessions,
+panes sharing a repository cwd are grouped into one workspace; ticket-shaped
+session names such as `CAL-101` are used when the tmux window is only named
+`codex`, `claude`, or another generic process name. A session fallback keeps
+older rows visible when no cwd exists. Endpoint-aware keys keep identical pane
+IDs on different tmux sockets from being merged.
+
+The operator can persist a human title, goal, next action, and manual stage in
+`$XDG_DATA_HOME/muxa/dashboard-work.json` (normally
+`~/.local/share/muxa/dashboard-work.json`). Writes use a temporary file and
+rename, and are serialized by the daemon. Live errors or agents waiting for
+input still lift a ticket into **Attention**; `done` and `review` remain explicit
+operator decisions. Ticket commands target only live registered agents or
+panes marked `@muxa_managed_agent` inside that exact work identity, never every
+shell pane in the window.
 
 ## Timeline
 
@@ -255,10 +274,10 @@ attach; not a plain open `muxa watch` interval). The `human` metric follows
 interaction intervals. Timeline lanes still show raw human-interaction spans
 separately as `interaction`.
 
-The workspace sidebar can sort by `active`, `human`, or `tmux`. `active` uses
-the same last-touch attribution as `muxa stats`, so overlapping work across
-multiple sessions is counted once and assigned to the most recently touched
-session.
+The workspace sidebar sorts by workflow priority, latest agent activity, or
+name. Timeline session filtering remains independent from logical workspace
+selection because one repository workspace may contain several physical tmux
+sessions.
 
 Closed intervals come from `activity.ndjson`. Currently-open agent states
 come from the live `Store` snapshot, and currently-open tmux foreground spans
@@ -298,12 +317,12 @@ that strips the carve-out (or use mTLS).
 
 ## What it doesn't do (yet)
 
-- No dashboard-specific database. The daemon rehydrates live state from
-  `state.json`, while prompt and activity history use the configured local
-  NDJSON files.
-- Control is intentionally narrow: pane prompt/abort and Muxa-owned PTY
-  input/terminate. Configuration, files, and arbitrary commands are not
-  writable through the dashboard.
+- The dashboard stores only work annotations in one local JSON file. It does
+  not yet keep ticket history, dependencies, estimates, or external issue
+  tracker synchronization.
+- Control is intentionally narrow: ticket/pane prompt and abort plus
+  Muxa-owned PTY input/terminate. Configuration, files, and arbitrary shell
+  commands are not writable through the dashboard.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.
 - No multi-user auth. One token = one bearer.
 

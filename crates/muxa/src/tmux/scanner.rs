@@ -22,6 +22,7 @@
 //!
 //! [`HerdrBackend`]: crate::backend::herdr::HerdrBackend
 
+use crate::backend::HostKind;
 use crate::tmux::{PaneInfo, PANE_FMT};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -44,6 +45,7 @@ const TMUX_LIST_TIMEOUT: Duration = Duration::from_secs(1);
 /// server.
 #[derive(Debug, Clone, Serialize)]
 pub struct PaneSummary {
+    pub host: HostKind,
     pub pane_id: String,
     pub session_id: String,
     pub session: String,
@@ -54,11 +56,53 @@ pub struct PaneSummary {
     pub tty: String,
     pub current_command: String,
     pub title: String,
+    pub current_path: String,
     pub socket: PathBuf,
+    pub muxa: MuxaPaneMetadata,
     /// Shell-quoted command that, when run, attaches to this pane. Uses
     /// `tmux -S <socket> attach-session -t <session>` plus
     /// `select-window` / `select-pane` to land on the exact pane.
     pub attach_command: String,
+}
+
+/// Muxa-managed logical identity stored in tmux user options. These values
+/// survive muxad restarts and are intentionally separate from mutable tmux
+/// names. Non-tmux and unmanaged panes serialize a well-formed empty object.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MuxaPaneMetadata {
+    pub managed_workspace: bool,
+    pub managed_work: bool,
+    pub managed_agent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+#[derive(Debug)]
+struct ScannedPane {
+    pane: PaneInfo,
+    muxa: MuxaPaneMetadata,
+}
+
+#[cfg(test)]
+impl ScannedPane {
+    fn unmanaged(pane: PaneInfo) -> Self {
+        Self {
+            pane,
+            muxa: MuxaPaneMetadata::default(),
+        }
+    }
 }
 
 /// A single per-socket failure during a scan. We collect these instead of
@@ -262,18 +306,18 @@ pub async fn scan() -> ScanResult {
 /// Generic scan entry point — runs `fetcher` against each socket and
 /// aggregates the results. Public-in-crate so the unit tests can swap in
 /// a deterministic fetcher.
-pub(crate) async fn scan_with<F, Fut>(sockets: Vec<PathBuf>, mut fetcher: F) -> ScanResult
+async fn scan_with<F, Fut>(sockets: Vec<PathBuf>, mut fetcher: F) -> ScanResult
 where
     F: FnMut(PathBuf) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<PaneInfo>, String>>,
+    Fut: std::future::Future<Output = Result<Vec<ScannedPane>, String>>,
 {
     let mut panes: Vec<PaneSummary> = Vec::new();
     let mut errors: Vec<ScanError> = Vec::new();
     for sock in sockets {
         match fetcher(sock.clone()).await {
             Ok(items) => {
-                for p in items {
-                    panes.push(to_summary(p, sock.clone()));
+                for pane in items {
+                    panes.push(to_summary(pane, sock.clone()));
                 }
             }
             Err(message) => errors.push(ScanError {
@@ -289,7 +333,7 @@ where
     }
 }
 
-async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<PaneInfo>, String> {
+async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<ScannedPane>, String> {
     let sock_str = sock
         .to_str()
         .ok_or_else(|| "non-utf8 socket path".to_string())?;
@@ -316,17 +360,49 @@ async fn list_panes_for_socket(sock: PathBuf) -> Result<Vec<PaneInfo>, String> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let socket = crate::tmux::socket_short_name(sock_str);
-    Ok(crate::tmux::parse_pane_lines_for_socket(
-        &stdout,
-        Some(&socket),
-    ))
+    Ok(parse_scanned_panes(&stdout, &socket))
+}
+
+fn parse_scanned_panes(stdout: &str, socket: &str) -> Vec<ScannedPane> {
+    crate::tmux::parse_pane_lines_for_socket(stdout, Some(socket))
+        .into_iter()
+        .zip(stdout.lines().filter(|line| line.split('\t').count() >= 7))
+        .map(|(pane, line)| {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            let value = |index: usize| {
+                columns
+                    .get(index)
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let workspace_id = value(22).or_else(|| value(12));
+            let work_id = value(23).or_else(|| value(15));
+            ScannedPane {
+                pane,
+                muxa: MuxaPaneMetadata {
+                    managed_workspace: columns.get(14).is_some_and(|value| *value == "1"),
+                    managed_work: columns.get(17).is_some_and(|value| *value == "1"),
+                    managed_agent: columns.get(21).is_some_and(|value| *value == "1"),
+                    workspace_id,
+                    workspace_cwd: value(13),
+                    work_id,
+                    work_cwd: value(16),
+                    agent: value(18),
+                    role: value(19),
+                    task: value(20),
+                },
+            }
+        })
+        .collect()
 }
 
 fn is_no_server_running(stderr: &str) -> bool {
     stderr.starts_with("no server running on")
 }
 
-fn to_summary(p: PaneInfo, socket: PathBuf) -> PaneSummary {
+fn to_summary(scanned: ScannedPane, socket: PathBuf) -> PaneSummary {
+    let p = scanned.pane;
     let attach_command = format!(
         "tmux -S {sock} attach-session -t {sess} \\; select-window -t {sess}:{win} \\; select-pane -t {pane}",
         sock = shell_quote(&socket),
@@ -335,6 +411,7 @@ fn to_summary(p: PaneInfo, socket: PathBuf) -> PaneSummary {
         pane = p.pane_id,
     );
     PaneSummary {
+        host: HostKind::Tmux,
         pane_id: p.pane_id,
         session_id: p.session_id,
         session: p.session,
@@ -345,7 +422,9 @@ fn to_summary(p: PaneInfo, socket: PathBuf) -> PaneSummary {
         tty: p.tty,
         current_command: p.current_command,
         title: p.title,
+        current_path: p.current_path,
         socket,
+        muxa: scanned.muxa,
         attach_command,
     }
 }
@@ -386,6 +465,7 @@ pub(crate) fn herdr_scan_result(panes: Vec<PaneInfo>) -> ScanResult {
 
 fn to_herdr_summary(p: PaneInfo) -> PaneSummary {
     PaneSummary {
+        host: HostKind::Herdr,
         pane_id: p.pane_id,
         session_id: p.session_id,
         session: p.session,
@@ -396,7 +476,9 @@ fn to_herdr_summary(p: PaneInfo) -> PaneSummary {
         tty: p.tty,
         current_command: p.current_command,
         title: p.title,
+        current_path: p.current_path,
         socket: PathBuf::from(HERDR_SOCKET_LABEL),
+        muxa: MuxaPaneMetadata::default(),
         // herdr has no `tmux attach`-style command a user copies; the CLI
         // (`muxa` jump / `jump_to_pane`) focuses over the socket instead.
         attach_command: String::new(),
@@ -646,13 +728,56 @@ mod tests {
         assert!(!is_no_server_running("server exiting"));
     }
 
+    #[test]
+    fn parse_scanned_panes_reads_managed_workspace_work_and_agent_metadata() {
+        let line = [
+            "%7",
+            "physical-session",
+            "2",
+            "0",
+            "/dev/pts/7",
+            "codex",
+            "agent",
+            "4242",
+            "/work/payments",
+            "$7",
+            "@7",
+            "shell",
+            "workspace-from-session",
+            "/work/payments",
+            "1",
+            "work-from-window",
+            "/work/payments/ticket",
+            "1",
+            "codex-primary",
+            "implementer",
+            "repair settlement retries",
+            "1",
+            "payments",
+            "PAY-42",
+        ]
+        .join("\t");
+
+        let panes = parse_scanned_panes(&line, "default");
+        assert_eq!(panes.len(), 1);
+        let pane = &panes[0];
+        assert_eq!(pane.pane.socket.as_deref(), Some("default"));
+        assert!(pane.muxa.managed_workspace);
+        assert!(pane.muxa.managed_work);
+        assert!(pane.muxa.managed_agent);
+        assert_eq!(pane.muxa.workspace_id.as_deref(), Some("payments"));
+        assert_eq!(pane.muxa.work_id.as_deref(), Some("PAY-42"));
+        assert_eq!(pane.muxa.role.as_deref(), Some("implementer"));
+        assert_eq!(pane.muxa.task.as_deref(), Some("repair settlement retries"));
+    }
+
     #[tokio::test]
     async fn scan_with_one_bad_socket_does_not_fail_the_whole_scan() {
         let s_good = PathBuf::from("/run/fake/good");
         let s_bad = PathBuf::from("/run/fake/bad");
         let result = scan_with(vec![s_good.clone(), s_bad.clone()], |sock| async move {
             if sock.file_name().and_then(|s| s.to_str()) == Some("good") {
-                Ok(vec![fake_pane("%1", "main")])
+                Ok(vec![ScannedPane::unmanaged(fake_pane("%1", "main"))])
             } else {
                 Err("simulated tmux failure".to_string())
             }
@@ -670,7 +795,7 @@ mod tests {
     async fn scan_with_attaches_socket_and_attach_command_per_pane() {
         let s = PathBuf::from("/tmp/tmux-1000/default");
         let result = scan_with(vec![s.clone()], |_| async {
-            Ok(vec![fake_pane("%7", "work")])
+            Ok(vec![ScannedPane::unmanaged(fake_pane("%7", "work"))])
         })
         .await;
         assert_eq!(result.panes.len(), 1);

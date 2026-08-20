@@ -20,7 +20,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use futures::stream::{self, Stream, StreamExt};
@@ -40,6 +40,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::backend::{HostKind, SharedBackend};
 use crate::config::{DashboardAuthMode, StatsConfig};
+use crate::dashboard::work_store::{WorkKey, WorkMetadataPatch, WorkRecord, WorkStore};
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
@@ -51,7 +52,7 @@ use crate::timeline::{
     self, TimelineBuildInput, TimelineDocument, TimelineFilters, TimelineLane, TimelineLaneKind,
     TimelineRange, TimelineTotals,
 };
-use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError};
+use crate::tmux::scanner::{self, MuxaPaneMetadata, PaneCache, PaneSummary, ScanError};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
 /// (15s is well under any sane proxy idle-timeout) but short enough
@@ -122,6 +123,9 @@ pub struct AppState {
     /// Optional SSH fleet runtime. Fleet reads reuse muxad's per-host cache;
     /// dashboard requests never launch their own SSH processes.
     pub fleet: Option<FleetRuntime>,
+    /// Durable operator-authored work metadata. Execution topology remains in
+    /// the backend; only workflow annotations are stored here.
+    work_store: Arc<tokio::sync::Mutex<WorkStore>>,
     /// 1-second cache for the `agents_by_state` histogram. See the
     /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
     /// and the eventual plan to replace this with per-state atomics.
@@ -139,6 +143,7 @@ pub struct AppState {
 pub struct DashboardRuntimeConfig {
     pub activity_path: Option<PathBuf>,
     pub session_activity_path: Option<PathBuf>,
+    pub work_store_path: Option<PathBuf>,
     pub stats_config: StatsConfig,
     pub fleet: Option<FleetRuntime>,
 }
@@ -164,6 +169,7 @@ impl AppState {
             session_activity_path: None,
             stats_config: StatsConfig::default(),
             fleet: None,
+            work_store: Arc::new(tokio::sync::Mutex::new(WorkStore::memory())),
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
             activity_ledger_cache: Arc::new(tokio::sync::Mutex::new(
                 crate::activity::ActivityCache::default(),
@@ -194,6 +200,12 @@ impl AppState {
     #[must_use]
     pub fn with_fleet(mut self, fleet: Option<FleetRuntime>) -> Self {
         self.fleet = fleet;
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_store_path(mut self, path: Option<PathBuf>) -> Self {
+        self.work_store = Arc::new(tokio::sync::Mutex::new(WorkStore::load(path)));
         self
     }
 
@@ -272,6 +284,7 @@ fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> sca
                     .map_or_else(|| PathBuf::from("tmux"), PathBuf::from),
             };
             PaneSummary {
+                host: kind,
                 pane_id: pane.pane_id,
                 session_id: pane.session_id,
                 session: pane.session,
@@ -282,7 +295,9 @@ fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> sca
                 tty: pane.tty,
                 current_command: pane.current_command,
                 title: pane.title,
+                current_path: pane.current_path,
                 socket,
+                muxa: MuxaPaneMetadata::default(),
                 attach_command: String::new(),
             }
         })
@@ -319,6 +334,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents_handler))
         .route("/api/fleet", get(fleet_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/work-metadata", get(work_metadata_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
         .route(
             "/api/terminal-sessions/{id}/capture",
@@ -336,6 +352,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
         .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
+        .route("/api/work-metadata", put(work_metadata_put_handler))
+        .route("/api/work-control/prompt", post(work_prompt_handler))
+        .route("/api/work-control/abort", post(work_abort_handler))
         .route(
             "/api/terminal-sessions/{id}/input",
             post(terminal_input_handler),
@@ -405,6 +424,7 @@ pub async fn serve(
     let state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
+        .with_work_store_path(runtime.work_store_path)
         .with_stats_config(runtime.stats_config)
         .with_fleet(runtime.fleet);
     let app = router(state);
@@ -676,6 +696,211 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
         panes: result.panes,
         errors: result.errors,
         fetched_at: result.fetched_at,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct WorkMetadataResponse {
+    works: Vec<WorkRecord>,
+}
+
+async fn work_metadata_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(WorkMetadataResponse {
+        works: state.work_store.lock().await.records(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkMetadataPutRequest {
+    key: WorkKey,
+    metadata: WorkMetadataPatch,
+}
+
+async fn work_metadata_put_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkMetadataPutRequest>,
+) -> Response {
+    let metadata = match input.metadata.validate() {
+        Ok(metadata) => metadata,
+        Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
+    };
+    let scan = state.refresh_pane_scan().await;
+    if !scan
+        .panes
+        .iter()
+        .any(|pane| pane_matches_work_key(pane, &input.key))
+    {
+        return control_error(StatusCode::NOT_FOUND, "work item is no longer present");
+    }
+    match state
+        .work_store
+        .lock()
+        .await
+        .upsert(input.key, metadata)
+        .await
+    {
+        Ok(record) => Json(json!({ "ok": true, "work": record })).into_response(),
+        Err(error) => control_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist work metadata: {error}"),
+        ),
+    }
+}
+
+fn pane_socket_identity(pane: &PaneSummary) -> String {
+    if pane.host == HostKind::Tmux {
+        pane.socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("default")
+            .to_string()
+    } else {
+        pane.socket.to_string_lossy().to_string()
+    }
+}
+
+fn pane_matches_work_key(pane: &PaneSummary, key: &WorkKey) -> bool {
+    pane.host == key.host
+        && pane_socket_identity(pane) == key.socket
+        && pane.session_id == key.session_id
+        && pane.window_id == key.window_id
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkPromptRequest {
+    key: WorkKey,
+    text: String,
+    #[serde(default = "default_true")]
+    submit: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkAbortRequest {
+    key: WorkKey,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkControlResult {
+    pane: String,
+    sent: bool,
+    submitted: bool,
+}
+
+async fn work_prompt_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkPromptRequest>,
+) -> Response {
+    if input.text.trim().is_empty() {
+        return control_error(StatusCode::BAD_REQUEST, "prompt text is empty");
+    }
+    run_work_control(&state, input.key, input.text, input.submit, "prompt").await
+}
+
+async fn work_abort_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkAbortRequest>,
+) -> Response {
+    run_work_control(&state, input.key, "\u{3}".to_string(), false, "abort").await
+}
+
+async fn run_work_control(
+    state: &AppState,
+    key: WorkKey,
+    text: String,
+    submit: bool,
+    action: &'static str,
+) -> Response {
+    let backend = match state
+        .backends
+        .iter()
+        .find(|backend| backend.kind() == key.host)
+        .cloned()
+    {
+        Some(backend) if backend.caps().send_text => backend,
+        Some(backend) => {
+            return control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane input", backend.kind()),
+            );
+        }
+        None => {
+            return control_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("no active {} backend", key.host),
+            );
+        }
+    };
+    let scan = state.refresh_pane_scan().await;
+    let agents = state.store.snapshot().await;
+    let candidates = scan
+        .panes
+        .iter()
+        .filter(|pane| pane_matches_work_key(pane, &key))
+        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &scan.panes, &agents))
+        .map(|pane| pane.pane_id.clone())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return control_error(
+            StatusCode::NOT_FOUND,
+            "work item has no live or managed agent panes",
+        );
+    }
+
+    let socket = key.socket;
+    let results = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|pane| {
+                let sent = backend.send_text_on(Some(&socket), &pane, &text);
+                let submitted = if sent && submit {
+                    std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+                    backend.send_text_on(Some(&socket), &pane, "\r")
+                } else {
+                    false
+                };
+                WorkControlResult {
+                    pane,
+                    sent,
+                    submitted,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let succeeded = results.iter().filter(|result| result.sent).count();
+    if succeeded == 0 {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{action} failed for every agent pane"),
+        );
+    }
+    Json(json!({
+        "ok": succeeded == results.len(),
+        "action": action,
+        "attempted": results.len(),
+        "succeeded": succeeded,
+        "results": results,
+    }))
+    .into_response()
+}
+
+fn pane_has_live_agent(pane: &PaneSummary, panes: &[PaneSummary], agents: &[Agent]) -> bool {
+    let duplicates = panes
+        .iter()
+        .filter(|candidate| candidate.host == pane.host && candidate.pane_id == pane.pane_id)
+        .count();
+    agents.iter().any(|agent| {
+        agent.state != AgentState::Stopped
+            && agent.pane.as_deref() == Some(&pane.pane_id)
+            && crate::backend::pane_id_host_kind(&pane.pane_id).is_none_or(|host| host == pane.host)
+            && match agent.tmux_socket.as_deref() {
+                Some(socket) => {
+                    crate::backend::pane_endpoint_identity(Some(&pane.pane_id), socket)
+                        == pane_socket_identity(pane)
+                }
+                None => duplicates == 1,
+            }
     })
 }
 
@@ -1674,6 +1899,7 @@ mod tests {
 
     struct RecordingControlBackend {
         sent: Arc<Mutex<Vec<(String, String)>>>,
+        panes: Vec<PaneInfo>,
     }
 
     struct InventoryBackend {
@@ -1724,11 +1950,14 @@ mod tests {
         }
 
         fn list_panes(&self) -> Vec<PaneInfo> {
-            Vec::new()
+            self.panes.clone()
         }
 
-        fn resolve_pane(&self, _pane_id: &str) -> Option<PaneInfo> {
-            None
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
         }
 
         fn capture_pane(&self, _pane_id: &str) -> Option<String> {
@@ -1785,6 +2014,47 @@ mod tests {
         cfg.auth = DashboardAuthMode::PublicRead;
         cfg.token = Some(token.to_string());
         state_from(cfg)
+    }
+
+    fn test_pane(
+        pane_id: &str,
+        session_id: &str,
+        session: &str,
+        window_id: &str,
+        window_name: &str,
+    ) -> PaneInfo {
+        PaneInfo {
+            socket: None,
+            pane_id: pane_id.into(),
+            session_id: session_id.into(),
+            session: session.into(),
+            window_id: window_id.into(),
+            window_name: window_name.into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "codex".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: "/work/muxa".into(),
+        }
+    }
+
+    async fn seed_agent(state: &AppState, session_id: &str, pane: &str) {
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::Codex,
+                    session_id: session_id.into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
     }
 
     fn state_from(cfg: DashboardConfig) -> AppState {
@@ -2096,6 +2366,7 @@ mod tests {
         use std::path::PathBuf;
 
         let tmux_pane = PaneSummary {
+            host: HostKind::Tmux,
             pane_id: "%1".into(),
             session_id: "$1".into(),
             session: "main".into(),
@@ -2106,7 +2377,9 @@ mod tests {
             tty: String::new(),
             current_command: "zsh".into(),
             title: String::new(),
+            current_path: "/tmp/project".into(),
             socket: PathBuf::from("default"),
+            muxa: MuxaPaneMetadata::default(),
             attach_command: "tmux attach".into(),
         };
         let tmux = ScanResult {
@@ -2440,7 +2713,10 @@ mod tests {
     #[tokio::test]
     async fn public_read_pat_can_send_and_submit_a_pane_prompt() {
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let backend: SharedBackend = Arc::new(RecordingControlBackend { sent: sent.clone() });
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes: Vec::new(),
+        });
         let app = router(public_read_state("edit-pat").with_backend(backend));
         let response = app
             .oneshot(
@@ -2460,6 +2736,124 @@ mod tests {
             vec![
                 ("herdr:p1".to_string(), "review this".to_string()),
                 ("herdr:p1".to_string(), "\r".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn work_metadata_requires_pat_and_persists_for_the_exact_ticket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dashboard-work.json");
+        let backend: SharedBackend = Arc::new(InventoryBackend {
+            kind: HostKind::Herdr,
+            panes: vec![test_pane(
+                "herdr:p1",
+                "session-1",
+                "muxa",
+                "window-1",
+                "CAL-101",
+            )],
+        });
+        let state = public_read_state("edit-pat")
+            .with_backend(backend)
+            .with_work_store_path(Some(path.clone()));
+        let app = router(state);
+        let body = r#"{
+            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+            "metadata":{"title":"Repair auth","goal":"No stale tokens","next_action":"Run tests","stage":"review"}
+        }"#;
+
+        let locked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/work-metadata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = body_json(response).await;
+        assert_eq!(response["works"][0]["metadata"]["title"], "Repair auth");
+        assert_eq!(response["works"][0]["metadata"]["stage"], "review");
+
+        let reloaded = WorkStore::load(Some(path));
+        assert_eq!(reloaded.records().len(), 1);
+        assert_eq!(
+            reloaded.records()[0].metadata.title.as_deref(),
+            Some("Repair auth")
+        );
+    }
+
+    #[tokio::test]
+    async fn work_prompt_targets_only_live_agents_in_the_selected_ticket() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let panes = vec![
+            test_pane("herdr:p1", "session-1", "muxa", "window-1", "CAL-101"),
+            test_pane("herdr:p2", "session-1", "muxa", "window-1", "CAL-101"),
+            test_pane("herdr:p3", "session-1", "muxa", "window-2", "CAL-102"),
+            test_pane("herdr:shell", "session-1", "muxa", "window-1", "CAL-101"),
+        ];
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes,
+        });
+        let state = public_read_state("edit-pat").with_backend(backend);
+        seed_agent(&state, "agent-1", "herdr:p1").await;
+        seed_agent(&state, "agent-2", "herdr:p2").await;
+        seed_agent(&state, "agent-3", "herdr:p3").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"text":"report status","submit":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = body_json(response).await;
+        assert_eq!(response["attempted"], 2);
+        assert_eq!(response["succeeded"], 2);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                ("herdr:p1".to_string(), "report status".to_string()),
+                ("herdr:p2".to_string(), "report status".to_string()),
             ]
         );
     }

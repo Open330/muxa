@@ -24,6 +24,7 @@ pub mod assets;
 pub mod auth;
 pub mod config;
 pub mod server;
+mod work_store;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
 pub use server::{router, serve, AppState, DashboardRuntimeConfig};

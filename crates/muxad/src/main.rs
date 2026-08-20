@@ -320,6 +320,7 @@ async fn main() -> Result<()> {
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
+            work_store_path: paths::default_dashboard_work_file(),
             stats_config: dashboard_stats_config,
             fleet: Some(fleet_runtime.clone()),
         };
