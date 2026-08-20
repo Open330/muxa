@@ -605,7 +605,6 @@ struct HerdrProcess {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
     use std::os::unix::net::UnixListener;
     use std::path::Path;
     use std::thread;

@@ -160,7 +160,10 @@ impl AskStore {
     /// failures: their child process died with the previous daemon.
     // `async` for symmetry with `CollaborationStore::load` and so the
     // daemon's startup path reads the same for both stores.
-    #[allow(clippy::unused_async)]
+    // Rust 1.98 renamed/expanded this lint. Keep the async API stable for
+    // startup symmetry while supporting both the MSRV and current stable.
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn load(opts: AskOptions) -> Arc<Self> {
         let mut snapshot = opts
             .path
