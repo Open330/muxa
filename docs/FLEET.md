@@ -6,12 +6,14 @@ session/window/pane model:
 ```text
 local muxad
   FleetManager
+    ├─ in-process      ─ host local ─ session ─ window ─ pane (agent)
     ├─ SSH stdio relay ─ host dev ─ session ─ window ─ pane (agent)
     ├─ SSH stdio relay ─ host gpu ─ session ─ window ─ pane (agent)
     └─ per-host cache  ─ host prod ─ last known snapshot while offline
 ```
 
-Each configured host gets one independent, persistent OpenSSH process. The
+The controller is always published as the first, in-process `local` host.
+Each configured remote host gets one independent, persistent OpenSSH process. The
 remote command is `muxa relay --stdio`, which talks only to that user's local
 owner-only muxad Unix socket. Fleet does not expose a remote TCP port, forward
 an agent socket, or copy terminal contents continuously.
@@ -48,6 +50,23 @@ expected for this manual probe.
 
 ## Inventory and metadata
 
+No setup is required for the controller node:
+
+```bash
+muxa fleet status
+muxa host show local
+muxa host doctor local
+muxa host label local environment=development
+muxa host annotate local muxa.dev/owner=platform
+```
+
+`local` has the same stable NodeId and topology shape as a remote node, but it
+does not use SSH and is always connected in control mode. It cannot be added,
+removed, disabled, or disconnected. User metadata is stored under
+`[fleet.local]`. muxad owns the truthful `muxa.io/local`,
+`muxa.io/transport`, and `kubernetes.io/{hostname,os,arch}` labels; selectors
+may use them, but user configuration cannot override them.
+
 Register hosts through the CLI so Muxa validates and atomically updates the
 TOML inventory:
 
@@ -63,8 +82,9 @@ muxa host list
 muxa host show dev
 ```
 
-The first host command enables `[fleet]`. Host mutations ask muxad to restart
-itself so the connection set and authorization policy are reloaded together.
+The first remote-host command enables outbound SSH Fleet connections. The
+local node remains available when `[fleet] enabled = false`. Host mutations
+ask muxad to restart itself so the connection set and authorization policy are reloaded together.
 If the daemon cannot be reached, the config edit remains valid and the CLI
 prints a reminder to restart it manually.
 
@@ -102,6 +122,9 @@ Supported selector requirements are:
 
 Every host has two independent policies:
 
+The local node is always connected and always uses `control`; these settings
+apply to remote inventory entries:
+
 - `mode = "observe"` allows snapshots and on-demand captures but rejects
   prompt delivery. This is the default.
 - `mode = "control"` additionally permits exact-pane prompt delivery.
@@ -121,6 +144,11 @@ muxa fleet status --json
 muxa fleet watch
 muxa watch --fleet --selector 'accelerator=gpu'
 
+muxa fleet panes local
+muxa fleet capture local '%12'
+muxa fleet send local '%12' 'Please summarize the current result.'
+muxa fleet attach local '%12'
+
 muxa fleet connect dev
 muxa fleet disconnect dev
 muxa fleet refresh dev
@@ -136,6 +164,8 @@ is ambiguous, `muxa fleet panes HOST --json` prints the complete `PaneKey` JSON
 accepted by capture/send/attach and MCP tools. Internally, every command carries
 the complete node/backend/session/window/pane identity, and the relay verifies
 that identity again against a fresh pane list before a control action.
+The local adapter performs the same exact-key verification in process; local
+attach jumps directly without opening an SSH TTY.
 
 The Fleet TUI uses the same focused hierarchy developed for local watch:
 
@@ -144,9 +174,10 @@ The Fleet TUI uses the same focused hierarchy developed for local watch:
   session/window chain.
 - `h`/`l` or Left/Right collapses/descends; Space toggles a parent.
 - `/` filters, `a` toggles attention-only, `r` refreshes, and `c` connects or
-  disconnects the selected host.
+  disconnects a remote host (`local` reports that it is always connected).
 - `p` captures the selected pane, `m` composes an exact-pane prompt, Enter
-  attaches through a separate SSH TTY, and `?` shows help.
+  attaches directly on `local` or through a separate remote SSH TTY, and `?`
+  shows help.
 
 Session inspectors roll up their windows and panes. A selected window fetches
 its panes on demand and renders their actual tmux split geometry. Captures are
@@ -165,6 +196,12 @@ relay. Keepalives detect a silent transport, while each host's state machine,
 backoff, and task remain independent so one slow host cannot stall the fleet.
 `max_parallel_connects` caps simultaneous SSH handshakes.
 
+The local adapter consumes Store transitions directly and refreshes backend
+topology at `refresh_secs`; backend scans run on blocking workers rather than
+the async IPC executor. It maintains its own revisioned Fleet snapshot, so
+selectors and UI rendering never clone or rewrite the authoritative local
+Store.
+
 The central cache stores agent/topology metadata only. Pane captures are
 bounded, sanitized for terminal control sequences, and requested only when a
 consumer selects them. Window capture parallelism and payload sizes are also
@@ -178,8 +215,9 @@ partial acknowledgement.
 ## Other interfaces
 
 `muxa mcp` exposes `muxa_fleet_status`, `muxa_fleet_capture`, and
-`muxa_fleet_send_prompt`. Remote control tools require an explicit host and
-pane; the same observe/control check applies.
+`muxa_fleet_send_prompt`. Control tools require an explicit host and pane;
+remote hosts apply the observe/control check, while `local` is owner-socket
+control.
 
 When the web dashboard is enabled, its authenticated read surface includes
 `GET /api/fleet?selector=...`. PAT-gated control is available at

@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bodies out of audit logs, bounds/sanitizes terminal data, and never retries
   mutations. See [docs/FLEET.md](docs/FLEET.md).
 
+  The controller is itself an always-present first-class `local` node, even
+  when remote Fleet connections are disabled. It exposes the same topology,
+  selectors, capture/send/attach, dashboard, and MCP surfaces through an
+  in-process adapter. Kubernetes-style system labels identify the local
+  hostname/OS/architecture, while user labels and annotations remain editable
+  through `muxa host label local` and `muxa host annotate local`.
+
 - **Agents can call a colleague naturally through Muxa MCP.** Connected Claude
   and Codex conversations now map `@peer`, provider/alias/role targets, and
   registered `/skills` to `muxa_call_peer`. The high-level tool expands the

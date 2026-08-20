@@ -96,7 +96,7 @@
 # no TCP listener is opened on either side. SSH identity, ProxyJump, port, and
 # host-key policy belong in ~/.ssh/config. See docs/FLEET.md.
 [fleet]
-# enabled               = false
+# enabled               = false      # outbound SSH hosts; local is always visible
 # refresh_secs          = 15
 # keepalive_secs        = 10
 # offline_after_secs    = 30       # must be at least 2 × keepalive_secs
@@ -104,6 +104,15 @@
 # command_timeout_secs  = 10
 # max_parallel_connects = 6
 # capture_policy        = "selected" # selected | never; pane text is fetched on demand only
+
+# Optional metadata for the built-in controller node. `muxa host label local`
+# and `muxa host annotate local` edit these tables. muxad supplies immutable
+# muxa.io/local, muxa.io/transport, and kubernetes.io/* identity labels.
+# [fleet.local.labels]
+# environment = "development"
+
+# [fleet.local.annotations]
+# "muxa.dev/owner" = "platform-team"
 
 # [fleet.hosts.devbox]
 # ssh           = "muxa-devbox"    # OpenSSH Host alias; no embedded flags

@@ -1832,6 +1832,7 @@ mod tests {
     fn fleet_host(alias: &str, environment: &str) -> crate::fleet::FleetHostSnapshot {
         crate::fleet::FleetHostSnapshot {
             alias: alias.into(),
+            local: false,
             ssh_target: alias.into(),
             labels: BTreeMap::from([("environment".into(), environment.into())]),
             annotations: BTreeMap::new(),

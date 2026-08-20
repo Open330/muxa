@@ -221,7 +221,7 @@ stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 time
 
 ```toml
 [fleet]
-enabled = true
+enabled = true              # outbound SSH host; local은 항상 표시
 refresh_secs = 15
 keepalive_secs = 10
 offline_after_secs = 30
@@ -229,6 +229,12 @@ connect_timeout_secs = 10
 command_timeout_secs = 10
 max_parallel_connects = 6
 capture_policy = "selected" # selected | never
+
+[fleet.local.labels]
+environment = "development"
+
+[fleet.local.annotations]
+"muxa.dev/owner" = "platform"
 
 [fleet.hosts.dev]
 ssh = "muxa-devbox"
@@ -246,7 +252,9 @@ region = "icn"
 "muxa.dev/owner" = "platform"
 ```
 
-Fleet은 활성 physical host마다 persistent OpenSSH stdio relay 하나를 유지합니다.
+Fleet은 controller를 첫 번째 `local` host로 항상 in-process 게시하며 `enabled = false`여도
+사용할 수 있습니다. 이 flag는 outbound SSH host만 제어합니다. 활성 remote physical
+host마다 persistent OpenSSH stdio relay 하나를 유지합니다.
 `offline_after_secs`는 `keepalive_secs`의 두 배 이상이어야 하며 timeout/concurrency 값은
 0일 수 없습니다. `capture_policy = "never"`는 control host에서도 pane/window capture를
 manager 단계에서 차단합니다.
@@ -256,6 +264,8 @@ ProxyJump, host-key 정책은 `~/.ssh/config`에 둡니다. `muxa_path`와 `remo
 fixed remote command token으로 검증됩니다. label은 Kubernetes-style selector에 쓰고,
 annotation은 설명형 value를 허용하지만 같은 namespaced key 문법을 사용합니다.
 inventory는 `muxa host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
+controller metadata는 `muxa host label local`, `muxa host annotate local`로 관리하며
+muxad가 제공하는 identity label은 덮어쓸 수 없습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
 
 ## Dashboard

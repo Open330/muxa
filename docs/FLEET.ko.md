@@ -6,12 +6,14 @@ Muxa Fleet은 기존 session/window/pane 구조 위에 physical host 계층을 �
 ```text
 local muxad
   FleetManager
+    ├─ in-process      ─ host local ─ session ─ window ─ pane(agent)
     ├─ SSH stdio relay ─ host dev ─ session ─ window ─ pane(agent)
     ├─ SSH stdio relay ─ host gpu ─ session ─ window ─ pane(agent)
     └─ host별 cache    ─ host prod ─ offline 중 last known snapshot
 ```
 
-설정된 host마다 독립적인 OpenSSH process 하나를 유지합니다. 원격에서는
+controller는 항상 첫 번째 `local` host로 in-process 게시됩니다. 설정된 remote
+host마다 독립적인 OpenSSH process 하나를 유지합니다. 원격에서는
 `muxa relay --stdio`가 실행되어 같은 사용자의 owner-only muxad Unix socket과만
 통신합니다. 원격 TCP port를 열거나 agent socket을 forwarding하지 않으며 terminal
 내용도 상시 복제하지 않습니다.
@@ -45,6 +47,22 @@ JSON hello 한 줄이 출력된 뒤 요청을 기다리면 정상입니다. 수�
 
 ## Inventory와 Kubernetes-style metadata
 
+controller node는 별도 설정 없이 바로 사용할 수 있습니다.
+
+```bash
+muxa fleet status
+muxa host show local
+muxa host doctor local
+muxa host label local environment=development
+muxa host annotate local muxa.dev/owner=platform
+```
+
+`local`도 remote node와 같은 stable NodeId와 topology를 가지지만 SSH를 사용하지 않고
+항상 connected/control 상태입니다. add/remove/disable/disconnect할 수 없으며 사용자
+metadata는 `[fleet.local]`에 저장됩니다. `muxa.io/local`, `muxa.io/transport`,
+`kubernetes.io/{hostname,os,arch}`는 muxad가 관리하는 사실 label이므로 selector에는
+쓸 수 있지만 사용자가 덮어쓸 수 없습니다.
+
 CLI를 사용하면 TOML을 검증하고 atomic하게 변경합니다.
 
 ```bash
@@ -59,7 +77,8 @@ muxa host list
 muxa host show dev
 ```
 
-첫 host 명령은 `[fleet]`을 활성화합니다. 변경 후에는 연결 목록과 권한 정책이
+첫 remote host 명령은 outbound SSH Fleet 연결을 활성화합니다. `[fleet] enabled = false`여도
+local node는 계속 보입니다. 변경 후에는 연결 목록과 권한 정책이
 함께 다시 로드되도록 muxad self-restart를 요청합니다. daemon에 연결할 수 없으면
 config 변경은 보존하고 수동 restart 안내를 출력합니다.
 
@@ -96,6 +115,8 @@ hostname, inventory alias를 바꿔도 node identity는 유지됩니다. 동일 
 
 각 host는 두 정책을 독립적으로 가집니다.
 
+local node는 항상 connected/control이며, 아래 설정은 remote inventory에 적용됩니다.
+
 - `mode = "observe"`: snapshot과 on-demand capture는 허용하지만 prompt 전송은
   거부합니다. 기본값입니다.
 - `mode = "control"`: exact-pane prompt 전송까지 허용합니다.
@@ -114,6 +135,11 @@ muxa fleet status --json
 muxa fleet watch
 muxa watch --fleet --selector 'accelerator=gpu'
 
+muxa fleet panes local
+muxa fleet capture local '%12'
+muxa fleet send local '%12' '현재 결과를 요약해주세요.'
+muxa fleet attach local '%12'
+
 muxa fleet connect dev
 muxa fleet disconnect dev
 muxa fleet refresh dev
@@ -128,6 +154,8 @@ bare pane id나 `session/window/pane` path는 해당 물리 host의 모든 backe
 capture/send/attach와 MCP 도구에 그대로 전달할 수 있는 complete `PaneKey` JSON을
 출력합니다. 내부 명령은 완전한 node/backend/session/window/pane identity를 전달하고,
 relay가 control 직전에 fresh pane list로 다시 확인합니다.
+local adapter도 같은 exact key 검증을 in-process로 수행하며 attach 시 SSH를 열지 않고
+직접 이동합니다.
 
 Fleet TUI 동작:
 
@@ -135,8 +163,10 @@ Fleet TUI 동작:
 - `j`/`k`는 singleton session/window chain에서도 actionable pane 사이를 바로
   이동합니다.
 - `h`/`l` 또는 Left/Right는 접기/내리기, Space는 parent toggle입니다.
-- `/` 검색, `a` attention-only, `r` refresh, `c` host 연결/해제입니다.
-- `p` pane capture, `m` exact-pane prompt composer, Enter remote attach, `?` help입니다.
+- `/` 검색, `a` attention-only, `r` refresh, `c` remote host 연결/해제입니다.
+  `local`에서는 항상 연결됐다는 안내만 표시합니다.
+- `p` pane capture, `m` exact-pane prompt composer, Enter는 `local`이면 직접 이동하고
+  remote이면 SSH attach하며, `?`는 help입니다.
 
 session inspector는 window와 하위 pane을 함께 roll-up합니다. window를 선택하면
 필요할 때만 pane을 capture하고 실제 tmux split geometry로 mosaic를 렌더링합니다.
@@ -154,6 +184,11 @@ reconcile하며, subscription을 잃으면 relay를 재연결합니다. keepaliv
 transport를 감지합니다. host마다 task/state/backoff가 독립적이므로 느린 host 하나가
 전체를 막지 않고 `max_parallel_connects`가 동시 SSH handshake를 제한합니다.
 
+local adapter는 Store transition을 직접 구독하고 `refresh_secs`마다 backend topology를
+갱신합니다. backend scan은 async IPC executor가 아닌 blocking worker에서 실행되며,
+별도의 revisioned Fleet snapshot을 유지하므로 selector/UI가 authoritative local Store를
+복제하거나 변경하지 않습니다.
+
 central cache에는 agent/topology metadata만 저장합니다. terminal capture는 선택 시에만
 요청하고 크기를 제한하며 control sequence를 제거합니다. window capture의 병렬성과
 payload도 제한됩니다. prompt는 remote shell command에 삽입하지 않고 stdin frame으로만
@@ -165,8 +200,8 @@ mutation은 자동 retry하지 않습니다. 결과는 text delivery와 Enter su
 ## 다른 interface
 
 `muxa mcp`는 `muxa_fleet_status`, `muxa_fleet_capture`,
-`muxa_fleet_send_prompt`를 제공합니다. remote 도구는 host와 pane을 명시해야 하며 같은
-observe/control 검사를 거칩니다.
+`muxa_fleet_send_prompt`를 제공합니다. control 도구는 host와 pane을 명시해야 합니다.
+remote는 observe/control 검사를 적용하고 `local`은 owner-only socket control입니다.
 
 web dashboard를 켜면 read API에 `GET /api/fleet?selector=...`가 추가됩니다.
 `POST /api/fleet/{host}/command`는 serialized `FleetOperation`을 받아 PAT를 요구합니다.

@@ -3,17 +3,21 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use muxa::config::{FleetCapturePolicy, FleetConfig, FleetConnectPolicy, FleetHostConfig};
 use muxa::fleet::{
-    drain_bounded, read_bounded_line, sanitize_capture_text, sanitize_terminal_text,
-    FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult, FleetHostSnapshot,
-    FleetHostState, FleetOperation, FleetRuntime, FleetStore, HostAccessMode, NodeId, RelayFrame,
-    RelayHello, RelayRequest, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
-    FLEET_PROTOCOL_VERSION,
+    drain_bounded, load_or_create_node_id, read_bounded_line, sanitize_capture_text,
+    sanitize_terminal_text, validate_label_value, FleetCapturedWindowPane, FleetCommandEnvelope,
+    FleetCommandReceiver, FleetCommandResult, FleetHostSnapshot, FleetHostState, FleetOperation,
+    FleetRuntime, FleetStore, FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello,
+    RelayRequest, RemoteSnapshot, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
+    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS,
 };
+use muxa::tmux::SessionInfo;
+use muxa::{HostKind, PaneKey, SharedBackend, SharedStore, WindowKey};
 use time::OffsetDateTime;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -25,32 +29,60 @@ const MAX_PENDING_REQUESTS: usize = 64;
 
 pub(crate) async fn start(
     cfg: &FleetConfig,
+    local_agents: SharedStore,
+    backends: Vec<SharedBackend>,
+    daemon_generation: u64,
     shutdown: broadcast::Receiver<()>,
-) -> (Option<FleetRuntime>, Option<tokio::task::JoinHandle<()>>) {
-    if !cfg.enabled {
-        return (None, None);
-    }
-
+) -> (FleetRuntime, tokio::task::JoinHandle<()>) {
     let store = Arc::new(FleetStore::new());
     let (runtime, receiver) = FleetRuntime::new(Arc::clone(&store));
+    let local_transitions = local_agents.subscribe();
+    let local_revision = Arc::new(AtomicU64::new(0));
+    let (node_id, identity_error) = local_node_id();
+    let local_snapshot =
+        collect_local_snapshot(&local_agents, &backends, Arc::clone(&local_revision)).await;
+    store
+        .upsert_host(local_host(
+            cfg,
+            node_id.clone(),
+            daemon_generation,
+            local_snapshot,
+            identity_error.clone(),
+        ))
+        .await;
     for (alias, host) in &cfg.hosts {
-        store.upsert_host(base_host(alias, host)).await;
+        store.upsert_host(base_host(alias, host, cfg.enabled)).await;
     }
     let config = cfg.clone();
     let handle = tokio::spawn(async move {
-        run_manager(config, store, receiver, shutdown).await;
+        run_manager(ManagerInput {
+            cfg: config,
+            store,
+            commands: receiver,
+            local: LocalManagerInput {
+                agents: local_agents,
+                backends,
+                transitions: local_transitions,
+                revision: local_revision,
+                identity_error,
+                node_id,
+            },
+            shutdown,
+        })
+        .await;
     });
-    (Some(runtime), Some(handle))
+    (runtime, handle)
 }
 
-fn base_host(alias: &str, cfg: &FleetHostConfig) -> FleetHostSnapshot {
+fn base_host(alias: &str, cfg: &FleetHostConfig, fleet_enabled: bool) -> FleetHostSnapshot {
     FleetHostSnapshot {
         alias: alias.into(),
+        local: false,
         ssh_target: cfg.ssh.clone(),
         labels: cfg.labels.clone(),
         annotations: cfg.annotations.clone(),
         mode: cfg.mode,
-        state: if cfg.enabled {
+        state: if fleet_enabled && cfg.enabled {
             FleetHostState::Connecting
         } else {
             FleetHostState::Disabled
@@ -72,19 +104,58 @@ fn base_host(alias: &str, cfg: &FleetHostConfig) -> FleetHostSnapshot {
     }
 }
 
-async fn run_manager(
+struct ManagerInput {
     cfg: FleetConfig,
     store: Arc<FleetStore>,
-    mut commands: FleetCommandReceiver,
-    mut shutdown: broadcast::Receiver<()>,
-) {
+    commands: FleetCommandReceiver,
+    local: LocalManagerInput,
+    shutdown: broadcast::Receiver<()>,
+}
+
+struct LocalManagerInput {
+    agents: SharedStore,
+    backends: Vec<SharedBackend>,
+    transitions: broadcast::Receiver<muxa::Transition>,
+    revision: Arc<AtomicU64>,
+    identity_error: Option<String>,
+    node_id: NodeId,
+}
+
+async fn run_manager(input: ManagerInput) {
+    let ManagerInput {
+        cfg,
+        store,
+        mut commands,
+        local,
+        mut shutdown,
+    } = input;
     let permits = Arc::new(Semaphore::new(cfg.max_parallel_connects));
-    let node_registry = Arc::new(RwLock::new(BTreeMap::<NodeId, String>::new()));
+    let node_registry = Arc::new(RwLock::new(BTreeMap::from([(
+        local.node_id,
+        LOCAL_HOST_ALIAS.to_string(),
+    )])));
     let mut routes = HashMap::new();
     let mut handles = Vec::new();
 
+    let (local_tx, local_rx) = mpsc::channel(64);
+    routes.insert(LOCAL_HOST_ALIAS.to_string(), local_tx);
+    handles.push(tokio::spawn(
+        LocalTask {
+            fleet: cfg.clone(),
+            store: Arc::clone(&store),
+            agents: local.agents,
+            backends: local.backends,
+            commands: local_rx,
+            transitions: local.transitions,
+            revision: local.revision,
+            identity_error: local.identity_error,
+            shutdown: shutdown.resubscribe(),
+        }
+        .run(),
+    ));
+
     for (alias, host) in &cfg.hosts {
-        if !host.enabled {
+        if !cfg.enabled || !host.enabled {
             continue;
         }
         let (tx, rx) = mpsc::channel(64);
@@ -127,6 +198,436 @@ async fn run_manager(
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
     }
+}
+
+fn local_node_id() -> (NodeId, Option<String>) {
+    let Some(path) = muxa::paths::default_node_id_file() else {
+        return (
+            NodeId::generate(),
+            Some("no data directory is available; local NodeId is ephemeral".into()),
+        );
+    };
+    match load_or_create_node_id(&path) {
+        Ok(node_id) => (node_id, None),
+        Err(error) => (
+            NodeId::generate(),
+            Some(format!(
+                "could not persist local NodeId at {}: {error}; identity is ephemeral",
+                path.display()
+            )),
+        ),
+    }
+}
+
+fn local_host(
+    cfg: &FleetConfig,
+    node_id: NodeId,
+    daemon_generation: u64,
+    remote: RemoteSnapshot,
+    identity_error: Option<String>,
+) -> FleetHostSnapshot {
+    let hostname = local_hostname();
+    let mut labels = cfg.local.labels.clone();
+    labels.insert("muxa.io/local".into(), "true".into());
+    labels.insert("muxa.io/transport".into(), "local".into());
+    labels.insert("kubernetes.io/os".into(), std::env::consts::OS.into());
+    labels.insert("kubernetes.io/arch".into(), std::env::consts::ARCH.into());
+    if validate_label_value(&hostname).is_ok() {
+        labels.insert("kubernetes.io/hostname".into(), hostname.clone());
+    }
+    let now = OffsetDateTime::now_utc();
+    FleetHostSnapshot {
+        alias: LOCAL_HOST_ALIAS.into(),
+        local: true,
+        ssh_target: "local://".into(),
+        labels,
+        annotations: cfg.local.annotations.clone(),
+        mode: HostAccessMode::Control,
+        state: if identity_error.is_some() {
+            FleetHostState::Degraded
+        } else {
+            FleetHostState::Online
+        },
+        node_id: Some(node_id),
+        hostname: Some(hostname),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        muxa_version: Some(env!("CARGO_PKG_VERSION").into()),
+        protocol: Some(FLEET_PROTOCOL_VERSION),
+        capabilities: FLEET_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect(),
+        daemon_generation: Some(daemon_generation),
+        boot_id: Some(local_boot_id()),
+        latency_ms: Some(0),
+        last_seen_at: Some(remote.observed_at),
+        received_at: Some(now),
+        error: identity_error,
+        remote: Some(remote),
+    }
+}
+
+struct LocalTask {
+    fleet: FleetConfig,
+    store: Arc<FleetStore>,
+    agents: SharedStore,
+    backends: Vec<SharedBackend>,
+    commands: mpsc::Receiver<HostCommand>,
+    transitions: broadcast::Receiver<muxa::Transition>,
+    revision: Arc<AtomicU64>,
+    identity_error: Option<String>,
+    shutdown: broadcast::Receiver<()>,
+}
+
+impl LocalTask {
+    async fn run(mut self) {
+        let mut refresh = tokio::time::interval(Duration::from_secs(self.fleet.refresh_secs));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The initial snapshot was collected before the manager was exposed.
+        refresh.tick().await;
+        loop {
+            tokio::select! {
+                _ = self.shutdown.recv() => break,
+                _ = refresh.tick() => self.refresh().await,
+                transition = self.transitions.recv() => {
+                    match transition {
+                        Ok(transition) => {
+                            let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+                            self.store.apply_transition(LOCAL_HOST_ALIAS, revision, transition).await;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            self.revision.fetch_add(skipped, Ordering::SeqCst);
+                            self.refresh().await;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.store.mutate_host(LOCAL_HOST_ALIAS, |host| {
+                                host.state = FleetHostState::Degraded;
+                                host.error = Some("local agent transition stream closed".into());
+                            }).await;
+                            break;
+                        }
+                    }
+                }
+                command = self.commands.recv() => {
+                    let Some(command) = command else { break; };
+                    let result = self.execute(command.operation).await;
+                    let _ = command.reply.send(result);
+                }
+            }
+        }
+    }
+
+    async fn refresh(&self) {
+        let snapshot =
+            collect_local_snapshot(&self.agents, &self.backends, Arc::clone(&self.revision)).await;
+        let observed = snapshot.observed_at;
+        let identity_error = self.identity_error.clone();
+        self.store
+            .mutate_host(LOCAL_HOST_ALIAS, |host| {
+                host.remote = Some(merge_remote_snapshot(host.remote.take(), snapshot));
+                host.state = if identity_error.is_some() {
+                    FleetHostState::Degraded
+                } else {
+                    FleetHostState::Online
+                };
+                host.last_seen_at = Some(observed);
+                host.received_at = Some(OffsetDateTime::now_utc());
+                host.error = identity_error;
+            })
+            .await;
+    }
+
+    async fn execute(&self, operation: FleetOperation) -> Result<FleetCommandResult, String> {
+        match operation {
+            FleetOperation::Connect => Ok(FleetCommandResult::accepted(
+                "local host is always connected",
+            )),
+            FleetOperation::Disconnect => {
+                Err("local host cannot be disconnected from its own muxad".into())
+            }
+            FleetOperation::Refresh => {
+                self.refresh().await;
+                let revision = self.revision.load(Ordering::SeqCst);
+                Ok(FleetCommandResult::accepted(format!(
+                    "refreshed local revision {revision}"
+                )))
+            }
+            FleetOperation::Capture { pane } => {
+                if self.fleet.capture_policy == FleetCapturePolicy::Never {
+                    return Err("fleet capture policy is 'never'".into());
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "capture", 0);
+                local_capture(&self.backends, pane).await
+            }
+            FleetOperation::CaptureWindow { window } => {
+                if self.fleet.capture_policy == FleetCapturePolicy::Never {
+                    return Err("fleet capture policy is 'never'".into());
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "capture_window", 0);
+                local_capture_window(&self.backends, window).await
+            }
+            FleetOperation::SendPrompt { pane, text, submit } => {
+                if text.len() > FLEET_MAX_FRAME_BYTES {
+                    return Err(format!(
+                        "local prompt exceeds {FLEET_MAX_FRAME_BYTES} bytes"
+                    ));
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
+                local_send_prompt(&self.backends, pane, text, submit).await
+            }
+        }
+    }
+}
+
+async fn collect_local_snapshot(
+    agents: &SharedStore,
+    backends: &[SharedBackend],
+    revision: Arc<AtomicU64>,
+) -> RemoteSnapshot {
+    // Pin before scans so transitions received while a backend is enumerating
+    // have a newer revision and are overlaid by `merge_remote_snapshot`.
+    let snapshot_revision = revision.load(Ordering::SeqCst);
+    let pane_tasks = backends
+        .iter()
+        .map(|backend| {
+            let backend = backend.clone();
+            tokio::task::spawn_blocking(move || backend.list_panes())
+        })
+        .collect::<Vec<_>>();
+    let session_tasks = backends
+        .iter()
+        .map(|backend| {
+            let kind = backend.kind();
+            tokio::task::spawn_blocking(move || local_sessions_for_backend(kind))
+        })
+        .collect::<Vec<_>>();
+    let agents = agents.snapshot().await;
+    let mut panes = Vec::new();
+    for task in pane_tasks {
+        match task.await {
+            Ok(observed) => panes.extend(observed),
+            Err(error) => tracing::warn!(%error, "local Fleet pane scan panicked"),
+        }
+    }
+    let mut sessions = Vec::new();
+    for task in session_tasks {
+        match task.await {
+            Ok(observed) => sessions.extend(observed),
+            Err(error) => tracing::warn!(%error, "local Fleet session scan panicked"),
+        }
+    }
+    RemoteSnapshot {
+        revision: snapshot_revision,
+        observed_at: OffsetDateTime::now_utc(),
+        agents,
+        panes,
+        sessions,
+        backends: local_backend_info(backends),
+    }
+}
+
+fn local_sessions_for_backend(kind: HostKind) -> Vec<SessionInfo> {
+    match kind {
+        HostKind::Tmux => muxa::tmux::list_sessions().unwrap_or_default(),
+        HostKind::Herdr => {
+            let socket = muxa::backend::herdr::default_socket_path();
+            muxa::backend::herdr::herdr_list_workspaces(&socket)
+                .into_iter()
+                .map(|workspace| SessionInfo {
+                    session_id: workspace.id,
+                    name: workspace.label,
+                    attached_clients: 0,
+                })
+                .collect()
+        }
+        HostKind::Rmux | HostKind::Zellij => Vec::new(),
+    }
+}
+
+fn local_backend_info(backends: &[SharedBackend]) -> Vec<muxa::fleet::FleetBackendInfo> {
+    backends
+        .iter()
+        .map(|backend| muxa::fleet::FleetBackendInfo::new(backend.kind(), backend.caps()))
+        .collect()
+}
+
+async fn exact_local_backend(
+    backends: &[SharedBackend],
+    key: &PaneKey,
+) -> Result<SharedBackend, String> {
+    let backend = backends
+        .iter()
+        .find(|backend| backend.kind() == key.window.session.endpoint.host)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "{} backend is unavailable",
+                key.window.session.endpoint.host
+            )
+        })?;
+    let scanner = backend.clone();
+    let panes = tokio::task::spawn_blocking(move || scanner.list_panes())
+        .await
+        .map_err(|error| format!("local pane scan panicked: {error}"))?;
+    if !panes
+        .iter()
+        .any(|pane| PaneKey::from_pane(backend.kind(), pane) == *key)
+    {
+        return Err("exact local pane target is stale or no longer exists".into());
+    }
+    Ok(backend)
+}
+
+async fn local_capture(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().capture_pane {
+        return Err(format!(
+            "{} backend does not support pane capture",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let capture = tokio::task::spawn_blocking(move || {
+        backend
+            .capture_pane_on(Some(&socket), &pane_id)
+            .map(sanitize_capture_text)
+    })
+    .await
+    .map_err(|error| format!("local capture task panicked: {error}"))?;
+    Ok(FleetCommandResult::capture(capture))
+}
+
+async fn local_capture_window(
+    backends: &[SharedBackend],
+    window: WindowKey,
+) -> Result<FleetCommandResult, String> {
+    if window.session.endpoint.host != HostKind::Tmux {
+        return Err("window geometry is currently available only for tmux backends".into());
+    }
+    let backend = backends
+        .iter()
+        .find(|backend| backend.kind() == HostKind::Tmux)
+        .cloned()
+        .ok_or_else(|| "tmux backend is unavailable".to_string())?;
+    let verify_backend = backend.clone();
+    let verify_window = window.clone();
+    let exists = tokio::task::spawn_blocking(move || {
+        verify_backend
+            .list_panes()
+            .iter()
+            .any(|pane| PaneKey::from_pane(verify_backend.kind(), pane).window == verify_window)
+    })
+    .await
+    .map_err(|error| format!("local window verification panicked: {error}"))?;
+    if !exists {
+        return Err("exact local window target is stale or no longer exists".into());
+    }
+    let capture = tokio::task::spawn_blocking(move || {
+        let socket = window.session.endpoint.socket.clone();
+        let (geometries, zoomed) =
+            muxa::tmux::layout::window_panes_on(Some(&socket), &window.window_id);
+        let visible = geometries
+            .into_iter()
+            .filter(|geometry| !zoomed || geometry.active)
+            .collect::<Vec<_>>();
+        let mut panes = Vec::with_capacity(visible.len());
+        for batch in visible.chunks(8) {
+            panes.extend(std::thread::scope(|scope| {
+                batch
+                    .iter()
+                    .cloned()
+                    .map(|geometry| {
+                        let backend = backend.clone();
+                        let socket = socket.clone();
+                        scope.spawn(move || {
+                            let text = backend
+                                .capture_pane_on(Some(&socket), &geometry.pane_id)
+                                .map(sanitize_capture_text);
+                            FleetCapturedWindowPane { geometry, text }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        FleetWindowCapture {
+            window,
+            panes,
+            zoomed,
+            observed_at: OffsetDateTime::now_utc(),
+        }
+    })
+    .await
+    .map_err(|error| format!("local window capture panicked: {error}"))?;
+    let result = FleetCommandResult::window_capture(capture);
+    let encoded = serde_json::to_vec(&result)
+        .map_err(|error| format!("encoding local window capture: {error}"))?;
+    if encoded.len() > FLEET_MAX_FRAME_BYTES {
+        return Err(format!(
+            "local window capture exceeds {FLEET_MAX_FRAME_BYTES} bytes"
+        ));
+    }
+    Ok(result)
+}
+
+async fn local_send_prompt(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+    text: String,
+    submit: bool,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().send_text {
+        return Err(format!(
+            "{} backend does not support text injection",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let outcome = tokio::task::spawn_blocking(move || {
+        if !backend.send_text_on(Some(&socket), &pane_id, &text) {
+            return None;
+        }
+        let submitted = if submit {
+            std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+            backend.send_text_on(Some(&socket), &pane_id, "\r")
+        } else {
+            false
+        };
+        Some(muxa::ipc::SendPromptOutcome {
+            sent: true,
+            submitted,
+        })
+    })
+    .await
+    .map_err(|error| format!("local send task panicked: {error}"))?
+    .ok_or_else(|| "backend refused text injection".to_string())?;
+    Ok(FleetCommandResult::sent(outcome))
+}
+
+fn local_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn local_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("process-{}", std::process::id()))
 }
 
 struct HostCommand {
@@ -872,6 +1373,38 @@ mod tests {
     use super::*;
     use muxa::event::{AgentEvent, AgentId, AgentKind, AgentState};
     use muxa::state::Store;
+
+    #[test]
+    fn local_host_is_first_class_with_truthful_managed_labels() {
+        let mut cfg = FleetConfig::default();
+        cfg.local
+            .labels
+            .insert("environment".into(), "development".into());
+        cfg.local
+            .annotations
+            .insert("example.com/owner".into(), "June".into());
+        let observed_at = OffsetDateTime::now_utc();
+        let remote = RemoteSnapshot {
+            revision: 4,
+            observed_at,
+            agents: Vec::new(),
+            panes: Vec::new(),
+            sessions: Vec::new(),
+            backends: Vec::new(),
+        };
+        let host = local_host(&cfg, NodeId::generate(), 9, remote, None);
+        assert!(host.local);
+        assert_eq!(host.alias, LOCAL_HOST_ALIAS);
+        assert_eq!(host.ssh_target, "local://");
+        assert_eq!(host.mode, HostAccessMode::Control);
+        assert_eq!(host.state, FleetHostState::Online);
+        assert_eq!(host.labels["muxa.io/local"], "true");
+        assert_eq!(host.labels["muxa.io/transport"], "local");
+        assert_eq!(host.labels["environment"], "development");
+        assert_eq!(host.annotations["example.com/owner"], "June");
+        assert_eq!(host.daemon_generation, Some(9));
+        assert_eq!(host.remote.unwrap().revision, 4);
+    }
 
     #[test]
     fn ssh_errors_are_classified_without_ansi_controls() {

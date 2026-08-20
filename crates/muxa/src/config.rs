@@ -134,7 +134,12 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FleetConfig {
+    /// Enable persistent outbound SSH connections. The controller's local
+    /// node is published regardless of this flag.
     pub enabled: bool,
+    /// Metadata for the controller node. It is always visible; `enabled`
+    /// controls only outbound SSH host connections.
+    pub local: FleetLocalConfig,
     pub refresh_secs: u64,
     pub keepalive_secs: u64,
     pub offline_after_secs: u64,
@@ -149,6 +154,7 @@ impl Default for FleetConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            local: FleetLocalConfig::default(),
             refresh_secs: 15,
             keepalive_secs: 10,
             offline_after_secs: 30,
@@ -159,6 +165,14 @@ impl Default for FleetConfig {
             hosts: BTreeMap::new(),
         }
     }
+}
+
+/// User-managed metadata layered onto the always-present local Fleet node.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FleetLocalConfig {
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1042,7 +1056,20 @@ fn validate_fleet(cfg: &FleetConfig) -> std::result::Result<(), ConfigError> {
             "must be between 1 and 128".into(),
         ));
     }
+    validate_fleet_metadata(
+        &cfg.local.labels,
+        &cfg.local.annotations,
+        "fleet.local",
+        crate::fleet::LOCAL_MANAGED_LABELS,
+    )?;
     for (alias, host) in &cfg.hosts {
+        if alias == crate::fleet::LOCAL_HOST_ALIAS {
+            return Err(invalid(
+                format!("fleet.hosts.{alias}"),
+                "the alias 'local' is reserved for this muxad node; configure its metadata under [fleet.local]"
+                    .into(),
+            ));
+        }
         validate_label_value(alias).map_err(|message| {
             invalid(
                 format!("fleet.hosts.{alias}"),
@@ -1086,17 +1113,43 @@ fn validate_fleet(cfg: &FleetConfig) -> std::result::Result<(), ConfigError> {
                 ));
             }
         }
-        for (key, value) in &host.labels {
-            validate_label_key(key)
-                .map_err(|message| invalid(format!("fleet.hosts.{alias}.labels.{key}"), message))?;
-            validate_label_value(value)
-                .map_err(|message| invalid(format!("fleet.hosts.{alias}.labels.{key}"), message))?;
+        validate_fleet_metadata(
+            &host.labels,
+            &host.annotations,
+            &format!("fleet.hosts.{alias}"),
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_fleet_metadata(
+    labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+    path: &str,
+    managed_labels: &[&str],
+) -> std::result::Result<(), ConfigError> {
+    for (key, value) in labels {
+        if managed_labels.contains(&key.as_str()) {
+            return Err(ConfigError::InvalidFleet {
+                path: format!("{path}.labels.{key}"),
+                message: "is managed by muxad and cannot be overridden".into(),
+            });
         }
-        for key in host.annotations.keys() {
-            validate_label_key(key).map_err(|message| {
-                invalid(format!("fleet.hosts.{alias}.annotations.{key}"), message)
-            })?;
-        }
+        validate_label_key(key).map_err(|message| ConfigError::InvalidFleet {
+            path: format!("{path}.labels.{key}"),
+            message,
+        })?;
+        validate_label_value(value).map_err(|message| ConfigError::InvalidFleet {
+            path: format!("{path}.labels.{key}"),
+            message,
+        })?;
+    }
+    for key in annotations.keys() {
+        validate_label_key(key).map_err(|message| ConfigError::InvalidFleet {
+            path: format!("{path}.annotations.{key}"),
+            message,
+        })?;
     }
     Ok(())
 }
@@ -2575,5 +2628,53 @@ accelerator = "gpu"
         ));
         cfg.fleet.offline_after_secs = 20;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn fleet_local_metadata_is_independent_of_remote_enablement() {
+        let input = r#"
+[fleet]
+enabled = false
+
+[fleet.local.labels]
+environment = "development"
+
+[fleet.local.annotations]
+"muxa.dev/owner" = "June <june@example.com>"
+"#;
+        let cfg: Config = toml::from_str(input).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.fleet.enabled);
+        assert_eq!(cfg.fleet.local.labels["environment"], "development");
+        assert_eq!(
+            cfg.fleet.local.annotations["muxa.dev/owner"],
+            "June <june@example.com>"
+        );
+    }
+
+    #[test]
+    fn fleet_reserves_local_alias_and_managed_labels() {
+        let mut cfg = Config::default();
+        cfg.fleet.hosts.insert(
+            crate::fleet::LOCAL_HOST_ALIAS.into(),
+            FleetHostConfig {
+                ssh: "other-machine".into(),
+                ..FleetHostConfig::default()
+            },
+        );
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFleet { .. })
+        ));
+
+        cfg.fleet.hosts.clear();
+        cfg.fleet
+            .local
+            .labels
+            .insert("muxa.io/local".into(), "false".into());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFleet { .. })
+        ));
     }
 }

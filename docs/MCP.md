@@ -61,20 +61,23 @@ roles, and registered `/skills` to `muxa_call_peer`.
 
 ### Physical-host Fleet tools
 
-When `[fleet] enabled = true`, the same MCP server can operate the cached
+The same MCP server can always operate the controller through host `local`.
+When `[fleet] enabled = true`, it additionally operates the cached remote
 host/session/window/pane hierarchy:
 
 ```text
 muxa_fleet_status      { "selector": "environment=production" }
+muxa_fleet_capture     { "host": "local", "pane": "%12" }
 muxa_fleet_capture     { "host": "dev", "pane": "%12" }
 muxa_fleet_send_prompt { "host": "dev", "pane": "%12",
                          "text": "Summarize the result", "submit": true }
 ```
 
-The host and pane are always explicit. Ambiguous pane ids are rejected, the
-relay verifies the complete identity again, and an observe-mode host rejects
-prompt delivery. Fleet calls use muxad's persistent SSH/cache control plane;
-the MCP subprocess never opens SSH itself. See [FLEET.md](FLEET.md).
+The host and pane are always explicit. Ambiguous pane ids are rejected. The
+local in-process adapter and remote relay both verify the complete identity
+again, and an observe-mode remote host rejects prompt delivery. Fleet calls
+use muxad's cache/control plane; the MCP subprocess never opens SSH itself.
+See [FLEET.md](FLEET.md).
 
 ## Implementation
 

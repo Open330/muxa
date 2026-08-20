@@ -282,12 +282,15 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 
 ## Fleet host
 
-로컬 muxad를 여러 SSH host의 중앙 controller로 사용할 수 있습니다. 각 physical node는
+로컬 muxad를 현재 장비와 여러 SSH host의 중앙 controller로 사용할 수 있습니다.
+controller 장비는 별도 Fleet 설정 없이 즉시 `local` node로 나타납니다. 각 physical node는
 stable UUID와 label/annotation metadata를 가지며 controller는 node마다 persistent outbound
 SSH stdio relay와 독립적인 last-known cache를 유지합니다. 기본값은 `observe`이고
 `control`은 host별로 명시해야 합니다. 원격 TCP listener는 열지 않습니다.
 
 ```bash
+muxa fleet status                         # local은 이미 표시됨
+muxa host label local environment=development
 muxa host add dev muxa-devbox --label environment=development --mode observe
 muxa host doctor dev
 muxa fleet watch

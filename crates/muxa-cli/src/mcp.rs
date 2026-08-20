@@ -91,7 +91,8 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     When work is already represented by a validated AIR 1 workflow, plan, or trace, \
     attach its typed air_artifacts reference for shared identity and visualization; \
     AIR Workbench remains the validator/editor and muxa never implies conformance. \
-    SSH fleet operations are a separate physical-host control plane: discover hosts \
+    Fleet operations are a separate physical-host control plane whose always-present \
+    local host needs no SSH configuration: discover hosts \
     with muxa_fleet_status, always name the host and pane explicitly for capture or \
     prompt delivery, and remember that observe-mode hosts reject control actions.";
 
@@ -487,7 +488,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_status",
-            "description": "Read the cached SSH fleet hierarchy and health for physical hosts. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
+            "description": "Read the cached physical-host Fleet hierarchy and health, including the always-present local controller node. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -498,11 +499,11 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_capture",
-            "description": "Capture one exact pane from a named SSH fleet host. The host must have a live cached topology; pane accepts a backend pane id or session/window/pane path and ambiguity is rejected.",
+            "description": "Capture one exact pane from a named Fleet host, including local. The host must have a live cached topology; pane accepts a backend pane id or session/window/pane path and ambiguity is rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "host": { "type": "string", "description": "Configured fleet host alias." },
+                    "host": { "type": "string", "description": "Fleet host alias; local always names the controller node." },
                     "pane": { "type": "string", "description": "Pane id such as %12 or session/window/%12." }
                 },
                 "required": ["host", "pane"],
@@ -511,11 +512,11 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_send_prompt",
-            "description": "Send literal text to one exact pane on a named control-mode SSH fleet host. The daemon enforces host authorization and never retries this mutation.",
+            "description": "Send literal text to one exact pane on a named Fleet host. Local is always control-capable; remote hosts must use control mode. The daemon never retries this mutation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "host": { "type": "string", "description": "Configured fleet host alias." },
+                    "host": { "type": "string", "description": "Fleet host alias; local always names the controller node." },
                     "pane": { "type": "string", "description": "Pane id such as %12 or session/window/%12." },
                     "text": { "type": "string", "description": "Literal prompt text." },
                     "submit": { "type": "boolean", "description": "Press Enter after delivery. Default true." }

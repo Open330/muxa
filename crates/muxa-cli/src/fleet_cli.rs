@@ -15,7 +15,7 @@ use muxa::fleet::{
     drain_bounded, read_bounded_line, sanitize_terminal_text, validate_label_key,
     validate_label_value, FleetHostSnapshot, FleetHostState, FleetOperation, GlobalPaneRef,
     HostAccessMode, LabelSelector, RelayFrame, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
-    FLEET_PROTOCOL_VERSION,
+    FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS, LOCAL_MANAGED_LABELS,
 };
 use muxa::ipc::Client;
 use muxa::{Config, PaneKey};
@@ -114,15 +114,15 @@ enum FleetCommand {
     Disconnect { host: String },
     /// Force a fresh full snapshot.
     Refresh { host: String },
-    /// List remote panes and their complete collision-free keys.
+    /// List panes on a local or remote Fleet host with collision-free keys.
     Panes {
         host: String,
         #[arg(long)]
         json: bool,
     },
-    /// Capture one exact remote pane selected by native pane id.
+    /// Capture one exact pane on a local or remote Fleet host.
     Capture { host: String, pane: String },
-    /// Send text to one exact remote agent pane.
+    /// Send text to one exact agent pane on a named Fleet host.
     Send {
         host: String,
         pane: String,
@@ -130,7 +130,7 @@ enum FleetCommand {
         #[arg(long, default_value_t = true)]
         submit: bool,
     },
-    /// Attach this terminal to one exact remote pane over a separate SSH TTY.
+    /// Attach to one exact pane directly when local, or through a separate SSH TTY.
     Attach { host: String, pane: String },
 }
 
@@ -185,6 +185,11 @@ pub(crate) async fn run_host(
         } => {
             let path = config_path.context("no config directory is available on this system")?;
             validate_label_value(&alias).map_err(anyhow::Error::msg)?;
+            if alias == LOCAL_HOST_ALIAS {
+                bail!(
+                    "host alias '{LOCAL_HOST_ALIAS}' is reserved for this node; use `muxa host label local` or `muxa host annotate local`"
+                );
+            }
             if cfg.fleet.hosts.contains_key(&alias) && !overwrite {
                 bail!("host '{alias}' already exists; pass --overwrite to replace it");
             }
@@ -219,6 +224,28 @@ pub(crate) async fn run_host(
             Ok(())
         }
         HostCommand::Show { alias } => {
+            if alias == LOCAL_HOST_ALIAS {
+                let live = client.fleet_snapshot(None).await.ok().and_then(|snapshot| {
+                    snapshot
+                        .hosts
+                        .into_iter()
+                        .find(|item| item.alias == LOCAL_HOST_ALIAS)
+                });
+                println!("alias:       {LOCAL_HOST_ALIAS}");
+                println!("transport:   local (in-process)");
+                println!("mode:        Control");
+                println!("connect:     Always");
+                println!("enabled:     true");
+                println!("labels:      {}", format_map(&cfg.fleet.local.labels));
+                println!("annotations: {}", format_map(&cfg.fleet.local.annotations));
+                if let Some(live) = live {
+                    println!("effective:   {}", format_map(&live.labels));
+                    print_live_host(&live);
+                } else {
+                    println!("state:       Offline (muxad Fleet IPC unavailable)");
+                }
+                return Ok(());
+            }
             let host = cfg
                 .fleet
                 .hosts
@@ -237,27 +264,12 @@ pub(crate) async fn run_host(
             println!("labels:      {}", format_map(&host.labels));
             println!("annotations: {}", format_map(&host.annotations));
             if let Some(live) = live {
-                println!("state:       {:?}", live.state);
-                println!(
-                    "node id:     {}",
-                    live.node_id.as_ref().map_or("-", muxa::NodeId::as_str)
-                );
-                println!(
-                    "hostname:    {}",
-                    sanitize_terminal_text(live.hostname.as_deref().unwrap_or("-"))
-                );
-                println!(
-                    "version:     {}",
-                    sanitize_terminal_text(live.muxa_version.as_deref().unwrap_or("-"))
-                );
-                println!("agents:      {}", live.agent_count());
-                if let Some(error) = live.error {
-                    println!("error:       {}", sanitize_terminal_text(&error));
-                }
+                print_live_host(&live);
             }
             Ok(())
         }
         HostCommand::Remove { alias } => {
+            reject_local_inventory_mutation(&alias, "removed")?;
             let path = config_path.context("no config directory is available on this system")?;
             if !cfg.fleet.hosts.contains_key(&alias) {
                 bail!("host '{alias}' is not configured");
@@ -302,15 +314,17 @@ pub(crate) async fn run_host(
             .await
         }
         HostCommand::Enable { alias } => {
+            reject_local_inventory_mutation(&alias, "enabled or disabled")?;
             set_host_enabled(config_path, cfg, client, &alias, true).await
         }
         HostCommand::Disable { alias } => {
+            reject_local_inventory_mutation(&alias, "enabled or disabled")?;
             set_host_enabled(config_path, cfg, client, &alias, false).await
         }
         HostCommand::Doctor {
             alias,
             timeout_secs,
-        } => doctor(cfg, &alias, Duration::from_secs(timeout_secs)).await,
+        } => doctor(client, cfg, &alias, Duration::from_secs(timeout_secs)).await,
     }
 }
 
@@ -506,6 +520,9 @@ async fn attach(client: &Client, cfg: &Config, host: &str, pane: &str) -> Result
 
 pub(crate) fn attach_exact(cfg: &Config, host: &str, target: &GlobalPaneRef) -> Result<()> {
     let token = crate::relay::encode_attach_token(target)?;
+    if host == LOCAL_HOST_ALIAS {
+        return crate::relay::remote_attach(&token);
+    }
     let configured = cfg
         .fleet
         .hosts
@@ -532,7 +549,47 @@ pub(crate) fn attach_exact(cfg: &Config, host: &str, target: &GlobalPaneRef) -> 
     Ok(())
 }
 
-async fn doctor(cfg: &Config, alias: &str, timeout: Duration) -> Result<()> {
+async fn doctor(client: &Client, cfg: &Config, alias: &str, timeout: Duration) -> Result<()> {
+    if alias == LOCAL_HOST_ALIAS {
+        return doctor_local(client, timeout).await;
+    }
+    doctor_remote(cfg, alias, timeout).await
+}
+
+async fn doctor_local(client: &Client, timeout: Duration) -> Result<()> {
+    println!("1/4 inventory       ok (built-in local node)");
+    let hello = tokio::time::timeout(timeout, client.hello(timeout))
+        .await
+        .map_err(|_| anyhow::anyhow!("local muxad hello timed out after {timeout:?}"))??;
+    println!(
+        "2/4 local muxad     ok (generation {})",
+        hello
+            .generation
+            .map_or_else(|| "-".into(), |value| value.to_string())
+    );
+    let snapshot = tokio::time::timeout(timeout, client.fleet_snapshot(None))
+        .await
+        .map_err(|_| anyhow::anyhow!("local Fleet snapshot timed out after {timeout:?}"))??;
+    let local = snapshot
+        .hosts
+        .into_iter()
+        .find(|host| host.local)
+        .context("muxad did not publish its local Fleet node")?;
+    let node_id = local.node_id.context("local Fleet node has no NodeId")?;
+    println!("3/4 local NodeId    ok ({node_id})");
+    let remote = local
+        .remote
+        .context("local Fleet node has no topology snapshot")?;
+    println!(
+        "4/4 local topology  ok ({} agents · {} panes · revision {})",
+        remote.agents.len(),
+        remote.panes.len(),
+        remote.revision
+    );
+    Ok(())
+}
+
+async fn doctor_remote(cfg: &Config, alias: &str, timeout: Duration) -> Result<()> {
     let host = cfg
         .fleet
         .hosts
@@ -638,46 +695,127 @@ fn inventory_with_live(
         .map(str::parse::<LabelSelector>)
         .transpose()
         .map_err(anyhow::Error::msg)?;
-    Ok(cfg
-        .fleet
-        .hosts
-        .iter()
-        .filter(|(_, host)| {
-            selector
+    let mut hosts = live.map_or_else(Vec::new, |snapshot| snapshot.hosts.clone());
+    if !hosts.iter().any(|host| host.local) {
+        let labels = local_inventory_labels(cfg);
+        if selector
+            .as_ref()
+            .is_none_or(|selector| selector.matches(&labels))
+        {
+            hosts.push(FleetHostSnapshot {
+                alias: LOCAL_HOST_ALIAS.into(),
+                local: true,
+                ssh_target: "local://".into(),
+                labels,
+                annotations: cfg.fleet.local.annotations.clone(),
+                mode: HostAccessMode::Control,
+                state: FleetHostState::Offline,
+                node_id: None,
+                hostname: None,
+                os: Some(std::env::consts::OS.into()),
+                arch: Some(std::env::consts::ARCH.into()),
+                muxa_version: Some(env!("CARGO_PKG_VERSION").into()),
+                protocol: Some(FLEET_PROTOCOL_VERSION),
+                capabilities: Vec::new(),
+                daemon_generation: None,
+                boot_id: None,
+                latency_ms: Some(0),
+                last_seen_at: None,
+                received_at: None,
+                error: Some("muxad Fleet IPC is unavailable".into()),
+                remote: None,
+            });
+        }
+    }
+    for (alias, host) in &cfg.fleet.hosts {
+        if hosts.iter().any(|item| item.alias == *alias)
+            || selector
                 .as_ref()
-                .is_none_or(|selector| selector.matches(&host.labels))
-        })
-        .map(|(alias, host)| {
-            live.and_then(|snapshot| snapshot.hosts.iter().find(|item| item.alias == *alias))
-                .cloned()
-                .unwrap_or_else(|| FleetHostSnapshot {
-                    alias: alias.clone(),
-                    ssh_target: host.ssh.clone(),
-                    labels: host.labels.clone(),
-                    annotations: host.annotations.clone(),
-                    mode: host.mode,
-                    state: if host.enabled {
-                        FleetHostState::Offline
-                    } else {
-                        FleetHostState::Disabled
-                    },
-                    node_id: None,
-                    hostname: None,
-                    os: None,
-                    arch: None,
-                    muxa_version: None,
-                    protocol: None,
-                    capabilities: Vec::new(),
-                    daemon_generation: None,
-                    boot_id: None,
-                    latency_ms: None,
-                    last_seen_at: None,
-                    received_at: None,
-                    error: Some("muxad has not loaded this inventory entry".into()),
-                    remote: None,
-                })
-        })
-        .collect())
+                .is_some_and(|selector| !selector.matches(&host.labels))
+        {
+            continue;
+        }
+        hosts.push(FleetHostSnapshot {
+            alias: alias.clone(),
+            local: false,
+            ssh_target: host.ssh.clone(),
+            labels: host.labels.clone(),
+            annotations: host.annotations.clone(),
+            mode: host.mode,
+            state: if cfg.fleet.enabled && host.enabled {
+                FleetHostState::Offline
+            } else {
+                FleetHostState::Disabled
+            },
+            node_id: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            muxa_version: None,
+            protocol: None,
+            capabilities: Vec::new(),
+            daemon_generation: None,
+            boot_id: None,
+            latency_ms: None,
+            last_seen_at: None,
+            received_at: None,
+            error: Some("muxad has not loaded this inventory entry".into()),
+            remote: None,
+        });
+    }
+    hosts.sort_by(|left, right| {
+        right
+            .local
+            .cmp(&left.local)
+            .then(left.alias.cmp(&right.alias))
+    });
+    Ok(hosts)
+}
+
+fn local_inventory_labels(cfg: &Config) -> BTreeMap<String, String> {
+    let mut labels = cfg.fleet.local.labels.clone();
+    labels.insert("muxa.io/local".into(), "true".into());
+    labels.insert("muxa.io/transport".into(), "local".into());
+    labels.insert("kubernetes.io/os".into(), std::env::consts::OS.into());
+    labels.insert("kubernetes.io/arch".into(), std::env::consts::ARCH.into());
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok());
+    if let Some(hostname) = hostname.filter(|value| validate_label_value(value).is_ok()) {
+        labels.insert("kubernetes.io/hostname".into(), hostname);
+    }
+    labels
+}
+
+fn print_live_host(live: &FleetHostSnapshot) {
+    println!("state:       {:?}", live.state);
+    println!(
+        "node id:     {}",
+        live.node_id.as_ref().map_or("-", muxa::NodeId::as_str)
+    );
+    println!(
+        "hostname:    {}",
+        sanitize_terminal_text(live.hostname.as_deref().unwrap_or("-"))
+    );
+    println!(
+        "version:     {}",
+        sanitize_terminal_text(live.muxa_version.as_deref().unwrap_or("-"))
+    );
+    println!("agents:      {}", live.agent_count());
+    if let Some(error) = &live.error {
+        println!("error:       {}", sanitize_terminal_text(error));
+    }
+}
+
+fn reject_local_inventory_mutation(alias: &str, action: &str) -> Result<()> {
+    if alias == LOCAL_HOST_ALIAS {
+        bail!(
+            "the always-present local host cannot be {action}; only its labels and annotations are user-managed"
+        );
+    }
+    Ok(())
 }
 
 fn print_hosts(hosts: &[FleetHostSnapshot]) {
@@ -758,18 +896,26 @@ async fn edit_metadata(
     annotation: bool,
 ) -> Result<()> {
     let path = config_path.context("no config directory is available on this system")?;
-    let current = cfg
-        .fleet
-        .hosts
-        .get(alias)
-        .with_context(|| format!("host '{alias}' is not configured"))?;
-    if changes.is_empty() {
-        let values = if annotation {
-            &current.annotations
+    let current = if alias == LOCAL_HOST_ALIAS {
+        if annotation {
+            &cfg.fleet.local.annotations
         } else {
-            &current.labels
-        };
-        println!("{}", format_map(values));
+            &cfg.fleet.local.labels
+        }
+    } else {
+        let host = cfg
+            .fleet
+            .hosts
+            .get(alias)
+            .with_context(|| format!("host '{alias}' is not configured"))?;
+        if annotation {
+            &host.annotations
+        } else {
+            &host.labels
+        }
+    };
+    if changes.is_empty() {
+        println!("{}", format_map(current));
         return Ok(());
     }
     edit_config(path, |document| {
@@ -777,6 +923,9 @@ async fn edit_metadata(
         for change in changes {
             if let Some(key) = change.strip_suffix('-').filter(|key| !key.contains('=')) {
                 validate_label_key(key).map_err(anyhow::Error::msg)?;
+                if !annotation && alias == LOCAL_HOST_ALIAS && LOCAL_MANAGED_LABELS.contains(&key) {
+                    bail!("label key '{key}' is managed by muxad and cannot be changed");
+                }
                 table.remove(key);
                 continue;
             }
@@ -785,6 +934,9 @@ async fn edit_metadata(
                 .with_context(|| format!("metadata '{change}' must be KEY=VALUE or KEY-"))?;
             validate_label_key(key).map_err(anyhow::Error::msg)?;
             if !annotation {
+                if alias == LOCAL_HOST_ALIAS && LOCAL_MANAGED_LABELS.contains(&key) {
+                    bail!("label key '{key}' is managed by muxad and cannot be changed");
+                }
                 validate_label_value(value).map_err(anyhow::Error::msg)?;
             }
             if table.contains_key(key) && !overwrite {
@@ -882,12 +1034,7 @@ fn write_document(path: &Path, text: &str) -> Result<()> {
 }
 
 fn fleet_hosts_table_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table> {
-    if document.get("fleet").is_none() {
-        document["fleet"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let fleet = document["fleet"]
-        .as_table_mut()
-        .context("[fleet] is not a table")?;
+    let fleet = fleet_table_mut(document)?;
     fleet.insert("enabled", toml_edit::value(true));
     if fleet.get("hosts").is_none() {
         fleet["hosts"] = toml_edit::Item::Table(toml_edit::Table::new());
@@ -895,6 +1042,15 @@ fn fleet_hosts_table_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut t
     fleet["hosts"]
         .as_table_mut()
         .context("[fleet.hosts] is not a table")
+}
+
+fn fleet_table_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table> {
+    if document.get("fleet").is_none() {
+        document["fleet"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    document["fleet"]
+        .as_table_mut()
+        .context("[fleet] is not a table")
 }
 
 fn host_table_mut<'a>(
@@ -912,6 +1068,21 @@ fn metadata_table_mut<'a>(
     alias: &str,
     field: &str,
 ) -> Result<&'a mut toml_edit::Table> {
+    if alias == LOCAL_HOST_ALIAS {
+        let fleet = fleet_table_mut(document)?;
+        if fleet.get("local").is_none() {
+            fleet["local"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let local = fleet["local"]
+            .as_table_mut()
+            .context("[fleet.local] is not a table")?;
+        if local.get(field).is_none() {
+            local[field] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        return local[field]
+            .as_table_mut()
+            .with_context(|| format!("[fleet.local.{field}] is not a table"));
+    }
     let host = host_table_mut(document, alias)?;
     if host.get(field).is_none() {
         host[field] = toml_edit::Item::Table(toml_edit::Table::new());
@@ -1005,5 +1176,35 @@ mod tests {
     fn pair_parser_accepts_annotation_urls_but_not_label_urls() {
         assert!(parse_pairs(&["docs=https://example.com/a".into()], true).is_ok());
         assert!(parse_pairs(&["docs=https://example.com/a".into()], false).is_err());
+    }
+
+    #[test]
+    fn local_inventory_is_visible_without_enabling_remote_fleet() {
+        let cfg = Config::default();
+        let hosts = inventory_with_live(&cfg, None, None).unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert!(hosts[0].local);
+        assert_eq!(hosts[0].alias, LOCAL_HOST_ALIAS);
+        assert_eq!(hosts[0].labels["muxa.io/local"], "true");
+
+        let selected = inventory_with_live(&cfg, None, Some("muxa.io/local=true")).unwrap();
+        assert_eq!(selected.len(), 1);
+        let excluded = inventory_with_live(&cfg, None, Some("muxa.io/local=false")).unwrap();
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn editing_local_metadata_does_not_enable_remote_connections() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        edit_config(&path, |document| {
+            metadata_table_mut(document, LOCAL_HOST_ALIAS, "labels")?
+                .insert("environment", toml_edit::value("development"));
+            Ok(())
+        })
+        .unwrap();
+        let updated = Config::load(&path).unwrap();
+        assert!(!updated.fleet.enabled);
+        assert_eq!(updated.fleet.local.labels["environment"], "development");
     }
 }

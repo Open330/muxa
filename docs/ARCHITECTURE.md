@@ -41,9 +41,10 @@ The CLI reads live daemon state over the socket and local retained files
 for history/reporting views, and can drive agents back through the socket
 (`send_prompt`/`capture`, exposed to other agents via `muxa mcp`).
 
-With `[fleet]` enabled, the controller daemon adds a separate physical-node
-plane. Each host task owns one OpenSSH stdio relay to the remote user's local
-muxad and writes only to its own `FleetStore` entry. Remote agents are never
+The controller daemon always adds a separate physical-node plane and publishes
+its own `local` node directly from the in-process Store/backends. With
+`[fleet]` enabled, each remote host task owns one OpenSSH stdio relay to the
+remote user's local muxad and writes only to its own `FleetStore` entry. Remote agents are never
 inserted into the local `Store`, so local reconciliation, pane-id reuse, and GC
 cannot corrupt another node's truth. See [FLEET.md](FLEET.md).
 
@@ -58,7 +59,7 @@ cannot corrupt another node's truth. See [FLEET.md](FLEET.md).
 | herdr bridge | Translates herdr's own `agent_status` stream into synthetic rows for agents muxa has no hooks for. |
 | Screen detection | Classifies hook-less agents (cursor, amp, …) from pane captures against TOML manifests; synthetic, hook-authoritative. |
 | Activity ledger | Append-only duration source for state/foreground/human intervals. |
-| FleetManager | Independent SSH relay state machines, node identity, authorization, revision reconciliation, and per-host caches. |
+| FleetManager | Always-present local adapter plus independent SSH relay state machines, node identity, authorization, revision reconciliation, and per-host caches. |
 
 Precedence when several producers describe one pane: **hooks > herdr
 bridge > screen detection** — synthetic rows are evicted the moment a real

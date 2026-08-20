@@ -324,13 +324,16 @@ agent herdr's own detection sees, with no manifest needed.
 
 ## Fleet Hosts
 
-Run muxad locally as a central controller for several SSH-reachable machines.
-Each physical node keeps its own stable UUID and label/annotation metadata;
+Run muxad locally as a central controller for this machine and several
+SSH-reachable machines. The controller appears immediately as the `local`
+node, without Fleet configuration. Each physical node keeps its own stable UUID and label/annotation metadata;
 the controller maintains one persistent outbound SSH stdio relay and an
 independent last-known cache per node. `observe` is the default, while
 `control` must be granted per host. No remote TCP listener is opened.
 
 ```bash
+muxa fleet status                         # local is already present
+muxa host label local environment=development
 muxa host add dev muxa-devbox --label environment=development --mode observe
 muxa host doctor dev
 muxa fleet watch

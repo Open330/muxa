@@ -39,6 +39,11 @@ prompt requests, results, errors, and explicit resync markers. See
 [`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
 separately from this local IPC protocol.
 
+The controller itself is always represented as host `local`. Its snapshot and
+commands use the same `FleetSnapshot`/`FleetOperation` schema and exact pane
+keys, but muxad executes them against its in-process Store/backends without an
+SSH or relay hop. `[fleet] enabled` therefore controls only remote transports.
+
 ## Request
 
 ```json
@@ -77,8 +82,9 @@ Response:
 
 #### `fleet_snapshot`
 
-Read muxad's per-physical-host cache. `selector` is an optional Kubernetes-
-style label selector. This operation never opens request-scoped SSH.
+Read muxad's per-physical-host cache, including the always-present `local`
+node. `selector` is an optional Kubernetes-style label selector. This
+operation never opens request-scoped SSH.
 
 ```json
 { "protocol": 4, "kind": "fleet_snapshot", "selector": "region=icn" }
@@ -86,8 +92,9 @@ style label selector. This operation never opens request-scoped SSH.
 
 #### `fleet_command`
 
-Dispatch one operation to an exact configured host. The manager rechecks the
-host's observe/control mode; the relay rechecks complete pane identity. Prompt
+Dispatch one operation to an exact host. The local adapter rechecks complete
+pane identity in process. For remote hosts the manager also rechecks
+observe/control mode and the relay verifies complete pane identity. Prompt
 mutations are not retried.
 
 ```json

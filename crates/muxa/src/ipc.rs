@@ -4963,6 +4963,7 @@ mod tests {
         fleet_store
             .upsert_host(FleetHostSnapshot {
                 alias: "dev".into(),
+                local: false,
                 ssh_target: "devbox".into(),
                 labels: std::collections::BTreeMap::from([(
                     "environment".into(),

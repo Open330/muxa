@@ -123,9 +123,9 @@ enum Cmd {
     },
     /// Register reusable `/` templates for the interactive message composer.
     Skill(message_skill::Args),
-    /// Manage the SSH host inventory and Kubernetes-style metadata.
+    /// Manage local/SSH host inventory and Kubernetes-style metadata.
     Host(fleet_cli::HostArgs),
-    /// Observe and control SSH-connected Muxa hosts.
+    /// Observe and control this node plus SSH-connected Muxa hosts.
     Fleet(fleet_cli::FleetArgs),
     /// Deterministic tmux agent lifecycle operations.
     Agent {

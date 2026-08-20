@@ -557,6 +557,10 @@ fn handle_key(
         }
         KeyCode::Char('c') => {
             if let Some(host) = app.selected_host() {
+                if host.local {
+                    app.status("local host is always connected");
+                    return Ok(false);
+                }
                 let operation = if matches!(
                     host.state,
                     FleetHostState::Online | FleetHostState::Connecting | FleetHostState::Degraded
@@ -1699,6 +1703,7 @@ mod tests {
     fn host() -> FleetHostSnapshot {
         FleetHostSnapshot {
             alias: "dev".into(),
+            local: false,
             ssh_target: "devbox".into(),
             labels: std::collections::BTreeMap::from([("tier".into(), "gpu".into())]),
             annotations: std::collections::BTreeMap::new(),

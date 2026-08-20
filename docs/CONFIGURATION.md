@@ -227,7 +227,7 @@ sweep that flips registered background tasks (see `muxa register`) to
 
 ```toml
 [fleet]
-enabled = true
+enabled = true              # outbound SSH hosts; local is always visible
 refresh_secs = 15
 keepalive_secs = 10
 offline_after_secs = 30
@@ -235,6 +235,12 @@ connect_timeout_secs = 10
 command_timeout_secs = 10
 max_parallel_connects = 6
 capture_policy = "selected" # selected | never
+
+[fleet.local.labels]
+environment = "development"
+
+[fleet.local.annotations]
+"muxa.dev/owner" = "platform"
 
 [fleet.hosts.dev]
 ssh = "muxa-devbox"
@@ -252,7 +258,10 @@ region = "icn"
 "muxa.dev/owner" = "platform"
 ```
 
-Fleet maintains one persistent OpenSSH stdio relay per enabled physical host.
+Fleet always publishes the controller as the first `local` host using an
+in-process snapshot; this remains available with `enabled = false`. The flag
+controls outbound SSH hosts. Fleet maintains one persistent OpenSSH stdio
+relay per enabled remote physical host.
 `offline_after_secs` must be at least twice `keepalive_secs`, and all timeout
 and concurrency values must be non-zero. `capture_policy = "never"` disables
 both pane and window capture at the manager even on control hosts.
@@ -262,7 +271,9 @@ identity, ProxyJump, and host-key policy in `~/.ssh/config`. `muxa_path` and
 `remote_socket` are validated as fixed remote command tokens. Labels implement
 Kubernetes-style selectors; annotations allow descriptive values but use the
 same namespaced key syntax. Prefer `muxa host add/label/annotate` to edit the
-inventory atomically. See [FLEET.md](FLEET.md).
+inventory atomically. Use `muxa host label local` and `muxa host annotate
+local` for controller metadata; muxad-managed identity labels cannot be
+overridden. See [FLEET.md](FLEET.md).
 
 ## Dashboard
 

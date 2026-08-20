@@ -36,8 +36,9 @@ agent hook/status event
 CLI는 live state를 socket으로 읽고, history/reporting view는 retained local
 file도 함께 사용합니다.
 
-`[fleet]`을 켜면 controller daemon에 별도의 physical-node plane이 추가됩니다. host별
-task가 remote user의 local muxad로 향하는 OpenSSH stdio relay 하나를 소유하고 자신의
+controller daemon은 항상 별도의 physical-node plane을 만들고 in-process Store/backend에서
+자신의 `local` node를 게시합니다. `[fleet]`을 켜면 remote host별 task가 remote user의
+local muxad로 향하는 OpenSSH stdio relay 하나를 소유하고 자신의
 `FleetStore` entry만 갱신합니다. remote agent는 local `Store`에 넣지 않으므로 local
 reconcile, pane-id 재사용, GC가 다른 node의 truth를 손상시키지 않습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
@@ -51,7 +52,7 @@ reconcile, pane-id 재사용, GC가 다른 node의 truth를 손상시키지 않�
 | Agent adapters | Claude/Codex/Gemini hook event를 muxa state transition으로 변환. |
 | tmux backend | pane/session, pane capture, foreground session activity 조회. |
 | Activity ledger | state/tmux/human interval의 append-only duration source. |
-| FleetManager | 독립 SSH relay state machine, node identity/권한, revision reconcile, host별 cache. |
+| FleetManager | always-present local adapter, 독립 SSH relay state machine, node identity/권한, revision reconcile, host별 cache. |
 
 ## Data Files
 

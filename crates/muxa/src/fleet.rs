@@ -28,6 +28,17 @@ use crate::topology::{PaneKey, WindowKey};
 
 pub const FLEET_PROTOCOL_VERSION: u32 = 1;
 pub const FLEET_MIN_PROTOCOL_VERSION: u32 = 1;
+/// Reserved inventory alias for the daemon's own physical node.
+pub const LOCAL_HOST_ALIAS: &str = "local";
+/// Truth-bearing labels populated by muxad for the controller node. Users may
+/// add metadata alongside these keys but cannot override them.
+pub const LOCAL_MANAGED_LABELS: &[&str] = &[
+    "muxa.io/local",
+    "muxa.io/transport",
+    "kubernetes.io/hostname",
+    "kubernetes.io/os",
+    "kubernetes.io/arch",
+];
 pub const FLEET_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const FLEET_MAX_DIAGNOSTIC_BYTES: usize = 1024;
 pub const FLEET_MAX_CAPTURE_BYTES: usize = 256 * 1024;
@@ -315,6 +326,11 @@ pub enum FleetHostState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetHostSnapshot {
     pub alias: String,
+    /// True for the controller node itself. The local node is always present
+    /// and never traverses SSH, even when remote Fleet connections are
+    /// disabled.
+    #[serde(default)]
+    pub local: bool,
     pub ssh_target: String,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
@@ -622,16 +638,25 @@ impl FleetStore {
     }
 
     pub async fn snapshot_selected(&self, selector: Option<&LabelSelector>) -> FleetSnapshot {
+        let mut hosts = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| selector.is_none_or(|selector| selector.matches(&host.labels)))
+            .cloned()
+            .collect::<Vec<_>>();
+        // The controller is the operator's anchor and should not disappear
+        // below alphabetically-earlier SSH aliases.
+        hosts.sort_by(|left, right| {
+            right
+                .local
+                .cmp(&left.local)
+                .then(left.alias.cmp(&right.alias))
+        });
         FleetSnapshot {
             generated_at: OffsetDateTime::now_utc(),
-            hosts: self
-                .hosts
-                .read()
-                .await
-                .values()
-                .filter(|host| selector.is_none_or(|selector| selector.matches(&host.labels)))
-                .cloned()
-                .collect(),
+            hosts,
         }
     }
 
@@ -963,6 +988,36 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncWriteExt, BufReader};
 
+    fn host(alias: &str, local: bool, labels: BTreeMap<String, String>) -> FleetHostSnapshot {
+        FleetHostSnapshot {
+            alias: alias.into(),
+            local,
+            ssh_target: alias.into(),
+            labels,
+            annotations: BTreeMap::new(),
+            mode: if local {
+                HostAccessMode::Control
+            } else {
+                HostAccessMode::Observe
+            },
+            state: FleetHostState::Online,
+            node_id: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            muxa_version: None,
+            protocol: None,
+            capabilities: Vec::new(),
+            daemon_generation: None,
+            boot_id: None,
+            latency_ms: None,
+            last_seen_at: None,
+            received_at: None,
+            error: None,
+            remote: None,
+        }
+    }
+
     #[test]
     fn node_id_is_stable_and_owner_scoped() {
         let dir = tempdir().unwrap();
@@ -1042,5 +1097,30 @@ mod tests {
             sanitize_terminal_text("ok\u{1b}[31mred\u{1b}[0m\u{1b}]0;bad\u{7}\u{0}done"),
             "okreddone"
         );
+    }
+
+    #[tokio::test]
+    async fn fleet_store_keeps_local_first_and_applies_selectors() {
+        let store = FleetStore::new();
+        store
+            .upsert_host(host(
+                "alpha",
+                false,
+                BTreeMap::from([("environment".into(), "production".into())]),
+            ))
+            .await;
+        store
+            .upsert_host(host(
+                LOCAL_HOST_ALIAS,
+                true,
+                BTreeMap::from([("muxa.io/local".into(), "true".into())]),
+            ))
+            .await;
+        let all = store.snapshot().await;
+        assert_eq!(all.hosts[0].alias, LOCAL_HOST_ALIAS);
+        let selector = "muxa.io/local=true".parse::<LabelSelector>().unwrap();
+        let selected = store.snapshot_selected(Some(&selector)).await;
+        assert_eq!(selected.hosts.len(), 1);
+        assert!(selected.hosts[0].local);
     }
 }
