@@ -1,10 +1,17 @@
 # muxa dashboard
 
-A small HTTP UI bolted onto the daemon. It shows the same agents you see on the
-tmux status line, a timeline graph of work/wait/error intervals, plus
-**every tmux pane on the box** (across all running servers), updated live
-over Server-Sent Events. Optional control actions are protected by a bearer
-token that can be pasted into the browser like a PAT.
+A work-oriented HTTP UI bolted onto the daemon. Its primary view projects the
+tmux execution topology into larger logical units: **session → workspace**,
+**window → work item (ticket)**, and **pane → participant (agent)**. This is a
+dashboard for scanning progress and attention across work, rather than another
+always-expanded tmux tree. Each ticket can still reveal its exact
+session/window/pane hierarchy and pane controls when execution detail is
+needed.
+
+The timeline and raw agent/pane/terminal inventories remain available as
+collapsed secondary panels. Data is updated live over Server-Sent Events, and
+optional control actions are protected by a bearer token that can be pasted
+into the browser like a PAT.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
 Token authentication is the default auth mode, and an enabled dashboard must
@@ -200,6 +207,30 @@ ones. Every per-socket invocation has a 1 s timeout.
 Results are cached for `pane_cache_ttl_ms` (default 2 s, lazy pull) so a
 hammering refresh loop doesn't fork tmux 60 times a minute.
 
+## Work-oriented projection
+
+The browser derives its work view from the existing `/api/panes` and
+`/api/agents` snapshots; this version does not introduce another database or
+duplicate tmux state on the server.
+
+| Dashboard concept | Execution source | Primary information |
+| ----------------- | ---------------- | ------------------- |
+| Workspace | tmux session, scoped by host/socket | ticket counts, activity, and attention |
+| Work item / ticket | tmux window | state, latest work signal, participants, last activity |
+| Participant / agent | tracked agent attached to a pane | runtime, model, and agent state |
+| Execution detail | pane plus its session/window coordinates | attach, prompt, and abort controls |
+
+The workspace rail deliberately does not render nested windows and panes.
+Selecting a workspace filters the ticket board. Expanding one ticket—or using
+the board-wide **expand execution** control—reveals only that work item's
+session/window/pane hierarchy. Endpoint-aware keys keep identical pane IDs on
+different tmux sockets from being merged.
+
+Names currently come from the underlying tmux session and window names, so
+unmanaged or legacy sessions may still look process-oriented. A team can get
+useful work labels immediately by naming sessions after workspaces and windows
+after tickets; explicit persisted ticket metadata is a future extension.
+
 ## Timeline
 
 The timeline panel calls `/api/timeline?since=7d` by default and can switch
@@ -224,7 +255,7 @@ attach; not a plain open `muxa watch` interval). The `human` metric follows
 interaction intervals. Timeline lanes still show raw human-interaction spans
 separately as `interaction`.
 
-The session sidebar can sort by `active`, `human`, or `tmux`. `active` uses
+The workspace sidebar can sort by `active`, `human`, or `tmux`. `active` uses
 the same last-touch attribution as `muxa stats`, so overlapping work across
 multiple sessions is counted once and assigned to the most recently touched
 session.

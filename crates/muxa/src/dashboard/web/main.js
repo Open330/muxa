@@ -1,3 +1,5 @@
+import { buildWorkProjection, normalizeAgent } from "./work-model.mjs";
+
 // muxa dashboard frontend.
 //
 // Vanilla ES2022 modules — no build step. Loaded as
@@ -27,6 +29,7 @@
 const TOKEN_KEY = "muxa.token";
 const COLLAPSED_PANELS_KEY = "muxa.dashboard.collapsedPanels";
 const COLLAPSED_TIMELINE_GROUPS_KEY = "muxa.dashboard.collapsedTimelineGroups";
+const EXPANDED_WORKS_KEY = "muxa.dashboard.expandedWorks";
 const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
 const PANES_REFETCH_INTERVAL_MS = 5000;
@@ -206,6 +209,9 @@ const dom = {
   sessionsMeta: document.getElementById("sessions-meta"),
   sessionSort: document.getElementById("session-sort"),
   showAllSessions: document.getElementById("show-all-sessions"),
+  workItemsMeta: document.getElementById("work-items-meta"),
+  workItemsContent: document.getElementById("work-items-content"),
+  toggleWorkExecution: document.getElementById("toggle-work-execution"),
   metricWorking: document.getElementById("metric-working"),
   metricWaiting: document.getElementById("metric-waiting"),
   metricErrors: document.getElementById("metric-errors"),
@@ -271,6 +277,7 @@ function renderAccess() {
   if (store.agents.size > 0) renderAgents();
   if (store.panes.length > 0) renderPanes();
   if (store.terminalSessions.length > 0) renderTerminals();
+  renderWorkItems();
 }
 
 async function fetchAccess() {
@@ -314,13 +321,13 @@ function initAccessControl() {
   });
 }
 
-function loadSet(key) {
+function loadSet(key, fallback = []) {
   try {
     const raw = localStorage.getItem(key);
-    const vals = raw ? JSON.parse(raw) : [];
-    return new Set(Array.isArray(vals) ? vals : []);
+    const vals = raw ? JSON.parse(raw) : fallback;
+    return new Set(Array.isArray(vals) ? vals : fallback);
   } catch (_) {
-    return new Set();
+    return new Set(fallback);
   }
 }
 
@@ -375,16 +382,21 @@ const store = {
     terminalFingerprint: "",
     sessionSummariesKey: "",
     sessionSummaries: [],
+    workProjectionKey: "",
+    workspaces: [],
   },
   ui: {
-    collapsedPanels: loadSet(COLLAPSED_PANELS_KEY),
+    collapsedPanels: loadSet(COLLAPSED_PANELS_KEY, ["timeline-panel", "data-panel"]),
     collapsedTimelineGroups: loadSet(COLLAPSED_TIMELINE_GROUPS_KEY),
+    expandedWorks: loadSet(EXPANDED_WORKS_KEY),
     activeTab: loadValue(DATA_TAB_KEY, "agents"),
     sessionSort: normalizeSessionSort(loadValue(SESSION_SORT_KEY, "priority")),
     sessionLimit: SESSION_PAGE_SIZE,
     selectedSegment: null,
     terminalCapture: null,
     selectedTimelineDay: "",
+    selectedWorkKey: "",
+    selectedWorkspaceKey: "",
   },
   filters: {
     agentStates: new Set(AGENT_STATES),
@@ -427,6 +439,35 @@ function rebuildTimelineIndexes() {
       store.indexes.timelineSessionByAgent.set(lane.session_id, lane.session_name || lane.session_id);
     }
   }
+}
+
+function workspaces() {
+  const cacheKey = `${store.revisions.agents}:${store.revisions.panes}`;
+  if (store.cache.workProjectionKey === cacheKey) return store.cache.workspaces;
+  store.cache.workProjectionKey = cacheKey;
+  store.cache.workspaces = buildWorkProjection(store.panes, [...store.agents.values()]);
+  return store.cache.workspaces;
+}
+
+function selectedWorkspace() {
+  if (!store.ui.selectedWorkspaceKey) return null;
+  return workspaces().find((workspace) => workspace.key === store.ui.selectedWorkspaceKey) || null;
+}
+
+function visibleWorks() {
+  const selected = selectedWorkspace();
+  if (selected) return selected.works;
+  const session = selectedSession();
+  return workspaces()
+    .filter((workspace) => !session || workspace.name === session)
+    .flatMap((workspace) => workspace.works);
+}
+
+function selectedWork() {
+  if (!store.ui.selectedWorkKey) return null;
+  return workspaces()
+    .flatMap((workspace) => workspace.works)
+    .find((work) => work.key === store.ui.selectedWorkKey) || null;
 }
 
 function paneForAgent(agent) {
@@ -483,6 +524,9 @@ function setSelectedSession(session) {
   const next = session || "";
   if (store.filters.timelineSession === next && store.timeline) return;
   store.filters.timelineSession = next;
+  const matchingWorkspaces = workspaces().filter((workspace) => workspace.name === next);
+  store.ui.selectedWorkspaceKey = matchingWorkspaces.length === 1 ? matchingWorkspaces[0].key : "";
+  store.ui.selectedWorkKey = "";
   store.ui.selectedSegment = null;
   store.ui.terminalCapture = null;
   store.indexes.timelineSessionByAgent.clear();
@@ -491,8 +535,21 @@ function setSelectedSession(session) {
   renderTimeline();
   renderAgents();
   renderPanes();
+  renderWorkItems();
   renderInspector();
   fetchTimeline({ force: true }).catch(() => {});
+}
+
+function setSelectedWorkspace(workspaceKey, session) {
+  store.ui.selectedWorkspaceKey = workspaceKey || "";
+  store.ui.selectedWorkKey = "";
+  setSelectedSession(session || "");
+  // setSelectedSession resolves name-only selections for timeline consumers;
+  // restore the exact endpoint-aware key supplied by the workspace rail.
+  store.ui.selectedWorkspaceKey = workspaceKey || "";
+  renderSessionSidebar();
+  renderWorkItems();
+  renderInspector();
 }
 
 // Copy text to clipboard. Uses the async Clipboard API when available
@@ -539,18 +596,19 @@ function renderCounts() {
   dom.counts.textContent = s;
   renderOverview();
   renderSessionSidebar();
+  renderWorkItems();
   renderInspector();
 }
 
 function renderOverview() {
-  const agents = [...store.agents.values()].filter(agentMatchesSelectedSession);
-  const working = agents.filter((a) => a.state === "working").length;
-  const waiting = agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length;
-  const errors = agents.filter((a) => a.state === "error").length;
+  const works = visibleWorks();
+  const active = works.filter((work) => work.working > 0).length;
+  const attention = works.filter((work) => work.attention > 0).length;
+  const errors = works.filter((work) => work.errors > 0).length;
   const lanes = store.timeline?.lanes || [];
   const totals = store.timeline?.totals || {};
-  dom.metricWorking.textContent = String(working);
-  dom.metricWaiting.textContent = String(waiting);
+  dom.metricWorking.textContent = String(active);
+  dom.metricWaiting.textContent = String(attention);
   dom.metricErrors.textContent = String(errors);
   dom.metricActive.textContent = formatDuration(totals.active_secs || 0);
   dom.metricHuman.textContent = formatDuration(
@@ -569,22 +627,20 @@ function renderSessionSidebar() {
   }
   dom.sessionsMeta.textContent = `${Math.min(store.ui.sessionLimit, summaries.length)}/${summaries.length}`;
   if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
-  const allAgents = store.agents.size;
-  const allWaiting = [...store.agents.values()].filter((a) =>
-    a.state === "waiting_input" || a.state === "waiting_choice" || a.state === "error"
-  ).length;
+  const allWorks = workspaces().flatMap((workspace) => workspace.works);
+  const allWaiting = allWorks.filter((work) => work.attention > 0).length;
   const allActive = active === "";
-  const allRow = `<button class="session-row${allActive ? " active" : ""}" type="button" data-session="">
+  const allRow = `<button class="session-row${allActive ? " active" : ""}" type="button" data-workspace="" data-session="">
     <span class="session-dot ${allWaiting > 0 ? "waiting" : "working"}"></span>
     <span class="session-main">
-      <span class="session-name">all sessions</span>
-      <span class="session-detail">${allAgents} agents · ${store.panes.length} panes</span>
+      <span class="session-name">all workspaces</span>
+      <span class="session-detail">${allWorks.length} tickets · ${store.agents.size} agents</span>
     </span>
     <span class="session-score">${allWaiting}</span>
   </button>`;
   const rows = visible.map((s) => {
-    const stateClass = s.errors > 0 ? "error" : s.waiting > 0 ? "waiting" : s.working > 0 ? "working" : "idle";
-    return `<button class="session-row${s.label === active ? " active" : ""}" type="button" data-session="${esc(s.label)}">
+    const stateClass = s.errorTickets > 0 ? "error" : s.attentionTickets > 0 ? "waiting" : s.activeTickets > 0 ? "working" : "idle";
+    return `<button class="session-row${s.label === active ? " active" : ""}" type="button" data-workspace="${esc(s.workspaceKey || "")}" data-session="${esc(s.label)}">
       <span class="session-dot ${stateClass}"></span>
       <span class="session-main">
         <span class="session-name">${esc(s.label)}</span>
@@ -615,6 +671,12 @@ function buildSessionSummaries() {
         working: 0,
         waiting: 0,
         errors: 0,
+        tickets: 0,
+        activeTickets: 0,
+        attentionTickets: 0,
+        errorTickets: 0,
+        workspaceKey: "",
+        workspaceKeyConflict: false,
         latest: "",
         totals: emptyTimelineTotals(),
         human_presence_secs: 0,
@@ -655,6 +717,19 @@ function buildSessionSummaries() {
   for (const pane of store.panes) {
     ensure(pane.session).panes += 1;
   }
+  for (const workspace of workspaces()) {
+    const s = ensure(workspace.name);
+    s.tickets += workspace.works.length;
+    s.activeTickets += workspace.active;
+    s.attentionTickets += workspace.attention;
+    s.errorTickets += workspace.errors;
+    if (!s.workspaceKeyConflict && !s.workspaceKey) {
+      s.workspaceKey = workspace.key;
+    } else if (s.workspaceKey !== workspace.key) {
+      s.workspaceKey = "";
+      s.workspaceKeyConflict = true;
+    }
+  }
   for (const active of store.timelineSummary?.active_sessions || store.timeline?.active_sessions || []) {
     ensure(active.label).totals.active_secs = active.active_secs || 0;
   }
@@ -676,13 +751,13 @@ function buildSessionSummaries() {
 
 function sessionSummaryLine(s) {
   const parts = [];
-  if (s.working) parts.push(`${s.working} work`);
-  if (s.waiting) parts.push(`${s.waiting} wait`);
-  if (s.errors) parts.push(`${s.errors} err`);
-  if (s.totals?.active_secs) parts.push(`act ${formatDuration(s.totals.active_secs)}`);
+  if (s.tickets) parts.push(`${s.tickets} tickets`);
+  if (s.attentionTickets) parts.push(`${s.attentionTickets} attention`);
+  if (s.errorTickets) parts.push(`${s.errorTickets} errors`);
+  if (s.activeTickets) parts.push(`${s.activeTickets} active`);
   if (s.agents) parts.push(`${s.agents} agents`);
-  if (s.panes) parts.push(`${s.panes} panes`);
-  return parts.slice(0, 3).join(" · ") || `${s.lanes} lanes`;
+  if (s.totals?.active_secs) parts.push(`act ${formatDuration(s.totals.active_secs)}`);
+  return parts.slice(0, 3).join(" · ") || `${s.panes} panes`;
 }
 
 function compareSessionSummaries(a, b) {
@@ -710,8 +785,8 @@ function compareSessionSummaries(a, b) {
 }
 
 function comparePriority(a, b) {
-  const scoreA = a.errors * 1000 + a.waiting * 100 + a.working * 10;
-  const scoreB = b.errors * 1000 + b.waiting * 100 + b.working * 10;
+  const scoreA = a.errorTickets * 1000 + a.attentionTickets * 100 + a.activeTickets * 10;
+  const scoreB = b.errorTickets * 1000 + b.attentionTickets * 100 + b.activeTickets * 10;
   return compareNumeric(scoreB, scoreA);
 }
 
@@ -732,10 +807,133 @@ function sessionScoreLabel(s, sort) {
   if (sort === "active") return formatDuration(s.totals.active_secs || 0);
   if (sort === "human") return formatDuration(s.human_presence_secs || 0);
   if (sort === "tmux") return formatDuration(s.totals.foreground_secs || 0);
-  if (s.errors > 0) return String(s.errors);
-  if (s.waiting > 0) return String(s.waiting);
-  if (s.working > 0) return String(s.working);
+  if (s.errorTickets > 0) return String(s.errorTickets);
+  if (s.attentionTickets > 0) return String(s.attentionTickets);
+  if (s.activeTickets > 0) return String(s.activeTickets);
   return "·";
+}
+
+function workStateLabel(work) {
+  switch (work.state) {
+    case "error": return "error";
+    case "needs_attention": return "needs attention";
+    case "active": return "active";
+    case "available": return "available";
+    default: return "untracked";
+  }
+}
+
+function workSummary(work) {
+  return String(work.summary || "No recent work summary").split("\n")[0].slice(0, 180);
+}
+
+function renderWorkParticipant(agent) {
+  return `<span class="participant-pill ${esc(agent.state)}" title="${esc(agent.model || agent.kind)}">
+    <span class="state-dot ${esc(agent.state)}"></span>
+    <span>${esc(agent.kind)}</span>
+    <small>${esc(agent.state.replaceAll("_", " "))}</small>
+  </span>`;
+}
+
+function renderWorkExecution(work) {
+  const panes = work.panes.map((pane) => {
+    const agent = pane.agent;
+    const state = agent?.state || "untracked";
+    const identity = `${work.workspaceName}:${work.index}.${pane.pane_index}`;
+    const attach = pane.attach_command
+      ? `<button class="attach-btn" type="button" data-cmd="${esc(pane.attach_command)}">copy attach</button>`
+      : "";
+    return `<div class="execution-pane-row">
+      <span class="state-dot ${esc(state)}"></span>
+      <span class="execution-pane-id" title="${esc(pane.pane_id)}">${esc(identity)}</span>
+      <span class="execution-pane-command">${esc(agent?.kind || pane.current_command || "shell")}</span>
+      <span class="execution-pane-title">${esc(agent?.ai_title || agent?.last_prompt || pane.title || "")}</span>
+      <span class="control-actions">${attach}${paneControlButtons(pane.pane_id, pane.socket)}</span>
+    </div>`;
+  }).join("");
+
+  return `<div class="work-execution">
+    <div class="execution-breadcrumb">
+      <span>session</span> ${esc(work.workspaceName)}
+      <b>›</b><span>window</span> ${esc(work.index)} · ${esc(work.name)}
+      <small>${esc(work.host)} · ${esc(work.endpoint)}</small>
+    </div>
+    <div class="execution-pane-list">${panes}</div>
+  </div>`;
+}
+
+function renderWorkItems() {
+  if (!dom.workItemsContent) return;
+  const works = visibleWorks();
+  const selected = store.ui.selectedWorkKey;
+  const attention = works.filter((work) => work.attention > 0).length;
+  const scope = selectedWorkspace()?.name || selectedSession() || "all workspaces";
+  dom.workItemsMeta.textContent = `${scope} · ${works.length} tickets${attention ? ` · ${attention} attention` : ""}`;
+
+  if (works.length === 0) {
+    dom.workItemsContent.innerHTML = `<div class="empty-block work-empty">
+      No window-backed work items in this scope.<br>
+      <small>Start a work window or choose another workspace.</small>
+    </div>`;
+    dom.toggleWorkExecution.textContent = "expand execution";
+    return;
+  }
+
+  dom.workItemsContent.innerHTML = works.map((work) => {
+    const expanded = store.ui.expandedWorks.has(work.key);
+    const participants = work.participants.length
+      ? work.participants.map(renderWorkParticipant).join("")
+      : `<span class="participant-empty">no tracked agent</span>`;
+    const stateClass = work.state === "needs_attention" ? "waiting" : work.state;
+    return `<article class="work-card state-${esc(stateClass)}${selected === work.key ? " selected" : ""}">
+      <div class="work-card-head">
+        <button class="work-card-select" type="button" data-select-work="${esc(work.key)}">
+          <span class="work-identity">
+            <strong>${esc(work.name)}</strong>
+            <small>${esc(work.workspaceName)} · window ${esc(work.index)}</small>
+          </span>
+          <span class="work-state ${esc(stateClass)}">${esc(workStateLabel(work))}</span>
+        </button>
+        <button class="work-expand" type="button" data-toggle-work="${esc(work.key)}" aria-expanded="${expanded ? "true" : "false"}">
+          <span aria-hidden="true">${expanded ? "⌄" : "›"}</span>
+          ${work.panes.length} pane${work.panes.length === 1 ? "" : "s"}
+        </button>
+      </div>
+      <button class="work-card-body" type="button" data-select-work="${esc(work.key)}">
+        <span class="work-summary">${esc(workSummary(work))}</span>
+        <span class="work-facts">
+          <span>${work.participants.length} agents</span>
+          ${work.working ? `<span>${work.working} working</span>` : ""}
+          ${work.waiting ? `<span class="attention-text">${work.waiting} waiting</span>` : ""}
+          ${work.errors ? `<span class="error-text">${work.errors} error</span>` : ""}
+          <span>${esc(relTime(work.latest))}</span>
+        </span>
+        <span class="participant-list">${participants}</span>
+      </button>
+      ${expanded ? renderWorkExecution(work) : ""}
+    </article>`;
+  }).join("");
+
+  const allExpanded = works.every((work) => store.ui.expandedWorks.has(work.key));
+  dom.toggleWorkExecution.textContent = allExpanded ? "collapse execution" : "expand execution";
+}
+
+function setSelectedWork(workKey) {
+  store.ui.selectedWorkKey = workKey || "";
+  store.ui.selectedSegment = null;
+  store.ui.terminalCapture = null;
+  renderWorkItems();
+  renderInspector();
+}
+
+function toggleWorkExecution(workKey) {
+  if (store.ui.expandedWorks.has(workKey)) {
+    store.ui.expandedWorks.delete(workKey);
+  } else {
+    store.ui.expandedWorks.add(workKey);
+  }
+  saveSet(EXPANDED_WORKS_KEY, store.ui.expandedWorks);
+  renderWorkItems();
 }
 
 function renderTimeline() {
@@ -1332,7 +1530,7 @@ function renderTimelineSessionOptions(doc) {
     if (session.label) store.timelineSessions.add(session.label);
   }
   const current = store.filters.timelineSession;
-  const options = [`<option value="">all sessions</option>`]
+  const options = [`<option value="">all workspaces</option>`]
     .concat([...store.timelineSessions.values()].sort().map((s) =>
       `<option value="${esc(s)}"${s === current ? " selected" : ""}>${esc(s)}</option>`
     ));
@@ -1613,7 +1811,7 @@ function renderTerminalCapture(capture) {
 }
 
 function renderDataMeta() {
-  const scope = selectedSession() || "all sessions";
+  const scope = selectedSession() || "all workspaces";
   dom.dataMeta.textContent = `${store.ui.activeTab} · ${scope}`;
 }
 
@@ -1734,6 +1932,16 @@ function initSessionControls() {
     saveValue(SESSION_SORT_KEY, store.ui.sessionSort);
     renderSessionSidebar();
   });
+  dom.toggleWorkExecution?.addEventListener("click", () => {
+    const works = visibleWorks();
+    const allExpanded = works.length > 0 && works.every((work) => store.ui.expandedWorks.has(work.key));
+    for (const work of works) {
+      if (allExpanded) store.ui.expandedWorks.delete(work.key);
+      else store.ui.expandedWorks.add(work.key);
+    }
+    saveSet(EXPANDED_WORKS_KEY, store.ui.expandedWorks);
+    renderWorkItems();
+  });
 }
 
 function initDynamicEventDelegation() {
@@ -1745,7 +1953,33 @@ function initDynamicEventDelegation() {
       return;
     }
     const row = event.target.closest("[data-session]");
-    if (row) setSelectedSession(row.getAttribute("data-session") || "");
+    if (row) {
+      setSelectedWorkspace(
+        row.getAttribute("data-workspace") || "",
+        row.getAttribute("data-session") || ""
+      );
+    }
+  });
+
+  dom.workItemsContent.addEventListener("click", async (event) => {
+    const control = event.target.closest("[data-pane-action]");
+    if (control) {
+      await runPaneControl(control).catch((error) => showToast(error.message));
+      return;
+    }
+    const copy = event.target.closest("[data-cmd]");
+    if (copy) {
+      const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
+      showToast(ok ? "copied attach command" : "clipboard blocked — copy manually");
+      return;
+    }
+    const toggle = event.target.closest("[data-toggle-work]");
+    if (toggle) {
+      toggleWorkExecution(toggle.getAttribute("data-toggle-work") || "");
+      return;
+    }
+    const select = event.target.closest("[data-select-work]");
+    if (select) setSelectedWork(select.getAttribute("data-select-work") || "");
   });
 
   dom.timelineHeatmap.addEventListener("click", (event) => {
@@ -1817,6 +2051,18 @@ function initDynamicEventDelegation() {
     renderPanes();
     renderInspector();
   });
+
+  dom.inspectorBody.addEventListener("click", async (event) => {
+    const control = event.target.closest("[data-pane-action]");
+    if (control) {
+      await runPaneControl(control).catch((error) => showToast(error.message));
+      return;
+    }
+    const copy = event.target.closest("[data-cmd]");
+    if (!copy) return;
+    const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
+    showToast(ok ? "copied attach command" : "clipboard blocked — copy manually");
+  });
 }
 
 function initCollapseControls() {
@@ -1860,6 +2106,11 @@ function renderInspector() {
     renderSegmentInspector(store.ui.selectedSegment);
     return;
   }
+  const work = selectedWork();
+  if (work) {
+    renderWorkInspector(work);
+    return;
+  }
 
   const session = selectedSession();
   const summaries = buildSessionSummaries();
@@ -1870,7 +2121,7 @@ function renderInspector() {
   const panes = store.panes.filter(paneMatchesSelectedSession);
 
   dom.inspectorMeta.textContent = session || "overview";
-  const title = session || "all sessions";
+  const title = session || "all workspaces";
   const activeSummary = summary || {
     working: agents.filter((a) => a.state === "working").length,
     waiting: agents.filter((a) => a.state === "waiting_input" || a.state === "waiting_choice").length,
@@ -1905,6 +2156,42 @@ function renderInspector() {
     <div class="inspector-section">
       <h3>Panes</h3>
       ${renderInspectorPanes(panes.slice(0, 8))}
+    </div>`;
+}
+
+function renderWorkInspector(work) {
+  dom.inspectorMeta.textContent = "ticket";
+  const participants = work.participants.length
+    ? work.participants.map((agent) => `<div class="mini-row participant-row">
+        <span class="state-dot ${esc(agent.state)}"></span>
+        <span>${esc(agent.kind)} · ${esc(agent.model || "default model")}</span>
+        <small>${esc(agent.state.replaceAll("_", " "))}</small>
+      </div>`).join("")
+    : `<div class="empty-block compact">no tracked agents</div>`;
+  dom.inspectorBody.innerHTML = `
+    <div class="inspector-title">
+      <span>${esc(work.name)}</span>
+      <small>${esc(work.workspaceName)} · ${esc(workStateLabel(work))}</small>
+    </div>
+    <div class="inspector-grid">
+      ${inspectorMetric("agents", work.participants.length)}
+      ${inspectorMetric("panes", work.panes.length)}
+      ${inspectorMetric("working", work.working)}
+      ${inspectorMetric("attention", work.attention)}
+      ${inspectorMetric("errors", work.errors)}
+      ${inspectorMetric("activity", relTime(work.latest))}
+    </div>
+    <div class="inspector-section">
+      <h3>Latest work signal</h3>
+      <p class="inspector-summary">${esc(workSummary(work))}</p>
+    </div>
+    <div class="inspector-section">
+      <h3>Participants</h3>
+      ${participants}
+    </div>
+    <div class="inspector-section inspector-execution">
+      <h3>Execution hierarchy</h3>
+      ${renderWorkExecution(work)}
     </div>`;
 }
 
@@ -2018,7 +2305,10 @@ function scheduleLiveRender({ panes = false, terminals = false } = {}) {
 async function fetchAgentsSnapshot() {
   const data = await jsonFetch("/api/agents");
   store.agents.clear();
-  for (const a of data.agents || []) store.agents.set(a.session_id, a);
+  for (const raw of data.agents || []) {
+    const agent = normalizeAgent(raw);
+    store.agents.set(agent.session_id, agent);
+  }
   store.revisions.agents += 1;
   scheduleLiveRender();
 }
@@ -2142,7 +2432,10 @@ async function fetchHealth() {
 
 function applySnapshot(payload) {
   store.agents.clear();
-  for (const a of payload.agents || []) store.agents.set(a.session_id, a);
+  for (const raw of payload.agents || []) {
+    const agent = normalizeAgent(raw);
+    store.agents.set(agent.session_id, agent);
+  }
   store.revisions.agents += 1;
   scheduleLiveRender();
   scheduleTimelineRefresh();
@@ -2150,7 +2443,7 @@ function applySnapshot(payload) {
 
 function applyTransition(t) {
   if (!t || !t.agent) return;
-  const a = t.agent;
+  const a = normalizeAgent(t.agent);
   if (t.to === "stopped" && t.from === "stopped") {
     store.agents.delete(a.session_id);
   } else {

@@ -89,6 +89,7 @@ mod tests {
         // test instead of a nebulous binary bloat.
         assert!(WebAssets::get("index.html").is_some());
         assert!(WebAssets::get("main.js").is_some());
+        assert!(WebAssets::get("work-model.mjs").is_some());
         assert!(WebAssets::get("style.css").is_some());
     }
 
@@ -96,6 +97,7 @@ mod tests {
     fn mime_table_covers_served_extensions() {
         assert_eq!(mime_for("foo.html"), "text/html; charset=utf-8");
         assert_eq!(mime_for("foo.js"), "application/javascript; charset=utf-8");
+        assert_eq!(mime_for("foo.mjs"), "application/javascript; charset=utf-8");
         assert_eq!(mime_for("foo.css"), "text/css; charset=utf-8");
         assert_eq!(mime_for("foo.unknown"), "application/octet-stream");
     }

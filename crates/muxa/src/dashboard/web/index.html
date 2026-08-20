@@ -28,11 +28,11 @@
     <aside class="panel session-panel">
       <div class="panel-header compact">
         <div class="panel-title">
-          <h2>Sessions</h2>
+          <h2>Workspaces</h2>
           <span class="panel-meta" id="sessions-meta"></span>
         </div>
         <div class="session-actions">
-          <select id="session-sort" class="select compact-select" title="Sort sessions">
+          <select id="session-sort" class="select compact-select" title="Sort workspaces">
             <option value="priority">priority</option>
             <option value="latest">latest</option>
             <option value="name">A-Z</option>
@@ -40,7 +40,7 @@
             <option value="human">human</option>
             <option value="tmux">tmux</option>
           </select>
-          <button class="icon-btn" type="button" id="show-all-sessions" title="Show all sessions">∅</button>
+          <button class="icon-btn" type="button" id="show-all-sessions" title="Show all workspaces">∅</button>
         </div>
       </div>
       <div class="session-list" id="session-list">
@@ -51,11 +51,11 @@
     <section class="workbench">
       <section class="overview-strip" id="overview-strip">
         <div class="metric-card">
-          <span>working</span>
+          <span>active tickets</span>
           <strong id="metric-working">—</strong>
         </div>
         <div class="metric-card attention">
-          <span>waiting</span>
+          <span>attention</span>
           <strong id="metric-waiting">—</strong>
         </div>
         <div class="metric-card danger">
@@ -76,6 +76,19 @@
         </div>
       </section>
 
+      <section class="panel work-items-panel" id="work-items-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Work items</h2>
+            <span class="panel-meta" id="work-items-meta"></span>
+          </div>
+          <button class="control-btn" type="button" id="toggle-work-execution">expand execution</button>
+        </div>
+        <div class="work-items-content" id="work-items-content">
+          <div class="empty-block">loading…</div>
+        </div>
+      </section>
+
       <section class="panel timeline-panel" id="timeline-panel" data-panel="timeline">
         <div class="panel-header">
           <div class="panel-title">
@@ -88,9 +101,9 @@
           <div class="filters">
             <span class="filter-label">range:</span>
             <span class="chips" id="timeline-range-chips"></span>
-            <span class="filter-label">session:</span>
+            <span class="filter-label">workspace:</span>
             <select id="timeline-session" class="select">
-              <option value="">all sessions</option>
+              <option value="">all workspaces</option>
             </select>
           </div>
         </div>
@@ -114,7 +127,10 @@
       <section class="panel data-panel" id="data-panel">
         <div class="panel-header">
           <div class="panel-title">
-            <h2>Data</h2>
+            <button class="collapse-btn" type="button" data-collapse-target="data-panel" aria-expanded="true" aria-controls="data-panel-content" title="Collapse execution inventory">
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <h2>Execution inventory</h2>
             <span class="panel-meta" id="data-meta"></span>
           </div>
           <div class="tabs" id="data-tabs">
@@ -124,6 +140,7 @@
           </div>
         </div>
 
+        <div class="panel-content" id="data-panel-content">
         <div class="tab-pane active" id="agents-tab">
           <div class="panel-toolbar">
             <div class="filters">
@@ -207,6 +224,7 @@
               </tbody>
             </table>
           </div>
+        </div>
         </div>
       </section>
     </section>
