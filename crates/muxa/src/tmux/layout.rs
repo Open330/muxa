@@ -41,7 +41,7 @@ const FRAME_FMT: &str =
 
 /// Where one pane sits on screen, plus the little bit of identity the
 /// overlay needs to label it when no agent is attached.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneGeometry {
     pub pane_id: String,
     /// tmux's per-window pane index — the digit `display-panes` shows, and

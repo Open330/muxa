@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Central SSH fleet management adds a physical host → session → window →
+  pane(agent) control plane.** `muxad` now maintains one isolated persistent
+  OpenSSH stdio relay and last-known cache per configured node, with stable
+  UUID identity, duplicate-node protection, bounded reconnect/concurrency,
+  keepalive health, revision-gap reconciliation, and explicit
+  observe/control authorization. `muxa host` manages inventory plus
+  Kubernetes-style labels/annotations and selectors; `muxa fleet` and
+  `muxa watch --fleet` provide status, focused hierarchy navigation, high
+  density inspectors, lazy pane/window capture with real tmux geometry,
+  exact prompt delivery, and separate-TTY remote attach. The same cache is
+  exposed through authenticated dashboard APIs and three explicit MCP tools.
+  The relay opens no TCP listener, forces SSH forwarding off, keeps prompt
+  bodies out of audit logs, bounds/sanitizes terminal data, and never retries
+  mutations. See [docs/FLEET.md](docs/FLEET.md).
+
+  The controller is itself an always-present first-class `local` node, even
+  when remote Fleet connections are disabled. It exposes the same topology,
+  selectors, capture/send/attach, dashboard, and MCP surfaces through an
+  in-process adapter. Kubernetes-style system labels identify the local
+  hostname/OS/architecture, while user labels and annotations remain editable
+  through `muxa host label local` and `muxa host annotate local`.
+
+  Human host tables are terminal-width aware and concise by default; labels
+  move behind `--show-labels` or explicit `-L` columns, while `-o wide/json`
+  preserve richer output. A Fleet selection containing only `local` now opens
+  the full native `muxa watch` experience without a redundant host row. The
+  multi-node view shares watch themes, view/expansion/sort choices, swarm mode,
+  dense inspectors, `/` message skills, exact capture/send/attach, and uses a
+  Fleet invalidation stream with a slow reconciliation poll instead of fixed
+  high-frequency full redraws.
+
+- **Agents can call a colleague naturally through Muxa MCP.** Connected Claude
+  and Codex conversations now map `@peer`, provider/alias/role targets, and
+  registered `/skills` to `muxa_call_peer`. The high-level tool expands the
+  template, selects a healthy peer deterministically, sends a durable request,
+  and can wait for its structured reply. Calls default to `REVIEW · READ-ONLY`;
+  execution requires an explicit task authorization, and creating a new pane
+  requires separate user confirmation. `muxa_peer_report` retrieves prior
+  structured replies for phrases such as “`@peer`'s report”; reserved routing
+  refuses to substitute GitHub or invent a PR when no explicit PR number or
+  GitHub PR URL grounds that workflow. Repository/cwd context alone is not
+  sufficient.
+
 ## [0.8.34] - 2026-08-14
 
 ### Changed

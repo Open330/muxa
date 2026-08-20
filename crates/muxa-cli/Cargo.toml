@@ -55,6 +55,7 @@ which = "7"
 # by codex hook merger and dashboard token writer. Plain `toml` would
 # rewrite the whole file from scratch.
 toml_edit = "0.22"
+toml = { workspace = true }
 # Width-aware truncation for human CLI tables; important for CJK prompts.
 unicode-width = "0.2"
 # Cryptographically-strong dashboard tokens via the OS RNG.

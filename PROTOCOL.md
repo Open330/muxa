@@ -31,6 +31,19 @@ Post-1.0: the protocol is stable within a major version; breaking changes bump
 Each connection is full-duplex: a client may issue multiple
 request/response pairs over the same stream.
 
+Physical-host Fleet uses a second, versioned JSON-lines protocol over an
+OpenSSH stdio channel. It is intentionally not a network service. The remote
+`muxa relay --stdio` announces a stable node UUID and capabilities, then
+exchanges full snapshots, revisioned transitions/keepalives, exact capture or
+prompt requests, results, errors, and explicit resync markers. See
+[`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
+separately from this local IPC protocol.
+
+The controller itself is always represented as host `local`. Its snapshot and
+commands use the same `FleetSnapshot`/`FleetOperation` schema and exact pane
+keys, but muxad executes them against its in-process Store/backends without an
+SSH or relay hop. `[fleet] enabled` therefore controls only remote transports.
+
 ## Request
 
 ```json
@@ -65,6 +78,49 @@ Response:
 
 ```json
 { "ok": true, "protocol": 1, "agents": [ <Agent>, ... ] }
+```
+
+#### `fleet_snapshot`
+
+Read muxad's per-physical-host cache, including the always-present `local`
+node. `selector` is an optional Kubernetes-style label selector. This
+operation never opens request-scoped SSH.
+
+```json
+{ "protocol": 4, "kind": "fleet_snapshot", "selector": "region=icn" }
+```
+
+#### `fleet_subscribe`
+
+Long-lived compact invalidation stream for the central Fleet cache. The server
+first acknowledges with `ok`, then writes newline-delimited `FleetUpdate`
+objects containing `host`, `state`, and an optional `revision`. Empty lines are
+keepalives. Updates are hints rather than partial snapshots: clients coalesce a
+burst and issue one selector-filtered `fleet_snapshot`, with a slow fallback
+poll for reconciliation.
+
+```json
+{ "protocol": 4, "kind": "fleet_subscribe" }
+```
+
+```json
+{ "host": "dev", "state": "online", "revision": 42 }
+```
+
+#### `fleet_command`
+
+Dispatch one operation to an exact host. The local adapter rechecks complete
+pane identity in process. For remote hosts the manager also rechecks
+observe/control mode and the relay verifies complete pane identity. Prompt
+mutations are not retried.
+
+```json
+{
+  "protocol": 4,
+  "kind": "fleet_command",
+  "host": "dev",
+  "operation": { "kind": "refresh" }
+}
 ```
 
 #### `by_pane`

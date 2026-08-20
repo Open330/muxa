@@ -1,5 +1,10 @@
 # Multi-host observation
 
+> This document uses the original “host” name for local pane backends
+> (tmux/rmux/herdr/zellij) inside one physical machine. For central management
+> of several SSH-reachable physical nodes, see [FLEET.md](FLEET.md). Fleet
+> preserves this backend set independently inside every node.
+
 Status: **daemon + CLI implemented.** `muxad` observes every backend in
 `muxa::active_backends()` simultaneously (for example tmux + rmux + herdr during a
 migration) — the reconciler, discovery, session-activity sampling,

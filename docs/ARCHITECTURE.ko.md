@@ -36,6 +36,16 @@ agent hook/status event
 CLI는 live state를 socket으로 읽고, history/reporting view는 retained local
 file도 함께 사용합니다.
 
+controller daemon은 항상 별도의 physical-node plane을 만들고 in-process Store/backend에서
+자신의 `local` node를 게시합니다. `[fleet]`을 켜면 remote host별 task가 remote user의
+local muxad로 향하는 OpenSSH stdio relay 하나를 소유하고 자신의
+`FleetStore` entry만 갱신합니다. remote agent는 local `Store`에 넣지 않으므로 local
+reconcile, pane-id 재사용, GC가 다른 node의 truth를 손상시키지 않습니다.
+[FLEET.ko.md](FLEET.ko.md)를 참고하세요.
+local-only Fleet watch는 native watch runtime을 그대로 사용합니다. multi-node path는
+IPC로 `FleetStore` invalidation을 구독해 coalesce하고 revision이 바뀐 host topology만
+재구성하며, 느린 full-snapshot reconcile poll을 함께 유지합니다.
+
 ## Components
 
 | Component | 역할 |
@@ -45,6 +55,7 @@ file도 함께 사용합니다.
 | Agent adapters | Claude/Codex/Gemini hook event를 muxa state transition으로 변환. |
 | tmux backend | pane/session, pane capture, foreground session activity 조회. |
 | Activity ledger | state/tmux/human interval의 append-only duration source. |
+| FleetManager | always-present local adapter, 독립 SSH relay state machine, node identity/권한, revision reconcile, host별 cache. |
 
 ## Data Files
 
@@ -55,6 +66,7 @@ file도 함께 사용합니다.
 | `activity.ndjson` | append-only duration ledger. |
 | `session-activity.json` | legacy/compat tmux foreground total. |
 | `collaboration.json` | same-window mailbox와 exact-session alias/role snapshot. |
+| `host-id` | Fleet handshake에 쓰는 owner-only stable physical-node UUID. |
 
 경로는 설정 가능하며 기본값은 `$XDG_DATA_HOME/muxa` 아래입니다.
 
@@ -66,6 +78,8 @@ file도 함께 사용합니다.
   `public_read`는 익명 조회를 허용하되 변경에는 PAT를 요구하고, `none`은
   조회만 허용하며 변경 기능을 비활성화합니다.
 - External sink는 opt-in입니다.
+- Fleet은 fixed SSH command token을 사용하고 forwarding을 끄며 exact global pane identity를
+  검증합니다. host는 observe-only가 기본이고 remote network listener를 열지 않습니다.
 - Rust `unsafe`는 금지되어 있습니다.
 
 ## Shutdown

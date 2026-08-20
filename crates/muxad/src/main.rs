@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
+mod fleet_manager;
 mod herdr_bridge;
 mod screen_detect;
 mod synthetic;
@@ -206,6 +207,18 @@ async fn main() -> Result<()> {
     // instead of `synthetic-%X` placeholders.
     enrich_from_history(&store, &history, &backends).await;
 
+    // The controller node is always a first-class Fleet host, even when
+    // outbound SSH connections are disabled. Start after hydration so its
+    // first published snapshot already contains restored local agents.
+    let (fleet_runtime, fleet_handle) = fleet_manager::start(
+        &cfg.fleet,
+        store.clone(),
+        backends.clone(),
+        restart.generation(),
+        shutdown_tx.subscribe(),
+    )
+    .await;
+
     let (activity_log, activity_writer_handle) =
         build_activity_log(&cfg, &writer_shutdown_tx).await;
     let activity_transition_handle = spawn_activity_transition_task(
@@ -308,6 +321,7 @@ async fn main() -> Result<()> {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
             stats_config: dashboard_stats_config,
+            fleet: Some(fleet_runtime.clone()),
         };
         tokio::spawn(async move {
             if let Err(e) = muxa::dashboard::serve(
@@ -353,6 +367,7 @@ async fn main() -> Result<()> {
         .with_collaboration(collaboration)
         .with_collaboration_audit(collaboration_audit)
         .with_ask(ask)
+        .with_fleet(fleet_runtime)
         .with_restart_controller(Arc::clone(&restart));
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -405,6 +420,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;
     await_shutdown_task("collaboration waker", collaboration_waker_handle).await;
+    await_shutdown_task("fleet manager", Some(fleet_handle)).await;
 
     let _ = activity_transition_shutdown_tx.send(());
     await_shutdown_task("activity transition", activity_transition_handle).await;

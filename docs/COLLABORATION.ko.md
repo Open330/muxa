@@ -196,6 +196,8 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 | --- | --- |
 | `muxa_collaboration_guide` | reviewer/question/subagent/AIR 전달의 권장 계약 조회 |
 | `muxa_room_context` | self, same-window peers, unread count 조회 |
+| `muxa_call_peer` | 등록 스킬 확장, peer 선택, durable 요청, 선택적 응답 대기, 확인 후 agent 생성 |
+| `muxa_peer_report` | 이전 peer 요청의 최신 완료 보고 또는 정확한 request id 조회 |
 | `muxa_set_identity` | 현재 agent session의 room-local alias/roles 교체 |
 | `muxa_send_message` | durable request 생성 |
 | `muxa_inbox` | 현재 agent session의 요청 claim/read |
@@ -203,6 +205,33 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 | `muxa_reply` | completed/blocked/declined/failed 구조화 응답 |
 | `muxa_wait_reply` | 요청의 terminal reply 대기 |
 | `muxa_cancel_message` | 아직 queued인 발신 요청 취소 |
+
+## Agent 대화에서 자연스럽게 호출하기
+
+`muxa mcp`에 연결된 Claude나 Codex agent는 `@peer`와 `@muxa-peer`를 Muxa 협업
+전용 표현으로 취급합니다. `@codex` 같은 provider, 고유한 `@alias`, `role:name`,
+또는 자연어로 동료에게 새 작업을 요청하는 표현은 `muxa_call_peer`로 변환합니다.
+`/name`으로 등록 스킬을 함께 지정할 수 있습니다.
+
+```text
+@peer 현재 변경사항을 리뷰해줘
+@codex /review-plan-feedback commit abc123을 context로 사용해줘
+```
+
+“`@peer`의 보고”, “peer 응답”, “peer 지적을 해결해”처럼 기존 결과를 가리키는
+표현은 먼저 `muxa_peer_report`로 실제 구조화된 mailbox 응답을 읽습니다. 사용자가
+제공했거나 이미 확인된 context에 명시적인 PR 번호나 GitHub PR URL이 없다면
+GitHub PR/review 도구를 호출하거나 PR을 추측해서는 안 됩니다. repository나 cwd만
+알고 있는 것은 충분한 근거가 아닙니다. Muxa 도구가 보이지 않을 때의 복구 방법은
+agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
+
+이 고수준 도구는 아래 mailbox 의미를 유지하면서 model이 여러 저수준 호출을 직접
+조립하지 않아도 되게 합니다. 기본값은 `kind=review`,
+`work_mode=read_only`이며 정상 peer를 결정적으로 선택하고 구조화된 응답을
+기다립니다. execute mode에는 명시적인 task 승인이 필요합니다. 적합한 peer가 없을
+때 Muxa는 자동으로 만들지 않고 확인을 요청하며, 사용자가 승인한 뒤에만
+`spawn_if_missing=true`로 다시 호출할 수 있습니다. MCP process는 시작할 때 도구와
+스킬을 읽으므로 스킬 변경이나 Muxa 업그레이드 뒤에는 기존 agent를 재시작하세요.
 
 일반적인 흐름:
 

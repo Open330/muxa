@@ -5,12 +5,15 @@ mod agent_launch;
 mod attend;
 mod dashboard_tui;
 mod doctor;
+mod fleet_cli;
+mod fleet_watch;
 mod init;
 mod logs;
 mod mcp;
 mod message_skill;
 mod onboarding;
 mod peek;
+mod relay;
 mod stats;
 mod theme;
 mod time_range;
@@ -120,6 +123,10 @@ enum Cmd {
     },
     /// Register reusable `/` templates for the interactive message composer.
     Skill(message_skill::Args),
+    /// Manage local/SSH host inventory and Kubernetes-style metadata.
+    Host(fleet_cli::HostArgs),
+    /// Observe and control this node plus SSH-connected Muxa hosts.
+    Fleet(fleet_cli::FleetArgs),
     /// Deterministic tmux agent lifecycle operations.
     Agent {
         #[command(subcommand)]
@@ -171,6 +178,13 @@ enum Cmd {
     Peek(peek::Args),
     /// Fullscreen nested session/window/pane topology of tracked agents.
     Watch {
+        /// Show the SSH fleet host/session/window/pane hierarchy instead of
+        /// the local topology.
+        #[arg(long)]
+        fleet: bool,
+        /// Kubernetes-style host label selector used with `--fleet`.
+        #[arg(short = 'l', long = "selector", requires = "fleet")]
+        selector: Option<String>,
         /// Show agents that have no tmux pane attached. Default behavior
         /// (governed by `[watch] hide_paneless = true`) hides them
         /// because Enter on the picker can't attach to them anyway —
@@ -247,6 +261,15 @@ enum Cmd {
         #[arg(long)]
         json: String,
     },
+    /// Bridge the owner-only local muxad socket over an authenticated SSH
+    /// stdio channel for Muxa Fleet. Usually launched by another muxad.
+    Relay {
+        #[arg(long, default_value_t = true)]
+        stdio: bool,
+    },
+    /// Exact remote pane attach endpoint used by `muxa fleet attach`.
+    #[command(hide = true)]
+    FleetRemoteAttach { token: String },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
     /// rotates through them (bind it to a tmux key); `--list` prints the
@@ -442,7 +465,7 @@ enum HookCmd {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum WatchViewArg {
+pub(crate) enum WatchViewArg {
     Session,
     Window,
     Pane,
@@ -459,7 +482,7 @@ impl From<WatchViewArg> for muxa::config::WatchView {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum WatchLayoutArg {
+pub(crate) enum WatchLayoutArg {
     Tree,
     Swarm,
 }
@@ -474,7 +497,7 @@ impl From<WatchLayoutArg> for muxa::config::WatchLayout {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum WatchSortArg {
+pub(crate) enum WatchSortArg {
     Name,
     #[value(alias = "activity", alias = "act")]
     Latest,
@@ -539,6 +562,7 @@ fn collaboration_client_kind(command: &Cmd) -> CollaborationClientKind {
     }
 }
 
+#[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -576,6 +600,8 @@ async fn main() -> Result<()> {
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
+        Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
+        Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action),
@@ -590,6 +616,8 @@ async fn main() -> Result<()> {
         Cmd::Panes => cmd_panes(),
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
+            fleet,
+            selector,
             include_paneless,
             view,
             layout,
@@ -598,16 +626,27 @@ async fn main() -> Result<()> {
             caller_client,
             caller_pane,
         } => {
-            // Pin focus-moving commands to the requesting client; jump_to_pane_tmux reads it.
-            //
-            // A value still containing `#{` is a binding that never expanded
-            // its formats (plain `display-popup` does not expand; only the
-            // `run-shell` wrapper does). Passing it on would aim every
-            // switch-client at a client named `#{client_name}` — a silent
-            // no-op that presents as "Enter does nothing". Drop it and fall
-            // back instead.
+            // Pin focus-moving commands to the requesting client. A value
+            // still containing `#{` is a binding that never expanded.
             if let Some(client_name) = caller_client.filter(|c| !c.contains("#{")) {
                 let _ = CALLER_CLIENT.set(client_name);
+            }
+            if fleet {
+                return cmd_fleet_watch(
+                    &client,
+                    cfg,
+                    config_path.clone(),
+                    selector,
+                    WatchInvocation {
+                        include_paneless,
+                        view,
+                        layout,
+                        sort,
+                        theme,
+                        caller_pane: caller_pane.filter(|p| p.starts_with('%')),
+                    },
+                )
+                .await;
             }
             cmd_watch(
                 &client,
@@ -642,12 +681,19 @@ async fn main() -> Result<()> {
             pane,
         } => cmd_register(&client, name, pid, cwd, pane).await,
         Cmd::ZellijPluginSnapshot { json } => cmd_zellij_plugin_snapshot(&client, &json).await,
+        Cmd::Relay { stdio } => {
+            if !stdio {
+                anyhow::bail!("only --stdio relay transport is supported");
+            }
+            relay::run(client).await
+        }
+        Cmd::FleetRemoteAttach { token } => relay::remote_attach(&token),
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket).await,
         Cmd::Doctor => doctor::run(socket).await,
         Cmd::Onboard(onboard_args) => onboarding::run(onboard_args),
-        Cmd::Mcp => mcp::run(client).await,
+        Cmd::Mcp => mcp::run(client, cfg.message.skills.clone()).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune {
@@ -1285,16 +1331,44 @@ async fn cmd_sync(client: &Client) -> Result<()> {
 /// One-shot per-invocation overrides for `muxa watch`, bundled so the
 /// argument list stays a description of *this run* rather than a flat
 /// parade of options.
-struct WatchInvocation {
-    include_paneless: bool,
-    view: Option<WatchViewArg>,
-    layout: Option<WatchLayoutArg>,
-    sort: Option<WatchSortArg>,
-    theme: Option<ThemeArg>,
-    caller_pane: Option<String>,
+#[derive(Debug, Clone)]
+pub(crate) struct WatchInvocation {
+    pub(crate) include_paneless: bool,
+    pub(crate) view: Option<WatchViewArg>,
+    pub(crate) layout: Option<WatchLayoutArg>,
+    pub(crate) sort: Option<WatchSortArg>,
+    pub(crate) theme: Option<ThemeArg>,
+    pub(crate) caller_pane: Option<String>,
 }
 
-async fn cmd_watch(
+pub(crate) async fn cmd_fleet_watch(
+    client: &Client,
+    cfg: Config,
+    config_path: Option<PathBuf>,
+    selector: Option<String>,
+    invocation: WatchInvocation,
+) -> Result<()> {
+    selector
+        .as_deref()
+        .map(str::parse::<muxa::LabelSelector>)
+        .transpose()
+        .map_err(anyhow::Error::msg)
+        .context("invalid fleet label selector")?;
+    let initial = client
+        .fleet_snapshot(selector.as_deref())
+        .await
+        .context("reading initial fleet state from muxad")?;
+    // A lone local controller is the overwhelmingly common case and should
+    // feel exactly like `muxa watch`: adding the Fleet feature must not insert
+    // a redundant host row or discard the mature inspector and collaboration
+    // surface. Host hierarchy becomes visible only when it carries information.
+    if fleet_watch::uses_native_local_watch(&initial) {
+        return cmd_watch(client, cfg, config_path, invocation.clone()).await;
+    }
+    fleet_watch::run(client.clone(), &cfg, selector, initial, invocation).await
+}
+
+pub(crate) async fn cmd_watch(
     client: &Client,
     cfg: Config,
     config_path: Option<PathBuf>,

@@ -50,12 +50,34 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list sixteen tools). Other MCP
+or `codex mcp list` (the `muxa` server should list twenty-one tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
 At initialization muxa tells the agent how to use same-window peers as a
 reviewer, focused question target, or delegated subagent. The agent can call
 `muxa_collaboration_guide` to retrieve that contract again at any time.
+The same instructions map conversational `@peer`, provider mentions, aliases,
+roles, and registered `/skills` to `muxa_call_peer`.
+
+### Physical-host Fleet tools
+
+The same MCP server can always operate the controller through host `local`.
+When `[fleet] enabled = true`, it additionally operates the cached remote
+host/session/window/pane hierarchy:
+
+```text
+muxa_fleet_status      { "selector": "environment=production" }
+muxa_fleet_capture     { "host": "local", "pane": "%12" }
+muxa_fleet_capture     { "host": "dev", "pane": "%12" }
+muxa_fleet_send_prompt { "host": "dev", "pane": "%12",
+                         "text": "Summarize the result", "submit": true }
+```
+
+The host and pane are always explicit. Ambiguous pane ids are rejected. The
+local in-process adapter and remote relay both verify the complete identity
+again, and an observe-mode remote host rejects prompt delivery. Fleet calls
+use muxad's cache/control plane; the MCP subprocess never opens SSH itself.
+See [FLEET.md](FLEET.md).
 
 ## Implementation
 
@@ -103,6 +125,8 @@ it:
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
 | `muxa_collaboration_guide` | — | Show the recommended reviewer, question, delegated-subagent, incoming-work, and AIR handoff contracts. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
+| `muxa_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and explicitly spawn an agent when no peer exists. |
+| `muxa_peer_report` | `target?`, `request_id?` | Read the newest completed peer report, optionally filtered by provider/pane/alias/role, or retrieve an exact prior request. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?` | Create a durable same-window peer request. |
 | `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
@@ -117,6 +141,59 @@ only reaches the focused pane. tmux, rmux, and herdr support it.
 
 Pane ids carry their host namespace: tmux `%12`, rmux `rmux:%12`, herdr
 `herdr:p1`. Use the `pane` field from `muxa_status` verbatim.
+
+### Natural peer calls
+
+Once the MCP server is connected, type requests naturally in the agent
+conversation:
+
+```text
+@peer review the current changes
+@codex /review-plan-feedback using commit abc123 as context
+@reviewer check the auth path for races
+@peer's report: summarize the findings and apply only the valid ones
+```
+
+`@peer` and the more explicit `@muxa-peer` are reserved Muxa collaboration
+expressions. New work maps to `muxa_call_peer`; possessive references to an
+existing report, reply, findings, or conversation map to `muxa_peer_report`
+first. Muxa does not intercept terminal keystrokes. `target="auto"` prefers a
+healthy peer from a
+different provider, then applies stable state/provider/numeric-pane ordering.
+Use a provider, pane id, unique alias, or `role:name` when the recipient
+matters. Ambiguous roles are refused instead of guessed.
+
+Muxa report language never implies a GitHub PR. The agent must not invoke a
+GitHub PR/review workflow unless the user or grounded conversation context
+provides an explicit PR number or GitHub PR URL; knowing the repository or cwd
+alone is insufficient. It must never invent a PR, issue, or review thread.
+“Resolve the peer feedback” means evaluate each Muxa finding, apply valid
+advice, record why rejected advice was not used, and optionally send that
+decision back to the peer. If the Muxa tools are missing, restart the agent;
+GitHub is not a fallback transport.
+
+The safe default is `intent="review"` with a read-only contract. `execute=true`
+is accepted only with `intent="task"`, so a conversational review cannot
+silently acquire edit authority. When there is no eligible peer, the tool
+returns `action_required="confirm_spawn"`; only repeat the call with
+`spawn_if_missing=true` after the user explicitly confirms creating a pane.
+Automatic spawning defaults to the other provider when possible.
+
+Registered message skills can be selected with or without a leading slash:
+
+```text
+muxa_call_peer(target="auto", intent="review",
+               skill="review-plan-feedback",
+               context="Review commit abc123", wait=true)
+
+muxa_call_peer(target="@codex", intent="task", execute=true,
+               body="Add regression tests only",
+               paths=["crates/auth/tests/**"])
+```
+
+The MCP process reads `[message.skills]` at startup. Restart an already-running
+agent after `muxa skill add/remove`, after editing the table, or after upgrading
+Muxa so it loads the current skills and tool definitions.
 
 ### Deterministic agent launch
 

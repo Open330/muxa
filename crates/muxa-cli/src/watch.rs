@@ -142,7 +142,7 @@ const WAKE_CAPACITY: usize = 1;
 const OUTCOME_CAPACITY: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
-struct WatchThemeSpec {
+pub(crate) struct WatchThemeSpec {
     title: &'static str,
     accent: Color,
     accent_fg: Color,
@@ -161,40 +161,40 @@ struct WatchThemeSpec {
     state_choice: Color,
     state_error: Color,
     state_starting: Color,
-    border_type: BorderType,
+    pub(crate) border_type: BorderType,
 }
 
 impl WatchThemeSpec {
-    fn accent_badge(self) -> Style {
+    pub(crate) fn accent_badge(self) -> Style {
         Style::default()
             .fg(self.accent_fg)
             .bg(self.accent)
             .add_modifier(Modifier::BOLD)
     }
 
-    fn action_badge(self) -> Style {
+    pub(crate) fn action_badge(self) -> Style {
         Style::default().fg(self.action_fg).bg(self.action)
     }
 
-    fn key_badge(self) -> Style {
+    pub(crate) fn key_badge(self) -> Style {
         Style::default().fg(self.key_fg).bg(self.key_bg)
     }
 
-    fn border_style(self) -> Style {
+    pub(crate) fn border_style(self) -> Style {
         Style::default().fg(self.border)
     }
 
-    fn dim_style(self) -> Style {
+    pub(crate) fn dim_style(self) -> Style {
         Style::default().fg(self.dim)
     }
 
-    fn table_header_style(self) -> Style {
+    pub(crate) fn table_header_style(self) -> Style {
         Style::default()
             .fg(self.table_header)
             .add_modifier(Modifier::BOLD)
     }
 
-    fn selected_style(self) -> Style {
+    pub(crate) fn selected_style(self) -> Style {
         let style = Style::default()
             .bg(self.selected_bg)
             .add_modifier(Modifier::BOLD);
@@ -205,7 +205,7 @@ impl WatchThemeSpec {
         }
     }
 
-    fn state_style(self, state: AgentState) -> Style {
+    pub(crate) fn state_style(self, state: AgentState) -> Style {
         match state {
             AgentState::Idle => Style::default()
                 .fg(self.state_idle)
@@ -228,7 +228,7 @@ impl WatchThemeSpec {
     }
 }
 
-fn watch_theme(theme: WatchTheme) -> WatchThemeSpec {
+pub(crate) fn watch_theme(theme: WatchTheme) -> WatchThemeSpec {
     match theme {
         WatchTheme::Classic => classic_watch_theme(),
         WatchTheme::OhMyMuxa => oh_my_muxa_watch_theme(),

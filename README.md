@@ -177,6 +177,25 @@ narrowly scoped execution subagents. Requests and replies can also carry
 validated AIR 1.0 artifact references, which watch visualizes with
 profile-colored mailbox badges.
 
+You can call a colleague directly from a connected Claude or Codex
+conversation. The agent maps the mention to Muxa's durable peer-call tool:
+
+```text
+@peer review the current changes
+@codex /review-plan-feedback using commit abc123 as context
+@peer's report: summarize it and apply only valid advice
+```
+
+`@peer` and `@muxa-peer` are reserved for Muxa collaboration. New requests use
+the peer-call tool; references to an existing peer report use the durable
+mailbox report tool and never imply a GitHub PR without an explicit PR reference.
+`@peer` chooses a healthy same-window agent deterministically; `@claude`,
+`@codex`, `@gemini`, `@alias`, and `role:name` narrow the target. Calls default
+to `REVIEW · READ-ONLY`. Executing changes requires an explicit task
+authorization, and creating a new agent pane requires a separate confirmation.
+Restart an already-running agent after upgrading Muxa or changing registered
+skills so its MCP process loads the new tool and templates.
+
 Agents reported as synthetic by `muxa doctor` are omitted from collaboration
 until a hook event establishes a stable session identity. Submit a prompt or
 restart that agent, then check again.
@@ -234,7 +253,9 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
-| `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages and watch ask. |
+| `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
+| `muxa host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |
+| `muxa fleet status/watch/capture/send/attach` | Central host → session → window → pane(agent) observation and control. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
@@ -301,7 +322,31 @@ user. Hooks always win when present. See
 On [herdr](https://herdr.dev) hosts, muxa additionally surfaces every
 agent herdr's own detection sees, with no manifest needed.
 
-## Hosts
+## Fleet Hosts
+
+Run muxad locally as a central controller for this machine and several
+SSH-reachable machines. The controller appears immediately as the `local`
+node, without Fleet configuration. Each physical node keeps its own stable UUID and label/annotation metadata;
+the controller maintains one persistent outbound SSH stdio relay and an
+independent last-known cache per node. `observe` is the default, while
+`control` must be granted per host. No remote TCP listener is opened.
+
+```bash
+muxa fleet status                         # local is already present
+muxa fleet status -L environment,region   # opt-in label columns
+muxa fleet status -o wide                 # hostname/version/latency when space permits
+muxa host label local environment=development
+muxa host add dev muxa-devbox --label environment=development --mode observe
+muxa host doctor dev
+muxa fleet watch
+# equivalent entry point: muxa watch --fleet
+# with only local, this is the full native watch with no redundant host row
+```
+
+See [docs/FLEET.md](docs/FLEET.md) for selectors, TUI controls, security,
+performance, MCP tools, and dashboard APIs.
+
+## Pane Backends
 
 muxa observes agents across terminal-multiplexer backends and can watch
 several at once (e.g. during a tmux→herdr migration):
@@ -326,6 +371,7 @@ simultaneously.
 | herdr host support | [docs/HERDR.md](docs/HERDR.md) |
 | rmux host support | [docs/RMUX.md](docs/RMUX.md) |
 | Multi-host observation | [docs/MULTI_HOST.md](docs/MULTI_HOST.md) |
+| Physical SSH fleet | [docs/FLEET.md](docs/FLEET.md) |
 | Screen-manifest detection | [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |
 | CLI dashboard | [docs/DASHBOARD_CLI.md](docs/DASHBOARD_CLI.md) |

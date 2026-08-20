@@ -148,6 +148,24 @@ subagent로 활용하라는 협업 지침이 자동으로 노출됩니다. 요�
 AIR 1.0 artifact 참조를 첨부할 수 있고, watch mailbox가 profile별 색상 배지로
 표시합니다.
 
+연결된 Claude 또는 Codex 대화 안에서 바로 동료를 호출할 수도 있습니다. agent가
+다음 표현을 Muxa의 durable peer-call 도구로 변환합니다.
+
+```text
+@peer 현재 변경사항을 리뷰해줘
+@codex /review-plan-feedback commit abc123을 context로 사용해줘
+@peer의 보고를 요약하고 타당한 조언만 반영해줘
+```
+
+`@peer`와 `@muxa-peer`는 Muxa 협업 전용 표현입니다. 새 요청은 peer-call 도구로,
+기존 peer 보고는 durable mailbox 보고 도구로 연결되며 명시적인 PR 참조 없이는
+GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent를 결정적으로
+선택하고, `@claude`, `@codex`,
+`@gemini`, `@alias`, `role:name`으로 대상을 좁힐 수 있습니다. 기본 계약은
+`REVIEW · READ-ONLY`입니다. 변경 실행은 명시적인 task 승인, 새 agent pane 생성은
+별도 확인이 있어야 합니다. Muxa를 업그레이드하거나 등록된 스킬을 바꾼 뒤에는
+실행 중이던 agent를 재시작해야 MCP process가 새 도구와 템플릿을 읽습니다.
+
 `muxa doctor`에서 synthetic으로 표시되는 agent는 안정적인 session identity가
 생길 때까지 협업 대상에서 제외됩니다. 새 prompt로 hook을 발생시키거나 agent를
 재시작한 뒤 다시 확인하세요.
@@ -200,6 +218,9 @@ footer에서 굵은 노란색으로 강조합니다. `j`, `l`, `Alt-T`, `o`, `?`
 | `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa peers` / `muxa identity` / `muxa msg` | 같은 tmux window의 agent를 찾고 이름/역할을 지정해 durable request/reply 메시지를 주고받음. |
+| `muxa skill add/list/show/remove` | watch/dashboard 메시지, watch ask, MCP peer call에서 사용할 `/` prompt 템플릿 관리. |
+| `muxa host add/list/label/annotate/doctor` | physical SSH node와 Kubernetes-style label/annotation 관리. |
+| `muxa fleet status/watch/capture/send/attach` | 중앙 host → session → window → pane(agent) 관측/제어. |
 | `muxa stats --since today` | WACT/ACT/WORK/WAIT 중심 summary. day/project/agent/session 단위로 묶을 수 있고, `--graph`는 WACT 시간 그래프만, `--verbose`는 진단 컬럼을 표시. |
 | `muxa report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
@@ -259,7 +280,30 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 항상 훅이 우선합니다.
 [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) 참고.
 
-## 호스트
+## Fleet host
+
+로컬 muxad를 현재 장비와 여러 SSH host의 중앙 controller로 사용할 수 있습니다.
+controller 장비는 별도 Fleet 설정 없이 즉시 `local` node로 나타납니다. 각 physical node는
+stable UUID와 label/annotation metadata를 가지며 controller는 node마다 persistent outbound
+SSH stdio relay와 독립적인 last-known cache를 유지합니다. 기본값은 `observe`이고
+`control`은 host별로 명시해야 합니다. 원격 TCP listener는 열지 않습니다.
+
+```bash
+muxa fleet status                         # local은 이미 표시됨
+muxa fleet status -L environment,region   # 필요한 label column만 추가
+muxa fleet status -o wide                 # 공간에 따라 hostname/version/latency
+muxa host label local environment=development
+muxa host add dev muxa-devbox --label environment=development --mode observe
+muxa host doctor dev
+muxa fleet watch
+# 같은 진입점: muxa watch --fleet
+# local 하나뿐이면 불필요한 host row 없이 완전한 native watch 사용
+```
+
+selector, TUI key, 보안/성능, MCP/dashboard API는
+[docs/FLEET.ko.md](docs/FLEET.ko.md)를 참고하세요.
+
+## Pane backend
 
 muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측하며, 여러 호스트를
 동시에 볼 수 있습니다(tmux→herdr 마이그레이션 등):
@@ -279,6 +323,7 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | 설치와 wiring | [docs/INSTALL.ko.md](docs/INSTALL.ko.md) |
 | 온보딩과 work/agent 운영 정책 | [docs/ONBOARDING.ko.md](docs/ONBOARDING.ko.md) |
 | MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
+| Physical SSH fleet | [docs/FLEET.ko.md](docs/FLEET.ko.md) |
 | Live TUI와 prompt composer | [docs/WATCH.ko.md](docs/WATCH.ko.md) |
 | CLI dashboard | [docs/DASHBOARD_CLI.ko.md](docs/DASHBOARD_CLI.ko.md) |
 | Stats, report, activity ledger | [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md) |
