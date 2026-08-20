@@ -392,10 +392,63 @@ fn next_id() -> u64 {
     now.rotate_left(8) ^ seq
 }
 
-struct AskAnswer {
-    text: String,
-    session_id: Option<String>,
-    cost_usd: Option<f64>,
+/// One finished headless turn: the agent's final text, the conversation id
+/// that would resume it, and what the turn cost.
+#[derive(Debug, Clone)]
+pub struct AskAnswer {
+    pub text: String,
+    pub session_id: Option<String>,
+    pub cost_usd: Option<f64>,
+}
+
+/// One headless agent turn that answers to its caller instead of to a
+/// store — the shape [`crate::pipeline`] uses to turn a work id into
+/// ticket context.
+///
+/// [`AskStore::ask`] is the interactive path: it records the question,
+/// returns immediately, and drops the answer into durable history for
+/// whichever surface reads it next. A resolver wants the opposite —
+/// nothing retained, the answer in hand before the next line of code
+/// runs — so it borrows the same argv and parsing without the store, the
+/// thread, or the `[ask].enabled` grant. Enabling `[ask]` is a grant to
+/// answer *the user's* typed questions; a resolver runs because the user
+/// typed `muxa work up`, which is its own consent.
+#[derive(Debug, Clone)]
+pub struct OneShot<'a> {
+    /// `claude` or `codex`.
+    pub agent: &'a str,
+    pub prompt: &'a str,
+    pub cwd: &'a std::path::Path,
+    pub permission_mode: AskPermissionMode,
+    pub additional_dirs: &'a [PathBuf],
+    pub timeout: Duration,
+}
+
+/// Run one headless turn and return its answer.
+///
+/// # Errors
+/// Returns [`AskError::UnsupportedAgent`] for an agent CLI without a print
+/// mode, [`AskError::EmptyPrompt`] for a blank prompt, and
+/// [`AskError::Io`] when the child fails, times out, or answers with
+/// something that is not a parseable result envelope.
+pub async fn one_shot(request: OneShot<'_>) -> Result<AskAnswer, AskError> {
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err(AskError::EmptyPrompt);
+    }
+    let agent = AskAgent::parse(request.agent)
+        .ok_or_else(|| AskError::UnsupportedAgent(request.agent.to_string()))?;
+    agent
+        .run(
+            prompt,
+            None,
+            request.cwd,
+            request.permission_mode,
+            request.additional_dirs,
+            request.timeout.max(Duration::from_secs(5)),
+        )
+        .await
+        .map_err(AskError::Io)
 }
 
 #[derive(Debug, Clone, Copy)]

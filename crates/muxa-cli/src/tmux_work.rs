@@ -24,12 +24,17 @@ const MANAGED_AGENT_OPTION: &str = "@muxa_managed_agent";
 const AGENT_OPTION: &str = "@muxa_agent";
 const AGENT_ROLE_OPTION: &str = "@muxa_agent_role";
 const AGENT_TASK_OPTION: &str = "@muxa_agent_task";
+/// Stable per-window name for one pipeline agent. This is the key
+/// `muxa work up` diffs on, which is why it lives on the pane rather
+/// than in the daemon: it has to outlive muxad, the CLI process, and
+/// the agent restarting inside the pane.
+const AGENT_ALIAS_OPTION: &str = "@muxa_agent_alias";
 const PANE_WORKSPACE_OPTION: &str = "@muxa_agent_workspace_id";
 const PANE_WORK_OPTION: &str = "@muxa_agent_work_id";
 
 const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
 const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}";
-const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}";
+const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_agent_alias}";
 const WINDOW_IDENTITY_FORMAT: &str =
     "#{window_id}\t#{session_id}\t#{session_name}\t#{window_name}\t#{automatic-rename}";
 
@@ -37,6 +42,9 @@ const WINDOW_IDENTITY_FORMAT: &str =
 pub struct ManagedAgentPane {
     pub pane: String,
     pub agent: String,
+    /// Pipeline alias, when this pane was created by `muxa work up`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,9 +340,13 @@ pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
         );
         for agent in &work.agents {
             println!(
-                "  {}  {}{}{}",
+                "  {}  {}{}{}{}",
                 agent.pane,
                 agent.agent,
+                agent
+                    .alias
+                    .as_deref()
+                    .map_or_else(String::new, |alias| format!(" alias={alias}")),
                 agent
                     .role
                     .as_deref()
@@ -717,6 +729,7 @@ pub fn mark_agent(
     work: Option<&str>,
     role: Option<&str>,
     task: Option<&str>,
+    alias: Option<&str>,
 ) -> Result<()> {
     validate_pane_id(pane)?;
     set_option(OptionScope::Pane, pane, AGENT_OPTION, &metadata(agent, 64)?)?;
@@ -751,6 +764,14 @@ pub fn mark_agent(
             pane,
             AGENT_TASK_OPTION,
             &metadata(task, 256)?,
+        )?;
+    }
+    if let Some(alias) = alias.filter(|value| !value.trim().is_empty()) {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_ALIAS_OPTION,
+            &metadata(alias, 64)?,
         )?;
     }
     Ok(())
@@ -939,7 +960,7 @@ fn parse_agent_pane(
     work: &str,
 ) -> Option<ManagedAgentPane> {
     let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() < 11
+    if fields.len() < 12
         || fields[1] != window
         || fields[3].trim().is_empty()
         || fields[8] != "1"
@@ -951,6 +972,7 @@ fn parse_agent_pane(
     Some(ManagedAgentPane {
         pane: fields[2].to_string(),
         agent: fields[3].to_string(),
+        alias: option(fields[11]),
         role: option(fields[4]),
         task: option(fields[5]),
         command: fields[6].to_string(),
@@ -1207,17 +1229,28 @@ mod tests {
         let windows = "muxa\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\n\
                        muxa\t$1\t@2\t1\tplain\t\t/repo\t\n\
                        legacy\t$2\t@3\t0\tlegacy\tOLD-1\t/tmp\t1\n";
-        let panes = "muxa\t@1\t%1\tcodex\timplementer\tmain\tcodex\t/repo/wt\t1\tmuxa\tTEST-0001\n\
-                     muxa\t@1\t%2\tcodex\treviewer\twrong\tcodex\t/repo/wt\t1\tmuxa\tTEST-9999\n\
-                     muxa\t@1\t%3\tcodex\treviewer\tunmanaged\tcodex\t/repo/wt\t\tmuxa\tTEST-0001\n";
+        // Trailing column is the pipeline alias: set on %1, empty on the
+        // hand-started %4 that `muxa work up` would report as unclaimed.
+        let panes = "muxa\t@1\t%1\tcodex\timplementer\tmain\tcodex\t/repo/wt\t1\tmuxa\tTEST-0001\timpl\n\
+                     muxa\t@1\t%2\tcodex\treviewer\twrong\tcodex\t/repo/wt\t1\tmuxa\tTEST-9999\t\n\
+                     muxa\t@1\t%3\tcodex\treviewer\tunmanaged\tcodex\t/repo/wt\t\tmuxa\tTEST-0001\t\n\
+                     muxa\t@1\t%4\tclaude\t\t\tclaude\t/repo/wt\t1\tmuxa\tTEST-0001\t\n";
         let workspaces = parse_workspaces(sessions, windows, panes);
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].workspace, "muxa");
         assert_eq!(workspaces[0].works.len(), 1);
         assert_eq!(workspaces[0].works[0].work, "TEST-0001");
         assert_eq!(workspaces[0].works[0].window, "@1");
-        assert_eq!(workspaces[0].works[0].agents.len(), 1);
+        assert_eq!(workspaces[0].works[0].agents.len(), 2);
         assert_eq!(workspaces[0].works[0].agents[0].pane, "%1");
+        assert_eq!(
+            workspaces[0].works[0].agents[0].alias.as_deref(),
+            Some("impl")
+        );
+        // A managed pane nobody aliased still parses; it simply has no key
+        // for the pipeline diff to claim it by.
+        assert_eq!(workspaces[0].works[0].agents[1].pane, "%4");
+        assert!(workspaces[0].works[0].agents[1].alias.is_none());
     }
 
     #[test]

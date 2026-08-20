@@ -427,6 +427,7 @@ fn tool_definitions() -> Vec<Value> {
                     "workspace": { "type": "string", "description": "Managed workspace/project id. Valid with work; defaults to cwd basename." },
                     "work": { "type": "string", "description": "Managed work/ticket id. Reuses its tmux window or creates it once; conflicts with placement/target/name." },
                     "role": { "type": "string", "description": "Optional pane role such as implementer or reviewer." },
+                    "alias": { "type": "string", "description": "Stable per-work name for this pane. `muxa work up` diffs on it to tell an agent it already started from one it still has to." },
                     "task": { "type": "string", "description": "Optional short pane task label." },
                     "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Default right." }
                 },
@@ -841,6 +842,10 @@ async fn call_tool(
                     .map(str::to_string),
                 work: args.get("work").and_then(Value::as_str).map(str::to_string),
                 role: args.get("role").and_then(Value::as_str).map(str::to_string),
+                alias: args
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 task: args.get("task").and_then(Value::as_str).map(str::to_string),
                 direction,
             };

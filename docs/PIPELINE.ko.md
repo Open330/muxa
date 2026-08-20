@@ -1,0 +1,212 @@
+# Work pipeline — `muxa work up`
+
+`muxa work start`가 명령형 primitive입니다. 한 번 실행하면 agent pane 하나가
+생깁니다. `muxa work up`은 선언형입니다. ticket id를 주면 인력이 배치된 tmux
+window를 돌려줍니다.
+
+```console
+$ muxa work up cal-1234
+work CAL-1234 is in workspace callabo via pipeline triad
+  cwd      /home/june/worktrees/cal-1234 (worktree cal-1234, created)
+  ticket   CAL-1234 Reaper double-reaps a lying pane  [In Progress]
+           https://linear.app/rtzr/issue/CAL-1234
+  + plan       codex     planner      %12
+  + impl       codex     implementer  %13
+  + review     claude    reviewer     %14
+  layout   main-vertical
+```
+
+내부적으로는 muxa의 기존 domain model — workspace = session, work = window,
+agent = pane ([WORKSPACE_MODEL.md](WORKSPACE_MODEL.md)) — 위에 선언된 line-up을
+얹은 것입니다.
+
+## 구조
+
+```
+work id ──▶ [[route]] ──▶ workspace + cwd/worktree + pipeline
+   │                              │
+   └──▶ [ticket.source] ──▶ ticket context ──┘
+                                             ▼
+                                  원하는 pane vs 실제 pane
+                                             ▼
+                                        차이만 생성
+```
+
+## ticket 조회는 agent에게 위임합니다
+
+muxa는 Linear, Jira, GitHub를 직접 말하지 않고 앞으로도 그럴 계획이 없습니다.
+headless agent turn 하나(`claude -p` / `codex exec`, `muxa ask`가 쓰는 그
+bridge)를 써서 agent에게 ticket 조회를 시킵니다. 이미 skill, MCP server, `gh`,
+환경변수 토큰으로 agent CLI에게 그 방법을 가르쳐 뒀기 때문입니다. provider를
+추가하는 일은 release가 아니라 prompt입니다.
+
+```toml
+[ticket.source.linear]
+match  = '^cal-\d+$'
+prompt = '''
+linear skill로 Linear issue {{id}}를 조회해서 JSON object 하나만 출력해라.
+{"id": "...", "title": "...", "body": "...", "url": "...", "state": "..."}
+'''
+```
+
+응답은 첫 글자부터 파싱하지 않고 JSON object를 **스캔**합니다. agent는 JSON
+주위에 산문을 붙이는 일이 흔하기 때문입니다 — fence, 앞머리 한 문장, 끝에
+덧붙이는 제안. 균형 잡힌 마지막 object가 이기므로 prompt에 적어 둔 예시 shape가
+실제 답을 이기지 않습니다. 흔한 필드 표기(`body`에 `description`, `id`에
+`identifier`, `state`에 `{"name": …}`)도 받아들입니다.
+
+결과는 `[ticket].cache_secs`(기본 15분) 동안 캐시되므로 pane 하나 더 붙이려고
+다시 실행해도 turn을 또 쓰지 않습니다. `--refresh`는 캐시를 무시하고,
+`--no-ticket`은 조회를 건너뛰고 id만으로 띄웁니다.
+
+## routing은 사용자 것입니다
+
+```toml
+[[route]]
+match     = '^cal-'
+workspace = 'callabo'
+pipeline  = 'triad'
+
+[route.worktree]
+repo   = '~/workspace/callabo'
+branch = '{{id}}'
+
+[[route]]
+match    = '.*'
+pipeline = 'solo'
+```
+
+route는 순서 있는 목록이고 첫 매치가 이깁니다. 구체적인 규칙을 위에, catch-all을
+아래에 둡니다. route가 정하는 것은 셋입니다: work가 들어갈 tmux session, agent가
+돌 디렉터리, 그리고 그 window를 채울 pipeline.
+
+`[route.worktree]`를 두면 work마다 git worktree가 생깁니다. 한 window의 agent
+셋이 같은 checkout에서 서로를 밟지 않게 해 주는 장치입니다. 기본 경로는 repo
+**바깥**(`<repo>/../<repo-name>-worktrees/<id>`)입니다. repo 안에 두면 부모의
+status와 agent가 돌리는 모든 `find`에 걸리기 때문입니다. 이미 있는 worktree는
+재사용하고, 이미 있는 branch는 새로 만들지 않고 checkout합니다.
+
+route 없이도 시작할 수 있습니다. `muxa work up cal-1234 --pipeline triad`는 그
+플래그 자체를 routing 결정으로 보고 현재 디렉터리를 씁니다.
+
+## pipeline은 script가 아니라 desired state입니다
+
+```toml
+[pipeline.triad]
+layout = 'main-vertical'
+prompt = '''
+{{work}} — {{ticket.title}}
+{{ticket.url}}
+
+{{ticket.body}}
+'''
+
+[[pipeline.triad.agent]]
+alias   = 'plan'
+program = 'codex'
+role    = 'planner'
+prompt  = '너는 기획을 맡는다. 접근안을 먼저 쓰고 코드는 고치지 마라.'
+
+[[pipeline.triad.agent]]
+alias   = 'impl'
+program = 'codex'
+role    = 'implementer'
+prompt  = '너는 구현을 맡는다. 기획을 따르고 범위를 바꾸려면 먼저 물어라.'
+
+[[pipeline.triad.agent]]
+alias   = 'review'
+program = 'claude'
+role    = 'reviewer'
+prompt  = '너는 리뷰를 맡는다. 구현을 비판하되 직접 고치지 마라.'
+```
+
+`alias`가 핵심입니다. desired-vs-actual diff가 이 키로 돌고, pane 자체에
+기록되므로(`@muxa_agent_alias`) muxad, CLI 프로세스, pane 안의 agent 재시작을
+모두 넘겨 살아남습니다. pipeline 안에서 유일해야 하고, 그 아래 pane이 생긴
+뒤에는 바꾸지 않아야 합니다.
+
+pipeline의 `prompt`는 모든 agent에게 필요한 context를 한 번만 적는 자리이고,
+각 agent의 `prompt`가 그 뒤에 붙습니다. `role`도 pane에 기록되므로 collaboration
+레이어에서 `role:reviewer`로 지목할 수 있습니다.
+
+`layout`은 모든 pane이 생긴 다음에만 적용됩니다. window를 반복해서 split하면
+그때그때 active pane이 반으로 쪼개지므로, 도중에 세 번 고치는 것보다 끝에 한 번
+정리하는 편이 맞습니다.
+
+## 다시 실행하면 수렴합니다
+
+`muxa work up`을 다시 실행하면 pipeline과 window의 현재 pane을 비교합니다.
+
+- alias에 pane이 없다 → **launch**
+- alias에 살아있는 pane이 있다 → **keep**, 건드리지 않음
+- alias에 살아있는 pane이 있고 `--prompt`를 줬다 → **메시지 전송**
+
+```console
+$ muxa work up cal-1234           # reviewer pane이 닫혀 있던 상태
+  = plan       running                %12
+  = impl       running                %13
+  + review     claude    reviewer     %21
+```
+
+첫 호출은 팀을 세우고, 두 번째는 no-op이고, 무언가 죽은 뒤의 호출은 정확히 그
+구멍만 메웁니다. 진행 중인 일감을 개선하는 경로는 `--prompt`입니다.
+
+```console
+$ muxa work up cal-1234 --prompt "이어가기 전에 main으로 rebase해라"
+  » plan       prompted               %12
+  » impl       prompted               %13
+  » review     prompted               %21
+```
+
+이건 의도적으로 opt-in입니다. turn 중인 agent에게 prompt를 밀어 넣는 건 명시적
+요청을 받을 만큼 방해가 되는 행동이라, 그냥 다시 실행하면 살아있는 agent는
+건드리지 않습니다.
+
+어떤 alias도 주장하지 않는 pane — 직접 띄운 것이거나 지금은 수정된 pipeline이
+남긴 것 — 은 **보고만 하고 절대 건드리지 않습니다**.
+
+```console
+  ? (no alias) gemini    unclaimed    %30
+```
+
+desired state로 수렴시키는 건 유용합니다. 하지만 사람이 연 pane을 desired state
+**바깥으로** 치우는 건 orchestration이 불신을 얻는 방식입니다.
+
+## Placeholder
+
+템플릿은 `{{이중}}` 중괄호를 쓰고, muxa가 아는 키만 치환하며 나머지는 그대로
+둡니다. resolver prompt가 요청하는 `{"id": "..."}` 형태를 그대로 담을 수 있는
+이유이자, 오타가 조용히 빈칸이 되는 대신 prompt에 그대로 드러나는 이유입니다.
+
+| 키 | 값 |
+| --- | --- |
+| `{{id}}` | 소문자 work id — branch명과 디렉터리용 |
+| `{{work}}` | muxa가 저장·표시하는 형태의 work id (`CAL-1234`) |
+| `{{workspace}}` | 결정된 workspace/session |
+| `{{cwd}}` | 결정된 작업 디렉터리 |
+| `{{alias}}`, `{{role}}`, `{{program}}` | 렌더링 중인 agent |
+| `{{ticket.title}}` `{{ticket.body}}` `{{ticket.url}}` `{{ticket.state}}` `{{ticket.id}}` `{{ticket.branch}}` | 조회된 ticket context |
+
+`{{ticket.body}}`는 4000자에서 `…[truncated]` 표시와 함께 잘립니다. launch
+prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으면 됩니다.
+
+## 명령 정리
+
+```console
+muxa work up <id>                    # 조회 → routing → 없는 것만 생성
+muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음
+muxa work up <id> --pipeline triad   # route의 pipeline을 덮어씀
+muxa work up <id> --prompt "..."     # 이미 돌고 있는 agent에게도 메시지
+muxa work up <id> --no-ticket        # 조회 없이 id만으로 실행
+muxa work up <id> --refresh          # 캐시된 ticket 무시
+muxa work up <id> --json             # 구조화된 plan + 결과
+muxa work down <id>                  # window와 그 안의 agent 전부 종료
+```
+
+`muxa work down`은 `muxa work close`의 다른 표기입니다. 둘 다 unmanaged window는
+건드리지 않고, 같은 work id가 여러 workspace에 있으면 `--workspace`를 요구합니다.
+
+## 설정
+
+주석 달린 레퍼런스는 [`config.example.toml`](../config.example.toml)의
+`[ticket]`, `[[route]]`, `[pipeline.*]` 섹션에 있습니다.

@@ -21,6 +21,7 @@ mod timeline;
 mod tmux_work;
 mod upgrade;
 mod watch;
+mod work_up;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -390,6 +391,10 @@ enum WindowCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
+    /// Bring a work window to the state its pipeline declares: resolve the
+    /// ticket, route it to a workspace, and create whichever agent panes
+    /// are missing. Re-running converges instead of duplicating.
+    Up(work_up::UpArgs),
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
     /// List muxa-managed work windows.
@@ -398,6 +403,8 @@ enum WorkCmd {
     Show(tmux_work::WorkShowArgs),
     /// Close a work window and every agent pane in it.
     Close(tmux_work::WorkCloseArgs),
+    /// Counterpart to `up`: close the work window and every agent in it.
+    Down(tmux_work::WorkCloseArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -536,12 +543,13 @@ fn run_window_cmd(action: WindowCmd) -> Result<()> {
     }
 }
 
-fn run_work_cmd(action: WorkCmd) -> Result<()> {
+async fn run_work_cmd(action: WorkCmd, cfg: &Config) -> Result<()> {
     match action {
+        WorkCmd::Up(args) => work_up::run(args, cfg).await,
         WorkCmd::Start(args) => agent_launch::run_work_start(args),
         WorkCmd::List(args) => tmux_work::run_work_list(args),
         WorkCmd::Show(args) => tmux_work::run_work_show(args),
-        WorkCmd::Close(args) => tmux_work::run_work_close(args),
+        WorkCmd::Close(args) | WorkCmd::Down(args) => tmux_work::run_work_close(args),
     }
 }
 
@@ -604,7 +612,7 @@ async fn main() -> Result<()> {
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Window { action } => run_window_cmd(action),
-        Cmd::Work { action } => run_work_cmd(action),
+        Cmd::Work { action } => run_work_cmd(action, &cfg).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
@@ -2700,6 +2708,49 @@ mod tests {
         assert_eq!(start.workspace.as_deref(), Some("muxa"));
         assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
         assert_eq!(start.role.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn work_up_cli_carries_the_pipeline_overrides() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "work",
+            "up",
+            "cal-1234",
+            "--pipeline",
+            "triad",
+            "--prompt",
+            "rebase onto main",
+            "--no-ticket",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Work {
+            action: WorkCmd::Up(up),
+        } = args.cmd
+        else {
+            panic!("expected work up");
+        };
+        assert_eq!(up.work, "cal-1234");
+        assert_eq!(up.pipeline.as_deref(), Some("triad"));
+        assert_eq!(up.prompt.as_deref(), Some("rebase onto main"));
+        assert!(up.no_ticket);
+        assert!(up.dry_run);
+        assert!(up.json);
+    }
+
+    #[test]
+    fn work_down_is_a_spelling_of_work_close() {
+        let args = Args::try_parse_from(["muxa", "work", "down", "cal-1234", "-y"]).unwrap();
+        let Cmd::Work {
+            action: WorkCmd::Down(down),
+        } = args.cmd
+        else {
+            panic!("expected work down");
+        };
+        assert_eq!(down.work, "cal-1234");
+        assert!(down.yes);
     }
 
     #[test]

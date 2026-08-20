@@ -263,6 +263,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa sync` | Backfill the registry by scanning active pane hosts. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
+| `muxa work up cal-1234` | Resolve the ticket, route it to a workspace, and create whichever pipeline agent panes are missing. Re-running converges; see [docs/PIPELINE.md](docs/PIPELINE.md). |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
 | `muxa workspace list/show/close` | Inspect or explicitly close workspace/project sessions. |
 | `muxa work list/show/close [--workspace muxa]` | Inspect or explicitly close work/ticket windows. |
@@ -367,6 +368,7 @@ simultaneously.
 | --- | --- |
 | Install and wiring | [docs/INSTALL.md](docs/INSTALL.md) |
 | Onboarding and work/agent policy (한국어) | [docs/ONBOARDING.ko.md](docs/ONBOARDING.ko.md) |
+| Work pipelines (`muxa work up`) | [docs/PIPELINE.md](docs/PIPELINE.md) · [한국어](docs/PIPELINE.ko.md) |
 | MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
 | herdr host support | [docs/HERDR.md](docs/HERDR.md) |
 | rmux host support | [docs/RMUX.md](docs/RMUX.md) |

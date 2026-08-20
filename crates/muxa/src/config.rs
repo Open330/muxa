@@ -127,6 +127,12 @@ pub struct Config {
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
     pub stats: StatsConfig,
+    /// How `muxa work up` turns a work id into ticket context.
+    pub ticket: TicketConfig,
+    /// Work-id routing rules, first match wins.
+    pub route: Vec<RouteConfig>,
+    /// Named agent line-ups, keyed by pipeline name.
+    pub pipeline: BTreeMap<String, PipelineConfig>,
 }
 
 /// Fleet-wide connection and refresh policy. Inventory keys are stable local
@@ -296,6 +302,159 @@ pub enum AskPermissionMode {
     /// Disable approval and sandbox checks for unattended automation.
     #[default]
     Bypass,
+}
+
+/// Default wall-clock ceiling for one ticket-resolver turn. Short next to
+/// `[ask]`'s: a resolver looks one ticket up, it does not do the work.
+pub const DEFAULT_TICKET_TIMEOUT_SECS: u64 = 180;
+
+/// `[ticket]` config — how a work id becomes ticket context.
+///
+/// Muxa does not speak Linear, Jira, or GitHub. It runs one headless agent
+/// turn and asks *that* agent to fetch the ticket, because the user has
+/// already taught their agent CLI how: skills, MCP servers, `gh`, an API
+/// token in the environment. Teaching muxa the same thing a second time
+/// would mean shipping a client per provider and chasing every schema
+/// change. Here, adding a provider is a prompt.
+///
+/// Disabled by default in the sense that matters: with no `[ticket.source]`
+/// entries nothing is ever spawned, and `muxa work up` runs on the work id
+/// alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TicketConfig {
+    /// Resolver agent CLI: `claude` or `codex`. Only these two have a
+    /// print mode that reports completion as a fact rather than a guess.
+    pub agent: String,
+    /// Directory the resolver runs in. Defaults to `$HOME`, which is both
+    /// where user-scoped skills live and a neutral place to run something
+    /// that should be reading an issue tracker, not a working tree.
+    pub cwd: Option<PathBuf>,
+    /// Permission policy for the resolver turn. `bypass` by default for
+    /// the same reason `[ask]` uses it: nobody is at the keyboard to
+    /// answer an approval prompt.
+    pub permission_mode: AskPermissionMode,
+    /// Extra roots exposed to the resolver, for skills that live outside
+    /// `cwd` or reach it through a symlink.
+    pub additional_dirs: Vec<PathBuf>,
+    /// Wall-clock ceiling for one resolver turn.
+    pub timeout_secs: u64,
+    /// Serve a cached ticket this long before spending another agent turn.
+    /// Re-running `muxa work up` to add a pane is common; paying for the
+    /// same lookup each time is not. `0` disables the cache.
+    pub cache_secs: u64,
+    /// Ticket sources keyed by name, tried in sorted-key order. The first
+    /// whose `match` accepts the work id wins.
+    pub source: BTreeMap<String, TicketSource>,
+}
+
+impl Default for TicketConfig {
+    fn default() -> Self {
+        Self {
+            agent: "claude".into(),
+            cwd: None,
+            permission_mode: AskPermissionMode::Bypass,
+            additional_dirs: Vec::new(),
+            timeout_secs: DEFAULT_TICKET_TIMEOUT_SECS,
+            cache_secs: 900,
+            source: BTreeMap::new(),
+        }
+    }
+}
+
+/// One `[ticket.source.<name>]` entry — a work-id pattern and the prompt
+/// that turns a matching id into ticket JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TicketSource {
+    /// Regex matched against the work id, case-insensitively.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Prompt handed to the resolver. Placeholders are rendered before it
+    /// is sent; `{{id}}` is the work id. The reply is scanned for a JSON
+    /// object, so the prompt should ask for one and nothing else.
+    pub prompt: String,
+}
+
+/// One `[[route]]` entry — a work-id pattern and the tmux geography plus
+/// pipeline it selects. First match wins, so specific rules go above the
+/// catch-all.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouteConfig {
+    /// Regex matched against the work id, case-insensitively.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Workspace id, i.e. the tmux session. Defaults to the directory name
+    /// of the resolved cwd, matching `muxa work start`.
+    pub workspace: Option<String>,
+    /// Pipeline to staff the work window with. Without one, `muxa work up`
+    /// needs `--pipeline`.
+    pub pipeline: Option<String>,
+    /// Working directory for the work window. Ignored when `worktree` is
+    /// set, which computes its own.
+    pub cwd: Option<String>,
+    /// Give this work its own git worktree instead of sharing a checkout.
+    pub worktree: Option<WorktreeConfig>,
+}
+
+/// `[route.worktree]` — a git worktree per work item, so three agents in
+/// one window cannot trip over each other's edits in a shared checkout.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorktreeConfig {
+    /// Repository the worktree is added to.
+    pub repo: String,
+    /// Where the worktree is created. Defaults to
+    /// `<repo>/../<repo-name>-worktrees/{{id}}`, which keeps it beside the
+    /// repo rather than inside it.
+    pub path: Option<String>,
+    /// Branch to check out, created when absent. Defaults to `{{id}}`.
+    pub branch: Option<String>,
+    /// Commit-ish a newly created branch starts from. Defaults to the
+    /// repo's `origin/HEAD`.
+    pub base: Option<String>,
+}
+
+/// One `[pipeline.<name>]` entry — the set of agents a work window should
+/// end up staffed with. This is a desired state, not a script: `muxa work
+/// up` compares it against the panes that already exist and creates only
+/// what is missing, so re-running it converges instead of duplicating.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineConfig {
+    /// Shown by `muxa work up --dry-run` and in error messages.
+    pub description: Option<String>,
+    /// tmux layout applied once every pane exists, e.g. `main-vertical`,
+    /// `even-horizontal`, `tiled`. Omit to leave tmux's own arrangement.
+    pub layout: Option<String>,
+    /// Prompt prefix prepended to every agent's prompt in this pipeline —
+    /// the ticket context each of them needs before its own instructions.
+    pub prompt: Option<String>,
+    /// The agents themselves, in creation order.
+    pub agent: Vec<PipelineAgentConfig>,
+}
+
+/// One `[[pipeline.<name>.agent]]` entry — one pane.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineAgentConfig {
+    /// Stable name for this pane within the work window. This is the key
+    /// the desired-vs-actual diff runs on, so it has to be unique in the
+    /// pipeline and must not change once panes exist under it.
+    pub alias: String,
+    /// Allowlisted agent CLI: `claude`, `codex`, `gemini`, or `opencode`.
+    pub program: String,
+    /// Collaboration role, recorded on the pane so peers can address it as
+    /// `role:<role>`.
+    pub role: Option<String>,
+    /// Short label shown in `muxa work show` and `muxa watch`.
+    pub task: Option<String>,
+    /// This agent's own instructions, appended to the pipeline prompt.
+    pub prompt: Option<String>,
+    /// Split direction when this pane joins an existing window: `right`
+    /// (default) or `down`.
+    pub direction: Option<String>,
 }
 
 /// `[collaboration]` config — same-window durable agent request/reply.

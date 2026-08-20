@@ -1411,7 +1411,15 @@ impl Effects for RealEffects {
             if plan.created_work {
                 crate::tmux_work::mark_work(&window, &workspace, &work, &cwd)?;
             }
-            crate::tmux_work::mark_agent(&pane, agent, Some(&workspace), Some(&work), None, None)
+            crate::tmux_work::mark_agent(
+                &pane,
+                agent,
+                Some(&workspace),
+                Some(&work),
+                None,
+                None,
+                None,
+            )
         })();
         if let Err(error) = marked {
             crate::tmux_work::cleanup_pane(&pane);

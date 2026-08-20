@@ -375,3 +375,109 @@
 # flavor          = "slack"            # slack | discord | generic
 # on_states       = ["WaitingInput", "Error"]
 # rate_limit_secs = 60                 # per (kind, session, state)
+
+# ---------------------------------------------------------------------------
+# `muxa work up` — declarative work pipelines
+#
+# One command takes a ticket id and leaves you with a staffed tmux window:
+#
+#     muxa work up cal-1234
+#
+# It resolves the ticket, routes it to a workspace/session, and creates
+# whichever agent panes the pipeline declares but the window does not have
+# yet. Re-running converges — it fills gaps, it does not duplicate a team.
+# Add `--dry-run` to see the plan without touching tmux. See docs/PIPELINE.md.
+# ---------------------------------------------------------------------------
+
+# How a work id becomes ticket context.
+#
+# muxa does not speak Linear, Jira, or GitHub. It spends one headless agent
+# turn asking an agent to fetch the ticket, because you already taught your
+# agent CLI how — a skill, an MCP server, `gh`, a token in the environment.
+# Adding a provider here is a prompt, not a muxa release.
+#
+# With no [ticket.source] entries nothing is ever spawned and `muxa work up`
+# runs on the work id alone.
+[ticket]
+# agent           = "claude"    # resolver CLI: claude | codex (print mode)
+# cwd             = "~"         # neutral cwd; also where user-scoped skills live
+# permission_mode = "bypass"    # default | edit | bypass — nobody is at the keyboard
+# additional_dirs = []
+# timeout_secs    = 180
+# cache_secs      = 900         # serve a cached ticket this long; 0 disables
+
+# Sources are tried in sorted-key order; the first `match` wins. `{{id}}` is
+# the work id. The reply is scanned for a JSON object, so ask for one — prose
+# around it is fine, and `{"like":"this"}` in the prompt is left alone because
+# only `{{double}}` braces are substituted.
+# [ticket.source.linear]
+# match  = '^cal-\d+$'
+# prompt = '''
+# Look up Linear issue {{id}} using the linear skill and answer with one JSON
+# object and nothing else:
+# {"id": "...", "title": "...", "body": "...", "url": "...", "state": "..."}
+# '''
+
+# [ticket.source.github]
+# match  = '^\d+$'
+# prompt = 'Run `gh issue view {{id}} --json number,title,body,url,state` and return its JSON.'
+
+# Routing: work id → where its tmux surfaces live and which pipeline staffs
+# them. Ordered, first match wins, so put the catch-all last. Without any
+# route, `muxa work up --pipeline <name>` still works and uses the current
+# directory.
+# [[route]]
+# match     = '^cal-'
+# workspace = 'callabo'          # the tmux session
+# pipeline  = 'triad'
+# # Give each work item its own git worktree so three agents in one window
+# # cannot trip over each other in a shared checkout. Omit to share a
+# # checkout and use `cwd` instead.
+# [route.worktree]
+# repo   = '~/workspace/callabo'
+# branch = '{{id}}'              # default: {{id}}
+# # path = '~/worktrees/{{id}}'  # default: <repo>/../<repo-name>-worktrees/{{id}}
+# # base = 'origin/main'         # default: the repo's origin/HEAD
+
+# [[route]]
+# match    = '.*'
+# cwd      = '{{cwd}}'
+# pipeline = 'solo'
+
+# A pipeline is a desired set of panes, not a script. `alias` is the key the
+# desired-vs-actual diff runs on: it is recorded on the pane, so it survives
+# muxad, the CLI, and the agent restarting. Keep it unique and stable.
+#
+# Placeholders: {{id}} (lowercase work id, for branches and paths), {{work}}
+# (as muxa stores it), {{workspace}}, {{cwd}}, {{alias}}, {{role}}, and
+# {{ticket.title|body|url|state|id|branch}}.
+# [pipeline.triad]
+# description = 'planner → implementer → reviewer'
+# layout      = 'main-vertical'   # tmux layout, applied once every pane exists
+# # Context every agent in this pipeline needs, stated once. Each agent's own
+# # prompt is appended to it.
+# prompt = '''
+# {{work}} — {{ticket.title}}
+# {{ticket.url}}
+#
+# {{ticket.body}}
+# '''
+
+# [[pipeline.triad.agent]]
+# alias   = 'plan'
+# program = 'codex'               # claude | codex | gemini | opencode
+# role    = 'planner'             # peers can address it as role:planner
+# prompt  = 'You own the approach. Write the plan first; do not edit code.'
+
+# [[pipeline.triad.agent]]
+# alias     = 'impl'
+# program   = 'codex'
+# role      = 'implementer'
+# prompt    = 'You own the implementation. Follow the planner; ask before scope changes.'
+# direction = 'down'              # right (default) | down
+
+# [[pipeline.triad.agent]]
+# alias   = 'review'
+# program = 'claude'
+# role    = 'reviewer'
+# prompt  = 'You own review. Critique the implementer; do not edit.'

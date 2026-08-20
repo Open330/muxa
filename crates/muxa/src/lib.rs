@@ -50,6 +50,7 @@ pub mod ipc;
 pub mod metrics;
 pub mod notify;
 pub mod paths;
+pub mod pipeline;
 mod process_snapshot;
 pub mod process_tree;
 pub mod reconcile;

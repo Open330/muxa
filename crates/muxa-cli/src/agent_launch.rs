@@ -141,6 +141,10 @@ pub struct StartArgs {
     /// Optional short task label stored on the pane.
     #[arg(long)]
     pub task: Option<String>,
+    /// Stable per-work name for this pane, used by `muxa work up` to tell
+    /// an agent it already started from one it still has to.
+    #[arg(long)]
+    pub alias: Option<String>,
     /// Split to the right (default) or below the target pane.
     #[arg(long, value_enum, default_value = "right")]
     pub direction: SplitDirection,
@@ -171,6 +175,9 @@ pub struct WorkStartArgs {
     /// Optional short task label.
     #[arg(long)]
     pub task: Option<String>,
+    /// Stable per-work name for this pane, used by `muxa work up`.
+    #[arg(long)]
+    pub alias: Option<String>,
     /// Split a reused work window to the right or below.
     #[arg(long, value_enum, default_value = "right")]
     pub direction: SplitDirection,
@@ -191,6 +198,7 @@ pub struct StartRequest {
     pub work: Option<String>,
     pub role: Option<String>,
     pub task: Option<String>,
+    pub alias: Option<String>,
     pub direction: SplitDirection,
 }
 
@@ -207,6 +215,7 @@ impl From<&StartArgs> for StartRequest {
             work: args.work.clone(),
             role: args.role.clone(),
             task: args.task.clone(),
+            alias: args.alias.clone(),
             direction: args.direction,
         }
     }
@@ -232,6 +241,8 @@ pub struct StartResult {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub cwd: PathBuf,
     pub prompt_supplied: bool,
 }
@@ -270,6 +281,7 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
         work: Some(args.work),
         role: args.role,
         task: args.task,
+        alias: args.alias,
         direction: args.direction,
     })?;
     if json {
@@ -371,6 +383,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             work.as_deref(),
             request.role.as_deref(),
             request.task.as_deref(),
+            request.alias.as_deref(),
         )
     })();
     if let Err(error) = mark {
@@ -391,6 +404,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         window,
         role: request.role,
         task: request.task,
+        alias: request.alias,
         cwd,
         prompt_supplied: prompt.is_some(),
     })
@@ -707,6 +721,7 @@ mod tests {
             work: None,
             role: None,
             task: None,
+            alias: None,
             direction: SplitDirection::Right,
         }
     }
