@@ -41,7 +41,7 @@ const TIMELINE_EVENT_DEBOUNCE_MS = 2000;
 const SESSION_PAGE_SIZE = 40;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
-const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "opencode", "unknown"];
+const AGENT_KINDS = ["claude_code", "codex", "gemini_cli", "antigravity", "opencode", "unknown"];
 const TIMELINE_RANGES = ["24h", "today", "last week", "month", "last month", "7d", "30d", "12w"];
 const SESSION_SORTS = new Set(["priority", "latest", "name"]);
 

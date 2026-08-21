@@ -28,7 +28,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::{Cell, ColumnConstraint, ContentArrangement, Table, Width};
 use muxa::adapters::{
-    claude, run_hook, ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
+    claude, run_hook, AntigravityAdapter, ClaudeAdapter, CodexAdapter, GeminiAdapter,
+    OpencodeAdapter,
 };
 use muxa::collaboration::{
     AirArtifactReference, CollaborationClientKind, CollaborationOrigin, NewRequest, RequestKind,
@@ -461,6 +462,15 @@ enum HookCmd {
     },
     /// Gemini CLI hook handler.
     Gemini {
+        #[arg(long)]
+        event: String,
+    },
+    /// Antigravity CLI (`agy`) hook handler. Reads hook JSON on stdin.
+    ///
+    /// Writes NOTHING to stdout on any event: agy reads a hook's stdout as a
+    /// verdict, and a `PreToolUse` reply without a valid `decision` blocks the
+    /// tool call outright.
+    Agy {
         #[arg(long)]
         event: String,
     },
@@ -1309,6 +1319,9 @@ async fn cmd_sync(client: &Client) -> Result<()> {
     if report.gemini_cli > 0 {
         parts.push(format!("{} gemini_cli", report.gemini_cli));
     }
+    if report.antigravity > 0 {
+        parts.push(format!("{} antigravity", report.antigravity));
+    }
 
     let total = report.total_ingested();
     if total == 0 && report.skipped_known == 0 && report.failed == 0 {
@@ -1946,6 +1959,20 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+        }
+        HookCmd::Agy { event } => {
+            // FAIL-OPEN, and deliberately unlike the other hook arms.
+            //
+            // agy treats a non-zero hook exit as a verdict: a `PreToolUse`
+            // handler that dies takes the tool call down with it
+            // ("tool call denied by pre-tool hook"). Observability must never
+            // be able to block the agent, so an unparseable payload — a shape
+            // change in a future agy, a truncated stdin — is logged and
+            // swallowed rather than propagated to a non-zero exit.
+            match run_hook::<AntigravityAdapter, _>(&event, &mut std::io::stdin()) {
+                Ok(ev) => best_effort_ingest(client, &ev).await,
+                Err(e) => tracing::debug!(error = %e, event, "agy hook payload ignored"),
+            }
         }
         HookCmd::Opencode { event } => {
             let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;

@@ -23,7 +23,7 @@ use muxa::state::SYNTHETIC_SESSION_PREFIX;
 use muxa::Agent;
 use tokio::time::timeout;
 
-use crate::init::files::{claude, codex, gemini, launchd, systemd as systemd_files};
+use crate::init::files::{antigravity, claude, codex, gemini, launchd, systemd as systemd_files};
 
 /// Marker block ids the `muxa init` tmux installer writes — must match
 /// the constants in `init::components::Component::id`. Duplicated as
@@ -366,7 +366,7 @@ fn check_systemd_unit_file() -> CheckResult {
     }
 }
 
-/// Run the per-agent hook check for Claude, Codex, and Gemini. Each
+/// Run the per-agent hook check for Claude, Codex, Gemini, and agy. Each
 /// returns `(label, result)` so `run()` can log them with a consistent
 /// `Hooks · <agent>` prefix.
 fn check_agent_hooks() -> Vec<(String, CheckResult)> {
@@ -382,6 +382,14 @@ fn check_agent_hooks() -> Vec<(String, CheckResult)> {
         (
             "Hooks · Gemini".to_string(),
             check_one_agent_hook("gemini", gemini::default_path(), gemini_hook_configured),
+        ),
+        (
+            "Hooks · Antigravity".to_string(),
+            check_one_agent_hook(
+                "agy",
+                antigravity::default_path(),
+                antigravity_hook_configured,
+            ),
         ),
     ]
 }
@@ -429,6 +437,43 @@ pub fn claude_hook_configured(settings_text: &str) -> bool {
 /// Claude.
 pub fn gemini_hook_configured(settings_text: &str) -> bool {
     json_hooks_dict_has_command(settings_text, "muxa hook gemini")
+}
+
+/// True iff agy's `hooks.json` contains at least one handler whose command
+/// starts with `muxa hook agy`.
+///
+/// A different shape from the Claude/Gemini walker, not a variant of it: agy
+/// keys the file by hook NAME first (`{"<name>": {"<Event>": [...]}}`), and an
+/// event's entries are either bare handlers (`Stop`, `PreInvocation`, …) or
+/// `{matcher, hooks[]}` groups (`PreToolUse`, `PostToolUse`). Both forms are
+/// accepted here so the check keeps passing if agy ever relaxes which events
+/// take a matcher.
+pub fn antigravity_hook_configured(hooks_text: &str) -> bool {
+    const PREFIX: &str = "muxa hook agy";
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(hooks_text) else {
+        return false;
+    };
+    let Some(named) = root.as_object() else {
+        return false;
+    };
+    named.values().any(|spec| {
+        spec.as_object().is_some_and(|events| {
+            events.values().any(|entries| {
+                entries.as_array().is_some_and(|arr| {
+                    arr.iter()
+                        .any(|entry| has_command(entry, PREFIX) || entry_has_command(entry, PREFIX))
+                })
+            })
+        })
+    })
+}
+
+/// A bare handler object — the flat (matcher-less) event form.
+fn has_command(entry: &serde_json::Value, prefix: &str) -> bool {
+    entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .is_some_and(|c| c.trim_start().starts_with(prefix))
 }
 
 /// True iff Codex's `config.toml` contains at least one hook entry
@@ -862,6 +907,43 @@ mod tests {
         // Garbage in must not panic — bare `false` is the right signal.
         assert!(!claude_hook_configured("not even json {"));
         assert!(!claude_hook_configured(""));
+    }
+
+    #[test]
+    fn antigravity_hook_configured_accepts_both_event_shapes() {
+        // Exactly what `files::antigravity::upsert` writes.
+        let written = crate::init::files::antigravity::upsert("").unwrap().0;
+        assert!(antigravity_hook_configured(&written));
+
+        // The grouped (matcher) form on its own...
+        let grouped = r#"{"muxa":{"PreToolUse":[
+            { "matcher": "*", "hooks": [{ "type": "command", "command": "muxa hook agy --event pre_tool_use" }] }
+        ]}}"#;
+        assert!(antigravity_hook_configured(grouped));
+
+        // ...and the flat form on its own.
+        let flat = r#"{"muxa":{"Stop":[
+            { "type": "command", "command": "muxa hook agy --event stop" }
+        ]}}"#;
+        assert!(antigravity_hook_configured(flat));
+    }
+
+    /// Someone else's hooks in the same file must not read as ours — that is
+    /// the whole point of walking the structure instead of substring-matching.
+    #[test]
+    fn antigravity_hook_configured_rejects_foreign_hooks() {
+        let other = r#"{"lint-checker":{"PostToolUse":[
+            { "matcher": "run_command", "hooks": [{ "type": "command", "command": "./lint.sh" }] }
+        ]}}"#;
+        assert!(!antigravity_hook_configured(other));
+        // The Gemini CLI's file shape must not satisfy the agy check either:
+        // that is the exact mix-up this whole adapter exists to prevent.
+        let gemini_shaped = r#"{"hooks":{"BeforeAgent":[
+            { "hooks": [{ "type": "command", "command": "muxa hook gemini --event before_agent" }] }
+        ]}}"#;
+        assert!(!antigravity_hook_configured(gemini_shaped));
+        assert!(!antigravity_hook_configured("{ not json"));
+        assert!(!antigravity_hook_configured("[]"));
     }
 
     #[test]

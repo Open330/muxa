@@ -195,7 +195,7 @@ enabled = true
 interval_secs = 30
 ```
 
-discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`gemini`)를
+discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`gemini`/`agy`)를
 찾아 hook이 오기 전에 레지스트리를 채웁니다. 데몬 시작 시 1회 실행되고 이후
 `interval_secs`마다 재스캔하므로, 새 tmux 세션에서 갓 시작한 agent가 첫 hook을
 쏘기 전이라도 그 주기 안에 `muxa status`에 뜹니다. `interval_secs = 0`이면

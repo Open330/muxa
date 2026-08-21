@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Google Antigravity CLI (`agy`) is a first-class agent.** agy replaced the
+  Gemini CLI upstream but shares none of its hook contract, so muxa's existing
+  Gemini support was silently inert against it: agy reads
+  `~/.gemini/config/hooks.json` (or `<workspace>/.agents/hooks.json`), not the
+  `hooks` key of `~/.gemini/settings.json`; its lifecycle is
+  `SessionStart`/`PreInvocation`/`PostInvocation`/`PreToolUse`/`PostToolUse`/`Stop`;
+  and its payloads are camelCase protojson keyed on `conversationId`. A new
+  `AgentKind::Antigravity`, adapter, and `muxa hook agy` handler cover all six
+  events. Neither prompts nor responses appear in any agy payload, so
+  `PreInvocation` and `Stop` read them out of the transcript agy points at —
+  `PreInvocation` only on `invocationNum == 0`, the turn boundary, so a
+  multi-invocation turn doesn't restate its prompt. `muxa init` gains an
+  `agy-hooks` component that owns one named key in agy's `hooks.json` (leaving
+  plugin and `/hooks`-authored entries alone), `muxa doctor` grew a matching
+  check, and `agy` panes are discovered, launchable (`muxa agent start --agent
+  agy`), filterable in `muxa timeline`, and reported to the omp sink under their
+  own `antigravity` slug rather than as `gemini`.
+
+  `muxa hook agy` is deliberately fail-open and byte-silent on stdout: agy reads
+  a hook's stdout as a verdict and treats a non-zero exit or a `decision`-less
+  reply as `tool call denied by pre-tool hook`, so a muxa parse error or a down
+  daemon must never be able to block the user's tool call.
+
+  A bundled `agy` screen manifest covers panes with no hooks wired — and is the
+  only way an agy row reaches `WaitingInput`, since agy exposes no
+  permission/notification hook. Unlike the other bundled manifests it was
+  derived from a real agy 1.1.17 session rather than written blind.
+  See [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md).
+
 - **Central SSH fleet management adds a physical host → session → window →
   pane(agent) control plane.** `muxad` now maintains one isolated persistent
   OpenSSH stdio relay and last-known cache per configured node, with stable

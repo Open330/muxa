@@ -200,7 +200,7 @@ interval_secs = 30
 ```
 
 Discovery scans tmux panes for known agent CLIs (`claude` / `codex` /
-`gemini`) and backfills the registry without waiting for a hook to fire. It
+`gemini`/`agy`) and backfills the registry without waiting for a hook to fire. It
 runs once at daemon startup and then every `interval_secs`, so a fresh agent
 session in a new tmux session shows up in `muxa status` within that window
 instead of only after its first hook. Set `interval_secs = 0` to keep the

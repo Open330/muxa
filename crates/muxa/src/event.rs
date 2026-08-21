@@ -21,7 +21,14 @@ pub enum AgentKind {
     ClaudeCode,
     Opencode,
     Codex,
+    /// The legacy Gemini CLI (`gemini`). Superseded by [`AgentKind::Antigravity`]
+    /// upstream, but kept first-class: its hook contract still works and
+    /// installs predate the switch.
     GeminiCli,
+    /// Google's Antigravity CLI (`agy`), the Gemini CLI's successor. A
+    /// separate kind rather than a rename — the two ship different hook
+    /// formats, different config locations, and can be installed side by side.
+    Antigravity,
     /// A non-agent background process (shell script, game, automation loop,
     /// or a `muxa run` PTY child) registered via `muxa register` / the
     /// `Register` IPC. Tracked by pid liveness rather than tmux pane
@@ -364,6 +371,8 @@ mod tests {
     fn kind_serializes_snake_case() {
         let json = serde_json::to_string(&AgentKind::GeminiCli).unwrap();
         assert_eq!(json, "\"gemini_cli\"");
+        let json = serde_json::to_string(&AgentKind::Antigravity).unwrap();
+        assert_eq!(json, "\"antigravity\"");
     }
 
     /// Older muxa peers emit `TurnStopped` without the `response` field.

@@ -21,6 +21,8 @@ pub enum Component {
     CodexHooks,
     /// Gemini CLI shell hooks
     GeminiHooks,
+    /// Antigravity CLI (`agy`) lifecycle hooks
+    AntigravityHooks,
     /// opencode plugin event bridge
     OpencodeHooks,
     /// `muxad` user-level systemd service (Linux only)
@@ -47,6 +49,7 @@ impl Component {
         Component::ClaudeHooks,
         Component::CodexHooks,
         Component::GeminiHooks,
+        Component::AntigravityHooks,
         Component::OpencodeHooks,
         Component::MuxadSystemd,
         Component::MuxadLaunchd,
@@ -65,6 +68,7 @@ impl Component {
             Component::ClaudeHooks => "claude-hooks",
             Component::CodexHooks => "codex-hooks",
             Component::GeminiHooks => "gemini-hooks",
+            Component::AntigravityHooks => "agy-hooks",
             Component::OpencodeHooks => "opencode-hooks",
             Component::MuxadSystemd => "muxad-systemd",
             Component::MuxadLaunchd => "muxad-launchd",
@@ -88,6 +92,7 @@ impl Component {
             Component::ClaudeHooks => "Claude Code: shell hooks + statusLine",
             Component::CodexHooks => "OpenAI Codex: shell hooks",
             Component::GeminiHooks => "Gemini CLI: shell hooks",
+            Component::AntigravityHooks => "Antigravity CLI (agy): lifecycle hooks",
             Component::OpencodeHooks => "opencode: plugin event bridge",
             Component::MuxadSystemd => "muxad: systemd user service (auto-start on login)",
             Component::MuxadLaunchd => "muxad: launchd LaunchAgent (auto-start on login)",
@@ -107,6 +112,7 @@ impl Component {
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
             Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",
+            Component::AntigravityHooks => "writes ~/.gemini/config/hooks.json; agy's own format",
             Component::OpencodeHooks => "installs ~/.config/opencode/plugins/muxa.ts",
             Component::MuxadSystemd => "Linux only; skipped on macOS / launchd hosts",
             Component::MuxadLaunchd => "macOS only; skipped on Linux / systemd hosts",
@@ -158,6 +164,7 @@ impl Component {
                 Component::ClaudeHooks,
                 Component::CodexHooks,
                 Component::GeminiHooks,
+                Component::AntigravityHooks,
                 Component::OpencodeHooks,
                 Component::Collaboration,
                 Component::Ask,

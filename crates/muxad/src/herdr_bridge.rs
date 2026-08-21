@@ -127,6 +127,8 @@ fn classify_agent(agent: &str) -> AgentKind {
         AgentKind::Codex
     } else if agent.contains("gemini") {
         AgentKind::GeminiCli
+    } else if agent.contains("antigravity") || agent == "agy" {
+        AgentKind::Antigravity
     } else if agent.contains("opencode") {
         AgentKind::Opencode
     } else {
@@ -660,6 +662,7 @@ fn agent_slug(kind: AgentKind) -> &'static str {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
         AgentKind::GeminiCli => "gemini",
+        AgentKind::Antigravity => "agy",
         AgentKind::Opencode => "opencode",
         AgentKind::Task => "task",
         AgentKind::Unknown => "unknown",

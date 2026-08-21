@@ -35,7 +35,7 @@ The default overview is grouped by tmux session. Each session group can show:
 | `--session` | tmux session name, tmux session id, or pane id. |
 | `--exclude-pane` | Drop pane ids matching a case-sensitive glob. Repeat or comma-separate values. |
 | `--exclude-session` | Drop tmux session names or ids matching a case-sensitive glob. Repeat or comma-separate values. |
-| `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
+| `--agent` | `codex`, `claude-code`, `gemini-cli`, `antigravity` (alias `agy`), `opencode`, `unknown`. |
 | `--view` | `timeline` default, or `heatmap` for a terminal contribution-map summary. |
 | `--group-by` | `session` default, `kind`, or `flat`. TUI only. |
 | `--sort` | `latest` default, `name`, `duration`, `working`, `waiting`, `error`, `human`, or `foreground`. Also accepts aliases like `dur`, `work`, `wait`, `err`, and `tmux`. |

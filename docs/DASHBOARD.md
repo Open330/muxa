@@ -255,7 +255,7 @@ shell pane in the window.
 The timeline panel calls `/api/timeline?since=7d` by default and can switch
 to `24h`, `today`, `last week`, `month`, `last month`, `30d`, `12w`, or a clicked `YYYY-MM-DD` calendar day in the
 browser. The endpoint also accepts `session=<name>` and `agent=<kind>`
-(`codex`, `claude_code`, `gemini_cli`, `opencode`, `unknown`).
+(`codex`, `claude_code`, `gemini_cli`, `antigravity`, `opencode`, `unknown`).
 API callers can also pass comma-separated `exclude-pane` / `exclude-session`
 case-sensitive globs, for example
 `/api/timeline?since=month&exclude-session=monitor*`.

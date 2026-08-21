@@ -52,7 +52,7 @@ IPC로 `FleetStore` invalidation을 구독해 coalesce하고 revision이 바뀐 
 | --- | --- |
 | `muxad` | daemon. registry, IPC server, background task, optional dashboard 소유. |
 | `muxa` | status, watch, attend, recap, stats/report, activity query, init, hook CLI. |
-| Agent adapters | Claude/Codex/Gemini hook event를 muxa state transition으로 변환. |
+| Agent adapters | Claude/Codex/Gemini/Antigravity hook event를 muxa state transition으로 변환. |
 | tmux backend | pane/session, pane capture, foreground session activity 조회. |
 | Activity ledger | state/tmux/human interval의 append-only duration source. |
 | FleetManager | always-present local adapter, 독립 SSH relay state machine, node identity/권한, revision reconcile, host별 cache. |

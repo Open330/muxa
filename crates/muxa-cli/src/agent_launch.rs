@@ -16,6 +16,12 @@ pub enum AgentProgram {
     Claude,
     Codex,
     Gemini,
+    /// The Antigravity CLI. Named for its binary (`agy`) rather than the
+    /// product, mirroring `Gemini` → `gemini`; `antigravity` stays accepted
+    /// as an alias on both the CLI flag and [`AgentProgram::parse`].
+    #[value(name = "agy", alias = "antigravity")]
+    #[serde(rename = "agy")]
+    Antigravity,
     Opencode,
 }
 
@@ -25,9 +31,10 @@ impl AgentProgram {
             "claude" | "claude_code" | "claude-code" => Ok(Self::Claude),
             "codex" | "cx" => Ok(Self::Codex),
             "gemini" | "gemini_cli" | "gemini-cli" => Ok(Self::Gemini),
+            "agy" | "antigravity" => Ok(Self::Antigravity),
             "opencode" => Ok(Self::Opencode),
             _ => Err(format!(
-                "unknown agent {value:?}; expected claude, codex, gemini, or opencode"
+                "unknown agent {value:?}; expected claude, codex, gemini, agy, or opencode"
             )),
         }
     }
@@ -37,6 +44,7 @@ impl AgentProgram {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
             Self::Opencode => "opencode",
         }
     }
@@ -57,6 +65,13 @@ impl AgentProgram {
                 format!("gemini --approval-mode yolo --skip-trust -i {prompt}")
             }
             (Self::Gemini, None) => "gemini --approval-mode yolo --skip-trust".into(),
+            // agy's own flag spelling: it has no `--approval-mode`/`--skip-trust`,
+            // and `-i` is its `--prompt-interactive` alias (so the pane stays
+            // interactive after the first prompt, matching gemini's behaviour).
+            (Self::Antigravity, Some(prompt)) => {
+                format!("agy --dangerously-skip-permissions -i {prompt}")
+            }
+            (Self::Antigravity, None) => "agy --dangerously-skip-permissions".into(),
             (Self::Opencode, Some(prompt)) => format!("opencode --prompt {prompt}"),
             (Self::Opencode, None) => "opencode".into(),
         }

@@ -232,7 +232,8 @@ Rows are keyed by `herdr:<pane_id>` with the SYNTHETIC session id
 `synthetic-herdr:<pane_id>` (the same shape `discovery` mints for a
 socket-less pane), so a discovery placeholder and a bridge row collapse
 onto one registry key. herdr agent names map `claude`→`ClaudeCode`,
-`codex`→`Codex`, `gemini`→`GeminiCli`, `opencode`→`Opencode` (loose,
+`codex`→`Codex`, `gemini`→`GeminiCli`, `agy`/`antigravity`→`Antigravity`,
+`opencode`→`Opencode` (loose,
 lowercased substring match — herdr's exact slugs aren't pinned in the
 schema); everything else is `AgentKind::Unknown` with the herdr
 `display_agent`/`agent` name carried in the row's **`model`** field (set
@@ -292,7 +293,8 @@ the wire `pane_id`) *and* non-synthetic. Mapping:
 | `Starting`                     | — (transient; nothing reported)          |
 
 `agent` is a herdr-aligned slug (`ClaudeCode`→`claude`, `Codex`→`codex`,
-`GeminiCli`→`gemini`, `Opencode`→`opencode`, else the kind name), matching the
+`GeminiCli`→`gemini`, `Antigravity`→`agy`, `Opencode`→`opencode`, else the kind
+name), matching the
 forward bridge's `classify_agent` so the same pane carries the same label in
 both directions. `agent_session_id` is muxa's real session id, and a
 process-global monotonic `seq` lets herdr discard out-of-order reports. `blocked`

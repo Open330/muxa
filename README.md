@@ -35,7 +35,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 `muxa` is a small daemon and CLI for observing — and now driving — AI
 coding agents running inside terminal multiplexer panes. It reads agent
 state from existing hook/event systems (Claude Code, OpenAI Codex, Google
-Gemini CLI), falls back to screen-manifest detection for hook-less agents,
+Gemini CLI and its Antigravity successor), falls back to screen-manifest
+detection for hook-less agents,
 and correlates it all with multiplexer panes and sessions. Through `muxa
 mcp` a coding agent can also orchestrate the others — inspect state, send
 prompts, wait for changes.
@@ -312,12 +313,12 @@ systems, so muxa gets exact state transitions:
 | Claude Code | Supported | `~/.claude/settings.json` |
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
 | Google Gemini CLI | Supported | `~/.gemini/settings.json` |
+| Google Antigravity CLI (`agy`) | Supported | `~/.gemini/config/hooks.json` — [details](docs/ANTIGRAVITY.md) |
 | opencode | Planned | [tracking issue](https://github.com/Open330/muxa/issues/14) |
 
 **Screen-detected (fallback).** Agents with no hooks are classified from
-their pane contents via TOML manifests — bundled best-effort for
-`cursor-agent`, `amp`, `copilot`, `aider`, and `goose`, extensible per
-user. Hooks always win when present. See
+their pane contents via TOML manifests — bundled for `agy`, `cursor-agent`,
+`amp`, `copilot`, `aider`, and `goose`, extensible per user. Hooks always win when present. See
 [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md).
 
 On [herdr](https://herdr.dev) hosts, muxa additionally surfaces every
@@ -374,6 +375,7 @@ simultaneously.
 | rmux host support | [docs/RMUX.md](docs/RMUX.md) |
 | Multi-host observation | [docs/MULTI_HOST.md](docs/MULTI_HOST.md) |
 | Physical SSH fleet | [docs/FLEET.md](docs/FLEET.md) |
+| Antigravity CLI (`agy`) support | [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md) |
 | Screen-manifest detection | [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) |
 | Live TUI and prompt composer | [docs/WATCH.md](docs/WATCH.md) |
 | CLI dashboard | [docs/DASHBOARD_CLI.md](docs/DASHBOARD_CLI.md) |

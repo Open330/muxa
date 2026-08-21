@@ -479,7 +479,7 @@
 
 # [[pipeline.triad.agent]]
 # alias   = 'plan'
-# program = 'codex'               # claude | codex | gemini | opencode
+# program = 'codex'               # claude | codex | gemini | agy | opencode
 # role    = 'planner'             # peers can address it as role:planner
 # prompt  = 'You own the approach. Write the plan first; do not edit code.'
 

@@ -343,6 +343,7 @@ mod tests {
             Component::ClaudeHooks
                 | Component::CodexHooks
                 | Component::GeminiHooks
+                | Component::AntigravityHooks
                 | Component::OpencodeHooks
         )
     }

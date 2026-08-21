@@ -31,7 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 </div>
 
 `muxa`는 terminal multiplexer pane 안에서 실행되는 AI coding agent를 관측하는
-작은 daemon + CLI입니다. Claude Code, OpenAI Codex, Google Gemini CLI의 기존
+작은 daemon + CLI입니다. Claude Code, OpenAI Codex, Google Gemini CLI와 그
+후속인 Antigravity CLI(`agy`)의 기존
 hook/event 시스템을 사용하고, 이를 tmux pane/session과 연결합니다.
 
 tmux나 agent binary를 fork하지 않습니다. tmux는 기본 full backend이고,
@@ -273,11 +274,12 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 | Claude Code | 지원 | `~/.claude/settings.json` |
 | OpenAI Codex | 지원 | `~/.codex/config.toml` |
 | Google Gemini CLI | 지원 | `~/.gemini/settings.json` |
+| Google Antigravity CLI (`agy`) | 지원 | `~/.gemini/config/hooks.json` — [문서](docs/ANTIGRAVITY.md) |
 | opencode | 예정 | [tracking issue](https://github.com/Open330/muxa/issues/14) |
 
 **화면 감지(fallback).** 훅이 없는 에이전트는 pane 내용을 TOML 매니페스트로
-분류합니다 — `cursor-agent`, `amp`, `copilot`, `aider`, `goose`용 매니페스트가
-기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 항상 훅이 우선합니다.
+분류합니다 — `agy`, `cursor-agent`, `amp`, `copilot`, `aider`, `goose`용
+매니페스트가 기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 항상 훅이 우선합니다.
 [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) 참고.
 
 ## Fleet host
