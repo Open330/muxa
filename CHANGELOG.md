@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.35] - 2026-08-22
+
 ### Added
 
 - **Google Antigravity CLI (`agy`) is a first-class agent.** agy replaced the
