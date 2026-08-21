@@ -489,6 +489,9 @@ idle = ['^> $']
         let m = parse_manifest(include_str!("screen/agents/agy.toml")).unwrap();
         assert!(m.matches_command("agy"));
         assert!(m.matches_command("/Users/x/.local/bin/agy"));
+        // Kept in lockstep with `discovery::classify_command`: a pane that
+        // discovery calls Antigravity must never be one this manifest skips.
+        assert!(m.matches_command("antigravity"));
 
         // Verbatim tails of real captures, three seconds apart in one turn.
         assert_eq!(

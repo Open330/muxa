@@ -601,7 +601,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/opencode (with or without @), pane:%N/%N, @alias, or role:<name>." },
+                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/agy/opencode (with or without @), pane:%N/%N, @alias, or role:<name>." },
                     "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
                     "body": { "type": "string", "description": "Request-specific instruction. Optional when skill is supplied." },
                     "skill": { "type": "string", "description": "Registered Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
@@ -611,7 +611,7 @@ fn tool_definitions() -> Vec<Value> {
                     "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "spawn_if_missing": { "type": "boolean", "description": "Default false. Create a same-window bypass-permission peer only after explicit user confirmation." },
-                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
+                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
                     "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "How long to wait for the new pane to register as a collaboration peer. Default 30." },
                     "air_artifacts": {
                         "type": "array",

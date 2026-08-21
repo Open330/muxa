@@ -47,6 +47,11 @@ Entries written by agy's own `/hooks` command, by plugins, or by hand are never
 touched, and `muxa init --uninstall --component agy-hooks` drops only the `muxa`
 key.
 
+`muxa doctor` reports this line only when agy is actually installed, and it
+requires **all six** events to be wired — a block left over from an older muxa
+reports as broken rather than healthy, because a partial block yields a row
+that never shows a prompt or a tool.
+
 Two shapes matter and are easy to get backwards: `PreToolUse`/`PostToolUse`
 wrap their handlers in a `{matcher, hooks[]}` group, while the lifecycle events
 take a flat handler list. A handler in the wrong shape is dropped without an
@@ -97,6 +102,11 @@ exit. `muxa hook agy` therefore:
 - exits `0` even when the payload is unparseable, the event flag is unknown, or
   muxad is down.
 
+`muxa hook` as a whole also stops aborting on an unreadable `config.toml` — it
+degrades to defaults and reports the parse error on stderr — because that check
+runs before the handler and would otherwise defeat the guarantee above from
+outside it. Every non-hook subcommand still fails loudly on a bad config.
+
 Observation must never be able to block the agent. This is the one hook handler
 in muxa that swallows its own errors for that reason.
 
@@ -123,6 +133,6 @@ in muxa that swallows its own errors for that reason.
 | `muxa agent start --agent` | `agy` (alias `antigravity`) → `agy --dangerously-skip-permissions [-i <prompt>]` |
 | `muxa watch` spawn form | `agy` |
 | `muxa timeline --agent` | `antigravity` (alias `agy`) |
-| MCP `muxa_start_agent` | `"agy"` |
+| MCP `muxa_start_agent` / `muxa_call_peer` | `"agy"` |
 | Wire / dashboard kind | `antigravity` |
 | omp sink | `source: antigravity`, `cli_name: agy` |

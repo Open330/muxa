@@ -59,7 +59,7 @@ pub fn default_path() -> Option<std::path::PathBuf> {
 
 pub fn upsert(original: &str) -> Result<(String, Outcome)> {
     let mut root = parse_or_empty(original)?;
-    let obj = ensure_object(&mut root);
+    let obj = as_object_mut(&mut root)?;
 
     let want = muxa_hook_spec();
     let changed = obj.get(HOOK_NAME) != Some(&want);
@@ -81,7 +81,12 @@ pub fn remove(original: &str) -> Result<(String, Outcome)> {
         return Ok((original.to_string(), Outcome::AlreadyAbsent));
     }
     let mut root = parse_or_empty(original)?;
-    let obj = ensure_object(&mut root);
+    // Uninstall is lenient where install is strict: a root we don't
+    // recognize cannot be holding our key, so report absence and leave the
+    // file byte-identical rather than erroring on the way out.
+    let Ok(obj) = as_object_mut(&mut root) else {
+        return Ok((original.to_string(), Outcome::AlreadyAbsent));
+    };
     if obj.remove(HOOK_NAME).is_none() {
         return Ok((original.to_string(), Outcome::AlreadyAbsent));
     }
@@ -119,11 +124,16 @@ fn parse_or_empty(text: &str) -> Result<Value> {
     }
 }
 
-fn ensure_object(v: &mut Value) -> &mut Map<String, Value> {
-    if !v.is_object() {
-        *v = Value::Object(Map::new());
-    }
-    v.as_object_mut().expect("just ensured object")
+/// Borrow the root as an object, or fail.
+///
+/// Deliberately NOT "replace whatever is there with `{}`": a root that parses
+/// but isn't an object (`[]`, `"x"`, `5`) is a file we don't understand, and
+/// silently overwriting it is the same class of data loss as overwriting
+/// unparseable JSON. agy itself refuses to save over a `hooks.json` it can't
+/// read; muxa matches that.
+fn as_object_mut(v: &mut Value) -> Result<&mut Map<String, Value>> {
+    v.as_object_mut()
+        .context("agy hooks.json must contain a JSON object at its root")
 }
 
 fn pretty_print(v: &Value) -> Result<String> {
@@ -278,5 +288,25 @@ mod tests {
     fn malformed_json_is_an_error_not_a_silent_overwrite() {
         assert!(upsert("{ not json").is_err());
         assert!(remove("{ not json").is_err());
+    }
+
+    /// Valid JSON of the wrong shape is data loss just the same, so `upsert`
+    /// refuses it instead of replacing the root with `{}`.
+    #[test]
+    fn a_non_object_root_is_refused_by_upsert() {
+        for text in ["[]", r#""a string""#, "5", "null"] {
+            assert!(upsert(text).is_err(), "upsert should refuse {text}");
+        }
+    }
+
+    /// Uninstall stays lenient: nothing of ours can live in a root we don't
+    /// recognize, so it reports absence and leaves the bytes alone.
+    #[test]
+    fn a_non_object_root_is_left_alone_by_remove() {
+        for text in ["[]", r#""a string""#, "5"] {
+            let (out, outcome) = remove(text).unwrap();
+            assert_eq!(outcome, Outcome::AlreadyAbsent, "{text}");
+            assert_eq!(out, text, "{text}");
+        }
     }
 }

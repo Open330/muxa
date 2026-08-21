@@ -12,7 +12,9 @@
 
 [agent]
 name = "agy"
-command = ["agy"]
+# Both spellings `discovery::classify_command` accepts, so a pane it calls an
+# Antigravity agent is never one screen detection then refuses to look at.
+command = ["agy", "antigravity"]
 
 [rules]
 # STRICT — agy's confirmation widget renders a fixed set of choice rows, so

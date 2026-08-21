@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A hook subcommand no longer aborts on an unreadable `config.toml`.**
+  `muxa hook …` now falls back to compiled defaults and puts the parse error
+  on stderr instead of exiting non-zero. Every other subcommand still fails
+  loudly. This matters because agy reads a non-zero hook exit as its verdict
+  (`tool call denied by pre-tool hook`), so one TOML typo would otherwise have
+  blocked every tool call in every agy session with nothing naming the cause.
+
 - **Session and window rows can send contracted messages without hierarchy
   descent.** Pressing `m` on a parent deterministically targets the first live
   tracked agent in numeric window/pane order, with the exact resolved pane

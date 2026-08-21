@@ -179,17 +179,13 @@ fn existing_dir(p: Option<PathBuf>) -> Option<PathBuf> {
     p.filter(|p| p.is_dir())
 }
 
-/// opencode has no single well-known settings file the way the other
-/// agents do — it keeps state under `~/.config/opencode/` (that's also
-/// where its `plugins/` dir lives). Presence of that directory is our
-/// "opencode is installed" signal.
-/// Is the Antigravity CLI installed?
+/// Is the Antigravity CLI installed, and where does it keep state?
 ///
 /// Prefers its state directory — `agy` creates `~/.gemini/antigravity-cli/`
-/// on first run, and unlike a PATH probe that survives a shell whose PATH the
-/// wizard didn't inherit. Falls back to `agy` on PATH so a fresh install that
-/// has never been run still pre-checks.
-fn detect_antigravity() -> Option<PathBuf> {
+/// on first run, and that survives a shell whose PATH the wizard didn't
+/// inherit. Falls back to `agy` on PATH so a fresh install that has never
+/// been run still pre-checks.
+pub fn detect_antigravity() -> Option<PathBuf> {
     let home = home_join(".gemini/antigravity-cli");
     if home.is_dir() {
         return Some(home);
@@ -197,6 +193,16 @@ fn detect_antigravity() -> Option<PathBuf> {
     which::which("agy").ok()
 }
 
+/// Presence-only form of [`detect_antigravity`], for callers (like `doctor`)
+/// that have no `Detection` in hand.
+pub fn antigravity_installed() -> bool {
+    detect_antigravity().is_some()
+}
+
+/// opencode has no single well-known settings file the way the other
+/// agents do — it keeps state under `~/.config/opencode/` (that's also
+/// where its `plugins/` dir lives). Presence of that directory is our
+/// "opencode is installed" signal.
 fn opencode_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("opencode"))
 }

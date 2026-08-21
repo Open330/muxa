@@ -599,7 +599,21 @@ async fn main() -> Result<()> {
     }
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let skill_path = config_path.clone();
-    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    let cfg = match Config::load_or_default(config_path.as_deref()) {
+        Ok(cfg) => cfg,
+        // A hook handler must not hard-fail on an unreadable config. agy
+        // reads a non-zero hook exit as its verdict
+        // (`tool call denied by pre-tool hook`), so one TOML typo in
+        // config.toml would otherwise block every tool call in every agy
+        // session — with nothing on screen naming the cause. Degrade to
+        // defaults and put the reason on stderr, never stdout (stdout is
+        // the verdict channel).
+        Err(e) if matches!(args.cmd, Cmd::Hook { .. }) => {
+            eprintln!("muxa: config unreadable ({e:#}); this hook is using defaults");
+            Config::default()
+        }
+        Err(e) => return Err(e).context("loading config"),
+    };
     set_icon_set(cfg.ui.icons);
     let socket = args
         .socket
