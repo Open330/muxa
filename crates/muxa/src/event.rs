@@ -38,6 +38,37 @@ pub enum AgentKind {
     Unknown,
 }
 
+impl AgentKind {
+    /// Can this agent's hook stream tell muxa it is waiting on the operator?
+    ///
+    /// Claude Code (`Notification`), Codex (`PermissionRequest`), the Gemini
+    /// CLI (`Notification`) and opencode (`permission.asked`) all can, so their
+    /// rows reach [`AgentState::WaitingInput`] from hooks alone and screen
+    /// inference must stay out of the way.
+    ///
+    /// The Antigravity CLI cannot — it exposes no permission or notification
+    /// hook at all (see `docs/ANTIGRAVITY.md`), so for an agy row that one
+    /// signal is only ever available from the pane's screen. `muxad`'s
+    /// synthetic layer keys its attention-refinement path off this.
+    // The two `true` arms stay separate on purpose: they are true for
+    // opposite reasons (one has an attention hook, one is not an agent at
+    // all), and spelling every kind out is what makes a new `AgentKind` a
+    // compile error here rather than a silent default.
+    #[allow(clippy::match_same_arms)]
+    #[must_use]
+    pub fn hooks_report_attention(self) -> bool {
+        match self {
+            Self::ClaudeCode | Self::Codex | Self::GeminiCli | Self::Opencode => true,
+            Self::Antigravity => false,
+            // Neither is a hook-driven agent: `Task` rows have no attention
+            // states at all (only Working/Stopped), and `Unknown` is the kind
+            // synthetic rows themselves carry. `true` keeps both out of the
+            // refinement path, which is exactly where they belong.
+            Self::Task | Self::Unknown => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]

@@ -7,11 +7,20 @@
 //! mechanics live here once:
 //!
 //! * **Hook-authoritative precedence** ([`occupant_is_authoritative`],
-//!   [`apply_if_unowned`]): a live, non-synthetic (real hook) row owns its pane;
-//!   a synthetic producer must drop its update wholesale rather than clobber it.
-//!   And because these rows are synthetic, `Store::apply`'s synthetic-eviction
-//!   pass drops them the instant a real hook `Started` claims the pane — so the
-//!   hook-authoritative rule falls out of the existing machinery for free.
+//!   [`pane_ownership`], [`apply_if_unowned`]): a live, non-synthetic (real
+//!   hook) row owns its pane; a synthetic producer must drop its update
+//!   wholesale rather than clobber it. And because these rows are synthetic,
+//!   `Store::apply`'s synthetic-eviction pass drops them the instant a real
+//!   hook `Started` claims the pane — so the hook-authoritative rule falls out
+//!   of the existing machinery for free.
+//! * **Attention refinement** ([`attention_refinement_events`]): the one
+//!   documented exception. When the owning row's agent CLI has no hook that can
+//!   report "waiting on the operator"
+//!   (`AgentKind::hooks_report_attention`), dropping the update wholesale
+//!   would mean that agent can *never* show as `WaitingInput`. Such a pane
+//!   instead gets an attention-only update applied to the REAL row — never a
+//!   second synthetic one, which `Store::apply` would evict on the next hook
+//!   event and re-mint on the next tick, flapping a duplicate row forever.
 //! * **Row liveness** ([`stop_synthetic_row`]): when a producer stops seeing an
 //!   agent on a pane whose shell is still open, it drives the synthetic row to
 //!   `Stopped` so it doesn't freeze at its last state forever.
@@ -48,6 +57,108 @@ pub enum SyntheticState {
 #[must_use]
 pub fn occupant_is_authoritative(agent: &Agent) -> bool {
     !agent.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) && agent.state != AgentState::Stopped
+}
+
+/// What a pane's current occupants permit a synthetic producer to do.
+///
+/// Not `PartialEq` — it carries an [`AgentId`], which isn't comparable; call
+/// sites and tests match on the variant instead.
+#[derive(Debug, Clone)]
+pub enum PaneOwnership {
+    /// No live real row. Mint and drive the synthetic row as usual.
+    Free,
+    /// A live real row owns the pane and its hooks can report every state muxa
+    /// tracks, attention included. Stay out entirely.
+    Hooked,
+    /// A live real row owns the pane, but its agent CLI exposes no hook that
+    /// can report "waiting on the operator". Screen inference is the only
+    /// source for that one signal, so the producer may refine THIS row's
+    /// attention state — and nothing else. See [`attention_refinement_events`].
+    AttentionBlind { id: AgentId, state: AgentState },
+}
+
+/// Classify `occupants` (as returned by `Store::by_pane`) into the update the
+/// producer is allowed to make.
+///
+/// The first authoritative occupant wins; in practice there is at most one,
+/// because `Store::apply` evicts synthetic rows from a pane a real row claims.
+#[must_use]
+pub fn pane_ownership(occupants: &[Agent]) -> PaneOwnership {
+    let Some(owner) = occupants.iter().find(|a| occupant_is_authoritative(a)) else {
+        return PaneOwnership::Free;
+    };
+    if owner.kind.hooks_report_attention() {
+        return PaneOwnership::Hooked;
+    }
+    PaneOwnership::AttentionBlind {
+        id: AgentId {
+            kind: owner.kind,
+            session_id: owner.session_id.clone(),
+            surface: owner.surface.clone(),
+            pane: owner.pane.clone(),
+            tmux_socket: owner.tmux_socket.clone(),
+            cwd: owner.cwd.clone(),
+        },
+        state: owner.state,
+    }
+}
+
+/// The events a screen observation may contribute to an
+/// [`PaneOwnership::AttentionBlind`] row. Empty means "the observation adds
+/// nothing" — the overwhelmingly common case.
+///
+/// Deliberately narrower than [`state_events`] in three ways:
+///
+/// 1. **No `Heartbeat`.** A real row's `model` is the model name its hooks
+///    reported (`gemini-3.7-flash-high`); stamping the manifest name over it
+///    would lose real information.
+/// 2. **`Working` contributes nothing.** Hooks own that transition and fire it
+///    within milliseconds of the tool starting, whereas a screen tick is
+///    seconds late. Racing them buys nothing and can only fight.
+/// 3. **`Idle` only ever *clears*.** It is the backstop for the one way a
+///    refined row could get stuck: hooks stop arriving (the CLI died mid-turn,
+///    or an event was lost) while the row sits at `WaitingInput`. An idle
+///    screen on a row that is NOT waiting is left to the hooks.
+#[must_use]
+pub fn attention_refinement_events(
+    id: AgentId,
+    owner_state: AgentState,
+    observed: SyntheticState,
+    name: &str,
+    message: Option<String>,
+    at: OffsetDateTime,
+) -> Vec<AgentEvent> {
+    let waiting = matches!(
+        owner_state,
+        AgentState::WaitingInput | AgentState::WaitingChoice
+    );
+    match observed {
+        // An approval prompt is on screen and the row doesn't know it yet.
+        // `Error` is left alone: it is a fact the hooks reported, and masking
+        // it with a wait would hide the failure the operator needs to see.
+        SyntheticState::Blocked if !waiting && owner_state != AgentState::Error => {
+            vec![AgentEvent::NotificationFired {
+                id,
+                level: NotificationLevel::NeedsInput,
+                message: message.unwrap_or_else(|| format!("{name} is waiting")),
+                at,
+            }]
+        }
+        // The prompt is gone and nothing is generating, yet the row is still
+        // waiting — release it. `idle_confirmed` is exactly this: positive
+        // evidence from a producer that OBSERVED the pane go idle.
+        SyntheticState::Idle if waiting => {
+            vec![AgentEvent::TurnStopped {
+                id,
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: true,
+                at,
+            }]
+        }
+        SyntheticState::Blocked | SyntheticState::Idle | SyntheticState::Working => Vec::new(),
+    }
 }
 
 /// Apply `events` to the pane, enforcing hook-authoritative precedence: if a
@@ -239,6 +350,271 @@ mod tests {
             }
             other => panic!("expected TurnStopped, got {other:?}"),
         }
+    }
+
+    /// Build a bare `Agent` row for ownership tests.
+    fn row(kind: AgentKind, session_id: &str, state: AgentState) -> Agent {
+        Agent {
+            kind,
+            session_id: session_id.to_owned(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: None,
+            tmux_session: None,
+            cwd: None,
+            pid: None,
+            workload: muxa::WorkloadSummary::default(),
+            subagents: Vec::new(),
+            state,
+            last_prompt: None,
+            last_response: None,
+            recap: None,
+            ai_title: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: AT,
+            last_activity_at: AT,
+            state_entered_at: AT,
+        }
+    }
+
+    #[test]
+    fn pane_ownership_free_when_no_live_real_row() {
+        assert!(matches!(pane_ownership(&[]), PaneOwnership::Free));
+        // A synthetic row does not own the pane...
+        let synth = row(
+            AgentKind::Unknown,
+            &format!("{SYNTHETIC_SESSION_PREFIX}%1"),
+            AgentState::Working,
+        );
+        assert!(matches!(pane_ownership(&[synth]), PaneOwnership::Free));
+        // ...and neither does a stopped real one.
+        let dead = row(AgentKind::ClaudeCode, "real", AgentState::Stopped);
+        assert!(matches!(pane_ownership(&[dead]), PaneOwnership::Free));
+    }
+
+    /// Every agent whose hooks can report a permission prompt keeps screen
+    /// inference fully out of the way — the pre-existing behavior.
+    #[test]
+    fn pane_ownership_hooked_for_agents_that_report_attention() {
+        for kind in [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::GeminiCli,
+            AgentKind::Opencode,
+        ] {
+            let owner = row(kind, "real", AgentState::Working);
+            assert!(
+                matches!(pane_ownership(&[owner]), PaneOwnership::Hooked),
+                "{kind} hooks report attention, so nothing may refine it",
+            );
+        }
+    }
+
+    /// agy is the one kind with no permission hook, so its row is refinable —
+    /// and the refinement must target the REAL row's identity, never a
+    /// synthetic one (a second row would flap: `Store::apply` evicts it on the
+    /// next hook event and the next tick re-mints it).
+    #[test]
+    fn pane_ownership_attention_blind_for_antigravity() {
+        let owner = row(AgentKind::Antigravity, "conv-1", AgentState::Working);
+        match pane_ownership(&[owner]) {
+            PaneOwnership::AttentionBlind { id, state } => {
+                assert_eq!(id.session_id, "conv-1");
+                assert_eq!(id.kind, AgentKind::Antigravity);
+                assert!(!id.session_id.starts_with(SYNTHETIC_SESSION_PREFIX));
+                assert_eq!(state, AgentState::Working);
+            }
+            other => panic!("expected AttentionBlind, got {other:?}"),
+        }
+    }
+
+    fn refine(owner_state: AgentState, observed: SyntheticState) -> Vec<AgentEvent> {
+        attention_refinement_events(
+            AgentId {
+                kind: AgentKind::Antigravity,
+                session_id: "conv-1".into(),
+                surface: None,
+                pane: Some("%1".into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            owner_state,
+            observed,
+            "agy",
+            None,
+            AT,
+        )
+    }
+
+    #[test]
+    fn refinement_raises_attention_on_a_blocked_screen() {
+        for owner_state in [AgentState::Working, AgentState::Idle, AgentState::Starting] {
+            match refine(owner_state, SyntheticState::Blocked).as_slice() {
+                [AgentEvent::NotificationFired {
+                    level, message, id, ..
+                }] => {
+                    assert_eq!(*level, NotificationLevel::NeedsInput);
+                    assert_eq!(message, "agy is waiting");
+                    assert_eq!(id.session_id, "conv-1", "must target the real row");
+                }
+                other => panic!("expected one NotificationFired for {owner_state}, got {other:?}"),
+            }
+        }
+    }
+
+    /// No `Heartbeat` — the real row's `model` came from its hooks
+    /// (`gemini-3.7-flash-high`), and stamping the manifest name over it would
+    /// destroy real information. This is the difference from `state_events`.
+    #[test]
+    fn refinement_never_emits_a_heartbeat() {
+        for owner_state in [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::WaitingInput,
+            AgentState::Error,
+        ] {
+            for observed in [
+                SyntheticState::Working,
+                SyntheticState::Blocked,
+                SyntheticState::Idle,
+            ] {
+                assert!(
+                    !refine(owner_state, observed)
+                        .iter()
+                        .any(|e| matches!(e, AgentEvent::Heartbeat { .. })),
+                    "{owner_state} + {observed:?} must not stamp the model field",
+                );
+            }
+        }
+    }
+
+    /// Hooks own `Working`: they report it in milliseconds, a screen tick is
+    /// seconds late, so racing them buys nothing and can only fight.
+    #[test]
+    fn refinement_ignores_a_working_screen() {
+        for owner_state in [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::WaitingInput,
+        ] {
+            assert!(refine(owner_state, SyntheticState::Working).is_empty());
+        }
+    }
+
+    /// Idle only ever *clears* a stuck wait; on a row that isn't waiting it is
+    /// the hooks' business.
+    #[test]
+    fn refinement_idle_clears_only_a_waiting_row() {
+        for owner_state in [AgentState::WaitingInput, AgentState::WaitingChoice] {
+            match refine(owner_state, SyntheticState::Idle).as_slice() {
+                [AgentEvent::TurnStopped {
+                    idle_confirmed,
+                    response,
+                    id,
+                    ..
+                }] => {
+                    assert!(*idle_confirmed, "must be positive idle evidence");
+                    assert_eq!(*response, None);
+                    assert_eq!(id.session_id, "conv-1");
+                }
+                other => panic!("expected TurnStopped for {owner_state}, got {other:?}"),
+            }
+        }
+        for owner_state in [AgentState::Working, AgentState::Idle, AgentState::Error] {
+            assert!(refine(owner_state, SyntheticState::Idle).is_empty());
+        }
+    }
+
+    /// Re-observing the same prompt must not re-fire, and an `Error` the hooks
+    /// reported must not be masked by a wait.
+    #[test]
+    fn refinement_is_idempotent_and_preserves_error() {
+        assert!(refine(AgentState::WaitingInput, SyntheticState::Blocked).is_empty());
+        assert!(refine(AgentState::WaitingChoice, SyntheticState::Blocked).is_empty());
+        assert!(refine(AgentState::Error, SyntheticState::Blocked).is_empty());
+    }
+
+    /// The whole point, end to end against a real store: an agy row that hooks
+    /// drove to `Working` reaches `WaitingInput` from a blocked screen, and its
+    /// hook-supplied `model` survives.
+    #[tokio::test]
+    async fn refinement_moves_a_real_agy_row_into_waiting_input() {
+        let store = Store::shared();
+        let real = AgentId {
+            kind: AgentKind::Antigravity,
+            session_id: "conv-1".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: None,
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: real.clone(),
+                at: AT,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: real.clone(),
+                model: Some("gemini-3.7-flash-high".into()),
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: AT,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: real.clone(),
+                tool: "run_command".into(),
+                subagent: None,
+                at: AT,
+            })
+            .await;
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
+
+        let occupants = store.by_pane("%1").await;
+        let PaneOwnership::AttentionBlind { id, state } = pane_ownership(&occupants) else {
+            panic!("an agy row must be attention-blind");
+        };
+        for ev in attention_refinement_events(id, state, SyntheticState::Blocked, "agy", None, AT) {
+            store.apply(&ev).await;
+        }
+
+        let rows = store.by_pane("%1").await;
+        assert_eq!(rows.len(), 1, "refinement must not mint a second row");
+        assert_eq!(rows[0].session_id, "conv-1");
+        assert_eq!(rows[0].state, AgentState::WaitingInput);
+        assert_eq!(
+            rows[0].model.as_deref(),
+            Some("gemini-3.7-flash-high"),
+            "the hook-supplied model must survive refinement",
+        );
+
+        // And the agy hook stream releases it again, unaided.
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: real,
+                tool: "run_command".into(),
+                success: true,
+                at: AT,
+            })
+            .await;
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
     }
 
     #[tokio::test]

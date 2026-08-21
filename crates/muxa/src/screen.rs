@@ -520,7 +520,27 @@ idle = ['^> $']
             "the input line is drawn during generation too",
         );
 
-        // agy's permission widget.
+        // agy's real permission widget, captured verbatim from a live prompt.
+        // Note it keeps the `esc to cancel` working-footer on screen, so this
+        // also pins that `blocked` is tested BEFORE `working`.
+        let prompt = "● Bash(echo REFINE_TEST) (ctrl+o to expand)\n\
+             Requesting permission for:\n   echo REFINE_TEST\n\
+             Do you want to proceed?\n\
+             > 1. Yes\n  2. Yes, and always allow in this conversation\n  4. No\n\
+             ↑/↓ Navigate · tab Amend\nesc to cancel";
+        assert_eq!(m.classify(prompt), Some(ScreenState::Blocked));
+
+        // The header alone is enough: choice-row wording varies per request
+        // type, so the manifest must not depend on any one of them.
+        assert_eq!(
+            m.classify("Requesting permission for:\n   rm -rf build\n> 1. Yes\n  2. No"),
+            Some(ScreenState::Blocked),
+        );
+        // A numbered selection widget with none of the longer labels.
+        assert_eq!(
+            m.classify("Do you want to proceed?\n> 1. Yes\n  2. No"),
+            Some(ScreenState::Blocked),
+        );
         assert_eq!(
             m.classify("Run command?\n> Yes, and always allow for commands that start with 'echo'\n  No, deny"),
             Some(ScreenState::Blocked),
@@ -543,6 +563,13 @@ idle = ['^> $']
             m.classify("These flags allow access to the cache and deny writes."),
             None,
             "prose about allow/deny must not read as an approval prompt",
+        );
+        // A numbered list in ordinary output is not a selection widget: the
+        // `>` cursor marker is what makes it one.
+        assert_eq!(
+            m.classify("Steps:\n1. Yes it compiles\n2. No warnings remain"),
+            None,
+            "a plain numbered list must not read as an approval prompt",
         );
         assert_eq!(
             m.classify("Generating the report is handled by the nightly job."),

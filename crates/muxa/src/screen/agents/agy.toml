@@ -1,14 +1,17 @@
 # Bundled screen-detection manifest — Google Antigravity CLI (`agy`).
 #
 # Unlike the other bundled manifests, these patterns were derived from a REAL
-# agy 1.1.17 session: the working/idle rules come from captured tmux panes and
-# the approval rules from agy's own confirmation-widget labels. See
+# agy 1.1.17 session: the working/idle rules and the permission-prompt header
+# come from captured tmux panes, the remaining approval rules from agy's own
+# confirmation-widget labels. See
 # docs/SCREEN_DETECTION.md. Override at $XDG_CONFIG_HOME/muxa/agents/agy.toml.
 #
-# muxa also ships hooks for agy (`muxa hook agy`), and hooks win: the daemon
-# never screen-infers a pane a live hook row owns. This manifest is what covers
-# an agy pane whose hooks aren't wired — and it is the ONLY way an agy row
-# reaches `WaitingInput`, because agy exposes no permission/notification hook.
+# muxa also ships hooks for agy (`muxa hook agy`), and hooks win everywhere
+# except one signal: agy exposes no permission/notification hook, so the
+# `blocked` rules below are the ONLY way an agy row ever reaches
+# `WaitingInput`. `muxad`'s synthetic layer therefore keeps this manifest live
+# even on a pane a real agy row owns, applying the attention signal (and
+# nothing else) to that row — see `muxad::synthetic::attention_refinement_events`.
 
 [agent]
 name = "agy"
@@ -22,6 +25,15 @@ command = ["agy", "antigravity"]
 # An over-broad `blocked` is the worst failure (a working agent shown as
 # "needs input"), and agy prints tool output verbatim into the same pane.
 blocked = [
+    # The header agy prints above EVERY permission request. Captured verbatim
+    # from a live prompt and by far the most robust anchor here — the choice
+    # rows below vary per request type (a command prompt renders numbered
+    # `1. Yes` / `4. No` rows, a file prompt renders `Yes, allow access`),
+    # but this line is constant.
+    '(?i)Requesting permission for:',
+    # The highlighted row of a numbered selection widget. Anchored to the
+    # cursor marker and the number so ordinary prose can never match.
+    '(?m)^\s*>\s*\d+\.\s+(?i:Yes|No)\b',
     # The choice rows of the permission widget. "always allow"/"always deny"
     # exist only in that widget, so they cannot come from tool output.
     '(?i)Yes, and always allow',

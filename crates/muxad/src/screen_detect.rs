@@ -145,8 +145,13 @@ impl ScreenDetector {
         for pane_id in dropped {
             synthetic::stop_synthetic_row(&self.store, &pane_id).await;
             self.tracked.remove(&pane_id);
-            self.last_state.remove(&pane_id);
         }
+        // Drop the last-classified state for every pane that fell out of
+        // candidacy, tracked or not. Attention-refined panes are deliberately
+        // never `tracked` (their row is real and not ours to stop), so pruning
+        // off `tracked` alone would leak an entry per agy pane ever seen.
+        self.last_state
+            .retain(|pane_id, _| current.contains(pane_id));
 
         let mut changes = 0;
         for (backend_idx, pane, manifest) in candidates {
@@ -201,10 +206,12 @@ impl ScreenDetector {
     ) -> bool {
         let pane_id = pane.pane_id.clone();
 
-        // Hook-authoritative: a live real row owns the pane — don't even capture.
-        // Forget any tracking so a later stop-sweep doesn't touch the real row.
         let occupants = self.store.by_pane(&pane_id).await;
-        if occupants.iter().any(synthetic::occupant_is_authoritative) {
+        let ownership = synthetic::pane_ownership(&occupants);
+        if matches!(ownership, synthetic::PaneOwnership::Hooked) {
+            // Hook-authoritative: a live real row owns the pane and its hooks
+            // report every state — don't even capture. Forget any tracking so
+            // a later stop-sweep doesn't touch the real row.
             self.tracked.remove(&pane_id);
             self.last_state.remove(&pane_id);
             return false;
@@ -223,6 +230,39 @@ impl ScreenDetector {
         if self.last_state.get(&pane_id) == Some(&state) {
             return false; // no change since last capture
         }
+        self.last_state.insert(pane_id.clone(), state);
+
+        if let synthetic::PaneOwnership::AttentionBlind {
+            id,
+            state: owner_state,
+        } = ownership
+        {
+            // The owning agent's hooks cannot report attention, so this pane
+            // gets the attention signal ONLY — applied to the real row, and
+            // never tracked: `tracked` drives the stop-sweep, and a real row is
+            // not ours to stop.
+            let events = synthetic::attention_refinement_events(
+                id,
+                owner_state,
+                to_synthetic(state),
+                &manifest.name,
+                None,
+                OffsetDateTime::now_utc(),
+            );
+            if events.is_empty() {
+                return false;
+            }
+            for ev in &events {
+                self.store.apply(ev).await;
+            }
+            tracing::debug!(
+                pane = %pane_id,
+                agent = %manifest.name,
+                ?state,
+                "screen detection refined an attention-blind hook row",
+            );
+            return true;
+        }
 
         let id = synthetic_id(pane);
         let events = synthetic::state_events(
@@ -233,7 +273,6 @@ impl ScreenDetector {
             OffsetDateTime::now_utc(),
         );
         synthetic::apply_if_unowned(&self.store, &pane_id, &events).await;
-        self.last_state.insert(pane_id.clone(), state);
         self.tracked.insert(pane_id);
         true
     }
@@ -501,6 +540,190 @@ mod tests {
         let rows = store.by_pane("%1").await;
         assert_eq!(rows.len(), 1, "no synthetic row added");
         assert_eq!(rows[0].session_id, "real");
+    }
+
+    /// A hook-owned agy pane is the one exception to "hooks own the pane": agy
+    /// has no permission hook, so screen inference supplies `WaitingInput` and
+    /// nothing else. Driven through the real detector loop with the bundled
+    /// `agy` manifest and captures taken from a live agy 1.1.17 pane.
+    #[tokio::test]
+    async fn refines_attention_on_a_hook_owned_agy_pane() {
+        let captures = Arc::new(Mutex::new(HashMap::new()));
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "⣷  Running command...\n>\nesc to cancel".into(),
+        );
+        let backend: SharedBackend =
+            Arc::new(FakeBackend::tmux(vec![pane("%1", "agy")], captures.clone()));
+
+        let store = Store::shared();
+        let real = AgentId {
+            kind: AgentKind::Antigravity,
+            session_id: "conv-1".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: Some("default".into()),
+            cwd: None,
+        };
+        // Hooks put the row in Working and stamp the model, as they would.
+        store
+            .apply(&AgentEvent::Started {
+                id: real.clone(),
+                at: AT,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: real.clone(),
+                model: Some("gemini-3.7-flash-high".into()),
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: AT,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: real.clone(),
+                tool: "run_command".into(),
+                subagent: None,
+                at: AT,
+            })
+            .await;
+
+        let mut det = detector(vec![backend], store.clone());
+
+        // A working screen adds nothing — hooks already own that transition.
+        assert_eq!(det.run_tick().await, 0);
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
+
+        // agy puts its permission widget up. Nothing in its hook stream can
+        // say so, so this tick is the only way the row learns it.
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "Run command?\n> Yes, and always allow for commands that start with 'echo'\n  No, deny"
+                .into(),
+        );
+        assert_eq!(det.run_tick().await, 1);
+        let rows = store.by_pane("%1").await;
+        assert_eq!(rows.len(), 1, "refinement must not mint a second row");
+        assert_eq!(rows[0].session_id, "conv-1");
+        assert_eq!(rows[0].state, AgentState::WaitingInput);
+        assert_eq!(
+            rows[0].model.as_deref(),
+            Some("gemini-3.7-flash-high"),
+            "the hook-supplied model must survive",
+        );
+
+        // The operator approves; agy's PostToolUse fires and releases the row
+        // without any help from the screen.
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: real,
+                tool: "run_command".into(),
+                success: true,
+                at: AT,
+            })
+            .await;
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
+    }
+
+    /// The safety valve: if the hook stream stops arriving while the row sits
+    /// at `WaitingInput`, an idle screen releases it rather than freezing it.
+    #[tokio::test]
+    async fn idle_screen_releases_a_stuck_agy_wait() {
+        let captures = Arc::new(Mutex::new(HashMap::new()));
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "Allow access to this file?\n> Yes, allow access\n  No, deny access".into(),
+        );
+        let backend: SharedBackend =
+            Arc::new(FakeBackend::tmux(vec![pane("%1", "agy")], captures.clone()));
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Antigravity,
+                    session_id: "conv-1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: None,
+                },
+                at: AT,
+            })
+            .await;
+
+        let mut det = detector(vec![backend], store.clone());
+        assert_eq!(det.run_tick().await, 1);
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::WaitingInput);
+
+        // No further hook events ever arrive; the prompt is gone from screen.
+        captures
+            .lock()
+            .unwrap()
+            .insert("%1".into(), "? for shortcuts".into());
+        assert_eq!(det.run_tick().await, 1);
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Idle);
+    }
+
+    /// A hook-owned agy pane must never be `tracked`: `tracked` drives the
+    /// stop-sweep, and driving a REAL row to `Stopped` because its foreground
+    /// command changed is not screen detection's call.
+    #[tokio::test]
+    async fn a_refined_pane_is_never_stopped_by_the_sweep() {
+        let captures = Arc::new(Mutex::new(HashMap::new()));
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "Run command?\n> Yes, and always allow\n  No, deny".into(),
+        );
+        let panes = Arc::new(Mutex::new(vec![pane("%1", "agy")]));
+        let backend: SharedBackend = Arc::new(FakeBackend::tmux(
+            panes.lock().unwrap().clone(),
+            captures.clone(),
+        ));
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Antigravity,
+                    session_id: "conv-1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: None,
+                },
+                at: AT,
+            })
+            .await;
+        let mut det = detector(vec![backend], store.clone());
+        assert_eq!(det.run_tick().await, 1);
+        assert!(
+            !det.tracked.contains("%1"),
+            "a real row is not ours to track or stop",
+        );
+
+        // The pane drops out of candidacy: the sweep must leave the real row be.
+        let empty: SharedBackend = Arc::new(FakeBackend::tmux(
+            vec![pane("%1", "bash")],
+            Arc::new(Mutex::new(HashMap::new())),
+        ));
+        det.backends = vec![empty];
+        det.run_tick().await;
+        let rows = store.by_pane("%1").await;
+        assert_eq!(rows[0].session_id, "conv-1");
+        assert_ne!(
+            rows[0].state,
+            AgentState::Stopped,
+            "the sweep must not stop a real row",
+        );
+        assert!(
+            !det.last_state.contains_key("%1"),
+            "last_state is pruned for refined panes too, not just tracked ones",
+        );
     }
 
     #[tokio::test]

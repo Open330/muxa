@@ -91,6 +91,45 @@ muxa reads the tail of that JSONL: the last `USER_INPUT`/`USER_EXPLICIT` step
 silently — a hook runs synchronously inside agy's loop, so a missing or
 malformed transcript must cost a blank cell, never a stall.
 
+## Attention comes from the screen
+
+agy fires no hook when it puts an approval prompt up, so nothing in the event
+stream can say "this agent is waiting on you" — the single most important thing
+muxa exists to report.
+
+Normally hooks are absolute: `muxad` skips screen inference entirely on any
+pane a live hook row owns. agy is the one documented exception. Its rows are
+classified **attention-blind** (`AgentKind::hooks_report_attention` is `false`),
+and for those the screen detector keeps running and contributes exactly one
+signal — applied to the **real** row, never a second synthetic one:
+
+| Screen says | Row is | Result |
+| --- | --- | --- |
+| `Blocked` | not waiting, not `Error` | → `WaitingInput` |
+| `Idle` | waiting | → `Idle` (releases a stuck wait) |
+| anything else | — | nothing |
+
+Three things this deliberately does **not** do:
+
+- **No `Heartbeat`.** The row's `model` is what the hooks reported
+  (`gemini-3.7-flash-high`); stamping the manifest name `agy` over it would
+  destroy real information.
+- **`Working` contributes nothing.** Hooks report it in milliseconds; a screen
+  tick is seconds late. Racing them can only fight.
+- **A second row is never minted.** `Store::apply` evicts synthetic rows from a
+  pane a real row owns, so a synthetic row here would be evicted on the next
+  hook event and re-minted on the next tick — a duplicate row flapping forever.
+
+In practice the hooks release the wait on their own: approving the prompt fires
+`PostToolUse` → `ToolCompleted` → `Working`. The `Idle` rule above is the
+backstop for the one case they can't cover — the hook stream stopping
+altogether while the row sits at `WaitingInput`.
+
+Verified against a live agy 1.1.17 pane, on both prompt shapes agy renders
+(a numbered command prompt and a file-creation prompt):
+`working` → `waiting_input` → approve → `idle`, with the hook-supplied model
+and response intact throughout.
+
 ## `muxa hook agy` is fail-open and silent
 
 agy reads a hook's **stdout as a verdict**. An empty stdout means "no opinion";
@@ -112,10 +151,10 @@ in muxa that swallows its own errors for that reason.
 
 ## What agy does not expose
 
-- **No permission/notification hook.** An agy row cannot reach `WaitingInput`
-  from hooks. The bundled `agy` screen manifest covers that for panes with no
-  hooks wired; where hooks *are* wired they take precedence and the approval
-  prompt is not observed. See [SCREEN_DETECTION.md](SCREEN_DETECTION.md).
+- **No permission/notification hook.** No agy hook fires when it puts an
+  approval prompt up, so `WaitingInput` is unreachable from the hook stream.
+  muxa fills the gap from the screen instead — see
+  [Attention comes from the screen](#attention-comes-from-the-screen).
 - **No session-end hook.** `Stop` is a turn boundary, not a session boundary, so
   agy rows are reaped by pane liveness like Codex's.
 - **`workspacePaths` is empty in print mode.** `cwd` is populated for

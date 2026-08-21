@@ -279,7 +279,9 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 
 **화면 감지(fallback).** 훅이 없는 에이전트는 pane 내용을 TOML 매니페스트로
 분류합니다 — `agy`, `cursor-agent`, `amp`, `copilot`, `aider`, `goose`용
-매니페스트가 기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 항상 훅이 우선합니다.
+매니페스트가 기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 훅이 우선하되
+예외가 하나 있습니다: `agy`는 승인 프롬프트에 대한 훅이 없어서 그 신호만은
+화면 감지가 계속 담당합니다.
 [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md) 참고.
 
 ## Fleet host

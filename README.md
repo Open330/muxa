@@ -318,7 +318,9 @@ systems, so muxa gets exact state transitions:
 
 **Screen-detected (fallback).** Agents with no hooks are classified from
 their pane contents via TOML manifests — bundled for `agy`, `cursor-agent`,
-`amp`, `copilot`, `aider`, and `goose`, extensible per user. Hooks always win when present. See
+`amp`, `copilot`, `aider`, and `goose`, extensible per user. Hooks win when
+present, with one carve-out: `agy` fires no hook for an approval prompt, so its
+panes stay screen-inferred for that one signal. See
 [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md).
 
 On [herdr](https://herdr.dev) hosts, muxa additionally surfaces every

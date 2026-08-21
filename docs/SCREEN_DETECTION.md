@@ -8,8 +8,10 @@ Antigravity)
 and, on herdr hosts, from **herdr's own detection** bridged into synthetic rows
 (`docs/HERDR.md`). For every *other* agent CLI — cursor-agent, amp, copilot,
 aider, goose, and anything a user declares — there is no event stream at all.
-`agy` sits in both camps: muxa ships hooks for it, and a bundled manifest for
-panes where those hooks aren't wired.
+`agy` sits in both camps: muxa ships hooks for it, *and* a bundled manifest —
+because agy's hooks cannot report an approval prompt, so screen inference stays
+live on agy panes even when hooks are wired. See
+[Attention refinement](#attention-refinement-the-one-exception).
 Screen-manifest detection is the last-resort fallback herdr validated: capture
 the pane and match TOML-declared regex rules against the visible tail to infer
 `Working` / `WaitingInput` / `Idle`.
@@ -134,6 +136,32 @@ task drives that synthetic row to `Stopped` via `synthetic::stop_synthetic_row`
 (the shell is alive, so the reconciler won't reap it; the row isn't `Stopped`,
 so GC won't evict it). Pane *close* is still handled by the reconciler as usual.
 
+## Attention refinement (the one exception)
+
+Hook-authoritative precedence has exactly one carve-out. An agent CLI whose
+hooks cannot report "waiting on the operator" would otherwise be able to reach
+`WaitingInput` only by *not* installing muxa's hooks — the wrong trade. Today
+that is the Antigravity CLI (`agy`); `AgentKind::hooks_report_attention()` is
+the predicate, and Claude Code, Codex, the Gemini CLI and opencode all return
+`true` and keep the original behavior unchanged.
+
+For an attention-blind row, `muxad::synthetic::pane_ownership` returns
+`AttentionBlind` instead of `Hooked`, and the detector applies
+`attention_refinement_events` to the **real** row:
+
+* `Blocked` on a row that isn't already waiting (and isn't `Error`) →
+  `NotificationFired(NeedsInput)`.
+* `Idle` on a row that *is* waiting → `TurnStopped { idle_confirmed: true }`,
+  the backstop for a hook stream that stopped arriving mid-wait.
+* Everything else → no events. `Working` in particular is left to the hooks,
+  which report it in milliseconds against a seconds-late screen tick.
+
+No `Heartbeat` is emitted (it would overwrite the row's hook-supplied `model`),
+and no synthetic row is minted — `Store::apply` evicts synthetic rows from a
+pane a real row owns, so one would flap in and out on every hook event. Such
+panes are also never added to the detector's `tracked` set: that set drives the
+stop-sweep, and a real row is not screen detection's to stop.
+
 ## Manifest sources
 
 1. **Bundled** — `agy`, `cursor`, `amp`, `copilot`, `aider`, `goose` ship in the
@@ -168,6 +196,8 @@ an unmatched screen just keeps the row's previous state.
 | copilot `❯ Yes` selection widget as `blocked` | **Low-medium** | The highlighted-row arrow is specific to an actual menu, not prose. |
 | Generic "do you want to allow/proceed/run", "approve this command", "permission to run" as `blocked` | **Low-medium** | Plausible phrasings; specific enough to avoid most prose, but not verified against each CLI's exact copy. |
 | goose "would like to call" / literal `Allow?` as `blocked` | **Low** | Speculative wording; `Allow?` requires the `?` affordance, not the bare word. |
+| agy's `Requesting permission for:` header as `blocked` | **High** | Captured verbatim from a live prompt; agy prints it above every permission request, whatever the choice rows look like. |
+| agy's `> N. Yes` / `> N. No` selection row as `blocked` | **High** | Requires the cursor marker AND the number, so a plain numbered list in tool output cannot match. |
 | agy's `Yes, and always allow` / `No, and always deny` choice rows as `blocked` | **High** | Verbatim strings from agy's permission widget; they exist nowhere else in its output. |
 | agy's `esc to cancel` footer + `Generating...`/`Running command...` as `working` | **High** | Captured from a live agy pane; the footer holds for the whole turn. |
 | bare `^> $` as `idle` | **Medium** | Common prompt shape; may miss CLIs with a richer prompt (model name, token count). |

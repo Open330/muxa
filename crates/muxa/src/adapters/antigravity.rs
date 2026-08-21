@@ -57,11 +57,14 @@
 //! ## What agy cannot tell us
 //!
 //! There is no permission/notification hook, so an agy row never reaches
-//! `WaitingInput` from hooks alone. The bundled `agy` screen manifest covers
-//! that case for panes with no hooks wired; where hooks *are* wired they take
-//! precedence and the approval prompt is not observed. There is likewise no
-//! session-end hook — `Stop` is a turn boundary, not a session boundary — so
-//! agy rows are reaped by pane liveness like Codex's.
+//! `WaitingInput` from hooks alone — this adapter simply has no event to emit
+//! for it. That signal comes from the bundled `agy` screen manifest instead:
+//! `muxad`'s synthetic layer treats an agy row as *attention-blind* and keeps
+//! screen inference running on its pane, applying the attention state (and
+//! only that) to this row. See `muxad::synthetic::attention_refinement_events`.
+//!
+//! There is likewise no session-end hook — `Stop` is a turn boundary, not a
+//! session boundary — so agy rows are reaped by pane liveness like Codex's.
 
 use super::hook::{truncate, AdapterError, HookAdapter};
 use crate::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};

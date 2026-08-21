@@ -32,11 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reply as `tool call denied by pre-tool hook`, so a muxa parse error or a down
   daemon must never be able to block the user's tool call.
 
-  A bundled `agy` screen manifest covers panes with no hooks wired — and is the
-  only way an agy row reaches `WaitingInput`, since agy exposes no
-  permission/notification hook. Unlike the other bundled manifests it was
-  derived from a real agy 1.1.17 session rather than written blind.
-  See [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md).
+  A bundled `agy` screen manifest supplies the one state agy's hooks cannot:
+  `WaitingInput`. agy fires no hook when it raises an approval prompt, so
+  hook-authoritative precedence gains its first carve-out — a row whose kind
+  reports `hooks_report_attention() == false` stays screen-inferred, and the
+  detector applies the attention signal (and only that) to the **real** row
+  rather than minting a synthetic one. Claude Code, Codex, the Gemini CLI and
+  opencode are unaffected. Unlike the other bundled manifests, agy's patterns
+  were derived from a real agy 1.1.17 session rather than written blind.
+  See [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md) and
+  [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md).
 
 - **Central SSH fleet management adds a physical host → session → window →
   pane(agent) control plane.** `muxad` now maintains one isolated persistent
