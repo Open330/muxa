@@ -1628,6 +1628,7 @@ fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
         "claude_code" => Ok(AgentKind::ClaudeCode),
         "codex" => Ok(AgentKind::Codex),
         "gemini_cli" => Ok(AgentKind::GeminiCli),
+        "antigravity" => Ok(AgentKind::Antigravity),
         "opencode" => Ok(AgentKind::Opencode),
         "unknown" => Ok(AgentKind::Unknown),
         _ => Err(format!("unknown agent kind {raw:?}")),

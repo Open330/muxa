@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Google Antigravity CLI (`agy`) is a first-class agent.** agy replaced the
+  Gemini CLI upstream but shares none of its hook contract, so muxa's existing
+  Gemini support was silently inert against it: agy reads
+  `~/.gemini/config/hooks.json` (or `<workspace>/.agents/hooks.json`), not the
+  `hooks` key of `~/.gemini/settings.json`; its lifecycle is
+  `SessionStart`/`PreInvocation`/`PostInvocation`/`PreToolUse`/`PostToolUse`/`Stop`;
+  and its payloads are camelCase protojson keyed on `conversationId`. A new
+  `AgentKind::Antigravity`, adapter, and `muxa hook agy` handler cover all six
+  events. Neither prompts nor responses appear in any agy payload, so
+  `PreInvocation` and `Stop` read them out of the transcript agy points at —
+  `PreInvocation` only on `invocationNum == 0`, the turn boundary, so a
+  multi-invocation turn doesn't restate its prompt. `muxa init` gains an
+  `agy-hooks` component that owns one named key in agy's `hooks.json` (leaving
+  plugin and `/hooks`-authored entries alone), `muxa doctor` grew a matching
+  check, and `agy` panes are discovered, launchable (`muxa agent start --agent
+  agy`), filterable in `muxa timeline`, and reported to the omp sink under their
+  own `antigravity` slug rather than as `gemini`.
+
+  `muxa hook agy` is deliberately fail-open and byte-silent on stdout: agy reads
+  a hook's stdout as a verdict and treats a non-zero exit or a `decision`-less
+  reply as `tool call denied by pre-tool hook`, so a muxa parse error or a down
+  daemon must never be able to block the user's tool call.
+
+  A bundled `agy` screen manifest supplies the one state agy's hooks cannot:
+  `WaitingInput`. agy fires no hook when it raises an approval prompt, so
+  hook-authoritative precedence gains its first carve-out — a row whose kind
+  reports `hooks_report_attention() == false` stays screen-inferred, and the
+  detector applies the attention signal (and only that) to the **real** row
+  rather than minting a synthetic one. Claude Code, Codex, the Gemini CLI and
+  opencode are unaffected. Unlike the other bundled manifests, agy's patterns
+  were derived from a real agy 1.1.17 session rather than written blind.
+  See [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md) and
+  [docs/SCREEN_DETECTION.md](docs/SCREEN_DETECTION.md).
+
 - **Central SSH fleet management adds a physical host → session → window →
   pane(agent) control plane.** `muxad` now maintains one isolated persistent
   OpenSSH stdio relay and last-known cache per configured node, with stable
@@ -55,6 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.34] - 2026-08-14
 
 ### Changed
+
+- **A hook subcommand no longer aborts on an unreadable `config.toml`.**
+  `muxa hook …` now falls back to compiled defaults and puts the parse error
+  on stderr instead of exiting non-zero. Every other subcommand still fails
+  loudly. This matters because agy reads a non-zero hook exit as its verdict
+  (`tool call denied by pre-tool hook`), so one TOML typo would otherwise have
+  blocked every tool call in every agy session with nothing naming the cause.
 
 - **Session and window rows can send contracted messages without hierarchy
   descent.** Pressing `m` on a parent deterministically targets the first live

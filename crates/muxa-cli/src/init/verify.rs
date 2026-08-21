@@ -47,6 +47,7 @@ fn agent_component(c: Component) -> bool {
         Component::ClaudeHooks
             | Component::CodexHooks
             | Component::GeminiHooks
+            | Component::AntigravityHooks
             | Component::OpencodeHooks
     )
 }

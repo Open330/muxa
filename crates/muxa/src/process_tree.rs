@@ -239,6 +239,7 @@ fn display_command(proc: &ProcessInfo, kind: WorkloadProcessKind) -> String {
                 AgentKind::ClaudeCode => "claude".to_string(),
                 AgentKind::Codex => "codex".to_string(),
                 AgentKind::GeminiCli => "gemini".to_string(),
+                AgentKind::Antigravity => "agy".to_string(),
                 AgentKind::Opencode => "opencode".to_string(),
                 AgentKind::Task | AgentKind::Unknown => command_name(&proc.comm).to_string(),
             };

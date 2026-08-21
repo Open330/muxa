@@ -429,7 +429,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode"] },
+                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"] },
                     "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Default pane." },
                     "target": { "type": "string", "description": "tmux target for pane/window placement. Defaults to TMUX_PANE." },
                     "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
@@ -601,7 +601,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/opencode (with or without @), pane:%N/%N, @alias, or role:<name>." },
+                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/agy/opencode (with or without @), pane:%N/%N, @alias, or role:<name>." },
                     "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
                     "body": { "type": "string", "description": "Request-specific instruction. Optional when skill is supplied." },
                     "skill": { "type": "string", "description": "Registered Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
@@ -611,7 +611,7 @@ fn tool_definitions() -> Vec<Value> {
                     "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "spawn_if_missing": { "type": "boolean", "description": "Default false. Create a same-window bypass-permission peer only after explicit user confirmation." },
-                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
+                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
                     "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "How long to wait for the new pane to register as a collaboration peer. Default 30." },
                     "air_artifacts": {
                         "type": "array",
@@ -1710,9 +1710,10 @@ fn provider_rank(kind: AgentKind) -> u8 {
         AgentKind::Codex => 0,
         AgentKind::ClaudeCode => 1,
         AgentKind::GeminiCli => 2,
-        AgentKind::Opencode => 3,
-        AgentKind::Task => 4,
-        AgentKind::Unknown => 5,
+        AgentKind::Antigravity => 3,
+        AgentKind::Opencode => 4,
+        AgentKind::Task => 5,
+        AgentKind::Unknown => 6,
     }
 }
 
@@ -1730,6 +1731,7 @@ fn provider_kind(target: &str) -> Option<AgentKind> {
         "claude" | "claude_code" | "claude-code" => Some(AgentKind::ClaudeCode),
         "codex" | "cx" => Some(AgentKind::Codex),
         "gemini" | "gemini_cli" | "gemini-cli" => Some(AgentKind::GeminiCli),
+        "agy" | "antigravity" => Some(AgentKind::Antigravity),
         "opencode" => Some(AgentKind::Opencode),
         _ => None,
     }
@@ -1754,13 +1756,20 @@ fn peer_spawn_program(
             ));
         }
     }
-    Ok(requested.or(targeted).unwrap_or(match current.agent_kind {
+    // Enumerated rather than collapsed to a `_` arm, and the duplicate
+    // `Codex` bodies are deliberate: spelling out every kind is what makes a
+    // new `AgentKind` a compile error here instead of a silent default.
+    #[allow(clippy::match_same_arms)]
+    let fallback = match current.agent_kind {
         AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Codex,
         AgentKind::Codex => crate::agent_launch::AgentProgram::Claude,
-        AgentKind::GeminiCli | AgentKind::Opencode | AgentKind::Task | AgentKind::Unknown => {
-            crate::agent_launch::AgentProgram::Codex
-        }
-    }))
+        AgentKind::GeminiCli
+        | AgentKind::Antigravity
+        | AgentKind::Opencode
+        | AgentKind::Task
+        | AgentKind::Unknown => crate::agent_launch::AgentProgram::Codex,
+    };
+    Ok(requested.or(targeted).unwrap_or(fallback))
 }
 
 fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram {
@@ -1770,6 +1779,7 @@ fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram 
             crate::agent_launch::AgentProgram::Codex
         }
         AgentKind::GeminiCli => crate::agent_launch::AgentProgram::Gemini,
+        AgentKind::Antigravity => crate::agent_launch::AgentProgram::Antigravity,
         AgentKind::Opencode => crate::agent_launch::AgentProgram::Opencode,
     }
 }
@@ -1779,6 +1789,7 @@ fn agent_program_label(program: crate::agent_launch::AgentProgram) -> &'static s
         crate::agent_launch::AgentProgram::Claude => "claude",
         crate::agent_launch::AgentProgram::Codex => "codex",
         crate::agent_launch::AgentProgram::Gemini => "gemini",
+        crate::agent_launch::AgentProgram::Antigravity => "agy",
         crate::agent_launch::AgentProgram::Opencode => "opencode",
     }
 }
@@ -2632,7 +2643,7 @@ mod tests {
         assert_eq!(start_agent["inputSchema"]["required"], json!(["agent"]));
         assert_eq!(
             start_agent["inputSchema"]["properties"]["agent"]["enum"],
-            json!(["claude", "codex", "gemini", "opencode"])
+            json!(["claude", "codex", "gemini", "agy", "opencode"])
         );
         assert!(start_agent["inputSchema"]["properties"]["work"].is_object());
         assert!(start_agent["inputSchema"]["properties"]["workspace"].is_object());

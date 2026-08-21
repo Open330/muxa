@@ -179,6 +179,8 @@ enum AgentKindArg {
     Codex,
     #[value(alias = "gemini_cli")]
     GeminiCli,
+    #[value(alias = "agy")]
+    Antigravity,
     Opencode,
     Unknown,
 }
@@ -189,6 +191,7 @@ impl From<AgentKindArg> for AgentKind {
             AgentKindArg::ClaudeCode => Self::ClaudeCode,
             AgentKindArg::Codex => Self::Codex,
             AgentKindArg::GeminiCli => Self::GeminiCli,
+            AgentKindArg::Antigravity => Self::Antigravity,
             AgentKindArg::Opencode => Self::Opencode,
             AgentKindArg::Unknown => Self::Unknown,
         }

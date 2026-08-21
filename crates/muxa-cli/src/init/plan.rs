@@ -102,6 +102,7 @@ pub fn build(
             Component::ClaudeHooks => plan_claude(direction, *c, &mut actions, &mut warnings)?,
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
             Component::GeminiHooks => plan_gemini(direction, *c, &mut actions)?,
+            Component::AntigravityHooks => plan_antigravity(direction, *c, &mut actions)?,
             Component::OpencodeHooks => plan_opencode(direction, *c, &mut actions)?,
             Component::MuxadSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
             Component::MuxadLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
@@ -427,6 +428,27 @@ fn plan_gemini(direction: Direction, c: Component, actions: &mut Vec<Action>) ->
         }
         Direction::Uninstall => {
             files::gemini::remove(&original).context("scrubbing gemini settings.json")?
+        }
+    };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+/// agy's hooks live in their own file, so unlike `plan_gemini` this creates
+/// `~/.gemini/config/hooks.json` when absent — that is the normal case, since
+/// agy only writes it once its own `/hooks` command is used.
+fn plan_antigravity(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::antigravity::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            files::antigravity::upsert(&original).context("merging agy hooks.json")?
+        }
+        Direction::Uninstall => {
+            files::antigravity::remove(&original).context("scrubbing agy hooks.json")?
         }
     };
     push_edit_or_delete(direction, c, path, before, after, outcome, actions);

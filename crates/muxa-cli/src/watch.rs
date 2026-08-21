@@ -1846,6 +1846,7 @@ enum SpawnAgent {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
     Opencode,
 }
 
@@ -1855,6 +1856,7 @@ impl SpawnAgent {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
             Self::Opencode => "opencode",
         }
     }
@@ -1863,7 +1865,8 @@ impl SpawnAgent {
         match self {
             Self::Claude => Self::Codex,
             Self::Codex => Self::Gemini,
-            Self::Gemini => Self::Opencode,
+            Self::Gemini => Self::Antigravity,
+            Self::Antigravity => Self::Opencode,
             Self::Opencode => Self::Claude,
         }
     }
@@ -1873,7 +1876,8 @@ impl SpawnAgent {
             Self::Claude => Self::Opencode,
             Self::Codex => Self::Claude,
             Self::Gemini => Self::Codex,
-            Self::Opencode => Self::Gemini,
+            Self::Antigravity => Self::Gemini,
+            Self::Opencode => Self::Antigravity,
         }
     }
 
@@ -1891,6 +1895,7 @@ impl SpawnAgent {
                 format!("codex --dangerously-bypass-approvals-and-sandbox {quoted}")
             }
             Self::Gemini => format!("gemini --approval-mode yolo --skip-trust -i {quoted}"),
+            Self::Antigravity => format!("agy --dangerously-skip-permissions -i {quoted}"),
             Self::Opencode => format!("opencode --prompt {quoted}"),
         }
     }
@@ -12905,6 +12910,7 @@ pub(crate) fn agent_kind_short(kind: AgentKind) -> &'static str {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
         AgentKind::GeminiCli => "gemini",
+        AgentKind::Antigravity => "agy",
         AgentKind::Opencode => "opencode",
         AgentKind::Task => "task",
         AgentKind::Unknown => "agent",

@@ -281,7 +281,7 @@ muxa_manage_tmux(action="close_workspace", workspace="muxa", confirm=true)
 Terminate and close refuse unconfirmed or unmanaged targets. Muxa does not
 expose arbitrary shell or generic tmux commands.
 
-Profiles are allowlisted (`claude`, `codex`, `gemini`, `opencode`) rather than
+Profiles are allowlisted (`claude`, `codex`, `gemini`, `agy`, `opencode`) rather than
 accepting an arbitrary shell command. They intentionally use each CLI's
 bypass/yolo mode. In particular, `codex` expands the local `cx` behavior to
 `codex --yolo` directly, so it does not depend on an interactive shell loading

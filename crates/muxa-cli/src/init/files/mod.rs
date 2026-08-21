@@ -5,6 +5,7 @@
 //! the disk — `apply.rs` owns I/O so the same edits can be unit-tested
 //! and dry-run-rendered.
 
+pub mod antigravity;
 pub mod ask;
 pub mod claude;
 pub mod codex;

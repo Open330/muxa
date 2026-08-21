@@ -107,6 +107,10 @@ pub fn render_detection(mode: Mode, d: &Detection) {
     lines.push(check_path("Claude Code config", d.claude_settings.as_ref()));
     lines.push(check_path("Codex config", d.codex_config.as_ref()));
     lines.push(check_path("Gemini CLI config", d.gemini_settings.as_ref()));
+    lines.push(check_path(
+        "Antigravity CLI (agy)",
+        d.antigravity_home.as_ref(),
+    ));
     lines.push(format!(
         "{} systemctl --user",
         if d.systemd_user_available {

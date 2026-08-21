@@ -22,6 +22,11 @@ pub struct Detection {
     pub claude_settings: Option<PathBuf>,
     pub codex_config: Option<PathBuf>,
     pub gemini_settings: Option<PathBuf>,
+    /// Marker that the Antigravity CLI has run here. Separate from
+    /// `gemini_settings`: agy shares the `~/.gemini` tree with the CLI it
+    /// replaced, so the presence of `settings.json` says nothing about
+    /// whether `agy` is installed (and vice versa).
+    pub antigravity_home: Option<PathBuf>,
     pub opencode_config: Option<PathBuf>,
     pub muxad_running: bool,
     pub systemd_user_available: bool,
@@ -37,6 +42,7 @@ impl Detection {
             claude_settings: existing_file(home_join(".claude/settings.json")),
             codex_config: existing_file(home_join(".codex/config.toml")),
             gemini_settings: existing_file(home_join(".gemini/settings.json")),
+            antigravity_home: detect_antigravity(),
             opencode_config: existing_dir(opencode_config_dir()),
             muxad_running: muxad_is_running(),
             systemd_user_available: super::files::systemd::systemd_available(),
@@ -74,6 +80,9 @@ impl Detection {
         if self.gemini_settings.is_some() {
             out.push(Component::GeminiHooks);
         }
+        if self.antigravity_home.is_some() {
+            out.push(Component::AntigravityHooks);
+        }
         // Pre-check the daemon-manager that fits this host so the
         // wizard's default produces a working install. The picker
         // hides the others (filtered via `Component::applicable_here`).
@@ -84,8 +93,8 @@ impl Detection {
 
     /// Whether an agent-hook component's config is present on disk.
     ///
-    /// Returns `Some(true)`/`Some(false)` for the four agent hooks
-    /// (Claude/Codex/Gemini/opencode) and `None` for every other
+    /// Returns `Some(true)`/`Some(false)` for the five agent hooks
+    /// (Claude/Codex/Gemini/agy/opencode) and `None` for every other
     /// component — the caller reads `None` as "not an agent hook, always
     /// keep". This is what lets the non-interactive/preset path skip
     /// wiring up an agent the user doesn't actually have installed,
@@ -95,6 +104,7 @@ impl Detection {
             Component::ClaudeHooks => Some(self.claude_settings.is_some()),
             Component::CodexHooks => Some(self.codex_config.is_some()),
             Component::GeminiHooks => Some(self.gemini_settings.is_some()),
+            Component::AntigravityHooks => Some(self.antigravity_home.is_some()),
             Component::OpencodeHooks => Some(self.opencode_config.is_some()),
             _ => None,
         }
@@ -167,6 +177,26 @@ fn existing_file(p: PathBuf) -> Option<PathBuf> {
 
 fn existing_dir(p: Option<PathBuf>) -> Option<PathBuf> {
     p.filter(|p| p.is_dir())
+}
+
+/// Is the Antigravity CLI installed, and where does it keep state?
+///
+/// Prefers its state directory — `agy` creates `~/.gemini/antigravity-cli/`
+/// on first run, and that survives a shell whose PATH the wizard didn't
+/// inherit. Falls back to `agy` on PATH so a fresh install that has never
+/// been run still pre-checks.
+pub fn detect_antigravity() -> Option<PathBuf> {
+    let home = home_join(".gemini/antigravity-cli");
+    if home.is_dir() {
+        return Some(home);
+    }
+    which::which("agy").ok()
+}
+
+/// Presence-only form of [`detect_antigravity`], for callers (like `doctor`)
+/// that have no `Detection` in hand.
+pub fn antigravity_installed() -> bool {
+    detect_antigravity().is_some()
 }
 
 /// opencode has no single well-known settings file the way the other

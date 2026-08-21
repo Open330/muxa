@@ -36,7 +36,7 @@ muxa timeline --since today --format json
 | `--session` | tmux session 이름, tmux session id, pane id. |
 | `--exclude-pane` | case-sensitive glob에 맞는 pane id를 제외합니다. 반복하거나 comma-separated로 줄 수 있습니다. |
 | `--exclude-session` | case-sensitive glob에 맞는 tmux session name/id를 제외합니다. 반복하거나 comma-separated로 줄 수 있습니다. |
-| `--agent` | `codex`, `claude-code`, `gemini-cli`, `opencode`, `unknown`. |
+| `--agent` | `codex`, `claude-code`, `gemini-cli`, `antigravity`(별칭 `agy`), `opencode`, `unknown`. |
 | `--view` | 기본값 `timeline`, 또는 terminal contribution-map summary인 `heatmap`. |
 | `--group-by` | 기본값 `session`, 또는 `kind`, `flat`. TUI 전용. |
 | `--sort` | 기본값 `latest`, 또는 `name`, `duration`, `working`, `waiting`, `error`, `human`, `foreground`. `dur`, `work`, `wait`, `err`, `tmux` alias도 지원. |

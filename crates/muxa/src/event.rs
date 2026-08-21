@@ -21,7 +21,14 @@ pub enum AgentKind {
     ClaudeCode,
     Opencode,
     Codex,
+    /// The legacy Gemini CLI (`gemini`). Superseded by [`AgentKind::Antigravity`]
+    /// upstream, but kept first-class: its hook contract still works and
+    /// installs predate the switch.
     GeminiCli,
+    /// Google's Antigravity CLI (`agy`), the Gemini CLI's successor. A
+    /// separate kind rather than a rename — the two ship different hook
+    /// formats, different config locations, and can be installed side by side.
+    Antigravity,
     /// A non-agent background process (shell script, game, automation loop,
     /// or a `muxa run` PTY child) registered via `muxa register` / the
     /// `Register` IPC. Tracked by pid liveness rather than tmux pane
@@ -29,6 +36,37 @@ pub enum AgentKind {
     /// `Stopped` (exited).
     Task,
     Unknown,
+}
+
+impl AgentKind {
+    /// Can this agent's hook stream tell muxa it is waiting on the operator?
+    ///
+    /// Claude Code (`Notification`), Codex (`PermissionRequest`), the Gemini
+    /// CLI (`Notification`) and opencode (`permission.asked`) all can, so their
+    /// rows reach [`AgentState::WaitingInput`] from hooks alone and screen
+    /// inference must stay out of the way.
+    ///
+    /// The Antigravity CLI cannot — it exposes no permission or notification
+    /// hook at all (see `docs/ANTIGRAVITY.md`), so for an agy row that one
+    /// signal is only ever available from the pane's screen. `muxad`'s
+    /// synthetic layer keys its attention-refinement path off this.
+    // The two `true` arms stay separate on purpose: they are true for
+    // opposite reasons (one has an attention hook, one is not an agent at
+    // all), and spelling every kind out is what makes a new `AgentKind` a
+    // compile error here rather than a silent default.
+    #[allow(clippy::match_same_arms)]
+    #[must_use]
+    pub fn hooks_report_attention(self) -> bool {
+        match self {
+            Self::ClaudeCode | Self::Codex | Self::GeminiCli | Self::Opencode => true,
+            Self::Antigravity => false,
+            // Neither is a hook-driven agent: `Task` rows have no attention
+            // states at all (only Working/Stopped), and `Unknown` is the kind
+            // synthetic rows themselves carry. `true` keeps both out of the
+            // refinement path, which is exactly where they belong.
+            Self::Task | Self::Unknown => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
@@ -364,6 +402,8 @@ mod tests {
     fn kind_serializes_snake_case() {
         let json = serde_json::to_string(&AgentKind::GeminiCli).unwrap();
         assert_eq!(json, "\"gemini_cli\"");
+        let json = serde_json::to_string(&AgentKind::Antigravity).unwrap();
+        assert_eq!(json, "\"antigravity\"");
     }
 
     /// Older muxa peers emit `TurnStopped` without the `response` field.

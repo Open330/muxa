@@ -222,8 +222,9 @@ fn command_basename(cmd: &str) -> String {
 /// The bundled manifest sources, shipped in the binary via `include_str!`.
 /// These are muxa-authored and MUST parse — a parse failure is a build-time
 /// bug caught by [`tests::every_bundled_manifest_parses`].
-fn bundled_sources() -> [(&'static str, &'static str); 5] {
+fn bundled_sources() -> [(&'static str, &'static str); 6] {
     [
+        ("agy", include_str!("screen/agents/agy.toml")),
         ("cursor", include_str!("screen/agents/cursor.toml")),
         ("amp", include_str!("screen/agents/amp.toml")),
         ("copilot", include_str!("screen/agents/copilot.toml")),
@@ -461,7 +462,7 @@ idle = ['^> $']
     #[test]
     fn every_bundled_manifest_parses() {
         let set = bundled_manifests();
-        assert_eq!(set.len(), 5);
+        assert_eq!(set.len(), 6);
         for m in &set {
             assert!(!m.name.is_empty());
         }
@@ -479,6 +480,107 @@ idle = ['^> $']
             Some(ScreenState::Blocked)
         );
         assert_eq!(m.classify("\n> "), Some(ScreenState::Idle));
+    }
+
+    /// Fixtures captured from a live agy 1.1.17 pane (working/idle) and from
+    /// agy's own confirmation-widget labels (blocked).
+    #[test]
+    fn agy_fixtures() {
+        let m = parse_manifest(include_str!("screen/agents/agy.toml")).unwrap();
+        assert!(m.matches_command("agy"));
+        assert!(m.matches_command("/Users/x/.local/bin/agy"));
+        // Kept in lockstep with `discovery::classify_command`: a pane that
+        // discovery calls Antigravity must never be one this manifest skips.
+        assert!(m.matches_command("antigravity"));
+
+        // Verbatim tails of real captures, three seconds apart in one turn.
+        assert_eq!(
+            m.classify("> Run the shell command: echo hi\n⡿  Generating...\n>\nesc to cancel"),
+            Some(ScreenState::Working),
+        );
+        assert_eq!(
+            m.classify(
+                "● Bash(echo hi) (ctrl+o to expand)\n⣷  Running command...\n>\nesc to cancel"
+            ),
+            Some(ScreenState::Working),
+        );
+
+        // The idle footer, and the bare prompt on its own.
+        assert_eq!(
+            m.classify("? for shortcuts                       Gemini 3.7 Flash · high"),
+            Some(ScreenState::Idle),
+        );
+        assert_eq!(m.classify("\n> "), Some(ScreenState::Idle));
+
+        // `working` is tested before `idle`, so the bare `>` input line that
+        // agy keeps drawing mid-turn cannot flip a busy pane to idle.
+        assert_eq!(
+            m.classify("⣻  Listing directory...\n>\nesc to cancel"),
+            Some(ScreenState::Working),
+            "the input line is drawn during generation too",
+        );
+
+        // agy's real permission widget, captured verbatim from a live prompt.
+        // Note it keeps the `esc to cancel` working-footer on screen, so this
+        // also pins that `blocked` is tested BEFORE `working`.
+        let prompt = "● Bash(echo REFINE_TEST) (ctrl+o to expand)\n\
+             Requesting permission for:\n   echo REFINE_TEST\n\
+             Do you want to proceed?\n\
+             > 1. Yes\n  2. Yes, and always allow in this conversation\n  4. No\n\
+             ↑/↓ Navigate · tab Amend\nesc to cancel";
+        assert_eq!(m.classify(prompt), Some(ScreenState::Blocked));
+
+        // The header alone is enough: choice-row wording varies per request
+        // type, so the manifest must not depend on any one of them.
+        assert_eq!(
+            m.classify("Requesting permission for:\n   rm -rf build\n> 1. Yes\n  2. No"),
+            Some(ScreenState::Blocked),
+        );
+        // A numbered selection widget with none of the longer labels.
+        assert_eq!(
+            m.classify("Do you want to proceed?\n> 1. Yes\n  2. No"),
+            Some(ScreenState::Blocked),
+        );
+        assert_eq!(
+            m.classify("Run command?\n> Yes, and always allow for commands that start with 'echo'\n  No, deny"),
+            Some(ScreenState::Blocked),
+        );
+        assert_eq!(
+            m.classify("Allow access to this file?\n> Yes, allow access\n  No, deny access"),
+            Some(ScreenState::Blocked),
+        );
+        // The folder-trust gate blocks the very first prompt of a session.
+        assert_eq!(
+            m.classify(
+                "Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit"
+            ),
+            Some(ScreenState::Blocked),
+        );
+
+        // agy echoes tool output into the same pane, so prose that merely
+        // talks about allowing or generating must classify as nothing.
+        assert_eq!(
+            m.classify("These flags allow access to the cache and deny writes."),
+            None,
+            "prose about allow/deny must not read as an approval prompt",
+        );
+        // A numbered list in ordinary output is not a selection widget: the
+        // `>` cursor marker is what makes it one.
+        assert_eq!(
+            m.classify("Steps:\n1. Yes it compiles\n2. No warnings remain"),
+            None,
+            "a plain numbered list must not read as an approval prompt",
+        );
+        assert_eq!(
+            m.classify("Generating the report is handled by the nightly job."),
+            None,
+            "`Generating` without agy's `...` suffix is prose, not a spinner",
+        );
+        assert_eq!(
+            m.classify("nothing to commit, working tree clean"),
+            None,
+            "the word `working` in prose must not read as busy",
+        );
     }
 
     #[test]

@@ -1,0 +1,67 @@
+# Bundled screen-detection manifest — Google Antigravity CLI (`agy`).
+#
+# Unlike the other bundled manifests, these patterns were derived from a REAL
+# agy 1.1.17 session: the working/idle rules and the permission-prompt header
+# come from captured tmux panes, the remaining approval rules from agy's own
+# confirmation-widget labels. See
+# docs/SCREEN_DETECTION.md. Override at $XDG_CONFIG_HOME/muxa/agents/agy.toml.
+#
+# muxa also ships hooks for agy (`muxa hook agy`), and hooks win everywhere
+# except one signal: agy exposes no permission/notification hook, so the
+# `blocked` rules below are the ONLY way an agy row ever reaches
+# `WaitingInput`. `muxad`'s synthetic layer therefore keeps this manifest live
+# even on a pane a real agy row owns, applying the attention signal (and
+# nothing else) to that row — see `muxad::synthetic::attention_refinement_events`.
+
+[agent]
+name = "agy"
+# Both spellings `discovery::classify_command` accepts, so a pane it calls an
+# Antigravity agent is never one screen detection then refuses to look at.
+command = ["agy", "antigravity"]
+
+[rules]
+# STRICT — agy's confirmation widget renders a fixed set of choice rows, so
+# these anchor on that literal UI rather than on generic approval phrasing.
+# An over-broad `blocked` is the worst failure (a working agent shown as
+# "needs input"), and agy prints tool output verbatim into the same pane.
+blocked = [
+    # The header agy prints above EVERY permission request. Captured verbatim
+    # from a live prompt and by far the most robust anchor here — the choice
+    # rows below vary per request type (a command prompt renders numbered
+    # `1. Yes` / `4. No` rows, a file prompt renders `Yes, allow access`),
+    # but this line is constant.
+    '(?i)Requesting permission for:',
+    # The highlighted row of a numbered selection widget. Anchored to the
+    # cursor marker and the number so ordinary prose can never match.
+    '(?m)^\s*>\s*\d+\.\s+(?i:Yes|No)\b',
+    # The choice rows of the permission widget. "always allow"/"always deny"
+    # exist only in that widget, so they cannot come from tool output.
+    '(?i)Yes, and always allow',
+    '(?i)No, and always deny',
+    '(?i)Yes, (allow (access|creation)|approve|grant permission for)\b',
+    '(?i)No, (deny|reject this change)\b',
+    '(?i)Yes, accept this change',
+    # Folder-trust gate on first run in a new directory — agy will not accept
+    # a prompt until it is answered.
+    '(?i)Do you trust the contents of this project\?',
+    '(?i)Yes, I trust this folder',
+    # The question line above the rows.
+    '(?i)Allow (access to this file|creation of this file|remote debugging|sandbox bypass for command execution)\?',
+    '(?i)Allow agent to access files outside workspace',
+]
+# Active generation. agy pairs a braille spinner with a "<Verb>ing…" label
+# ("Generating...", "Running command...", "Listing directory...") and swaps the
+# footer hint to `esc to cancel` for the whole turn — that footer is the
+# steady signal, the spinner glyph the frame-by-frame one.
+working = [
+    '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]',
+    '(?i)esc to (cancel|interrupt generation)',
+    '(?i)\b(Generating|Thinking|Running command|Listing directory)\.\.\.',
+]
+# Idle: agy swaps the footer back to the shortcut hint once the turn ends.
+# Listed after `working` on purpose — the bare `>` input line is drawn during
+# generation too, so it can only be trusted once the working rules have missed.
+idle = [
+    '(?i)\?\s+for shortcuts',
+    '(?m)^\s*>\s*$',
+]

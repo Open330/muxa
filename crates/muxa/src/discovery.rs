@@ -56,6 +56,11 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
         "claude" => Some(AgentKind::ClaudeCode),
         "codex" => Some(AgentKind::Codex),
         "gemini" | "gemini-cli" => Some(AgentKind::GeminiCli),
+        // Antigravity ships a native binary, so it lands in tmux under its
+        // own name rather than behind a `node` shim. `antigravity` is
+        // accepted too: the installer's shell shim can be renamed, and the
+        // cost of the extra arm is one string compare.
+        "agy" | "antigravity" => Some(AgentKind::Antigravity),
         _ => None,
     }
 }
@@ -310,13 +315,14 @@ pub struct DiscoveryReport {
     pub claude_code: usize,
     pub codex: usize,
     pub gemini_cli: usize,
+    pub antigravity: usize,
     pub skipped_known: usize,
     pub failed: usize,
 }
 
 impl DiscoveryReport {
     pub fn total_ingested(&self) -> usize {
-        self.claude_code + self.codex + self.gemini_cli
+        self.claude_code + self.codex + self.gemini_cli + self.antigravity
     }
 
     fn bump(&mut self, kind: AgentKind) {
@@ -324,6 +330,7 @@ impl DiscoveryReport {
             AgentKind::ClaudeCode => self.claude_code += 1,
             AgentKind::Codex => self.codex += 1,
             AgentKind::GeminiCli => self.gemini_cli += 1,
+            AgentKind::Antigravity => self.antigravity += 1,
             // We never synthesize for Opencode/Unknown/Task today.
             AgentKind::Opencode | AgentKind::Unknown | AgentKind::Task => {}
         }
@@ -419,6 +426,17 @@ mod tests {
         assert_eq!(classify_command("codex"), Some(AgentKind::Codex));
         assert_eq!(classify_command("gemini"), Some(AgentKind::GeminiCli));
         assert_eq!(classify_command("gemini-cli"), Some(AgentKind::GeminiCli));
+        assert_eq!(classify_command("agy"), Some(AgentKind::Antigravity));
+        assert_eq!(
+            classify_command("antigravity"),
+            Some(AgentKind::Antigravity)
+        );
+        // agy is a native binary, so tmux reports the full path for a
+        // non-PATH install; the basename rule must still classify it.
+        assert_eq!(
+            classify_command("/Users/x/.local/bin/agy"),
+            Some(AgentKind::Antigravity),
+        );
         // Case-insensitive — some shells uppercase argv[0].
         assert_eq!(classify_command("CLAUDE"), Some(AgentKind::ClaudeCode));
         // macOS `ps -o comm=` can return the full executable path for a

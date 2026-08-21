@@ -7,7 +7,8 @@ This page keeps the detailed install and wiring notes out of the README.
 - Rust 1.88+
 - tmux 3.x
 - Unix-like OS
-- One supported agent CLI: Claude Code, OpenAI Codex, or Google Gemini CLI
+- One supported agent CLI: Claude Code, OpenAI Codex, Google Gemini CLI, or the
+  Google Antigravity CLI (`agy`)
 
 ## Try Before Installing
 
@@ -183,6 +184,7 @@ hook commands without overwriting existing user hooks.
 | Claude Code | Merge `examples/claude-settings.json` into `~/.claude/settings.json`. |
 | OpenAI Codex | Add the `[[hooks.*]]` blocks documented in `crates/muxa/src/adapters/codex.rs`. |
 | Google Gemini CLI | Merge the hooks from `crates/muxa/src/adapters/gemini.rs` into `~/.gemini/settings.json`. |
+| Google Antigravity CLI | Add the `muxa` block from `crates/muxa/src/adapters/antigravity.rs` to `~/.gemini/config/hooks.json`. Note this is agy's own `hooks.json`, **not** the Gemini CLI's `settings.json`. |
 
 ## Verify
 

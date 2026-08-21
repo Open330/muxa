@@ -7,7 +7,7 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 - Rust 1.88+
 - tmux 3.x
 - Unix-like OS
-- Claude Code, OpenAI Codex, Google Gemini CLI 중 하나
+- Claude Code, OpenAI Codex, Google Gemini CLI, Google Antigravity CLI(`agy`) 중 하나
 
 ## 설치 전 체험
 
@@ -159,6 +159,7 @@ tmux source-file ~/.tmux.conf
 | Claude Code | `examples/claude-settings.json`을 `~/.claude/settings.json`에 merge. |
 | OpenAI Codex | `crates/muxa/src/adapters/codex.rs`의 module doc에 있는 `[[hooks.*]]` block 추가. |
 | Google Gemini CLI | `crates/muxa/src/adapters/gemini.rs`의 hook block을 `~/.gemini/settings.json`에 merge. |
+| Google Antigravity CLI | `crates/muxa/src/adapters/antigravity.rs`의 `muxa` block을 `~/.gemini/config/hooks.json`에 추가. Gemini CLI의 `settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
 
 ## 확인
 
