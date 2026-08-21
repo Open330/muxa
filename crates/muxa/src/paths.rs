@@ -13,6 +13,7 @@ pub const COLLABORATION_FILENAME: &str = "collaboration.json";
 pub const COLLABORATION_AUDIT_FILENAME: &str = "collaboration-audit.ndjson";
 pub const ASK_FILENAME: &str = "ask.json";
 pub const NODE_ID_FILENAME: &str = "host-id";
+pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -79,6 +80,13 @@ pub fn default_collaboration_file() -> Option<PathBuf> {
 /// Default append-only collaboration caller audit ledger.
 pub fn default_collaboration_audit_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_AUDIT_FILENAME))
+}
+
+/// Durable dashboard-only work metadata. Execution identity remains owned by
+/// the pane backend; this file stores operator annotations such as title,
+/// workflow stage, goal, and next action.
+pub fn default_dashboard_work_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(DASHBOARD_WORK_FILENAME))
 }
 
 fn posix_uid() -> u32 {
