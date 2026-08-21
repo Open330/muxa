@@ -122,6 +122,10 @@ pub(crate) struct Resolved {
     ticket: Option<Ticket>,
     worktree: Option<WorktreePlan>,
     created_worktree: bool,
+    /// Whether the caller actually asked for this directory, as opposed to
+    /// happening to stand in it. Only a pinned cwd is asserted against the
+    /// work window's recorded one.
+    cwd_pinned: bool,
     layout: Option<String>,
     request: Option<ComposedRequest>,
     desired: Vec<DesiredAgent>,
@@ -275,15 +279,34 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         request.as_ref().map(|request| request.text.as_str()),
     );
 
-    let (cwd, worktree, created_worktree) = resolve_cwd(args, route, &vars)?;
+    // Find the work window before choosing a directory, not after: a work
+    // item that already exists has a cwd, and that answer beats whichever
+    // directory the operator happens to be standing in.
+    let workspace_hint = match args.workspace.as_deref() {
+        Some(workspace) => Some(crate::tmux_work::normalize_workspace_id(workspace)?),
+        None => match route.workspace.as_deref() {
+            Some(workspace) => {
+                let rendered = vars.render(workspace);
+                // A workspace template that wants `{{cwd}}` cannot be
+                // resolved yet; look the work up across workspaces instead.
+                if rendered.contains("{{") {
+                    None
+                } else {
+                    Some(crate::tmux_work::normalize_workspace_id(&rendered)?)
+                }
+            }
+            None => None,
+        },
+    };
+    let existing = crate::tmux_work::find_work_in(&work, workspace_hint.as_deref())?;
+
+    let (cwd, worktree, created_worktree) = resolve_cwd(args, route, &vars, existing.as_ref())?;
     vars.set_opt("cwd", cwd.to_str());
 
-    let workspace = match args.workspace.as_deref() {
-        Some(workspace) => crate::tmux_work::normalize_workspace_id(workspace)?,
-        None => match route.workspace.as_deref() {
-            Some(workspace) => crate::tmux_work::normalize_workspace_id(&vars.render(workspace))?,
-            None => crate::tmux_work::workspace_id_for_cwd(&cwd)?,
-        },
+    let workspace = match (workspace_hint, &existing) {
+        (Some(workspace), _) => workspace,
+        (None, Some(existing)) => existing.workspace.clone(),
+        (None, None) => crate::tmux_work::workspace_id_for_cwd(&cwd)?,
     };
     vars.set_opt("workspace", Some(&workspace));
 
@@ -306,16 +329,25 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         ticket,
         worktree,
         created_worktree,
+        cwd_pinned: cwd_is_pinned(args, route),
         layout: spec.layout.clone(),
         request,
         desired,
     })
 }
 
+/// Whether the caller named a directory, as opposed to happening to stand
+/// in one. Only a named directory is worth asserting against the work
+/// window's recorded cwd; standing somewhere else must not fail a re-run.
+fn cwd_is_pinned(args: &UpArgs, route: &muxa::config::RouteConfig) -> bool {
+    args.cwd.is_some() || route.cwd.is_some() || route.worktree.is_some()
+}
+
 fn resolve_cwd(
     args: &UpArgs,
     route: &muxa::config::RouteConfig,
     vars: &Vars,
+    existing: Option<&crate::tmux_work::WorkInfo>,
 ) -> Result<(PathBuf, Option<WorktreePlan>, bool)> {
     if let Some(config) = &route.worktree {
         if args.cwd.is_some() {
@@ -332,7 +364,12 @@ fn resolve_cwd(
     let source = match (&args.cwd, route.cwd.as_deref()) {
         (Some(cwd), _) => cwd.clone(),
         (None, Some(template)) => PathBuf::from(expand_tilde(&vars.render(template))),
-        (None, None) => std::env::current_dir().context("resolve current directory")?,
+        // Unpinned: the work window's own directory if it has one, so a
+        // re-run from anywhere converges instead of arguing about cwd.
+        (None, None) => match existing {
+            Some(existing) => existing.cwd.clone(),
+            None => std::env::current_dir().context("resolve current directory")?,
+        },
     };
     let cwd = std::fs::canonicalize(&source)
         .with_context(|| format!("resolve cwd {}", source.display()))?;
@@ -564,7 +601,11 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
         agent: program,
         placement: Placement::Pane,
         target: None,
-        cwd: Some(resolved.cwd.clone()),
+        // Supplying a cwd asserts it against the work window's recorded one,
+        // so only assert what the caller actually named. Unpinned, the
+        // launcher adopts the existing work's directory — the same answer
+        // `resolve` reported.
+        cwd: resolved.cwd_pinned.then(|| resolved.cwd.clone()),
         prompt: agent.prompt.clone(),
         name: None,
         workspace: Some(resolved.workspace.clone()),
@@ -702,6 +743,46 @@ fn print_result(result: &UpResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn up_args(cwd: Option<&str>) -> UpArgs {
+        UpArgs {
+            work: "cal-1".into(),
+            pipeline: None,
+            workspace: None,
+            cwd: cwd.map(PathBuf::from),
+            body: None,
+            skill: None,
+            context: None,
+            dry_run: false,
+            no_ticket: true,
+            refresh: false,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn only_a_named_directory_is_asserted_against_the_work_window() {
+        let bare = muxa::config::RouteConfig::default();
+        // Standing somewhere is not a claim about where the work lives, so
+        // a re-run from another directory must converge, not argue.
+        assert!(!cwd_is_pinned(&up_args(None), &bare));
+        assert!(cwd_is_pinned(&up_args(Some("/tmp")), &bare));
+
+        let routed = muxa::config::RouteConfig {
+            cwd: Some("/srv/{{id}}".into()),
+            ..muxa::config::RouteConfig::default()
+        };
+        assert!(cwd_is_pinned(&up_args(None), &routed));
+
+        let worktree = muxa::config::RouteConfig {
+            worktree: Some(muxa::config::WorktreeConfig {
+                repo: "/repo".into(),
+                ..muxa::config::WorktreeConfig::default()
+            }),
+            ..muxa::config::RouteConfig::default()
+        };
+        assert!(cwd_is_pinned(&up_args(None), &worktree));
+    }
 
     #[test]
     fn tilde_expands_only_for_the_current_user() {

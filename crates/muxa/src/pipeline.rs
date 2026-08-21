@@ -379,10 +379,17 @@ pub fn worktree_plan(
     expand: &dyn Fn(&str) -> String,
 ) -> WorktreePlan {
     let repo = std::path::PathBuf::from(expand(&vars.render(&config.repo)));
-    let branch = config.branch.as_deref().map_or_else(
-        || vars.get("id").unwrap_or_default().to_string(),
-        |branch| vars.render(branch),
-    );
+    // Without an explicit branch, take the one the tracker suggests before
+    // falling back to the work id — a tracker that names a branch is naming
+    // the branch the team will actually push.
+    let branch = match config.branch.as_deref() {
+        Some(branch) => vars.render(branch),
+        None => vars
+            .get("ticket.branch")
+            .or_else(|| vars.get("id"))
+            .unwrap_or_default()
+            .to_string(),
+    };
     let path = match config.path.as_deref() {
         Some(path) => std::path::PathBuf::from(expand(&vars.render(path))),
         None => default_worktree_path(&repo, vars.get("id").unwrap_or("work")),
@@ -991,6 +998,28 @@ program = 'claude'
         );
         assert_eq!(plan.branch, "cal-1234");
         assert!(!plan.path.starts_with(&plan.repo));
+    }
+
+    #[test]
+    fn a_tracker_supplied_branch_beats_the_bare_work_id() {
+        let config = WorktreeConfig {
+            repo: "/repo".into(),
+            ..WorktreeConfig::default()
+        };
+        let vars = Vars::new().set("id", "cal-7").with_ticket(&Ticket {
+            id: "CAL-7".into(),
+            branch: Some("june/cal-7-fix-reaper".into()),
+            ..Ticket::default()
+        });
+        let plan = worktree_plan(&config, &vars, &|value| value.to_string());
+        assert_eq!(plan.branch, "june/cal-7-fix-reaper");
+
+        // No suggestion from the tracker: the work id is the branch.
+        let bare = Vars::new().set("id", "cal-7");
+        assert_eq!(
+            worktree_plan(&config, &bare, &|value| value.to_string()).branch,
+            "cal-7"
+        );
     }
 
     #[test]
