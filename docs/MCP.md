@@ -50,7 +50,7 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list twenty-one tools). Other MCP
+or `codex mcp list` (the `muxa` server should list twenty-two tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
 At initialization muxa tells the agent how to use same-window peers as a
