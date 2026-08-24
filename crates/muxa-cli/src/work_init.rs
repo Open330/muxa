@@ -310,15 +310,60 @@ fn merge(existing: &str, proposal: &str) -> Result<(String, Vec<String>)> {
         .parse()
         .context("the proposed config does not parse")?;
     let mut replaced = Vec::new();
+    let mut next = last_position(&doc) + 1;
     for key in OWNED_KEYS {
         if let Some(item) = incoming.get(key) {
             if doc.contains_key(key) {
                 replaced.push(key.to_string());
             }
-            doc.insert(key, item.clone());
+            let mut item = item.clone();
+            // Append rather than splice. A comment written before a header
+            // belongs to that header and lives in the *previous* section's
+            // span; inserting a table between the two silently re-homes it,
+            // so `# allow_work_start = true` under `[dashboard]` would come
+            // back as a key of `[[route]]` the moment someone uncommented
+            // it — and unknown keys are a hard error.
+            next = place_after(&mut item, next);
+            doc.insert(key, item);
         }
     }
     Ok((doc.to_string(), replaced))
+}
+
+/// Highest render position any top-level table currently occupies.
+fn last_position(doc: &toml_edit::DocumentMut) -> usize {
+    doc.iter()
+        .filter_map(|(_, item)| match item {
+            toml_edit::Item::Table(table) => table.position(),
+            toml_edit::Item::ArrayOfTables(array) => {
+                array.iter().filter_map(toml_edit::Table::position).max()
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Pin an incoming item to render after everything already in the file,
+/// returning the next free position.
+fn place_after(item: &mut toml_edit::Item, mut next: usize) -> usize {
+    match item {
+        toml_edit::Item::Table(table) => {
+            table.set_position(next);
+            next += 1;
+            for (_, child) in table.iter_mut() {
+                next = place_after(child, next);
+            }
+        }
+        toml_edit::Item::ArrayOfTables(array) => {
+            for table in array.iter_mut() {
+                table.set_position(next);
+                next += 1;
+            }
+        }
+        _ => {}
+    }
+    next
 }
 
 fn report(block: &str, summary: &ProposalSummary, replaced: &[String], path: &std::path::Path) {
@@ -470,6 +515,29 @@ program = 'claude'
         // Replaced wholesale, not merged key-by-key: a half-old, half-new
         // pipeline set is harder to reason about than a stated replacement.
         assert!(!merged.contains("pipeline.old"), "{merged}");
+    }
+
+    #[test]
+    fn a_comment_keeps_the_section_it_was_written_for() {
+        // A comment before a header belongs to that header. Inserting a new
+        // table between them leaves the comment stranded under the new
+        // section, where uncommenting it would mean something else entirely
+        // — and, for a key the new section does not accept, break config
+        // loading outright.
+        let existing =
+            "[watch]\ntheme = \"classic\"\n\n# allow_work_start = true\n[ask]\nenabled = true\n";
+        let (merged, _) = merge(existing, PROPOSAL).expect("merge");
+        let comment = merged.find("# allow_work_start").expect("comment survives");
+        let ask = merged.find("[ask]").expect("[ask] survives");
+        // The comment must stay inside the span of the section it was
+        // written for, which means nothing new may be spliced above it.
+        let route = merged.find("[[route]]").expect("route written");
+        assert!(
+            route > ask,
+            "new sections must be appended, not spliced above existing ones:\n{merged}"
+        );
+        let between = &merged[comment..ask];
+        assert!(!between.contains('['), "{merged}");
     }
 
     #[test]

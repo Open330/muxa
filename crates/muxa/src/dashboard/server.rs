@@ -3141,9 +3141,19 @@ mod tests {
             .unwrap();
         let snapshot = body_json(snapshot).await;
         assert_eq!(snapshot["schema_version"], work::WORK_SCHEMA_VERSION);
-        assert_eq!(snapshot["works"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["works"][0]["stage"], "review");
-        assert_eq!(snapshot["works"][0]["runs"].as_array().unwrap().len(), 1);
+        // Select the work this test created rather than asserting a global
+        // count. The pane scan always includes the host's own tmux server,
+        // so a machine with any muxa-managed work of its own would fail an
+        // assertion about how many works exist — a real failure this test
+        // hit once the developer's box had one.
+        let mine = snapshot["works"]
+            .as_array()
+            .expect("works array")
+            .iter()
+            .find(|work| work["title"] == "Repair auth")
+            .expect("the work this test annotated is present");
+        assert_eq!(mine["stage"], "review");
+        assert_eq!(mine["runs"].as_array().unwrap().len(), 1);
 
         let reloaded = WorkStore::load(Some(path));
         assert_eq!(reloaded.records().len(), 1);
