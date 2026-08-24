@@ -1,12 +1,15 @@
 # muxa dashboard
 
-A work-oriented HTTP UI bolted onto the daemon. Its primary view projects the
-tmux execution topology into larger logical units: **session → workspace**,
-**window → work item (ticket)**, and **pane → participant (agent)**. This is a
-dashboard for scanning progress and attention across work, rather than another
-always-expanded tmux tree. Each ticket can still reveal its exact
-session/window/pane hierarchy and pane controls when execution detail is
-needed.
+A work-oriented HTTP UI bolted onto the daemon. Its primary view reads the
+canonical muxa hierarchy: **Workspace → Work → Run → Agent session**, with tmux
+session/window/pane retained only as the current execution binding. An optional
+Linear/GitHub/Jira issue is a reference attached to Work; it is not the Work
+identity itself.
+
+The board never promotes every visible tmux window into a Work card. Managed or
+persisted Work appears on the four-stage board, while generic windows are listed
+separately as **Unlinked executions**. Runs and panes remain expandable when
+execution detail or controls are needed.
 
 The timeline and raw agent/pane/terminal inventories remain available as
 collapsed secondary panels. Data is updated live over Server-Sent Events, and
@@ -29,6 +32,7 @@ machine without explicit public-bind acknowledgement.
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
 | `GET /api/fleet?selector=...` | Cached hierarchy, including the always-present local node.          |
 | `GET /api/panes`    | Global tmux pane list (every readable socket), with per-socket scan errors.   |
+| `GET /api/works`    | Canonical v2 Workspace/Work/Run snapshot plus unlinked executions.            |
 | `GET /api/work-metadata` | Durable titles, goals, next actions, and manual workflow stages.        |
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
@@ -36,9 +40,9 @@ machine without explicit public-bind acknowledgement.
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
-| `PUT /api/work-metadata` | Save the work definition for one exact host/socket/session/window.     |
-| `POST /api/work-control/prompt` | Prompt every live or managed agent pane in one ticket.           |
-| `POST /api/work-control/abort` | Send Ctrl-C to every live or managed agent pane in one ticket.     |
+| `PUT /api/work-metadata` | Save a definition by logical `{workspace_id, work_id}` identity.       |
+| `POST /api/work-control/prompt` | Prompt every live agent run linked to one Work.                |
+| `POST /api/work-control/abort` | Send Ctrl-C to every live agent run linked to one Work.          |
 | `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
 | `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
 
@@ -213,42 +217,36 @@ hammering refresh loop doesn't fork tmux 60 times a minute.
 
 ## Work-oriented projection
 
-The browser derives execution identity from `/api/panes` and `/api/agents`, then
-overlays the small `/api/work-metadata` annotation store. It does not copy live
-tmux state into another database: host, socket, session, window, pane, and agent
-liveness remain owned by the execution backend.
+`muxa::work::build_snapshot` is the single projection used by the HTTP and CLI
+dashboards. The browser consumes `/api/works`; it does not infer Work from a
+session name, a ticket-shaped window name, or repository cwd.
 
-| Dashboard concept | Execution source | Primary information |
-| ----------------- | ---------------- | ------------------- |
-| Workspace | managed workspace ID, otherwise repository cwd or session fallback | ticket counts, workflow stage, and attention |
-| Work item / ticket | exact host/socket/session/window, labeled by managed work ID or inferred name | title, goal, next action, state, participants |
-| Participant / agent | tracked agent attached to a pane | runtime, model, and agent state |
-| Execution detail | pane plus its session/window coordinates | attach, prompt, and abort controls |
+| Concept | Stable identity / source | Dashboard responsibility |
+| --- | --- | --- |
+| Workspace | `workspace_id` | Scope and aggregate Work progress. |
+| Work | `{workspace_id, work_id}` plus durable metadata | Outcome, local stage, goal, next action. |
+| External issue | source, provider stable ID, display key, URL, external status | Context/reference only; never the Work primary key or board stage. |
+| Run | host/socket/session/window execution identity | One current or previous execution attempt for Work. |
+| Agent session | daemon agent session attached to a Run pane | Runtime state, model, prompt/response, control target. |
+| Signal | attention, blocked, error | Overlay on Work; never a board lane. |
 
-The workspace rail deliberately does not render nested windows and panes.
-Selecting a workspace filters a five-lane ticket board: **Attention**, **In
-progress**, **Review**, **Queued**, and **Done**. Selecting a ticket opens a
-fixed detail drawer for its work definition, participant status, ticket-level
-commands, and execution hierarchy. Expanding one ticket—or using the
-board-wide **expand execution** control—reveals the session/window/pane
-hierarchy only when it is needed.
+The workspace rail remains flat. Selecting a workspace filters the four local
+Work stages: **Queued**, **In progress**, **Review**, and **Done**. Attention,
+blocked, and error render as signal badges on the card so a waiting agent does
+not silently rewrite the operator's workflow stage. Selecting a Work opens a
+drawer that shows local stage, external issue status, Run state, and Agent state
+as separate facts. Expanding execution reveals all linked Runs and panes.
 
-Muxa-managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role,
-and task) are the preferred logical identities. For legacy/unmanaged sessions,
-panes sharing a repository cwd are grouped into one workspace; ticket-shaped
-session names such as `CAL-101` are used when the tmux window is only named
-`codex`, `claude`, or another generic process name. A session fallback keeps
-older rows visible when no cwd exists. Endpoint-aware keys keep identical pane
-IDs on different tmux sockets from being merged.
+Durable records live in `$XDG_DATA_HOME/muxa/dashboard-work.json` (normally
+`~/.local/share/muxa/dashboard-work.json`). Schema v2 keys records by logical
+Work identity. Schema v1 host/socket/session/window annotations are migrated
+with their old binding retained for compatibility. Writes remain atomic and
+serialized by the daemon.
 
-The operator can persist a human title, goal, next action, and manual stage in
-`$XDG_DATA_HOME/muxa/dashboard-work.json` (normally
-`~/.local/share/muxa/dashboard-work.json`). Writes use a temporary file and
-rename, and are serialized by the daemon. Live errors or agents waiting for
-input still lift a ticket into **Attention**; `done` and `review` remain explicit
-operator decisions. Ticket commands target only live registered agents or
-panes marked `@muxa_managed_agent` inside that exact work identity, never every
-shell pane in the window.
+Managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role/task)
+link a Run to Work. `muxa work up` also stores optional external-source metadata
+on the window, which `/api/works` discovers and persists. Unmanaged windows stay
+in `unlinked_executions`; they are never guessed into Work from their names.
 
 ## Timeline
 
@@ -317,10 +315,10 @@ that strips the carve-out (or use mTLS).
 
 ## What it doesn't do (yet)
 
-- The dashboard stores only work annotations in one local JSON file. It does
-  not yet keep ticket history, dependencies, estimates, or external issue
-  tracker synchronization.
-- Control is intentionally narrow: ticket/pane prompt and abort plus
+- External issue references are captured at `muxa work up` time. Continuous
+  two-way Linear/GitHub/Jira synchronization, dependencies, and estimates are
+  not implemented.
+- Control is intentionally narrow: Work/pane prompt and abort plus
   Muxa-owned PTY input/terminate. Configuration, files, and arbitrary shell
   commands are not writable through the dashboard.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.

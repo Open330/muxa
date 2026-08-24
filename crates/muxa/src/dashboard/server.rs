@@ -40,7 +40,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::backend::{HostKind, SharedBackend};
 use crate::config::{DashboardAuthMode, StatsConfig};
-use crate::dashboard::work_store::{WorkKey, WorkMetadataPatch, WorkRecord, WorkStore};
+use crate::dashboard::work_store::WorkStore;
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
@@ -53,6 +53,9 @@ use crate::timeline::{
     TimelineRange, TimelineTotals,
 };
 use crate::tmux::scanner::{self, MuxaPaneMetadata, PaneCache, PaneSummary, ScanError};
+use crate::work::{
+    self, ExecutionIdentity, WorkIdentity, WorkMetadataPatch, WorkRecord, WorkSnapshot,
+};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
 /// (15s is well under any sane proxy idle-timeout) but short enough
@@ -334,6 +337,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents_handler))
         .route("/api/fleet", get(fleet_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/works", get(works_handler))
         .route("/api/work-metadata", get(work_metadata_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
         .route(
@@ -699,6 +703,27 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+async fn works_handler(State(state): State<AppState>) -> Json<WorkSnapshot> {
+    let scan = state.refresh_pane_scan().await;
+    let agents = state.store.snapshot().await;
+    let mut work_store = state.work_store.lock().await;
+    for pane in &scan.panes {
+        if let Some((identity, item)) = work::external_item_for_pane(pane, scan.fetched_at) {
+            if let Err(error) = work_store.upsert_external_item(identity, item).await {
+                tracing::warn!(%error, "failed to persist discovered external work item");
+            }
+        }
+    }
+    let records = work_store.records();
+    drop(work_store);
+    Json(work::build_snapshot(
+        &scan.panes,
+        &agents,
+        &records,
+        scan.fetched_at,
+    ))
+}
+
 #[derive(Debug, Serialize)]
 struct WorkMetadataResponse {
     works: Vec<WorkRecord>,
@@ -712,7 +737,10 @@ async fn work_metadata_handler(State(state): State<AppState>) -> impl IntoRespon
 
 #[derive(Debug, Deserialize)]
 struct WorkMetadataPutRequest {
-    key: WorkKey,
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
     metadata: WorkMetadataPatch,
 }
 
@@ -725,20 +753,40 @@ async fn work_metadata_put_handler(
         Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
     };
     let scan = state.refresh_pane_scan().await;
-    if !scan
-        .panes
-        .iter()
-        .any(|pane| pane_matches_work_key(pane, &input.key))
-    {
+    let records = state.work_store.lock().await.records();
+    let identity_exists = input.identity.as_ref().is_some_and(|identity| {
+        records.iter().any(|record| &record.identity == identity)
+            || scan
+                .panes
+                .iter()
+                .any(|pane| work::work_identity_for_pane(pane).as_ref() == Some(identity))
+    });
+    let key_exists = input.key.as_ref().is_some_and(|key| {
+        scan.panes
+            .iter()
+            .any(|pane| pane_matches_execution(pane, key))
+    });
+    if !identity_exists && !key_exists {
         return control_error(StatusCode::NOT_FOUND, "work item is no longer present");
     }
-    match state
-        .work_store
-        .lock()
-        .await
-        .upsert(input.key, metadata)
-        .await
-    {
+    let result = if let Some(identity) = input.identity {
+        state
+            .work_store
+            .lock()
+            .await
+            .upsert_metadata(identity, metadata)
+            .await
+    } else if let Some(key) = input.key {
+        state
+            .work_store
+            .lock()
+            .await
+            .upsert_legacy_metadata(key, metadata)
+            .await
+    } else {
+        unreachable!("validated selector")
+    };
+    match result {
         Ok(record) => Json(json!({ "ok": true, "work": record })).into_response(),
         Err(error) => control_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -748,18 +796,10 @@ async fn work_metadata_put_handler(
 }
 
 fn pane_socket_identity(pane: &PaneSummary) -> String {
-    if pane.host == HostKind::Tmux {
-        pane.socket
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("default")
-            .to_string()
-    } else {
-        pane.socket.to_string_lossy().to_string()
-    }
+    work::pane_socket_identity(pane)
 }
 
-fn pane_matches_work_key(pane: &PaneSummary, key: &WorkKey) -> bool {
+fn pane_matches_execution(pane: &PaneSummary, key: &ExecutionIdentity) -> bool {
     pane.host == key.host
         && pane_socket_identity(pane) == key.socket
         && pane.session_id == key.session_id
@@ -768,7 +808,10 @@ fn pane_matches_work_key(pane: &PaneSummary, key: &WorkKey) -> bool {
 
 #[derive(Debug, Deserialize)]
 struct WorkPromptRequest {
-    key: WorkKey,
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
     text: String,
     #[serde(default = "default_true")]
     submit: bool,
@@ -776,7 +819,10 @@ struct WorkPromptRequest {
 
 #[derive(Debug, Deserialize)]
 struct WorkAbortRequest {
-    key: WorkKey,
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
 }
 
 #[derive(Debug, Serialize)]
@@ -793,51 +839,75 @@ async fn work_prompt_handler(
     if input.text.trim().is_empty() {
         return control_error(StatusCode::BAD_REQUEST, "prompt text is empty");
     }
-    run_work_control(&state, input.key, input.text, input.submit, "prompt").await
+    run_work_control(
+        &state,
+        input.identity,
+        input.key,
+        input.text,
+        input.submit,
+        "prompt",
+    )
+    .await
 }
 
 async fn work_abort_handler(
     State(state): State<AppState>,
     Json(input): Json<WorkAbortRequest>,
 ) -> Response {
-    run_work_control(&state, input.key, "\u{3}".to_string(), false, "abort").await
+    run_work_control(
+        &state,
+        input.identity,
+        input.key,
+        "\u{3}".to_string(),
+        false,
+        "abort",
+    )
+    .await
 }
 
 async fn run_work_control(
     state: &AppState,
-    key: WorkKey,
+    identity: Option<WorkIdentity>,
+    key: Option<ExecutionIdentity>,
     text: String,
     submit: bool,
     action: &'static str,
 ) -> Response {
-    let backend = match state
-        .backends
-        .iter()
-        .find(|backend| backend.kind() == key.host)
-        .cloned()
-    {
-        Some(backend) if backend.caps().send_text => backend,
-        Some(backend) => {
-            return control_error(
-                StatusCode::NOT_IMPLEMENTED,
-                format!("{} backend does not support pane input", backend.kind()),
-            );
-        }
-        None => {
-            return control_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("no active {} backend", key.host),
-            );
-        }
-    };
+    if identity.is_none() && key.is_none() {
+        return control_error(StatusCode::BAD_REQUEST, "work selector is missing");
+    }
     let scan = state.refresh_pane_scan().await;
     let agents = state.store.snapshot().await;
+    let records = state.work_store.lock().await.records();
+    let legacy_binding = identity.as_ref().and_then(|identity| {
+        records
+            .iter()
+            .find(|record| &record.identity == identity)
+            .and_then(|record| record.legacy_binding.clone())
+    });
     let candidates = scan
         .panes
         .iter()
-        .filter(|pane| pane_matches_work_key(pane, &key))
+        .filter(|pane| {
+            identity.as_ref().is_some_and(|identity| {
+                work::work_identity_for_pane(pane).as_ref() == Some(identity)
+                    || legacy_binding
+                        .as_ref()
+                        .is_some_and(|binding| pane_matches_execution(pane, binding))
+            }) || key
+                .as_ref()
+                .is_some_and(|key| pane_matches_execution(pane, key))
+        })
         .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &scan.panes, &agents))
-        .map(|pane| pane.pane_id.clone())
+        .filter_map(|pane| {
+            let backend = state
+                .backends
+                .iter()
+                .find(|backend| backend.kind() == pane.host)
+                .filter(|backend| backend.caps().send_text)
+                .cloned()?;
+            Some((backend, pane_socket_identity(pane), pane.pane_id.clone()))
+        })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return control_error(
@@ -846,11 +916,10 @@ async fn run_work_control(
         );
     }
 
-    let socket = key.socket;
     let results = tokio::task::spawn_blocking(move || {
         candidates
             .into_iter()
-            .map(|pane| {
+            .map(|(backend, socket, pane)| {
                 let sent = backend.send_text_on(Some(&socket), &pane, &text);
                 let submitted = if sent && submit {
                     std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
@@ -2742,7 +2811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_metadata_requires_pat_and_persists_for_the_exact_ticket() {
+    async fn work_metadata_requires_pat_and_persists_for_the_exact_work() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("dashboard-work.json");
         let backend: SharedBackend = Arc::new(InventoryBackend {
@@ -2794,6 +2863,7 @@ mod tests {
         assert_eq!(saved.status(), StatusCode::OK);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/work-metadata")
@@ -2806,6 +2876,21 @@ mod tests {
         assert_eq!(response["works"][0]["metadata"]["title"], "Repair auth");
         assert_eq!(response["works"][0]["metadata"]["stage"], "review");
 
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/works")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = body_json(snapshot).await;
+        assert_eq!(snapshot["schema_version"], work::WORK_SCHEMA_VERSION);
+        assert_eq!(snapshot["works"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["works"][0]["stage"], "review");
+        assert_eq!(snapshot["works"][0]["runs"].as_array().unwrap().len(), 1);
+
         let reloaded = WorkStore::load(Some(path));
         assert_eq!(reloaded.records().len(), 1);
         assert_eq!(
@@ -2815,7 +2900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_prompt_targets_only_live_agents_in_the_selected_ticket() {
+    async fn work_prompt_targets_only_live_agents_in_the_selected_work() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let panes = vec![
             test_pane("herdr:p1", "session-1", "muxa", "window-1", "CAL-101"),

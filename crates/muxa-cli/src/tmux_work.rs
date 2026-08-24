@@ -2,7 +2,7 @@
 //!
 //! Muxa's tmux policy is deliberately narrow:
 //! - one managed session represents one workspace or project;
-//! - one managed window represents one work item (normally a ticket);
+//! - one managed window binds the current run of a muxa Work;
 //! - one managed pane represents one coding agent;
 //!
 //! Identity is stored in tmux user options so it survives muxad and MCP
@@ -31,9 +31,16 @@ const AGENT_TASK_OPTION: &str = "@muxa_agent_task";
 const AGENT_ALIAS_OPTION: &str = "@muxa_agent_alias";
 const PANE_WORKSPACE_OPTION: &str = "@muxa_agent_workspace_id";
 const PANE_WORK_OPTION: &str = "@muxa_agent_work_id";
+const EXTERNAL_SOURCE_OPTION: &str = "@muxa_external_source";
+const EXTERNAL_SCOPE_OPTION: &str = "@muxa_external_scope";
+const EXTERNAL_STABLE_ID_OPTION: &str = "@muxa_external_stable_id";
+const EXTERNAL_KEY_OPTION: &str = "@muxa_external_key";
+const EXTERNAL_TITLE_OPTION: &str = "@muxa_external_title";
+const EXTERNAL_URL_OPTION: &str = "@muxa_external_url";
+const EXTERNAL_STATUS_OPTION: &str = "@muxa_external_status";
 
 const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
-const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}";
+const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}";
 const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_agent_alias}";
 const WINDOW_IDENTITY_FORMAT: &str =
     "#{window_id}\t#{session_id}\t#{session_name}\t#{window_name}\t#{automatic-rename}";
@@ -62,7 +69,25 @@ pub struct WorkInfo {
     pub window_index: u32,
     pub window_name: String,
     pub cwd: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_item: Option<Box<ExternalItemInfo>>,
     pub agents: Vec<ManagedAgentPane>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExternalItemInfo {
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    pub display_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -212,7 +237,7 @@ pub struct WorkListArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkShowArgs {
-    /// Ticket/work id, for example TEST-0001.
+    /// Muxa Work id, for example TEST-0001.
     pub work: String,
     /// Workspace id when the same work id exists in more than one workspace.
     #[arg(long)]
@@ -224,7 +249,7 @@ pub struct WorkShowArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkCloseArgs {
-    /// Ticket/work id, for example TEST-0001.
+    /// Muxa Work id, for example TEST-0001.
     pub work: String,
     /// Workspace id when the same work id exists in more than one workspace.
     #[arg(long)]
@@ -722,6 +747,44 @@ pub fn mark_work(window: &str, workspace: &str, work: &str, cwd: &Path) -> Resul
     Ok(())
 }
 
+/// Attach a provider-neutral external issue snapshot to a managed work
+/// window. These options let muxad discover the association and persist it in
+/// the durable work store without teaching muxad a Linear/GitHub/Jira client.
+pub fn mark_work_external(window: &str, ticket: &muxa::pipeline::Ticket) -> Result<()> {
+    let Some(source) = ticket.source.as_deref() else {
+        return Ok(());
+    };
+    set_option(
+        OptionScope::Window,
+        window,
+        EXTERNAL_SOURCE_OPTION,
+        &metadata(source, 64)?,
+    )?;
+    set_option(
+        OptionScope::Window,
+        window,
+        EXTERNAL_KEY_OPTION,
+        &metadata(&ticket.id, 128)?,
+    )?;
+    for (key, value, max) in [
+        (EXTERNAL_SCOPE_OPTION, ticket.scope.as_deref(), 256),
+        (EXTERNAL_STABLE_ID_OPTION, ticket.stable_id.as_deref(), 256),
+        (EXTERNAL_TITLE_OPTION, ticket.title.as_deref(), 512),
+        (EXTERNAL_URL_OPTION, ticket.url.as_deref(), 2_048),
+        (EXTERNAL_STATUS_OPTION, ticket.state.as_deref(), 128),
+    ] {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            set_option(
+                OptionScope::Window,
+                window,
+                key,
+                &external_metadata(value, max),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn mark_agent(
     pane: &str,
     agent: &str,
@@ -893,6 +956,15 @@ fn metadata(raw: &str, max: usize) -> Result<String> {
     Ok(value.to_string())
 }
 
+fn external_metadata(raw: &str, max: usize) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = normalized.len().min(max);
+    while !normalized.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    normalized[..end].to_string()
+}
+
 fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<WorkspaceInfo> {
     let mut workspaces = Vec::new();
     for line in sessions.lines() {
@@ -949,8 +1021,34 @@ fn parse_work_window(
         window_index: fields[3].parse().unwrap_or(0),
         window_name: fields[4].to_string(),
         cwd: PathBuf::from(fields[6]),
+        external_item: parse_external_item(&fields),
         agents,
     })
+}
+
+fn parse_external_item(fields: &[&str]) -> Option<Box<ExternalItemInfo>> {
+    let source = fields.get(8)?.trim();
+    let display_key = fields.get(11).map_or("", |value| value.trim());
+    if source.is_empty() || display_key.is_empty() {
+        return None;
+    }
+    Some(Box::new(ExternalItemInfo {
+        source: source.into(),
+        scope: optional_field(fields, 9),
+        stable_id: optional_field(fields, 10),
+        display_key: display_key.into(),
+        title: optional_field(fields, 12),
+        url: optional_field(fields, 13),
+        status: optional_field(fields, 14),
+    }))
+}
+
+fn optional_field(fields: &[&str], index: usize) -> Option<String> {
+    fields
+        .get(index)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_agent_pane(
@@ -1226,7 +1324,7 @@ mod tests {
     fn parser_keeps_only_managed_workspace_work_and_agent_hierarchy() {
         let sessions = "muxa\t$1\tmuxa\t/repo\t1\t1\t2\n\
                         legacy\t$2\t\t/tmp\t\t0\t1\n";
-        let windows = "muxa\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\n\
+        let windows = "muxa\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\tlinear\tCAL\tstable-1\tCAL-7093\tDashboard work\thttps://linear.app/CAL-7093\tstarted\n\
                        muxa\t$1\t@2\t1\tplain\t\t/repo\t\n\
                        legacy\t$2\t@3\t0\tlegacy\tOLD-1\t/tmp\t1\n";
         // Trailing column is the pipeline alias: set on %1, empty on the
@@ -1241,6 +1339,13 @@ mod tests {
         assert_eq!(workspaces[0].works.len(), 1);
         assert_eq!(workspaces[0].works[0].work, "TEST-0001");
         assert_eq!(workspaces[0].works[0].window, "@1");
+        assert_eq!(
+            workspaces[0].works[0]
+                .external_item
+                .as_ref()
+                .map(|item| (item.source.as_str(), item.display_key.as_str())),
+            Some(("linear", "CAL-7093"))
+        );
         assert_eq!(workspaces[0].works[0].agents.len(), 2);
         assert_eq!(workspaces[0].works[0].agents[0].pane, "%1");
         assert_eq!(

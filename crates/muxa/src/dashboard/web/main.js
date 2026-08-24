@@ -1,4 +1,4 @@
-import { buildWorkProjection, normalizeAgent, WORK_STAGES } from "./work-model.mjs";
+import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 
 // muxa dashboard frontend.
 //
@@ -33,7 +33,7 @@ const EXPANDED_WORKS_KEY = "muxa.dashboard.expandedWorks";
 const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
 const PANES_REFETCH_INTERVAL_MS = 5000;
-const WORK_METADATA_REFETCH_INTERVAL_MS = 15000;
+const WORK_REFETCH_INTERVAL_MS = 5000;
 const TERMINALS_REFETCH_INTERVAL_MS = 2000;
 const TIMELINE_REFETCH_INTERVAL_MS = 30000;
 const TIMELINE_MIN_REFRESH_INTERVAL_MS = 10000;
@@ -371,7 +371,7 @@ const store = {
   },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
-  workMetadata: [], // WorkRecord[]
+  workSnapshot: { schema_version: 2, workspaces: [], works: [], unlinked_executions: [] },
   terminalSessions: [], // SessionRef[]
   paneErrors: [], // ScanError[]
   timeline: null, // TimelineDocument
@@ -382,10 +382,10 @@ const store = {
     panesById: new Map(),
     timelineSessionByAgent: new Map(),
   },
-  revisions: { agents: 0, panes: 0, timeline: 0, workMetadata: 0 },
+  revisions: { agents: 0, panes: 0, timeline: 0, works: 0 },
   cache: {
     paneFingerprint: "",
-    workMetadataFingerprint: "",
+    workSnapshotFingerprint: "",
     terminalFingerprint: "",
     sessionSummariesKey: "",
     sessionSummaries: [],
@@ -449,15 +449,95 @@ function rebuildTimelineIndexes() {
 }
 
 function workspaces() {
-  const cacheKey = `${store.revisions.agents}:${store.revisions.panes}:${store.revisions.workMetadata}`;
+  const cacheKey = String(store.revisions.works);
   if (store.cache.workProjectionKey === cacheKey) return store.cache.workspaces;
   store.cache.workProjectionKey = cacheKey;
-  store.cache.workspaces = buildWorkProjection(
-    store.panes,
-    [...store.agents.values()],
-    store.workMetadata
-  );
+  const worksByWorkspace = new Map();
+  for (const raw of store.workSnapshot.works || []) {
+    const work = adaptWork(raw);
+    if (!worksByWorkspace.has(work.workspaceKey)) worksByWorkspace.set(work.workspaceKey, []);
+    worksByWorkspace.get(work.workspaceKey).push(work);
+  }
+  store.cache.workspaces = (store.workSnapshot.workspaces || []).map((raw) => {
+    const works = worksByWorkspace.get(raw.id) || [];
+    const latest = works.reduce((value, work) => work.latest > value ? work.latest : value, "");
+    return {
+      key: raw.id,
+      name: raw.name || raw.id,
+      cwd: raw.cwd || "",
+      source: "muxa",
+      works,
+      agents: works.reduce((total, work) => total + work.participants.length, 0),
+      panes: works.reduce((total, work) => total + work.panes.length, 0),
+      attention: works.filter((work) => work.signals.includes("attention")).length,
+      errors: works.filter((work) => work.signals.includes("error")).length,
+      active: works.filter((work) => work.stage === "in_progress").length,
+      review: works.filter((work) => work.stage === "review").length,
+      done: works.filter((work) => work.stage === "done").length,
+      latest,
+    };
+  });
   return store.cache.workspaces;
+}
+
+function adaptWork(raw) {
+  const runs = raw.runs || [];
+  const panes = runs.flatMap((run) => (run.panes || []).map((pane) => ({
+    ...pane,
+    agent: pane.agent ? normalizeAgent(pane.agent) : null,
+    host: run.execution?.host || "tmux",
+    socket: run.execution?.socket || "default",
+    session_id: run.execution?.session_id || "",
+    session: run.session_name || run.execution?.session_id || "",
+    window_id: run.execution?.window_id || "",
+    window_name: run.window_name || "",
+    window_index: run.window_index || "",
+    muxa: { role: pane.role || null, task: pane.task || null },
+  })));
+  const participants = panes.filter((pane) => pane.agent).map((pane) => pane.agent);
+  const latestAgent = [...participants].sort((left, right) =>
+    (right.last_activity_at || "").localeCompare(left.last_activity_at || "")
+  )[0];
+  const firstRun = runs[0] || {};
+  const externalItems = raw.external_items || [];
+  const signals = raw.signals || [];
+  const state = signals.includes("error")
+    ? "error"
+    : signals.includes("attention")
+      ? "needs_attention"
+      : runs.some((run) => ["running", "starting"].includes(run.state))
+        ? "active"
+        : participants.length > 0
+          ? "available"
+          : "untracked";
+  return {
+    key: logicalWorkKey(raw.identity),
+    identity: raw.identity,
+    workspaceKey: raw.identity.workspace_id,
+    workspaceName: raw.identity.workspace_id,
+    workId: raw.identity.work_id,
+    name: raw.identity.work_id,
+    title: raw.title || raw.identity.work_id,
+    goal: raw.goal || "",
+    nextAction: raw.next_action || "",
+    stage: raw.stage || "queued",
+    signals,
+    externalItems,
+    runs,
+    panes,
+    participants,
+    latest: raw.latest_at || "",
+    state,
+    source: raw.source || "managed",
+    managed: raw.source === "managed",
+    metadata: raw.metadata || { stage: "auto" },
+    summary: latestAgent?.recap || latestAgent?.ai_title || latestAgent?.last_response ||
+      latestAgent?.last_prompt || firstRun.window_name || "No recent work signal",
+    host: firstRun.execution?.host || "",
+    endpoint: firstRun.execution?.socket || "",
+    sessionName: firstRun.session_name || "",
+    index: firstRun.window_index || "",
+  };
 }
 
 function selectedWorkspace() {
@@ -604,7 +684,9 @@ function renderCounts() {
 
 function renderOverview() {
   const works = visibleWorks();
-  dom.metricAttention.textContent = String(works.filter((work) => work.stage === "attention").length);
+  dom.metricAttention.textContent = String(works.filter((work) =>
+    work.signals.includes("attention") || work.signals.includes("blocked") || work.signals.includes("error")
+  ).length);
   dom.metricProgress.textContent = String(works.filter((work) => work.stage === "in_progress").length);
   dom.metricReview.textContent = String(works.filter((work) => work.stage === "review").length);
   dom.metricQueued.textContent = String(works.filter((work) => work.stage === "queued").length);
@@ -625,23 +707,22 @@ function renderSessionSidebar() {
   dom.sessionsMeta.textContent = `${Math.min(store.ui.sessionLimit, sorted.length)}/${sorted.length}`;
   if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
   const allWorks = sorted.flatMap((workspace) => workspace.works);
-  const allAttention = allWorks.filter((work) => work.stage === "attention").length;
+  const allAttention = allWorks.filter((work) => work.signals.length > 0).length;
   const allRow = `<button class="session-row${active ? "" : " active"}" type="button" data-workspace="">
     <span class="session-dot ${allAttention > 0 ? "waiting" : "working"}"></span>
     <span class="session-main">
       <span class="session-name">all workspaces</span>
-      <span class="session-detail">${allWorks.length} tickets · ${store.agents.size} agents</span>
+      <span class="session-detail">${allWorks.length} works · ${store.agents.size} agents</span>
     </span>
     <span class="session-score">${allAttention || "·"}</span>
   </button>`;
   const rows = visible.map((workspace) => {
     const stateClass = workspace.errors > 0 ? "error" : workspace.attention > 0 ? "waiting" : workspace.active > 0 ? "working" : "idle";
-    const source = workspace.source === "managed" ? "managed" : workspace.source === "inferred" ? "repo" : "session";
     return `<button class="session-row${workspace.key === active ? " active" : ""}" type="button" data-workspace="${esc(workspace.key)}">
       <span class="session-dot ${stateClass}"></span>
       <span class="session-main">
         <span class="session-name">${esc(workspace.name)}</span>
-        <span class="session-detail">${workspace.works.length} tickets · ${workspace.agents} agents · ${source}</span>
+        <span class="session-detail">${workspace.works.length} works · ${workspace.agents} agents</span>
       </span>
       <span class="session-score">${esc(workspaceScoreLabel(workspace))}</span>
     </button>`;
@@ -690,10 +771,10 @@ function buildSessionSummaries() {
         working: 0,
         waiting: 0,
         errors: 0,
-        tickets: 0,
-        activeTickets: 0,
-        attentionTickets: 0,
-        errorTickets: 0,
+        works: 0,
+        activeWorks: 0,
+        attentionWorks: 0,
+        errorWorks: 0,
         workspaceKey: "",
         workspaceKeyConflict: false,
         latest: "",
@@ -738,10 +819,10 @@ function buildSessionSummaries() {
   }
   for (const workspace of workspaces()) {
     const s = ensure(workspace.name);
-    s.tickets += workspace.works.length;
-    s.activeTickets += workspace.active;
-    s.attentionTickets += workspace.attention;
-    s.errorTickets += workspace.errors;
+    s.works += workspace.works.length;
+    s.activeWorks += workspace.active;
+    s.attentionWorks += workspace.attention;
+    s.errorWorks += workspace.errors;
     if (!s.workspaceKeyConflict && !s.workspaceKey) {
       s.workspaceKey = workspace.key;
     } else if (s.workspaceKey !== workspace.key) {
@@ -770,10 +851,10 @@ function buildSessionSummaries() {
 
 function sessionSummaryLine(s) {
   const parts = [];
-  if (s.tickets) parts.push(`${s.tickets} tickets`);
-  if (s.attentionTickets) parts.push(`${s.attentionTickets} attention`);
-  if (s.errorTickets) parts.push(`${s.errorTickets} errors`);
-  if (s.activeTickets) parts.push(`${s.activeTickets} active`);
+  if (s.works) parts.push(`${s.works} works`);
+  if (s.attentionWorks) parts.push(`${s.attentionWorks} attention`);
+  if (s.errorWorks) parts.push(`${s.errorWorks} errors`);
+  if (s.activeWorks) parts.push(`${s.activeWorks} active`);
   if (s.agents) parts.push(`${s.agents} agents`);
   if (s.totals?.active_secs) parts.push(`act ${formatDuration(s.totals.active_secs)}`);
   return parts.slice(0, 3).join(" · ") || `${s.panes} panes`;
@@ -804,8 +885,8 @@ function compareSessionSummaries(a, b) {
 }
 
 function comparePriority(a, b) {
-  const scoreA = a.errorTickets * 1000 + a.attentionTickets * 100 + a.activeTickets * 10;
-  const scoreB = b.errorTickets * 1000 + b.attentionTickets * 100 + b.activeTickets * 10;
+  const scoreA = a.errorWorks * 1000 + a.attentionWorks * 100 + a.activeWorks * 10;
+  const scoreB = b.errorWorks * 1000 + b.attentionWorks * 100 + b.activeWorks * 10;
   return compareNumeric(scoreB, scoreA);
 }
 
@@ -826,9 +907,9 @@ function sessionScoreLabel(s, sort) {
   if (sort === "active") return formatDuration(s.totals.active_secs || 0);
   if (sort === "human") return formatDuration(s.human_presence_secs || 0);
   if (sort === "tmux") return formatDuration(s.totals.foreground_secs || 0);
-  if (s.errorTickets > 0) return String(s.errorTickets);
-  if (s.attentionTickets > 0) return String(s.attentionTickets);
-  if (s.activeTickets > 0) return String(s.activeTickets);
+  if (s.errorWorks > 0) return String(s.errorWorks);
+  if (s.attentionWorks > 0) return String(s.attentionWorks);
+  if (s.activeWorks > 0) return String(s.activeWorks);
   return "·";
 }
 
@@ -844,10 +925,9 @@ function workStateLabel(work) {
 
 function workStageLabel(stage) {
   switch (stage) {
-    case "attention": return "Attention";
     case "in_progress": return "In progress";
     case "review": return "Review";
-    case "done": return "Recently done";
+    case "done": return "Done";
     default: return "Queued";
   }
 }
@@ -867,52 +947,95 @@ function renderWorkParticipant(agent, metadata = {}) {
 }
 
 function renderWorkExecution(work) {
-  const panes = work.panes.map((pane) => {
-    const agent = pane.agent;
-    const state = agent?.state || "untracked";
-    const identity = `${work.sessionName}:${work.index}.${pane.pane_index}`;
-    const attach = pane.attach_command
-      ? `<button class="attach-btn" type="button" data-cmd="${esc(pane.attach_command)}">copy attach</button>`
-      : "";
-    return `<div class="execution-pane-row">
-      <span class="state-dot ${esc(state)}"></span>
-      <span class="execution-pane-id" title="${esc(pane.pane_id)}">${esc(identity)}</span>
-      <span class="execution-pane-command">${esc(agent?.kind || pane.current_command || "shell")}</span>
-      <span class="execution-pane-title">${esc(agent?.ai_title || agent?.last_prompt || pane.title || "")}</span>
-      <span class="control-actions">${attach}${paneControlButtons(pane.pane_id, pane.socket)}</span>
-    </div>`;
+  if (work.runs.length === 0) {
+    return `<div class="work-execution"><div class="empty-block compact">No active run is linked to this Work.</div></div>`;
+  }
+  const runs = work.runs.map((run) => {
+    const socket = run.execution?.socket || "default";
+    const panes = (run.panes || []).map((pane) => {
+      const agent = pane.agent ? normalizeAgent(pane.agent) : null;
+      const state = agent?.state || "untracked";
+      const identity = `${run.session_name}:${run.window_index}.${pane.pane_index}`;
+      const attach = pane.attach_command
+        ? `<button class="attach-btn" type="button" data-cmd="${esc(pane.attach_command)}">copy attach</button>`
+        : "";
+      return `<div class="execution-pane-row">
+        <span class="state-dot ${esc(state)}"></span>
+        <span class="execution-pane-id" title="${esc(pane.pane_id)}">${esc(identity)}</span>
+        <span class="execution-pane-command">${esc(agent?.kind || pane.current_command || "shell")}</span>
+        <span class="execution-pane-title">${esc(agent?.ai_title || agent?.last_prompt || pane.title || "")}</span>
+        <span class="control-actions">${attach}${paneControlButtons(pane.pane_id, socket)}</span>
+      </div>`;
+    }).join("");
+    return `<section class="execution-run">
+      <div class="execution-breadcrumb">
+        <span>run</span> ${esc(run.id)}
+        <b>›</b><span>session</span> ${esc(run.session_name)}
+        <b>›</b><span>window</span> ${esc(run.window_index)} · ${esc(run.window_name)}
+        <small>${esc(run.state)} · ${esc(run.execution?.host || "")} · ${esc(socket)}</small>
+      </div>
+      <div class="execution-pane-list">${panes}</div>
+    </section>`;
   }).join("");
+  return `<div class="work-execution">${runs}</div>`;
+}
 
-  return `<div class="work-execution">
-    <div class="execution-breadcrumb">
-      <span>workspace</span> ${esc(work.workspaceName)}
-      <b>›</b><span>session</span> ${esc(work.sessionName)}
-      <b>›</b><span>window</span> ${esc(work.index)} · ${esc(work.name)}
-      <small>${esc(work.host)} · ${esc(work.endpoint)}</small>
+function renderWorkSignals(work) {
+  if (work.signals.length === 0) return "";
+  return `<span class="work-signals">${work.signals.map((signal) =>
+    `<span class="work-signal ${esc(signal)}">${esc(signal)}</span>`
+  ).join("")}</span>`;
+}
+
+function renderExternalBadge(work) {
+  const item = work.externalItems[0];
+  if (!item) return `<span class="external-badge local">local work</span>`;
+  const status = item.status ? ` · ${item.status}` : "";
+  return `<span class="external-badge">${esc(item.source)} · ${esc(item.display_key)}${esc(status)}</span>`;
+}
+
+function renderUnlinkedExecutions() {
+  if (selectedWorkspace()) return "";
+  const runs = store.workSnapshot.unlinked_executions || [];
+  if (runs.length === 0) return "";
+  const visible = runs.slice(0, 20);
+  const rows = visible.map((run) => `<div class="unlinked-row">
+    <span class="state-dot ${run.state === "failed" ? "error" : run.state === "running" ? "working" : "idle"}"></span>
+    <span><b>${esc(run.session_name)}:${esc(run.window_index)}</b><small>${esc(run.window_name || run.id)}</small></span>
+    <span>${esc(run.state)}</span>
+    <span>${(run.panes || []).length} panes</span>
+    <span title="${esc(run.cwd || "")}">${esc(run.cwd || "no cwd")}</span>
+  </div>`).join("");
+  const hidden = runs.length - visible.length;
+  return `<section class="unlinked-executions">
+    <div class="unlinked-heading">
+      <span>Unlinked executions</span>
+      <small>${runs.length} tmux windows are visible but are not tracked as Work${hidden > 0 ? ` · ${hidden} hidden` : ""}</small>
     </div>
-    <div class="execution-pane-list">${panes}</div>
-  </div>`;
+    <div class="unlinked-list">${rows}</div>
+  </section>`;
 }
 
 function renderWorkItems() {
   if (!dom.workItemsContent) return;
   const works = visibleWorks();
   const selected = store.ui.selectedWorkKey;
-  const attention = works.filter((work) => work.stage === "attention").length;
+  const attention = works.filter((work) => work.signals.length > 0).length;
   const scope = selectedWorkspace()?.name || "all workspaces";
-  dom.workItemsMeta.textContent = `${scope} · ${works.length} tickets${attention ? ` · ${attention} attention` : ""}`;
+  dom.workItemsMeta.textContent = `${scope} · ${works.length} works${attention ? ` · ${attention} attention` : ""}`;
 
-  if (works.length === 0) {
+  const unlinked = renderUnlinkedExecutions();
+  if (works.length === 0 && !unlinked) {
     dom.workItemsContent.innerHTML = `<div class="empty-block work-empty">
-      No window-backed work items in this scope.<br>
-      <small>Start a work window or choose another workspace.</small>
+      No Work is tracked in this scope.<br>
+      <small>Create one with muxa work up, or choose another workspace.</small>
     </div>`;
     dom.toggleWorkExecution.textContent = "expand execution";
     return;
   }
 
-  const columns = ["attention", "in_progress", "review", "queued", "done"];
-  dom.workItemsContent.innerHTML = columns.map((stage) => {
+  const columns = ["queued", "in_progress", "review", "done"];
+  const board = columns.map((stage) => {
     const staged = works.filter((work) => work.stage === stage);
     const cards = staged.map((work) => {
       const expanded = store.ui.expandedWorks.has(work.key);
@@ -921,23 +1044,23 @@ function renderWorkItems() {
           .map((pane) => renderWorkParticipant(pane.agent, pane.muxa || {})).join("")
         : `<span class="participant-empty">no tracked agent</span>`;
       const stateClass = work.state === "needs_attention" ? "waiting" : work.state;
-      const managed = work.managed ? `<span class="managed-badge">managed</span>` : "";
       const next = work.nextAction
-        ? `<span class="ticket-next"><b>next</b>${esc(work.nextAction)}</span>`
+        ? `<span class="work-next"><b>next</b>${esc(work.nextAction)}</span>`
         : "";
-      return `<article class="work-card board-ticket state-${esc(stateClass)}${selected === work.key ? " selected" : ""}">
+      return `<article class="work-card board-work state-${esc(stateClass)}${selected === work.key ? " selected" : ""}">
       <button class="work-card-select" type="button" data-select-work="${esc(work.key)}">
-        <span class="ticket-kicker">
-          <span>${esc(work.ticketId)}</span>${managed}
+        <span class="work-kicker">
+          <span>${esc(work.workId)}</span>${renderExternalBadge(work)}
           <small>${esc(work.workspaceName)}</small>
         </span>
-        <strong class="ticket-title">${esc(work.title)}</strong>
+        <strong class="work-title">${esc(work.title)}</strong>
         <span class="work-summary">${esc(work.goal || workSummary(work))}</span>
         ${next}
+        ${renderWorkSignals(work)}
         <span class="participant-list">${participants}</span>
       </button>
-      <div class="ticket-footer">
-        <span>${work.participants.length} agents · ${esc(relTime(work.latest))}</span>
+      <div class="work-footer">
+        <span>${work.runs.length} runs · ${work.participants.length} agents · ${esc(relTime(work.latest))}</span>
         <button class="work-expand" type="button" data-toggle-work="${esc(work.key)}" aria-expanded="${expanded ? "true" : "false"}">
           <span aria-hidden="true">${expanded ? "⌄" : "›"}</span>
           execution
@@ -954,8 +1077,9 @@ function renderWorkItems() {
       <div class="work-lane-list">${cards || `<div class="lane-empty">No work</div>`}</div>
     </section>`;
   }).join("");
+  dom.workItemsContent.innerHTML = board + unlinked;
 
-  const allExpanded = works.every((work) => store.ui.expandedWorks.has(work.key));
+  const allExpanded = works.length > 0 && works.every((work) => store.ui.expandedWorks.has(work.key));
   dom.toggleWorkExecution.textContent = allExpanded ? "collapse execution" : "expand execution";
 }
 
@@ -1810,34 +1934,14 @@ async function runPaneControl(button) {
   }
 }
 
-function sameWorkIdentity(left, right) {
-  return left?.host === right?.host &&
-    left?.socket === right?.socket &&
-    left?.session_id === right?.session_id &&
-    left?.window_id === right?.window_id;
-}
-
-function acceptWorkRecord(record) {
-  const index = store.workMetadata.findIndex((candidate) =>
-    sameWorkIdentity(candidate.key, record.key)
-  );
-  if (index === -1) store.workMetadata.push(record);
-  else store.workMetadata[index] = record;
-  store.revisions.workMetadata += 1;
-  renderOverview();
-  renderSessionSidebar();
-  renderWorkItems();
-  renderInspector();
-}
-
 async function saveWorkMetadata(form) {
   const work = selectedWork();
   if (!work) throw new Error("selected work item is no longer present");
   const data = new FormData(form);
-  const payload = await controlFetch("/api/work-metadata", {
+  await controlFetch("/api/work-metadata", {
     method: "PUT",
     body: JSON.stringify({
-      key: work.identity,
+      identity: work.identity,
       metadata: {
         title: data.get("title") || null,
         stage: data.get("stage") || "auto",
@@ -1846,18 +1950,18 @@ async function saveWorkMetadata(form) {
       },
     }),
   });
-  acceptWorkRecord(payload.work);
-  showToast(`saved ${work.ticketId}`);
+  await fetchWorks();
+  showToast(`saved ${work.workId}`);
 }
 
 async function runWorkAction(action) {
   const work = selectedWork();
   if (!work) throw new Error("selected work item is no longer present");
   if (action === "abort") {
-    if (!window.confirm(`Abort every live agent in ${work.ticketId}?`)) return;
+    if (!window.confirm(`Abort every live agent in ${work.workId}?`)) return;
     const result = await controlFetch("/api/work-control/abort", {
       method: "POST",
-      body: JSON.stringify({ key: work.identity }),
+      body: JSON.stringify({ identity: work.identity }),
     });
     showToast(`aborted ${result.succeeded}/${result.attempted} agents`);
     return;
@@ -1867,10 +1971,10 @@ async function runWorkAction(action) {
   const text = action === "status"
     ? "Report current progress, blockers, evidence, and the next concrete action in one concise update."
     : textarea?.value.trim();
-  if (!text) throw new Error("enter a ticket instruction first");
+  if (!text) throw new Error("enter a work instruction first");
   const result = await controlFetch("/api/work-control/prompt", {
     method: "POST",
-    body: JSON.stringify({ key: work.identity, text, submit: true }),
+    body: JSON.stringify({ identity: work.identity, text, submit: true }),
   });
   if (textarea && action === "prompt") textarea.value = "";
   showToast(`prompted ${result.succeeded}/${result.attempted} agents`);
@@ -2257,7 +2361,8 @@ function renderInspector() {
 }
 
 function renderWorkInspector(work) {
-  dom.inspectorMeta.textContent = `${workStageLabel(work.stage)} · ${work.participants.length} agents`;
+  const signalSummary = work.signals.length ? ` · ${work.signals.join(", ")}` : "";
+  dom.inspectorMeta.textContent = `${workStageLabel(work.stage)}${signalSummary} · ${work.runs.length} runs`;
   const participants = work.participants.length
     ? work.panes.filter((pane) => pane.agent).map((pane) => {
       const metadata = pane.muxa || {};
@@ -2270,21 +2375,40 @@ function renderWorkInspector(work) {
       </div>`;
     }).join("")
     : `<div class="empty-block compact">no tracked agents</div>`;
-  const manualStage = work.metadata?.stage || "auto";
+  const storedStage = work.metadata?.stage || "auto";
+  const manualStage = WORK_STAGES.includes(storedStage)
+    ? storedStage
+    : (work.stage === "in_progress" ? "in_progress" : "auto");
   const stageOptions = WORK_STAGES.map((stage) =>
     `<option value="${stage}"${stage === manualStage ? " selected" : ""}>${stage.replaceAll("_", " ")}</option>`
   ).join("");
   const disabled = store.access.writeAuthorized ? "" : " disabled";
+  const externalItems = work.externalItems.length
+    ? work.externalItems.map((item) => {
+      const href = safeExternalHref(item.url);
+      const heading = `${item.source} · ${item.display_key}`;
+      const title = item.title || "Linked external issue";
+      return `<div class="drawer-external-item">
+        <span><b>${esc(heading)}</b><small>${esc(title)}</small></span>
+        <em>${esc(item.status || "status unknown")}</em>
+        ${href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">open ↗</a>` : ""}
+      </div>`;
+    }).join("")
+    : `<div class="empty-block compact">Local Work · no external issue linked</div>`;
   dom.inspectorBody.innerHTML = `
     <div class="drawer-work-heading">
-      <span class="drawer-ticket-id">${esc(work.ticketId)}</span>
+      <span class="drawer-work-id">${esc(work.workId)}</span>
       <h2>${esc(work.title)}</h2>
-      <p>${esc(work.workspaceName)} · ${esc(workStateLabel(work))} · ${esc(work.source)}</p>
+      <p>${esc(work.workspaceName)} · local stage ${esc(workStageLabel(work.stage))} · run ${esc(workStateLabel(work))}</p>
     </div>
     <div class="drawer-signal">
       <span>Latest work signal</span>
       <p>${esc(workSummary(work))}</p>
       <small>${esc(relTime(work.latest))}</small>
+    </div>
+    <div class="inspector-section drawer-external-items">
+      <h3>External issues</h3>
+      ${externalItems}
     </div>
     <form class="work-metadata-form" data-work-metadata-form>
       <h3>Work definition</h3>
@@ -2296,8 +2420,8 @@ function renderWorkInspector(work) {
       ${store.access.writeAuthorized ? "" : `<small class="locked-note">Unlock edit to change workflow metadata.</small>`}
     </form>
     <div class="inspector-section drawer-controls">
-      <h3>Ticket command</h3>
-      <textarea id="work-batch-prompt" rows="3" placeholder="Send one instruction to every live agent in this ticket"${disabled}></textarea>
+      <h3>Work actions</h3>
+      <textarea id="work-batch-prompt" rows="3" placeholder="Send one instruction to every live agent in this Work"${disabled}></textarea>
       <div class="drawer-action-row">
         <button class="control-btn primary" type="button" data-work-action="prompt"${disabled}>prompt all</button>
         <button class="control-btn" type="button" data-work-action="status"${disabled}>request status</button>
@@ -2362,6 +2486,16 @@ function esc(v) {
   return String(v ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
+}
+
+function safeExternalHref(value) {
+  if (!value) return "";
+  try {
+    const url = new URL(value, window.location.origin);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function relTime(iso) {
@@ -2458,24 +2592,27 @@ async function fetchPanes() {
   return panesRequest;
 }
 
-let workMetadataRequest = null;
-async function fetchWorkMetadata() {
-  if (workMetadataRequest) return workMetadataRequest;
-  workMetadataRequest = (async () => {
+let worksRequest = null;
+async function fetchWorks() {
+  if (worksRequest) return worksRequest;
+  worksRequest = (async () => {
     try {
-      const data = await jsonFetch("/api/work-metadata");
-      const works = data.works || [];
-      const fingerprint = JSON.stringify(works);
-      if (fingerprint === store.cache.workMetadataFingerprint) return;
-      store.cache.workMetadataFingerprint = fingerprint;
-      store.workMetadata = works;
-      store.revisions.workMetadata += 1;
+      const data = validateWorkSnapshot(await jsonFetch("/api/works"));
+      const fingerprint = JSON.stringify([
+        data.workspaces || [],
+        data.works || [],
+        data.unlinked_executions || [],
+      ]);
+      if (fingerprint === store.cache.workSnapshotFingerprint) return;
+      store.cache.workSnapshotFingerprint = fingerprint;
+      store.workSnapshot = data;
+      store.revisions.works += 1;
       scheduleLiveRender();
     } finally {
-      workMetadataRequest = null;
+      worksRequest = null;
     }
   })();
-  return workMetadataRequest;
+  return worksRequest;
 }
 
 let terminalsRequest = null;
@@ -2577,6 +2714,7 @@ function applySnapshot(payload) {
   }
   store.revisions.agents += 1;
   scheduleLiveRender();
+  fetchWorks().catch(() => {});
   scheduleTimelineRefresh();
 }
 
@@ -2590,6 +2728,7 @@ function applyTransition(t) {
   }
   store.revisions.agents += 1;
   scheduleLiveRender();
+  fetchWorks().catch(() => {});
   scheduleTimelineRefresh();
 }
 
@@ -2625,13 +2764,13 @@ async function main() {
   await Promise.all([
     fetchAgentsSnapshot(),
     fetchPanes(),
-    fetchWorkMetadata(),
+    fetchWorks(),
     store.ui.activeTab === "terminals" ? fetchTerminalSessions() : Promise.resolve(),
     fetchTimeline({ force: true }),
   ]);
 
   setTimeout(pollPanes, PANES_REFETCH_INTERVAL_MS);
-  setTimeout(pollWorkMetadata, WORK_METADATA_REFETCH_INTERVAL_MS);
+  setTimeout(pollWorks, WORK_REFETCH_INTERVAL_MS);
   setTimeout(pollTerminals, TERMINALS_REFETCH_INTERVAL_MS);
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
 
@@ -2639,7 +2778,7 @@ async function main() {
     if (document.hidden) return;
     scheduleLiveRender({ panes: true, terminals: true });
     fetchPanes().catch(() => {});
-    fetchWorkMetadata().catch(() => {});
+    fetchWorks().catch(() => {});
     if (store.ui.activeTab === "terminals") fetchTerminalSessions().catch(() => {});
     if (Date.now() - lastTimelineFetchAt >= TIMELINE_MIN_REFRESH_INTERVAL_MS) {
       fetchTimeline().catch(() => {});
@@ -2664,9 +2803,9 @@ async function pollPanes() {
   setTimeout(pollPanes, PANES_REFETCH_INTERVAL_MS);
 }
 
-async function pollWorkMetadata() {
-  if (!document.hidden) await fetchWorkMetadata().catch(() => {});
-  setTimeout(pollWorkMetadata, WORK_METADATA_REFETCH_INTERVAL_MS);
+async function pollWorks() {
+  if (!document.hidden) await fetchWorks().catch(() => {});
+  setTimeout(pollWorks, WORK_REFETCH_INTERVAL_MS);
 }
 
 async function pollTerminals() {

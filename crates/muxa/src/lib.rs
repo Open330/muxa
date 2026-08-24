@@ -65,6 +65,7 @@ pub mod state;
 pub mod timeline;
 pub mod tmux;
 pub mod topology;
+pub mod work;
 
 // ---------------------------------------------------------------------------
 // Stable public surface.

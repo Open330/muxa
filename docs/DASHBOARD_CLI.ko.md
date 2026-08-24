@@ -1,10 +1,13 @@
 # CLI dashboard
 
-`muxa dashboard`는 workspace-card 기반 TUI console입니다. tmux card 하나는
-workspace session이고 pane에는 work window 위치가 함께 표시됩니다.
+`muxa dashboard`는 Work-card 기반 TUI console입니다. Web dashboard와 같은
+canonical `WorkSnapshot`을 사용하므로 로컬 Work 단계, 외부 issue 상태, Run 상태,
+Agent 상태, Attention/Error 신호를 구분합니다. 일반 tmux session/window는 card로
+만들지 않고 unlinked execution 수만 note로 알리며 topology 확인은 `muxa watch`로
+연결합니다.
 
 작고 빠른 picker/table이 필요하면 `muxa watch`를 쓰고, card, inspector, live
-terminal capture, prompt composer, workspace 단위 ACT/WACT total이 필요한
+Run capture, prompt composer, Work 일괄 action, ACT/WACT total이 필요한
 운영 화면은 `muxa dashboard`를 씁니다.
 tracked tmux agent pane 안에서 실행하면 현재 agent의 collaboration room
 console 역할도 함께 수행합니다.
@@ -30,18 +33,20 @@ muxa dashboard --include-paneless
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` / `←` / `→`, `h` / `j` / `k` / `l` | card 선택 이동. |
-| `Tab`, `[` / `]` | 선택 workspace card 안의 action target 전환. |
+| `Tab`, `[` / `]` | 선택 Work card 안의 execution target 전환. |
 | `PageUp` / `PageDown` | live capture history scroll. |
 | `G` / `End` | capture를 최신 output으로 이동. |
 | `f` | capture fullscreen toggle. |
 | `n` | 진단 note가 있을 때 notes popup 열기. |
-| `Enter` | 선택 workspace inspector toggle. |
+| `Enter` | 선택 Work inspector toggle. |
 | `p` | 선택 pane 또는 muxa PTY session에 prompt composer 열기. |
+| `P` | 하나의 prompt를 선택 Work의 모든 live agent에 전송. |
 | `m` | 선택한 same-room agent에게 구조화 요청 작성. 초안 어디서든 `/`를 눌러 현재 커서 위치에 등록한 메시지 스킬 삽입. |
 | `b` | request를 claim하지 않고 incoming/sent collaboration mailbox 열기. |
 | `i` | pending collaboration request를 claim하고 incoming mailbox 열기. |
-| `c` | 선택 workspace의 최신 prompt 복사. |
+| `c` | 선택 Work의 최신 prompt 복사. |
 | `R` | 확인 후 선택 pane 또는 PTY session에 Ctrl-C 전송. |
+| `A` | 확인 후 선택 Work의 모든 live agent에 Ctrl-C 전송. |
 | `K` | 확인 후 선택 pane 또는 PTY session 종료. |
 | `o` | 선택 pane/session을 명시적으로 열기. |
 | `r` | 즉시 refresh. |
@@ -58,23 +63,23 @@ zellij card는 계속 표시되고 `o`로 focus할 수 있지만, zellij-safe in
 
 ## Card와 inspector
 
-Card는 tmux/zellij session, muxa-owned PTY session, detached agent session
-단위로 묶입니다. 각 card는 다음을 보여줍니다:
+Card는 논리 `{workspace_id, work_id}` 단위로 묶입니다. 각 card는 다음을 보여줍니다:
 
-- host type, agent 수, pane 수
-- 현재 dominant state
+- 로컬 Work 단계와 Attention/Blocked/Error 신호
+- 외부 provider/display key/status 또는 `local work`
+- Run, agent, pane 수와 dominant Agent runtime 상태
 - 최신 activity age와 foreground time
 - 선택한 `--since` window의 ACT/WACT
 - agent가 제공하는 model/context/cost hint
 - 최신 prompt 또는 notification preview
 
-Inspector는 선택 card의 세부 정보와 primary pane 또는 PTY session의 live
-capture를 보여줍니다. backend가 capture를 지원하지 않으면 TUI는 실패하지 않고
+Inspector는 선택 Work의 Run/Agent 정보와 선택 execution target의 live capture를
+보여줍니다. backend가 capture를 지원하지 않으면 TUI는 실패하지 않고
 unavailable 상태로 표시합니다.
 
-multi-pane card에서는 강조된 action target이 `p`, `R`, `K`, `o`, capture의
-대상입니다. `Tab`, `[`, `]`로 dashboard 안에서 target을 바꿀 수 있고,
-destructive action 확인창은 실행 전 정확한 pane 또는 PTY session을 표시합니다.
+multi-agent Work에서는 강조된 target이 `p`, `R`, `K`, `o`, capture의 대상입니다.
+`P`, `A`는 cursor와 무관하게 Work의 모든 live agent를 대상으로 합니다. 확인창은
+exact-target action인지 Work-wide action인지 실행 전에 명시합니다.
 
 ## Collaboration room
 

@@ -28,3 +28,12 @@ mod work_store;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
 pub use server::{router, serve, AppState, DashboardRuntimeConfig};
+
+/// Read the durable Work records without constructing the HTTP dashboard.
+/// CLI surfaces use this together with [`crate::work::build_snapshot`] so the
+/// web and terminal dashboards share one projection instead of re-inferring
+/// Work from tmux names.
+#[must_use]
+pub fn load_work_records(path: Option<std::path::PathBuf>) -> Vec<crate::work::WorkRecord> {
+    work_store::WorkStore::load(path).records()
+}

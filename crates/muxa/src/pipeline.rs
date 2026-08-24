@@ -1,14 +1,15 @@
 //! Work pipelines — a declared line-up of agents, reconciled onto tmux.
 //!
 //! `muxa work start` creates one agent pane at a time, which is the right
-//! primitive and the wrong ergonomics for a ticket that wants a planner, an
+//! primitive and the wrong ergonomics for a Work whose external issue wants a planner, an
 //! implementer, and a reviewer sitting in the same window. This module is
 //! the layer above it: a work id in, a *desired set of panes* out, compared
 //! against the panes that already exist.
 //!
 //! Three deliberate choices shape it.
 //!
-//! **Ticket lookup is delegated to an agent.** Muxa never learns Linear's
+//! **External issue lookup is delegated to an agent.** The config and Rust
+//! type retain the historical `ticket` name for compatibility. Muxa never learns Linear's
 //! GraphQL or Jira's REST. It spends one headless turn asking an agent CLI
 //! to fetch the ticket, because the user already taught that agent how —
 //! through a skill, an MCP server, `gh`, a token in the environment. Adding
@@ -79,6 +80,16 @@ pub enum PipelineError {
 /// window is perfectly launchable on the id alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ticket {
+    /// Resolver source key (`linear`, `github`, `jira`, ...). This is set by
+    /// muxa after source selection, not trusted from the resolver response.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Provider scope such as a Linear workspace/team or GitHub owner/repo.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Provider-internal immutable identity when returned by the resolver.
+    #[serde(default)]
+    pub stable_id: Option<String>,
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -135,14 +146,19 @@ impl Ticket {
                     .filter(|text| !text.is_empty())
             })
         };
+        let display_id = pick(&["identifier", "key", "number", "id"])
+            .filter(|value| !looks_like_uuid(value))
+            .unwrap_or_else(|| id.to_string());
+        let stable_id = pick(&["id", "uuid", "node_id"]).filter(|value| value != &display_id);
         Ok(Self {
+            source: None,
+            scope: pick(&["scope", "repository", "repo", "team"]),
+            stable_id,
             // `identifier`/`key` before `id`: trackers carry both a human
             // ticket id and an internal UUID, and Linear puts the UUID under
             // the more obvious name. Getting this backwards is invisible in
             // a unit test and glaring in a window title.
-            id: pick(&["identifier", "key", "number", "id"])
-                .filter(|value| !looks_like_uuid(value))
-                .unwrap_or_else(|| id.to_string()),
+            id: display_id,
             title: pick(&["title", "name", "summary"]),
             body: pick(&["body", "description", "content"]),
             url: pick(&["url", "html_url", "link", "permalink"]),

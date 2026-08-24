@@ -87,6 +87,20 @@ pub struct MuxaPaneMetadata {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_stable_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_status: Option<String>,
 }
 
 #[derive(Debug)]
@@ -391,6 +405,13 @@ fn parse_scanned_panes(stdout: &str, socket: &str) -> Vec<ScannedPane> {
                     agent: value(18),
                     role: value(19),
                     task: value(20),
+                    external_source: value(24),
+                    external_scope: value(25),
+                    external_stable_id: value(26),
+                    external_key: value(27),
+                    external_title: value(28),
+                    external_url: value(29),
+                    external_status: value(30),
                 },
             }
         })
