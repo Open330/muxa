@@ -346,6 +346,7 @@ muxa host add dev muxa-devbox --label environment=development --mode observe
 muxa host doctor dev
 muxa fleet watch
 # equivalent entry point: muxa watch --fleet
+# `muxa init` also binds this view to tmux prefix+S (local watch stays prefix+s)
 # with only local, this is the full native watch with no redundant host row
 ```
 

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use muxa::collaboration::{CollaborationOrigin, RequestMailbox};
 use muxa::fleet::{
     load_or_create_node_id, read_bounded_line, sanitize_capture_text, FleetBackendInfo,
     FleetCapturedWindowPane, FleetCommandResult, FleetWindowCapture, GlobalPaneRef, RelayFrame,
@@ -340,6 +341,77 @@ async fn handle_request(
                 result: FleetCommandResult::sent(outcome),
             })
         }
+        RelayRequest::CollaborationSend {
+            request_id,
+            pane,
+            request,
+        } => {
+            exact_backend(&backends, &pane).await?;
+            let origin = collaboration_origin(&pane, true);
+            let target = format!("pane:{}", pane.pane_id);
+            let request = client
+                .collaboration_send(&origin, &target, &request)
+                .await
+                .context("sending collaboration request")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_request(request),
+            })
+        }
+        RelayRequest::CollaborationMailbox { request_id, pane } => {
+            exact_backend(&backends, &pane).await?;
+            let agent = collaboration_origin(&pane, false);
+            let console = collaboration_origin(&pane, true);
+            let (incoming, sent) = tokio::try_join!(
+                client.collaboration_list(&agent, RequestMailbox::Incoming),
+                client.collaboration_list(&console, RequestMailbox::Sent),
+            )
+            .context("reading collaboration mailbox")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_mailbox(incoming, sent),
+            })
+        }
+        RelayRequest::CollaborationClaim { request_id, pane } => {
+            exact_backend(&backends, &pane).await?;
+            let agent = collaboration_origin(&pane, false);
+            let incoming = client
+                .collaboration_inbox(&agent)
+                .await
+                .context("claiming collaboration inbox")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_mailbox(incoming, Vec::new()),
+            })
+        }
+        RelayRequest::CollaborationReply {
+            request_id,
+            pane,
+            collaboration_request_id,
+            status,
+            body,
+        } => {
+            exact_backend(&backends, &pane).await?;
+            let agent = collaboration_origin(&pane, false);
+            let request = client
+                .collaboration_reply(&agent, &collaboration_request_id, status, &body, &[], &[])
+                .await
+                .context("replying to collaboration request")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_request(request),
+            })
+        }
+    }
+}
+
+fn collaboration_origin(pane: &PaneKey, console: bool) -> CollaborationOrigin {
+    let endpoint = &pane.window.session.endpoint;
+    CollaborationOrigin {
+        pane: pane.pane_id.clone(),
+        socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
+            .then(|| endpoint.socket.clone()),
+        console,
     }
 }
 
