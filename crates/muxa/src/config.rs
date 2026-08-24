@@ -698,6 +698,15 @@ pub struct DashboardTomlConfig {
     pub allow_public: Option<bool>,
     /// Pane scanner cache TTL in milliseconds. Default 2000.
     pub pane_cache_ttl_ms: Option<u64>,
+    /// Let the dashboard stand up a work pipeline — that is, *launch agent
+    /// processes* — through `POST /api/work-control/up`.
+    ///
+    /// Off by default, and deliberately its own switch rather than riding
+    /// on the control token. Every other write route steers a process the
+    /// operator already started; this one starts new ones with permissions
+    /// bypassed. That is a different kind of authority and deserves a
+    /// different grant, the same way `[ask]` and `[collaboration]` do.
+    pub allow_work_start: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

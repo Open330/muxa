@@ -137,10 +137,15 @@ pub struct AppState {
     /// Compact final response cache. This protects the daemon from multiple
     /// dashboard tabs rebuilding the same retained-history projection at once.
     timeline_summary_cache: Arc<tokio::sync::Mutex<TimelineSummaryCache>>,
+    /// `[message.skills]`, so a dashboard prompt can expand the same `/name`
+    /// templates the CLI and `muxa_call_peer` expand. One composer, three
+    /// front doors.
+    message_skills: Arc<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Default)]
 pub struct DashboardRuntimeConfig {
+    pub message_skills: BTreeMap<String, String>,
     pub activity_path: Option<PathBuf>,
     pub session_activity_path: Option<PathBuf>,
     pub work_store_path: Option<PathBuf>,
@@ -177,7 +182,14 @@ impl AppState {
             timeline_summary_cache: Arc::new(tokio::sync::Mutex::new(
                 TimelineSummaryCache::default(),
             )),
+            message_skills: Arc::new(BTreeMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn with_message_skills(mut self, skills: BTreeMap<String, String>) -> Self {
+        self.message_skills = Arc::new(skills);
+        self
     }
 
     #[must_use]
@@ -354,6 +366,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
         .route("/api/work-metadata", put(work_metadata_put_handler))
         .route("/api/work-control/prompt", post(work_prompt_handler))
+        .route("/api/work-control/up", post(work_up_handler))
         .route("/api/work-control/abort", post(work_abort_handler))
         .route(
             "/api/terminal-sessions/{id}/input",
@@ -426,6 +439,7 @@ pub async fn serve(
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
         .with_work_store_path(runtime.work_store_path)
         .with_stats_config(runtime.stats_config)
+        .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
@@ -769,7 +783,17 @@ fn pane_matches_work_key(pane: &PaneSummary, key: &WorkKey) -> bool {
 #[derive(Debug, Deserialize)]
 struct WorkPromptRequest {
     key: WorkKey,
+    /// Literal text, kept for callers that compose their own prompt.
+    #[serde(default)]
     text: String,
+    /// Registered `[message.skills]` name, expanded ahead of `body` exactly
+    /// as `muxa_call_peer` and `muxa work up` expand it.
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
     #[serde(default = "default_true")]
     submit: bool,
 }
@@ -786,14 +810,146 @@ struct WorkControlResult {
     submitted: bool,
 }
 
+/// Ceiling for one `muxa work up` run. Generous because resolving a ticket
+/// spends a headless agent turn, which is minutes rather than milliseconds.
+const WORK_UP_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Deserialize)]
+struct WorkUpRequest {
+    /// Work/ticket id, for example `cal-1234`.
+    work: String,
+    #[serde(default)]
+    pipeline: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    no_ticket: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Stand a work item's pipeline up from the dashboard.
+///
+/// This delegates to the `muxa` binary rather than reimplementing the
+/// pipeline here. The launcher and the managed-tmux registry live in the
+/// CLI crate, which depends on this one — so calling them in-process would
+/// mean either inverting that dependency or keeping a second implementation
+/// alive. One implementation behind a subprocess beats two behind none.
+///
+/// Gated on `[dashboard] allow_work_start` on top of the control token:
+/// every other write route steers a process the operator already started,
+/// while this one starts new ones with permissions bypassed.
+async fn work_up_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkUpRequest>,
+) -> Response {
+    if !state.config.allow_work_start {
+        return control_error(
+            StatusCode::FORBIDDEN,
+            "starting work is disabled; set [dashboard] allow_work_start = true to enable it",
+        );
+    }
+    if input.work.trim().is_empty() {
+        return control_error(StatusCode::BAD_REQUEST, "work id is empty");
+    }
+
+    let mut args: Vec<String> = vec![
+        "work".into(),
+        "up".into(),
+        input.work.trim().into(),
+        "--json".into(),
+    ];
+    let mut push = |flag: &str, value: Option<&String>| {
+        if let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    };
+    push("--pipeline", input.pipeline.as_ref());
+    push("--workspace", input.workspace.as_ref());
+    push("--skill", input.skill.as_ref());
+    push("--body", input.body.as_ref());
+    push("--context", input.context.as_ref());
+    if input.no_ticket {
+        args.push("--no-ticket".into());
+    }
+    if input.dry_run {
+        args.push("--dry-run".into());
+    }
+
+    let mut command = tokio::process::Command::new("muxa");
+    command
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(WORK_UP_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return control_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawning muxa: {error}"),
+            )
+        }
+        Err(_) => {
+            return control_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("muxa work up exceeded {}s", WORK_UP_TIMEOUT.as_secs()),
+            )
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            format!("muxa work up failed: {detail}"),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
+        Err(error) => control_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("muxa work up answered with unparseable JSON: {error}"),
+        ),
+    }
+}
+
 async fn work_prompt_handler(
     State(state): State<AppState>,
     Json(input): Json<WorkPromptRequest>,
 ) -> Response {
-    if input.text.trim().is_empty() {
-        return control_error(StatusCode::BAD_REQUEST, "prompt text is empty");
-    }
-    run_work_control(&state, input.key, input.text, input.submit, "prompt").await
+    // `text` stays the escape hatch; skill/body/context go through the one
+    // composer so a template registered once works from every front door.
+    let composed = match crate::request::compose(
+        crate::request::RequestParts {
+            skill: input.skill.as_deref(),
+            body: input.body.as_deref(),
+            context: input.context.as_deref(),
+        },
+        &state.message_skills,
+    ) {
+        Ok(composed) => composed,
+        Err(error) => return control_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let text = match (composed, input.text.trim()) {
+        (Some(composed), "") => composed.text,
+        (Some(composed), literal) => format!("{}\n\n{literal}", composed.text),
+        (None, "") => {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "prompt requires text, body, skill, or context",
+            )
+        }
+        (None, literal) => literal.to_string(),
+    };
+    run_work_control(&state, input.key, text, input.submit, "prompt").await
 }
 
 async fn work_abort_handler(
@@ -2812,6 +2968,118 @@ mod tests {
             reloaded.records()[0].metadata.title.as_deref(),
             Some("Repair auth")
         );
+    }
+
+    #[tokio::test]
+    async fn starting_work_needs_its_own_grant_beyond_the_control_token() {
+        // A valid control token is not enough: every other write route steers
+        // a process the operator already started, while this one starts new
+        // ones with permissions bypassed.
+        let state = public_read_state("edit-pat");
+        assert!(!state.config.allow_work_start, "default must be off");
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/up")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"work":"cal-1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("allow_work_start"),
+            "the refusal should name the switch that enables it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_work_still_refuses_without_the_control_token() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::PublicRead;
+        cfg.token = Some("edit-pat".into());
+        cfg.allow_work_start = true;
+        let response = router(state_from(cfg))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/up")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"work":"cal-1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_expands_the_same_registered_skill_the_cli_does() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let panes = vec![test_pane(
+            "herdr:p1",
+            "session-1",
+            "muxa",
+            "window-1",
+            "CAL-101",
+        )];
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes,
+        });
+        let state = public_read_state("edit-pat")
+            .with_backend(backend)
+            .with_message_skills(BTreeMap::from([(
+                "review-plan".to_string(),
+                "Run the peer review workflow.".to_string(),
+            )]));
+        seed_agent(&state, "agent-1", "herdr:p1").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"skill":"/review-plan","body":"check CAL-101","context":"tests pass","submit":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "Run the peer review workflow.\n\ncheck CAL-101\n\nInvocation context:\ntests pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_with_nothing_to_say_is_refused() {
+        let response = router(public_read_state("edit-pat"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"s","window_id":"w"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
