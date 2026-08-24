@@ -392,9 +392,9 @@ enum WindowCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
-    /// Bring a work window to the state its pipeline declares: resolve the
-    /// ticket, route it to a workspace, and create whichever agent panes
-    /// are missing. Re-running converges instead of duplicating.
+    /// Converge a Work's current Run to its pipeline: optionally link an
+    /// external issue, route the Work, and create missing agent sessions.
+    /// Re-running converges instead of duplicating.
     Up(work_up::UpArgs),
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
