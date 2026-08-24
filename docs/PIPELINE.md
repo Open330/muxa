@@ -47,6 +47,11 @@ Only `[ticket]`, `[[route]]`, and `[pipeline.*]` are touched. The file is
 rewritten through `toml_edit`, so your comments and every other section
 survive verbatim.
 
+Every path here spends **one headless agent turn, billed to your agent
+account**. muxa says what it is about to run before it runs it, and
+`--dry-run` skips only the file write — the turn still happens and still
+bills. Non-interactive callers must pass `--yes` to confirm the spend.
+
 ```console
 muxa work init                                # ask interactively
 muxa work init --describe "..."               # non-interactive

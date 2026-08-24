@@ -62,7 +62,9 @@ pub struct UpArgs {
     /// it from the instruction.
     #[arg(long)]
     pub context: Option<String>,
-    /// Resolve and diff, then print what would happen and change nothing.
+    /// Resolve and diff, then print what would happen and create nothing.
+    /// Ticket lookup still runs on a cache miss, and that is a billed agent
+    /// turn; `--no-ticket` skips it entirely.
     #[arg(long)]
     pub dry_run: bool,
     /// Skip external issue lookup and launch on the Work id alone.
@@ -468,7 +470,7 @@ fn run_prepare(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn expand_tilde(value: &str) -> String {
+pub(crate) fn expand_tilde(value: &str) -> String {
     let Some(rest) = value.strip_prefix('~') else {
         return value.to_string();
     };
@@ -501,6 +503,12 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
             return Ok(Some(ticket));
         }
     }
+    // Say what is being spawned before spawning it. Only on a cache miss:
+    // the common re-run costs nothing and does not need announcing.
+    eprintln!(
+        "resolving {id} via ticket source {source_name:?} — one headless {} turn, billed to your account",
+        config.agent
+    );
     let prompt = Vars::new().set("id", id).render(&source.prompt);
     let cwd = config
         .cwd
@@ -520,6 +528,9 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
     .with_context(|| {
         format!("ticket source {source_name:?} could not look up {id} (use --no-ticket to launch without it)")
     })?;
+    if let Some(cost) = answer.cost_usd {
+        eprintln!("that lookup cost ${cost:.4}.");
+    }
     let mut ticket = Ticket::parse_reply(id, &answer.text).with_context(|| {
         format!("ticket source {source_name:?} answered for {id} but not with a ticket")
     })?;

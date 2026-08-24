@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::work_up::expand_tilde;
 use muxa::config::Config;
 use muxa::pipeline::{self, ProposalSummary};
 
@@ -37,7 +38,8 @@ pub struct InitArgs {
     /// Resolver agent: claude or codex. Defaults to `[ticket].agent`.
     #[arg(long)]
     pub agent: Option<String>,
-    /// Print the proposed config and change nothing.
+    /// Print the proposed config and write nothing. The agent turn still
+    /// runs and is still billed — only the file write is skipped.
     #[arg(long)]
     pub dry_run: bool,
     /// Skip the confirmation prompt.
@@ -111,17 +113,31 @@ pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) 
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let prompt = compose_prompt(&describe, &existing);
 
-    println!("asking {agent} to write the config…");
+    let resolver_cwd = config
+        .ticket
+        .cwd
+        .clone()
+        .map(|cwd| PathBuf::from(expand_tilde(&cwd.to_string_lossy())))
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    announce(&agent, &resolver_cwd, config, args.dry_run);
+    if !args.yes && !confirm_spend()? {
+        println!("nothing was called.");
+        return Ok(());
+    }
     let answer = muxa::ask::one_shot(muxa::ask::OneShot {
         agent: &agent,
         prompt: &prompt,
-        cwd: &dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+        cwd: &resolver_cwd,
         permission_mode: config.ticket.permission_mode,
         additional_dirs: &config.ticket.additional_dirs,
         timeout: Duration::from_secs(config.ticket.timeout_secs.max(60)),
     })
     .await
     .context("asking an agent to write the pipeline config")?;
+    if let Some(cost) = answer.cost_usd {
+        println!("that turn cost ${cost:.4}.");
+    }
 
     let block = pipeline::extract_toml_block(&answer.text)
         .ok_or_else(|| anyhow::anyhow!("{agent} answered without any TOML"))?
@@ -151,6 +167,50 @@ pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) 
     println!("wrote {}", path.display());
     println!("try it:  muxa work up <ticket-id> --dry-run");
     Ok(())
+}
+
+/// Say what is about to be spawned, and that it costs money, before
+/// spawning it.
+///
+/// `--dry-run` is the reason this exists rather than being obvious: it
+/// skips the *file write*, not the agent turn, so "dry run" must not be
+/// read as "nothing happens". The expensive half happens either way.
+fn announce(agent: &str, cwd: &std::path::Path, config: &Config, dry_run: bool) {
+    for line in notice_lines(agent, cwd, config, dry_run) {
+        println!("{line}");
+    }
+}
+
+fn notice_lines(agent: &str, cwd: &std::path::Path, config: &Config, dry_run: bool) -> Vec<String> {
+    let mut lines = vec![
+        format!("muxa is about to run one headless {agent} turn to write your config."),
+        format!("  command   {agent} (print mode)"),
+        format!("  runs in   {}", cwd.display()),
+        format!(
+            "  policy    {:?} permissions, {}s ceiling",
+            config.ticket.permission_mode, config.ticket.timeout_secs
+        ),
+        format!("  cost      billed to your {agent} account, like any other turn"),
+    ];
+    if dry_run {
+        lines.push(
+            "  note      --dry-run skips writing the file; the turn still runs and still bills"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// Ask before spending. Non-interactive callers must say `--yes`, matching
+/// how the rest of muxa gates an action the operator cannot take back.
+fn confirm_spend() -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("this spends a billed agent turn; pass --yes to confirm non-interactively");
+    }
+    Ok(cliclack::confirm("Spend one agent turn?")
+        .initial_value(true)
+        .interact()?)
 }
 
 fn ask_operator() -> Result<String> {
@@ -265,6 +325,40 @@ pipeline = 'solo'
 alias = 'main'
 program = 'claude'
 ";
+
+    #[test]
+    fn the_notice_names_the_command_and_that_it_costs_money() {
+        let config = Config::default();
+        let lines = notice_lines("claude", std::path::Path::new("/home/june"), &config, false);
+        let text = lines.join("\n");
+        assert!(text.contains("claude (print mode)"), "{text}");
+        assert!(text.contains("/home/june"), "{text}");
+        assert!(text.contains("billed"), "{text}");
+        // Nothing about dry-run when this is a real run.
+        assert!(!text.contains("--dry-run"), "{text}");
+    }
+
+    #[test]
+    fn dry_run_says_the_turn_still_bills() {
+        // The whole point: --dry-run skips the file write, not the agent
+        // turn, so it must not read as "nothing happens".
+        let config = Config::default();
+        let text = notice_lines("codex", std::path::Path::new("/tmp"), &config, true).join("\n");
+        assert!(text.contains("--dry-run skips writing the file"), "{text}");
+        assert!(text.contains("still runs and still bills"), "{text}");
+    }
+
+    #[test]
+    fn a_non_interactive_run_refuses_before_spending_anything() {
+        // Tests run without a tty, which is exactly the case that must not
+        // silently spend a turn.
+        let error = confirm_spend().unwrap_err().to_string();
+        assert!(error.contains("billed"), "{error}");
+        assert!(
+            error.contains("--yes"),
+            "should name the way through: {error}"
+        );
+    }
 
     #[test]
     fn merging_keeps_every_section_it_does_not_own() {

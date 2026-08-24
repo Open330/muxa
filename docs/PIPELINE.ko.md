@@ -42,6 +42,11 @@ muxa는 headless agent 한 턴으로 그 문장을 TOML로 바꾸고, **위임�
 건드리는 건 `[ticket]`·`[[route]]`·`[pipeline.*]` 셋뿐입니다. `toml_edit`으로 다시
 쓰므로 주석과 나머지 섹션은 그대로 살아남습니다.
 
+여기의 모든 경로는 **headless agent 턴 하나를 쓰고, 그 비용은 계정에 과금됩니다.**
+muxa는 실행 전에 무엇을 호출하는지 먼저 알리고, `--dry-run`은 파일 쓰기만
+건너뜁니다 — 턴은 그대로 돌고 그대로 과금됩니다. 비대화형 호출은 `--yes`로
+그 지출을 확인해야 합니다.
+
 ```console
 muxa work init                                # 대화형으로 묻기
 muxa work init --describe "..."               # 비대화형
