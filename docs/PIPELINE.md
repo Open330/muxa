@@ -21,6 +21,43 @@ Under the hood, Workspace and Work are durable logical objects. A tmux session
 binds a Workspace, a window binds the current Run, and a pane binds an agent
 session (see [WORK_MODEL.md](WORK_MODEL.md)).
 
+## Getting set up
+
+`[ticket]`, `[[route]]`, and `[pipeline.*]` are the most structured
+configuration muxa asks for and the least guessable — nested tables, an
+ordered array of routes, regexes, placeholder templates. So you do not have
+to write them from this document:
+
+```console
+$ muxa work init
+◇  Describe the work pipeline you want
+│  cal-* tickets: codex planner, codex implementer, claude reviewer
+```
+
+muxa spends one headless agent turn turning that sentence into TOML, then
+does the part it does *not* delegate: parse the result, compile every
+regex, check that every pipeline a route names exists and that every agent
+it lists could actually launch, print what it would change, and only write
+after you confirm. A model that invents a key or names `vim` as an agent is
+refused with the reason, and your config is left untouched — `Config`
+denies unknown fields, so a typo written to disk would take the daemon down
+at its next start.
+
+Only `[ticket]`, `[[route]]`, and `[pipeline.*]` are touched. The file is
+rewritten through `toml_edit`, so your comments and every other section
+survive verbatim.
+
+```console
+muxa work init                                # ask interactively
+muxa work init --describe "..."               # non-interactive
+muxa work init --dry-run                      # show the proposal, write nothing
+muxa work init --agent codex                  # use a different resolver
+```
+
+Prefer to write it by hand? The annotated reference is in
+[`config.example.toml`](../config.example.toml), and everything below
+explains what each part does.
+
 ## The shape
 
 ```
@@ -270,6 +307,7 @@ So an agent's launch prompt is three layers, outermost first:
 ## Command reference
 
 ```console
+muxa work init                       # write the config by describing it
 muxa work up <work> --external <id>  # link issue, route, create what is missing
 muxa work up <id>                    # compatibility: also look up <id> as an issue
 muxa work up <id> --dry-run          # print the plan, touch nothing

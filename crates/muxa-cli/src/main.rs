@@ -21,6 +21,7 @@ mod timeline;
 mod tmux_work;
 mod upgrade;
 mod watch;
+mod work_init;
 mod work_up;
 
 use anyhow::{Context, Result};
@@ -393,6 +394,10 @@ enum WindowCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
+    /// Describe a work pipeline in your own words and let an agent write
+    /// the `[ticket]`/`[[route]]`/`[pipeline.*]` config for you. Validated
+    /// and shown before anything is written.
+    Init(work_init::InitArgs),
     /// Converge a Work's current Run to its pipeline: optionally link an
     /// external issue, route the Work, and create missing agent sessions.
     /// Re-running converges instead of duplicating.
@@ -554,8 +559,9 @@ fn run_window_cmd(action: WindowCmd) -> Result<()> {
     }
 }
 
-async fn run_work_cmd(action: WorkCmd, cfg: &Config) -> Result<()> {
+async fn run_work_cmd(action: WorkCmd, cfg: &Config, config_path: Option<PathBuf>) -> Result<()> {
     match action {
+        WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Up(args) => work_up::run(args, cfg).await,
         WorkCmd::Start(args) => agent_launch::run_work_start(args),
         WorkCmd::List(args) => tmux_work::run_work_list(args),
@@ -637,7 +643,7 @@ async fn main() -> Result<()> {
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Window { action } => run_window_cmd(action),
-        Cmd::Work { action } => run_work_cmd(action, &cfg).await,
+        Cmd::Work { action } => run_work_cmd(action, &cfg, config_path).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,

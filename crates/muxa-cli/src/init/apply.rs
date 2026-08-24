@@ -240,7 +240,10 @@ fn ensure_parent(p: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+/// Replace a file's contents without a window where it is truncated,
+/// preserving its mode. Shared with `muxa work init`, which edits the same
+/// `config.toml` this module does.
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let permissions = match fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

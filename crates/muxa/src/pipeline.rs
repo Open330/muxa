@@ -34,7 +34,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    PipelineAgentConfig, PipelineConfig, RouteConfig, TicketConfig, TicketSource, WorktreeConfig,
+    Config, PipelineAgentConfig, PipelineConfig, RouteConfig, TicketConfig, TicketSource,
+    WorktreeConfig,
 };
 
 /// Ticket body characters kept in a rendered prompt. A description can run
@@ -71,6 +72,18 @@ pub enum PipelineError {
     NoTicketJson(String),
     #[error("the ticket resolver answered with JSON that is not a ticket: {0}")]
     BadTicketJson(String),
+    #[error("the reply carried no TOML; it began: {0}")]
+    NoToml(String),
+    #[error("the generated TOML does not parse: {0}")]
+    BadToml(String),
+    #[error("the generated config configures nothing: expected at least one [[route]] and one [pipeline.*]")]
+    EmptyProposal,
+    #[error("pipeline {pipeline:?} agent {alias:?} names program {program:?}, which is not an allowlisted agent CLI (claude, codex, gemini, opencode)")]
+    UnknownProgram {
+        pipeline: String,
+        alias: String,
+        program: String,
+    },
 }
 
 /// Ticket context, as the resolver agent reported it.
@@ -208,6 +221,136 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
     }
     let (start, end) = best?;
     text.get(start..end)
+}
+
+/// Agent CLIs a pipeline may name. Kept here so a generated config can be
+/// rejected before it reaches tmux, rather than failing one pane at a time.
+pub const ALLOWLISTED_PROGRAMS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
+
+/// Pull a TOML document out of an agent's reply.
+///
+/// Prefers a fenced `toml` code block, because that is what the prompt asks
+/// for and what models reliably produce. Falls back to the whole reply so
+/// a model that answered with bare TOML still works.
+#[must_use]
+pub fn extract_toml_block(reply: &str) -> Option<&str> {
+    let mut rest = reply;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        let (tag, body) = after.split_once('\n')?;
+        let tag = tag.trim();
+        let Some(close) = body.find("```") else {
+            // Unterminated fence: take what is there rather than nothing.
+            return (tag.is_empty() || tag.eq_ignore_ascii_case("toml"))
+                .then_some(body)
+                .filter(|body| !body.trim().is_empty());
+        };
+        if tag.is_empty() || tag.eq_ignore_ascii_case("toml") {
+            let block = &body[..close];
+            if !block.trim().is_empty() {
+                return Some(block);
+            }
+        }
+        rest = &body[close + 3..];
+    }
+    (!reply.trim().is_empty()).then_some(reply)
+}
+
+/// What a generated config actually configures, for the confirmation the
+/// operator sees before anything is written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProposalSummary {
+    pub ticket_sources: Vec<String>,
+    pub routes: Vec<String>,
+    /// `name → agent count`, in the order a pipeline's agents are declared.
+    pub pipelines: Vec<(String, usize)>,
+}
+
+/// Parse and check a generated `[ticket]`/`[[route]]`/`[pipeline.*]` block
+/// before it is allowed anywhere near the operator's config file.
+///
+/// A model that invents a key, a bad regex, or a pipeline nobody defined
+/// would otherwise take the daemon down at its next start —
+/// [`crate::config::Config`] denies unknown fields, so a typo is a parse
+/// error rather than a shrug. Better to refuse here, while the text is
+/// still just text.
+///
+/// # Errors
+/// [`PipelineError::BadToml`] when the text is not a valid config,
+/// [`PipelineError::EmptyProposal`] when it configures nothing,
+/// [`PipelineError::BadPattern`] for a regex that will not compile,
+/// [`PipelineError::UnknownPipeline`] for a route naming a pipeline that
+/// does not exist, [`PipelineError::EmptyPipeline`] /
+/// [`PipelineError::DuplicateAlias`] / [`PipelineError::UnknownProgram`]
+/// for a line-up that could never launch.
+pub fn validate_proposal(toml_text: &str) -> Result<(Config, ProposalSummary), PipelineError> {
+    let config: Config =
+        toml::from_str(toml_text).map_err(|error| PipelineError::BadToml(error.to_string()))?;
+    if config.route.is_empty() || config.pipeline.is_empty() {
+        return Err(PipelineError::EmptyProposal);
+    }
+    for source in config.ticket.source.values() {
+        if !source.pattern.is_empty() {
+            compile("ticket source", &source.pattern)?;
+        }
+    }
+    for route in &config.route {
+        if !route.pattern.is_empty() {
+            compile("route", &route.pattern)?;
+        }
+        if let Some(name) = route.pipeline.as_deref() {
+            if !config.pipeline.contains_key(name) {
+                return Err(PipelineError::UnknownPipeline(name.to_string()));
+            }
+        }
+    }
+    for (name, pipeline) in &config.pipeline {
+        // Rendering with empty vars is the cheapest way to reuse the same
+        // emptiness and duplicate-alias rules the launcher enforces.
+        desired_agents(name, pipeline, &Vars::new())?;
+        for agent in &pipeline.agent {
+            let program = agent.program.trim().to_ascii_lowercase();
+            if !ALLOWLISTED_PROGRAMS.contains(&program.as_str()) {
+                return Err(PipelineError::UnknownProgram {
+                    pipeline: name.clone(),
+                    alias: agent.alias.clone(),
+                    program: agent.program.clone(),
+                });
+            }
+        }
+    }
+    let summary = ProposalSummary {
+        ticket_sources: config.ticket.source.keys().cloned().collect(),
+        routes: config
+            .route
+            .iter()
+            .map(|route| {
+                format!(
+                    "{} → {}",
+                    route.pattern,
+                    route.pipeline.as_deref().unwrap_or("(no pipeline)")
+                )
+            })
+            .collect(),
+        pipelines: config
+            .pipeline
+            .iter()
+            .map(|(name, pipeline)| (name.clone(), pipeline.agent.len()))
+            .collect(),
+    };
+    Ok((config, summary))
+}
+
+fn compile(scope: &'static str, pattern: &str) -> Result<(), PipelineError> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map(|_| ())
+        .map_err(|source| PipelineError::BadPattern {
+            scope,
+            pattern: pattern.to_string(),
+            source,
+        })
 }
 
 /// Placeholder values available to `[ticket.source]` prompts, `[[route]]`
@@ -1051,6 +1194,128 @@ program = 'claude'
         assert_eq!(plan.path, Path::new("/wt/cal-7"));
         assert_eq!(plan.branch, "june/cal-7");
         assert_eq!(plan.base.as_deref(), Some("origin/main"));
+    }
+
+    const GOOD: &str = r"
+[[route]]
+match = '^cal-'
+pipeline = 'triad'
+
+[pipeline.triad]
+[[pipeline.triad.agent]]
+alias = 'impl'
+program = 'codex'
+[[pipeline.triad.agent]]
+alias = 'review'
+program = 'claude'
+";
+
+    #[test]
+    fn a_fenced_toml_block_is_lifted_out_of_the_prose_around_it() {
+        let reply = format!("Sure, here you go:\n\n```toml{GOOD}```\n\nPaste that in.");
+        let block = extract_toml_block(&reply).expect("block");
+        assert!(block.contains("[pipeline.triad]"), "{block}");
+        assert!(!block.contains("Paste that in"), "{block}");
+    }
+
+    #[test]
+    fn bare_toml_with_no_fence_still_works() {
+        let block = extract_toml_block(GOOD).expect("block");
+        assert!(block.contains("[[route]]"));
+        assert!(extract_toml_block("   ").is_none());
+    }
+
+    #[test]
+    fn a_valid_proposal_reports_what_it_configures() {
+        let (_, summary) = validate_proposal(GOOD).expect("valid");
+        assert_eq!(summary.routes, vec!["^cal- → triad"]);
+        assert_eq!(summary.pipelines, vec![("triad".to_string(), 2)]);
+        assert!(summary.ticket_sources.is_empty());
+    }
+
+    #[test]
+    fn an_invented_key_is_refused_before_it_reaches_the_config_file() {
+        // Config denies unknown fields, so a model's typo would take the
+        // daemon down at its next start. Catch it while it is still text.
+        let error = validate_proposal(
+            r"
+[[route]]
+match = '.*'
+piepline = 'triad'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn a_route_naming_a_pipeline_nobody_defined_is_refused() {
+        let error = validate_proposal(
+            r"
+[[route]]
+match = '.*'
+pipeline = 'ghost'
+
+[pipeline.real]
+[[pipeline.real.agent]]
+alias = 'a'
+program = 'codex'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn a_program_that_is_not_an_agent_cli_is_refused() {
+        let error = validate_proposal(
+            r"
+[[route]]
+match = '.*'
+pipeline = 'p'
+
+[pipeline.p]
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'vim'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vim"), "{error}");
+        assert!(
+            error.contains("claude"),
+            "should list what is allowed: {error}"
+        );
+    }
+
+    #[test]
+    fn an_uncompilable_pattern_is_refused_with_the_pattern_named() {
+        let error = validate_proposal(
+            r"
+[[route]]
+match = 'cal-['
+pipeline = 'p'
+
+[pipeline.p]
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'codex'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cal-["), "{error}");
+    }
+
+    #[test]
+    fn a_proposal_that_configures_nothing_is_refused() {
+        assert!(matches!(
+            validate_proposal("[ticket]\nagent = 'claude'\n"),
+            Err(PipelineError::EmptyProposal)
+        ));
     }
 
     #[test]
