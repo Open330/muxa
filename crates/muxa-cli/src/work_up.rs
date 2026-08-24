@@ -148,11 +148,16 @@ pub(crate) struct Resolved {
     states: HashMap<String, AgentState>,
 }
 
-pub async fn run(args: UpArgs, config: &Config, client: Option<&muxa::ipc::Client>) -> Result<()> {
+pub async fn run(
+    args: UpArgs,
+    config: &Config,
+    config_path: Option<PathBuf>,
+    client: Option<&muxa::ipc::Client>,
+) -> Result<()> {
     let json = args.json;
     let dry_run = args.dry_run;
     let show_prompts = args.show_prompts;
-    let resolved = resolve(&args, config, client).await?;
+    let resolved = resolve_or_onboard(&args, config, config_path, client).await?;
     if show_prompts {
         print_prompts(&resolved.desired);
     }
@@ -740,6 +745,62 @@ fn existing_agents(
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Resolve, and on a first run with nothing configured, offer to set it
+/// up rather than failing with instructions the operator then has to
+/// follow by hand.
+///
+/// "No route matches" is only an error for someone who already has a
+/// config. For everyone else it is the first thing muxa ever says to
+/// them, and answering it with TOML syntax is how a feature goes unused.
+/// `muxa work init` is already the conversation that fixes it, so this
+/// hands over to it and retries once with the config it wrote.
+async fn resolve_or_onboard(
+    args: &UpArgs,
+    config: &Config,
+    config_path: Option<PathBuf>,
+    client: Option<&muxa::ipc::Client>,
+) -> Result<Resolved> {
+    let error = match resolve(args, config, client).await {
+        Ok(resolved) => return Ok(resolved),
+        Err(error) => error,
+    };
+    let unconfigured = error
+        .downcast_ref::<pipeline::PipelineError>()
+        .is_some_and(|error| matches!(error, pipeline::PipelineError::NoRoute(_)));
+    if !unconfigured || !offer_onboarding()? {
+        return Err(error);
+    }
+    crate::work_init::run(
+        crate::work_init::InitArgs {
+            describe: None,
+            agent: None,
+            dry_run: false,
+            yes: false,
+        },
+        config,
+        config_path.clone(),
+    )
+    .await?;
+    // Reload: the file just changed underneath the config this process
+    // started with.
+    let config = Config::load_or_default(config_path.as_deref())
+        .context("re-reading the config muxa work init just wrote")?;
+    resolve(args, &config, client).await
+}
+
+/// Ask whether to set muxa up now. Non-interactive callers keep the plain
+/// error — a script wants a failure it can read, not a prompt.
+fn offer_onboarding() -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(false);
+    }
+    println!("muxa has no work pipeline configured yet.");
+    Ok(cliclack::confirm("Set one up now?")
+        .initial_value(true)
+        .interact()?)
 }
 
 /// Build the caller's request, asking for one when nothing was supplied.
