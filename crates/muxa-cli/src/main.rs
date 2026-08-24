@@ -160,7 +160,7 @@ enum Cmd {
     Report(stats::ReportArgs),
     /// Explore agent work/wait/error intervals as an interactive timeline.
     Timeline(timeline::Args),
-    /// Session-card TUI console for inspecting and operating agents.
+    /// Work-board TUI for tracking Work, Runs, external issues, and agents.
     Dashboard(dashboard_tui::Args),
     /// Query raw activity ledger intervals.
     Activity(activity_query::Args),
