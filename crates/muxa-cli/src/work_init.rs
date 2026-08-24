@@ -73,8 +73,14 @@ match     = '^cal-'           # regex against the work id
 workspace = 'callabo'         # the tmux session; defaults to the cwd name
 pipeline  = 'triad'           # must name a [pipeline.*] below
 cwd       = '~/src/{{id}}'    # optional; omit to use the current directory
-[route.worktree]              # optional: a git worktree per work item
-repo   = '~/src/repo'
+prepare   = 'mk-ws {{id}} {{ticket.branch}}'
+                              # optional: command that provisions this work's
+                              # environment, run once when the work window does
+                              # not exist yet. Pair it with `cwd`, since the
+                              # directory usually does not exist until it has
+                              # run. Cannot be combined with [route.worktree].
+[route.worktree]              # optional: a git worktree per work item.
+repo   = '~/src/repo'         # Use this OR prepare, never both.
 branch = '{{id}}'
 
 [pipeline.<name>]             # REQUIRED: at least one
@@ -85,6 +91,7 @@ prompt = '''...'''            # context every agent in this pipeline gets
 alias   = 'impl'              # unique within the pipeline; keys the pane diff
 program = 'codex'             # ONLY claude, codex, gemini, or opencode
 role    = 'implementer'       # optional; peers address it as role:<role>
+task    = 'fix the reaper'    # optional; short label in `muxa work show`/`watch`
 prompt  = '...'               # optional; this agent's own instructions
 direction = 'right'           # optional: right (default) or down
 
@@ -362,6 +369,34 @@ pipeline = 'solo'
 alias = 'main'
 program = 'claude'
 ";
+
+    #[test]
+    fn the_schema_documents_every_key_a_route_accepts() {
+        // A key the schema omits is a key the model will not use — it is
+        // told not to invent any, and it obeys. `prepare` shipped once
+        // without being documented here and simply never appeared in a
+        // generated config, so this locks the two together.
+        let route = serde_json::to_value(muxa::config::RouteConfig::default())
+            .expect("RouteConfig serializes");
+        for key in route.as_object().expect("an object").keys() {
+            assert!(
+                SCHEMA.contains(key.as_str()),
+                "route key `{key}` is not in the schema the model is shown"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schema_documents_every_key_a_pipeline_agent_accepts() {
+        let agent = serde_json::to_value(muxa::config::PipelineAgentConfig::default())
+            .expect("PipelineAgentConfig serializes");
+        for key in agent.as_object().expect("an object").keys() {
+            assert!(
+                SCHEMA.contains(key.as_str()),
+                "pipeline agent key `{key}` is not in the schema the model is shown"
+            );
+        }
+    }
 
     #[test]
     fn the_notice_names_the_command_and_that_it_costs_money() {
