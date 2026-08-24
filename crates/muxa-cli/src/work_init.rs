@@ -120,11 +120,16 @@ pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) 
         .map(|cwd| PathBuf::from(expand_tilde(&cwd.to_string_lossy())))
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    announce(&agent, &resolver_cwd, config, args.dry_run);
-    if !args.yes && !confirm_spend()? {
-        println!("nothing was called.");
-        return Ok(());
-    }
+    announce(&resolver_cwd, config, args.dry_run);
+    let agent = if args.yes {
+        agent
+    } else {
+        let Some(chosen) = choose_agent(&agent)? else {
+            println!("nothing was called.");
+            return Ok(());
+        };
+        chosen
+    };
     let answer = muxa::ask::one_shot(muxa::ask::OneShot {
         agent: &agent,
         prompt: &prompt,
@@ -175,22 +180,21 @@ pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) 
 /// `--dry-run` is the reason this exists rather than being obvious: it
 /// skips the *file write*, not the agent turn, so "dry run" must not be
 /// read as "nothing happens". The expensive half happens either way.
-fn announce(agent: &str, cwd: &std::path::Path, config: &Config, dry_run: bool) {
-    for line in notice_lines(agent, cwd, config, dry_run) {
+fn announce(cwd: &std::path::Path, config: &Config, dry_run: bool) {
+    for line in notice_lines(cwd, config, dry_run) {
         println!("{line}");
     }
 }
 
-fn notice_lines(agent: &str, cwd: &std::path::Path, config: &Config, dry_run: bool) -> Vec<String> {
+fn notice_lines(cwd: &std::path::Path, config: &Config, dry_run: bool) -> Vec<String> {
     let mut lines = vec![
-        format!("muxa is about to run one headless {agent} turn to write your config."),
-        format!("  command   {agent} (print mode)"),
+        "muxa is about to run one headless agent turn to write your config.".to_string(),
         format!("  runs in   {}", cwd.display()),
         format!(
             "  policy    {:?} permissions, {}s ceiling",
             config.ticket.permission_mode, config.ticket.timeout_secs
         ),
-        format!("  cost      billed to your {agent} account, like any other turn"),
+        "  cost      billed to that agent's account, like any other turn".to_string(),
     ];
     if dry_run {
         lines.push(
@@ -201,16 +205,49 @@ fn notice_lines(agent: &str, cwd: &std::path::Path, config: &Config, dry_run: bo
     lines
 }
 
-/// Ask before spending. Non-interactive callers must say `--yes`, matching
-/// how the rest of muxa gates an action the operator cannot take back.
-fn confirm_spend() -> Result<bool> {
+/// Which agent to spend the turn on — and, by answering, whether to spend
+/// it at all. One prompt rather than "confirm?" then "which?": picking the
+/// agent is already the decision.
+///
+/// Only agents that can actually do the job are listed: the bridge needs a
+/// print mode ([`muxa::ask::supported_agents`]) and the binary has to be on
+/// PATH. Offering one that would fail after the operator picked it is worse
+/// than not offering it at all.
+fn choose_agent(default: &str) -> Result<Option<String>> {
     use std::io::IsTerminal;
+    let available = available_agents(&|name| which::which(name).is_ok());
+    if available.is_empty() {
+        bail!(
+            "no headless-capable agent is installed; muxa needs one of: {}",
+            muxa::ask::supported_agents().join(", ")
+        );
+    }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("this spends a billed agent turn; pass --yes to confirm non-interactively");
     }
-    Ok(cliclack::confirm("Spend one agent turn?")
-        .initial_value(true)
-        .interact()?)
+    let mut select = cliclack::select("Spend one agent turn on…");
+    for name in &available {
+        select = select.item(
+            Some((*name).to_string()),
+            *name,
+            if *name == default { "configured" } else { "" },
+        );
+    }
+    select = select.item(None, "Cancel", "call nothing");
+    if available.contains(&default) {
+        select = select.initial_value(Some(default.to_string()));
+    }
+    Ok(select.interact()?)
+}
+
+/// Supported by the bridge *and* present on this machine, in the bridge's
+/// preference order.
+fn available_agents(installed: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
+    muxa::ask::supported_agents()
+        .iter()
+        .copied()
+        .filter(|name| installed(name))
+        .collect()
 }
 
 fn ask_operator() -> Result<String> {
@@ -329,9 +366,8 @@ program = 'claude'
     #[test]
     fn the_notice_names_the_command_and_that_it_costs_money() {
         let config = Config::default();
-        let lines = notice_lines("claude", std::path::Path::new("/home/june"), &config, false);
+        let lines = notice_lines(std::path::Path::new("/home/june"), &config, false);
         let text = lines.join("\n");
-        assert!(text.contains("claude (print mode)"), "{text}");
         assert!(text.contains("/home/june"), "{text}");
         assert!(text.contains("billed"), "{text}");
         // Nothing about dry-run when this is a real run.
@@ -343,7 +379,7 @@ program = 'claude'
         // The whole point: --dry-run skips the file write, not the agent
         // turn, so it must not read as "nothing happens".
         let config = Config::default();
-        let text = notice_lines("codex", std::path::Path::new("/tmp"), &config, true).join("\n");
+        let text = notice_lines(std::path::Path::new("/tmp"), &config, true).join("\n");
         assert!(text.contains("--dry-run skips writing the file"), "{text}");
         assert!(text.contains("still runs and still bills"), "{text}");
     }
@@ -351,13 +387,29 @@ program = 'claude'
     #[test]
     fn a_non_interactive_run_refuses_before_spending_anything() {
         // Tests run without a tty, which is exactly the case that must not
-        // silently spend a turn.
-        let error = confirm_spend().unwrap_err().to_string();
-        assert!(error.contains("billed"), "{error}");
+        // silently spend a turn. Whether it lands on the "no agent
+        // installed" or the "not a terminal" refusal depends on the
+        // machine; both stop before anything is spawned.
+        let error = choose_agent("claude").unwrap_err().to_string();
         assert!(
-            error.contains("--yes"),
-            "should name the way through: {error}"
+            error.contains("--yes") || error.contains("no headless-capable agent"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn only_agents_that_could_actually_run_are_offered() {
+        // The launcher knows gemini/agy/opencode; the headless bridge does
+        // not, so they must never appear here however installed.
+        let all = available_agents(&|_| true);
+        assert_eq!(all, muxa::ask::supported_agents().to_vec());
+        assert!(!all.contains(&"gemini"), "{all:?}");
+        assert!(!all.contains(&"agy"), "{all:?}");
+
+        // Supported but absent from PATH is still not offered: picking it
+        // would fail after the operator chose it.
+        assert_eq!(available_agents(&|name| name == "codex"), vec!["codex"]);
+        assert!(available_agents(&|_| false).is_empty());
     }
 
     #[test]
