@@ -1510,6 +1510,9 @@ async fn cmd_dashboard(client: &Client, cfg: &Config, args: dashboard_tui::Args)
         })
         .flatten();
     match dashboard_tui::run(client, cfg, args).await? {
+        Some(dashboard_tui::OpenTarget::TopologyPane(key)) => {
+            jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
+        }
         Some(dashboard_tui::OpenTarget::Pane(pane_id)) => {
             jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
         }

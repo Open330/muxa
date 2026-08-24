@@ -771,6 +771,9 @@ async fn work_metadata_put_handler(
     State(state): State<AppState>,
     Json(input): Json<WorkMetadataPutRequest>,
 ) -> Response {
+    if let Err(error) = validate_work_selector(input.identity.as_ref(), input.key.as_ref()) {
+        return control_error(StatusCode::BAD_REQUEST, error);
+    }
     let metadata = match input.metadata.validate() {
         Ok(metadata) => metadata,
         Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
@@ -827,6 +830,17 @@ fn pane_matches_execution(pane: &PaneSummary, key: &ExecutionIdentity) -> bool {
         && pane_socket_identity(pane) == key.socket
         && pane.session_id == key.session_id
         && pane.window_id == key.window_id
+}
+
+fn validate_work_selector(
+    identity: Option<&WorkIdentity>,
+    key: Option<&ExecutionIdentity>,
+) -> Result<(), &'static str> {
+    match (identity, key) {
+        (None, None) => Err("work selector is missing"),
+        (Some(_), Some(_)) => Err("provide exactly one work selector: identity or key"),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1113,8 +1127,8 @@ async fn run_work_control(
     submit: bool,
     action: &'static str,
 ) -> Response {
-    if identity.is_none() && key.is_none() {
-        return control_error(StatusCode::BAD_REQUEST, "work selector is missing");
+    if let Err(error) = validate_work_selector(identity.as_ref(), key.as_ref()) {
+        return control_error(StatusCode::BAD_REQUEST, error);
     }
     let scan = state.refresh_pane_scan().await;
     let agents = state.store.snapshot().await;
@@ -3137,6 +3151,59 @@ mod tests {
             reloaded.records()[0].metadata.title.as_deref(),
             Some("Repair auth")
         );
+    }
+
+    #[tokio::test]
+    async fn work_mutations_refuse_ambiguous_logical_and_execution_selectors() {
+        let app = router(public_read_state("edit-pat"));
+        let metadata = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "identity":{"workspace_id":"muxa","work_id":"CAL-101"},
+                            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+                            "metadata":{"stage":"review"}
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(metadata).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exactly one"));
+
+        let prompt = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "identity":{"workspace_id":"muxa","work_id":"CAL-101"},
+                            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+                            "text":"report status"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prompt.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(prompt).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exactly one"));
     }
 
     #[tokio::test]

@@ -26,7 +26,8 @@ use muxa::work::{BoardStage, ExternalItemRef, WorkSignal, WorkSnapshot};
 #[cfg(test)]
 use muxa::SessionRef;
 use muxa::{
-    Agent, AgentKind, AgentState, Config, HostKind, PaneBackend, ScopeExclusions, SurfaceKind,
+    Agent, AgentKind, AgentState, BackendEndpoint, Config, HostKind, PaneBackend, PaneKey,
+    ScopeExclusions, SessionKey, SurfaceKind, TopologyNodeKey, WindowKey,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -85,12 +86,14 @@ enum DashboardSort {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
 }
@@ -98,6 +101,7 @@ enum ActionTarget {
 impl ActionTarget {
     fn capture_target(&self) -> CaptureTarget {
         match self {
+            Self::TopologyPane(pane) => CaptureTarget::TopologyPane(pane.clone()),
             Self::Pane(pane) => CaptureTarget::Pane(pane.clone()),
             Self::PtySession(session) => CaptureTarget::PtySession(session.clone()),
         }
@@ -105,6 +109,7 @@ impl ActionTarget {
 
     fn open_target(&self) -> OpenTarget {
         match self {
+            Self::TopologyPane(pane) => OpenTarget::TopologyPane(pane.clone()),
             Self::Pane(pane) => OpenTarget::Pane(pane.clone()),
             Self::PtySession(session) => OpenTarget::PtySession(session.clone()),
         }
@@ -112,6 +117,7 @@ impl ActionTarget {
 
     fn prompt_target(&self) -> PromptTarget {
         match self {
+            Self::TopologyPane(pane) => PromptTarget::TopologyPane(pane.clone()),
             Self::Pane(pane) => PromptTarget::Pane(pane.clone()),
             Self::PtySession(session) => PromptTarget::PtySession(session.clone()),
         }
@@ -119,8 +125,24 @@ impl ActionTarget {
 
     fn label(&self) -> String {
         match self {
+            Self::TopologyPane(pane) => format!(
+                "{} pane {}",
+                pane.window.session.endpoint.socket, pane.pane_id
+            ),
             Self::Pane(pane) => format!("pane {pane}"),
             Self::PtySession(session) => format!("pty {session}"),
+        }
+    }
+
+    fn is_pane(&self) -> bool {
+        matches!(self, Self::TopologyPane(_) | Self::Pane(_))
+    }
+
+    fn pane_id(&self) -> Option<&str> {
+        match self {
+            Self::TopologyPane(pane) => Some(&pane.pane_id),
+            Self::Pane(pane) => Some(pane),
+            Self::PtySession(_) => None,
         }
     }
 }
@@ -432,8 +454,10 @@ struct SessionCard {
     label: String,
     host: CardHost,
     pane_ids: Vec<String>,
+    pane_keys: Vec<PaneKey>,
     pane_labels: Vec<String>,
     primary_pane: Option<String>,
+    primary_pane_key: Option<PaneKey>,
     pty_session_id: Option<String>,
     cwd: Option<String>,
     agents: Vec<Agent>,
@@ -460,23 +484,34 @@ struct SessionCard {
 impl SessionCard {
     fn action_targets(&self) -> Vec<ActionTarget> {
         let mut targets = Vec::new();
-        if let Some(pane) = self.primary_pane.as_ref() {
+        if let Some(pane) = self.primary_pane_key.as_ref() {
+            push_action_target(&mut targets, ActionTarget::TopologyPane(pane.clone()));
+        } else if let Some(pane) = self.primary_pane.as_ref() {
             push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
         }
         if let Some(session) = self.pty_session_id.as_ref() {
             push_action_target(&mut targets, ActionTarget::PtySession(session.clone()));
         }
-        for agent in &self.agents {
-            if let Some(pane) = agent.pane.as_ref() {
-                push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
-            } else if let Some(surface) = agent.surface.as_ref() {
-                if surface.kind == SurfaceKind::Pty {
-                    push_action_target(&mut targets, ActionTarget::PtySession(surface.id.clone()));
+        if self.pane_keys.is_empty() {
+            for agent in &self.agents {
+                if let Some(pane) = agent.pane.as_ref() {
+                    push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
+                } else if let Some(surface) = agent.surface.as_ref() {
+                    if surface.kind == SurfaceKind::Pty {
+                        push_action_target(
+                            &mut targets,
+                            ActionTarget::PtySession(surface.id.clone()),
+                        );
+                    }
                 }
             }
-        }
-        for pane in &self.pane_ids {
-            push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
+            for pane in &self.pane_ids {
+                push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
+            }
+        } else {
+            for pane in &self.pane_keys {
+                push_action_target(&mut targets, ActionTarget::TopologyPane(pane.clone()));
+            }
         }
         targets
     }
@@ -850,10 +885,8 @@ impl DashboardApp {
     }
 
     fn selected_collaboration_peer(&self) -> Option<&Participant> {
-        let ActionTarget::Pane(pane) = self.selected_action_target()? else {
-            return None;
-        };
-        self.data.collaboration.peer_for_pane(&pane)
+        let target = self.selected_action_target()?;
+        self.data.collaboration.peer_for_pane(target.pane_id()?)
     }
 
     fn collaboration_requests(&self) -> &[CollaborationRequest] {
@@ -944,12 +977,17 @@ struct ConfirmPopup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
     Quick(QuickAction),
+    PanePrompt {
+        pane: PaneKey,
+        text: String,
+    },
+    PaneAbort(PaneKey),
     WorkPrompt {
-        panes: Vec<String>,
+        panes: Vec<PaneKey>,
         text: String,
     },
     WorkAbort {
-        panes: Vec<String>,
+        panes: Vec<PaneKey>,
     },
     PtyPrompt {
         session_id: String,
@@ -1043,9 +1081,10 @@ impl PromptComposer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PromptTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
-    WorkPanes(Vec<String>),
+    WorkPanes(Vec<PaneKey>),
     CollaborationSend {
         origin: CollaborationOrigin,
         target: String,
@@ -1061,6 +1100,7 @@ enum PromptTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CaptureTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
 }
@@ -1479,9 +1519,8 @@ fn dashboard_collaboration_origin_from(
 /// daemon's participant because it is already normalized; cards outside the
 /// launch room fall back to the selected agent's recorded endpoint.
 fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
-    let ActionTarget::Pane(pane) = app.selected_action_target()? else {
-        return None;
-    };
+    let target = app.selected_action_target()?;
+    let pane = target.pane_id()?.to_string();
     let participant = app.data.collaboration.peer_for_pane(&pane);
     let agent = app.selected_card().and_then(|card| {
         card.agents
@@ -1502,6 +1541,10 @@ fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
                     .as_deref()
                     .map(|endpoint| muxa::backend::pane_endpoint_identity(Some(&pane), endpoint))
             })
+        })
+        .or_else(|| match &target {
+            ActionTarget::TopologyPane(key) => Some(key.window.session.endpoint.socket.clone()),
+            ActionTarget::Pane(_) | ActionTarget::PtySession(_) => None,
         });
     Some(CollaborationAnchor {
         origin: CollaborationOrigin {
@@ -1570,8 +1613,22 @@ fn build_work_dashboard_data(
 
         let mut seen_agents = BTreeSet::new();
         for run in work.runs {
+            let window = WindowKey {
+                session: SessionKey {
+                    endpoint: BackendEndpoint {
+                        host: run.execution.host,
+                        socket: run.execution.socket.clone(),
+                    },
+                    session_id: run.execution.session_id.clone(),
+                },
+                window_id: run.execution.window_id.clone(),
+            };
             for pane in run.panes {
-                builder.pane_ids.insert(pane.pane_id);
+                builder.pane_ids.insert(pane.pane_id.clone());
+                builder.pane_keys.insert(PaneKey {
+                    window: window.clone(),
+                    pane_id: pane.pane_id,
+                });
                 if let Some(agent) = pane.agent {
                     if seen_agents.insert(agent.session_id.clone()) {
                         builder.agents.push(agent);
@@ -1762,6 +1819,7 @@ struct CardBuilder {
     label: String,
     host: CardHost,
     pane_ids: BTreeSet<String>,
+    pane_keys: BTreeSet<PaneKey>,
     pty_session_id: Option<String>,
     cwd: Option<String>,
     agents: Vec<Agent>,
@@ -1780,6 +1838,7 @@ impl CardBuilder {
             label,
             host,
             pane_ids: BTreeSet::new(),
+            pane_keys: BTreeSet::new(),
             pty_session_id: None,
             cwd: None,
             agents: Vec::new(),
@@ -1872,7 +1931,17 @@ fn finalize_card(
     let status = counts.status();
     let active = active_for_card(&builder, active_by_session);
     let pane_ids = builder.pane_ids.into_iter().collect::<Vec<_>>();
+    let pane_keys = builder.pane_keys.into_iter().collect::<Vec<_>>();
     let primary_pane = choose_primary_pane(&builder.agents, &pane_ids);
+    let primary_pane_key = primary_pane
+        .as_ref()
+        .and_then(|pane_id| {
+            pane_keys
+                .iter()
+                .find(|pane| &pane.pane_id == pane_id)
+                .cloned()
+        })
+        .or_else(|| pane_keys.first().cloned());
     let pane_labels = pane_ids
         .iter()
         .map(|pane| pane_label(pane, pane_by_id))
@@ -1903,8 +1972,10 @@ fn finalize_card(
         label: builder.label,
         host: builder.host,
         pane_ids,
+        pane_keys,
         pane_labels,
         primary_pane,
+        primary_pane_key,
         pty_session_id: builder.pty_session_id,
         cwd: builder.cwd.or(fallback_cwd),
         agents: builder.agents,
@@ -2199,6 +2270,7 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
                 return UiAction::None;
             }
             UiAction::Run(match composer.target {
+                PromptTarget::TopologyPane(pane) => PendingAction::PanePrompt { pane, text },
                 PromptTarget::Pane(pane_id) => {
                     PendingAction::Quick(QuickAction::SendPrompt { pane_id, text })
                 }
@@ -2373,7 +2445,10 @@ fn cycle_composer_option(composer: &mut PromptComposer) {
                 | RequestStatus::Cancelled => RequestStatus::Completed,
             };
         }
-        PromptTarget::Pane(_) | PromptTarget::PtySession(_) | PromptTarget::WorkPanes(_) => {}
+        PromptTarget::TopologyPane(_)
+        | PromptTarget::Pane(_)
+        | PromptTarget::PtySession(_)
+        | PromptTarget::WorkPanes(_) => {}
     }
 }
 
@@ -2583,7 +2658,7 @@ fn open_composer(app: &mut DashboardApp) -> UiAction {
         app.set_hint("no session selected", HintLevel::Err);
         return UiAction::None;
     };
-    if matches!(target, ActionTarget::Pane(_)) && !pane_write_supported(host) {
+    if target.is_pane() && !pane_write_supported(host) {
         let message = unsupported_pane_action(host, "prompting")
             .unwrap_or_else(|| "prompt unsupported".into());
         app.set_hint(message, HintLevel::Err);
@@ -2596,19 +2671,33 @@ fn open_composer(app: &mut DashboardApp) -> UiAction {
     UiAction::None
 }
 
-fn live_work_panes(card: &SessionCard) -> Vec<String> {
-    let mut panes = Vec::new();
-    for agent in &card.agents {
-        if agent.state == AgentState::Stopped {
-            continue;
-        }
-        if let Some(pane) = agent.pane.as_ref() {
-            if !panes.contains(pane) {
-                panes.push(pane.clone());
-            }
-        }
+fn live_work_panes(card: &SessionCard) -> Vec<PaneKey> {
+    card.pane_keys
+        .iter()
+        .filter(|pane| {
+            card.agents.iter().any(|agent| {
+                agent.state != AgentState::Stopped && agent_targets_pane_key(agent, pane, card)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn agent_targets_pane_key(agent: &Agent, key: &PaneKey, card: &SessionCard) -> bool {
+    if agent.pane.as_deref() != Some(&key.pane_id) {
+        return false;
     }
-    panes
+    if let Some(socket) = agent.tmux_socket.as_deref() {
+        let endpoint = muxa::backend::pane_endpoint_identity(agent.pane.as_deref(), socket);
+        return endpoint == key.window.session.endpoint.socket
+            && muxa::backend::pane_id_host_kind(&key.pane_id)
+                .is_none_or(|host| host == key.window.session.endpoint.host);
+    }
+    card.pane_keys
+        .iter()
+        .filter(|pane| pane.pane_id == key.pane_id)
+        .count()
+        == 1
 }
 
 fn open_work_composer(app: &mut DashboardApp) -> UiAction {
@@ -2648,13 +2737,14 @@ fn confirm_abort(app: &mut DashboardApp) -> UiAction {
     let Some((host, label, target)) = selected_target_context(app) else {
         return UiAction::None;
     };
-    if matches!(target, ActionTarget::Pane(_)) && !pane_write_supported(host) {
+    if target.is_pane() && !pane_write_supported(host) {
         let message =
             unsupported_pane_action(host, "abort").unwrap_or_else(|| "abort unsupported".into());
         app.set_hint(message, HintLevel::Err);
         return UiAction::None;
     }
     let action = match target.clone() {
+        ActionTarget::TopologyPane(pane) => PendingAction::PaneAbort(pane),
         ActionTarget::Pane(pane_id) => PendingAction::Quick(QuickAction::AbortTurn(pane_id)),
         ActionTarget::PtySession(session_id) => PendingAction::PtyCtrlC(session_id),
     };
@@ -2695,13 +2785,16 @@ fn confirm_kill(app: &mut DashboardApp) -> UiAction {
     let Some((host, label, target)) = selected_target_context(app) else {
         return UiAction::None;
     };
-    if matches!(target, ActionTarget::Pane(_)) && !pane_write_supported(host) {
+    if target.is_pane() && !pane_write_supported(host) {
         let message = unsupported_pane_action(host, "termination")
             .unwrap_or_else(|| "terminate unsupported".into());
         app.set_hint(message, HintLevel::Err);
         return UiAction::None;
     }
     let action = match target.clone() {
+        ActionTarget::TopologyPane(pane) => {
+            PendingAction::Quick(QuickAction::TerminateNode(TopologyNodeKey::Pane(pane)))
+        }
         ActionTarget::Pane(pane_id) => PendingAction::Quick(QuickAction::KillPane(pane_id)),
         ActionTarget::PtySession(session_id) => PendingAction::TerminatePty(session_id),
     };
@@ -2718,20 +2811,16 @@ async fn run_pending_action(client: &Client, action: PendingAction) -> ActionOut
             let mut fx = RealEffects;
             watch::dispatch_quick_action(action, &mut fx)
         }
-        PendingAction::WorkPrompt { panes, text } => run_work_quick_actions(
-            panes
-                .into_iter()
-                .map(|pane_id| QuickAction::SendPrompt {
-                    pane_id,
-                    text: text.clone(),
-                })
-                .collect(),
-            "prompted",
-        ),
-        PendingAction::WorkAbort { panes } => run_work_quick_actions(
-            panes.into_iter().map(QuickAction::AbortTurn).collect(),
-            "aborted",
-        ),
+        PendingAction::PanePrompt { pane, text } => {
+            run_exact_pane_action(&pane, &text, true, "prompted")
+        }
+        PendingAction::PaneAbort(pane) => run_exact_pane_action(&pane, "\u{3}", false, "aborted"),
+        PendingAction::WorkPrompt { panes, text } => {
+            run_work_pane_actions(panes, &text, true, "prompted")
+        }
+        PendingAction::WorkAbort { panes } => {
+            run_work_pane_actions(panes, "\u{3}", false, "aborted")
+        }
         PendingAction::PtyPrompt { session_id, text } => {
             write_pty(
                 client,
@@ -2865,16 +2954,26 @@ async fn terminate_pty(client: &Client, session_id: String) -> ActionOutcome {
     }
 }
 
-fn run_work_quick_actions(actions: Vec<QuickAction>, verb: &str) -> ActionOutcome {
-    let attempted = actions.len();
+fn run_exact_pane_action(pane: &PaneKey, text: &str, submit: bool, verb: &str) -> ActionOutcome {
+    match send_to_exact_pane(pane, text, submit) {
+        Ok(()) => ActionOutcome::Ok(format!("{verb} pane {}", pane.pane_id)),
+        Err(error) => ActionOutcome::Err(format!("{verb} failed: {error}")),
+    }
+}
+
+fn run_work_pane_actions(
+    panes: Vec<PaneKey>,
+    text: &str,
+    submit: bool,
+    verb: &str,
+) -> ActionOutcome {
+    let attempted = panes.len();
     let mut succeeded = 0;
     let mut errors = Vec::new();
-    let mut effects = RealEffects;
-    for action in actions {
-        match watch::dispatch_quick_action(action, &mut effects) {
-            ActionOutcome::Ok(_) => succeeded += 1,
-            ActionOutcome::Err(error) => errors.push(error),
-            ActionOutcome::HelpToggled => {}
+    for pane in panes {
+        match send_to_exact_pane(&pane, text, submit) {
+            Ok(()) => succeeded += 1,
+            Err(error) => errors.push(format!("{}: {error}", pane.pane_id)),
         }
     }
     if errors.is_empty() {
@@ -2885,6 +2984,27 @@ fn run_work_quick_actions(actions: Vec<QuickAction>, verb: &str) -> ActionOutcom
             errors.join("; ")
         ))
     }
+}
+
+fn send_to_exact_pane(pane: &PaneKey, text: &str, submit: bool) -> std::result::Result<(), String> {
+    let endpoint = &pane.window.session.endpoint;
+    let backend = muxa::active_backends()
+        .into_iter()
+        .find(|backend| backend.kind() == endpoint.host)
+        .ok_or_else(|| format!("{} backend is not active", endpoint.host))?;
+    if !backend.caps().send_text {
+        return Err(format!("{} pane input is not supported", endpoint.host));
+    }
+    if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
+        return Err("input was rejected".into());
+    }
+    if submit {
+        std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+        if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, "\r") {
+            return Err("prompt text was sent but submit failed".into());
+        }
+    }
+    Ok(())
 }
 
 fn apply_outcome(app: &mut DashboardApp, outcome: ActionOutcome) {
@@ -2913,7 +3033,13 @@ async fn refresh_capture(client: &Client, app: &mut DashboardApp) {
         return;
     }
 
-    if matches!((&target, host), (CaptureTarget::Pane(_), CardHost::Zellij)) {
+    if matches!(
+        (&target, host),
+        (
+            CaptureTarget::TopologyPane(_) | CaptureTarget::Pane(_),
+            CardHost::Zellij
+        )
+    ) {
         app.capture = CaptureCache {
             target: Some(target),
             text: None,
@@ -2924,6 +3050,16 @@ async fn refresh_capture(client: &Client, app: &mut DashboardApp) {
     }
 
     let text = match target.clone() {
+        CaptureTarget::TopologyPane(pane) => tokio::task::spawn_blocking(move || {
+            let endpoint = &pane.window.session.endpoint;
+            muxa::active_backends()
+                .into_iter()
+                .find(|backend| backend.kind() == endpoint.host)
+                .and_then(|backend| backend.capture_pane_on(Some(&endpoint.socket), &pane.pane_id))
+        })
+        .await
+        .ok()
+        .flatten(),
         CaptureTarget::Pane(pane_id) => {
             // Resolve the backend by the pane id's namespace (like the jump
             // path) so a herdr pane captures via herdr even when the
@@ -3536,6 +3672,7 @@ fn agent_for_action_target<'a>(card: &'a SessionCard, target: &ActionTarget) -> 
 
 fn agent_matches_action_target(agent: &Agent, target: &ActionTarget) -> bool {
     match target {
+        ActionTarget::TopologyPane(pane) => agent.pane.as_deref() == Some(&pane.pane_id),
         ActionTarget::Pane(pane) => agent.pane.as_deref() == Some(pane.as_str()),
         ActionTarget::PtySession(session_id) => agent.surface.as_ref().is_some_and(|surface| {
             surface.kind == SurfaceKind::Pty && surface.id.as_str() == session_id.as_str()
@@ -4700,7 +4837,9 @@ fn render_message_skill_palette(
 
 fn composer_title(composer: &PromptComposer) -> String {
     match &composer.target {
-        PromptTarget::Pane(_) | PromptTarget::PtySession(_) => "prompt".into(),
+        PromptTarget::TopologyPane(_) | PromptTarget::Pane(_) | PromptTarget::PtySession(_) => {
+            "prompt".into()
+        }
         PromptTarget::WorkPanes(panes) => format!("Work prompt · {} live agents", panes.len()),
         PromptTarget::CollaborationSend {
             kind, work_mode, ..
@@ -4826,6 +4965,10 @@ fn message_composer_rect(area: Rect, skills_open: bool) -> Rect {
 
 fn capture_target_label(target: &CaptureTarget) -> String {
     match target {
+        CaptureTarget::TopologyPane(pane) => format!(
+            "{} pane {}",
+            pane.window.session.endpoint.socket, pane.pane_id
+        ),
         CaptureTarget::Pane(pane) => format!("pane {pane}"),
         CaptureTarget::PtySession(session) => format!("pty {session}"),
     }
@@ -6301,6 +6444,92 @@ mod tests {
         assert_eq!(data.totals.works, 1);
         assert_eq!(data.totals.attention, 1);
         assert!(data.notes[0].contains("1 unlinked executions hidden"));
+    }
+
+    #[test]
+    fn work_dashboard_controls_keep_the_exact_execution_endpoint() {
+        let now = datetime!(2026-08-24 00:00 UTC);
+        let identity = muxa::work::WorkIdentity::new("muxa", "dashboard-v2");
+        let mut agent = fake_agent(
+            "agent-1",
+            Some("%1"),
+            AgentState::Working,
+            Some("review controls"),
+            now,
+        );
+        agent.tmux_socket = Some("alpha".into());
+        let snapshot = WorkSnapshot {
+            schema_version: muxa::work::WORK_SCHEMA_VERSION,
+            generated_at: now,
+            workspaces: Vec::new(),
+            works: vec![muxa::work::WorkSnapshotItem {
+                identity: identity.clone(),
+                title: "Rebuild dashboard".into(),
+                goal: None,
+                next_action: None,
+                stage: BoardStage::InProgress,
+                signals: Vec::new(),
+                external_items: Vec::new(),
+                runs: vec![muxa::work::RunSnapshot {
+                    id: "tmux:alpha:$1:@1".into(),
+                    state: muxa::work::RunState::Running,
+                    linked: true,
+                    work: Some(identity),
+                    execution: muxa::work::ExecutionIdentity {
+                        host: HostKind::Tmux,
+                        socket: "alpha".into(),
+                        session_id: "$1".into(),
+                        window_id: "@1".into(),
+                    },
+                    session_name: "muxa".into(),
+                    window_name: "dashboard-v2".into(),
+                    window_index: "0".into(),
+                    cwd: Some("/tmp/muxa".into()),
+                    panes: vec![muxa::work::RunPaneSnapshot {
+                        pane_id: "%1".into(),
+                        pane_index: "0".into(),
+                        current_command: "codex".into(),
+                        title: "review controls".into(),
+                        current_path: "/tmp/muxa".into(),
+                        attach_command: "tmux -L alpha attach".into(),
+                        role: Some("reviewer".into()),
+                        task: Some("review controls".into()),
+                        agent: Some(agent),
+                    }],
+                    latest_at: Some(now),
+                }],
+                participants: 1,
+                latest_at: Some(now),
+                source: muxa::work::WorkSource::Managed,
+                metadata: muxa::work::WorkMetadata {
+                    title: Some("Rebuild dashboard".into()),
+                    goal: None,
+                    next_action: None,
+                    stage: muxa::work::WorkStage::InProgress,
+                    updated_at: now,
+                },
+            }],
+            unlinked_executions: Vec::new(),
+        };
+
+        let data = build_work_dashboard_data(
+            now,
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            DashboardSort::Attention,
+            Vec::new(),
+        );
+        let card = &data.cards[0];
+        let panes = live_work_panes(card);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window.session.endpoint.socket, "alpha");
+        assert!(matches!(
+            card.action_targets().first(),
+            Some(ActionTarget::TopologyPane(key))
+                if key.window.session.endpoint.socket == "alpha" && key.pane_id == "%1"
+        ));
     }
 
     #[test]

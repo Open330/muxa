@@ -780,14 +780,15 @@ pub fn mark_work_external(window: &str, ticket: &muxa::pipeline::Ticket) -> Resu
         (EXTERNAL_URL_OPTION, ticket.url.as_deref(), 2_048),
         (EXTERNAL_STATUS_OPTION, ticket.state.as_deref(), 128),
     ] {
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            set_option(
-                OptionScope::Window,
-                window,
-                key,
-                &external_metadata(value, max),
-            )?;
-        }
+        // Write every field, including empty ones. Otherwise changing the
+        // linked issue could combine its key with the previous issue's URL,
+        // title, or provider status left behind on this Run window.
+        set_option(
+            OptionScope::Window,
+            window,
+            key,
+            &external_option_value(value, max),
+        )?;
     }
     Ok(())
 }
@@ -995,6 +996,11 @@ fn external_metadata(raw: &str, max: usize) -> String {
         end = end.saturating_sub(1);
     }
     normalized[..end].to_string()
+}
+
+fn external_option_value(raw: Option<&str>, max: usize) -> String {
+    raw.filter(|value| !value.trim().is_empty())
+        .map_or_else(String::new, |value| external_metadata(value, max))
 }
 
 fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<WorkspaceInfo> {
@@ -1443,6 +1449,16 @@ mod tests {
         assert_eq!(stage_suffix(&work, &records), "");
         let staged = vec![record_at("callabo", "CAL-1234", WorkStage::InProgress)];
         assert_eq!(stage_suffix(&work, &staged), "  stage=in_progress");
+    }
+
+    #[test]
+    fn an_external_issue_refresh_clears_absent_fields_and_normalizes_present_ones() {
+        assert_eq!(external_option_value(None, 32), "");
+        assert_eq!(external_option_value(Some("   "), 32), "");
+        assert_eq!(
+            external_option_value(Some("  Needs\n review  "), 32),
+            "Needs review"
+        );
     }
 
     #[test]
