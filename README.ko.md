@@ -45,21 +45,23 @@ Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 
 
 | tmux 객체 | Muxa에서의 의미 | 사용 방식 |
 | --- | --- | --- |
-| **session** | 하나의 workspace 또는 project | 여러 독립 work window를 담는 지속적인 project context입니다. |
-| **window** | 하나의 work 또는 ticket | 안정적인 work identity와 cwd. 같은 work를 다시 시작하면 이 window를 재사용합니다. |
-| **pane** | 하나의 agent | 해당 work window에서 일하는 implementer, reviewer 또는 helper입니다. |
+| **session** | workspace 실행 context | 한 workspace의 활성 Run window를 담습니다. |
+| **window** | Work의 활성 Run | 안정적인 Work identity에 연결되며 window 종료는 Work 삭제가 아니라 Run 종료입니다. |
+| **pane** | agent 실행 surface | implementer, reviewer, helper Agent session을 Run에 연결합니다. |
 
 권장 workflow도 이 모델을 그대로 따릅니다.
 
 1. work ID를 시작하면 Muxa가 workspace session을 생성하거나 재사용하고 work
    window와 첫 agent pane을 만듭니다.
-2. 같은 work window에 agent pane을 추가하며 다른 ticket은 sibling window가 됩니다.
+2. 같은 Work Run에 agent pane을 추가하며 다른 Work는 sibling Run window를 사용합니다.
 3. `muxa watch`에서 상태 확인, preview, 메시지, 제어를 수행하거나 agent가
    `muxa mcp`를 통해 같은 정책으로 다른 agent를 관리합니다.
 4. 작업이 끝나면 agent pane, work window 또는 workspace session을 명시적으로
    닫습니다. Muxa는 unmanaged tmux 객체를 종료하지 않습니다.
 
-요약하면 **workspace/session → work/window → agent/pane → 관측·협업 → 명시적 종료**입니다.
+Linear/GitHub/Jira issue는 Work에 연결되는 선택적 외부 참조이며 Work 자체나 로컬
+단계가 아닙니다. [Work domain model](docs/WORK_MODEL.md)을 참고하세요. 요약하면
+**Workspace → Work → Run → Agent session**이며 tmux는 현재 실행 binding입니다.
 `muxa onboard`는 먼저 환영 인사와 연습용 session을 만드는 이유를 설명합니다.
 이어서 가상 shell의 `tmux new-session`부터 tmux 계층과 조작, detach/attach,
 Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 있습니다.
@@ -76,7 +78,7 @@ Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 �
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
 | `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
-| `muxa dashboard` | pane 조작과 같은 work window의 agent 협업을 제공하는 workspace-card TUI. |
+| `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
@@ -187,8 +189,8 @@ GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent
 
 ## 핵심 명령어
 
-기본 tmux 운영 정책은 session 하나가 workspace/project, window 하나가
-work/ticket, pane 하나가 agent라는 것입니다. `muxa onboard`는 Muxa를 소개하기
+기본 tmux 운영 정책은 workspace 실행 context를 session에, Work의 활성 Run을
+window에, Agent session을 pane에 연결합니다. `muxa onboard`는 Muxa를 소개하기
 전까지 tmux 자체의 기본 개념과 조작에 집중합니다. 가상
 기본 shell에서 시작하되, 먼저 환영 인사와 session이 terminal 화면을 하나의 작업
 공간으로 유지한다는 이유를 설명합니다. 그다음 `tmux new-session -s muxa-onboarding`을
@@ -213,7 +215,7 @@ footer에서 굵은 노란색으로 강조합니다. `j`, `l`, `Alt-T`, `o`, `?`
 | --- | --- |
 | `muxa status [--json]` | 추적 중인 agent 테이블 또는 desktop integration용 versioned JSON snapshot. |
 | `muxa watch [--view pane\|work]` | workspace → work → agent live TUI picker/dashboard. |
-| `muxa dashboard [--since today]` | live capture, prompt composer, abort/terminate action, ACT/WACT total을 보여주는 workspace-card TUI console. |
+| `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. |
@@ -229,7 +231,7 @@ footer에서 굵은 노란색으로 강조합니다. `j`, `l`, `Alt-T`, `o`, `?`
 | `muxa sync` | tmux pane scan으로 registry backfill. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | workspace session과 work window를 만들거나 재사용하고 agent pane을 추가. |
 | `muxa workspace list/show/close` | workspace/project session을 조회하거나 명시적으로 종료. |
-| `muxa work list/show/close [--workspace muxa]` | work/ticket window를 조회하거나 명시적으로 종료. |
+| `muxa work list/show/close [--workspace muxa]` | Work와 현재 Run binding을 조회하거나 Run window를 명시적으로 종료. |
 | `muxa agent start --workspace muxa --work muxa-onboarding ...` | allowlist agent pane을 work window에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
 | `muxa onboard [--lang auto\|en\|ko]` | shell → tmux → Muxa 통합 fullscreen walkthrough. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 통합 guide 출력 지원. |

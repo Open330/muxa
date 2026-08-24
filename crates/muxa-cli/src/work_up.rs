@@ -2,13 +2,13 @@
 //! pipeline declares.
 //!
 //! `muxa work start` is the imperative primitive: one invocation, one
-//! agent pane. This is the declarative one. A work id names a ticket, the
-//! ticket routes to a workspace and a pipeline, and the pipeline says which
-//! agents that work should have. Running it compares that against the panes
+//! agent pane. This is the declarative one. A Work ID may resolve an external
+//! issue reference; that context routes the Work to a workspace and pipeline,
+//! and the pipeline says which agents the Work should have. Running it compares that against the panes
 //! the window already has and creates the difference — so the first call
 //! stands a team up and the second call is a no-op, not a duplicate team.
 //!
-//! The interesting seam is ticket lookup. Muxa does not talk to Linear,
+//! The interesting seam is external issue lookup. Muxa does not talk to Linear,
 //! Jira, or GitHub; it spends one headless agent turn asking an agent to do
 //! it, because a user who already has a ticket-fetching skill has already
 //! solved this problem once and should not solve it again inside muxa. See
@@ -31,8 +31,13 @@ use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest}
 #[derive(Debug, clap::Args)]
 #[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
 pub struct UpArgs {
-    /// Work/ticket id, for example cal-1234. One managed tmux window per id.
+    /// Stable Muxa Work id, for example auth-cleanup.
     pub work: String,
+    /// Optional external issue key to resolve and link, for example CAL-1234.
+    /// When omitted, the Work id is still looked up for compatibility; use
+    /// `--no-ticket` for a strictly local Work.
+    #[arg(long, value_name = "ISSUE")]
+    pub external: Option<String>,
     /// Pipeline to staff the window with. Defaults to the matching route's.
     #[arg(long)]
     pub pipeline: Option<String>,
@@ -60,10 +65,10 @@ pub struct UpArgs {
     /// Resolve and diff, then print what would happen and change nothing.
     #[arg(long)]
     pub dry_run: bool,
-    /// Skip ticket lookup and launch on the work id alone.
+    /// Skip external issue lookup and launch on the Work id alone.
     #[arg(long)]
     pub no_ticket: bool,
-    /// Ignore a cached ticket and ask the resolver again.
+    /// Ignore a cached external issue and ask the resolver again.
     #[arg(long)]
     pub refresh: bool,
     /// Emit the structured result as JSON.
@@ -192,6 +197,10 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
             Some(info) => (Some(info.session), Some(info.window)),
             None => (None, None),
         };
+    if let (Some(window), Some(ticket)) = (window.as_deref(), resolved.ticket.as_ref()) {
+        crate::tmux_work::mark_work_external(window, ticket)
+            .with_context(|| format!("record external issue on work window {window}"))?;
+    }
     if let (Some(window), Some(layout)) = (window.as_deref(), resolved.layout.as_deref()) {
         // Splitting an existing window repeatedly halves whichever pane was
         // active, so geometry is only sane once every pane exists.
@@ -236,13 +245,31 @@ fn finish(
 pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
     let work = crate::tmux_work::normalize_work_id(&args.work)?;
     let id = work.to_ascii_lowercase();
+    if args.no_ticket
+        && args
+            .external
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        bail!("--external cannot be combined with --no-ticket");
+    }
+    let explicit_external = args
+        .external
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let external_lookup = explicit_external.unwrap_or(&id);
 
     // An explicit --pipeline is its own routing decision, so it stands in
     // for a missing rule rather than being refused by one. That keeps the
     // first run of `muxa work up --pipeline x` working on an empty config,
     // which is where most people meet this command.
     let fallback = muxa::config::RouteConfig::default();
-    let route = match pipeline::select_route(&config.route, &work)? {
+    // An explicitly linked issue may carry the routing prefix while the
+    // durable Work id stays provider-neutral (`auth-cleanup` + `CAL-1234`).
+    // Legacy calls without `--external` continue routing on the Work id.
+    let route_selector = explicit_external.unwrap_or(&work);
+    let route = match pipeline::select_route(&config.route, route_selector)? {
         Some(route) => route,
         None if args.pipeline.is_some() => &fallback,
         None => {
@@ -253,7 +280,7 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
     let ticket = if args.no_ticket {
         None
     } else {
-        resolve_ticket(&config.ticket, &id, args.refresh).await?
+        resolve_ticket(&config.ticket, external_lookup, args.refresh).await?
     };
 
     // Two ids because the two forms are both load-bearing: `work` is what
@@ -407,7 +434,8 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
         return Ok(None);
     };
     if !refresh {
-        if let Some(ticket) = cached_ticket(id, config.cache_secs) {
+        if let Some(mut ticket) = cached_ticket(id, config.cache_secs) {
+            ticket.source = Some(source_name.to_string());
             return Ok(Some(ticket));
         }
     }
@@ -430,9 +458,10 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
     .with_context(|| {
         format!("ticket source {source_name:?} could not look up {id} (use --no-ticket to launch without it)")
     })?;
-    let ticket = Ticket::parse_reply(id, &answer.text).with_context(|| {
+    let mut ticket = Ticket::parse_reply(id, &answer.text).with_context(|| {
         format!("ticket source {source_name:?} answered for {id} but not with a ticket")
     })?;
+    ticket.source = Some(source_name.to_string());
     store_ticket(id, &ticket);
     Ok(Some(ticket))
 }
@@ -674,12 +703,16 @@ fn print_result(result: &UpResult) {
                 .state
                 .as_deref()
                 .map_or_else(String::new, |state| format!("  [{state}]"));
-            println!("  ticket   {} {title}{state}", ticket.id);
+            println!(
+                "  external {}:{} {title}{state}",
+                ticket.source.as_deref().unwrap_or("issue"),
+                ticket.id
+            );
             if let Some(url) = &ticket.url {
                 println!("           {url}");
             }
         }
-        None => println!("  ticket   (not resolved)"),
+        None => println!("  external (not resolved)"),
     }
     if let Some(request) = &result.request {
         let mut lines = request.text.lines();
@@ -747,6 +780,7 @@ mod tests {
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
             work: "cal-1".into(),
+            external: None,
             pipeline: None,
             workspace: None,
             cwd: cwd.map(PathBuf::from),

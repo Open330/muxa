@@ -1,11 +1,14 @@
 # CLI dashboard
 
-`muxa dashboard` is a workspace-card TUI console. A tmux card is one workspace
-session and its panes retain their work-window locations.
+`muxa dashboard` is a Work-card TUI console. It reads the same canonical
+`WorkSnapshot` as the web dashboard: local Work stage, external issue status,
+Run state, Agent state, and attention/error signals remain separate. Generic
+tmux sessions/windows do not become cards; a note reports unlinked execution
+count and points to `muxa watch` for topology inspection.
 
 Use `muxa watch` when you want the compact picker/table. Use
 `muxa dashboard` when you want a richer console with cards, an inspector,
-live terminal capture, prompt composition, and workspace-level ACT/WACT totals.
+live Run capture, prompt composition, Work-wide actions, and ACT/WACT totals.
 When it runs inside a tracked tmux agent pane, it also becomes that agent's
 collaboration-room console.
 
@@ -30,18 +33,20 @@ muxa dashboard --include-paneless
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` / `←` / `→`, `h` / `j` / `k` / `l` | Move card selection. |
-| `Tab`, `[` / `]` | Cycle the action target inside the selected workspace card. |
+| `Tab`, `[` / `]` | Cycle the execution target inside the selected Work card. |
 | `PageUp` / `PageDown` | Scroll live capture history. |
 | `G` / `End` | Return capture to the latest output. |
 | `f` | Toggle capture fullscreen. |
 | `n` | Open dashboard notes when diagnostics are available. |
-| `Enter` | Toggle the selected workspace inspector. |
+| `Enter` | Toggle the selected Work inspector. |
 | `p` | Open the prompt composer for the selected pane or muxa PTY session. |
+| `P` | Compose one prompt and send it to every live agent in the selected Work. |
 | `m` | Compose a structured request for the selected same-room agent; press `/` anywhere in the draft to insert a registered message skill at the cursor. |
 | `b` | Open incoming/sent collaboration mailbox history without claiming requests. |
 | `i` | Claim pending collaboration requests and open the incoming mailbox. |
-| `c` | Copy the selected workspace's latest prompt. |
+| `c` | Copy the selected Work's latest prompt. |
 | `R` | Confirm and send Ctrl-C to the selected pane or PTY session. |
+| `A` | Confirm and send Ctrl-C to every live agent in the selected Work. |
 | `K` | Confirm and terminate the selected pane or PTY session. |
 | `o` | Explicitly open the selected pane/session. |
 | `r` | Refresh now. |
@@ -58,23 +63,24 @@ actions are disabled with an explicit hint until a zellij-safe input path exists
 
 ## Cards and inspector
 
-Cards are grouped by tmux/zellij session, muxa-owned PTY session, or detached
-agent session. Each card shows:
+Cards are grouped by logical `{workspace_id, work_id}`. Each card shows:
 
-- host type, agent count, pane count
-- current dominant state
+- local Work stage and Attention/Blocked/Error signals
+- external provider/display key/status, or `local work`
+- Run, agent, and pane counts
+- dominant Agent runtime state
 - latest activity age and foreground time
 - ACT/WACT for the selected `--since` window
 - model/context/cost hints when agents report them
 - last prompt or notification preview
 
-The inspector shows the selected card's details plus a live capture of the
-primary pane or PTY session when the backend supports capture.
+The inspector shows the selected Work's Run/Agent details plus a live capture
+of the selected execution target when the backend supports capture.
 
-For multi-pane cards, the highlighted action target controls where `p`, `R`,
-`K`, `o`, and capture apply. Use `Tab`, `[` or `]` to move that target without
-leaving the dashboard. Confirm prompts name the exact pane or PTY session before
-running destructive actions.
+For multi-agent Work, the highlighted target controls where `p`, `R`, `K`, `o`,
+and capture apply. `P` and `A` deliberately ignore that cursor and target all
+live agent panes in the Work. Confirm prompts name whether an action is exact-
+target or Work-wide before it runs.
 
 ## Collaboration room
 

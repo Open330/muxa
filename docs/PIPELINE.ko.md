@@ -1,14 +1,14 @@
 # Work pipeline — `muxa work up`
 
-`muxa work start`가 명령형 primitive입니다. 한 번 실행하면 agent pane 하나가
-생깁니다. `muxa work up`은 선언형입니다. ticket id를 주면 인력이 배치된 tmux
-window를 돌려줍니다.
+`muxa work start`가 명령형 primitive입니다. 한 번 실행하면 agent session 하나가
+생깁니다. `muxa work up`은 선언형입니다. 안정적인 Muxa Work id와 선택적인 외부
+이슈 키를 별도로 주면 현재 Run을 만들거나 선언 상태로 수렴시킵니다.
 
 ```console
-$ muxa work up cal-1234
-work CAL-1234 is in workspace callabo via pipeline triad
-  cwd      /home/june/worktrees/cal-1234 (worktree cal-1234, created)
-  ticket   CAL-1234 Reaper double-reaps a lying pane  [In Progress]
+$ muxa work up auth-cleanup --external CAL-1234
+work auth-cleanup is in workspace callabo via pipeline triad
+  cwd      /home/june/worktrees/auth-cleanup (worktree auth-cleanup, created)
+  external linear:CAL-1234 Reaper double-reaps a lying pane  [In Progress]
            https://linear.app/rtzr/issue/CAL-1234
   + plan       codex     planner      %12
   + impl       codex     implementer  %13
@@ -16,16 +16,18 @@ work CAL-1234 is in workspace callabo via pipeline triad
   layout   main-vertical
 ```
 
-내부적으로는 muxa의 기존 domain model — workspace = session, work = window,
-agent = pane ([WORKSPACE_MODEL.md](WORKSPACE_MODEL.md)) — 위에 선언된 line-up을
-얹은 것입니다.
+내부적으로 Workspace와 Work는 지속되는 논리 객체입니다. tmux session은
+Workspace를, window는 현재 Run을, pane은 agent session을 바인딩합니다.
+([WORK_MODEL.md](WORK_MODEL.md))
 
 ## 구조
 
 ```
-work id ──▶ [[route]] ──▶ workspace + cwd/worktree + pipeline
-   │                              │
-   └──▶ [ticket.source] ──▶ ticket context ──┘
+Work id ─────────────────────────▶ 지속되는 Work identity
+외부 이슈 ─▶ [ticket.source] ─▶ 외부 context + [[route]]
+                                             │
+                                             ▼
+                              workspace + cwd/worktree + pipeline
                                              ▼
                                   원하는 pane vs 실제 pane
                                              ▼
@@ -233,7 +235,8 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 ## 명령 정리
 
 ```console
-muxa work up <id>                    # 조회 → routing → 없는 것만 생성
+muxa work up <work> --external <id>  # 외부 이슈 연결 → routing → 없는 것만 생성
+muxa work up <id>                    # 호환 경로: <id>를 외부 이슈로도 조회
 muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음
 muxa work up <id> --pipeline triad   # route의 pipeline을 덮어씀
 muxa work up <id> --body "..."       # 일감 내용; launch 또는 전달
@@ -253,7 +256,8 @@ muxa work down <id>                  # window와 그 안의 agent 전부 종료
 
 ```text
 muxa_start_work {
-  "work": "cal-1234",
+  "work": "auth-cleanup",
+  "external": "CAL-1234",
   "body": "double reap을 고쳐라",
   "skill": "review-plan",
   "dry_run": true
@@ -263,6 +267,28 @@ muxa_start_work {
 `muxa_start_agent`를 여러 번 부르는 것보다 이쪽이 낫습니다. 그쪽은 이미 있는
 agent와 아직 만들어야 할 agent를 구분하지 못해 수렴 대신 팀을 복제합니다.
 [MCP.md](MCP.md) 참고.
+
+## dashboard에서
+
+같은 파이프라인을 work board의 **start work** 컨트롤에서도 실행할 수 있습니다.
+`POST /api/work-control/up`으로 갑니다. 제어 토큰 **위에** `[dashboard]
+allow_work_start = true`가 더 필요합니다 — dashboard의 다른 쓰기는 이미 떠 있는
+프로세스를 조종하지만, 이건 권한을 우회한 프로세스를 새로 만들기 때문입니다.
+
+이 경로에서도 Work와 외부 이슈는 분리됩니다. 외부 title과 provider status는
+참조 정보로 연결될 뿐 로컬 Work title이나 workflow stage를 덮어쓰지 않습니다.
+board의 로컬 stage(`queued`·`in_progress`·`review`·`done`)는 CLI에도 표시되고,
+blocked와 attention은 별도 signal로 남습니다.
+
+```console
+$ muxa work list
+auth-cleanup  workspace=callabo  session=callabo  window=@7  agents=3  cwd=…  stage=review
+```
+
+`stage=auto`는 아무것도 출력하지 않습니다. auto는 "아무도 말한 적 없음"이라,
+항상 붙어 있는 칼럼보다 할 말이 있을 때만 나타나는 칼럼이 더 많은 걸 말합니다.
+CLI는 그 저장소를 읽기만 하고, 쓰기는 daemon이 소유합니다.
+[DASHBOARD.md](DASHBOARD.md) 참고.
 
 ## 설정
 

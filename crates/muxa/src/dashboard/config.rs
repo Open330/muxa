@@ -39,6 +39,9 @@ pub struct DashboardConfig {
     pub token: Option<String>,
     pub allow_public: bool,
     pub pane_cache_ttl: Duration,
+    /// Whether `POST /api/work-control/up` may launch agents. See
+    /// [`crate::config::DashboardTomlConfig::allow_work_start`].
+    pub allow_work_start: bool,
 }
 
 /// Per-field overrides captured by the binary layer (CLI flags + env
@@ -127,6 +130,7 @@ impl DashboardConfig {
         };
 
         let allow_public = ov.allow_public.or(toml.allow_public).unwrap_or(false);
+        let allow_work_start = toml.allow_work_start.unwrap_or(false);
 
         let pane_cache_ttl = toml
             .pane_cache_ttl_ms
@@ -152,6 +156,7 @@ impl DashboardConfig {
             token,
             allow_public,
             pane_cache_ttl,
+            allow_work_start,
         })
     }
 
@@ -166,6 +171,7 @@ impl DashboardConfig {
             token: None,
             allow_public: false,
             pane_cache_ttl: DEFAULT_PANE_CACHE_TTL,
+            allow_work_start: false,
         }
     }
 }

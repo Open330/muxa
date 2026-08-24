@@ -40,7 +40,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::backend::{HostKind, SharedBackend};
 use crate::config::{DashboardAuthMode, StatsConfig};
-use crate::dashboard::work_store::{WorkKey, WorkMetadataPatch, WorkRecord, WorkStore};
+use crate::dashboard::work_store::WorkStore;
 use crate::dashboard::{assets, auth, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
@@ -53,6 +53,9 @@ use crate::timeline::{
     TimelineRange, TimelineTotals,
 };
 use crate::tmux::scanner::{self, MuxaPaneMetadata, PaneCache, PaneSummary, ScanError};
+use crate::work::{
+    self, ExecutionIdentity, WorkIdentity, WorkMetadataPatch, WorkRecord, WorkSnapshot,
+};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
 /// (15s is well under any sane proxy idle-timeout) but short enough
@@ -137,10 +140,15 @@ pub struct AppState {
     /// Compact final response cache. This protects the daemon from multiple
     /// dashboard tabs rebuilding the same retained-history projection at once.
     timeline_summary_cache: Arc<tokio::sync::Mutex<TimelineSummaryCache>>,
+    /// `[message.skills]`, so a dashboard prompt can expand the same `/name`
+    /// templates the CLI and `muxa_call_peer` expand. One composer, three
+    /// front doors.
+    message_skills: Arc<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Default)]
 pub struct DashboardRuntimeConfig {
+    pub message_skills: BTreeMap<String, String>,
     pub activity_path: Option<PathBuf>,
     pub session_activity_path: Option<PathBuf>,
     pub work_store_path: Option<PathBuf>,
@@ -177,7 +185,14 @@ impl AppState {
             timeline_summary_cache: Arc::new(tokio::sync::Mutex::new(
                 TimelineSummaryCache::default(),
             )),
+            message_skills: Arc::new(BTreeMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn with_message_skills(mut self, skills: BTreeMap<String, String>) -> Self {
+        self.message_skills = Arc::new(skills);
+        self
     }
 
     #[must_use]
@@ -334,6 +349,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents_handler))
         .route("/api/fleet", get(fleet_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/works", get(works_handler))
         .route("/api/work-metadata", get(work_metadata_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
         .route(
@@ -354,6 +370,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
         .route("/api/work-metadata", put(work_metadata_put_handler))
         .route("/api/work-control/prompt", post(work_prompt_handler))
+        .route("/api/work-control/up", post(work_up_handler))
         .route("/api/work-control/abort", post(work_abort_handler))
         .route(
             "/api/terminal-sessions/{id}/input",
@@ -426,6 +443,7 @@ pub async fn serve(
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
         .with_work_store_path(runtime.work_store_path)
         .with_stats_config(runtime.stats_config)
+        .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
@@ -586,6 +604,12 @@ struct AccessResponse {
     read_requires_token: bool,
     write_available: bool,
     write_authorized: bool,
+    capabilities: AccessCapabilities,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessCapabilities {
+    work_start: bool,
 }
 
 async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -607,6 +631,9 @@ async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> im
         read_requires_token: matches!(state.config.auth, DashboardAuthMode::Token),
         write_available: state.config.token.is_some(),
         write_authorized,
+        capabilities: AccessCapabilities {
+            work_start: state.config.allow_work_start,
+        },
     })
 }
 
@@ -699,6 +726,27 @@ async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+async fn works_handler(State(state): State<AppState>) -> Json<WorkSnapshot> {
+    let scan = state.refresh_pane_scan().await;
+    let agents = state.store.snapshot().await;
+    let mut work_store = state.work_store.lock().await;
+    for pane in &scan.panes {
+        if let Some((identity, item)) = work::external_item_for_pane(pane, scan.fetched_at) {
+            if let Err(error) = work_store.upsert_external_item(identity, item).await {
+                tracing::warn!(%error, "failed to persist discovered external work item");
+            }
+        }
+    }
+    let records = work_store.records();
+    drop(work_store);
+    Json(work::build_snapshot(
+        &scan.panes,
+        &agents,
+        &records,
+        scan.fetched_at,
+    ))
+}
+
 #[derive(Debug, Serialize)]
 struct WorkMetadataResponse {
     works: Vec<WorkRecord>,
@@ -712,7 +760,10 @@ async fn work_metadata_handler(State(state): State<AppState>) -> impl IntoRespon
 
 #[derive(Debug, Deserialize)]
 struct WorkMetadataPutRequest {
-    key: WorkKey,
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
     metadata: WorkMetadataPatch,
 }
 
@@ -720,25 +771,48 @@ async fn work_metadata_put_handler(
     State(state): State<AppState>,
     Json(input): Json<WorkMetadataPutRequest>,
 ) -> Response {
+    if let Err(error) = validate_work_selector(input.identity.as_ref(), input.key.as_ref()) {
+        return control_error(StatusCode::BAD_REQUEST, error);
+    }
     let metadata = match input.metadata.validate() {
         Ok(metadata) => metadata,
         Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
     };
     let scan = state.refresh_pane_scan().await;
-    if !scan
-        .panes
-        .iter()
-        .any(|pane| pane_matches_work_key(pane, &input.key))
-    {
+    let records = state.work_store.lock().await.records();
+    let identity_exists = input.identity.as_ref().is_some_and(|identity| {
+        records.iter().any(|record| &record.identity == identity)
+            || scan
+                .panes
+                .iter()
+                .any(|pane| work::work_identity_for_pane(pane).as_ref() == Some(identity))
+    });
+    let key_exists = input.key.as_ref().is_some_and(|key| {
+        scan.panes
+            .iter()
+            .any(|pane| pane_matches_execution(pane, key))
+    });
+    if !identity_exists && !key_exists {
         return control_error(StatusCode::NOT_FOUND, "work item is no longer present");
     }
-    match state
-        .work_store
-        .lock()
-        .await
-        .upsert(input.key, metadata)
-        .await
-    {
+    let result = if let Some(identity) = input.identity {
+        state
+            .work_store
+            .lock()
+            .await
+            .upsert_metadata(identity, metadata)
+            .await
+    } else if let Some(key) = input.key {
+        state
+            .work_store
+            .lock()
+            .await
+            .upsert_legacy_metadata(key, metadata)
+            .await
+    } else {
+        unreachable!("validated selector")
+    };
+    match result {
         Ok(record) => Json(json!({ "ok": true, "work": record })).into_response(),
         Err(error) => control_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -748,35 +822,54 @@ async fn work_metadata_put_handler(
 }
 
 fn pane_socket_identity(pane: &PaneSummary) -> String {
-    if pane.host == HostKind::Tmux {
-        pane.socket
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("default")
-            .to_string()
-    } else {
-        pane.socket.to_string_lossy().to_string()
-    }
+    work::pane_socket_identity(pane)
 }
 
-fn pane_matches_work_key(pane: &PaneSummary, key: &WorkKey) -> bool {
+fn pane_matches_execution(pane: &PaneSummary, key: &ExecutionIdentity) -> bool {
     pane.host == key.host
         && pane_socket_identity(pane) == key.socket
         && pane.session_id == key.session_id
         && pane.window_id == key.window_id
 }
 
+fn validate_work_selector(
+    identity: Option<&WorkIdentity>,
+    key: Option<&ExecutionIdentity>,
+) -> Result<(), &'static str> {
+    match (identity, key) {
+        (None, None) => Err("work selector is missing"),
+        (Some(_), Some(_)) => Err("provide exactly one work selector: identity or key"),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkPromptRequest {
-    key: WorkKey,
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
+    /// Literal text, kept for callers that compose their own prompt.
+    #[serde(default)]
     text: String,
+    /// Registered `[message.skills]` name, expanded ahead of `body` exactly
+    /// as `muxa_call_peer` and `muxa work up` expand it.
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
     #[serde(default = "default_true")]
     submit: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct WorkAbortRequest {
-    key: WorkKey,
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
 }
 
 #[derive(Debug, Serialize)]
@@ -786,58 +879,289 @@ struct WorkControlResult {
     submitted: bool,
 }
 
+/// Ceiling for one `muxa work up` run. Generous because resolving a ticket
+/// spends a headless agent turn, which is minutes rather than milliseconds.
+const WORK_UP_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Deserialize)]
+struct WorkUpRequest {
+    /// Stable Muxa Work id.
+    work: String,
+    /// Optional external issue key resolved by `muxa work up`.
+    #[serde(default)]
+    external: Option<String>,
+    #[serde(default)]
+    pipeline: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    no_ticket: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Stand a work item's pipeline up from the dashboard.
+///
+/// This delegates to the `muxa` binary rather than reimplementing the
+/// pipeline here. The launcher and the managed-tmux registry live in the
+/// CLI crate, which depends on this one — so calling them in-process would
+/// mean either inverting that dependency or keeping a second implementation
+/// alive. One implementation behind a subprocess beats two behind none.
+///
+/// Gated on `[dashboard] allow_work_start` on top of the control token:
+/// every other write route steers a process the operator already started,
+/// while this one starts new ones with permissions bypassed.
+async fn work_up_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkUpRequest>,
+) -> Response {
+    if !state.config.allow_work_start {
+        // Not FORBIDDEN: the browser treats 401/403 as "your token is bad"
+        // and drops into read-only. This deployment simply does not offer
+        // the capability, which is what 501 says — and what the backend
+        // capability checks above already use.
+        return control_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "starting work is disabled; set [dashboard] allow_work_start = true to enable it",
+        );
+    }
+    if input.work.trim().is_empty() {
+        return control_error(StatusCode::BAD_REQUEST, "work id is empty");
+    }
+    if input.no_ticket
+        && input
+            .external
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            "external cannot be combined with no_ticket",
+        );
+    }
+
+    let mut args: Vec<String> = vec![
+        "work".into(),
+        "up".into(),
+        input.work.trim().into(),
+        "--json".into(),
+    ];
+    let mut push = |flag: &str, value: Option<&String>| {
+        if let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    };
+    push("--pipeline", input.pipeline.as_ref());
+    push("--workspace", input.workspace.as_ref());
+    push("--external", input.external.as_ref());
+    push("--skill", input.skill.as_ref());
+    push("--body", input.body.as_ref());
+    push("--context", input.context.as_ref());
+    // The dashboard's empty external field means a local Work. The CLI keeps
+    // implicit Work-id lookup for compatibility, but the new UI never
+    // silently turns a Work id into an external issue key.
+    if input.no_ticket
+        || input
+            .external
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        args.push("--no-ticket".into());
+    }
+    if input.dry_run {
+        args.push("--dry-run".into());
+    }
+
+    let result = match execute_work_up(args).await {
+        Ok(result) => result,
+        Err((status, error)) => return control_error(status, error),
+    };
+    let linked_external_item = if input.dry_run {
+        false
+    } else {
+        persist_started_external_item(&state, &result).await
+    };
+    Json(json!({
+        "ok": true,
+        // Retained for clients of the first control-plane draft. Provider
+        // titles now remain external references instead of becoming local
+        // operator-authored Work metadata.
+        "seeded_metadata": false,
+        "linked_external_item": linked_external_item,
+        "result": result
+    }))
+    .into_response()
+}
+
+async fn execute_work_up(args: Vec<String>) -> Result<serde_json::Value, (StatusCode, String)> {
+    let mut command = tokio::process::Command::new("muxa");
+    command
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(WORK_UP_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawning muxa: {error}"),
+            ));
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("muxa work up exceeded {}s", WORK_UP_TIMEOUT.as_secs()),
+            ));
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("muxa work up failed: {detail}"),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("muxa work up answered with unparseable JSON: {error}"),
+        )
+    })
+}
+
+/// Persist the external reference recorded on the newly created Run without
+/// copying its title or provider status into the local Work definition.
+async fn persist_started_external_item(state: &AppState, result: &serde_json::Value) -> bool {
+    let (Some(workspace_id), Some(work_id)) = (
+        result.get("workspace").and_then(serde_json::Value::as_str),
+        result.get("work").and_then(serde_json::Value::as_str),
+    ) else {
+        return false;
+    };
+    let identity = WorkIdentity::new(workspace_id, work_id);
+    let scan = state.refresh_pane_scan().await;
+    let item = scan.panes.iter().find_map(|pane| {
+        let (candidate, item) = work::external_item_for_pane(pane, scan.fetched_at)?;
+        (candidate == identity).then_some(item)
+    });
+    let Some(item) = item else {
+        return false;
+    };
+    state
+        .work_store
+        .lock()
+        .await
+        .upsert_external_item(identity, item)
+        .await
+        .is_ok()
+}
+
 async fn work_prompt_handler(
     State(state): State<AppState>,
     Json(input): Json<WorkPromptRequest>,
 ) -> Response {
-    if input.text.trim().is_empty() {
-        return control_error(StatusCode::BAD_REQUEST, "prompt text is empty");
-    }
-    run_work_control(&state, input.key, input.text, input.submit, "prompt").await
+    // `text` stays the escape hatch; skill/body/context go through the one
+    // composer so a template registered once works from every front door.
+    let composed = match crate::request::compose(
+        crate::request::RequestParts {
+            skill: input.skill.as_deref(),
+            body: input.body.as_deref(),
+            context: input.context.as_deref(),
+        },
+        &state.message_skills,
+    ) {
+        Ok(composed) => composed,
+        Err(error) => return control_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let text = match (composed, input.text.trim()) {
+        (Some(composed), "") => composed.text,
+        (Some(composed), literal) => format!("{}\n\n{literal}", composed.text),
+        (None, "") => {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "prompt requires text, body, skill, or context",
+            )
+        }
+        (None, literal) => literal.to_string(),
+    };
+    run_work_control(
+        &state,
+        input.identity,
+        input.key,
+        text,
+        input.submit,
+        "prompt",
+    )
+    .await
 }
 
 async fn work_abort_handler(
     State(state): State<AppState>,
     Json(input): Json<WorkAbortRequest>,
 ) -> Response {
-    run_work_control(&state, input.key, "\u{3}".to_string(), false, "abort").await
+    run_work_control(
+        &state,
+        input.identity,
+        input.key,
+        "\u{3}".to_string(),
+        false,
+        "abort",
+    )
+    .await
 }
 
 async fn run_work_control(
     state: &AppState,
-    key: WorkKey,
+    identity: Option<WorkIdentity>,
+    key: Option<ExecutionIdentity>,
     text: String,
     submit: bool,
     action: &'static str,
 ) -> Response {
-    let backend = match state
-        .backends
-        .iter()
-        .find(|backend| backend.kind() == key.host)
-        .cloned()
-    {
-        Some(backend) if backend.caps().send_text => backend,
-        Some(backend) => {
-            return control_error(
-                StatusCode::NOT_IMPLEMENTED,
-                format!("{} backend does not support pane input", backend.kind()),
-            );
-        }
-        None => {
-            return control_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("no active {} backend", key.host),
-            );
-        }
-    };
+    if let Err(error) = validate_work_selector(identity.as_ref(), key.as_ref()) {
+        return control_error(StatusCode::BAD_REQUEST, error);
+    }
     let scan = state.refresh_pane_scan().await;
     let agents = state.store.snapshot().await;
+    let records = state.work_store.lock().await.records();
+    let legacy_binding = identity.as_ref().and_then(|identity| {
+        records
+            .iter()
+            .find(|record| &record.identity == identity)
+            .and_then(|record| record.legacy_binding.clone())
+    });
     let candidates = scan
         .panes
         .iter()
-        .filter(|pane| pane_matches_work_key(pane, &key))
+        .filter(|pane| {
+            identity.as_ref().is_some_and(|identity| {
+                work::work_identity_for_pane(pane).as_ref() == Some(identity)
+                    || legacy_binding
+                        .as_ref()
+                        .is_some_and(|binding| pane_matches_execution(pane, binding))
+            }) || key
+                .as_ref()
+                .is_some_and(|key| pane_matches_execution(pane, key))
+        })
         .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &scan.panes, &agents))
-        .map(|pane| pane.pane_id.clone())
+        .filter_map(|pane| {
+            let backend = state
+                .backends
+                .iter()
+                .find(|backend| backend.kind() == pane.host)
+                .filter(|backend| backend.caps().send_text)
+                .cloned()?;
+            Some((backend, pane_socket_identity(pane), pane.pane_id.clone()))
+        })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return control_error(
@@ -846,11 +1170,10 @@ async fn run_work_control(
         );
     }
 
-    let socket = key.socket;
     let results = tokio::task::spawn_blocking(move || {
         candidates
             .into_iter()
-            .map(|pane| {
+            .map(|(backend, socket, pane)| {
                 let sent = backend.send_text_on(Some(&socket), &pane, &text);
                 let submitted = if sent && submit {
                     std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
@@ -2742,7 +3065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_metadata_requires_pat_and_persists_for_the_exact_ticket() {
+    async fn work_metadata_requires_pat_and_persists_for_the_exact_work() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("dashboard-work.json");
         let backend: SharedBackend = Arc::new(InventoryBackend {
@@ -2794,6 +3117,7 @@ mod tests {
         assert_eq!(saved.status(), StatusCode::OK);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/work-metadata")
@@ -2806,6 +3130,21 @@ mod tests {
         assert_eq!(response["works"][0]["metadata"]["title"], "Repair auth");
         assert_eq!(response["works"][0]["metadata"]["stage"], "review");
 
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/works")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = body_json(snapshot).await;
+        assert_eq!(snapshot["schema_version"], work::WORK_SCHEMA_VERSION);
+        assert_eq!(snapshot["works"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["works"][0]["stage"], "review");
+        assert_eq!(snapshot["works"][0]["runs"].as_array().unwrap().len(), 1);
+
         let reloaded = WorkStore::load(Some(path));
         assert_eq!(reloaded.records().len(), 1);
         assert_eq!(
@@ -2815,7 +3154,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_prompt_targets_only_live_agents_in_the_selected_ticket() {
+    async fn work_mutations_refuse_ambiguous_logical_and_execution_selectors() {
+        let app = router(public_read_state("edit-pat"));
+        let metadata = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "identity":{"workspace_id":"muxa","work_id":"CAL-101"},
+                            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+                            "metadata":{"stage":"review"}
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(metadata).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exactly one"));
+
+        let prompt = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "identity":{"workspace_id":"muxa","work_id":"CAL-101"},
+                            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+                            "text":"report status"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prompt.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(prompt).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn starting_work_needs_its_own_grant_beyond_the_control_token() {
+        // A valid control token is not enough: every other write route steers
+        // a process the operator already started, while this one starts new
+        // ones with permissions bypassed.
+        let state = public_read_state("edit-pat");
+        assert!(!state.config.allow_work_start, "default must be off");
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/up")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"work":"cal-1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Not 403: the browser reads 401/403 as a bad token and flips the
+        // whole dashboard to read-only, which would be a lie here.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("allow_work_start"),
+            "the refusal should name the switch that enables it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_work_still_refuses_without_the_control_token() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::PublicRead;
+        cfg.token = Some("edit-pat".into());
+        cfg.allow_work_start = true;
+        let response = router(state_from(cfg))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/up")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"work":"cal-1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_expands_the_same_registered_skill_the_cli_does() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let panes = vec![test_pane(
+            "herdr:p1",
+            "session-1",
+            "muxa",
+            "window-1",
+            "CAL-101",
+        )];
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes,
+        });
+        let state = public_read_state("edit-pat")
+            .with_backend(backend)
+            .with_message_skills(BTreeMap::from([(
+                "review-plan".to_string(),
+                "Run the peer review workflow.".to_string(),
+            )]));
+        seed_agent(&state, "agent-1", "herdr:p1").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"skill":"/review-plan","body":"check CAL-101","context":"tests pass","submit":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "Run the peer review workflow.\n\ncheck CAL-101\n\nInvocation context:\ntests pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_with_nothing_to_say_is_refused() {
+        let response = router(public_read_state("edit-pat"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"s","window_id":"w"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn work_prompt_targets_only_live_agents_in_the_selected_work() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let panes = vec![
             test_pane("herdr:p1", "session-1", "muxa", "window-1", "CAL-101"),

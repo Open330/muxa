@@ -7,7 +7,7 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 ## 이것만 기억하세요
 
 - tmux window 하나가 협업 room 하나입니다. Muxa managed model에서 이 window는
-  workspace session 안의 work/ticket 경계이기도 합니다.
+  현재 Run의 협업 경계이며, 지속되는 Work나 외부 이슈의 identity는 아닙니다.
 - MCP나 `muxa msg`로 말하는 **agent**는 자기 pane을 대행하는 발신자입니다. 응답은
   그 pane으로 돌아가 agent를 깨웁니다.
 - `muxa watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이

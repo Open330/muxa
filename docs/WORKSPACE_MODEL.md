@@ -3,11 +3,15 @@
 Muxa의 기본 tmux domain model을 다음 계층으로 전환한다. 기존
 `session = work` 형식은 읽거나 변환하지 않는다.
 
-| tmux object | Muxa identity | lifecycle |
+| tmux object | Muxa execution binding | lifecycle |
 | --- | --- | --- |
-| session | workspace/project | 여러 work를 담고 workspace 종료 시 제거 |
-| window | work/ticket/issue | work 생성·재사용·종료의 단위 |
-| pane | agent | role/task를 가진 실행 agent |
+| session | workspace 실행 context | 여러 Work Run을 담고 workspace 종료 시 제거 |
+| window | Work의 현재 Run | Work 생성·재사용 시 binding하고 종료하면 Run이 끝남 |
+| pane | agent 실행 surface | role/task를 가진 Agent session의 현재 binding |
+
+논리 모델은 `Workspace → Work → Run → Agent session`입니다. Linear/GitHub/Jira
+issue는 Work에 연결되는 외부 참조이지 Work 자체가 아닙니다. 자세한 invariant는
+[WORK_MODEL.md](WORK_MODEL.md)를 참고합니다.
 
 ## Implementation checklist
 

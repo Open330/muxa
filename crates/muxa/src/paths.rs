@@ -82,9 +82,9 @@ pub fn default_collaboration_audit_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_AUDIT_FILENAME))
 }
 
-/// Durable dashboard-only work metadata. Execution identity remains owned by
-/// the pane backend; this file stores operator annotations such as title,
-/// workflow stage, goal, and next action.
+/// Durable logical Work records. Execution bindings remain owned by pane
+/// backends; this file stores operator metadata and optional external issue
+/// references keyed by `{workspace_id, work_id}`.
 pub fn default_dashboard_work_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(DASHBOARD_WORK_FILENAME))
 }

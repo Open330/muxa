@@ -492,6 +492,12 @@ button, select {
   background: var(--surface);
 }
 
+.execution-run + .execution-run {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+
 .execution-breadcrumb {
   display: flex;
   align-items: center;
@@ -1426,7 +1432,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .work-board {
   display: grid;
-  grid-template-columns: repeat(5, minmax(235px, 1fr));
+  grid-template-columns: repeat(4, minmax(235px, 1fr));
   align-items: start;
   gap: 10px;
   padding: 10px;
@@ -1465,7 +1471,6 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font-size: 10px;
 }
 
-.work-lane.stage-attention .work-lane-header { color: var(--yellow); }
 .work-lane.stage-in_progress .work-lane-header { color: var(--green); }
 .work-lane.stage-review .work-lane-header { color: var(--magenta); }
 .work-lane.stage-done .work-lane-header { color: var(--fg-dim); }
@@ -1485,20 +1490,20 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font: 10px/1.2 var(--mono);
 }
 
-.board-ticket {
+.board-work {
   border-left-width: 2px;
   background: var(--surface);
 }
 
-.board-ticket .work-card-select {
+.board-work .work-card-select {
   width: 100%;
   display: block;
   padding: 10px;
 }
 
-.ticket-kicker {
+.work-kicker {
   display: grid;
-  grid-template-columns: minmax(0, auto) auto 1fr;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) minmax(0, auto);
   align-items: center;
   gap: 5px;
   min-width: 0;
@@ -1506,15 +1511,15 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font: 10px/1.2 var(--mono);
 }
 
-.ticket-kicker > span,
-.ticket-kicker small {
+.work-kicker > span,
+.work-kicker small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.ticket-kicker small {
+.work-kicker small {
   color: var(--fg-dim);
   text-align: right;
 }
@@ -1529,7 +1534,25 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   text-transform: uppercase;
 }
 
-.ticket-title {
+.external-badge {
+  min-width: 0;
+  overflow: hidden;
+  padding: 2px 5px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 38%, var(--border));
+  border-radius: 999px;
+  color: var(--cyan);
+  font-size: 8px;
+  letter-spacing: .02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.external-badge.local {
+  border-color: var(--border-soft);
+  color: var(--fg-dim);
+}
+
+.work-title {
   display: -webkit-box;
   margin-top: 8px;
   overflow: hidden;
@@ -1539,7 +1562,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   -webkit-line-clamp: 2;
 }
 
-.board-ticket .work-summary {
+.board-work .work-summary {
   min-height: 0;
   margin-top: 7px;
   color: var(--fg-muted);
@@ -1547,7 +1570,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   line-height: 1.45;
 }
 
-.ticket-next {
+.work-next {
   display: flex;
   gap: 6px;
   margin-top: 8px;
@@ -1559,7 +1582,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   line-height: 1.35;
 }
 
-.ticket-next b {
+.work-next b {
   flex: 0 0 auto;
   color: var(--accent);
   font: 9px/1.5 var(--mono);
@@ -1567,11 +1590,96 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   text-transform: uppercase;
 }
 
-.board-ticket .participant-list {
+.work-signals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.work-signal {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--yellow) 45%, var(--border));
+  border-radius: 999px;
+  color: var(--yellow);
+  font: 8px/1.3 var(--mono);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.work-signal.error {
+  border-color: color-mix(in srgb, var(--red) 48%, var(--border));
+  color: var(--red);
+}
+
+.unlinked-executions {
+  grid-column: 1 / -1;
+  min-width: 0;
+  margin-top: 2px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface-2) 68%, transparent);
+}
+
+.unlinked-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  color: var(--fg-muted);
+  font: 10px/1.3 var(--mono);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+.unlinked-heading small {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-align: right;
+  text-transform: none;
+}
+
+.unlinked-list {
+  display: grid;
+}
+
+.unlinked-row {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 8px minmax(120px, 1.2fr) 80px 64px minmax(140px, 1fr);
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--fg-muted);
+  font: 10px/1.2 var(--mono);
+}
+
+.unlinked-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unlinked-row b,
+.unlinked-row small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unlinked-row b { color: var(--fg); }
+.unlinked-row small { margin-top: 2px; color: var(--fg-dim); }
+
+.board-work .participant-list {
   margin-top: 9px;
 }
 
-.ticket-footer {
+.work-footer {
   min-height: 31px;
   display: flex;
   align-items: center;
@@ -1583,7 +1691,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font: 9px/1.2 var(--mono);
 }
 
-.ticket-footer .work-expand {
+.work-footer .work-expand {
   align-self: stretch;
   min-width: 76px;
 }
@@ -1641,7 +1749,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   border-bottom: 1px solid var(--border);
 }
 
-.drawer-ticket-id {
+.drawer-work-id {
   color: var(--accent);
   font: 10px/1.2 var(--mono);
   letter-spacing: .05em;
@@ -1786,6 +1894,36 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font-style: normal;
 }
 
+.drawer-external-item {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-soft);
+  font: 10px/1.3 var(--mono);
+}
+
+.drawer-external-item b,
+.drawer-external-item small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drawer-external-item small,
+.drawer-external-item em {
+  color: var(--fg-muted);
+  font-style: normal;
+}
+
+.drawer-external-item a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
 .toast {
   position: fixed;
   left: 50%;
@@ -1808,7 +1946,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   }
 
   .work-board {
-    grid-template-columns: repeat(5, minmax(225px, 1fr));
+    grid-template-columns: repeat(4, minmax(225px, 1fr));
   }
 }
 
@@ -1844,7 +1982,7 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   }
 
   .work-board {
-    grid-template-columns: repeat(5, minmax(220px, 78vw));
+    grid-template-columns: repeat(4, minmax(220px, 78vw));
   }
 
   .execution-pane-row {
@@ -1852,6 +1990,14 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   }
 
   .execution-pane-title {
+    display: none;
+  }
+
+  .unlinked-row {
+    grid-template-columns: 8px minmax(120px, 1fr) 72px 52px;
+  }
+
+  .unlinked-row > span:last-child {
     display: none;
   }
 
@@ -1874,5 +2020,53 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
   .timeline-wrap {
     max-height: 560px;
+  }
+}
+
+/* Start-work form in the work board header. Kept on one row so the board
+   heading stays a heading and does not become a control panel. */
+.work-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.work-start-form {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.work-start-form input {
+  font: inherit;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border, rgba(148, 163, 184, 0.35));
+  background: var(--input-bg, rgba(15, 23, 42, 0.35));
+  color: inherit;
+}
+
+.work-start-id {
+  width: 9rem;
+}
+
+.work-start-external {
+  width: 13rem;
+}
+
+.work-start-body {
+  width: 16rem;
+}
+
+.work-start-form button[disabled] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (max-width: 900px) {
+  .work-start-body,
+  .work-start-external {
+    display: none;
   }
 }

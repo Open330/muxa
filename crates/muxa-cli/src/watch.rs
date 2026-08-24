@@ -1011,7 +1011,7 @@ pub(crate) enum QuickAction {
         dir: String,
         agent_label: &'static str,
         launch: String,
-        /// Explicit work/ticket id; `None` derives one from the directory.
+        /// Explicit Work id; `None` derives one from the directory.
         work: Option<String>,
     },
     /// Spawn relative to an exact selected topology node. Session targets
@@ -2008,7 +2008,7 @@ struct SpawnComposer {
     target: Option<TopologyNodeKey>,
     dir: String,
     dir_cursor: usize,
-    /// Work/ticket id. Empty means derive it from the directory.
+    /// Work id. Empty means derive it from the directory.
     name: String,
     name_cursor: usize,
     agent: SpawnAgent,

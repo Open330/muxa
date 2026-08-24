@@ -1,8 +1,8 @@
-//! `muxa dashboard` — session-first operator console.
+//! `muxa dashboard` — Work-first operator console.
 //!
-//! `muxa watch` is a compact picker. This module keeps the same trusted side
-//! effects for tmux actions, but presents a richer card board where the user can
-//! inspect panes and send prompts without attaching to the underlying session.
+//! `muxa watch` remains the compact execution picker. This module shows durable
+//! muxa Work as the primary unit, with runs and panes retained as expandable
+//! execution detail and control targets.
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -18,12 +18,16 @@ use muxa::collaboration::{
 use muxa::config::{IconSet, WatchTheme};
 use muxa::event::RateLimitScope;
 use muxa::ipc::Client;
+#[cfg(test)]
 use muxa::session::SessionBackendKind;
 use muxa::session_activity::SessionActivity;
 use muxa::tmux::PaneInfo;
+use muxa::work::{BoardStage, ExternalItemRef, WorkSignal, WorkSnapshot};
+#[cfg(test)]
+use muxa::SessionRef;
 use muxa::{
-    Agent, AgentKind, AgentState, Config, HostKind, PaneBackend, ScopeExclusions, SessionRef,
-    SurfaceKind,
+    Agent, AgentKind, AgentState, BackendEndpoint, Config, HostKind, PaneBackend, PaneKey,
+    ScopeExclusions, SessionKey, SurfaceKind, TopologyNodeKey, WindowKey,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -82,12 +86,14 @@ enum DashboardSort {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
 }
@@ -95,6 +101,7 @@ enum ActionTarget {
 impl ActionTarget {
     fn capture_target(&self) -> CaptureTarget {
         match self {
+            Self::TopologyPane(pane) => CaptureTarget::TopologyPane(pane.clone()),
             Self::Pane(pane) => CaptureTarget::Pane(pane.clone()),
             Self::PtySession(session) => CaptureTarget::PtySession(session.clone()),
         }
@@ -102,6 +109,7 @@ impl ActionTarget {
 
     fn open_target(&self) -> OpenTarget {
         match self {
+            Self::TopologyPane(pane) => OpenTarget::TopologyPane(pane.clone()),
             Self::Pane(pane) => OpenTarget::Pane(pane.clone()),
             Self::PtySession(session) => OpenTarget::PtySession(session.clone()),
         }
@@ -109,6 +117,7 @@ impl ActionTarget {
 
     fn prompt_target(&self) -> PromptTarget {
         match self {
+            Self::TopologyPane(pane) => PromptTarget::TopologyPane(pane.clone()),
             Self::Pane(pane) => PromptTarget::Pane(pane.clone()),
             Self::PtySession(session) => PromptTarget::PtySession(session.clone()),
         }
@@ -116,8 +125,24 @@ impl ActionTarget {
 
     fn label(&self) -> String {
         match self {
+            Self::TopologyPane(pane) => format!(
+                "{} pane {}",
+                pane.window.session.endpoint.socket, pane.pane_id
+            ),
             Self::Pane(pane) => format!("pane {pane}"),
             Self::PtySession(session) => format!("pty {session}"),
+        }
+    }
+
+    fn is_pane(&self) -> bool {
+        matches!(self, Self::TopologyPane(_) | Self::Pane(_))
+    }
+
+    fn pane_id(&self) -> Option<&str> {
+        match self {
+            Self::TopologyPane(pane) => Some(&pane.pane_id),
+            Self::Pane(pane) => Some(pane),
+            Self::PtySession(_) => None,
         }
     }
 }
@@ -416,7 +441,7 @@ impl CollaborationData {
 
 #[derive(Debug, Clone, Default)]
 struct DashboardTotals {
-    sessions: usize,
+    works: usize,
     tracked_agents: usize,
     attention: usize,
     working: usize,
@@ -429,13 +454,14 @@ struct SessionCard {
     label: String,
     host: CardHost,
     pane_ids: Vec<String>,
+    pane_keys: Vec<PaneKey>,
     pane_labels: Vec<String>,
     primary_pane: Option<String>,
+    primary_pane_key: Option<PaneKey>,
     pty_session_id: Option<String>,
     cwd: Option<String>,
     agents: Vec<Agent>,
     status: CardStatus,
-    counts: StateCounts,
     last_activity_at: Option<OffsetDateTime>,
     active: ActiveDuration,
     foreground_secs: Option<u64>,
@@ -447,28 +473,45 @@ struct SessionCard {
     cost_usd: Option<f64>,
     context_used_pct: Option<f32>,
     kinds: Vec<AgentKind>,
+    workspace: Option<String>,
+    work_id: Option<String>,
+    stage: Option<BoardStage>,
+    signals: Vec<WorkSignal>,
+    external_item: Option<ExternalItemRef>,
+    run_count: usize,
 }
 
 impl SessionCard {
     fn action_targets(&self) -> Vec<ActionTarget> {
         let mut targets = Vec::new();
-        if let Some(pane) = self.primary_pane.as_ref() {
+        if let Some(pane) = self.primary_pane_key.as_ref() {
+            push_action_target(&mut targets, ActionTarget::TopologyPane(pane.clone()));
+        } else if let Some(pane) = self.primary_pane.as_ref() {
             push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
         }
         if let Some(session) = self.pty_session_id.as_ref() {
             push_action_target(&mut targets, ActionTarget::PtySession(session.clone()));
         }
-        for agent in &self.agents {
-            if let Some(pane) = agent.pane.as_ref() {
-                push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
-            } else if let Some(surface) = agent.surface.as_ref() {
-                if surface.kind == SurfaceKind::Pty {
-                    push_action_target(&mut targets, ActionTarget::PtySession(surface.id.clone()));
+        if self.pane_keys.is_empty() {
+            for agent in &self.agents {
+                if let Some(pane) = agent.pane.as_ref() {
+                    push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
+                } else if let Some(surface) = agent.surface.as_ref() {
+                    if surface.kind == SurfaceKind::Pty {
+                        push_action_target(
+                            &mut targets,
+                            ActionTarget::PtySession(surface.id.clone()),
+                        );
+                    }
                 }
             }
-        }
-        for pane in &self.pane_ids {
-            push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
+            for pane in &self.pane_ids {
+                push_action_target(&mut targets, ActionTarget::Pane(pane.clone()));
+            }
+        } else {
+            for pane in &self.pane_keys {
+                push_action_target(&mut targets, ActionTarget::TopologyPane(pane.clone()));
+            }
         }
         targets
     }
@@ -481,6 +524,14 @@ impl SessionCard {
     }
 
     fn attention_score(&self) -> u8 {
+        if self.signals.contains(&WorkSignal::Error) {
+            return 7;
+        }
+        if self.signals.contains(&WorkSignal::Blocked)
+            || self.signals.contains(&WorkSignal::Attention)
+        {
+            return 6;
+        }
         match self.status {
             CardStatus::Error => 6,
             CardStatus::WaitingChoice => 5,
@@ -499,6 +550,7 @@ fn push_action_target(targets: &mut Vec<ActionTarget>, target: ActionTarget) {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardHost {
     Tmux,
@@ -511,6 +563,7 @@ enum CardHost {
 }
 
 impl CardHost {
+    #[cfg(test)]
     fn label(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
@@ -561,6 +614,23 @@ impl CardStatus {
             Self::Stopped => "stopped",
             Self::Empty => "untracked",
         }
+    }
+}
+
+fn board_stage_label(stage: BoardStage) -> &'static str {
+    match stage {
+        BoardStage::Queued => "queued",
+        BoardStage::InProgress => "in progress",
+        BoardStage::Review => "review",
+        BoardStage::Done => "done",
+    }
+}
+
+fn work_signal_label(signal: WorkSignal) -> &'static str {
+    match signal {
+        WorkSignal::Attention => "attention",
+        WorkSignal::Blocked => "blocked",
+        WorkSignal::Error => "error",
     }
 }
 
@@ -616,36 +686,6 @@ impl StateCounts {
             CardStatus::Idle
         } else {
             CardStatus::Stopped
-        }
-    }
-
-    fn compact(self) -> String {
-        let mut parts = Vec::new();
-        if self.error > 0 {
-            parts.push(format!("{} err", self.error));
-        }
-        if self.waiting_choice > 0 {
-            parts.push(format!("{} choice", self.waiting_choice));
-        }
-        if self.waiting_input > 0 {
-            parts.push(format!("{} input", self.waiting_input));
-        }
-        if self.working > 0 {
-            parts.push(format!("{} work", self.working));
-        }
-        if self.starting > 0 {
-            parts.push(format!("{} start", self.starting));
-        }
-        if self.idle > 0 {
-            parts.push(format!("{} idle", self.idle));
-        }
-        if self.stopped > 0 {
-            parts.push(format!("{} stop", self.stopped));
-        }
-        if parts.is_empty() {
-            "no agents".to_string()
-        } else {
-            parts.join(" · ")
         }
     }
 }
@@ -845,10 +885,8 @@ impl DashboardApp {
     }
 
     fn selected_collaboration_peer(&self) -> Option<&Participant> {
-        let ActionTarget::Pane(pane) = self.selected_action_target()? else {
-            return None;
-        };
-        self.data.collaboration.peer_for_pane(&pane)
+        let target = self.selected_action_target()?;
+        self.data.collaboration.peer_for_pane(target.pane_id()?)
     }
 
     fn collaboration_requests(&self) -> &[CollaborationRequest] {
@@ -939,6 +977,18 @@ struct ConfirmPopup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
     Quick(QuickAction),
+    PanePrompt {
+        pane: PaneKey,
+        text: String,
+    },
+    PaneAbort(PaneKey),
+    WorkPrompt {
+        panes: Vec<PaneKey>,
+        text: String,
+    },
+    WorkAbort {
+        panes: Vec<PaneKey>,
+    },
     PtyPrompt {
         session_id: String,
         text: String,
@@ -1031,8 +1081,10 @@ impl PromptComposer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PromptTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
+    WorkPanes(Vec<PaneKey>),
     CollaborationSend {
         origin: CollaborationOrigin,
         target: String,
@@ -1048,6 +1100,7 @@ enum PromptTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CaptureTarget {
+    TopologyPane(PaneKey),
     Pane(String),
     PtySession(String),
 }
@@ -1305,16 +1358,21 @@ async fn load_dashboard_data(
         .context("querying daemon agent snapshot")?;
 
     let backend = muxa::default_backend();
-    let host = backend.kind();
     let panes = backend.list_panes();
     let mut notes = Vec::new();
-    let sessions = match client.list_sessions().await {
-        Ok(sessions) => sessions,
-        Err(e) => {
-            notes.push(format!("terminal session list unavailable: {e}"));
-            Vec::new()
-        }
-    };
+    let scan = muxa::tmux::scanner::scan().await;
+    notes.extend(
+        scan.errors
+            .iter()
+            .map(|error| format!("tmux scan {}: {}", error.socket.display(), error.message)),
+    );
+    let records = muxa::dashboard::load_work_records(muxa::paths::default_dashboard_work_file());
+    let work_snapshot = muxa::work::build_snapshot(&scan.panes, &agents, &records, now);
+    if args.include_paneless {
+        notes.push(
+            "paneless agents are execution diagnostics; use `muxa watch` to inspect them".into(),
+        );
+    }
     let session_activities = load_session_activities(cfg).await;
     let active_stats =
         match stats::session_active_stats(client, cfg, &args.since, &ScopeExclusions::default())
@@ -1327,16 +1385,13 @@ async fn load_dashboard_data(
             }
         };
 
-    let mut data = build_dashboard_data(
+    let mut data = build_work_dashboard_data(
         now,
-        agents,
+        work_snapshot,
         panes,
-        sessions,
         session_activities,
         active_stats,
-        args.include_paneless,
         args.sort,
-        host,
         notes,
     );
     data.collaboration = load_collaboration_data(client, anchor).await;
@@ -1464,9 +1519,8 @@ fn dashboard_collaboration_origin_from(
 /// daemon's participant because it is already normalized; cards outside the
 /// launch room fall back to the selected agent's recorded endpoint.
 fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
-    let ActionTarget::Pane(pane) = app.selected_action_target()? else {
-        return None;
-    };
+    let target = app.selected_action_target()?;
+    let pane = target.pane_id()?.to_string();
     let participant = app.data.collaboration.peer_for_pane(&pane);
     let agent = app.selected_card().and_then(|card| {
         card.agents
@@ -1487,6 +1541,10 @@ fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
                     .as_deref()
                     .map(|endpoint| muxa::backend::pane_endpoint_identity(Some(&pane), endpoint))
             })
+        })
+        .or_else(|| match &target {
+            ActionTarget::TopologyPane(key) => Some(key.window.session.endpoint.socket.clone()),
+            ActionTarget::Pane(_) | ActionTarget::PtySession(_) => None,
         });
     Some(CollaborationAnchor {
         origin: CollaborationOrigin {
@@ -1513,7 +1571,127 @@ async fn load_session_activities(cfg: &Config) -> Vec<SessionActivity> {
     muxa::session_activity::load(&path).await
 }
 
+fn build_work_dashboard_data(
+    now: OffsetDateTime,
+    snapshot: WorkSnapshot,
+    panes: Vec<PaneInfo>,
+    session_activities: Vec<SessionActivity>,
+    active_stats: SessionActiveStats,
+    sort: DashboardSort,
+    mut notes: Vec<String>,
+) -> DashboardData {
+    let pane_by_id = panes
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+        .collect::<HashMap<_, _>>();
+    let activity_by_name = session_activities
+        .into_iter()
+        .map(|activity| (activity.name.clone(), activity))
+        .collect::<HashMap<_, _>>();
+    let mut cards = Vec::with_capacity(snapshot.works.len());
+
+    for work in snapshot.works {
+        let host = work
+            .runs
+            .first()
+            .map_or(CardHost::Tmux, |run| card_host(run.execution.host));
+        let mut builder = CardBuilder::new(
+            format!(
+                "work:{}:{}",
+                work.identity.workspace_id, work.identity.work_id
+            ),
+            work.title,
+            host,
+        );
+        builder.workspace = Some(work.identity.workspace_id);
+        builder.work_id = Some(work.identity.work_id);
+        builder.stage = Some(work.stage);
+        builder.signals = work.signals;
+        builder.external_item = work.external_items.into_iter().next();
+        builder.run_count = work.runs.len();
+        builder.cwd = work.runs.iter().find_map(|run| run.cwd.clone());
+
+        let mut seen_agents = BTreeSet::new();
+        for run in work.runs {
+            let window = WindowKey {
+                session: SessionKey {
+                    endpoint: BackendEndpoint {
+                        host: run.execution.host,
+                        socket: run.execution.socket.clone(),
+                    },
+                    session_id: run.execution.session_id.clone(),
+                },
+                window_id: run.execution.window_id.clone(),
+            };
+            for pane in run.panes {
+                builder.pane_ids.insert(pane.pane_id.clone());
+                builder.pane_keys.insert(PaneKey {
+                    window: window.clone(),
+                    pane_id: pane.pane_id,
+                });
+                if let Some(agent) = pane.agent {
+                    if seen_agents.insert(agent.session_id.clone()) {
+                        builder.agents.push(agent);
+                    }
+                }
+            }
+        }
+        cards.push(finalize_card(
+            builder,
+            now,
+            &pane_by_id,
+            &activity_by_name,
+            &active_stats.by_session,
+        ));
+    }
+    sort_cards(&mut cards, sort);
+
+    if !snapshot.unlinked_executions.is_empty() {
+        notes.push(format!(
+            "{} unlinked executions hidden from Work board; use `muxa watch` for topology",
+            snapshot.unlinked_executions.len()
+        ));
+    }
+    let totals = DashboardTotals {
+        works: cards.len(),
+        tracked_agents: cards.iter().map(|card| card.agents.len()).sum(),
+        attention: cards
+            .iter()
+            .filter(|card| {
+                !card.signals.is_empty()
+                    || matches!(
+                        card.status,
+                        CardStatus::Error | CardStatus::WaitingChoice | CardStatus::WaitingInput
+                    )
+            })
+            .count(),
+        working: cards
+            .iter()
+            .filter(|card| card.stage == Some(BoardStage::InProgress))
+            .count(),
+        active: active_stats.totals,
+    };
+
+    DashboardData {
+        generated_at: now,
+        cards,
+        totals,
+        notes,
+        collaboration: CollaborationData::default(),
+    }
+}
+
+fn card_host(host: HostKind) -> CardHost {
+    match host {
+        HostKind::Tmux => CardHost::Tmux,
+        HostKind::Rmux => CardHost::Rmux,
+        HostKind::Zellij => CardHost::Zellij,
+        HostKind::Herdr => CardHost::Herdr,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_dashboard_data(
     now: OffsetDateTime,
     agents: Vec<Agent>,
@@ -1608,7 +1786,7 @@ fn build_dashboard_data(
     sort_cards(&mut cards, sort);
 
     let totals = DashboardTotals {
-        sessions: cards.len(),
+        works: cards.len(),
         tracked_agents: cards.iter().map(|card| card.agents.len()).sum(),
         attention: cards
             .iter()
@@ -1641,9 +1819,16 @@ struct CardBuilder {
     label: String,
     host: CardHost,
     pane_ids: BTreeSet<String>,
+    pane_keys: BTreeSet<PaneKey>,
     pty_session_id: Option<String>,
     cwd: Option<String>,
     agents: Vec<Agent>,
+    workspace: Option<String>,
+    work_id: Option<String>,
+    stage: Option<BoardStage>,
+    signals: Vec<WorkSignal>,
+    external_item: Option<ExternalItemRef>,
+    run_count: usize,
 }
 
 impl CardBuilder {
@@ -1653,13 +1838,21 @@ impl CardBuilder {
             label,
             host,
             pane_ids: BTreeSet::new(),
+            pane_keys: BTreeSet::new(),
             pty_session_id: None,
             cwd: None,
             agents: Vec::new(),
+            workspace: None,
+            work_id: None,
+            stage: None,
+            signals: Vec::new(),
+            external_item: None,
+            run_count: 0,
         }
     }
 }
 
+#[cfg(test)]
 struct CardIdentity {
     key: String,
     label: String,
@@ -1667,6 +1860,7 @@ struct CardIdentity {
     pty_session_id: Option<String>,
 }
 
+#[cfg(test)]
 fn card_identity(
     agent: &Agent,
     pane_by_id: &HashMap<String, PaneInfo>,
@@ -1737,7 +1931,17 @@ fn finalize_card(
     let status = counts.status();
     let active = active_for_card(&builder, active_by_session);
     let pane_ids = builder.pane_ids.into_iter().collect::<Vec<_>>();
+    let pane_keys = builder.pane_keys.into_iter().collect::<Vec<_>>();
     let primary_pane = choose_primary_pane(&builder.agents, &pane_ids);
+    let primary_pane_key = primary_pane
+        .as_ref()
+        .and_then(|pane_id| {
+            pane_keys
+                .iter()
+                .find(|pane| &pane.pane_id == pane_id)
+                .cloned()
+        })
+        .or_else(|| pane_keys.first().cloned());
     let pane_labels = pane_ids
         .iter()
         .map(|pane| pane_label(pane, pane_by_id))
@@ -1768,13 +1972,14 @@ fn finalize_card(
         label: builder.label,
         host: builder.host,
         pane_ids,
+        pane_keys,
         pane_labels,
         primary_pane,
+        primary_pane_key,
         pty_session_id: builder.pty_session_id,
         cwd: builder.cwd.or(fallback_cwd),
         agents: builder.agents,
         status,
-        counts,
         last_activity_at,
         active,
         foreground_secs,
@@ -1786,6 +1991,12 @@ fn finalize_card(
         cost_usd,
         context_used_pct,
         kinds,
+        workspace: builder.workspace,
+        work_id: builder.work_id,
+        stage: builder.stage,
+        signals: builder.signals,
+        external_item: builder.external_item,
+        run_count: builder.run_count,
     }
 }
 
@@ -1997,6 +2208,7 @@ fn handle_normal_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
             UiAction::None
         }
         KeyCode::Char('p') => open_composer(app),
+        KeyCode::Char('P') => open_work_composer(app),
         KeyCode::Char('m') => open_collaboration_composer(app),
         KeyCode::Char('b') => {
             app.overlay = Overlay::Collaboration;
@@ -2012,6 +2224,7 @@ fn handle_normal_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
         ),
         KeyCode::Char('c') => copy_selected_prompt(app),
         KeyCode::Char('R') => confirm_abort(app),
+        KeyCode::Char('A') => confirm_work_abort(app),
         KeyCode::Char('K') => confirm_kill(app),
         _ => UiAction::None,
     }
@@ -2057,12 +2270,14 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
                 return UiAction::None;
             }
             UiAction::Run(match composer.target {
+                PromptTarget::TopologyPane(pane) => PendingAction::PanePrompt { pane, text },
                 PromptTarget::Pane(pane_id) => {
                     PendingAction::Quick(QuickAction::SendPrompt { pane_id, text })
                 }
                 PromptTarget::PtySession(session_id) => {
                     PendingAction::PtyPrompt { session_id, text }
                 }
+                PromptTarget::WorkPanes(panes) => PendingAction::WorkPrompt { panes, text },
                 PromptTarget::CollaborationSend {
                     origin,
                     target,
@@ -2230,7 +2445,10 @@ fn cycle_composer_option(composer: &mut PromptComposer) {
                 | RequestStatus::Cancelled => RequestStatus::Completed,
             };
         }
-        PromptTarget::Pane(_) | PromptTarget::PtySession(_) => {}
+        PromptTarget::TopologyPane(_)
+        | PromptTarget::Pane(_)
+        | PromptTarget::PtySession(_)
+        | PromptTarget::WorkPanes(_) => {}
     }
 }
 
@@ -2440,7 +2658,7 @@ fn open_composer(app: &mut DashboardApp) -> UiAction {
         app.set_hint("no session selected", HintLevel::Err);
         return UiAction::None;
     };
-    if matches!(target, ActionTarget::Pane(_)) && !pane_write_supported(host) {
+    if target.is_pane() && !pane_write_supported(host) {
         let message = unsupported_pane_action(host, "prompting")
             .unwrap_or_else(|| "prompt unsupported".into());
         app.set_hint(message, HintLevel::Err);
@@ -2450,6 +2668,56 @@ fn open_composer(app: &mut DashboardApp) -> UiAction {
         target.prompt_target(),
         format!("{label} · {}", target.label()),
     ));
+    UiAction::None
+}
+
+fn live_work_panes(card: &SessionCard) -> Vec<PaneKey> {
+    card.pane_keys
+        .iter()
+        .filter(|pane| {
+            card.agents.iter().any(|agent| {
+                agent.state != AgentState::Stopped && agent_targets_pane_key(agent, pane, card)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn agent_targets_pane_key(agent: &Agent, key: &PaneKey, card: &SessionCard) -> bool {
+    if agent.pane.as_deref() != Some(&key.pane_id) {
+        return false;
+    }
+    if let Some(socket) = agent.tmux_socket.as_deref() {
+        let endpoint = muxa::backend::pane_endpoint_identity(agent.pane.as_deref(), socket);
+        return endpoint == key.window.session.endpoint.socket
+            && muxa::backend::pane_id_host_kind(&key.pane_id)
+                .is_none_or(|host| host == key.window.session.endpoint.host);
+    }
+    card.pane_keys
+        .iter()
+        .filter(|pane| pane.pane_id == key.pane_id)
+        .count()
+        == 1
+}
+
+fn open_work_composer(app: &mut DashboardApp) -> UiAction {
+    let Some(card) = app.selected_card() else {
+        app.set_hint("no Work selected", HintLevel::Err);
+        return UiAction::None;
+    };
+    if !pane_write_supported(card.host) {
+        let message = unsupported_pane_action(card.host, "prompting")
+            .unwrap_or_else(|| "prompt unsupported".into());
+        app.set_hint(message, HintLevel::Err);
+        return UiAction::None;
+    }
+    let panes = live_work_panes(card);
+    if panes.is_empty() {
+        app.set_hint("selected Work has no live agent panes", HintLevel::Err);
+        return UiAction::None;
+    }
+    let label = format!("{} · all {} agents", card.label, panes.len());
+    app.composer = Some(PromptComposer::new(PromptTarget::WorkPanes(panes), label));
     UiAction::None
 }
 
@@ -2469,13 +2737,14 @@ fn confirm_abort(app: &mut DashboardApp) -> UiAction {
     let Some((host, label, target)) = selected_target_context(app) else {
         return UiAction::None;
     };
-    if matches!(target, ActionTarget::Pane(_)) && !pane_write_supported(host) {
+    if target.is_pane() && !pane_write_supported(host) {
         let message =
             unsupported_pane_action(host, "abort").unwrap_or_else(|| "abort unsupported".into());
         app.set_hint(message, HintLevel::Err);
         return UiAction::None;
     }
     let action = match target.clone() {
+        ActionTarget::TopologyPane(pane) => PendingAction::PaneAbort(pane),
         ActionTarget::Pane(pane_id) => PendingAction::Quick(QuickAction::AbortTurn(pane_id)),
         ActionTarget::PtySession(session_id) => PendingAction::PtyCtrlC(session_id),
     };
@@ -2486,17 +2755,46 @@ fn confirm_abort(app: &mut DashboardApp) -> UiAction {
     UiAction::None
 }
 
+fn confirm_work_abort(app: &mut DashboardApp) -> UiAction {
+    let Some(card) = app.selected_card() else {
+        return UiAction::None;
+    };
+    if !pane_write_supported(card.host) {
+        let message = unsupported_pane_action(card.host, "abort")
+            .unwrap_or_else(|| "abort unsupported".into());
+        app.set_hint(message, HintLevel::Err);
+        return UiAction::None;
+    }
+    let panes = live_work_panes(card);
+    if panes.is_empty() {
+        app.set_hint("selected Work has no live agent panes", HintLevel::Err);
+        return UiAction::None;
+    }
+    app.confirm = Some(ConfirmPopup {
+        message: format!(
+            "Abort current turns on all {} agents in {}?",
+            panes.len(),
+            card.label
+        ),
+        on_confirm: PendingAction::WorkAbort { panes },
+    });
+    UiAction::None
+}
+
 fn confirm_kill(app: &mut DashboardApp) -> UiAction {
     let Some((host, label, target)) = selected_target_context(app) else {
         return UiAction::None;
     };
-    if matches!(target, ActionTarget::Pane(_)) && !pane_write_supported(host) {
+    if target.is_pane() && !pane_write_supported(host) {
         let message = unsupported_pane_action(host, "termination")
             .unwrap_or_else(|| "terminate unsupported".into());
         app.set_hint(message, HintLevel::Err);
         return UiAction::None;
     }
     let action = match target.clone() {
+        ActionTarget::TopologyPane(pane) => {
+            PendingAction::Quick(QuickAction::TerminateNode(TopologyNodeKey::Pane(pane)))
+        }
         ActionTarget::Pane(pane_id) => PendingAction::Quick(QuickAction::KillPane(pane_id)),
         ActionTarget::PtySession(session_id) => PendingAction::TerminatePty(session_id),
     };
@@ -2513,92 +2811,200 @@ async fn run_pending_action(client: &Client, action: PendingAction) -> ActionOut
             let mut fx = RealEffects;
             watch::dispatch_quick_action(action, &mut fx)
         }
+        PendingAction::PanePrompt { pane, text } => {
+            run_exact_pane_action(&pane, &text, true, "prompted")
+        }
+        PendingAction::PaneAbort(pane) => run_exact_pane_action(&pane, "\u{3}", false, "aborted"),
+        PendingAction::WorkPrompt { panes, text } => {
+            run_work_pane_actions(panes, &text, true, "prompted")
+        }
+        PendingAction::WorkAbort { panes } => {
+            run_work_pane_actions(panes, "\u{3}", false, "aborted")
+        }
         PendingAction::PtyPrompt { session_id, text } => {
-            match client
-                .write_session(&session_id, &format!("{text}\r"))
-                .await
-            {
-                Ok(()) => ActionOutcome::Ok(format!("sent prompt to {session_id}")),
-                Err(e) => ActionOutcome::Err(format!("send failed: {e}")),
-            }
+            write_pty(
+                client,
+                session_id,
+                format!("{text}\r"),
+                "sent prompt to",
+                "send",
+            )
+            .await
         }
         PendingAction::PtyCtrlC(session_id) => {
-            match client.write_session(&session_id, "\u{3}").await {
-                Ok(()) => ActionOutcome::Ok(format!("sent Ctrl-C to {session_id}")),
-                Err(e) => ActionOutcome::Err(format!("abort failed: {e}")),
-            }
+            write_pty(
+                client,
+                session_id,
+                "\u{3}".into(),
+                "sent Ctrl-C to",
+                "abort",
+            )
+            .await
         }
-        PendingAction::TerminatePty(session_id) => {
-            match client.terminate_session(&session_id).await {
-                Ok(()) => ActionOutcome::Ok(format!("terminated {session_id}")),
-                Err(e) => ActionOutcome::Err(format!("terminate failed: {e}")),
-            }
-        }
-        PendingAction::CollaborationInbox { origin } => {
-            match client.collaboration_inbox(&origin).await {
-                Ok(requests) if requests.is_empty() => {
-                    ActionOutcome::Ok("collaboration inbox is empty".into())
-                }
-                Ok(requests) => ActionOutcome::Ok(format!(
-                    "claimed {} collaboration request{}",
-                    requests.len(),
-                    if requests.len() == 1 { "" } else { "s" }
-                )),
-                Err(e) => ActionOutcome::Err(format!("inbox failed: {e}")),
-            }
-        }
+        PendingAction::TerminatePty(session_id) => terminate_pty(client, session_id).await,
+        PendingAction::CollaborationInbox { origin } => collaboration_inbox(client, origin).await,
         PendingAction::CollaborationSend {
             origin,
             target,
             kind,
             body,
             work_mode,
-        } => {
-            let request = NewRequest {
-                kind,
-                body,
-                expects_reply: kind != RequestKind::Notice,
-                work_mode,
-                paths: Vec::new(),
-                air_artifacts: Vec::new(),
-            };
-            match client.collaboration_send(&origin, &target, &request).await {
-                Ok(request) => ActionOutcome::Ok(format!(
-                    "sent {} to {} ({})",
-                    short_request_id(&request.id),
-                    request.to.label(),
-                    request_kind_label(kind)
-                )),
-                Err(e) => ActionOutcome::Err(format!("collaboration send failed: {e}")),
-            }
-        }
+        } => collaboration_send(client, origin, target, kind, body, work_mode).await,
         PendingAction::CollaborationReply {
             origin,
             request_id,
             status,
             body,
-        } => {
-            match client
-                .collaboration_reply(&origin, &request_id, status, &body, &[], &[])
-                .await
-            {
-                Ok(request) => ActionOutcome::Ok(format!(
-                    "replied to {} ({})",
-                    short_request_id(&request.id),
-                    request_status_label(status)
-                )),
-                Err(e) => ActionOutcome::Err(format!("collaboration reply failed: {e}")),
-            }
-        }
+        } => collaboration_reply(client, origin, request_id, status, body).await,
         PendingAction::CollaborationCancel { origin, request_id } => {
-            match client.collaboration_cancel(&origin, &request_id).await {
-                Ok(request) => {
-                    ActionOutcome::Ok(format!("cancelled {}", short_request_id(&request.id)))
-                }
-                Err(e) => ActionOutcome::Err(format!("collaboration cancel failed: {e}")),
-            }
+            collaboration_cancel(client, origin, request_id).await
         }
     }
+}
+
+async fn collaboration_inbox(client: &Client, origin: CollaborationOrigin) -> ActionOutcome {
+    match client.collaboration_inbox(&origin).await {
+        Ok(requests) if requests.is_empty() => {
+            ActionOutcome::Ok("collaboration inbox is empty".into())
+        }
+        Ok(requests) => ActionOutcome::Ok(format!(
+            "claimed {} collaboration request{}",
+            requests.len(),
+            if requests.len() == 1 { "" } else { "s" }
+        )),
+        Err(error) => ActionOutcome::Err(format!("inbox failed: {error}")),
+    }
+}
+
+async fn collaboration_send(
+    client: &Client,
+    origin: CollaborationOrigin,
+    target: String,
+    kind: RequestKind,
+    body: String,
+    work_mode: WorkMode,
+) -> ActionOutcome {
+    let request = NewRequest {
+        kind,
+        body,
+        expects_reply: kind != RequestKind::Notice,
+        work_mode,
+        paths: Vec::new(),
+        air_artifacts: Vec::new(),
+    };
+    match client.collaboration_send(&origin, &target, &request).await {
+        Ok(request) => ActionOutcome::Ok(format!(
+            "sent {} to {} ({})",
+            short_request_id(&request.id),
+            request.to.label(),
+            request_kind_label(kind)
+        )),
+        Err(error) => ActionOutcome::Err(format!("collaboration send failed: {error}")),
+    }
+}
+
+async fn collaboration_reply(
+    client: &Client,
+    origin: CollaborationOrigin,
+    request_id: String,
+    status: RequestStatus,
+    body: String,
+) -> ActionOutcome {
+    match client
+        .collaboration_reply(&origin, &request_id, status, &body, &[], &[])
+        .await
+    {
+        Ok(request) => ActionOutcome::Ok(format!(
+            "replied to {} ({})",
+            short_request_id(&request.id),
+            request_status_label(status)
+        )),
+        Err(error) => ActionOutcome::Err(format!("collaboration reply failed: {error}")),
+    }
+}
+
+async fn collaboration_cancel(
+    client: &Client,
+    origin: CollaborationOrigin,
+    request_id: String,
+) -> ActionOutcome {
+    match client.collaboration_cancel(&origin, &request_id).await {
+        Ok(request) => ActionOutcome::Ok(format!("cancelled {}", short_request_id(&request.id))),
+        Err(error) => ActionOutcome::Err(format!("collaboration cancel failed: {error}")),
+    }
+}
+
+async fn write_pty(
+    client: &Client,
+    session_id: String,
+    data: String,
+    success: &str,
+    operation: &str,
+) -> ActionOutcome {
+    match client.write_session(&session_id, &data).await {
+        Ok(()) => ActionOutcome::Ok(format!("{success} {session_id}")),
+        Err(error) => ActionOutcome::Err(format!("{operation} failed: {error}")),
+    }
+}
+
+async fn terminate_pty(client: &Client, session_id: String) -> ActionOutcome {
+    match client.terminate_session(&session_id).await {
+        Ok(()) => ActionOutcome::Ok(format!("terminated {session_id}")),
+        Err(error) => ActionOutcome::Err(format!("terminate failed: {error}")),
+    }
+}
+
+fn run_exact_pane_action(pane: &PaneKey, text: &str, submit: bool, verb: &str) -> ActionOutcome {
+    match send_to_exact_pane(pane, text, submit) {
+        Ok(()) => ActionOutcome::Ok(format!("{verb} pane {}", pane.pane_id)),
+        Err(error) => ActionOutcome::Err(format!("{verb} failed: {error}")),
+    }
+}
+
+fn run_work_pane_actions(
+    panes: Vec<PaneKey>,
+    text: &str,
+    submit: bool,
+    verb: &str,
+) -> ActionOutcome {
+    let attempted = panes.len();
+    let mut succeeded = 0;
+    let mut errors = Vec::new();
+    for pane in panes {
+        match send_to_exact_pane(&pane, text, submit) {
+            Ok(()) => succeeded += 1,
+            Err(error) => errors.push(format!("{}: {error}", pane.pane_id)),
+        }
+    }
+    if errors.is_empty() {
+        ActionOutcome::Ok(format!("{verb} {succeeded}/{attempted} Work agents"))
+    } else {
+        ActionOutcome::Err(format!(
+            "{verb} {succeeded}/{attempted} Work agents · {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn send_to_exact_pane(pane: &PaneKey, text: &str, submit: bool) -> std::result::Result<(), String> {
+    let endpoint = &pane.window.session.endpoint;
+    let backend = muxa::active_backends()
+        .into_iter()
+        .find(|backend| backend.kind() == endpoint.host)
+        .ok_or_else(|| format!("{} backend is not active", endpoint.host))?;
+    if !backend.caps().send_text {
+        return Err(format!("{} pane input is not supported", endpoint.host));
+    }
+    if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
+        return Err("input was rejected".into());
+    }
+    if submit {
+        std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+        if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, "\r") {
+            return Err("prompt text was sent but submit failed".into());
+        }
+    }
+    Ok(())
 }
 
 fn apply_outcome(app: &mut DashboardApp, outcome: ActionOutcome) {
@@ -2627,7 +3033,13 @@ async fn refresh_capture(client: &Client, app: &mut DashboardApp) {
         return;
     }
 
-    if matches!((&target, host), (CaptureTarget::Pane(_), CardHost::Zellij)) {
+    if matches!(
+        (&target, host),
+        (
+            CaptureTarget::TopologyPane(_) | CaptureTarget::Pane(_),
+            CardHost::Zellij
+        )
+    ) {
         app.capture = CaptureCache {
             target: Some(target),
             text: None,
@@ -2638,6 +3050,16 @@ async fn refresh_capture(client: &Client, app: &mut DashboardApp) {
     }
 
     let text = match target.clone() {
+        CaptureTarget::TopologyPane(pane) => tokio::task::spawn_blocking(move || {
+            let endpoint = &pane.window.session.endpoint;
+            muxa::active_backends()
+                .into_iter()
+                .find(|backend| backend.kind() == endpoint.host)
+                .and_then(|backend| backend.capture_pane_on(Some(&endpoint.socket), &pane.pane_id))
+        })
+        .await
+        .ok()
+        .flatten(),
         CaptureTarget::Pane(pane_id) => {
             // Resolve the backend by the pane id's namespace (like the jump
             // path) so a herdr pane captures via herdr even when the
@@ -2751,7 +3173,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &DashboardApp) {
             app.theme.key_style(),
         ),
         Span::raw("  "),
-        subtle_pill(format!("{} workspaces", totals.sessions), app.theme),
+        subtle_pill(format!("{} works", totals.works), app.theme),
         Span::raw("  "),
         subtle_pill(format!("{} agents", totals.tracked_agents), app.theme),
         Span::raw("  "),
@@ -2833,13 +3255,13 @@ fn render_cards(f: &mut Frame, area: Rect, app: &mut DashboardApp) {
         .borders(Borders::ALL)
         .border_style(app.theme.border_style())
         .border_type(BorderType::Plain)
-        .title(Span::styled(" workspaces ", app.theme.title_style()));
+        .title(Span::styled(" Work board ", app.theme.title_style()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.data.cards.is_empty() {
         let text = Text::from(Line::from(Span::styled(
-            "No workspaces or tracked agents found.",
+            "No managed or persisted Work found. Start one with `muxa work up`.",
             app.theme.dim_style(),
         )));
         f.render_widget(Paragraph::new(text), inner);
@@ -2982,6 +3404,12 @@ fn compact_card_lines(
 }
 
 fn card_title(card: &SessionCard) -> String {
+    if let Some(work_id) = card.work_id.as_deref() {
+        if card.label.eq_ignore_ascii_case(work_id) {
+            return work_id.to_string();
+        }
+        return format!("{work_id} · {}", card.label);
+    }
     let prefix = match card.host {
         CardHost::Tmux | CardHost::Rmux | CardHost::Zellij | CardHost::Herdr => "",
         CardHost::Pty => "pty:",
@@ -2995,13 +3423,31 @@ fn card_status_line(card: &SessionCard, width: usize, theme: DashboardTheme) -> 
     let mut spans = vec![
         status_pill(card.status, theme),
         Span::raw(" "),
-        subtle_pill(card.host.label(), theme),
+        subtle_pill(card.stage.map_or("execution", board_stage_label), theme),
         Span::raw(" "),
         Span::styled(
             format!("{} {}", icon_agent(), card.agents.len()),
             Style::default().fg(theme.panel),
         ),
     ];
+    if !card.signals.is_empty() {
+        spans.extend([
+            Span::raw("  "),
+            Span::styled(
+                card.signals
+                    .iter()
+                    .copied()
+                    .map(work_signal_label)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Style::default().fg(if card.signals.contains(&WorkSignal::Error) {
+                    theme.error
+                } else {
+                    theme.warn
+                }),
+            ),
+        ]);
+    }
     if let Some(label) = card.pane_labels.first() {
         spans.extend([
             Span::raw("  "),
@@ -3073,6 +3519,18 @@ fn card_resource_line(
     theme: DashboardTheme,
 ) -> Line<'static> {
     let mut parts = Vec::new();
+    if let Some(item) = card.external_item.as_ref() {
+        parts.push(format!(
+            "{}:{}{}",
+            item.source,
+            item.display_key,
+            item.status
+                .as_deref()
+                .map_or_else(String::new, |status| format!("/{status}"))
+        ));
+    } else if card.work_id.is_some() {
+        parts.push("local work".into());
+    }
     if let Some(model) = card.model.as_deref() {
         parts.push(model.to_string());
     }
@@ -3214,6 +3672,7 @@ fn agent_for_action_target<'a>(card: &'a SessionCard, target: &ActionTarget) -> 
 
 fn agent_matches_action_target(agent: &Agent, target: &ActionTarget) -> bool {
     match target {
+        ActionTarget::TopologyPane(pane) => agent.pane.as_deref() == Some(&pane.pane_id),
         ActionTarget::Pane(pane) => agent.pane.as_deref() == Some(pane.as_str()),
         ActionTarget::PtySession(session_id) => agent.surface.as_ref().is_some_and(|surface| {
             surface.kind == SurfaceKind::Pty && surface.id.as_str() == session_id.as_str()
@@ -3394,7 +3853,7 @@ fn render_summary_strip(f: &mut Frame, area: Rect, card: &SessionCard, app: &Das
     render_metric_tile(
         f,
         columns[0],
-        format!("{} session", icon_session()),
+        format!("{} work", icon_session()),
         vec![
             status_pill(card.status, app.theme),
             Span::raw(" "),
@@ -3402,13 +3861,14 @@ fn render_summary_strip(f: &mut Frame, area: Rect, card: &SessionCard, app: &Das
         ],
         vec![
             format!(
+                "{} · {} runs",
+                card.workspace.as_deref().unwrap_or("-"),
+                card.run_count
+            ),
+            format!(
                 "{} agents · {} panes",
                 card.agents.len(),
                 card.pane_ids.len()
-            ),
-            app.data.collaboration.room.as_ref().map_or_else(
-                || card.counts.compact(),
-                |room| format!("{} · {}", card.counts.compact(), room_identity(room)),
             ),
         ],
         app.theme,
@@ -3854,10 +4314,10 @@ fn render_footer(f: &mut Frame, area: Rect, app: &DashboardApp) {
         Span::raw(" mailbox  "),
         key("i", app.theme),
         Span::raw(" inbox  "),
-        key("p", app.theme),
-        Span::raw(" prompt  "),
-        key("R", app.theme),
-        Span::raw(" abort  "),
+        key("p/P", app.theme),
+        Span::raw(" prompt target/all  "),
+        key("R/A", app.theme),
+        Span::raw(" abort target/all  "),
         key("K", app.theme),
         Span::raw(" terminate  "),
         key("o", app.theme),
@@ -3898,11 +4358,13 @@ fn render_help(f: &mut Frame, area: Rect, theme: DashboardTheme) {
         Line::from("  n                 show dashboard notes"),
         Line::from("  Enter             toggle inspector"),
         Line::from("  p                 compose prompt for selected target"),
+        Line::from("  P                 compose one prompt for all live Work agents"),
         Line::from("  m                 message selected same-room peer"),
         Line::from("  b                 open collaboration mailbox"),
         Line::from("  i                 claim collaboration inbox"),
         Line::from("  c                 copy last prompt"),
         Line::from("  R                 abort current turn"),
+        Line::from("  A                 abort all live turns in selected Work"),
         Line::from("  K                 terminate pane or PTY session"),
         Line::from("  o                 open target explicitly"),
         Line::from("  r                 refresh now"),
@@ -4375,7 +4837,10 @@ fn render_message_skill_palette(
 
 fn composer_title(composer: &PromptComposer) -> String {
     match &composer.target {
-        PromptTarget::Pane(_) | PromptTarget::PtySession(_) => "prompt".into(),
+        PromptTarget::TopologyPane(_) | PromptTarget::Pane(_) | PromptTarget::PtySession(_) => {
+            "prompt".into()
+        }
+        PromptTarget::WorkPanes(panes) => format!("Work prompt · {} live agents", panes.len()),
         PromptTarget::CollaborationSend {
             kind, work_mode, ..
         } => format!(
@@ -4500,6 +4965,10 @@ fn message_composer_rect(area: Rect, skills_open: bool) -> Rect {
 
 fn capture_target_label(target: &CaptureTarget) -> String {
     match target {
+        CaptureTarget::TopologyPane(pane) => format!(
+            "{} pane {}",
+            pane.window.session.endpoint.socket, pane.pane_id
+        ),
         CaptureTarget::Pane(pane) => format!("pane {pane}"),
         CaptureTarget::PtySession(session) => format!("pty {session}"),
     }
@@ -5891,6 +6360,176 @@ mod tests {
             assert!(dump.contains("muxa dashboard"));
             assert!(dump.contains("main"));
         }
+    }
+
+    #[test]
+    fn work_dashboard_keeps_work_external_issue_and_execution_separate() {
+        let now = datetime!(2026-08-24 00:00 UTC);
+        let identity = muxa::work::WorkIdentity::new("muxa", "dashboard-v2");
+        let snapshot = WorkSnapshot {
+            schema_version: muxa::work::WORK_SCHEMA_VERSION,
+            generated_at: now,
+            workspaces: Vec::new(),
+            works: vec![muxa::work::WorkSnapshotItem {
+                identity: identity.clone(),
+                title: "Rebuild dashboard".into(),
+                goal: None,
+                next_action: None,
+                stage: BoardStage::InProgress,
+                signals: vec![WorkSignal::Attention],
+                external_items: vec![ExternalItemRef {
+                    source: "linear".into(),
+                    scope: Some("CAL".into()),
+                    stable_id: Some("linear-1".into()),
+                    display_key: "CAL-7093".into(),
+                    title: Some("Dashboard".into()),
+                    url: Some("https://linear.app/example/CAL-7093".into()),
+                    status: Some("started".into()),
+                    item_type: Some("issue".into()),
+                    synced_at: now,
+                }],
+                runs: Vec::new(),
+                participants: 0,
+                latest_at: None,
+                source: muxa::work::WorkSource::Persisted,
+                metadata: muxa::work::WorkMetadata {
+                    title: Some("Rebuild dashboard".into()),
+                    goal: None,
+                    next_action: None,
+                    stage: muxa::work::WorkStage::InProgress,
+                    updated_at: now,
+                },
+            }],
+            unlinked_executions: vec![muxa::work::RunSnapshot {
+                id: "tmux:@9".into(),
+                state: muxa::work::RunState::Idle,
+                linked: false,
+                work: None,
+                execution: muxa::work::ExecutionIdentity {
+                    host: HostKind::Tmux,
+                    socket: "default".into(),
+                    session_id: "$9".into(),
+                    window_id: "@9".into(),
+                },
+                session_name: "scratch".into(),
+                window_name: "shell".into(),
+                window_index: "0".into(),
+                cwd: Some("/tmp".into()),
+                panes: Vec::new(),
+                latest_at: None,
+            }],
+        };
+
+        let data = build_work_dashboard_data(
+            now,
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            DashboardSort::Attention,
+            Vec::new(),
+        );
+
+        assert_eq!(data.cards.len(), 1);
+        assert_eq!(data.cards[0].workspace.as_deref(), Some("muxa"));
+        assert_eq!(data.cards[0].work_id.as_deref(), Some("dashboard-v2"));
+        assert_eq!(data.cards[0].stage, Some(BoardStage::InProgress));
+        assert_eq!(
+            data.cards[0]
+                .external_item
+                .as_ref()
+                .map(|item| item.display_key.as_str()),
+            Some("CAL-7093")
+        );
+        assert_eq!(data.totals.works, 1);
+        assert_eq!(data.totals.attention, 1);
+        assert!(data.notes[0].contains("1 unlinked executions hidden"));
+    }
+
+    #[test]
+    fn work_dashboard_controls_keep_the_exact_execution_endpoint() {
+        let now = datetime!(2026-08-24 00:00 UTC);
+        let identity = muxa::work::WorkIdentity::new("muxa", "dashboard-v2");
+        let mut agent = fake_agent(
+            "agent-1",
+            Some("%1"),
+            AgentState::Working,
+            Some("review controls"),
+            now,
+        );
+        agent.tmux_socket = Some("alpha".into());
+        let snapshot = WorkSnapshot {
+            schema_version: muxa::work::WORK_SCHEMA_VERSION,
+            generated_at: now,
+            workspaces: Vec::new(),
+            works: vec![muxa::work::WorkSnapshotItem {
+                identity: identity.clone(),
+                title: "Rebuild dashboard".into(),
+                goal: None,
+                next_action: None,
+                stage: BoardStage::InProgress,
+                signals: Vec::new(),
+                external_items: Vec::new(),
+                runs: vec![muxa::work::RunSnapshot {
+                    id: "tmux:alpha:$1:@1".into(),
+                    state: muxa::work::RunState::Running,
+                    linked: true,
+                    work: Some(identity),
+                    execution: muxa::work::ExecutionIdentity {
+                        host: HostKind::Tmux,
+                        socket: "alpha".into(),
+                        session_id: "$1".into(),
+                        window_id: "@1".into(),
+                    },
+                    session_name: "muxa".into(),
+                    window_name: "dashboard-v2".into(),
+                    window_index: "0".into(),
+                    cwd: Some("/tmp/muxa".into()),
+                    panes: vec![muxa::work::RunPaneSnapshot {
+                        pane_id: "%1".into(),
+                        pane_index: "0".into(),
+                        current_command: "codex".into(),
+                        title: "review controls".into(),
+                        current_path: "/tmp/muxa".into(),
+                        attach_command: "tmux -L alpha attach".into(),
+                        role: Some("reviewer".into()),
+                        task: Some("review controls".into()),
+                        agent: Some(agent),
+                    }],
+                    latest_at: Some(now),
+                }],
+                participants: 1,
+                latest_at: Some(now),
+                source: muxa::work::WorkSource::Managed,
+                metadata: muxa::work::WorkMetadata {
+                    title: Some("Rebuild dashboard".into()),
+                    goal: None,
+                    next_action: None,
+                    stage: muxa::work::WorkStage::InProgress,
+                    updated_at: now,
+                },
+            }],
+            unlinked_executions: Vec::new(),
+        };
+
+        let data = build_work_dashboard_data(
+            now,
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            SessionActiveStats::default(),
+            DashboardSort::Attention,
+            Vec::new(),
+        );
+        let card = &data.cards[0];
+        let panes = live_work_panes(card);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window.session.endpoint.socket, "alpha");
+        assert!(matches!(
+            card.action_targets().first(),
+            Some(ActionTarget::TopologyPane(key))
+                if key.window.session.endpoint.socket == "alpha" && key.pane_id == "%1"
+        ));
     }
 
     #[test]

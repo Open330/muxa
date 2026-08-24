@@ -139,7 +139,7 @@ enum Cmd {
         #[command(subcommand)]
         action: WindowCmd,
     },
-    /// Manage work/ticket tmux windows.
+    /// Manage Muxa Work and its current tmux Run window.
     Work {
         #[command(subcommand)]
         action: WorkCmd,
@@ -160,7 +160,7 @@ enum Cmd {
     Report(stats::ReportArgs),
     /// Explore agent work/wait/error intervals as an interactive timeline.
     Timeline(timeline::Args),
-    /// Session-card TUI console for inspecting and operating agents.
+    /// Work-board TUI for tracking Work, Runs, external issues, and agents.
     Dashboard(dashboard_tui::Args),
     /// Query raw activity ledger intervals.
     Activity(activity_query::Args),
@@ -392,9 +392,9 @@ enum WindowCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
-    /// Bring a work window to the state its pipeline declares: resolve the
-    /// ticket, route it to a workspace, and create whichever agent panes
-    /// are missing. Re-running converges instead of duplicating.
+    /// Converge a Work's current Run to its pipeline: optionally link an
+    /// external issue, route the Work, and create missing agent sessions.
+    /// Re-running converges instead of duplicating.
     Up(work_up::UpArgs),
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
@@ -1510,6 +1510,9 @@ async fn cmd_dashboard(client: &Client, cfg: &Config, args: dashboard_tui::Args)
         })
         .flatten();
     match dashboard_tui::run(client, cfg, args).await? {
+        Some(dashboard_tui::OpenTarget::TopologyPane(key)) => {
+            jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
+        }
         Some(dashboard_tui::OpenTarget::Pane(pane_id)) => {
             jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
         }

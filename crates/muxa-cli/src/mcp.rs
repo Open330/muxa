@@ -57,12 +57,13 @@ const MAX_WAIT_SECS: u64 = 600;
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    For managed tmux work, treat one session as one workspace/project, one window \
-    as one work/ticket, and one pane as one agent. Use muxa_start_agent with a work id instead \
+    For managed tmux work, treat one session as one workspace/project, one window as the current \
+    Run of a durable Work, and one pane as an agent session. External issues are references, not Work ids. \
+    Use muxa_start_agent with a work id instead \
     of delegating tmux setup to another model; use muxa_manage_tmux for lifecycle \
     control and never invent raw tmux commands. \
-    To staff a whole ticket rather than one pane, call muxa_start_work: it resolves the \
-    ticket, routes it, and creates only the pipeline agents the window is missing, so \
+    To staff a whole Work rather than one pane, call muxa_start_work: it optionally resolves an \
+    external issue, routes the Work, and creates only the pipeline agents the window is missing, so \
     re-running converges instead of duplicating the team. Several muxa_start_agent calls \
     cannot do that. Pass what the work is as body (with an optional /skill and context), \
     the same phrasing muxa_call_peer takes; the same body steers agents already running. \
@@ -436,7 +437,7 @@ fn tool_definitions() -> Vec<Value> {
                     "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
                     "name": { "type": "string", "description": "Optional window/session name." },
                     "workspace": { "type": "string", "description": "Managed workspace/project id. Valid with work; defaults to cwd basename." },
-                    "work": { "type": "string", "description": "Managed work/ticket id. Reuses its tmux window or creates it once; conflicts with placement/target/name." },
+                    "work": { "type": "string", "description": "Managed Work id. Reuses the current Run window or creates it once; conflicts with placement/target/name." },
                     "role": { "type": "string", "description": "Optional pane role such as implementer or reviewer." },
                     "alias": { "type": "string", "description": "Stable per-work name for this pane. `muxa work up` diffs on it to tell an agent it already started from one it still has to." },
                     "task": { "type": "string", "description": "Optional short pane task label." },
@@ -448,10 +449,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_start_work",
-            "description": "Bring one work item's tmux window to the state its configured pipeline declares: \
-                resolve the ticket, route it to a workspace and directory, and create whichever agent panes \
+            "description": "Bring one Work's current Run to the state its configured pipeline declares: \
+                optionally resolve and link an external issue, route the Work to a workspace and directory, and create whichever agent panes \
                 are missing. This is the deterministic way to stand up a whole team (planner, implementer, \
-                reviewer) for a ticket — prefer it over several muxa_start_agent calls, which cannot tell an \
+                reviewer) for a Work — prefer it over several muxa_start_agent calls, which cannot tell an \
                 agent that already exists from one that still has to be created. Re-running converges instead \
                 of duplicating: existing panes are kept, and a body/skill/context is typed into them rather \
                 than launched again, which is also how you steer work already in flight. Panes no pipeline \
@@ -461,7 +462,8 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "work": { "type": "string", "description": "Work/ticket id, for example cal-1234. One managed tmux window per id." },
+                    "work": { "type": "string", "description": "Stable Muxa Work id. One managed tmux window per id." },
+                    "external": { "type": "string", "description": "Optional external issue key to resolve and link, for example CAL-1234." },
                     "pipeline": { "type": "string", "description": "Pipeline name from [pipeline.*]. Defaults to the matching route's; required when no route matches." },
                     "workspace": { "type": "string", "description": "Workspace/project session. Defaults to the route's, then the cwd basename." },
                     "cwd": { "type": "string", "description": "Work directory. Overrides the route; refused when the route creates a git worktree." },
@@ -478,8 +480,8 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "muxa_manage_tmux",
-            "description": "Manage Muxa's tmux lifecycle using workspace=session, work=window, \
-                and agent=pane. List/show managed workspaces and work, interrupt an agent turn, \
+            "description": "Manage Muxa's tmux bindings: session=Workspace, window=current Run, \
+                and pane=agent session. List/show managed Workspaces and Work, interrupt an agent turn, \
                 or explicitly terminate an agent pane/close a work window or workspace session. \
                 Destructive actions require confirm=true and refuse unmanaged targets.",
             "inputSchema": {
@@ -491,7 +493,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "pane": { "type": "string", "description": "Exact pane id for agent actions, for example %42." },
                     "workspace": { "type": "string", "description": "Workspace/project id for workspace actions or to disambiguate work." },
-                    "work": { "type": "string", "description": "Work/ticket id for work actions, for example TEST-0001." },
+                    "work": { "type": "string", "description": "Muxa Work id for Work actions, for example TEST-0001." },
                     "confirm": { "type": "boolean", "description": "Must be true for terminate_agent, close_work, and close_workspace." }
                 },
                 "required": ["action"],
@@ -1531,6 +1533,7 @@ async fn start_work(args: &Value, config: &muxa::config::Config) -> Value {
     };
     let up = crate::work_up::UpArgs {
         work,
+        external: text("external"),
         pipeline: text("pipeline"),
         workspace: text("workspace"),
         cwd: text("cwd").map(std::path::PathBuf::from),
@@ -2584,7 +2587,8 @@ mod tests {
         let instructions = init["result"]["instructions"].as_str().unwrap();
         assert!(instructions.contains("start of substantial work"));
         assert!(instructions.contains("one session as one workspace/project"));
-        assert!(instructions.contains("one window as one work/ticket"));
+        assert!(instructions.contains("one window as the current Run"));
+        assert!(instructions.contains("External issues are references"));
         assert!(instructions.contains("muxa_manage_tmux"));
         assert!(instructions.contains("review + read_only"));
         assert!(instructions.contains("task + execute + narrow paths"));

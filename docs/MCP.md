@@ -257,11 +257,12 @@ muxa_start_agent {
     "session": "muxa", "window": "@7", "created_work": false, ... }
 ```
 
-The managed policy is **tmux session = workspace/project, window = work/ticket,
-pane = agent**. With `work`, muxa derives `workspace` from the cwd basename when
-it is omitted, creates the session and first work window when needed, and stores
-identity in tmux user options at the matching scope. Later calls reuse that work
-window and add an agent pane; a conflicting cwd is refused. Different work IDs
+The managed binding policy is **tmux session = Workspace, window = current Run,
+pane = agent session**. Work remains a durable logical object and any Linear,
+GitHub, or Jira issue is only an external reference. With `work`, muxa derives
+`workspace` from the cwd basename when it is omitted, creates the session and
+first Run window when needed, and stores identity in tmux user options at the
+matching scope. Later calls reuse that Run window and add an agent pane; a conflicting cwd is refused. Different Work IDs
 can use different worktree paths inside one workspace session. `role` and `task`
 become durable pane metadata. Without `work`, `placement` retains the lower-level
 detached pane/window/session behavior. `cwd` must already exist.

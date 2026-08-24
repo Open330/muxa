@@ -18,9 +18,10 @@ muxa watch --include-paneless
 ```
 
 `view = "work"` groups tmux panes by window and labels each parent as
-`workspace › work`. One session is a workspace/project, one window is a
-work/ticket, and each child pane is an agent. `view = "pane"` shows one row per
-pane.
+`workspace › work`. This is an execution topology view: a session binds a
+Workspace, a window binds the current Run, and each child pane binds an agent
+session. `view = "pane"` shows one row per pane. Durable Work and external issue
+state belong to `muxa dashboard`, not this topology tree.
 
 The default tree is an accordion: selecting a session reveals its windows and
 folds the previously selected session. In pane view, selecting a window also

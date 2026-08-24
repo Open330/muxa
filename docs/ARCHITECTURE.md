@@ -3,21 +3,24 @@
 `muxa` is intentionally small: one daemon, one CLI, local files, and no
 database.
 
-## Managed tmux domain model
+## Work domain and execution bindings
 
-Muxa is optimized around a work-oriented tmux model:
+The logical hierarchy is **Workspace → Work → Run → Agent session**. An
+external Linear/GitHub/Jira issue is an optional reference on Work, not its
+identity. Local Work stage, external issue status, Run state, Agent state, and
+attention/error signals are distinct fields.
 
-| tmux object | Domain identity | Invariant |
+Managed tmux is currently one execution adapter:
+
+| tmux object | Current binding | Invariant |
 | --- | --- | --- |
-| Session | Workspace/project | One managed session contains the project's work windows. |
-| Window | Work/ticket | One managed window is created or reused for a work ID and cwd. It is also the collaboration room. |
-| Pane | Agent | Every managed agent is placed in its own pane inside the work window. |
+| Session | Workspace execution context | One managed session contains active Run windows for a workspace. |
+| Window | One active Run for Work | `@muxa_work_id` links the physical window to logical Work. |
+| Pane | Agent execution surface | `@muxa_managed_agent` links the pane to an Agent session/role/task. |
 
-This mapping is shared by the CLI, `muxa watch`, the daemon registry, and
-`muxa mcp`. Starting the same work in a workspace must reuse its window or fail
-on an incompatible cwd; adding an agent must add a pane; closing work kills the
-window, while closing a workspace kills the session. Destructive controls refuse
-unmanaged targets.
+Starting the same work in a workspace reuses its compatible active window;
+closing that window ends the Run rather than redefining Work. Unmanaged windows
+are never inferred into Work. See [WORK_MODEL.md](WORK_MODEL.md).
 
 ## Flow
 
@@ -78,6 +81,7 @@ hook claims the pane.
 | `activity.ndjson` | Append-only duration ledger. |
 | `session-activity.json` | Legacy/compat tmux foreground totals. |
 | `collaboration.json` | Durable same-window mailbox plus exact-session aliases and roles. |
+| `dashboard-work.json` | Schema-v2 Work definitions and external issue references keyed by logical Work identity. |
 | `host-id` | Owner-only stable physical-node UUID used by Fleet handshakes. |
 
 Paths are configurable; defaults live under `$XDG_DATA_HOME/muxa`.
