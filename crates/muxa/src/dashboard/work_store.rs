@@ -38,6 +38,22 @@ pub enum WorkStage {
     Done,
 }
 
+impl WorkStage {
+    /// Wire/display spelling, matching the serde representation so a
+    /// dashboard badge and a CLI column never disagree.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Queued => "queued",
+            Self::InProgress => "in_progress",
+            Self::Review => "review",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]

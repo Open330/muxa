@@ -10,6 +10,8 @@
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
+use muxa::backend::HostKind;
+use muxa::dashboard::work_store::{WorkRecord, WorkStage, WorkStore};
 use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -58,6 +60,9 @@ pub struct WorkInfo {
     pub work: String,
     pub workspace: String,
     pub session: String,
+    /// tmux's stable `$N`. The dashboard's work store keys on it, so the
+    /// mutable session *name* alone cannot look a record up.
+    pub session_id: String,
     pub window: String,
     pub window_index: u32,
     pub window_name: String,
@@ -309,15 +314,17 @@ pub fn run_work_list(args: WorkListArgs) -> Result<()> {
     } else if works.is_empty() {
         println!("no muxa-managed work windows");
     } else {
+        let (socket, records) = work_annotations();
         for work in works {
             println!(
-                "{}  workspace={}  session={}  window={}  agents={}  cwd={}",
+                "{}  workspace={}  session={}  window={}  agents={}  cwd={}{}",
                 work.work,
                 work.workspace,
                 work.session,
                 work.window,
                 work.agents.len(),
-                work.cwd.display()
+                work.cwd.display(),
+                stage_suffix(&work, socket.as_deref(), &records)
             );
         }
     }
@@ -330,13 +337,15 @@ pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&work)?);
     } else {
+        let (socket, records) = work_annotations();
         println!(
-            "{}  workspace={}  session={}  window={}  cwd={}",
+            "{}  workspace={}  session={}  window={}  cwd={}{}",
             work.work,
             work.workspace,
             work.session,
             work.window,
-            work.cwd.display()
+            work.cwd.display(),
+            stage_suffix(&work, socket.as_deref(), &records)
         );
         for agent in &work.agents {
             println!(
@@ -777,6 +786,57 @@ pub fn mark_agent(
     Ok(())
 }
 
+/// Basename of the tmux server's socket, which is what the dashboard's
+/// work store records. Asked of tmux rather than read from `$TMUX` so it
+/// is right outside a pane and under `MUXA_TMUX_SOCKET` scoping too.
+fn tmux_socket_identity() -> Option<String> {
+    let path = tmux_output(&["display-message", "-p", "#{socket_path}"]).ok()?;
+    let path = path.trim();
+    (!path.is_empty())
+        .then(|| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
+/// The stage a human (or the dashboard) recorded for this work window.
+///
+/// Kept pure so the matching rule is testable: a window id alone is not an
+/// identity — the same `@3` exists on every tmux server — so the socket and
+/// session id have to agree too.
+fn stage_for(work: &WorkInfo, socket: &str, records: &[WorkRecord]) -> Option<WorkStage> {
+    records
+        .iter()
+        .find(|record| {
+            record.key.host == HostKind::Tmux
+                && record.key.socket == socket
+                && record.key.session_id == work.session_id
+                && record.key.window_id == work.window
+        })
+        .map(|record| record.metadata.stage)
+}
+
+/// Load the dashboard's annotations for display. Read-only on purpose:
+/// `WorkStore` rewrites the whole file on save, so a second writer outside
+/// muxad's mutex would drop records the dashboard holds in memory.
+fn work_annotations() -> (Option<String>, Vec<WorkRecord>) {
+    let socket = tmux_socket_identity();
+    let records = socket.as_ref().map_or_else(Vec::new, |_| {
+        WorkStore::load(muxa::paths::default_dashboard_work_file()).records()
+    });
+    (socket, records)
+}
+
+fn stage_suffix(work: &WorkInfo, socket: Option<&str>, records: &[WorkRecord]) -> String {
+    socket
+        .and_then(|socket| stage_for(work, socket, records))
+        .filter(|stage| *stage != WorkStage::Auto)
+        .map_or_else(String::new, |stage| format!("  stage={}", stage.label()))
+}
+
 pub fn window_id_for_pane(pane: &str) -> Result<String> {
     validate_pane_id(pane)?;
     let window = tmux_output(&["display-message", "-p", "-t", pane, "#{window_id}"])?;
@@ -945,6 +1005,7 @@ fn parse_work_window(
         work,
         workspace: workspace.to_string(),
         session: fields[0].to_string(),
+        session_id: session_id.to_string(),
         window,
         window_index: fields[3].parse().unwrap_or(0),
         window_name: fields[4].to_string(),
@@ -1251,6 +1312,72 @@ mod tests {
         // for the pipeline diff to claim it by.
         assert_eq!(workspaces[0].works[0].agents[1].pane, "%4");
         assert!(workspaces[0].works[0].agents[1].alias.is_none());
+    }
+
+    fn work_at(session_id: &str, window: &str) -> WorkInfo {
+        WorkInfo {
+            work: "CAL-1234".into(),
+            workspace: "callabo".into(),
+            session: "callabo".into(),
+            session_id: session_id.into(),
+            window: window.into(),
+            window_index: 0,
+            window_name: "CAL-1234".into(),
+            cwd: PathBuf::from("/work"),
+            agents: Vec::new(),
+        }
+    }
+
+    fn record_at(socket: &str, session_id: &str, window: &str, stage: WorkStage) -> WorkRecord {
+        WorkRecord {
+            key: muxa::dashboard::work_store::WorkKey {
+                host: HostKind::Tmux,
+                socket: socket.into(),
+                session_id: session_id.into(),
+                window_id: window.into(),
+            },
+            metadata: muxa::dashboard::work_store::WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                stage,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        }
+    }
+
+    #[test]
+    fn a_stage_is_only_borrowed_from_a_record_for_this_exact_window() {
+        let work = work_at("$1", "@7");
+        let records = vec![
+            record_at("default", "$1", "@7", WorkStage::Review),
+            // Same window id on another server, and the same id in another
+            // session: neither is this work item.
+            record_at("other", "$1", "@7", WorkStage::Done),
+            record_at("default", "$2", "@7", WorkStage::Blocked),
+        ];
+        assert_eq!(
+            stage_for(&work, "default", &records),
+            Some(WorkStage::Review)
+        );
+        assert_eq!(stage_for(&work_at("$9", "@7"), "default", &records), None);
+        assert_eq!(stage_for(&work, "nosuch", &records), None);
+        assert_eq!(stage_for(&work, "default", &[]), None);
+    }
+
+    #[test]
+    fn the_default_stage_adds_no_column() {
+        let work = work_at("$1", "@7");
+        let records = vec![record_at("default", "$1", "@7", WorkStage::Auto)];
+        // `auto` means "nobody has said anything"; printing it would be noise.
+        assert_eq!(stage_suffix(&work, Some("default"), &records), "");
+        let staged = vec![record_at("default", "$1", "@7", WorkStage::InProgress)];
+        assert_eq!(
+            stage_suffix(&work, Some("default"), &staged),
+            "  stage=in_progress"
+        );
+        // No tmux server means no socket identity, so nothing is claimed.
+        assert_eq!(stage_suffix(&work, None, &staged), "");
     }
 
     #[test]
