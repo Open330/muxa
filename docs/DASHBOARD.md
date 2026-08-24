@@ -37,7 +37,8 @@ machine without explicit public-bind acknowledgement.
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
 | `PUT /api/work-metadata` | Save the work definition for one exact host/socket/session/window.     |
-| `POST /api/work-control/prompt` | Prompt every live or managed agent pane in one ticket.           |
+| `POST /api/work-control/prompt` | Prompt every live or managed agent pane in one ticket. Accepts `text`, or `skill`/`body`/`context` expanded by the shared composer. |
+| `POST /api/work-control/up` | Stand a work item's pipeline up: resolve the ticket, create the missing agent panes, prompt the ones already running. Requires `allow_work_start`. |
 | `POST /api/work-control/abort` | Send Ctrl-C to every live or managed agent pane in one ticket.     |
 | `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
 | `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
@@ -249,6 +250,37 @@ input still lift a ticket into **Attention**; `done` and `review` remain explici
 operator decisions. Ticket commands target only live registered agents or
 panes marked `@muxa_managed_agent` inside that exact work identity, never every
 shell pane in the window.
+
+## Starting work from the board
+
+The board could steer work it had not started — prompt a ticket's panes, abort
+them, annotate them — but not create the team. `POST /api/work-control/up`, and
+the board header's **start work** control, close that: give it a work id and it
+resolves the ticket, routes it to a workspace and directory, and creates
+whichever agent panes the pipeline declares but the window does not have yet.
+Pressing it twice fills gaps rather than duplicating the team; with a `body` it
+also prompts the agents already running. See [PIPELINE.md](PIPELINE.md) for the
+`[[route]]` and `[pipeline.*]` configuration it needs.
+
+It is off until you set `[dashboard] allow_work_start = true`, **on top of** the
+control token. Every other write route steers a process you already started;
+this one starts new ones with permissions bypassed. That is a different kind of
+authority, so it gets its own grant — the way `[ask]` and `[collaboration]` do.
+Disabled, the route answers `501` rather than `403`, because the token is fine;
+the capability simply is not offered here.
+
+The daemon runs the `muxa` binary for this rather than reimplementing the
+pipeline. The launcher and the managed-tmux registry live in the CLI crate,
+which depends on the library the daemon links, so calling them in-process would
+mean inverting that dependency or keeping a second implementation alive.
+
+A work item created this way takes its **title from the resolved ticket**, but
+only when the store holds no record for that window — a title you typed is
+yours, and a later run must not overwrite it. The response reports
+`seeded_metadata` so the UI never has to guess. A `muxa work up` run from the
+CLI does *not* seed: `WorkStore` rewrites the whole file on save, so a second
+writer outside the daemon's lock would drop records the dashboard holds in
+memory.
 
 ## Timeline
 

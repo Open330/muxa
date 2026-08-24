@@ -284,6 +284,30 @@ Prefer it over several `muxa_start_agent` calls: those cannot tell an agent
 that already exists from one that still has to be created, so they duplicate
 a team instead of converging on it. See [MCP.md](MCP.md).
 
+## From the dashboard
+
+The same pipeline runs from the work board's **start work** control, which
+posts to `POST /api/work-control/up`. It needs `[dashboard] allow_work_start
+= true` on top of the control token: every other dashboard write steers a
+process you already started, while this one starts new ones with permissions
+bypassed.
+
+Two things flow back the other way. A work item created there takes its
+**title from the resolved ticket**, so nobody retypes what the resolver just
+fetched — but only when nothing is recorded for that window, because a title
+you typed is yours. And the board's **workflow stage** (`queued`,
+`in_progress`, `review`, `blocked`, `done`) now shows up in the CLI:
+
+```console
+$ muxa work list
+CAL-1234  workspace=callabo  session=callabo  window=@7  agents=3  cwd=…  stage=review
+```
+
+`stage=auto` prints nothing — auto means nobody has said anything, and a
+column that is always there says less than one that appears when it has
+something to report. The CLI only ever reads that store; the daemon owns
+writing it. See [DASHBOARD.md](DASHBOARD.md).
+
 ## Configuration
 
 See the `[ticket]`, `[[route]]`, and `[pipeline.*]` sections of

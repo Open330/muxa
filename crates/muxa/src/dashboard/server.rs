@@ -850,8 +850,12 @@ async fn work_up_handler(
     Json(input): Json<WorkUpRequest>,
 ) -> Response {
     if !state.config.allow_work_start {
+        // Not FORBIDDEN: the browser treats 401/403 as "your token is bad"
+        // and drops into read-only. This deployment simply does not offer
+        // the capability, which is what 501 says — and what the backend
+        // capability checks above already use.
         return control_error(
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_IMPLEMENTED,
             "starting work is disabled; set [dashboard] allow_work_start = true to enable it",
         );
     }
@@ -3123,7 +3127,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // Not 403: the browser reads 401/403 as a bad token and flips the
+        // whole dashboard to read-only, which would be a lie here.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert!(
             body["error"]

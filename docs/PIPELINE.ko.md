@@ -264,6 +264,28 @@ muxa_start_work {
 agent와 아직 만들어야 할 agent를 구분하지 못해 수렴 대신 팀을 복제합니다.
 [MCP.md](MCP.md) 참고.
 
+## dashboard에서
+
+같은 파이프라인을 work board의 **start work** 컨트롤에서도 실행할 수 있습니다.
+`POST /api/work-control/up`으로 갑니다. 제어 토큰 **위에** `[dashboard]
+allow_work_start = true`가 더 필요합니다 — dashboard의 다른 쓰기는 이미 떠 있는
+프로세스를 조종하지만, 이건 권한을 우회한 프로세스를 새로 만들기 때문입니다.
+
+반대 방향으로도 둘이 흐릅니다. 거기서 만든 work는 **티켓의 title을 물려받아**
+resolver가 방금 가져온 걸 다시 타이핑하지 않아도 됩니다. 단 그 창에 기록이 없을
+때만입니다 — 사람이 쓴 title은 그 사람 것이니까요. 그리고 board의 **workflow
+stage**(`queued`·`in_progress`·`review`·`blocked`·`done`)가 이제 CLI에도 뜹니다.
+
+```console
+$ muxa work list
+CAL-1234  workspace=callabo  session=callabo  window=@7  agents=3  cwd=…  stage=review
+```
+
+`stage=auto`는 아무것도 출력하지 않습니다. auto는 "아무도 말한 적 없음"이라,
+항상 붙어 있는 칼럼보다 할 말이 있을 때만 나타나는 칼럼이 더 많은 걸 말합니다.
+CLI는 그 저장소를 읽기만 하고, 쓰기는 daemon이 소유합니다.
+[DASHBOARD.md](DASHBOARD.md) 참고.
+
 ## 설정
 
 주석 달린 레퍼런스는 [`config.example.toml`](../config.example.toml)의

@@ -210,6 +210,10 @@ const dom = {
   sessionsMeta: document.getElementById("sessions-meta"),
   sessionSort: document.getElementById("session-sort"),
   showAllSessions: document.getElementById("show-all-sessions"),
+  workStartForm: document.getElementById("work-start-form"),
+  workStartId: document.getElementById("work-start-id"),
+  workStartBody: document.getElementById("work-start-body"),
+  workStartSubmit: document.getElementById("work-start-submit"),
   workItemsMeta: document.getElementById("work-items-meta"),
   workItemsContent: document.getElementById("work-items-content"),
   toggleWorkExecution: document.getElementById("toggle-work-execution"),
@@ -2184,6 +2188,53 @@ function initDynamicEventDelegation() {
     event.preventDefault();
     await saveWorkMetadata(form).catch((error) => showToast(error.message));
   });
+
+  dom.workStartForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await startWork().catch((error) => showToast(error.message));
+  });
+}
+
+// Stand up a work item's pipeline. The server resolves the ticket and
+// creates only the agent panes the window is missing, so pressing this
+// twice fills gaps rather than duplicating the team.
+async function startWork() {
+  const work = dom.workStartId?.value.trim();
+  if (!work) throw new Error("enter a work or ticket id first");
+  const body = dom.workStartBody?.value.trim() || undefined;
+
+  // Resolving a ticket spends a headless agent turn, so this is slow by
+  // nature; say so rather than leaving a dead button.
+  const button = dom.workStartSubmit;
+  const restore = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "starting…";
+  }
+  try {
+    const payload = await controlFetch("/api/work-control/up", {
+      method: "POST",
+      body: JSON.stringify({ work, body }),
+    });
+    const result = payload.result || {};
+    const launched = (result.launched || []).length;
+    const prompted = (result.reprompted || []).length;
+    const parts = [];
+    if (launched) parts.push(`${launched} started`);
+    if (prompted) parts.push(`${prompted} prompted`);
+    showToast(
+      parts.length
+        ? `${result.work || work}: ${parts.join(", ")}`
+        : `${result.work || work} is already staffed`,
+    );
+    if (dom.workStartBody) dom.workStartBody.value = "";
+    await Promise.allSettled([fetchAgentsSnapshot(), fetchWorkMetadata()]);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = restore || "start work";
+    }
+  }
 }
 
 function initCollapseControls() {

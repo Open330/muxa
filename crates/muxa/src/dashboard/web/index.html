@@ -79,7 +79,30 @@
             <h2>Work board</h2>
             <span class="panel-meta" id="work-items-meta"></span>
           </div>
-          <button class="control-btn" type="button" id="toggle-work-execution">expand execution</button>
+          <div class="work-header-actions">
+            <form class="work-start-form" id="work-start-form">
+              <input
+                id="work-start-id"
+                class="work-start-id"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="cal-1234"
+                aria-label="Work or ticket id"
+                required
+              />
+              <input
+                id="work-start-body"
+                class="work-start-body"
+                type="text"
+                autocomplete="off"
+                placeholder="what the work is (optional)"
+                aria-label="Instruction for the pipeline agents"
+              />
+              <button class="control-btn" type="submit" id="work-start-submit">start work</button>
+            </form>
+            <button class="control-btn" type="button" id="toggle-work-execution">expand execution</button>
+          </div>
         </div>
         <div class="work-items-content work-board" id="work-items-content">
           <div class="empty-block">loading…</div>
