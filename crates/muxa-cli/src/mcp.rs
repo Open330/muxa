@@ -1056,7 +1056,7 @@ async fn call_tool(
             })
         }
         "muxa_call_peer" => Ok(call_peer(client, &args, &config.message.skills).await),
-        "muxa_start_work" => Ok(start_work(&args, config).await),
+        "muxa_start_work" => Ok(start_work(client, &args, config).await),
         "muxa_peer_report" => Ok(peer_report(client, &args).await),
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
@@ -1522,7 +1522,7 @@ fn peer_call_contract(args: &Value) -> std::result::Result<(RequestKind, WorkMod
 /// Resolution is async (it may spend a headless agent turn looking the
 /// ticket up); everything after it shells out to tmux and is therefore
 /// handed to `spawn_blocking` rather than run on the reactor.
-async fn start_work(args: &Value, config: &muxa::config::Config) -> Value {
+async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config) -> Value {
     let text = |key: &str| {
         args.get(key)
             .and_then(Value::as_str)
@@ -1544,11 +1544,12 @@ async fn start_work(args: &Value, config: &muxa::config::Config) -> Value {
         skill: text("skill"),
         context: text("context"),
         dry_run: flag("dry_run"),
+        show_prompts: false,
         no_ticket: flag("no_ticket"),
         refresh: flag("refresh"),
         json: true,
     };
-    let resolved = match crate::work_up::resolve(&up, config).await {
+    let resolved = match crate::work_up::resolve(&up, config, Some(client)).await {
         Ok(resolved) => resolved,
         Err(error) => return error_result(&format!("{error:#}")),
     };

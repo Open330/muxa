@@ -559,10 +559,15 @@ fn run_window_cmd(action: WindowCmd) -> Result<()> {
     }
 }
 
-async fn run_work_cmd(action: WorkCmd, cfg: &Config, config_path: Option<PathBuf>) -> Result<()> {
+async fn run_work_cmd(
+    action: WorkCmd,
+    cfg: &Config,
+    config_path: Option<PathBuf>,
+    client: &Client,
+) -> Result<()> {
     match action {
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
-        WorkCmd::Up(args) => work_up::run(args, cfg).await,
+        WorkCmd::Up(args) => work_up::run(args, cfg, Some(client)).await,
         WorkCmd::Start(args) => agent_launch::run_work_start(args),
         WorkCmd::List(args) => tmux_work::run_work_list(args),
         WorkCmd::Show(args) => tmux_work::run_work_show(args),
@@ -643,7 +648,7 @@ async fn main() -> Result<()> {
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action),
         Cmd::Window { action } => run_window_cmd(action),
-        Cmd::Work { action } => run_work_cmd(action, &cfg, config_path).await,
+        Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
         Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,

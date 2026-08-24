@@ -21,10 +21,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use muxa::config::{Config, TicketConfig};
+use muxa::event::AgentState;
 use muxa::pipeline::{
     self, DesiredAgent, ExistingAgent, Plan, PlanStep, Ticket, Vars, WorktreePlan, REQUEST_KEY,
 };
 use muxa::request::{ComposedRequest, RequestParts};
+use std::collections::HashMap;
 
 use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest};
 
@@ -73,6 +75,10 @@ pub struct UpArgs {
     /// Ignore a cached external issue and ask the resolver again.
     #[arg(long)]
     pub refresh: bool,
+    /// Print the exact prompt each agent would receive, before spending
+    /// anything on it.
+    #[arg(long)]
+    pub show_prompts: bool,
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -136,12 +142,20 @@ pub(crate) struct Resolved {
     layout: Option<String>,
     request: Option<ComposedRequest>,
     desired: Vec<DesiredAgent>,
+    /// pane → what the daemon says that agent is doing. Empty when the
+    /// daemon is unreachable, which degrades to the old pane-only view
+    /// rather than failing the launch.
+    states: HashMap<String, AgentState>,
 }
 
-pub async fn run(args: UpArgs, config: &Config) -> Result<()> {
+pub async fn run(args: UpArgs, config: &Config, client: Option<&muxa::ipc::Client>) -> Result<()> {
     let json = args.json;
     let dry_run = args.dry_run;
-    let resolved = resolve(&args, config).await?;
+    let show_prompts = args.show_prompts;
+    let resolved = resolve(&args, config, client).await?;
+    if show_prompts {
+        print_prompts(&resolved.desired);
+    }
     let result = apply(resolved, dry_run)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -154,7 +168,7 @@ pub async fn run(args: UpArgs, config: &Config) -> Result<()> {
 /// The blocking half: read the window, diff it against the pipeline, and
 /// act on the difference.
 pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
-    let existing = existing_agents(&resolved.work, &resolved.workspace)?;
+    let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
     let broadcast = resolved
         .request
         .as_ref()
@@ -187,7 +201,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
                     .with_context(|| format!("send --prompt to {alias} in pane {pane}"))?;
                 reprompted.push(alias.clone());
             }
-            PlanStep::Keep { .. } => {}
+            PlanStep::Keep { .. } | PlanStep::Attention { .. } => {}
         }
     }
 
@@ -244,7 +258,12 @@ fn finish(
 
 // ---------------------------------------------------------------- resolve
 
-pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
+pub(crate) async fn resolve(
+    args: &UpArgs,
+    config: &Config,
+    client: Option<&muxa::ipc::Client>,
+) -> Result<Resolved> {
+    let states = agent_states(client).await;
     let work = crate::tmux_work::normalize_work_id(&args.work)?;
     let id = work.to_ascii_lowercase();
     if args.no_ticket
@@ -295,14 +314,11 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
 
     // The caller's request is a var like any other, so a pipeline template
     // can place it — and so it reaches the ticket-less path unchanged.
-    let request = muxa::request::compose(
-        RequestParts {
-            skill: args.skill.as_deref(),
-            body: args.body.as_deref(),
-            context: args.context.as_deref(),
-        },
-        &config.message.skills,
-    )?;
+    //
+    // Asked for when nothing was supplied: muxa has no idea what
+    // "cal-7210 callabo resolve" means and does not need to. It is opaque
+    // text the operator writes, carried to every agent verbatim.
+    let request = compose_request(args, config, &work)?;
     vars.set_opt(
         REQUEST_KEY,
         request.as_ref().map(|request| request.text.as_str()),
@@ -362,6 +378,7 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         layout: spec.layout.clone(),
         request,
         desired,
+        states,
     })
 }
 
@@ -679,12 +696,43 @@ fn git(repo: &Path, args: &[String]) -> Result<String> {
 
 // ----------------------------------------------------------------- apply
 
-fn existing_agents(work: &str, workspace: &str) -> Result<Vec<ExistingAgent>> {
+/// Read the window's panes and, for each, what the daemon says the agent
+/// on it is doing.
+///
+/// A pane proves someone was started there. Whether they are working,
+/// idle, or stuck on a permission prompt is a different question, and the
+/// daemon is the only thing that can answer it.
+/// Ask the daemon what every tracked agent is doing, keyed by pane.
+///
+/// Best-effort: `muxa work up` does not otherwise need the daemon, and a
+/// launch should not fail because the control plane is down. Without it,
+/// the plan falls back to "a pane exists", which is what it always did.
+async fn agent_states(client: Option<&muxa::ipc::Client>) -> HashMap<String, AgentState> {
+    let Some(client) = client else {
+        return HashMap::new();
+    };
+    client.snapshot().await.map_or_else(
+        |_| HashMap::new(),
+        |agents| {
+            agents
+                .into_iter()
+                .filter_map(|agent| agent.pane.map(|pane| (pane, agent.state)))
+                .collect()
+        },
+    )
+}
+
+fn existing_agents(
+    work: &str,
+    workspace: &str,
+    states: &HashMap<String, AgentState>,
+) -> Result<Vec<ExistingAgent>> {
     Ok(crate::tmux_work::find_work_in(work, Some(workspace))?
         .map(|info| {
             info.agents
                 .into_iter()
                 .map(|agent| ExistingAgent {
+                    state: states.get(&agent.pane).copied(),
                     pane: agent.pane,
                     program: agent.agent,
                     alias: agent.alias,
@@ -692,6 +740,38 @@ fn existing_agents(work: &str, workspace: &str) -> Result<Vec<ExistingAgent>> {
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Build the caller's request, asking for one when nothing was supplied.
+fn compose_request(args: &UpArgs, config: &Config, work: &str) -> Result<Option<ComposedRequest>> {
+    let body = match args.body.clone() {
+        Some(body) => Some(body),
+        None if args.skill.is_none() && args.context.is_none() => ask_for_request(work)?,
+        None => None,
+    };
+    Ok(muxa::request::compose(
+        RequestParts {
+            skill: args.skill.as_deref(),
+            body: body.as_deref(),
+            context: args.context.as_deref(),
+        },
+        &config.message.skills,
+    )?)
+}
+
+/// Ask what the agents should work on. Empty is a valid answer: a
+/// ticket-driven pipeline already knows the task.
+fn ask_for_request(work: &str) -> Result<Option<String>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None);
+    }
+    let text: String = cliclack::input(format!("What should the agents do for {work}?"))
+        .placeholder("leave empty to use the pipeline's own instructions")
+        .required(false)
+        .interact()?;
+    let text = text.trim().to_string();
+    Ok((!text.is_empty()).then_some(text))
 }
 
 fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
@@ -726,6 +806,56 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
     })
 }
 
+/// One line per pipeline alias: what it is, and what it is doing.
+fn print_plan_rows(result: &UpResult) {
+    for step in &result.plan.steps {
+        match step {
+            PlanStep::Launch(agent) => {
+                let pane = result
+                    .launched
+                    .iter()
+                    .find(|launched| launched.alias == agent.alias)
+                    .map_or_else(|| "-".to_string(), |launched| launched.pane.clone());
+                println!(
+                    "  + {:<10} {:<9} {:<12} {pane}",
+                    agent.alias,
+                    agent.program,
+                    agent.role.as_deref().unwrap_or("-")
+                );
+            }
+            PlanStep::Reprompt { alias, pane, .. } => {
+                println!("  » {alias:<10} {:<9} {:<12} {pane}", "prompted", "");
+            }
+            PlanStep::Keep { alias, pane, state } => {
+                println!(
+                    "  = {alias:<10} {:<9} {:<12} {pane}",
+                    state.map_or("running", state_label),
+                    ""
+                );
+            }
+            PlanStep::Attention { alias, pane, state } => {
+                println!(
+                    "  ! {alias:<10} {:<9} {:<12} {pane}",
+                    state.map_or("blocked", state_label),
+                    "needs you"
+                );
+            }
+        }
+    }
+}
+
+fn state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Starting => "starting",
+        AgentState::Working => "working",
+        AgentState::Idle => "idle",
+        AgentState::WaitingInput => "waiting",
+        AgentState::WaitingChoice => "choosing",
+        AgentState::Error => "error",
+        AgentState::Stopped => "stopped",
+    }
+}
+
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
     if !muxa::tmux::send_text(pane, text) {
         bail!("tmux refused the prompt; the pane may be gone");
@@ -756,6 +886,29 @@ fn apply_layout(window: &str, layout: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- output
+
+/// Show what each agent would actually receive. The rendered prompt is
+/// the thing worth reviewing before spending a turn on it — a leftover
+/// `{{ticket.title}}` or a role instruction that says the wrong thing is
+/// obvious here and invisible in the plan summary.
+fn print_prompts(desired: &[DesiredAgent]) {
+    println!("prompts that would be sent:\n");
+    for agent in desired {
+        println!(
+            "─── {} ({}{}) ───",
+            agent.alias,
+            agent.program,
+            agent
+                .role
+                .as_deref()
+                .map_or_else(String::new, |role| format!(", {role}"))
+        );
+        match agent.prompt.as_deref() {
+            Some(prompt) => println!("{prompt}\n"),
+            None => println!("(no prompt — starts interactive)\n"),
+        }
+    }
+}
 
 fn print_result(result: &UpResult) {
     let verb = if result.dry_run { "would be" } else { "is" };
@@ -804,29 +957,7 @@ fn print_result(result: &UpResult) {
             }
         );
     }
-    for step in &result.plan.steps {
-        match step {
-            PlanStep::Launch(agent) => {
-                let pane = result
-                    .launched
-                    .iter()
-                    .find(|launched| launched.alias == agent.alias)
-                    .map_or_else(|| "-".to_string(), |launched| launched.pane.clone());
-                println!(
-                    "  + {:<10} {:<9} {:<12} {pane}",
-                    agent.alias,
-                    agent.program,
-                    agent.role.as_deref().unwrap_or("-")
-                );
-            }
-            PlanStep::Reprompt { alias, pane, .. } => {
-                println!("  » {alias:<10} {:<9} {:<12} {pane}", "prompted", "");
-            }
-            PlanStep::Keep { alias, pane } => {
-                println!("  = {alias:<10} {:<9} {:<12} {pane}", "running", "");
-            }
-        }
-    }
+    print_plan_rows(result);
     for extra in &result.plan.unclaimed {
         println!(
             "  ? {:<10} {:<9} {:<12} {}",
@@ -838,6 +969,12 @@ fn print_result(result: &UpResult) {
     }
     if let Some(layout) = &result.layout {
         println!("  layout   {layout}");
+    }
+    if result.plan.attention() > 0 {
+        println!(
+            "\n{} agent(s) are waiting on you; muxa did not type over their prompt.",
+            result.plan.attention()
+        );
     }
     if result.dry_run {
         println!("\ndry run: nothing was created. Re-run without --dry-run to apply.");
@@ -861,6 +998,7 @@ mod tests {
             skill: None,
             context: None,
             dry_run: false,
+            show_prompts: false,
             no_ticket: true,
             refresh: false,
             json: false,

@@ -37,6 +37,7 @@ use crate::config::{
     Config, PipelineAgentConfig, PipelineConfig, RouteConfig, TicketConfig, TicketSource,
     WorktreeConfig,
 };
+use crate::event::AgentState;
 
 /// Ticket body characters kept in a rendered prompt. A description can run
 /// to thousands of words; the prompt carries the shape of the task and the
@@ -665,12 +666,34 @@ fn render_agent(
 }
 
 /// A pane that already exists in the work window.
+///
+/// `state` is what makes a re-run a reconcile rather than a headcount. A
+/// pane proves someone was started there; it says nothing about whether
+/// that agent is working, idle, or stuck on a permission prompt nobody
+/// will ever answer. Those look identical from tmux and could not be
+/// further apart in what they need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExistingAgent {
     pub pane: String,
     pub program: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// From the daemon's registry. `None` means the daemon had nothing for
+    /// this pane — usually that it is not running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<AgentState>,
+}
+
+/// Whether this agent is blocked on a person.
+///
+/// A prompt typed at an agent sitting on an approval dialog is swallowed
+/// by the dialog, so muxa must report it rather than talk over it.
+#[must_use]
+pub fn needs_a_human(state: Option<AgentState>) -> bool {
+    matches!(
+        state,
+        Some(AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error)
+    )
 }
 
 /// What `muxa work up` intends to do to one pane.
@@ -686,7 +709,20 @@ pub enum PlanStep {
         prompt: String,
     },
     /// The alias has a live pane and nothing to say to it. Converged.
-    Keep { alias: String, pane: String },
+    Keep {
+        alias: String,
+        pane: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<AgentState>,
+    },
+    /// The alias is blocked on a person — an approval prompt or an error.
+    /// Never prompted over: the dialog would eat the message, and the
+    /// operator would be left believing it was delivered.
+    Attention {
+        alias: String,
+        pane: String,
+        state: Option<AgentState>,
+    },
 }
 
 impl PlanStep {
@@ -694,7 +730,9 @@ impl PlanStep {
     pub fn alias(&self) -> &str {
         match self {
             Self::Launch(agent) => &agent.alias,
-            Self::Reprompt { alias, .. } | Self::Keep { alias, .. } => alias,
+            Self::Reprompt { alias, .. }
+            | Self::Keep { alias, .. }
+            | Self::Attention { alias, .. } => alias,
         }
     }
 }
@@ -728,9 +766,19 @@ impl Plan {
 
     /// True when every desired pane already exists and there is nothing to
     /// say to any of them.
+    /// Aliases blocked on a person. Converging is not possible until
+    /// somebody answers them, so they are counted separately.
+    #[must_use]
+    pub fn attention(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step, PlanStep::Attention { .. }))
+            .count()
+    }
+
     #[must_use]
     pub fn converged(&self) -> bool {
-        self.launches() == 0 && self.reprompts() == 0
+        self.launches() == 0 && self.reprompts() == 0 && self.attention() == 0
     }
 }
 
@@ -754,6 +802,13 @@ pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Opt
             });
             match (live, broadcast) {
                 (None, _) => PlanStep::Launch(agent.clone()),
+                // Blocked on a person beats everything: do not type at it,
+                // and do not report it as converged either.
+                (Some(live), _) if needs_a_human(live.state) => PlanStep::Attention {
+                    alias: agent.alias.clone(),
+                    pane: live.pane.clone(),
+                    state: live.state,
+                },
                 (Some(live), Some(message)) => PlanStep::Reprompt {
                     alias: agent.alias.clone(),
                     pane: live.pane.clone(),
@@ -762,6 +817,7 @@ pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Opt
                 (Some(live), None) => PlanStep::Keep {
                     alias: agent.alias.clone(),
                     pane: live.pane.clone(),
+                    state: live.state,
                 },
             }
         })
@@ -1073,11 +1129,16 @@ program = 'claude'
     }
 
     fn existing(rows: &[(&str, Option<&str>)]) -> Vec<ExistingAgent> {
+        existing_in(rows, Some(AgentState::Working))
+    }
+
+    fn existing_in(rows: &[(&str, Option<&str>)], state: Option<AgentState>) -> Vec<ExistingAgent> {
         rows.iter()
             .map(|(pane, alias)| ExistingAgent {
                 pane: (*pane).to_string(),
                 program: "codex".into(),
                 alias: alias.map(str::to_string),
+                state,
             })
             .collect()
     }
@@ -1128,6 +1189,52 @@ program = 'claude'
             PlanStep::Reprompt { pane, prompt, .. }
                 if pane == "%1" && prompt == "rebase onto main first"
         ));
+    }
+
+    #[test]
+    fn an_agent_blocked_on_a_person_is_never_prompted_over() {
+        // A prompt typed at an approval dialog is eaten by the dialog, and
+        // the operator is left believing it was delivered.
+        for state in [
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+        ] {
+            let plan = plan(
+                &desired(&["impl"]),
+                &existing_in(&[("%1", Some("impl"))], Some(state)),
+                Some("carry on"),
+            );
+            assert_eq!(plan.reprompts(), 0, "{state:?} must not be prompted");
+            assert_eq!(plan.attention(), 1, "{state:?}");
+            assert!(!plan.converged(), "{state:?} is not converged");
+        }
+    }
+
+    #[test]
+    fn a_working_agent_is_kept_and_a_broadcast_still_reaches_it() {
+        let working = existing_in(&[("%1", Some("impl"))], Some(AgentState::Working));
+        assert!(plan(&desired(&["impl"]), &working, None).converged());
+        assert_eq!(
+            plan(&desired(&["impl"]), &working, Some("go")).reprompts(),
+            1
+        );
+
+        // Idle is still staffed — it just has nothing to say for itself.
+        // Distinguishing it from Working is the operator's call, not a
+        // reason to relaunch.
+        let idle = existing_in(&[("%1", Some("impl"))], Some(AgentState::Idle));
+        assert!(plan(&desired(&["impl"]), &idle, None).converged());
+        assert_eq!(plan(&desired(&["impl"]), &idle, Some("go")).reprompts(), 1);
+    }
+
+    #[test]
+    fn an_unknown_state_is_treated_as_present_not_blocked() {
+        // The daemon may simply not have this pane; that is not a reason to
+        // claim a human is needed.
+        assert!(!needs_a_human(None));
+        assert!(!needs_a_human(Some(AgentState::Starting)));
+        assert!(!needs_a_human(Some(AgentState::Stopped)));
     }
 
     #[test]
