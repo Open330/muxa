@@ -912,12 +912,87 @@ async fn work_up_handler(
         );
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-        Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
-        Err(error) => control_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("muxa work up answered with unparseable JSON: {error}"),
-        ),
+    let result = match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(result) => result,
+        Err(error) => {
+            return control_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("muxa work up answered with unparseable JSON: {error}"),
+            )
+        }
+    };
+    let seeded = if input.dry_run {
+        false
+    } else {
+        seed_work_metadata_from_ticket(&state, &result).await
+    };
+    Json(json!({ "ok": true, "seeded_metadata": seeded, "result": result })).into_response()
+}
+
+/// Build the store's key for a window the pipeline just reported.
+///
+/// The pipeline speaks tmux window ids; the store keys on the whole host
+/// identity, because the same `@3` exists on every tmux server.
+fn work_key_for_window(panes: &[PaneSummary], window: &str) -> Option<WorkKey> {
+    panes
+        .iter()
+        .find(|pane| pane.host == HostKind::Tmux && pane.window_id == window)
+        .map(|pane| WorkKey {
+            host: pane.host,
+            socket: pane_socket_identity(pane),
+            session_id: pane.session_id.clone(),
+            window_id: pane.window_id.clone(),
+        })
+}
+
+/// Whether the store already says something about this window. A title a
+/// person typed is theirs; the ticket only supplies one where nothing is.
+fn already_annotated(records: &[WorkRecord], key: &WorkKey) -> bool {
+    records.iter().any(|record| &record.key == key)
+}
+
+/// Give a freshly created work item the title its ticket already knows,
+/// so the dashboard is not asking an operator to retype what the resolver
+/// just fetched.
+///
+/// Only when the store has no record for that window: a title someone
+/// typed is theirs, and a later `work up` must not overwrite it — the same
+/// rule that keeps the pipeline from touching a pane it did not create.
+/// Returns whether a record was written.
+///
+/// This runs here rather than in the CLI because [`WorkStore`] rewrites the
+/// whole file on every save; a second writer outside the daemon's mutex
+/// would drop whatever the dashboard had in memory.
+async fn seed_work_metadata_from_ticket(state: &AppState, result: &serde_json::Value) -> bool {
+    let Some(title) = result
+        .get("ticket")
+        .and_then(|ticket| ticket.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    else {
+        return false;
+    };
+    let Some(window) = result.get("window").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    // The pipeline reports a window id; the store keys on the full host
+    // identity, which only the pane scan can supply.
+    let scan = state.refresh_pane_scan().await;
+    let Some(key) = work_key_for_window(&scan.panes, window) else {
+        return false;
+    };
+    let mut store = state.work_store.lock().await;
+    if already_annotated(&store.records(), &key) {
+        return false;
+    }
+    let patch = WorkMetadataPatch {
+        title: Some(title.to_string()),
+        ..WorkMetadataPatch::default()
+    };
+    match patch.validate() {
+        Ok(patch) => store.upsert(key, patch).await.is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -2968,6 +3043,65 @@ mod tests {
             reloaded.records()[0].metadata.title.as_deref(),
             Some("Repair auth")
         );
+    }
+
+    fn tmux_pane_summary(window: &str, session_id: &str) -> crate::tmux::scanner::PaneSummary {
+        crate::tmux::scanner::PaneSummary {
+            host: HostKind::Tmux,
+            pane_id: "%1".into(),
+            session_id: session_id.into(),
+            session: "callabo".into(),
+            window_id: window.into(),
+            window_name: "CAL-1234".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "codex".into(),
+            title: String::new(),
+            current_path: "/work".into(),
+            socket: std::path::PathBuf::from("/tmp/tmux-1000/default"),
+            muxa: crate::tmux::scanner::MuxaPaneMetadata::default(),
+            attach_command: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_window_id_alone_is_not_a_store_key() {
+        let panes = vec![tmux_pane_summary("@7", "$1")];
+        let key = work_key_for_window(&panes, "@7").expect("known window");
+        assert_eq!(key.window_id, "@7");
+        assert_eq!(key.session_id, "$1");
+        assert_eq!(key.host, HostKind::Tmux);
+        // A window nobody scanned cannot be keyed, so nothing is seeded.
+        assert!(work_key_for_window(&panes, "@9").is_none());
+    }
+
+    #[test]
+    fn a_title_someone_typed_is_never_overwritten_by_the_ticket() {
+        let key = WorkKey {
+            host: HostKind::Tmux,
+            socket: "default".into(),
+            session_id: "$1".into(),
+            window_id: "@7".into(),
+        };
+        assert!(!already_annotated(&[], &key));
+        let record = WorkRecord {
+            key: key.clone(),
+            metadata: crate::dashboard::work_store::WorkMetadata {
+                title: Some("what a human called it".into()),
+                goal: None,
+                next_action: None,
+                stage: crate::dashboard::work_store::WorkStage::default(),
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        };
+        assert!(already_annotated(std::slice::from_ref(&record), &key));
+        // A record for a different window must not block this one.
+        let other = WorkKey {
+            window_id: "@8".into(),
+            ..key.clone()
+        };
+        assert!(!already_annotated(&[record], &other));
     }
 
     #[tokio::test]
