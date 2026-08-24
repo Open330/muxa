@@ -301,6 +301,7 @@ muxa host add dev muxa-devbox --label environment=development --mode observe
 muxa host doctor dev
 muxa fleet watch
 # 같은 진입점: muxa watch --fleet
+# `muxa init`은 이 화면을 tmux prefix+S에 연결함(local watch는 prefix+s 유지)
 # local 하나뿐이면 불필요한 host row 없이 완전한 native watch 사용
 ```
 
