@@ -34,8 +34,11 @@ request/response pairs over the same stream.
 Physical-host Fleet uses a second, versioned JSON-lines protocol over an
 OpenSSH stdio channel. It is intentionally not a network service. The remote
 `muxa relay --stdio` announces a stable node UUID and capabilities, then
-exchanges full snapshots, revisioned transitions/keepalives, exact capture or
-prompt requests, results, errors, and explicit resync markers. See
+exchanges full snapshots, revisioned transitions/keepalives, exact capture,
+prompt, or collaboration/mailbox requests, results, errors, and explicit
+resync markers. Collaboration operations are advertised by the optional
+`collaboration` capability so mixed-version controllers reject them before
+sending an unsupported frame. See
 [`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
 separately from this local IPC protocol.
 
@@ -111,8 +114,11 @@ poll for reconciliation.
 
 Dispatch one operation to an exact host. The local adapter rechecks complete
 pane identity in process. For remote hosts the manager also rechecks
-observe/control mode and the relay verifies complete pane identity. Prompt
-mutations are not retried.
+observe/control mode and the relay verifies complete pane identity. Prompt and
+collaboration mutations are not retried. The collaboration operations are
+`collaboration_send`, `collaboration_mailbox`, `collaboration_claim`, and
+`collaboration_reply`; their durable data remains in the selected physical
+node's muxad rather than being copied into the controller.
 
 ```json
 {

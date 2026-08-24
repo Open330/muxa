@@ -185,17 +185,28 @@ host level becomes meaningful and the central Fleet hierarchy is shown.
 
 The multi-node Fleet TUI uses the same focused navigation conventions:
 
-- Arrow Up/Down visits every visible structural node.
-- `j`/`k` jumps directly between actionable panes, including a singleton
-  session/window chain.
+- `j`/`k` and Arrow Up/Down move between siblings in focus mode. A singleton
+  session/window/pane chain automatically bubbles to the nearest parent with
+  siblings, so it never traps the cursor. In always/manual expansion they move
+  through visible rows.
+- Uppercase `J`/`K` jumps directly between actionable panes across the Fleet.
 - `h`/`l` or Left/Right collapses/descends; Space toggles a parent.
-- `/` filters, `a` toggles attention-only, `r` refreshes, and `c` connects or
-  disconnects a remote host (`local` reports that it is always connected).
-- `o`/`p` captures the selected pane. `m` works on a session, window, or pane:
+- `/` filters, `Alt-a` toggles attention-only, `a` opens Ask, `A` opens Ask
+  history, `r` refreshes, and `c` connects or disconnects a remote host
+  (`local` reports that it is always connected).
+- `o`/`p` captures the selected pane. `m` works on a session, window, or pane;
   parent nodes resolve to the lowest-index pane that owns a live agent, while
-  an exact pane stays exact (`/` opens the shared message-skill palette). Enter
-  attaches directly on `local` or through a separate remote SSH TTY, and `?`
-  shows help.
+  an exact pane stays exact. `Tab` cycles the durable request kind,
+  `Ctrl-E` cycles read-only/execute/just-send, and `/` opens the shared
+  message-skill palette. In that palette, `F2`/`Ctrl-A` registers a skill and
+  Delete/`Ctrl-D` removes the selected skill. `M` (or `b`) opens that pane's mailbox, where `i`
+  claims queued requests and `e` replies. These operations use the selected
+  physical host's local muxad over the existing SSH relay.
+  Each mailbox tab returns its 32 newest requests to keep the interactive
+  response bounded; the node remains the durable source of truth.
+- Enter attaches directly on `local` or through a separate remote SSH TTY,
+  and `?` shows help. `muxa init` binds `prefix+s` to local watch and
+  `prefix+S` to Fleet watch.
 - `--view`, `--layout tree|swarm`, `--sort`, and `--theme` use the same values
   as native watch. `focus` expansion follows the selected view depth,
   `manual` changes only through structural keys, and direct `j`/`k` jumps
@@ -258,10 +269,12 @@ When the web dashboard is enabled, its authenticated read surface includes
 `POST /api/fleet/{host}/command` with a serialized `FleetOperation`; dashboard
 `auth = "none"` still disables all writes.
 
-Durable Muxa collaboration mailboxes remain local to a physical node in this
-release. Fleet prompt delivery can ask a remote agent to work, but it does not
-pretend that a cross-host `@peer` request has durable reply semantics. A future
-hub transport can add that capability without changing node or pane identity.
+Durable collaboration data remains owned by each physical node. Fleet watch
+does not copy it into a central database: `m`, `M`, claim, and reply commands
+are routed to the selected node's muxad over the authenticated SSH stdio relay.
+The `collaboration` relay capability gates these commands, so mixed-version
+nodes fail with an upgrade instruction instead of silently degrading durable
+requests into keystrokes.
 
 ## Security checklist
 

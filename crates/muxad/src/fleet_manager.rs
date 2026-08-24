@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use muxa::collaboration::{CollaborationOrigin, RequestMailbox};
 use muxa::config::{FleetCapturePolicy, FleetConfig, FleetConnectPolicy, FleetHostConfig};
 use muxa::fleet::{
     drain_bounded, load_or_create_node_id, read_bounded_line, sanitize_capture_text,
@@ -31,6 +32,7 @@ pub(crate) async fn start(
     cfg: &FleetConfig,
     local_agents: SharedStore,
     backends: Vec<SharedBackend>,
+    local_client: muxa::ipc::Client,
     daemon_generation: u64,
     shutdown: broadcast::Receiver<()>,
 ) -> (FleetRuntime, tokio::task::JoinHandle<()>) {
@@ -62,6 +64,7 @@ pub(crate) async fn start(
             local: LocalManagerInput {
                 agents: local_agents,
                 backends,
+                client: local_client,
                 transitions: local_transitions,
                 revision: local_revision,
                 identity_error,
@@ -115,6 +118,7 @@ struct ManagerInput {
 struct LocalManagerInput {
     agents: SharedStore,
     backends: Vec<SharedBackend>,
+    client: muxa::ipc::Client,
     transitions: broadcast::Receiver<muxa::Transition>,
     revision: Arc<AtomicU64>,
     identity_error: Option<String>,
@@ -145,6 +149,7 @@ async fn run_manager(input: ManagerInput) {
             store: Arc::clone(&store),
             agents: local.agents,
             backends: local.backends,
+            client: local.client,
             commands: local_rx,
             transitions: local.transitions,
             revision: local.revision,
@@ -273,6 +278,7 @@ struct LocalTask {
     store: Arc<FleetStore>,
     agents: SharedStore,
     backends: Vec<SharedBackend>,
+    client: muxa::ipc::Client,
     commands: mpsc::Receiver<HostCommand>,
     transitions: broadcast::Receiver<muxa::Transition>,
     revision: Arc<AtomicU64>,
@@ -376,7 +382,72 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
                 local_send_prompt(&self.backends, pane, text, submit).await
             }
+            FleetOperation::CollaborationSend { pane, request } => {
+                exact_local_backend(&self.backends, &pane).await?;
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_send", request.body.len());
+                let origin = fleet_collaboration_origin(&pane, true);
+                let target = format!("pane:{}", pane.pane_id);
+                self.client
+                    .collaboration_send(&origin, &target, &request)
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationMailbox { pane } => {
+                exact_local_backend(&self.backends, &pane).await?;
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_mailbox", 0);
+                let agent = fleet_collaboration_origin(&pane, false);
+                let console = fleet_collaboration_origin(&pane, true);
+                let (incoming, sent) = tokio::try_join!(
+                    self.client
+                        .collaboration_list(&agent, RequestMailbox::Incoming),
+                    self.client
+                        .collaboration_list(&console, RequestMailbox::Sent),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(FleetCommandResult::collaboration_mailbox(incoming, sent))
+            }
+            FleetOperation::CollaborationClaim { pane } => {
+                exact_local_backend(&self.backends, &pane).await?;
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_claim", 0);
+                self.client
+                    .collaboration_inbox(&fleet_collaboration_origin(&pane, false))
+                    .await
+                    .map(|incoming| FleetCommandResult::collaboration_mailbox(incoming, Vec::new()))
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationReply {
+                pane,
+                request_id,
+                status,
+                body,
+            } => {
+                exact_local_backend(&self.backends, &pane).await?;
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_reply", body.len());
+                self.client
+                    .collaboration_reply(
+                        &fleet_collaboration_origin(&pane, false),
+                        &request_id,
+                        status,
+                        &body,
+                        &[],
+                        &[],
+                    )
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
+            }
         }
+    }
+}
+
+fn fleet_collaboration_origin(pane: &PaneKey, console: bool) -> CollaborationOrigin {
+    let endpoint = &pane.window.session.endpoint;
+    CollaborationOrigin {
+        pane: pane.pane_id.clone(),
+        socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
+            .then(|| endpoint.socket.clone()),
+        console,
     }
 }
 
@@ -948,11 +1019,31 @@ impl HostTask {
                         let _ = command.reply.send(Ok(FleetCommandResult::accepted("already connected")));
                         continue;
                     }
-                    if matches!(command.operation, FleetOperation::SendPrompt { .. })
+                    if matches!(
+                        command.operation,
+                        FleetOperation::SendPrompt { .. }
+                            | FleetOperation::CollaborationSend { .. }
+                            | FleetOperation::CollaborationClaim { .. }
+                            | FleetOperation::CollaborationReply { .. }
+                    )
                         && self.config.mode != HostAccessMode::Control
                     {
                         let _ = command.reply.send(Err(format!(
                             "host '{}' is observe-only; set mode = 'control' to send prompts",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    if matches!(
+                        command.operation,
+                        FleetOperation::CollaborationSend { .. }
+                            | FleetOperation::CollaborationMailbox { .. }
+                            | FleetOperation::CollaborationClaim { .. }
+                            | FleetOperation::CollaborationReply { .. }
+                    ) && !connected.hello.capabilities.iter().any(|capability| capability == "collaboration")
+                    {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' does not support Fleet collaboration; upgrade muxa on that host",
                             self.alias
                         )));
                         continue;
@@ -1006,6 +1097,44 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::SendPrompt { request_id: id, pane, text, submit }
+                        }
+                        FleetOperation::CollaborationSend { pane, request } => {
+                            audit_operation(&self.alias, "collaboration_send", request.body.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationSend { request_id: id, pane, request }
+                        }
+                        FleetOperation::CollaborationMailbox { pane } => {
+                            audit_operation(&self.alias, "collaboration_mailbox", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationMailbox { request_id: id, pane }
+                        }
+                        FleetOperation::CollaborationClaim { pane } => {
+                            audit_operation(&self.alias, "collaboration_claim", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationClaim { request_id: id, pane }
+                        }
+                        FleetOperation::CollaborationReply { pane, request_id, status, body } => {
+                            audit_operation(&self.alias, "collaboration_reply", body.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationReply {
+                                request_id: id,
+                                pane,
+                                collaboration_request_id: request_id,
+                                status,
+                                body,
+                            }
                         }
                         FleetOperation::Connect | FleetOperation::Disconnect => unreachable!(),
                     };

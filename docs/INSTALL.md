@@ -162,11 +162,12 @@ Optional popups:
 
 ```tmux
 bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
+bind-key S display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --fleet"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
 
-Use `prefix+s` to watch all agents. For collaboration, focus the sending agent
-pane and use `prefix+D`.
+Use `prefix+s` for the local watch and `prefix+S` for the physical-host Fleet.
+`prefix+D` opens the dashboard.
 
 Reload:
 

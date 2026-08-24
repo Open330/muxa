@@ -137,11 +137,12 @@ optional popup:
 
 ```tmux
 bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
+bind-key S display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --fleet"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
 
-전체 agent 조회는 `prefix+s`를 사용합니다. 협업할 때는 메시지를 보낼 agent
-pane을 선택하고 `prefix+D`를 누릅니다.
+`prefix+s`는 local watch, `prefix+S`는 physical-host Fleet watch를 엽니다.
+`prefix+D`는 dashboard를 엽니다.
 
 reload:
 

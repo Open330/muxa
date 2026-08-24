@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Multi-node Fleet watch now follows native watch interaction semantics.**
+  `j`/`k` and arrows navigate siblings with singleton-parent fallback, while
+  `J`/`K` keep the fast global agent-pane jump. The renderer now uses the same
+  configured watch theme without Fleet-only hard-coded colors, and `muxa init`
+  adds `prefix+S` for Fleet while retaining `prefix+s` for local watch.
+- **Ask, durable messages, and mailboxes remain available when a remote host
+  makes the Fleet hierarchy visible.** `a`/`A`, `m`, and `M` retain their
+  native roles, including Ask agent switching, message kind/mode persistence,
+  shared `/` skills with in-watch add/remove, and mailbox claim/reply. Remote
+  collaboration stays owned by the selected node and travels over the existing
+  exact-pane SSH relay behind an explicit capability gate.
+
 ## [0.8.35] - 2026-08-22
 
 ### Added
