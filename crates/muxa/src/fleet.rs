@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 use crate::backend::{BackendCaps, HostKind};
+use crate::collaboration::{CollaborationRequest, NewRequest, RequestStatus};
 use crate::event::AgentState;
 use crate::ipc::SendPromptOutcome;
 use crate::state::{Agent, Transition};
@@ -41,12 +42,16 @@ pub const LOCAL_MANAGED_LABELS: &[&str] = &[
 ];
 pub const FLEET_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const FLEET_MAX_DIAGNOSTIC_BYTES: usize = 1024;
+/// Keep each Fleet mailbox tab comfortably below the relay frame ceiling even
+/// when every request carries maximum-sized text and AIR references.
+pub const FLEET_MAILBOX_REQUEST_LIMIT: usize = 32;
 pub const FLEET_MAX_CAPTURE_BYTES: usize = 256 * 1024;
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
     "window_capture",
     "send_prompt",
+    "collaboration",
     "exact_pane_ref",
     "labels_v1",
 ];
@@ -460,6 +465,26 @@ pub enum RelayRequest {
         text: String,
         submit: bool,
     },
+    CollaborationSend {
+        request_id: String,
+        pane: PaneKey,
+        request: NewRequest,
+    },
+    CollaborationMailbox {
+        request_id: String,
+        pane: PaneKey,
+    },
+    CollaborationClaim {
+        request_id: String,
+        pane: PaneKey,
+    },
+    CollaborationReply {
+        request_id: String,
+        pane: PaneKey,
+        collaboration_request_id: String,
+        status: RequestStatus,
+        body: String,
+    },
 }
 
 impl RelayRequest {
@@ -470,7 +495,11 @@ impl RelayRequest {
             | Self::Ping { request_id }
             | Self::Capture { request_id, .. }
             | Self::CaptureWindow { request_id, .. }
-            | Self::SendPrompt { request_id, .. } => request_id,
+            | Self::SendPrompt { request_id, .. }
+            | Self::CollaborationSend { request_id, .. }
+            | Self::CollaborationMailbox { request_id, .. }
+            | Self::CollaborationClaim { request_id, .. }
+            | Self::CollaborationReply { request_id, .. } => request_id,
         }
     }
 }
@@ -526,6 +555,22 @@ pub enum FleetOperation {
         #[serde(default)]
         submit: bool,
     },
+    CollaborationSend {
+        pane: PaneKey,
+        request: NewRequest,
+    },
+    CollaborationMailbox {
+        pane: PaneKey,
+    },
+    CollaborationClaim {
+        pane: PaneKey,
+    },
+    CollaborationReply {
+        pane: PaneKey,
+        request_id: String,
+        status: RequestStatus,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,6 +584,12 @@ pub struct FleetCommandResult {
     pub send: Option<SendPromptOutcomeWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_capture: Option<FleetWindowCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_request: Option<Box<CollaborationRequest>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_incoming: Vec<CollaborationRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_sent: Vec<CollaborationRequest>,
 }
 
 impl FleetCommandResult {
@@ -550,6 +601,9 @@ impl FleetCommandResult {
             capture: None,
             send: None,
             window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
         }
     }
 
@@ -561,6 +615,9 @@ impl FleetCommandResult {
             capture,
             send: None,
             window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
         }
     }
 
@@ -572,6 +629,9 @@ impl FleetCommandResult {
             capture: None,
             send: Some(outcome.into()),
             window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
         }
     }
 
@@ -583,6 +643,42 @@ impl FleetCommandResult {
             capture: None,
             send: None,
             window_capture: Some(capture),
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn collaboration_request(request: CollaborationRequest) -> Self {
+        Self {
+            accepted: true,
+            message: None,
+            capture: None,
+            send: None,
+            window_capture: None,
+            collaboration_request: Some(Box::new(request)),
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn collaboration_mailbox(
+        mut incoming: Vec<CollaborationRequest>,
+        mut sent: Vec<CollaborationRequest>,
+    ) -> Self {
+        incoming.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
+        sent.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
+        Self {
+            accepted: true,
+            message: None,
+            capture: None,
+            send: None,
+            window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: incoming,
+            collaboration_sent: sent,
         }
     }
 }
@@ -1006,6 +1102,7 @@ fn valid_dns_subdomain(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionKey;
     use tempfile::tempdir;
     use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -1118,6 +1215,50 @@ mod tests {
             sanitize_terminal_text("ok\u{1b}[31mred\u{1b}[0m\u{1b}]0;bad\u{7}\u{0}done"),
             "okreddone"
         );
+    }
+
+    #[test]
+    fn collaboration_relay_requests_round_trip_with_exact_pane_identity() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: SessionKey {
+                    endpoint: crate::BackendEndpoint {
+                        host: HostKind::Tmux,
+                        socket: "remote-default".into(),
+                    },
+                    session_id: "$7".into(),
+                },
+                window_id: "@8".into(),
+            },
+            pane_id: "%9".into(),
+        };
+        let request = RelayRequest::CollaborationSend {
+            request_id: "relay-1".into(),
+            pane: pane.clone(),
+            request: NewRequest {
+                kind: crate::collaboration::RequestKind::Review,
+                body: "review this change".into(),
+                expects_reply: true,
+                work_mode: crate::collaboration::WorkMode::ReadOnly,
+                paths: Vec::new(),
+                air_artifacts: Vec::new(),
+            },
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: RelayRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.request_id(), "relay-1");
+        match decoded {
+            RelayRequest::CollaborationSend {
+                pane: decoded_pane,
+                request,
+                ..
+            } => {
+                assert_eq!(decoded_pane, pane);
+                assert_eq!(request.kind, crate::collaboration::RequestKind::Review);
+                assert_eq!(request.body, "review this change");
+            }
+            _ => panic!("wrong relay request variant"),
+        }
     }
 
     #[tokio::test]

@@ -173,20 +173,29 @@ tree/swarm, collaboration/mailbox, ask, preview, command palette, message skill 
 
 multi-node Fleet TUI 동작:
 
-- Up/Down은 보이는 모든 structural node를 순회합니다.
-- `j`/`k`는 singleton session/window chain에서도 actionable pane 사이를 바로
-  이동합니다.
+- focus 모드에서 `j`/`k`와 Up/Down은 같은 계층의 sibling 사이를 이동합니다.
+  session/window/pane이 하나뿐인 chain에서는 sibling이 있는 가장 가까운 parent
+  계층으로 자동으로 올라가므로 cursor가 갇히지 않습니다. always/manual에서는
+  보이는 행을 순회합니다.
+- 대문자 `J`/`K`는 Fleet 전체의 actionable pane 사이를 바로 이동합니다.
 - `h`/`l` 또는 Left/Right는 접기/내리기, Space는 parent toggle입니다.
-- `/` 검색, `a` attention-only, `r` refresh, `c` remote host 연결/해제입니다.
-  `local`에서는 항상 연결됐다는 안내만 표시합니다.
+- `/` 검색, `Alt-a` attention-only, `a` Ask, `A` Ask history, `r` refresh,
+  `c` remote host 연결/해제입니다. `local`에서는 항상 연결됐다는 안내만 표시합니다.
 - `o`/`p`는 선택 pane을 capture합니다. `m`은 session/window/pane에서 사용할 수
   있고 parent에서는 live agent가 있는 가장 낮은 index의 pane을 안정적으로
-  선택합니다. composer의 `/`는 공용 message-skill palette를 엽니다. Enter는
-  `local`이면 직접 이동하고
-  remote이면 SSH attach하며, `?`는 help입니다.
+  선택합니다. `Tab`은 durable request kind, `Ctrl-E`는
+  read-only/execute/just-send mode를 바꾸며 `/`는 공용 message-skill palette를
+  엽니다. palette 안에서 `F2`/`Ctrl-A`는 skill 등록, Delete/`Ctrl-D`는 선택한
+  skill 삭제입니다. `M`(또는 `b`)은 해당 pane의 mailbox를 열고 그 안에서 `i` claim,
+  `e` reply를 수행합니다. 이 동작은 기존 SSH relay로 선택한 physical host의
+  muxad에 전달됩니다.
+  interactive response 크기를 제한하기 위해 mailbox tab마다 최신 32개를
+  표시하며, durable 원본은 계속 해당 node가 소유합니다.
+- Enter는 `local`이면 직접 이동하고 remote이면 SSH attach하며, `?`는 help입니다.
+  `muxa init`은 `prefix+s`를 local watch, `prefix+S`를 Fleet watch에 연결합니다.
 - `--view`, `--layout tree|swarm`, `--sort`, `--theme`은 native watch와 같은 값을
   사용합니다. `focus` 확장은 선택한 view 깊이를 지키고, `manual`은 구조 키로만
-  바뀌며, `j`/`k` 직접 이동은 대상의 ancestor만 엽니다.
+  바뀌며, 전역 `J`/`K` 이동은 대상의 ancestor만 엽니다.
 - 기본 설정이 숨기는 pane 없는 agent는 `--include-paneless`로 표시할 수 있습니다.
   별도 행과 Inspector로 상태를 볼 수 있지만 pane 대상 attach/capture/message는
   의도적으로 비활성화됩니다.
@@ -238,10 +247,11 @@ web dashboard를 켜면 read API에 `GET /api/fleet?selector=...`가 추가됩�
 `POST /api/fleet/{host}/command`는 serialized `FleetOperation`을 받아 PAT를 요구합니다.
 dashboard `auth = "none"`에서는 기존 정책대로 모든 write가 비활성화됩니다.
 
-durable Muxa collaboration mailbox는 이번 버전에서 physical node local입니다. Fleet
-prompt로 remote agent에게 작업을 요청할 수는 있지만 cross-host `@peer`가 durable reply를
-보장한다고 가장하지 않습니다. 향후 hub transport는 현재 node/pane identity를 바꾸지
-않고 추가할 수 있습니다.
+durable collaboration data의 소유권은 계속 각 physical node에 있습니다. Fleet watch는
+이를 중앙 DB로 복제하지 않고 `m`, `M`, claim, reply를 authenticated SSH stdio relay로
+선택한 node의 muxad에 전달합니다. `collaboration` relay capability가 이 명령을 gate하므로
+구버전 node에서는 durable request를 keystroke로 조용히 낮추지 않고 upgrade 안내를
+표시합니다.
 
 ## 보안 checklist
 

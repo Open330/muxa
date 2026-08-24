@@ -180,7 +180,7 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let outro_msg = if args.uninstall {
         "Uninstalled."
     } else {
-        "Done. Run `muxa onboard`, then try `prefix+s` to watch and collaborate."
+        "Done. Run `muxa onboard`, then try `prefix+s` for local watch or `prefix+S` for Fleet."
     };
     ui::outro(mode, outro_msg);
     Ok(())

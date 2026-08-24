@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
         &cfg.fleet,
         store.clone(),
         backends.clone(),
+        Client::new(socket.clone()),
         restart.generation(),
         shutdown_tx.subscribe(),
     )

@@ -1400,7 +1400,15 @@ pub(crate) async fn cmd_fleet_watch(
     if fleet_watch::uses_native_local_watch(&initial) {
         return cmd_watch(client, cfg, config_path, invocation.clone()).await;
     }
-    fleet_watch::run(client.clone(), &cfg, selector, initial, invocation).await
+    fleet_watch::run(
+        client.clone(),
+        &cfg,
+        selector,
+        initial,
+        invocation,
+        config_path,
+    )
+    .await
 }
 
 pub(crate) async fn cmd_watch(

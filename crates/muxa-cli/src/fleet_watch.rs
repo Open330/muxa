@@ -1,7 +1,9 @@
 //! Central host → session → window → pane(agent) Fleet TUI.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -13,7 +15,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use muxa::config::{WatchLayout, WatchSortKey, WatchTheme, WatchTreeExpansion, WatchView};
+use muxa::ask::{AskEntry, AskStatus};
+use muxa::collaboration::{CollaborationRequest, NewRequest, RequestKind, RequestStatus, WorkMode};
+use muxa::config::{
+    WatchCollaborationMode, WatchLayout, WatchSortKey, WatchTheme, WatchTreeExpansion, WatchView,
+};
 use muxa::fleet::{
     FleetCommandResult, FleetHostSnapshot, FleetHostState, FleetOperation, FleetSnapshot,
     FleetWindowCapture, GlobalPaneRef,
@@ -25,9 +31,11 @@ use muxa::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -127,6 +135,41 @@ enum InputMode {
     Normal,
     Search,
     Message,
+    Ask,
+    Reply,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum MailboxTab {
+    #[default]
+    Incoming,
+    Sent,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MailboxState {
+    open: bool,
+    loading: bool,
+    host: Option<String>,
+    pane: Option<PaneKey>,
+    incoming: Vec<CollaborationRequest>,
+    sent: Vec<CollaborationRequest>,
+    selected: usize,
+    tab: MailboxTab,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SkillEditorField {
+    #[default]
+    Name,
+    Prompt,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SkillEditor {
+    name: String,
+    prompt: String,
+    field: SkillEditorField,
 }
 
 #[allow(clippy::struct_excessive_bools)] // independent TUI state flags
@@ -157,6 +200,16 @@ struct App {
     expansion_initialized: bool,
     sort: WatchSortKey,
     show_paneless: bool,
+    ask_agent: String,
+    ask_entries: Vec<AskEntry>,
+    ask_selected: usize,
+    ask_panel: bool,
+    message_kind: RequestKind,
+    message_mode: WatchCollaborationMode,
+    mailbox: MailboxState,
+    reply_request_id: Option<String>,
+    skill_editor: Option<SkillEditor>,
+    skill_delete_confirm: Option<String>,
 }
 
 impl App {
@@ -199,6 +252,16 @@ impl App {
             expansion_initialized: false,
             sort,
             show_paneless: false,
+            ask_agent: "claude".into(),
+            ask_entries: Vec::new(),
+            ask_selected: 0,
+            ask_panel: false,
+            message_kind: RequestKind::Question,
+            message_mode: WatchCollaborationMode::ReadOnly,
+            mailbox: MailboxState::default(),
+            reply_request_id: None,
+            skill_editor: None,
+            skill_delete_confirm: None,
         }
     }
 
@@ -413,23 +476,60 @@ impl App {
         self.rebuild_rows(Some(&key));
     }
 
+    fn move_vertical(&mut self, delta: isize) {
+        if self.layout == WatchLayout::Swarm {
+            self.move_swarm(delta);
+        } else if self.expansion == WatchTreeExpansion::Focus {
+            self.move_focus_sibling(delta);
+        } else {
+            self.move_row(delta);
+        }
+    }
+
     fn move_row(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
         }
-        self.selected = self
-            .selected
-            .saturating_add_signed(delta)
-            .min(self.rows.len() - 1);
+        self.selected = wrapped_step(self.selected, self.rows.len(), delta);
         if let Some(key) = self.selected_key().cloned() {
             self.focus_key(key);
         }
     }
 
-    /// Vim `j/k` jumps between actionable agent panes. Arrow keys retain
-    /// access to every host/session/window inspector, so a single-child tree
-    /// does not force the common path through four structural rows.
-    fn move_pane(&mut self, delta: isize) {
+    /// Match native watch's focus-mode navigation: descendants are context,
+    /// while vertical movement stays in the selected node's sibling group.
+    /// If that group contains only one node, bubble to the parent's siblings
+    /// so a singleton pane/window chain never traps the cursor.
+    fn move_focus_sibling(&mut self, delta: isize) {
+        let Some(mut anchor) = self.selected_key().cloned() else {
+            return;
+        };
+        loop {
+            let parent = anchor.parent();
+            let candidates = self
+                .rows
+                .iter()
+                .filter(|row| row.key.parent() == parent)
+                .map(|row| row.key.clone())
+                .collect::<Vec<_>>();
+            let Some(current) = candidates.iter().position(|key| key == &anchor) else {
+                return;
+            };
+            if candidates.len() != 1 {
+                let next = wrapped_step(current, candidates.len(), delta);
+                self.focus_key(candidates[next].clone());
+                return;
+            }
+            let Some(parent) = parent else {
+                return;
+            };
+            anchor = parent;
+        }
+    }
+
+    /// Uppercase `J/K` preserves Fleet's fast global jump between actionable
+    /// panes without changing the familiar native-watch meaning of `j/k`.
+    fn jump_pane(&mut self, delta: isize) {
         let panes = all_pane_keys(
             &self.snapshot,
             &self.topologies,
@@ -450,11 +550,10 @@ impl App {
                     panes.iter().position(|pane| pane.host() == host)
                 })
             });
-        let next = match (index, delta.is_negative()) {
-            (Some(index), false) => (index + 1).min(panes.len() - 1),
-            (Some(index), true) => index.saturating_sub(1),
-            (None, false) => 0,
-            (None, true) => panes.len() - 1,
+        let next = match index {
+            Some(index) => wrapped_step(index, panes.len(), delta),
+            None if delta.is_negative() => panes.len() - 1,
+            None => 0,
         };
         self.reveal_key(panes[next].clone());
     }
@@ -473,11 +572,10 @@ impl App {
         }
         let current = self.selected_key();
         let index = current.and_then(|key| nodes.iter().position(|node| node == key));
-        let next = match (index, delta.is_negative()) {
-            (Some(index), false) => (index + 1).min(nodes.len() - 1),
-            (Some(index), true) => index.saturating_sub(1),
-            (None, false) => 0,
-            (None, true) => nodes.len() - 1,
+        let next = match index {
+            Some(index) => wrapped_step(index, nodes.len(), delta),
+            None if delta.is_negative() => nodes.len() - 1,
+            None => 0,
         };
         self.reveal_key(nodes[next].clone());
     }
@@ -532,6 +630,29 @@ impl App {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(4))
             .map(|(message, _)| message.as_str())
+    }
+
+    fn mailbox_requests(&self) -> &[CollaborationRequest] {
+        match self.mailbox.tab {
+            MailboxTab::Incoming => &self.mailbox.incoming,
+            MailboxTab::Sent => &self.mailbox.sent,
+        }
+    }
+
+    fn clamp_mailbox(&mut self) {
+        self.mailbox.selected = self
+            .mailbox
+            .selected
+            .min(self.mailbox_requests().len().saturating_sub(1));
+    }
+}
+
+fn wrapped_step(current: usize, len: usize, delta: isize) -> usize {
+    debug_assert!(len > 0);
+    if delta.is_negative() {
+        (current + len - (delta.unsigned_abs() % len)) % len
+    } else {
+        (current + (delta.unsigned_abs() % len)) % len
     }
 }
 
@@ -592,6 +713,13 @@ enum BackgroundResult {
     },
     PaneCapture(std::result::Result<FleetCommandResult, String>),
     Command(std::result::Result<FleetCommandResult, String>),
+    AskAgent(std::result::Result<String, String>),
+    AskSent(std::result::Result<AskEntry, String>),
+    AskList(std::result::Result<Vec<AskEntry>, String>),
+    CollaborationSent(std::result::Result<FleetCommandResult, String>),
+    Mailbox(std::result::Result<FleetCommandResult, String>),
+    MailboxClaimed(std::result::Result<FleetCommandResult, String>),
+    CollaborationReply(std::result::Result<FleetCommandResult, String>),
 }
 
 #[allow(clippy::too_many_lines)] // one event loop keeps refresh and terminal cleanup auditable
@@ -601,6 +729,7 @@ pub(crate) async fn run(
     selector: Option<String>,
     initial: FleetSnapshot,
     invocation: crate::WatchInvocation,
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let theme = invocation
@@ -631,6 +760,11 @@ pub(crate) async fn run(
         cfg.watch.tree_expansion,
         sort,
     );
+    app.message_kind = cfg
+        .watch
+        .collaboration_kind
+        .unwrap_or(RequestKind::Question);
+    app.message_mode = cfg.watch.collaboration_mode.unwrap_or_default();
     app.show_paneless = invocation.include_paneless || !cfg.watch.hide_paneless;
     app.apply_snapshot(initial);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
@@ -662,6 +796,7 @@ pub(crate) async fn run(
     });
     let now = Instant::now();
     let mut last_refresh = now;
+    let mut last_ask_refresh = now;
     let mut refresh_deadline = None;
     let mut last_render = now.checked_sub(IDLE_REDRAW_INTERVAL).unwrap_or(now);
     let mut needs_render = true;
@@ -698,6 +833,19 @@ pub(crate) async fn run(
             }
             last_refresh = Instant::now();
             refresh_deadline = None;
+        }
+        if app.ask_panel && last_ask_refresh.elapsed() >= Duration::from_secs(1) {
+            match client.ask_list().await {
+                Ok(entries) => {
+                    app.ask_entries = entries;
+                    app.ask_selected = app
+                        .ask_selected
+                        .min(app.ask_entries.len().saturating_sub(1));
+                    needs_render = true;
+                }
+                Err(error) => app.status(format!("ask history refresh failed: {error}")),
+            }
+            last_ask_refresh = Instant::now();
         }
 
         while let Ok(result) = background_rx.try_recv() {
@@ -738,6 +886,70 @@ pub(crate) async fn run(
                     ),
                     Err(error) => app.status(error),
                 },
+                BackgroundResult::AskAgent(result) => match result {
+                    Ok(agent) => {
+                        app.ask_agent.clone_from(&agent);
+                        if app.mode == InputMode::Ask {
+                            app.status(format!("ask agent: {agent}"));
+                        }
+                    }
+                    Err(error) => app.status(format!("ask agent: {error}")),
+                },
+                BackgroundResult::AskSent(result) => match result {
+                    Ok(entry) => {
+                        app.status(format!("asked {} — answer lands in A", entry.agent));
+                        app.ask_entries.push(entry);
+                        app.ask_selected = app.ask_entries.len().saturating_sub(1);
+                        app.ask_panel = true;
+                        last_ask_refresh = Instant::now();
+                    }
+                    Err(error) => app.status(format!("ask failed: {error}")),
+                },
+                BackgroundResult::AskList(result) => match result {
+                    Ok(entries) => {
+                        app.ask_entries = entries;
+                        app.ask_selected = app.ask_entries.len().saturating_sub(1);
+                        app.ask_panel = true;
+                        last_ask_refresh = Instant::now();
+                    }
+                    Err(error) => app.status(format!("ask history: {error}")),
+                },
+                BackgroundResult::CollaborationSent(result) => match result {
+                    Ok(result) => {
+                        let id = result
+                            .collaboration_request
+                            .as_ref()
+                            .map_or("request", |request| short_request_id(&request.id));
+                        app.status(format!("collaboration {id} sent — reply lands in M"));
+                    }
+                    Err(error) => app.status(format!("message failed: {error}")),
+                },
+                BackgroundResult::Mailbox(result) => {
+                    app.mailbox.loading = false;
+                    match result {
+                        Ok(result) => {
+                            app.mailbox.incoming = result.collaboration_incoming;
+                            app.mailbox.sent = result.collaboration_sent;
+                            app.clamp_mailbox();
+                        }
+                        Err(error) => app.status(format!("mailbox: {error}")),
+                    }
+                }
+                BackgroundResult::MailboxClaimed(result) => match result {
+                    Ok(result) => {
+                        app.mailbox.incoming = result.collaboration_incoming;
+                        app.clamp_mailbox();
+                        app.status("claimed queued inbox requests");
+                    }
+                    Err(error) => app.status(format!("claim inbox: {error}")),
+                },
+                BackgroundResult::CollaborationReply(result) => match result {
+                    Ok(_) => {
+                        app.status("reply sent");
+                        refresh_mailbox(client.clone(), &mut app, background_tx.clone());
+                    }
+                    Err(error) => app.status(format!("reply failed: {error}")),
+                },
             }
         }
 
@@ -752,16 +964,37 @@ pub(crate) async fn run(
             needs_render = true;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    quit = handle_key(key, &client, cfg, &mut terminal, &mut app, &background_tx)?;
+                    quit = handle_key(
+                        key,
+                        &client,
+                        cfg,
+                        config_path.as_deref(),
+                        &mut terminal,
+                        &mut app,
+                        &background_tx,
+                    )?;
                 }
-                Event::Paste(text) => match app.mode {
-                    InputMode::Search => {
-                        app.query.push_str(&safe_text(&text).replace('\n', " "));
-                        app.rebuild_rows(None);
+                Event::Paste(text) => {
+                    if let Some(editor) = app.skill_editor.as_mut() {
+                        match editor.field {
+                            SkillEditorField::Name => {
+                                editor.name.push_str(&text.replace(['\r', '\n'], " "));
+                            }
+                            SkillEditorField::Prompt => editor.prompt.push_str(&text),
+                        }
+                    } else {
+                        match app.mode {
+                            InputMode::Search => {
+                                app.query.push_str(&safe_text(&text).replace('\n', " "));
+                                app.rebuild_rows(None);
+                            }
+                            InputMode::Message | InputMode::Ask | InputMode::Reply => {
+                                app.composer.push_str(&text);
+                            }
+                            InputMode::Normal => {}
+                        }
                     }
-                    InputMode::Message => app.composer.push_str(&text),
-                    InputMode::Normal => {}
-                },
+                }
                 Event::Resize(_, _)
                 | Event::Mouse(_)
                 | Event::FocusGained
@@ -781,10 +1014,41 @@ fn handle_key(
     key: KeyEvent,
     client: &Client,
     cfg: &Config,
+    config_path: Option<&Path>,
     terminal: &mut TerminalSession,
     app: &mut App,
     background: &mpsc::UnboundedSender<BackgroundResult>,
 ) -> Result<bool> {
+    if let Some(name) = app.skill_delete_confirm.clone() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                app.skill_delete_confirm = None;
+                let Some(path) = config_path else {
+                    app.status("no config path is available for deleting the skill");
+                    return Ok(false);
+                };
+                match crate::message_skill::remove(path, &name) {
+                    Ok(()) => {
+                        app.message_skills.remove(&name);
+                        if let Some(palette) = app.skill_palette.as_mut() {
+                            palette.move_selection(0, &app.message_skills);
+                        }
+                        app.status(format!("removed /{name}"));
+                    }
+                    Err(error) => app.status(format!("skill delete failed: {error}")),
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => {
+                app.skill_delete_confirm = None;
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if app.skill_editor.is_some() {
+        handle_skill_editor_key(key, config_path, app);
+        return Ok(false);
+    }
     match app.mode {
         InputMode::Search => {
             match key.code {
@@ -807,36 +1071,7 @@ fn handle_key(
             return Ok(false);
         }
         InputMode::Message => {
-            if let Some(palette) = app.skill_palette.as_mut() {
-                match key.code {
-                    KeyCode::Esc => app.skill_palette = None,
-                    KeyCode::Enter => {
-                        if let Some(prompt) = palette.selected_prompt(&app.message_skills) {
-                            let mut cursor = app.composer.chars().count();
-                            crate::message_skill::insert_prompt(
-                                &mut app.composer,
-                                &mut cursor,
-                                &prompt,
-                            );
-                            app.skill_palette = None;
-                        }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        palette.move_selection(1, &app.message_skills);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        palette.move_selection(-1, &app.message_skills);
-                    }
-                    KeyCode::Backspace => {
-                        if !palette.backspace() {
-                            app.skill_palette = None;
-                        }
-                    }
-                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        palette.insert(character);
-                    }
-                    _ => {}
-                }
+            if handle_skill_palette_key(key, app) {
                 return Ok(false);
             }
             match key.code {
@@ -857,30 +1092,171 @@ fn handle_key(
                         app.status("message is empty");
                         return Ok(false);
                     }
+                    if app.message_mode != WatchCollaborationMode::JustSend
+                        && !host_supports_collaboration(app, &host)
+                    {
+                        app.status(format!(
+                            "host '{host}' needs a muxa upgrade for Fleet collaboration"
+                        ));
+                        return Ok(false);
+                    }
                     let text = std::mem::take(&mut app.composer);
+                    app.mode = InputMode::Normal;
+                    if app.message_mode == WatchCollaborationMode::JustSend {
+                        spawn_command(
+                            client,
+                            background,
+                            host,
+                            FleetOperation::SendPrompt {
+                                pane,
+                                text,
+                                submit: true,
+                            },
+                        );
+                        app.status("sending prompt…");
+                    } else {
+                        let request = NewRequest {
+                            kind: app.message_kind,
+                            body: text,
+                            expects_reply: app.message_kind != RequestKind::Notice,
+                            work_mode: match app.message_mode {
+                                WatchCollaborationMode::Execute => WorkMode::Execute,
+                                WatchCollaborationMode::ReadOnly
+                                | WatchCollaborationMode::JustSend => WorkMode::ReadOnly,
+                            },
+                            paths: Vec::new(),
+                            air_artifacts: Vec::new(),
+                        };
+                        spawn_collaboration_send(client, background, app, host, pane, request);
+                        app.status("sending collaboration request…");
+                    }
+                }
+                KeyCode::Tab => {
+                    app.message_kind = next_request_kind(app.message_kind);
+                    persist_message_defaults_or_status(config_path, app);
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.message_mode = next_message_mode(app.message_mode);
+                    persist_message_defaults_or_status(config_path, app);
+                }
+                KeyCode::Backspace => {
+                    app.composer.pop();
+                }
+                KeyCode::Char('/') => {
+                    app.skill_palette = Some(crate::message_skill::Palette::default());
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.composer.push(character);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        InputMode::Ask => {
+            if handle_skill_palette_key(key, app) {
+                return Ok(false);
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    app.mode = InputMode::Normal;
+                    app.composer.clear();
+                    app.skill_palette = None;
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.composer.push('\n');
+                }
+                KeyCode::Enter => {
+                    if app.composer.trim().is_empty() {
+                        app.status("question is empty");
+                        return Ok(false);
+                    }
+                    let prompt = std::mem::take(&mut app.composer);
                     app.mode = InputMode::Normal;
                     let client = client.clone();
                     let sender = background.clone();
                     tokio::spawn(async move {
                         let result = client
-                            .fleet_execute(
-                                &host,
-                                &FleetOperation::SendPrompt {
-                                    pane,
-                                    text,
-                                    submit: true,
-                                },
-                            )
+                            .ask_send(&prompt)
                             .await
                             .map_err(|error| error.to_string());
-                        let _ = sender.send(BackgroundResult::Command(result));
+                        let _ = sender.send(BackgroundResult::AskSent(result));
                     });
-                    app.status("sending prompt…");
+                    app.status("asking…");
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let next = if app.ask_agent == "claude" {
+                        "codex"
+                    } else {
+                        "claude"
+                    };
+                    let client = client.clone();
+                    let sender = background.clone();
+                    tokio::spawn(async move {
+                        let result = client
+                            .ask_agent(Some(next))
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = sender.send(BackgroundResult::AskAgent(result));
+                    });
+                    app.status(format!("switching Ask to {next}…"));
+                }
+                KeyCode::Char('/') => {
+                    app.skill_palette = Some(crate::message_skill::Palette::default());
                 }
                 KeyCode::Backspace => {
                     app.composer.pop();
                 }
-                KeyCode::Char('/') if !app.message_skills.is_empty() => {
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.composer.push(character);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        InputMode::Reply => {
+            if handle_skill_palette_key(key, app) {
+                return Ok(false);
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    app.mode = InputMode::Normal;
+                    app.composer.clear();
+                    app.reply_request_id = None;
+                    app.mailbox.open = true;
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.composer.push('\n');
+                }
+                KeyCode::Enter => {
+                    if app.composer.trim().is_empty() {
+                        app.status("reply is empty");
+                        return Ok(false);
+                    }
+                    let Some(request_id) = app.reply_request_id.take() else {
+                        app.status("reply target is no longer available");
+                        app.mode = InputMode::Normal;
+                        return Ok(false);
+                    };
+                    let Some(host) = app.mailbox.host.clone() else {
+                        app.status("mailbox host is no longer available");
+                        app.mode = InputMode::Normal;
+                        return Ok(false);
+                    };
+                    let Some(pane) = app.mailbox.pane.clone() else {
+                        app.status("mailbox pane is no longer available");
+                        app.mode = InputMode::Normal;
+                        return Ok(false);
+                    };
+                    let body = std::mem::take(&mut app.composer);
+                    app.mode = InputMode::Normal;
+                    app.mailbox.open = true;
+                    spawn_collaboration_reply(client, background, host, pane, request_id, body);
+                    app.status("sending reply…");
+                }
+                KeyCode::Backspace => {
+                    app.composer.pop();
+                }
+                KeyCode::Char('/') => {
                     app.skill_palette = Some(crate::message_skill::Palette::default());
                 }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -891,6 +1267,66 @@ fn handle_key(
             return Ok(false);
         }
         InputMode::Normal => {}
+    }
+
+    if app.ask_panel {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'A') => app.ask_panel = false,
+            KeyCode::Char('a') => {
+                app.ask_panel = false;
+                open_ask_composer(client, app, background);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.ask_selected =
+                    (app.ask_selected + 1).min(app.ask_entries.len().saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.ask_selected = app.ask_selected.saturating_sub(1);
+            }
+            KeyCode::Char('r') => refresh_ask_history(client, background),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if app.mailbox.open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'M' | 'b') => app.mailbox.open = false,
+            KeyCode::Char('m') => {
+                app.mailbox.open = false;
+                if app.selected_message_pane().is_some() {
+                    app.mode = InputMode::Message;
+                    app.composer.clear();
+                    app.skill_palette = None;
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                app.mailbox.tab = match app.mailbox.tab {
+                    MailboxTab::Incoming => MailboxTab::Sent,
+                    MailboxTab::Sent => MailboxTab::Incoming,
+                };
+                app.mailbox.selected = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = app.mailbox_requests().len();
+                if len > 0 {
+                    app.mailbox.selected = wrapped_step(app.mailbox.selected, len, 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = app.mailbox_requests().len();
+                if len > 0 {
+                    app.mailbox.selected = wrapped_step(app.mailbox.selected, len, -1);
+                }
+            }
+            KeyCode::Char('r') => {
+                refresh_mailbox(client.clone(), app, background.clone());
+            }
+            KeyCode::Char('i') => claim_mailbox(client, app, background),
+            KeyCode::Char('e') => open_reply_composer(app),
+            _ => {}
+        }
+        return Ok(false);
     }
 
     if app.popup.is_some() {
@@ -908,12 +1344,10 @@ fn handle_key(
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-        KeyCode::Down if app.layout == WatchLayout::Swarm => app.move_swarm(1),
-        KeyCode::Up if app.layout == WatchLayout::Swarm => app.move_swarm(-1),
-        KeyCode::Down => app.move_row(1),
-        KeyCode::Up => app.move_row(-1),
-        KeyCode::Char('j') => app.move_pane(1),
-        KeyCode::Char('k') => app.move_pane(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_vertical(1),
+        KeyCode::Up | KeyCode::Char('k') => app.move_vertical(-1),
+        KeyCode::Char('J') => app.jump_pane(1),
+        KeyCode::Char('K') => app.jump_pane(-1),
         KeyCode::Home | KeyCode::Char('g') => {
             if app.layout == WatchLayout::Swarm {
                 if let Some(first) = all_swarm_keys(
@@ -956,10 +1390,12 @@ fn handle_key(
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
         KeyCode::Char(' ') => app.toggle_selected(),
         KeyCode::Char('/') => app.mode = InputMode::Search,
-        KeyCode::Char('a') => {
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
             app.attention_only = !app.attention_only;
             app.rebuild_rows(None);
         }
+        KeyCode::Char('a') => open_ask_composer(client, app, background),
+        KeyCode::Char('A') => refresh_ask_history(client, background),
         KeyCode::Char('?') => app.help = true,
         KeyCode::Char('r') => {
             if let Some(host) = app.selected_key().map(|key| key.host().to_string()) {
@@ -1009,6 +1445,7 @@ fn handle_key(
                 app.status("select a session, window, or pane with a live agent");
             }
         }
+        KeyCode::Char('M' | 'b') => open_mailbox(client, app, background),
         KeyCode::Enter => {
             if let Some((host_alias, pane)) = app.selected_pane() {
                 let Some(host) = app
@@ -1043,6 +1480,395 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn open_ask_composer(
+    client: &Client,
+    app: &mut App,
+    background: &mpsc::UnboundedSender<BackgroundResult>,
+) {
+    app.mode = InputMode::Ask;
+    app.composer.clear();
+    app.skill_palette = None;
+    let client = client.clone();
+    let sender = background.clone();
+    tokio::spawn(async move {
+        let result = client
+            .ask_agent(None)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(BackgroundResult::AskAgent(result));
+    });
+}
+
+fn refresh_ask_history(client: &Client, background: &mpsc::UnboundedSender<BackgroundResult>) {
+    let client = client.clone();
+    let sender = background.clone();
+    tokio::spawn(async move {
+        let result = client.ask_list().await.map_err(|error| error.to_string());
+        let _ = sender.send(BackgroundResult::AskList(result));
+    });
+}
+
+fn handle_skill_palette_key(key: KeyEvent, app: &mut App) -> bool {
+    let Some(palette) = app.skill_palette.as_ref() else {
+        return false;
+    };
+    let selected_name = crate::message_skill::matching_skills(&app.message_skills, &palette.query)
+        .get(palette.selected)
+        .map(|(name, _)| (*name).clone());
+    match key.code {
+        KeyCode::F(2) | KeyCode::Char('a')
+            if key.code == KeyCode::F(2) || key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.skill_editor = Some(SkillEditor::default());
+            app.skill_palette = None;
+        }
+        KeyCode::Delete | KeyCode::Char('d')
+            if key.code == KeyCode::Delete || key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(name) = selected_name {
+                app.skill_delete_confirm = Some(name);
+            } else {
+                app.status("no message skill selected");
+            }
+        }
+        KeyCode::Esc => app.skill_palette = None,
+        KeyCode::Enter => {
+            let prompt = app
+                .skill_palette
+                .as_ref()
+                .and_then(|palette| palette.selected_prompt(&app.message_skills));
+            if let Some(prompt) = prompt {
+                let mut cursor = app.composer.chars().count();
+                crate::message_skill::insert_prompt(&mut app.composer, &mut cursor, &prompt);
+                app.skill_palette = None;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(palette) = app.skill_palette.as_mut() {
+                palette.move_selection(1, &app.message_skills);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(palette) = app.skill_palette.as_mut() {
+                palette.move_selection(-1, &app.message_skills);
+            }
+        }
+        KeyCode::Backspace => {
+            if app
+                .skill_palette
+                .as_mut()
+                .is_some_and(|palette| !palette.backspace())
+            {
+                app.skill_palette = None;
+            }
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(palette) = app.skill_palette.as_mut() {
+                palette.insert(character);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_skill_editor_key(key: KeyEvent, config_path: Option<&Path>, app: &mut App) {
+    match key.code {
+        KeyCode::Esc => app.skill_editor = None,
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(editor) = app.skill_editor.as_mut() {
+                editor.field = match editor.field {
+                    SkillEditorField::Name => SkillEditorField::Prompt,
+                    SkillEditorField::Prompt => SkillEditorField::Name,
+                };
+            }
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if let Some(editor) = app
+                .skill_editor
+                .as_mut()
+                .filter(|editor| editor.field == SkillEditorField::Prompt)
+            {
+                editor.prompt.push('\n');
+            }
+        }
+        KeyCode::Enter => {
+            let Some(editor) = app.skill_editor.as_mut() else {
+                return;
+            };
+            if editor.field == SkillEditorField::Name {
+                match crate::message_skill::validate_name(&editor.name) {
+                    Ok(()) => editor.field = SkillEditorField::Prompt,
+                    Err(error) => app.status(error.to_string()),
+                }
+                return;
+            }
+            let name = editor.name.clone();
+            let prompt = editor.prompt.clone();
+            let Some(path) = config_path else {
+                app.status("no config path is available for saving the skill");
+                return;
+            };
+            match crate::message_skill::upsert(path, &name, &prompt) {
+                Ok(()) => {
+                    app.message_skills.insert(name.clone(), prompt);
+                    app.skill_editor = None;
+                    app.status(format!("saved /{name}"));
+                }
+                Err(error) => app.status(format!("skill save failed: {error}")),
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(editor) = app.skill_editor.as_mut() {
+                match editor.field {
+                    SkillEditorField::Name => {
+                        editor.name.pop();
+                    }
+                    SkillEditorField::Prompt => {
+                        editor.prompt.pop();
+                    }
+                }
+            }
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(editor) = app.skill_editor.as_mut() {
+                match editor.field {
+                    SkillEditorField::Name => editor.name.push(character),
+                    SkillEditorField::Prompt => editor.prompt.push(character),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn host_supports_collaboration(app: &App, alias: &str) -> bool {
+    app.snapshot
+        .hosts
+        .iter()
+        .find(|host| host.alias == alias)
+        .is_some_and(|host| {
+            host.local
+                || host
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "collaboration")
+        })
+}
+
+fn spawn_collaboration_send(
+    client: &Client,
+    background: &mpsc::UnboundedSender<BackgroundResult>,
+    app: &mut App,
+    host: String,
+    pane: PaneKey,
+    request: NewRequest,
+) {
+    if !host_supports_collaboration(app, &host) {
+        app.status(format!(
+            "host '{host}' needs a muxa upgrade for Fleet collaboration"
+        ));
+        return;
+    }
+    let client = client.clone();
+    let sender = background.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fleet_execute(&host, &FleetOperation::CollaborationSend { pane, request })
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(BackgroundResult::CollaborationSent(result));
+    });
+}
+
+fn open_mailbox(
+    client: &Client,
+    app: &mut App,
+    background: &mpsc::UnboundedSender<BackgroundResult>,
+) {
+    let Some((host, pane)) = app.selected_message_pane() else {
+        app.status("select a session, window, or pane with a live agent");
+        return;
+    };
+    if !host_supports_collaboration(app, &host) {
+        app.status(format!(
+            "host '{host}' needs a muxa upgrade for Fleet collaboration"
+        ));
+        return;
+    }
+    app.mailbox.open = true;
+    app.mailbox.loading = true;
+    app.mailbox.host = Some(host);
+    app.mailbox.pane = Some(pane);
+    app.mailbox.selected = 0;
+    refresh_mailbox(client.clone(), app, background.clone());
+}
+
+fn refresh_mailbox(
+    client: Client,
+    app: &mut App,
+    background: mpsc::UnboundedSender<BackgroundResult>,
+) {
+    let (Some(host), Some(pane)) = (app.mailbox.host.clone(), app.mailbox.pane.clone()) else {
+        app.status("mailbox target is no longer available");
+        return;
+    };
+    app.mailbox.loading = true;
+    tokio::spawn(async move {
+        let result = client
+            .fleet_execute(&host, &FleetOperation::CollaborationMailbox { pane })
+            .await
+            .map_err(|error| error.to_string());
+        let _ = background.send(BackgroundResult::Mailbox(result));
+    });
+}
+
+fn claim_mailbox(
+    client: &Client,
+    app: &mut App,
+    background: &mpsc::UnboundedSender<BackgroundResult>,
+) {
+    if app.mailbox.tab != MailboxTab::Incoming {
+        app.status("switch to incoming requests before claiming");
+        return;
+    }
+    let (Some(host), Some(pane)) = (app.mailbox.host.clone(), app.mailbox.pane.clone()) else {
+        app.status("mailbox target is no longer available");
+        return;
+    };
+    let client = client.clone();
+    let sender = background.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fleet_execute(&host, &FleetOperation::CollaborationClaim { pane })
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(BackgroundResult::MailboxClaimed(result));
+    });
+    app.status("claiming queued inbox requests…");
+}
+
+fn open_reply_composer(app: &mut App) {
+    if app.mailbox.tab != MailboxTab::Incoming {
+        app.status("switch to incoming requests to reply");
+        return;
+    }
+    let Some(request) = app.mailbox_requests().get(app.mailbox.selected).cloned() else {
+        app.status("no incoming request selected");
+        return;
+    };
+    if request.status == RequestStatus::Queued {
+        app.status("press i to claim the request before replying");
+        return;
+    }
+    if request.status.is_terminal() {
+        app.status("selected request is already terminal");
+        return;
+    }
+    app.reply_request_id = Some(request.id);
+    app.composer.clear();
+    app.skill_palette = None;
+    app.mailbox.open = false;
+    app.mode = InputMode::Reply;
+}
+
+fn spawn_collaboration_reply(
+    client: &Client,
+    background: &mpsc::UnboundedSender<BackgroundResult>,
+    host: String,
+    pane: PaneKey,
+    request_id: String,
+    body: String,
+) {
+    let client = client.clone();
+    let sender = background.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fleet_execute(
+                &host,
+                &FleetOperation::CollaborationReply {
+                    pane,
+                    request_id,
+                    status: RequestStatus::Completed,
+                    body,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(BackgroundResult::CollaborationReply(result));
+    });
+}
+
+fn next_request_kind(kind: RequestKind) -> RequestKind {
+    match kind {
+        RequestKind::Question => RequestKind::Review,
+        RequestKind::Review => RequestKind::Task,
+        RequestKind::Task => RequestKind::Notice,
+        RequestKind::Notice => RequestKind::Question,
+    }
+}
+
+fn next_message_mode(mode: WatchCollaborationMode) -> WatchCollaborationMode {
+    match mode {
+        WatchCollaborationMode::ReadOnly => WatchCollaborationMode::Execute,
+        WatchCollaborationMode::Execute => WatchCollaborationMode::JustSend,
+        WatchCollaborationMode::JustSend => WatchCollaborationMode::ReadOnly,
+    }
+}
+
+fn persist_message_defaults_or_status(path: Option<&Path>, app: &mut App) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(error) = persist_message_defaults(path, app.message_kind, app.message_mode) {
+        app.status(format!("message kind/mode save failed: {error}"));
+    }
+}
+
+fn persist_message_defaults(
+    path: &Path,
+    kind: RequestKind,
+    mode: WatchCollaborationMode,
+) -> std::result::Result<(), String> {
+    let original = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let mut document = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| format!("parse {}: {error}", path.display()))?
+    };
+    match document.get("watch") {
+        Some(toml_edit::Item::Table(_)) | None => {}
+        Some(_) => return Err("[watch] is not a table".into()),
+    }
+    if document.get("watch").is_none() {
+        document["watch"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let watch = document["watch"]
+        .as_table_mut()
+        .ok_or_else(|| "[watch] is not a table".to_string())?;
+    watch["collaboration_kind"] = toml_edit::value(request_kind_label(kind));
+    watch["collaboration_mode"] = toml_edit::value(match mode {
+        WatchCollaborationMode::ReadOnly => "read_only",
+        WatchCollaborationMode::Execute => "execute",
+        WatchCollaborationMode::JustSend => "just_send",
+    });
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    std::fs::write(path, document.to_string())
+        .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 fn spawn_command(
@@ -1785,11 +2611,32 @@ fn render(frame: &mut Frame, app: &App) {
         render_tree(frame, chunks[0], app);
     }
     render_inspector(frame, chunks[1], app);
-    if app.mode == InputMode::Message {
+    if app.ask_panel {
+        render_ask_panel(frame, area, app);
+    }
+    if app.mailbox.open {
+        render_mailbox(frame, area, app);
+    }
+    if matches!(
+        app.mode,
+        InputMode::Message | InputMode::Ask | InputMode::Reply
+    ) {
         render_composer(frame, area, app);
         if app.skill_palette.is_some() {
             render_skill_palette(frame, area, app);
         }
+    }
+    if app.skill_editor.is_some() {
+        render_skill_editor(frame, area, app);
+    }
+    if let Some(name) = app.skill_delete_confirm.as_deref() {
+        render_popup(
+            frame,
+            area,
+            " delete message skill ",
+            &format!("Delete /{name}?\n\ny/Enter confirm · n/Esc cancel"),
+            app.theme,
+        );
     }
     if let Some(capture) = &app.popup {
         render_popup(frame, area, " pane capture ", capture, app.theme);
@@ -1799,7 +2646,7 @@ fn render(frame: &mut Frame, app: &App) {
             frame,
             area,
             " fleet keys ",
-            "↑/↓ every node    j/k previous/next agent pane\nh/l collapse/expand    Space toggle\nEnter attach pane      p capture pane\nm send prompt          r refresh host\nc connect/disconnect   a attention only\n/ search               ? help    q quit",
+            "↑/↓ · j/k siblings in focus; visible nodes otherwise\nJ/K previous/next agent pane across Fleet\nh/l collapse/expand    Space toggle\nEnter attach pane      p capture pane\na ask · A history      m message · M mailbox (b alias)\nTab kind · Ctrl-E mode i claim · e reply in mailbox\nr refresh host         c connect/disconnect\nAlt-a attention only   / search · ? help · q quit",
             app.theme,
         );
     }
@@ -1841,24 +2688,42 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
             "▸"
         };
         let indent = "  ".repeat(row.depth);
-        let marker = row.state.map_or("○", state_marker);
-        let attention = if row.attention > 0 {
-            format!(" !{}", row.attention)
-        } else {
-            String::new()
-        };
+        let node = Line::from(vec![
+            Span::styled(format!("{indent}{branch} "), theme.dim_style()),
+            Span::styled(
+                safe_text(&row.label),
+                if row.depth == 0 {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+        ]);
+        let mut state = vec![Span::styled(
+            row.state.map_or("○", state_marker),
+            row.state
+                .map_or_else(|| theme.dim_style(), |state| theme.state_style(state)),
+        )];
+        if row.attention > 0 {
+            state.push(Span::styled(
+                format!(" !{}", row.attention),
+                theme.state_style(AgentState::Error),
+            ));
+        }
         Row::new(vec![
-            Cell::from(format!("{indent}{branch} {}", safe_text(&row.label))),
-            Cell::from(format!("{marker}{attention}")),
-            Cell::from(safe_text(&row.detail)),
+            Cell::from(node),
+            Cell::from(Line::from(state)),
+            Cell::from(Span::styled(safe_text(&row.detail), theme.dim_style())),
         ])
     });
     let footer = app.active_status().map_or_else(
         || match app.mode {
             InputMode::Search => format!(" search: {}_ ", app.query),
             _ if !app.query.is_empty() => format!(" filter: {} · Esc/q clear/quit ", app.query),
-            _ if app.attention_only => " attention only · a clear ".into(),
-            _ => " ↑↓ nodes · j/k agents · Enter attach · m message · ? help ".into(),
+            _ if app.attention_only => " attention only · Alt-a/Esc clear ".into(),
+            _ => {
+                " j/k move · J/K agents · Enter attach · a/A ask · m/M collaborate · ? help ".into()
+            }
         },
         |status| format!(" {} ", safe_text(status)),
     );
@@ -1873,7 +2738,8 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
                 .border_style(theme.border_style()),
         )
         .row_highlight_style(theme.selected_style())
-        .highlight_symbol("› ");
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -1911,7 +2777,7 @@ fn render_swarm(frame: &mut Frame, area: Rect, app: &App) {
         nodes.len()
     );
     let footer = if app.query.is_empty() {
-        " j/k move · Enter attach · o/p capture · m message · / search · ? help ".to_string()
+        " j/k move · Enter attach · a/A ask · m/M collaborate · / search · ? help ".to_string()
     } else {
         format!(" filter: {} · Esc clear ", app.query)
     };
@@ -1938,7 +2804,8 @@ fn render_swarm(frame: &mut Frame, area: Rect, app: &App) {
             .border_style(theme.border_style()),
     )
     .row_highlight_style(theme.selected_style())
-    .highlight_symbol("> ");
+    .highlight_symbol("> ")
+    .highlight_spacing(HighlightSpacing::Always);
     let selected = app
         .selected_key()
         .and_then(|selected| nodes.iter().position(|key| key == selected))
@@ -2013,7 +2880,7 @@ fn swarm_row(
 fn render_inspector(frame: &mut Frame, area: Rect, app: &App) {
     let theme = crate::watch::watch_theme(app.theme);
     let block = Block::default()
-        .title(" inspector ")
+        .title(Span::styled(" Inspector ", theme.accent_badge()))
         .borders(Borders::ALL)
         .border_type(theme.border_type)
         .border_style(theme.border_style());
@@ -2128,7 +2995,7 @@ fn host_inspector(host: &FleetHostSnapshot) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             safe_text(error),
-            Style::default().fg(Color::Red),
+            Style::default().add_modifier(Modifier::BOLD),
         )));
     }
     lines
@@ -2413,7 +3280,7 @@ fn paneless_agent_inspector(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "No pane is attached; attach, capture, and message actions are unavailable.",
-        Style::default().fg(Color::DarkGray),
+        Style::default().add_modifier(Modifier::DIM),
     )));
     lines
 }
@@ -2542,22 +3409,275 @@ fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = crate::watch::watch_theme(app.theme);
     let popup = centered(area, 76, 12);
     frame.render_widget(Clear, popup);
-    let title = app.selected_key().map_or_else(
-        || " message ".into(),
-        |key| format!(" message · {} ", key_path(key)),
-    );
+    let (title, footer): (String, String) = match app.mode {
+        InputMode::Ask => (
+            format!(" ask · {} ", app.ask_agent),
+            " Enter ask · Tab agent · Shift-Enter newline · / skills · Esc cancel ".into(),
+        ),
+        InputMode::Reply => (
+            format!(
+                " reply · {} ",
+                app.reply_request_id
+                    .as_deref()
+                    .map_or("request", short_request_id)
+            ),
+            " Enter reply · Shift-Enter newline · / skills · Esc cancel ".into(),
+        ),
+        InputMode::Message => {
+            let path = app.selected_key().map_or_else(|| "agent".into(), key_path);
+            (
+                format!(
+                    " message · {} · {} · {path} ",
+                    request_kind_label(app.message_kind),
+                    message_mode_label(app.message_mode)
+                ),
+                " Enter send · Shift-Enter newline · Tab kind · Ctrl-E mode · / skills · Esc cancel ".into(),
+            )
+        }
+        InputMode::Normal | InputMode::Search => return,
+    };
     frame.render_widget(
         Paragraph::new(format!("{}_", safe_text(&app.composer)))
             .block(
                 Block::default()
-                    .title(title)
-                    .title_bottom(" Enter send · Shift-Enter newline · / skills · Esc cancel ")
+                    .title(Span::styled(title, theme.action_badge()))
+                    .title_bottom(footer)
                     .borders(Borders::ALL)
                     .border_type(theme.border_type)
                     .border_style(theme.border_style()),
             )
             .wrap(Wrap { trim: false }),
         popup,
+    );
+}
+
+#[allow(clippy::too_many_lines)] // one modal renderer keeps list/detail layout coherent
+fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = crate::watch::watch_theme(app.theme);
+    let popup = centered(area, 92, 82);
+    frame.render_widget(Clear, popup);
+    let target = match (&app.mailbox.host, &app.mailbox.pane) {
+        (Some(host), Some(pane)) => format!("{host} › {}", pane.pane_id),
+        _ => "no agent selected".into(),
+    };
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" mailbox ", theme.accent_badge()),
+            Span::styled(
+                format!(" incoming {} ", app.mailbox.incoming.len()),
+                if app.mailbox.tab == MailboxTab::Incoming {
+                    theme.action_badge()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" sent {} ", app.mailbox.sent.len()),
+                if app.mailbox.tab == MailboxTab::Sent {
+                    theme.action_badge()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+            Span::styled(format!(" · {target} "), theme.table_header_style()),
+        ]))
+        .title_bottom(" Tab inbox/sent · j/k move · i claim · e reply · r refresh · M/Esc close ")
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_style());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if app.mailbox.loading && app.mailbox.incoming.is_empty() && app.mailbox.sent.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("loading mailbox…", theme.dim_style())),
+            inner,
+        );
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(inner);
+    let requests = app.mailbox_requests();
+    let visible = usize::from(chunks[0].height).max(1);
+    let start = app
+        .mailbox
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible);
+    let rows = requests
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, request)| {
+            let marker = if index == app.mailbox.selected {
+                "> "
+            } else {
+                "  "
+            };
+            let peer = match app.mailbox.tab {
+                MailboxTab::Incoming => request.from.label(),
+                MailboxTab::Sent => request.to.label(),
+            };
+            Row::new(vec![
+                Cell::from(marker),
+                Cell::from(short_request_id(&request.id)),
+                Cell::from(request_kind_label(request.kind)),
+                Cell::from(request_status_label(request.status)),
+                Cell::from(safe_text(&peer)),
+                Cell::from(safe_text(&request.body).replace('\n', " ")),
+            ])
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Min(20),
+        ],
+    )
+    .header(
+        Row::new(["", "ID", "KIND", "STATUS", "PEER", "MESSAGE"]).style(theme.table_header_style()),
+    );
+    frame.render_widget(table, chunks[0]);
+
+    let detail = requests.get(app.mailbox.selected).map_or_else(
+        || {
+            if app.mailbox.loading {
+                "refreshing…".into()
+            } else {
+                "no requests".into()
+            }
+        },
+        |request| {
+            let mut detail = format!(
+                "{} · {} · {}\nfrom: {}\nto: {}\nmode: {:?}\ncreated: {}\n\n{}",
+                request.id,
+                request_kind_label(request.kind),
+                request_status_label(request.status),
+                request.from.label(),
+                request.to.label(),
+                request.work_mode,
+                request.created_at,
+                safe_text(&request.body)
+            );
+            if let Some(reply) = &request.reply {
+                let _ = write!(
+                    detail,
+                    "\n\nreply · {}\n{}",
+                    request_status_label(reply.status),
+                    safe_text(&reply.body)
+                );
+            }
+            detail
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(safe_text(&detail))
+            .block(
+                Block::default()
+                    .title(Span::styled(" selected request ", theme.dim_style()))
+                    .borders(Borders::TOP)
+                    .border_style(theme.border_style()),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+}
+
+fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = crate::watch::watch_theme(app.theme);
+    let popup = centered(area, 92, 82);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" ask ", theme.accent_badge()),
+            Span::styled(
+                format!(" {} entries ", app.ask_entries.len()),
+                theme.table_header_style(),
+            ),
+        ]))
+        .title_bottom(" a new · j/k move · r refresh · A/Esc close ")
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_style());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if app.ask_entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "no questions yet — press a to ask one",
+                theme.dim_style(),
+            )),
+            inner,
+        );
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(inner);
+    let visible_rows = usize::from(chunks[0].height).max(1);
+    let start = app
+        .ask_selected
+        .saturating_sub(visible_rows.saturating_sub(1));
+    let rows = app
+        .ask_entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, entry)| {
+            let status = match entry.status {
+                AskStatus::Running => Span::styled("…", theme.state_style(AgentState::Working)),
+                AskStatus::Answered => Span::styled("✓", theme.state_style(AgentState::Idle)),
+                AskStatus::Failed => Span::styled("✗", theme.state_style(AgentState::Error)),
+            };
+            let marker = if index == app.ask_selected {
+                "> "
+            } else {
+                "  "
+            };
+            Row::new(vec![
+                Cell::from(Line::from(vec![Span::raw(marker), status])),
+                Cell::from(entry.agent.clone()),
+                Cell::from(safe_text(&entry.prompt).replace('\n', " ")),
+            ])
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Length(10),
+            Constraint::Min(20),
+        ],
+    )
+    .header(Row::new(["", "AGENT", "QUESTION"]).style(theme.table_header_style()));
+    frame.render_widget(table, chunks[0]);
+
+    let entry = &app.ask_entries[app.ask_selected.min(app.ask_entries.len() - 1)];
+    let answer = if let Some(error) = entry.error.as_deref() {
+        format!("ask: {}\n\nerror: {}", entry.prompt, safe_text(error))
+    } else if entry.answer.is_empty() {
+        format!("ask: {}\n\n(waiting for answer)", entry.prompt)
+    } else {
+        format!("ask: {}\n\nanswer: {}", entry.prompt, entry.answer)
+    };
+    frame.render_widget(
+        Paragraph::new(safe_text(&answer))
+            .block(
+                Block::default()
+                    .title(Span::styled(" answer ", theme.accent_badge()))
+                    .borders(Borders::TOP)
+                    .border_style(theme.border_style()),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[1],
     );
 }
 
@@ -2597,13 +3717,66 @@ fn render_skill_palette(frame: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .title(format!(" skills · {query} "))
-                    .title_bottom(" type filter · ↑/↓ select · Enter insert · Esc back ")
+                    .title_bottom(
+                        " type filter · ↑/↓ select · Enter insert · F2/Ctrl-A add · Del/Ctrl-D remove · Esc back ",
+                    )
                     .borders(Borders::ALL)
                     .border_type(theme.border_type)
                     .border_style(theme.border_style()),
             )
             .wrap(Wrap { trim: false }),
         popup,
+    );
+}
+
+fn render_skill_editor(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(editor) = app.skill_editor.as_ref() else {
+        return;
+    };
+    let theme = crate::watch::watch_theme(app.theme);
+    let popup = centered(area, 76, 42);
+    frame.render_widget(Clear, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(popup);
+    let name_style = if editor.field == SkillEditorField::Name {
+        theme.selected_style()
+    } else {
+        Style::default()
+    };
+    let prompt_style = if editor.field == SkillEditorField::Prompt {
+        theme.selected_style()
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Paragraph::new(format!("/{}_", safe_text(&editor.name)))
+            .style(name_style)
+            .block(
+                Block::default()
+                    .title(Span::styled(" name ", theme.table_header_style()))
+                    .borders(Borders::ALL)
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
+            ),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("{}_", safe_text(&editor.prompt)))
+            .style(prompt_style)
+            .block(
+                Block::default()
+                    .title(Span::styled(" prompt ", theme.table_header_style()))
+                    .title_bottom(
+                        " Tab field · Enter next/save · Shift-Enter newline · Esc cancel ",
+                    )
+                    .borders(Borders::ALL)
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[1],
     );
 }
 
@@ -2698,15 +3871,16 @@ fn key_path(key: &NodeKey) -> String {
 fn heading(value: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(
         safe_text(&value.into()),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().add_modifier(Modifier::BOLD),
     ))
 }
 
 fn kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:<12}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{key:<12}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
         Span::raw(safe_text(value)),
     ])
 }
@@ -2721,6 +3895,40 @@ fn state_marker(state: AgentState) -> &'static str {
         AgentState::Error => "■",
         AgentState::Stopped => "×",
     }
+}
+
+fn request_kind_label(kind: RequestKind) -> &'static str {
+    match kind {
+        RequestKind::Question => "question",
+        RequestKind::Review => "review",
+        RequestKind::Task => "task",
+        RequestKind::Notice => "notice",
+    }
+}
+
+fn message_mode_label(mode: WatchCollaborationMode) -> &'static str {
+    match mode {
+        WatchCollaborationMode::ReadOnly => "read only",
+        WatchCollaborationMode::Execute => "execute",
+        WatchCollaborationMode::JustSend => "just send",
+    }
+}
+
+fn request_status_label(status: RequestStatus) -> &'static str {
+    match status {
+        RequestStatus::Queued => "queued",
+        RequestStatus::Claimed => "claimed",
+        RequestStatus::Completed => "completed",
+        RequestStatus::Blocked => "blocked",
+        RequestStatus::Declined => "declined",
+        RequestStatus::Failed => "failed",
+        RequestStatus::Expired => "expired",
+        RequestStatus::Cancelled => "cancelled",
+    }
+}
+
+fn short_request_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 fn state_label(state: AgentState) -> &'static str {
@@ -2964,7 +4172,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_tree_keeps_structural_nodes_but_j_targets_panes() {
+    fn focus_tree_keeps_structural_nodes_and_global_jump_targets_panes() {
         let host = host();
         let topology = host_topology(&host).unwrap();
         let mut app = App::new(
@@ -2983,7 +4191,7 @@ mod tests {
         app.topologies.insert("dev".into(), topology);
         app.rebuild_rows(None);
         assert!(matches!(app.selected_key(), Some(NodeKey::Host(_))));
-        app.move_pane(1);
+        app.jump_pane(1);
         assert!(matches!(app.selected_key(), Some(NodeKey::Pane { .. })));
         assert!(app
             .rows
@@ -2993,6 +4201,173 @@ mod tests {
             .rows
             .iter()
             .any(|row| matches!(row.key, NodeKey::Window { .. })));
+    }
+
+    #[test]
+    fn fleet_message_contract_controls_match_native_watch() {
+        assert_eq!(
+            next_request_kind(RequestKind::Question),
+            RequestKind::Review
+        );
+        assert_eq!(next_request_kind(RequestKind::Review), RequestKind::Task);
+        assert_eq!(next_request_kind(RequestKind::Task), RequestKind::Notice);
+        assert_eq!(
+            next_request_kind(RequestKind::Notice),
+            RequestKind::Question
+        );
+        assert_eq!(
+            next_message_mode(WatchCollaborationMode::ReadOnly),
+            WatchCollaborationMode::Execute
+        );
+        assert_eq!(
+            next_message_mode(WatchCollaborationMode::Execute),
+            WatchCollaborationMode::JustSend
+        );
+        assert_eq!(
+            next_message_mode(WatchCollaborationMode::JustSend),
+            WatchCollaborationMode::ReadOnly
+        );
+
+        let mut remote = host();
+        let app = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Pane,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        let mut app = app;
+        app.apply_snapshot(FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote.clone()],
+        });
+        assert!(!host_supports_collaboration(&app, "dev"));
+        remote.capabilities.push("collaboration".into());
+        app.apply_snapshot(FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote],
+        });
+        assert!(host_supports_collaboration(&app, "dev"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\ntheme = \"classic\"\n").unwrap();
+        persist_message_defaults(&path, RequestKind::Task, WatchCollaborationMode::Execute)
+            .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("collaboration_kind = \"task\""));
+        assert!(saved.contains("collaboration_mode = \"execute\""));
+
+        app.skill_editor = Some(SkillEditor {
+            name: "review-plan".into(),
+            prompt: "ask another agent to review the plan".into(),
+            field: SkillEditorField::Prompt,
+        });
+        handle_skill_editor_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Some(&path),
+            &mut app,
+        );
+        assert!(app.skill_editor.is_none());
+        assert_eq!(
+            app.message_skills.get("review-plan").map(String::as_str),
+            Some("ask another agent to review the plan")
+        );
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("review-plan"));
+    }
+
+    #[test]
+    fn focus_navigation_matches_native_watch_siblings_and_singleton_fallback() {
+        let mut remote_host = host();
+        let remote = remote_host.remote.as_mut().unwrap();
+        let mut second_window = remote.panes[0].clone();
+        second_window.pane_id = "%2".into();
+        second_window.window_id = "@2".into();
+        second_window.window_name = "CAL-2".into();
+        second_window.window_index = "1".into();
+        let mut second_session = remote.panes[0].clone();
+        second_session.pane_id = "%3".into();
+        second_session.session_id = "$2".into();
+        second_session.session = "other".into();
+        second_session.window_id = "@3".into();
+        second_session.window_name = "CAL-3".into();
+        remote.panes.extend([second_window, second_session]);
+
+        let mut app = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Pane,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        app.apply_snapshot(FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote_host],
+        });
+
+        app.expand_or_child();
+        assert!(matches!(app.selected_key(), Some(NodeKey::Session { .. })));
+        let first_session = app.selected_key().cloned().unwrap();
+        app.move_vertical(1);
+        assert!(matches!(app.selected_key(), Some(NodeKey::Session { .. })));
+        assert_ne!(app.selected_key(), Some(&first_session));
+        app.move_vertical(-1);
+        assert_eq!(app.selected_key(), Some(&first_session));
+
+        let first_pane = all_pane_keys(
+            &app.snapshot,
+            &app.topologies,
+            "",
+            false,
+            WatchSortKey::Name,
+        )
+        .into_iter()
+        .find(|key| {
+            matches!(
+                key,
+                NodeKey::Pane { key, .. }
+                    if key.window.session.session_id == "$1" && key.window.window_id == "@1"
+            )
+        })
+        .unwrap();
+        app.reveal_key(first_pane);
+        app.move_vertical(1);
+        assert!(matches!(
+            app.selected_key(),
+            Some(NodeKey::Window { key, .. }) if key.window_id == "@2"
+        ));
+    }
+
+    #[test]
+    fn focus_navigation_moves_between_hosts_and_wraps() {
+        let first = host();
+        let mut second = host();
+        second.alias = "prod".into();
+        second.ssh_target = "prod-box".into();
+        let mut app = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Window,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        app.apply_snapshot(FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![second, first],
+        });
+        assert!(matches!(app.selected_key(), Some(NodeKey::Host(host)) if host == "dev"));
+        app.move_vertical(1);
+        assert!(matches!(app.selected_key(), Some(NodeKey::Host(host)) if host == "prod"));
+        app.move_vertical(1);
+        assert!(matches!(app.selected_key(), Some(NodeKey::Host(host)) if host == "dev"));
     }
 
     #[test]
@@ -3067,7 +4442,7 @@ mod tests {
             1,
             "ordinary movement must not expand manual trees"
         );
-        manual.move_pane(1);
+        manual.jump_pane(1);
         assert!(matches!(manual.selected_key(), Some(NodeKey::Pane { .. })));
         assert!(manual
             .rows
