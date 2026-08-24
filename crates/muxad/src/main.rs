@@ -318,6 +318,7 @@ async fn main() -> Result<()> {
         // route to the correct host during mixed-host migrations.
         let backends_for_dash = backends.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
+            message_skills: cfg.message.skills.clone(),
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
             work_store_path: paths::default_dashboard_work_file(),

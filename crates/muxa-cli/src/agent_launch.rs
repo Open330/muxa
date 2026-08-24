@@ -147,7 +147,7 @@ pub struct StartArgs {
     /// Managed workspace/project. Valid only together with --work.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Managed work/ticket. Reuses its tmux window or creates it once.
+    /// Managed Work. Reuses its current Run window or creates it once.
     #[arg(long)]
     pub work: Option<String>,
     /// Optional agent role stored on the pane, for example reviewer.
@@ -170,7 +170,7 @@ pub struct StartArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WorkStartArgs {
-    /// Work/ticket id. One managed tmux window is created per id.
+    /// Work id. Its current Run reuses or creates one managed tmux window.
     pub work: String,
     /// Workspace/project session. Defaults to the work directory name.
     #[arg(long)]

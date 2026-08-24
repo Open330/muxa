@@ -10,6 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
+use muxa::work::{WorkRecord, WorkStage};
 use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -65,6 +66,8 @@ pub struct WorkInfo {
     pub work: String,
     pub workspace: String,
     pub session: String,
+    /// tmux's stable `$N`, retained as this Run's physical coordinate.
+    pub session_id: String,
     pub window: String,
     pub window_index: u32,
     pub window_name: String,
@@ -334,15 +337,17 @@ pub fn run_work_list(args: WorkListArgs) -> Result<()> {
     } else if works.is_empty() {
         println!("no muxa-managed work windows");
     } else {
+        let records = work_annotations();
         for work in works {
             println!(
-                "{}  workspace={}  session={}  window={}  agents={}  cwd={}",
+                "{}  workspace={}  session={}  window={}  agents={}  cwd={}{}",
                 work.work,
                 work.workspace,
                 work.session,
                 work.window,
                 work.agents.len(),
-                work.cwd.display()
+                work.cwd.display(),
+                stage_suffix(&work, &records)
             );
         }
     }
@@ -355,13 +360,15 @@ pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&work)?);
     } else {
+        let records = work_annotations();
         println!(
-            "{}  workspace={}  session={}  window={}  cwd={}",
+            "{}  workspace={}  session={}  window={}  cwd={}{}",
             work.work,
             work.workspace,
             work.session,
             work.window,
-            work.cwd.display()
+            work.cwd.display(),
+            stage_suffix(&work, &records)
         );
         for agent in &work.agents {
             println!(
@@ -840,6 +847,31 @@ pub fn mark_agent(
     Ok(())
 }
 
+/// The stage a human (or the dashboard) recorded for this logical Work.
+/// A new Run in another tmux window retains the same stage because execution
+/// coordinates are deliberately not part of Work identity.
+fn stage_for(work: &WorkInfo, records: &[WorkRecord]) -> Option<WorkStage> {
+    records
+        .iter()
+        .find(|record| {
+            record.identity.workspace_id == work.workspace && record.identity.work_id == work.work
+        })
+        .map(|record| record.metadata.stage)
+}
+
+/// Load the dashboard's annotations for display. Read-only on purpose:
+/// `WorkStore` rewrites the whole file on save, so a second writer outside
+/// muxad's mutex would drop records the dashboard holds in memory.
+fn work_annotations() -> Vec<WorkRecord> {
+    muxa::dashboard::load_work_records(muxa::paths::default_dashboard_work_file())
+}
+
+fn stage_suffix(work: &WorkInfo, records: &[WorkRecord]) -> String {
+    stage_for(work, records)
+        .filter(|stage| *stage != WorkStage::Auto)
+        .map_or_else(String::new, |stage| format!("  stage={}", stage.label()))
+}
+
 pub fn window_id_for_pane(pane: &str) -> Result<String> {
     validate_pane_id(pane)?;
     let window = tmux_output(&["display-message", "-p", "-t", pane, "#{window_id}"])?;
@@ -1017,6 +1049,7 @@ fn parse_work_window(
         work,
         workspace: workspace.to_string(),
         session: fields[0].to_string(),
+        session_id: session_id.to_string(),
         window,
         window_index: fields[3].parse().unwrap_or(0),
         window_name: fields[4].to_string(),
@@ -1356,6 +1389,60 @@ mod tests {
         // for the pipeline diff to claim it by.
         assert_eq!(workspaces[0].works[0].agents[1].pane, "%4");
         assert!(workspaces[0].works[0].agents[1].alias.is_none());
+    }
+
+    fn work_at(workspace: &str, work: &str) -> WorkInfo {
+        WorkInfo {
+            work: work.into(),
+            workspace: workspace.into(),
+            session: "callabo".into(),
+            session_id: "$1".into(),
+            window: "@7".into(),
+            window_index: 0,
+            window_name: work.into(),
+            cwd: PathBuf::from("/work"),
+            external_item: None,
+            agents: Vec::new(),
+        }
+    }
+
+    fn record_at(workspace: &str, work: &str, stage: WorkStage) -> WorkRecord {
+        WorkRecord {
+            identity: muxa::work::WorkIdentity::new(workspace, work),
+            metadata: muxa::work::WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                stage,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+            external_items: Vec::new(),
+            legacy_binding: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn a_stage_follows_the_logical_work_across_runs() {
+        let work = work_at("callabo", "CAL-1234");
+        let records = vec![
+            record_at("callabo", "CAL-1234", WorkStage::Review),
+            record_at("callabo", "OTHER", WorkStage::Done),
+            record_at("other", "CAL-1234", WorkStage::Blocked),
+        ];
+        assert_eq!(stage_for(&work, &records), Some(WorkStage::Review));
+        assert_eq!(stage_for(&work_at("callabo", "MISSING"), &records), None);
+        assert_eq!(stage_for(&work, &[]), None);
+    }
+
+    #[test]
+    fn the_default_stage_adds_no_column() {
+        let work = work_at("callabo", "CAL-1234");
+        let records = vec![record_at("callabo", "CAL-1234", WorkStage::Auto)];
+        // `auto` means "nobody has said anything"; printing it would be noise.
+        assert_eq!(stage_suffix(&work, &records), "");
+        let staged = vec![record_at("callabo", "CAL-1234", WorkStage::InProgress)];
+        assert_eq!(stage_suffix(&work, &staged), "  stage=in_progress");
     }
 
     #[test]

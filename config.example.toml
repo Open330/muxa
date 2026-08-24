@@ -327,6 +327,15 @@
 # token         = "<paste 32+ random hex bytes here>"
 # allow_public  = false
 # pane_cache_ttl_ms = 2000
+#
+# Let the dashboard stand a work pipeline up — that is, launch agent
+# processes — through `POST /api/work-control/up` and the board's
+# "start work" control. Off by default, and deliberately its own switch
+# rather than riding on the control token: every other write route steers
+# a process you already started, while this one starts new ones with
+# permissions bypassed. Requires [[route]] and [pipeline.*] to be
+# configured; see docs/PIPELINE.md.
+# allow_work_start = false
 
 # External sinks. Default off — none of these forward data anywhere
 # unless you explicitly opt in.

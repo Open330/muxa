@@ -18,8 +18,10 @@ muxa watch --include-paneless
 ```
 
 `view = "work"`는 tmux window 기준으로 묶고 parent를 `workspace › work`로
-표시합니다. session 하나는 workspace/project, window 하나는 work/ticket,
-child pane 하나는 agent입니다. `view = "pane"`은 pane별로 한 줄씩 보여줍니다.
+표시하는 실행 topology view입니다. session은 Workspace를, window는 현재 Run을,
+child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로 한 줄씩
+보여줍니다. 지속되는 Work와 외부 이슈 상태는 이 tree가 아니라 `muxa dashboard`가
+담당합니다.
 
 ## 주요 키
 

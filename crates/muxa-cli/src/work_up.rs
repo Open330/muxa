@@ -31,8 +31,13 @@ use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest}
 #[derive(Debug, clap::Args)]
 #[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
 pub struct UpArgs {
-    /// Muxa Work id, for example cal-1234. It may also resolve an external issue.
+    /// Stable Muxa Work id, for example auth-cleanup.
     pub work: String,
+    /// Optional external issue key to resolve and link, for example CAL-1234.
+    /// When omitted, the Work id is still looked up for compatibility; use
+    /// `--no-ticket` for a strictly local Work.
+    #[arg(long, value_name = "ISSUE")]
+    pub external: Option<String>,
     /// Pipeline to staff the window with. Defaults to the matching route's.
     #[arg(long)]
     pub pipeline: Option<String>,
@@ -240,13 +245,31 @@ fn finish(
 pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
     let work = crate::tmux_work::normalize_work_id(&args.work)?;
     let id = work.to_ascii_lowercase();
+    if args.no_ticket
+        && args
+            .external
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        bail!("--external cannot be combined with --no-ticket");
+    }
+    let explicit_external = args
+        .external
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let external_lookup = explicit_external.unwrap_or(&id);
 
     // An explicit --pipeline is its own routing decision, so it stands in
     // for a missing rule rather than being refused by one. That keeps the
     // first run of `muxa work up --pipeline x` working on an empty config,
     // which is where most people meet this command.
     let fallback = muxa::config::RouteConfig::default();
-    let route = match pipeline::select_route(&config.route, &work)? {
+    // An explicitly linked issue may carry the routing prefix while the
+    // durable Work id stays provider-neutral (`auth-cleanup` + `CAL-1234`).
+    // Legacy calls without `--external` continue routing on the Work id.
+    let route_selector = explicit_external.unwrap_or(&work);
+    let route = match pipeline::select_route(&config.route, route_selector)? {
         Some(route) => route,
         None if args.pipeline.is_some() => &fallback,
         None => {
@@ -257,7 +280,7 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
     let ticket = if args.no_ticket {
         None
     } else {
-        resolve_ticket(&config.ticket, &id, args.refresh).await?
+        resolve_ticket(&config.ticket, external_lookup, args.refresh).await?
     };
 
     // Two ids because the two forms are both load-bearing: `work` is what
@@ -757,6 +780,7 @@ mod tests {
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
             work: "cal-1".into(),
+            external: None,
             pipeline: None,
             workspace: None,
             cwd: cwd.map(PathBuf::from),

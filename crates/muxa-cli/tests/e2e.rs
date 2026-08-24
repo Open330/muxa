@@ -188,8 +188,8 @@ fn onboarding_prints_even_when_config_is_invalid() {
     assert!(stdout.contains("Muxa unified onboarding"));
     assert!(stdout.contains("Welcome to the Muxa onboarding"));
     assert!(stdout.contains("tmux new-session -s muxa-onboarding"));
-    assert!(stdout.contains("session = workspace/project"));
-    assert!(stdout.contains("window  = work/ticket"));
+    assert!(stdout.contains("session = Workspace binding"));
+    assert!(stdout.contains("window  = current Run binding"));
     assert!(stdout.contains("muxa watch shortcuts"));
 
     let korean = Command::new(bin("muxa"))

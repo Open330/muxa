@@ -24,7 +24,10 @@ pub mod assets;
 pub mod auth;
 pub mod config;
 pub mod server;
-mod work_store;
+/// Durable operator annotations for work items. Public so read-only
+/// consumers (the CLI's `work list`/`work show`) can show the stage the
+/// dashboard records without a second copy of the schema.
+pub mod work_store;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
 pub use server::{router, serve, AppState, DashboardRuntimeConfig};

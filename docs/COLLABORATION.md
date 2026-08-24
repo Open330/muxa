@@ -8,7 +8,8 @@ mailbox, not through terminal screen scraping.
 ## The whole model
 
 - One tmux window is one collaboration room. In the managed Muxa model, that
-  window is also the work/ticket boundary inside its workspace session.
+  window is the current Run's coordination boundary, not the durable Work or
+  external issue identity.
 - An **agent** speaking through MCP or `muxa msg` is the represented sender: it
   is the pane it runs in, and the reply routes back there and wakes it.
 - `muxa watch` is not an agent. It is the **operator console** — the human at

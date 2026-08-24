@@ -1,14 +1,15 @@
 # Work pipelines — `muxa work up`
 
 `muxa work start` is the imperative primitive: one invocation, one agent
-pane. `muxa work up` is the declarative one. You give it a ticket id; it
-gives you a staffed tmux window.
+session. `muxa work up` is the declarative one. You give it a stable Muxa Work
+id and, optionally, a separate external issue key; it creates or converges the
+current Run.
 
 ```console
-$ muxa work up cal-1234
-work CAL-1234 is in workspace callabo via pipeline triad
-  cwd      /home/june/worktrees/cal-1234 (worktree cal-1234, created)
-  ticket   CAL-1234 Reaper double-reaps a lying pane  [In Progress]
+$ muxa work up auth-cleanup --external CAL-1234
+work auth-cleanup is in workspace callabo via pipeline triad
+  cwd      /home/june/worktrees/auth-cleanup (worktree auth-cleanup, created)
+  external linear:CAL-1234 Reaper double-reaps a lying pane  [In Progress]
            https://linear.app/rtzr/issue/CAL-1234
   + plan       codex     planner      %12
   + impl       codex     implementer  %13
@@ -16,16 +17,18 @@ work CAL-1234 is in workspace callabo via pipeline triad
   layout   main-vertical
 ```
 
-Under the hood that is muxa's existing domain model — workspace = session,
-work = window, agent = pane (see [WORKSPACE_MODEL.md](WORKSPACE_MODEL.md)) —
-with a declared line-up on top of it.
+Under the hood, Workspace and Work are durable logical objects. A tmux session
+binds a Workspace, a window binds the current Run, and a pane binds an agent
+session (see [WORK_MODEL.md](WORK_MODEL.md)).
 
 ## The shape
 
 ```
-work id ──▶ [[route]] ──▶ workspace + cwd/worktree + pipeline
-   │                              │
-   └──▶ [ticket.source] ──▶ ticket context ──┘
+Work id ───────────────────────▶ durable Work identity
+external issue ─▶ [ticket.source] ─▶ external context + [[route]]
+                                             │
+                                             ▼
+                              workspace + cwd/worktree + pipeline
                                              ▼
                               desired panes vs. actual panes
                                              ▼
@@ -251,7 +254,8 @@ So an agent's launch prompt is three layers, outermost first:
 ## Command reference
 
 ```console
-muxa work up <id>                    # resolve, route, create what is missing
+muxa work up <work> --external <id>  # link issue, route, create what is missing
+muxa work up <id>                    # compatibility: also look up <id> as an issue
 muxa work up <id> --dry-run          # print the plan, touch nothing
 muxa work up <id> --pipeline triad   # override the route's pipeline
 muxa work up <id> --body "..."       # what the work is; launches or steers
@@ -273,7 +277,8 @@ arguments:
 
 ```text
 muxa_start_work {
-  "work": "cal-1234",
+  "work": "auth-cleanup",
+  "external": "CAL-1234",
   "body": "fix the double reap",
   "skill": "review-plan",
   "dry_run": true
@@ -283,6 +288,30 @@ muxa_start_work {
 Prefer it over several `muxa_start_agent` calls: those cannot tell an agent
 that already exists from one that still has to be created, so they duplicate
 a team instead of converging on it. See [MCP.md](MCP.md).
+
+## From the dashboard
+
+The same pipeline runs from the work board's **start work** control, which
+posts to `POST /api/work-control/up`. It needs `[dashboard] allow_work_start
+= true` on top of the control token: every other dashboard write steers a
+process you already started, while this one starts new ones with permissions
+bypassed.
+
+Work and external issue remain separate throughout this path. The external
+title and provider status are linked as reference data; they never overwrite
+the local Work title or workflow stage. The board's local stage (`queued`,
+`in_progress`, `review`, `done`) also shows up in the CLI, while blocked and
+attention remain signals:
+
+```console
+$ muxa work list
+auth-cleanup  workspace=callabo  session=callabo  window=@7  agents=3  cwd=…  stage=review
+```
+
+`stage=auto` prints nothing — auto means nobody has said anything, and a
+column that is always there says less than one that appears when it has
+something to report. The CLI only ever reads that store; the daemon owns
+writing it. See [DASHBOARD.md](DASHBOARD.md).
 
 ## Configuration
 

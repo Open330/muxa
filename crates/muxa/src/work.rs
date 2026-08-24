@@ -79,6 +79,20 @@ pub enum WorkStage {
     Done,
 }
 
+impl WorkStage {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Queued => "queued",
+            Self::InProgress => "in_progress",
+            Self::Review => "review",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoardStage {

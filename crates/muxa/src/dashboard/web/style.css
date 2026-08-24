@@ -2022,3 +2022,51 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
     max-height: 560px;
   }
 }
+
+/* Start-work form in the work board header. Kept on one row so the board
+   heading stays a heading and does not become a control panel. */
+.work-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.work-start-form {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.work-start-form input {
+  font: inherit;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border, rgba(148, 163, 184, 0.35));
+  background: var(--input-bg, rgba(15, 23, 42, 0.35));
+  color: inherit;
+}
+
+.work-start-id {
+  width: 9rem;
+}
+
+.work-start-external {
+  width: 13rem;
+}
+
+.work-start-body {
+  width: 16rem;
+}
+
+.work-start-form button[disabled] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (max-width: 900px) {
+  .work-start-body,
+  .work-start-external {
+    display: none;
+  }
+}

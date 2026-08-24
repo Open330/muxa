@@ -169,13 +169,13 @@ struct Section {
 }
 
 const POLICY: &str = "\
-session = workspace/project\n\
-window  = work/ticket\n\
-pane    = agent\n\
+session = Workspace binding\n\
+window  = current Run binding\n\
+pane    = agent session binding\n\
 \n\
 Muxa owns tmux lifecycle, location, state, and collaboration routing.\n\
 Agents own files, code, Git, tests, and reasoning.\n\
-One ticket reuses one managed window in its workspace session.";
+A Work is durable, may link external issues, and reuses its current Run window.";
 
 const WORKFLOW: &str = "\
 1. Start the work with its first agent:\n\
@@ -209,13 +209,13 @@ Use exact pane ids for agent control. Destructive actions require confirmation.\
 Use collaboration review + read_only by default; grant execute only with narrow paths.";
 
 const POLICY_KO: &str = "\
-session = workspace/project\n\
-window  = work/ticket\n\
-pane    = agent\n\
+session = Workspace binding\n\
+window  = current Run binding\n\
+pane    = agent session binding\n\
 \n\
 Muxa는 tmux 생명주기, 위치, 상태, 협업 routing을 관리합니다.\n\
 Agent는 파일, 코드, Git, 테스트와 추론을 담당합니다.\n\
-같은 ticket은 workspace session 안의 같은 managed window를 재사용합니다.";
+Work는 지속되며 외부 이슈를 연결할 수 있고 현재 Run window를 재사용합니다.";
 
 const WORKFLOW_KO: &str = "\
 1. 첫 agent와 함께 work 시작:\n\
@@ -2001,12 +2001,12 @@ mod tests {
 
     #[test]
     fn onboarding_policy_and_workflow_pin_the_domain_model() {
-        assert!(POLICY.contains("session = workspace/project"));
-        assert!(POLICY.contains("window  = work/ticket"));
-        assert!(POLICY.contains("pane    = agent"));
+        assert!(POLICY.contains("session = Workspace binding"));
+        assert!(POLICY.contains("window  = current Run binding"));
+        assert!(POLICY.contains("pane    = agent session binding"));
         assert!(WORKFLOW.contains("muxa work start muxa-onboarding"));
         assert!(WORKFLOW.contains("muxa agent start --workspace muxa --work muxa-onboarding"));
-        assert!(POLICY_KO.contains("같은 ticket"));
+        assert!(POLICY_KO.contains("외부 이슈"));
         assert!(WORKFLOW_KO.contains("같은 work에 다른 agent 추가"));
     }
 

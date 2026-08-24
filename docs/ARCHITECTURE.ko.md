@@ -2,20 +2,20 @@
 
 `muxa`는 의도적으로 작게 유지합니다: daemon 하나, CLI 하나, local file, database 없음.
 
-## Managed tmux domain model
+## Managed Work와 tmux binding
 
 Muxa는 작업 단위 tmux 모델에 최적화되어 있습니다.
 
-| tmux 객체 | Domain identity | 불변 조건 |
+| 논리 객체 | tmux binding | 불변 조건 |
 | --- | --- | --- |
-| Session | Workspace/project | managed session 하나가 project의 여러 work window를 담습니다. |
-| Window | Work/ticket | work ID와 cwd마다 managed window 하나를 생성하거나 재사용하며 collaboration room이기도 합니다. |
-| Pane | Agent | 모든 managed agent는 해당 work window 안의 독립 pane에서 실행됩니다. |
+| Workspace | Session | managed session 하나가 Workspace의 현재 Run window를 담습니다. |
+| Work | 현재 Run의 Window | Work는 window 종료 뒤에도 지속되며 외부 이슈 identity와 분리됩니다. |
+| Agent session | Pane | 모든 managed agent session은 해당 Run window 안의 독립 pane에서 실행됩니다. |
 
-CLI, `muxa watch`, daemon registry, `muxa mcp`가 모두 이 매핑을 공유합니다.
-같은 workspace의 같은 work는 기존 window를 재사용하거나 cwd가 다르면 실패해야
-합니다. agent 추가는 pane 추가, work 종료는 window 종료, workspace 종료는
-session 종료로 이어지며 파괴적 제어는 unmanaged target을 거부합니다.
+CLI, `muxa watch`, daemon registry, `muxa mcp`가 이 binding을 공유합니다.
+같은 Workspace의 같은 Work는 현재 Run window를 재사용하거나 cwd가 다르면
+실패해야 합니다. agent 추가는 pane 추가, Run 종료는 window 종료, Workspace
+실행 종료는 session 종료로 이어지며 파괴적 제어는 unmanaged target을 거부합니다.
 
 ## Flow
 

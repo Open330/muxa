@@ -139,7 +139,7 @@ enum Cmd {
         #[command(subcommand)]
         action: WindowCmd,
     },
-    /// Manage work/ticket tmux windows.
+    /// Manage Muxa Work and its current tmux Run window.
     Work {
         #[command(subcommand)]
         action: WorkCmd,

@@ -41,7 +41,8 @@ machine without explicit public-bind acknowledgement.
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
 | `PUT /api/work-metadata` | Save a definition by logical `{workspace_id, work_id}` identity.       |
-| `POST /api/work-control/prompt` | Prompt every live agent run linked to one Work.                |
+| `POST /api/work-control/prompt` | Prompt every live agent run linked to one Work. Accepts `text`, or shared-composer `skill`/`body`/`context`. |
+| `POST /api/work-control/up` | Start or converge a Work pipeline and optionally link an external issue. Requires `allow_work_start`. |
 | `POST /api/work-control/abort` | Send Ctrl-C to every live agent run linked to one Work.          |
 | `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
 | `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
@@ -247,6 +248,36 @@ Managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role/task)
 link a Run to Work. `muxa work up` also stores optional external-source metadata
 on the window, which `/api/works` discovers and persists. Unmanaged windows stay
 in `unlinked_executions`; they are never guessed into Work from their names.
+
+## Starting work from the board
+
+The board could steer Work it had not started — prompt its Runs, abort them,
+annotate it — but not create the team. `POST /api/work-control/up`, and the
+board header's **start work** control, close that: give it a stable Work id and,
+optionally, a separate external issue key. Muxa routes it to a workspace and
+directory and creates whichever agent panes the pipeline declares but the Run
+does not have yet.
+Pressing it twice fills gaps rather than duplicating the team; with a `body` it
+also prompts the agents already running. See [PIPELINE.md](PIPELINE.md) for the
+`[[route]]` and `[pipeline.*]` configuration it needs.
+
+It is off until you set `[dashboard] allow_work_start = true`, **on top of** the
+control token. Every other write route steers a process you already started;
+this one starts new ones with permissions bypassed. That is a different kind of
+authority, so it gets its own grant — the way `[ask]` and `[collaboration]` do.
+Disabled, the route answers `501` rather than `403`, because the token is fine;
+the capability simply is not offered here.
+
+The daemon runs the `muxa` binary for this rather than reimplementing the
+pipeline. The launcher and the managed-tmux registry live in the CLI crate,
+which depends on the library the daemon links, so calling them in-process would
+mean inverting that dependency or keeping a second implementation alive.
+
+An external issue title and provider status stay in `external_items`; they do
+not overwrite the local Work title or stage. The response reports
+`linked_external_item`, while the compatibility field `seeded_metadata`
+remains false. This keeps provider sync and operator-authored workflow state
+independent.
 
 ## Timeline
 
