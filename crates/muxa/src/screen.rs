@@ -172,6 +172,17 @@ impl ManifestSet {
         self.manifests.len()
     }
 
+    /// The manifest whose `name` matches, for callers that know *which* agent
+    /// occupies a pane rather than only what its foreground command is called.
+    /// An npm-installed codex reports `node`, so the command is the weaker of
+    /// the two keys whenever the registry has an answer.
+    #[must_use]
+    pub fn manifest_for_name(&self, name: &str) -> Option<&AgentManifest> {
+        self.manifests
+            .iter()
+            .find(|manifest| manifest.name.eq_ignore_ascii_case(name))
+    }
+
     /// Names of the loaded manifests, for startup logging.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.manifests.iter().map(|m| m.name.as_str())

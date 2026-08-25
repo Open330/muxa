@@ -79,7 +79,8 @@ pub fn command_name(cmd: &str) -> &str {
 /// example, lands in tmux as `node` (the JS shim) with the real
 /// `codex` binary one or two `fork()`s deep — `classify_command` alone
 /// misses that, so callers fall through to a process-tree walk.
-fn is_wrapper_command(cmd: &str) -> bool {
+#[must_use]
+pub fn is_wrapper_command(cmd: &str) -> bool {
     matches!(
         command_name(cmd).to_ascii_lowercase().as_str(),
         "node" | "deno" | "bun" | "python" | "python3" | "ruby"

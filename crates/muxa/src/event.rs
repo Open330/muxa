@@ -39,6 +39,25 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    /// Name of the bundled screen-detection manifest for this kind, if one
+    /// exists.
+    ///
+    /// This is the registry's answer to "which agent occupies the pane", and
+    /// it beats `pane_current_command`: an npm-installed codex runs as `node`,
+    /// which names no manifest, so command-only selection silently skipped
+    /// every such pane. Kinds whose hooks cover attention entirely (Claude,
+    /// opencode, the Gemini CLI) ship no manifest and return `None`.
+    #[must_use]
+    pub fn screen_manifest_name(self) -> Option<&'static str> {
+        match self {
+            Self::Codex => Some("codex"),
+            Self::Antigravity => Some("agy"),
+            Self::ClaudeCode | Self::Opencode | Self::GeminiCli | Self::Task | Self::Unknown => {
+                None
+            }
+        }
+    }
+
     /// Can this agent's hook stream tell muxa it is waiting on the operator?
     ///
     /// Claude Code (`Notification`), Codex (`PermissionRequest`), the Gemini

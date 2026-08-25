@@ -32,7 +32,7 @@
 use muxa::event::{AgentEvent, AgentId, NotificationLevel};
 use muxa::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use muxa::{AgentState, SharedStore};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 /// The three states screen inference can distinguish. Both synthetic producers
 /// map their host-specific signal onto this before building events.
@@ -77,17 +77,44 @@ pub enum PaneOwnership {
     AttentionBlind { id: AgentId, state: AgentState },
 }
 
+/// How long after launch a hook-reporting row still accepts screen-sourced
+/// attention refinement.
+///
+/// A hooked agent's hooks are authoritative — but only once they exist. Codex
+/// asks its trust/policy question *before* creating the session that owns the
+/// hooks, so during that gate no hook can fire and the row sits at whatever
+/// state muxa launched it in. Treating the pane as fully `Hooked` from second
+/// zero means nothing ever looks at the screen and the gate reads as `idle`.
+///
+/// Inside this window the row is merely [`PaneOwnership::AttentionBlind`], so
+/// [`attention_refinement_events`] may promote it to waiting (and only that —
+/// `Working` still contributes nothing, so a healthy agent's hooks are never
+/// raced). The window is generous relative to what it covers: the gate paints
+/// within a second of launch, so anything that has not shown one by then never
+/// will.
+pub const STARTUP_ATTENTION_WINDOW: Duration = Duration::minutes(5);
+
+/// Is this row still inside the post-launch window where its hooks may not
+/// exist yet? Only `Idle` qualifies: any other state is itself proof that
+/// something already reported, and a row muxa launched starts out `Idle`.
+fn in_startup_window(owner: &Agent, now: OffsetDateTime) -> bool {
+    owner.state == AgentState::Idle && now - owner.started_at < STARTUP_ATTENTION_WINDOW
+}
+
 /// Classify `occupants` (as returned by `Store::by_pane`) into the update the
 /// producer is allowed to make.
 ///
 /// The first authoritative occupant wins; in practice there is at most one,
 /// because `Store::apply` evicts synthetic rows from a pane a real row claims.
+///
+/// `now` exists for the [`STARTUP_ATTENTION_WINDOW`] carve-out described on
+/// that constant.
 #[must_use]
-pub fn pane_ownership(occupants: &[Agent]) -> PaneOwnership {
+pub fn pane_ownership(occupants: &[Agent], now: OffsetDateTime) -> PaneOwnership {
     let Some(owner) = occupants.iter().find(|a| occupant_is_authoritative(a)) else {
         return PaneOwnership::Free;
     };
-    if owner.kind.hooks_report_attention() {
+    if owner.kind.hooks_report_attention() && !in_startup_window(owner, now) {
         return PaneOwnership::Hooked;
     }
     PaneOwnership::AttentionBlind {
@@ -279,6 +306,9 @@ mod tests {
     use super::*;
 
     const AT: OffsetDateTime = datetime!(2026-07-20 12:00:00 UTC);
+    /// Past [`STARTUP_ATTENTION_WINDOW`] from `AT` — steady state, where a
+    /// hook-reporting row is fully hook-authoritative.
+    const LATER: OffsetDateTime = datetime!(2026-07-20 13:00:00 UTC);
 
     fn id(pane: &str) -> AgentId {
         AgentId {
@@ -389,17 +419,17 @@ mod tests {
 
     #[test]
     fn pane_ownership_free_when_no_live_real_row() {
-        assert!(matches!(pane_ownership(&[]), PaneOwnership::Free));
+        assert!(matches!(pane_ownership(&[], AT), PaneOwnership::Free));
         // A synthetic row does not own the pane...
         let synth = row(
             AgentKind::Unknown,
             &format!("{SYNTHETIC_SESSION_PREFIX}%1"),
             AgentState::Working,
         );
-        assert!(matches!(pane_ownership(&[synth]), PaneOwnership::Free));
+        assert!(matches!(pane_ownership(&[synth], AT), PaneOwnership::Free));
         // ...and neither does a stopped real one.
         let dead = row(AgentKind::ClaudeCode, "real", AgentState::Stopped);
-        assert!(matches!(pane_ownership(&[dead]), PaneOwnership::Free));
+        assert!(matches!(pane_ownership(&[dead], AT), PaneOwnership::Free));
     }
 
     /// Every agent whose hooks can report a permission prompt keeps screen
@@ -414,7 +444,7 @@ mod tests {
         ] {
             let owner = row(kind, "real", AgentState::Working);
             assert!(
-                matches!(pane_ownership(&[owner]), PaneOwnership::Hooked),
+                matches!(pane_ownership(&[owner], LATER), PaneOwnership::Hooked),
                 "{kind} hooks report attention, so nothing may refine it",
             );
         }
@@ -427,7 +457,7 @@ mod tests {
     #[test]
     fn pane_ownership_attention_blind_for_antigravity() {
         let owner = row(AgentKind::Antigravity, "conv-1", AgentState::Working);
-        match pane_ownership(&[owner]) {
+        match pane_ownership(&[owner], LATER) {
             PaneOwnership::AttentionBlind { id, state } => {
                 assert_eq!(id.session_id, "conv-1");
                 assert_eq!(id.kind, AgentKind::Antigravity);
@@ -436,6 +466,65 @@ mod tests {
             }
             other => panic!("expected AttentionBlind, got {other:?}"),
         }
+    }
+
+    /// The gap this carve-out exists for: codex's trust gate paints before the
+    /// session (and therefore the hooks) exist, so a freshly launched, still
+    /// `Idle` row must stay refinable even though codex hooks normally report
+    /// attention.
+    #[test]
+    fn pane_ownership_refinable_inside_the_startup_window() {
+        let owner = row(AgentKind::Codex, "real", AgentState::Idle);
+        let just_after = AT + Duration::seconds(3);
+        match pane_ownership(&[owner], just_after) {
+            PaneOwnership::AttentionBlind { id, state } => {
+                assert_eq!(id.kind, AgentKind::Codex);
+                assert_eq!(state, AgentState::Idle);
+            }
+            other => panic!("a just-launched codex row must be refinable, got {other:?}"),
+        }
+    }
+
+    /// ...and the carve-out is bounded on both axes: it closes once the window
+    /// elapses, and it never applies to a row that already reported a state,
+    /// since that state is itself proof the hooks are alive.
+    #[test]
+    fn startup_carve_out_is_bounded_by_time_and_by_state() {
+        let stale = row(AgentKind::Codex, "real", AgentState::Idle);
+        assert!(
+            matches!(
+                pane_ownership(&[stale], AT + STARTUP_ATTENTION_WINDOW),
+                PaneOwnership::Hooked
+            ),
+            "the window must close, or screen inference races hooks forever",
+        );
+
+        let reported = row(AgentKind::Codex, "real", AgentState::Working);
+        assert!(
+            matches!(
+                pane_ownership(&[reported], AT + Duration::seconds(3)),
+                PaneOwnership::Hooked
+            ),
+            "a row that already left Idle has live hooks; stay out of its way",
+        );
+    }
+
+    /// The registry names the agent on a pane; `pane_current_command` only
+    /// names the process. For an npm-installed codex those disagree (`node`),
+    /// which is why manifest selection consults the kind first.
+    #[test]
+    fn codex_kind_names_its_manifest() {
+        assert_eq!(AgentKind::Codex.screen_manifest_name(), Some("codex"));
+        assert_eq!(AgentKind::Antigravity.screen_manifest_name(), Some("agy"));
+        // Kinds whose hooks fully cover attention ship no manifest.
+        assert_eq!(AgentKind::ClaudeCode.screen_manifest_name(), None);
+
+        let set = muxa::screen::load_manifests();
+        assert!(
+            set.manifest_for_name("codex").is_some(),
+            "every name screen_manifest_name returns must resolve",
+        );
+        assert!(set.manifest_for_name("agy").is_some());
     }
 
     fn refine(owner_state: AgentState, observed: SyntheticState) -> Vec<AgentEvent> {
@@ -588,7 +677,9 @@ mod tests {
         assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
 
         let occupants = store.by_pane("%1").await;
-        let PaneOwnership::AttentionBlind { id, state } = pane_ownership(&occupants) else {
+        let PaneOwnership::AttentionBlind { id, state } =
+            pane_ownership(&occupants, OffsetDateTime::now_utc())
+        else {
             panic!("an agy row must be attention-blind");
         };
         for ev in attention_refinement_events(id, state, SyntheticState::Blocked, "agy", None, AT) {
