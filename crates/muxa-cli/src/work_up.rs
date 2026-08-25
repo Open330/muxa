@@ -79,6 +79,10 @@ pub struct UpArgs {
     /// anything on it.
     #[arg(long)]
     pub show_prompts: bool,
+    /// Draw the pipeline as a dependency graph: what runs together, what
+    /// waits, and where this work currently sits in it.
+    #[arg(long)]
+    pub graph: bool,
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -157,9 +161,13 @@ pub async fn run(
     let json = args.json;
     let dry_run = args.dry_run;
     let show_prompts = args.show_prompts;
+    let args_graph = args.graph;
     let resolved = resolve_or_onboard(&args, config, config_path, client).await?;
     if show_prompts {
         print_prompts(&resolved.desired);
+    }
+    if args_graph {
+        print_graph(&resolved.desired);
     }
     let result = apply(resolved, dry_run)?;
     if json {
@@ -984,6 +992,46 @@ fn print_prompts(desired: &[DesiredAgent]) {
     }
 }
 
+/// Draw the pipeline as layers of a dependency graph.
+///
+/// The config lists agents in a flat table array and buries the ordering
+/// in an `after` key, so the one thing an operator wants to know before
+/// paying for a run — what starts now and what waits — is the one thing
+/// the file does not show. Equal depth means parallel.
+///
+/// Glyphs stay inside Geometric Shapes U+25A0–25CF: the half-filled
+/// circles just past that range fall back to a different font in most
+/// terminals and render at the wrong size.
+fn print_graph(desired: &[DesiredAgent]) {
+    let nodes = muxa::pipeline::graph(desired);
+    println!("pipeline graph:\n");
+    let mut depth = usize::MAX;
+    for node in &nodes {
+        if node.depth != depth {
+            depth = node.depth;
+            let label = if depth == 0 {
+                "starts immediately".to_string()
+            } else {
+                format!("waits for depth {}", depth - 1)
+            };
+            println!("  ── {label} ──");
+        }
+        let glyph = if node.after.is_empty() { '●' } else { '○' };
+        println!(
+            "   {glyph} {:<10} {:<9} {:<12}{}",
+            node.alias,
+            node.program,
+            node.role.as_deref().unwrap_or("-"),
+            if node.after.is_empty() {
+                String::new()
+            } else {
+                format!("after {}", node.after.join(", "))
+            }
+        );
+    }
+    println!();
+}
+
 fn print_result(result: &UpResult) {
     let verb = if result.dry_run { "would be" } else { "is" };
     println!(
@@ -1079,6 +1127,7 @@ mod tests {
             context: None,
             dry_run: false,
             show_prompts: false,
+            graph: false,
             no_ticket: true,
             refresh: false,
             json: false,

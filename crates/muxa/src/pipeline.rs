@@ -861,6 +861,64 @@ impl Plan {
     }
 }
 
+/// One row of a rendered pipeline graph: an agent, how deep its longest
+/// dependency chain runs, and what it is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphNode {
+    pub alias: String,
+    pub program: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// 0 for anything that can start immediately; otherwise one past the
+    /// deepest thing it waits on. Everything sharing a depth can run at the
+    /// same time, which is the fact a list of tables hides.
+    pub depth: usize,
+    pub after: Vec<String>,
+}
+
+/// Lay a pipeline out by dependency depth.
+///
+/// The TOML says which agents exist and, buried in an `after` key, which
+/// ones wait. It does not say what runs *together*, and that is the thing
+/// an operator actually wants to know before spending money on a run.
+/// Depth answers it: equal depth means parallel.
+///
+/// Assumes the edges are already validated — [`desired_agents`] refuses
+/// unknown aliases and cycles, so a node here always resolves.
+#[must_use]
+pub fn graph(agents: &[DesiredAgent]) -> Vec<GraphNode> {
+    let mut depths: BTreeMap<&str, usize> = BTreeMap::new();
+    // Repeated relaxation rather than a recursive walk: the set is tiny and
+    // this cannot blow the stack on a pathological config.
+    for _ in 0..agents.len() {
+        for agent in agents {
+            let depth = agent
+                .after
+                .iter()
+                .map(|dependency| depths.get(dependency.as_str()).map_or(0, |depth| depth + 1))
+                .max()
+                .unwrap_or(0);
+            depths.insert(agent.alias.as_str(), depth);
+        }
+    }
+    let mut nodes: Vec<GraphNode> = agents
+        .iter()
+        .map(|agent| GraphNode {
+            alias: agent.alias.clone(),
+            program: agent.program.clone(),
+            role: agent.role.clone(),
+            depth: depths.get(agent.alias.as_str()).copied().unwrap_or(0),
+            after: agent.after.clone(),
+        })
+        .collect();
+    nodes.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.alias.cmp(&right.alias))
+    });
+    nodes
+}
+
 /// Compare the pipeline's panes against the window's panes.
 ///
 /// `broadcast` is the "improve work already in flight" path: with it, every
@@ -1271,6 +1329,32 @@ program = 'claude'
             direction: None,
             after: after.iter().map(|a| (*a).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn depth_says_what_runs_together_which_the_toml_never_does() {
+        let agents = vec![
+            desired_after("impl", &[]),
+            desired_after("docs", &[]),
+            desired_after("review", &["impl"]),
+            desired_after("ship", &["review", "docs"]),
+        ];
+        let nodes = graph(&agents);
+        let depth = |alias: &str| {
+            nodes
+                .iter()
+                .find(|node| node.alias == alias)
+                .expect("node")
+                .depth
+        };
+        // impl and docs have nothing to wait for, so they run together.
+        assert_eq!(depth("impl"), 0);
+        assert_eq!(depth("docs"), 0);
+        assert_eq!(depth("review"), 1);
+        // ship waits on the *deepest* of its edges, not the first.
+        assert_eq!(depth("ship"), 2);
+        // Rendered shallowest-first so the reading order is the run order.
+        assert!(nodes.windows(2).all(|w| w[0].depth <= w[1].depth));
     }
 
     #[test]
