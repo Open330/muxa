@@ -3155,11 +3155,17 @@ mod tests {
         assert_eq!(mine["stage"], "review");
         assert_eq!(mine["runs"].as_array().unwrap().len(), 1);
 
+        // Reload from disk and look for this test's own record. Counting is
+        // not safe here: `GET /api/works` upserts an external item for every
+        // pane it discovers, and the scan includes the host's real tmux — so
+        // the file legitimately holds a row per work running on the machine.
         let reloaded = WorkStore::load(Some(path));
-        assert_eq!(reloaded.records().len(), 1);
-        assert_eq!(
-            reloaded.records()[0].metadata.title.as_deref(),
-            Some("Repair auth")
+        assert!(
+            reloaded
+                .records()
+                .iter()
+                .any(|record| record.metadata.title.as_deref() == Some("Repair auth")),
+            "the annotated work survived the round trip"
         );
     }
 
