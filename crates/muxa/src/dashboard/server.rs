@@ -2348,6 +2348,8 @@ mod tests {
         window_name: &str,
     ) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -2715,6 +2717,8 @@ mod tests {
             fetched_at: OffsetDateTime::now_utc(),
         };
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: "herdr:p1".into(),
             session_id: "ws1".into(),
@@ -2742,6 +2746,8 @@ mod tests {
         let scan = backend_scan_result(
             HostKind::Rmux,
             vec![crate::tmux::PaneInfo {
+                agent_role: None,
+                agent_alias: None,
                 socket: Some("/tmp/rmux-user/default".into()),
                 pane_id: "rmux:%4".into(),
                 session_id: "$1".into(),
@@ -2771,6 +2777,8 @@ mod tests {
         let rmux: SharedBackend = Arc::new(InventoryBackend {
             kind: HostKind::Rmux,
             panes: vec![crate::tmux::PaneInfo {
+                agent_role: None,
+                agent_alias: None,
                 socket: Some("/tmp/rmux-secondary/default".into()),
                 pane_id: "rmux:%8".into(),
                 session_id: "$2".into(),

@@ -385,6 +385,8 @@ mod tests {
 
     fn pane(id: &str, session: &str, window: u32, idx: u32) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),

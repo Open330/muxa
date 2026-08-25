@@ -634,6 +634,8 @@ mod tests {
 
     fn pane(socket: &str, session_name: &str, window_name: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             pane_id: "%1".into(),
             session_id: "$1".into(),
             session: session_name.into(),

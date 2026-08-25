@@ -580,6 +580,8 @@ mod tests {
     use std::sync::Arc;
     fn fake_pane(id: &str, session: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),

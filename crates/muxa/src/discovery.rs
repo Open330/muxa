@@ -405,6 +405,8 @@ mod tests {
 
     fn pane(id: &str, cmd: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),

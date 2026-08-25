@@ -15045,6 +15045,8 @@ mod tests {
 
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: pane.into(),
             session_id: String::new(),
@@ -15073,6 +15075,8 @@ mod tests {
         pane_index: u32,
     ) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: Some(socket.into()),
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -19491,6 +19495,8 @@ sort = ["state"]
     #[test]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: "%42".into(),
             session_id: String::new(),

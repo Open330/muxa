@@ -614,13 +614,19 @@ impl CollaborationStore {
 
     /// Attach persisted aliases and roles only to the exact live agent
     /// generation that registered them. A later process reusing the same pane
-    /// remains anonymous until it registers its own identity.
+    /// inherits no *self-registered* identity — it stays anonymous until it
+    /// registers its own.
+    ///
+    /// What it does keep is whatever `participants_from` read off the pane's
+    /// muxa options. That is a different kind of claim: the launcher's
+    /// declaration about the slot ("this pane is the pipeline's reviewer"),
+    /// not an agent's statement about itself, and it remains true for whoever
+    /// occupies the slot. So a registered identity overwrites it, and its
+    /// absence leaves it standing.
     pub async fn enrich_participants(&self, participants: &mut [Participant]) {
         let _transaction = self.transaction_lock.lock().await;
         let identities = self.identities.read().await;
         for participant in participants {
-            participant.alias = None;
-            participant.roles.clear();
             if let Some(identity) = identities
                 .iter()
                 .find(|identity| identity.matches(participant))
@@ -1182,8 +1188,14 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
             window_name: (!pane.window_name.is_empty()).then(|| pane.window_name.clone()),
             state: agent.state,
             cwd: agent.cwd.clone(),
-            alias: None,
-            roles: Vec::new(),
+            // Seeded from what the launcher stamped on the pane. A pipeline
+            // agent is addressable as `role:reviewer` / `@review` from the
+            // moment its pane exists, without waiting for it to run
+            // `muxa identity set` — which it never does, and could not do
+            // before its first turn anyway. `enrich_participants` replaces
+            // both if the agent registered an identity of its own.
+            alias: pane.agent_alias.clone(),
+            roles: pane.agent_role.clone().into_iter().collect(),
             console: false,
         };
         let key = (socket, pane_id.clone());
@@ -1524,6 +1536,8 @@ mod tests {
 
     fn pane_info(pane_id: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "main".into(),
@@ -1550,6 +1564,115 @@ mod tests {
                 disclosure: AirLocatorDisclosure::LocalOnly,
             }),
         }
+    }
+
+    fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
+        PaneInfo {
+            agent_role: Some(role.into()),
+            agent_alias: Some(alias.into()),
+            ..pane_info(pane_id)
+        }
+    }
+
+    /// The bug this closes: `muxa work up` stamps `@muxa_agent_role` on the
+    /// pane, but the room only knew about identities an agent registered for
+    /// itself — which a pipeline agent never does. `role:implementer` matched
+    /// nobody, so the reviewer's handoff was dropped and the pair stalled with
+    /// the work looking finished.
+    #[tokio::test]
+    async fn pipeline_roles_from_pane_metadata_resolve_a_target() {
+        let store = crate::Store::shared();
+        for (session, pane) in [("impl-session", "%1"), ("review-session", "%2")] {
+            store
+                .apply(&crate::event::AgentEvent::Started {
+                    id: crate::event::AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: session.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: Some("/repo".into()),
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+        let panes = vec![
+            managed_pane("%1", "implementer", "impl"),
+            managed_pane("%2", "reviewer", "review"),
+        ];
+        let participants = participants_from(&store.snapshot().await, &panes);
+        assert_eq!(participants.len(), 2);
+
+        let reviewer = participants
+            .iter()
+            .find(|p| p.pane == "%2")
+            .expect("reviewer participant");
+
+        for selector in [
+            "role:implementer",
+            "role:IMPLEMENTER",
+            "@impl",
+            "alias:impl",
+        ] {
+            let target = resolve_target(
+                reviewer,
+                selector,
+                &participants,
+                crate::config::CollaborationScope::Window,
+            )
+            .unwrap_or_else(|e| panic!("{selector} must resolve: {e}"));
+            assert_eq!(target.pane, "%1", "{selector} routed to the wrong pane");
+        }
+    }
+
+    /// Pane metadata is the launcher's claim about the slot; an identity the
+    /// agent registered for itself is more specific and must win. Registering
+    /// only an alias must not leave the launcher's role behind, or an agent
+    /// could never shed a role it was launched with.
+    #[tokio::test]
+    async fn self_registered_identity_overrides_pane_metadata() {
+        let collab = CollaborationStore::in_memory(CollaborationOptions::default());
+        let panes = vec![managed_pane("%1", "implementer", "impl")];
+        let store = crate::Store::shared();
+        store
+            .apply(&crate::event::AgentEvent::Started {
+                id: crate::event::AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "impl-session".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let mut participants = participants_from(&store.snapshot().await, &panes);
+
+        // No registration yet: the launcher's claim stands.
+        collab.enrich_participants(&mut participants).await;
+        assert_eq!(participants[0].roles, vec!["implementer".to_string()]);
+        assert_eq!(participants[0].alias.as_deref(), Some("impl"));
+
+        let caller = participants[0].clone();
+        collab
+            .set_identity(
+                &caller,
+                &participants.clone(),
+                Some("driver".into()),
+                vec!["rust".into()],
+            )
+            .await
+            .expect("identity registers");
+
+        collab.enrich_participants(&mut participants).await;
+        assert_eq!(participants[0].alias.as_deref(), Some("driver"));
+        assert_eq!(
+            participants[0].roles,
+            vec!["rust".to_string()],
+            "the registered role set replaces the launcher's, never merges",
+        );
     }
 
     #[tokio::test]

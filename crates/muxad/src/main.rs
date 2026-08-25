@@ -1869,6 +1869,8 @@ mod tests {
 
     fn collaboration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "collaboration".into(),

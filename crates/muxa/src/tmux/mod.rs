@@ -497,6 +497,15 @@ pub struct PaneInfo {
     /// use this to disambiguate. `None` when the backend cannot name one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
+    /// `@muxa_agent_role` — the role a muxa-managed launch stamped on this
+    /// pane (`implementer`, `reviewer`, ...). Declared by the launcher, not
+    /// self-registered by the agent, so it survives the window before the
+    /// agent's first hook and lets `role:` routing resolve a pipeline peer.
+    /// `None` for unmanaged panes and non-tmux backends.
+    pub agent_role: Option<String>,
+    /// `@muxa_agent_alias` — the pipeline-local name for this pane (`impl`,
+    /// `review`). Same provenance and caveats as [`Self::agent_role`].
+    pub agent_alias: Option<String>,
 }
 
 /// The short display name for a tmux socket path: its file basename
@@ -557,7 +566,7 @@ pub struct ClientInfo {
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
 pub(crate) const CLIENT_FMT: &str =
@@ -575,6 +584,14 @@ pub(crate) fn parse_pane_lines(stdout: &str) -> Vec<PaneInfo> {
 
 /// `parse_pane_lines` with the originating server's socket short name
 /// stamped on every row (see [`PaneInfo::socket`]).
+/// A tmux format column that was never set comes back as the empty string,
+/// which is absence, not a value.
+fn non_empty(col: Option<&&str>) -> Option<String> {
+    col.map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) -> Vec<PaneInfo> {
     let mut panes = Vec::new();
     for line in stdout.lines() {
@@ -597,6 +614,8 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             pane_pid,
             current_path: cols.get(8).map(|s| (*s).to_string()).unwrap_or_default(),
             socket: socket.map(Into::into),
+            agent_role: non_empty(cols.get(19)),
+            agent_alias: non_empty(cols.get(31)),
         });
     }
     panes
@@ -1196,6 +1215,43 @@ mod tests {
         assert_eq!(panes[0].session_id, "$3");
         assert_eq!(panes[0].window_id, "@7");
         assert_eq!(panes[0].window_name, "auth-refactor");
+    }
+
+    /// `PANE_FMT` asked tmux for `@muxa_agent_role` long before anything kept
+    /// it, so `role:` routing had nothing to match and pipeline peers were
+    /// unaddressable. Both columns are now retained.
+    #[test]
+    fn parses_managed_agent_role_and_alias() {
+        let mut cols = vec!["%10", "main", "0", "0", "/dev/pts/0", "codex", "title"];
+        cols.resize(19, "");
+        cols.push("reviewer"); // 19: @muxa_agent_role
+        cols.resize(31, "");
+        cols.push("review"); // 31: @muxa_agent_alias
+        let panes = parse_pane_lines(&format!("{}\n", cols.join("\t")));
+        assert_eq!(panes[0].agent_role.as_deref(), Some("reviewer"));
+        assert_eq!(panes[0].agent_alias.as_deref(), Some("review"));
+    }
+
+    /// An unmanaged pane leaves both options unset, and tmux renders unset as
+    /// the empty string — which is absence, not a role named "".
+    #[test]
+    fn unset_role_and_alias_columns_are_absent_not_empty() {
+        let stdout = "%10\tmain\t0\t0\t/dev/pts/0\tclaude\ttitle\n";
+        let panes = parse_pane_lines(stdout);
+        assert_eq!(panes[0].agent_role, None);
+        assert_eq!(panes[0].agent_alias, None);
+
+        let padded = format!(
+            "{}\n",
+            ["%11", "main", "0", "0", "/dev/pts/0", "claude", "t"]
+                .into_iter()
+                .chain(std::iter::repeat_n("", 26))
+                .collect::<Vec<_>>()
+                .join("\t")
+        );
+        let panes = parse_pane_lines(&padded);
+        assert_eq!(panes[0].agent_role, None);
+        assert_eq!(panes[0].agent_alias, None);
     }
 
     #[test]

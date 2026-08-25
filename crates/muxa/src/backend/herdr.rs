@@ -502,6 +502,8 @@ fn to_pane_info(pane: &HerdrPaneInfo, process: Option<&HerdrProcessInfo>) -> Pan
         None => (String::new(), 0, String::new()),
     };
     PaneInfo {
+        agent_role: None,
+        agent_alias: None,
         pane_id: format!("{PANE_ID_PREFIX}{}", pane.pane_id),
         session_id: pane.workspace_id.clone(),
         session: pane.workspace_id.clone(),

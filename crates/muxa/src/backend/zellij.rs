@@ -220,6 +220,8 @@ mod tests {
 
     fn fake_pane(id: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),

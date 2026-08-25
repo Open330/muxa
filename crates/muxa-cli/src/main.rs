@@ -2648,6 +2648,8 @@ mod tests {
 
     fn pane(id: &str, session: &str) -> muxa::tmux::PaneInfo {
         muxa::tmux::PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),

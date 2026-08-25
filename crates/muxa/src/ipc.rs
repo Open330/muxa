@@ -3592,6 +3592,8 @@ mod tests {
 
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "collaboration".into(),
@@ -4755,6 +4757,8 @@ mod tests {
         assert!(backend.list_panes().is_empty());
 
         let pane = PaneInfo {
+            agent_role: None,
+            agent_alias: None,
             socket: None,
             pane_id: "zellij:3".into(),
             session_id: String::new(),
