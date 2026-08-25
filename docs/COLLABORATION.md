@@ -179,7 +179,7 @@ worktrees remain the safest choice for concurrent edits.
 | `muxa_inbox` | Claim/read requests for this exact agent session. |
 | `muxa_list_messages` | List incoming, sent, or all requests without claiming. |
 | `muxa_reply` | Return a completed/blocked/declined/failed response. |
-| `muxa_wait_reply` | Wait for the structured terminal response. |
+| `muxa_wait_reply` | Event-driven wait for the structured terminal response. |
 | `muxa_cancel_message` | Cancel a sent request while it is still queued. |
 
 ## Natural calls from an agent conversation
@@ -212,6 +212,20 @@ authorization. If no eligible peer exists, Muxa asks for confirmation instead
 of silently creating one; `spawn_if_missing=true` is valid only after that
 confirmation. Restart existing agents after changing skills or upgrading Muxa
 because their MCP process loads tools and templates at startup.
+For a confirmed automatic spawn, Muxa arms the daemon transition subscription
+before creating the pane and re-reads room context only when that pane's agent
+registers; there is no fixed 500 ms registration loop.
+
+Waiting is a single blocking MCP call, not a model-driven polling loop. muxad
+subscribes to a monotonic durable-mailbox revision and re-reads the exact
+request only when that revision changes or at the final timeout boundary. If a
+new client reaches an older daemon that rejects `collaboration_wait`, it uses a
+bounded `collaboration_get` compatibility loop inside that same call, without
+additional model turns. If a
+call is sent with `wait=false`, the sender can continue independently; muxad
+reacts to the reply and injects one short notification after the sender becomes
+idle. Agents should not monitor Muxa-managed peers with `sleep`, raw
+`tmux capture-pane`, or repeated status/capture calls.
 
 ## Reviewers and delegated subagents
 
@@ -265,7 +279,7 @@ the sender may cancel only while a request remains `queued`, before the
 recipient has claimed it.
 
 Every collaboration IPC operation (context, identity, send, inbox, list,
-reply, get, and cancel) is also appended to
+reply, get, wait, and cancel) is also appended to
 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`. The `0600` ledger records the
 represented origin/session, OS-observed caller, target/request id, and outcome,
 but never duplicates message or reply bodies. `muxa msg list --json` and

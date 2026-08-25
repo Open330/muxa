@@ -30,7 +30,7 @@ use muxa::collaboration::{
     RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use muxa::event::{AgentKind, AgentState};
-use muxa::ipc::Client;
+use muxa::ipc::{Client, TransitionStream};
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -67,6 +67,9 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     re-running converges instead of duplicating the team. Several muxa_start_agent calls \
     cannot do that. Pass what the work is as body (with an optional /skill and context), \
     the same phrasing muxa_call_peer takes; the same body steers agents already running. \
+    Wait once through muxa_wait_reply for durable peer work, or muxa_wait_for_change for \
+    pane work. Never monitor a Muxa-managed agent with sleep, raw tmux capture-pane, or \
+    repeated status/capture calls; elapsed wait time does not require model turns. \
     Reserved routing: @peer and @muxa-peer always mean Muxa collaboration, never \
     a GitHub user, pull-request reviewer, issue, or review thread. A request for \
     @peer's report, reply, previous findings, or conversation must call \
@@ -1825,6 +1828,14 @@ async fn spawn_peer(
         alias: None,
         direction: crate::agent_launch::SplitDirection::Right,
     };
+    // Arm the daemon transition subscription before creating the pane. A
+    // Started hook can register very quickly; subscribing first ensures the
+    // signal is either in this stream or represented by the authoritative
+    // context read after spawn, with no polling race between the two.
+    let registrations = client
+        .subscribe()
+        .await
+        .map_err(|error| format!("call_peer could not watch peer registration: {error}"))?;
     let started = tokio::task::spawn_blocking(move || crate::agent_launch::start(request))
         .await
         .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
@@ -1834,39 +1845,89 @@ async fn spawn_peer(
         .and_then(Value::as_u64)
         .unwrap_or(30)
         .clamp(1, 60);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let refreshed = client
-            .collaboration_context(origin)
-            .await
-            .map_err(|error| format!("call_peer context after spawn failed: {error}"))?;
-        if let Some(peer) = refreshed
-            .peers
-            .iter()
-            .find(|peer| peer.pane == started.pane && peer_is_eligible(peer))
-        {
-            return Ok((
-                PeerSelection {
-                    peer: peer.clone(),
-                    reason: format!(
-                        "spawned {} in {} after explicit confirmation for target {target:?}",
-                        agent_program_label(program),
-                        started.pane
-                    ),
-                },
-                started,
-            ));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "created {} peer pane {} but it did not register for collaboration within {timeout_secs}s; keep the pane, verify its hooks/MCP setup, then call again with target=\"pane:{}\"",
+    let peer = wait_for_spawned_peer_registration(
+        client,
+        origin,
+        &started.pane,
+        timeout_secs,
+        registrations,
+    )
+    .await?
+    .ok_or_else(|| {
+        format!(
+            "created {} peer pane {} but it did not register for collaboration within {timeout_secs}s; keep the pane, verify its hooks/MCP setup, then call again with target=\"pane:{}\"",
+            agent_program_label(program),
+            started.pane,
+            started.pane
+        )
+    })?;
+    Ok((
+        PeerSelection {
+            peer,
+            reason: format!(
+                "spawned {} in {} after explicit confirmation for target {target:?}",
                 agent_program_label(program),
-                started.pane,
                 started.pane
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+            ),
+        },
+        started,
+    ))
+}
+
+async fn wait_for_spawned_peer_registration(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    pane: &str,
+    timeout_secs: u64,
+    mut registrations: TransitionStream,
+) -> std::result::Result<Option<Participant>, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    if let Some(peer) = registered_peer(client, origin, pane).await? {
+        return Ok(Some(peer));
     }
+    loop {
+        match tokio::time::timeout_at(deadline, registrations.recv()).await {
+            Ok(Ok(Some(transition))) => {
+                if transition.agent.pane.as_deref() == Some(pane) {
+                    if let Some(peer) = registered_peer(client, origin, pane).await? {
+                        return Ok(Some(peer));
+                    }
+                }
+            }
+            Ok(Ok(None) | Err(_)) => {
+                // Re-arm before the authoritative read so a registration
+                // racing stream recovery cannot be lost.
+                registrations = match tokio::time::timeout_at(deadline, client.subscribe()).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        return Err(format!(
+                            "call_peer registration stream could not reconnect: {error}"
+                        ));
+                    }
+                    Err(_) => return registered_peer(client, origin, pane).await,
+                };
+                if let Some(peer) = registered_peer(client, origin, pane).await? {
+                    return Ok(Some(peer));
+                }
+            }
+            Err(_) => return registered_peer(client, origin, pane).await,
+        }
+    }
+}
+
+async fn registered_peer(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    pane: &str,
+) -> std::result::Result<Option<Participant>, String> {
+    let room = client
+        .collaboration_context(origin)
+        .await
+        .map_err(|error| format!("call_peer context after spawn failed: {error}"))?;
+    Ok(room
+        .peers
+        .into_iter()
+        .find(|peer| peer.pane == pane && peer_is_eligible(peer)))
 }
 
 async fn await_collaboration_reply(
@@ -1875,18 +1936,11 @@ async fn await_collaboration_reply(
     request_id: &str,
     timeout_secs: u64,
 ) -> std::result::Result<Option<CollaborationRequest>, String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match client.collaboration_get(origin, request_id).await {
-            Ok(request) if request.status.is_terminal() => return Ok(Some(request)),
-            Ok(_) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let request = client
+        .collaboration_wait(origin, request_id, timeout_secs)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(request.status.is_terminal().then_some(request))
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -2020,26 +2074,22 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_WAIT_SECS)
-        .min(MAX_WAIT_SECS);
+        .clamp(1, MAX_WAIT_SECS);
     let origin = match current_collaboration_origin() {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match client.collaboration_get(&origin, request_id).await {
-            Ok(request) if request.status.is_terminal() => return json_result(&json!(request)),
-            Ok(_) => {}
-            Err(error) => return error_result(&format!("wait_reply failed: {error}")),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return json_result(&json!({
-                "completed": false,
-                "reason": "timeout",
-                "request_id": request_id,
-            }));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    match client
+        .collaboration_wait(&origin, request_id, timeout_secs)
+        .await
+    {
+        Ok(request) if request.status.is_terminal() => json_result(&json!(request)),
+        Ok(_) => json_result(&json!({
+            "completed": false,
+            "reason": "timeout",
+            "request_id": request_id,
+        })),
+        Err(error) => error_result(&format!("wait_reply failed: {error}")),
     }
 }
 
@@ -2539,6 +2589,58 @@ mod tests {
         }
     }
 
+    struct RegistrationBackend {
+        panes: Vec<PaneInfo>,
+    }
+
+    impl PaneBackend for RegistrationBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Tmux
+        }
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+        fn capture_pane(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn pane_pid_map(&self) -> std::collections::HashMap<u32, String> {
+            std::collections::HashMap::new()
+        }
+        fn current_pane(&self) -> Option<String> {
+            self.panes.first().map(|pane| pane.pane_id.clone())
+        }
+        fn focus_pane(&self, _: &str) -> bool {
+            false
+        }
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
+    fn registration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "registration".into(),
+            window_id: "@1".into(),
+            window_name: "agents".into(),
+            window_index: "0".into(),
+            pane_index: pane_index.into(),
+            tty: String::new(),
+            current_command: "agent".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 0,
+            socket: Some("default".into()),
+        }
+    }
+
     async fn wait_for_socket(sock: &Path) {
         for _ in 0..50 {
             if sock.exists() {
@@ -2570,6 +2672,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawned_peer_registration_resumes_from_transition_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("peer-registration.sock");
+        let store = Store::shared();
+        let origin_id = muxa::event::AgentId {
+            kind: AgentKind::Codex,
+            session_id: "origin".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: Some("default".into()),
+            cwd: Some("/repo".into()),
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: origin_id,
+                at: time::OffsetDateTime::now_utc(),
+            })
+            .await;
+        let backend: SharedBackend = Arc::new(RegistrationBackend {
+            panes: vec![registration_pane("%1", "0"), registration_pane("%2", "1")],
+        });
+        let server = Server::new(sock.clone(), store.clone()).with_backends(vec![backend]);
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+        let registrations = client.subscribe().await.unwrap();
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+        };
+        let waiting_client = client.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_spawned_peer_registration(&waiting_client, &origin, "%2", 2, registrations)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let started = std::time::Instant::now();
+        store
+            .apply(&AgentEvent::Started {
+                id: muxa::event::AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "spawned".into(),
+                    surface: None,
+                    pane: Some("%2".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                at: time::OffsetDateTime::now_utc(),
+            })
+            .await;
+        let peer = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("registration transition should wake without a poll interval")
+            .unwrap()
+            .unwrap()
+            .expect("spawned peer should be visible");
+        assert_eq!(peer.pane, "%2");
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        // The waiter dropped its stream. Nudge the server-side writer once so
+        // it observes the closed socket before the daemon's bounded drain.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: muxa::event::AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "origin".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                prompt: "close registration stream".into(),
+                at: time::OffsetDateTime::now_utc(),
+            })
+            .await;
+        tokio::task::yield_now().await;
+        shutdown.send(()).unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn initialize_and_tools_list() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("mcp-init.sock");
@@ -2590,6 +2776,7 @@ mod tests {
         assert!(instructions.contains("one window as the current Run"));
         assert!(instructions.contains("External issues are references"));
         assert!(instructions.contains("muxa_manage_tmux"));
+        assert!(instructions.contains("raw tmux capture-pane"));
         assert!(instructions.contains("review + read_only"));
         assert!(instructions.contains("task + execute + narrow paths"));
         assert!(instructions.contains("verify and integrate the result yourself"));

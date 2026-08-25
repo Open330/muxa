@@ -96,6 +96,22 @@ not show up in the parent's status or in every `find` the agents run. An
 existing worktree is reused; an existing branch is checked out rather than
 recreated.
 
+Teams with their own workspace/container provisioner can use `prepare`
+instead of `[route.worktree]`:
+
+```toml
+[[route]]
+match   = '^cal-'
+cwd     = '~/workspace-agent/{{id}}'
+prepare = 'workspace-tool create {{id}} {{ticket.branch}}'
+```
+
+Muxa renders placeholders, runs the command only while creating a work whose
+window does not exist, then verifies that `cwd` exists. `--dry-run` prints the
+command without executing it, and unresolved placeholders are refused before
+they reach the shell. `prepare` and `worktree` are mutually exclusive because
+only one mechanism may own provisioning.
+
 You do not need a route to get started: `muxa work up cal-1234 --pipeline
 triad` treats the explicit flag as its own routing decision and uses the
 current directory.

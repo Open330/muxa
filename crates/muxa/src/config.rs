@@ -396,6 +396,19 @@ pub struct RouteConfig {
     pub cwd: Option<String>,
     /// Give this work its own git worktree instead of sharing a checkout.
     pub worktree: Option<WorktreeConfig>,
+    /// Command that provisions this work's environment, run once when the
+    /// work window does not exist yet.
+    ///
+    /// Teams that already own provisioning — a workspace manager, a
+    /// container, a devbox — should keep owning it. muxa runs the command
+    /// and then works in `cwd`; it does not try to learn what a workspace
+    /// is. Pair it with `cwd`, since the directory usually does not exist
+    /// until the command has run.
+    ///
+    /// Placeholders resolve first, including `{{ticket.*}}` — so a branch
+    /// name the resolver decided (`fix/` for a bug, `feat/` otherwise) can
+    /// be passed straight through.
+    pub prepare: Option<String>,
 }
 
 /// `[route.worktree]` — a git worktree per work item, so three agents in
@@ -1868,6 +1881,23 @@ mod tests {
         assert!(cfg.discovery.enabled);
         assert_eq!(cfg.ask.permission_mode, AskPermissionMode::Bypass);
         assert_eq!(cfg.ask.timeout_secs, DEFAULT_ASK_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn parses_route_owned_prepare_command() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[route]]
+match = "^cal-"
+cwd = "~/workspace-agent/{{id}}"
+prepare = "workspace-tool create {{id}} {{ticket.branch}}"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.route[0].prepare.as_deref(),
+            Some("workspace-tool create {{id}} {{ticket.branch}}")
+        );
     }
 
     #[test]

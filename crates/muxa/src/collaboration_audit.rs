@@ -32,6 +32,7 @@ pub enum CollaborationAuditOperation {
     List,
     Reply,
     Get,
+    Wait,
     Cancel,
 }
 

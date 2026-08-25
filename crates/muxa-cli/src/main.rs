@@ -369,6 +369,7 @@ enum MsgCmd {
     /// Wait for the structured reply to a sent request.
     Wait {
         request_id: String,
+        /// Maximum wait in seconds (clamped to 600).
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
@@ -1036,17 +1037,14 @@ async fn cmd_msg_wait(
     request_id: &str,
     timeout_secs: u64,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let request = client.collaboration_get(origin, request_id).await?;
-        if request.status.is_terminal() {
-            println!("{}", serde_json::to_string_pretty(&request)?);
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for {request_id}");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    let request = client
+        .collaboration_wait(origin, request_id, timeout_secs)
+        .await?;
+    if request.status.is_terminal() {
+        println!("{}", serde_json::to_string_pretty(&request)?);
+        Ok(())
+    } else {
+        anyhow::bail!("timed out waiting for {request_id}")
     }
 }
 

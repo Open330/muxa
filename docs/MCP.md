@@ -91,13 +91,13 @@ cargo-deny policy). No new dependencies. Protocol revision: `2024-11-05`.
 ### Concurrency and framing
 
 Requests are read line-by-line from stdin and **each is dispatched on its own
-task**, so a long-running tool (`muxa_wait_for_change`, up to 600 s) never
-blocks unrelated traffic — a `ping` or `tools/list` issued while a wait is
-outstanding is answered immediately. Responses may therefore interleave in
-time; that is expected for concurrent JSON-RPC, and the `id` echoed on each
-response lets the client correlate. Output framing stays strict: the shared
-stdout writer is locked across each whole `write` + newline, so two
-concurrent responses never splice mid-line (one JSON object per line).
+task**, so a long-running tool (`muxa_wait_for_change` or `muxa_wait_reply`, up
+to 600 s) never blocks unrelated traffic — a `ping` or `tools/list` issued
+while a wait is outstanding is answered immediately. Responses may therefore
+interleave in time; that is expected for concurrent JSON-RPC, and the `id`
+echoed on each response lets the client correlate. Output framing stays
+strict: the shared stdout writer is locked across each whole `write` + newline,
+so two concurrent responses never splice mid-line (one JSON object per line).
 
 Framing is robust against non-conforming input rather than silently dropping
 it:
@@ -133,7 +133,7 @@ it:
 | `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
 | `muxa_list_messages` | `mailbox?` | List incoming, sent, or all requests without claiming. |
 | `muxa_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
-| `muxa_wait_reply` | `request_id`, `timeout_secs?` | Wait for a structured peer response. |
+| `muxa_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
 | `muxa_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
@@ -178,7 +178,11 @@ is accepted only with `intent="task"`, so a conversational review cannot
 silently acquire edit authority. When there is no eligible peer, the tool
 returns `action_required="confirm_spawn"`; only repeat the call with
 `spawn_if_missing=true` after the user explicitly confirms creating a pane.
-Automatic spawning defaults to the other provider when possible.
+Automatic spawning defaults to the other provider when possible. Before it
+creates the pane, the tool arms muxad's transition stream and then re-reads the
+authoritative room only when the spawned pane registers. This removes the old
+500 ms peer-registration polling loop and closes the fast-start lost-wakeup
+race.
 
 Registered message skills can be selected with or without a leading slash:
 
@@ -320,6 +324,16 @@ work mode, and paths, and always terminate with `muxa_reply`. The sender waits
 with `muxa_wait_reply`, then verifies and integrates the result. Avoid
 concurrent edits to the same files; use separate worktrees when scopes cannot
 be isolated.
+
+`muxa_wait_reply` holds one MCP tool call while muxad waits on the durable
+mailbox revision. Elapsed wait time causes no repeated model turns, status
+calls, or pane captures. If the sender chose `wait=false`, muxad instead reacts
+to the terminal mailbox revision and wakes the sender once its pane is idle.
+When a new CLI connects to an older daemon without `collaboration_wait`, that
+same tool call uses a bounded internal compatibility poll; the model is not
+sampled again. Current daemons always use the event-driven path.
+Do not replace either path with `sleep`, raw `tmux capture-pane`, or repeated
+status/capture calls.
 
 ### AIR artifact handoff
 

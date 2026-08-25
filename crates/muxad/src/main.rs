@@ -46,6 +46,10 @@ const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
 const PANE_SESSION_CACHE_INTERVAL_SECONDS: u64 = 5;
 const SHUTDOWN_TASK_TIMEOUT_SECONDS: u64 = 2;
+/// Slow safety-net scan for collaboration wake delivery. Normal delivery is
+/// driven by mailbox revisions and agent transitions; this only reconciles a
+/// rare dropped/closed transition or state restored during startup.
+const COLLABORATION_WAKE_RECONCILE_SECONDS: u64 = 30;
 /// Carries the daemon image identity across an in-place re-exec.
 const RESTART_GENERATION_ENV: &str = "MUXA_RESTART_GENERATION";
 
@@ -585,15 +589,41 @@ fn spawn_collaboration_waker_task(
         return None;
     }
     let mut shutdown_rx = shutdown_tx.subscribe();
+    // Subscribe before spawning and before the initial authoritative scan, so
+    // a request or state transition racing task startup is represented either
+    // by that scan or by an already-pending signal.
+    let mut mailbox_changes = collaboration.subscribe();
+    let mut agent_transitions = store.subscribe();
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        wake_idle_collaboration_peers(&collaboration, &store, &backends).await;
+        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(
+            COLLABORATION_WAKE_RECONCILE_SECONDS,
+        ));
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reconcile.tick().await;
         loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    wake_idle_collaboration_peers(&collaboration, &store, &backends).await;
+            let should_scan = tokio::select! {
+                changed = mailbox_changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    true
                 }
+                transition = agent_transitions.recv() => match transition {
+                    Ok(transition) => transition.to == muxa::AgentState::Idle,
+                    // A lag means the exact transition to Idle may have been
+                    // dropped. Re-read the authoritative state immediately.
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        tracing::debug!(dropped, "collaboration waker transition stream lagged");
+                        true
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = reconcile.tick() => true,
                 _ = shutdown_rx.recv() => break,
+            };
+            if should_scan {
+                wake_idle_collaboration_peers(&collaboration, &store, &backends).await;
             }
         }
     }))
@@ -1869,6 +1899,79 @@ mod tests {
                 at: OffsetDateTime::now_utc(),
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn collaboration_waker_reacts_to_mailbox_revision() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let sender = participants
+            .iter()
+            .find(|participant| participant.pane == "%1")
+            .unwrap()
+            .clone();
+        let recipient = participants
+            .iter()
+            .find(|participant| participant.pane == "%2")
+            .unwrap()
+            .clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        let mut cfg = Config::default();
+        cfg.collaboration.enabled = true;
+        cfg.collaboration.wake = CollaborationWake::IdleOnly;
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let waker = spawn_collaboration_waker_task(
+            &cfg,
+            mailbox.clone(),
+            store,
+            vec![backend],
+            &shutdown_tx,
+        )
+        .expect("enabled collaboration should spawn a waker");
+
+        let request = mailbox
+            .create(
+                sender,
+                recipient,
+                NewRequest {
+                    kind: RequestKind::Question,
+                    body: "wake from revision".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                let prompt_and_submit_sent = sends.lock().unwrap().len() >= 2;
+                if prompt_and_submit_sent && mailbox.pending_unnotified().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mailbox revision should trigger prompt and submit without a timer tick");
+        {
+            let delivered = sends.lock().unwrap();
+            assert_eq!(delivered[0].0, "%2");
+            assert!(delivered[0].1.contains(&request.id));
+        }
+
+        shutdown_tx.send(()).unwrap();
+        waker.await.unwrap();
     }
 
     #[tokio::test]
