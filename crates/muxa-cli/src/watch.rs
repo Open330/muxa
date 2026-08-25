@@ -5647,6 +5647,58 @@ fn state_summary_gutter_spans(
 }
 
 #[cfg(test)]
+mod pane_label_tests {
+    use super::*;
+    use muxa::topology::{BackendEndpoint, PaneKey, PaneNode, SessionKey, WindowKey};
+
+    fn pane(alias: Option<&str>, command: &str, agent: Option<Agent>) -> PaneNode {
+        PaneNode {
+            key: PaneKey {
+                window: WindowKey {
+                    session: SessionKey {
+                        endpoint: BackendEndpoint {
+                            host: muxa::HostKind::Tmux,
+                            socket: "default".into(),
+                        },
+                        session_id: "$1".into(),
+                    },
+                    window_id: "@1".into(),
+                },
+                pane_id: "%1".into(),
+            },
+            index: "0".into(),
+            tty: String::new(),
+            current_command: command.into(),
+            title: String::new(),
+            cwd: "/repo".into(),
+            pane_pid: 0,
+            agent,
+            agent_alias: alias.map(Into::into),
+        }
+    }
+
+    /// The case the program name cannot express: one work, two claudes. Both
+    /// rows read `claude` and the tree stops telling them apart.
+    #[test]
+    fn the_pipeline_alias_names_the_pane() {
+        assert_eq!(
+            pane_label_owner(&pane(Some("impl"), "claude", None)),
+            "impl"
+        );
+        assert_eq!(
+            pane_label_owner(&pane(Some("review"), "claude", None)),
+            "review",
+        );
+    }
+
+    /// A pane nobody aliased still says what is running in it.
+    #[test]
+    fn an_unaliased_pane_falls_back_to_its_command() {
+        assert_eq!(pane_label_owner(&pane(None, "vim", None)), "vim");
+    }
+}
+
+#[cfg(test)]
 mod work_up_key_tests {
     use super::*;
 
@@ -13533,6 +13585,23 @@ fn tree_state_is_redundant(target: &TreeTarget, node: TopologyNodeRef<'_>) -> bo
     }
 }
 
+/// What to call a pane in the tree, after its id.
+///
+/// The pipeline alias wins when there is one. `claude` and `codex` name the
+/// CLI, which stops distinguishing anything the moment one work runs two of
+/// the same kind — and a pair whose reviewer and implementer are both claude
+/// then reads as two identical rows. `impl` and `review` say what the pane is
+/// *for*. The CLI stays visible on the row (state glyph, model column) and in
+/// the inspector, so nothing is lost.
+fn pane_label_owner(pane: &muxa::topology::PaneNode) -> String {
+    pane.agent_alias.clone().unwrap_or_else(|| {
+        pane.agent.as_ref().map_or_else(
+            || pane.current_command.clone(),
+            |agent| agent_kind_short(agent.kind).to_string(),
+        )
+    })
+}
+
 fn tree_node_label(
     target: &TreeTarget,
     node: TopologyNodeRef<'_>,
@@ -13582,10 +13651,7 @@ fn tree_node_label(
         TopologyNodeRef::Session(session) => session.name.clone(),
         TopologyNodeRef::Window(window) => window.name.clone(),
         TopologyNodeRef::Pane(pane) => {
-            let owner = pane.agent.as_ref().map_or_else(
-                || pane.current_command.clone(),
-                |agent| agent_kind_short(agent.kind).to_string(),
-            );
+            let owner = pane_label_owner(pane);
             if owner.trim().is_empty() {
                 pane.key.pane_id.clone()
             } else {
