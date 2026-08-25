@@ -337,7 +337,18 @@ fn load_user_overrides(dir: &std::path::Path, manifests: &mut Vec<AgentManifest>
 #[must_use]
 pub fn prepare_capture(raw: &str, max_lines: usize) -> String {
     let stripped = strip_ansi(raw);
-    let lines: Vec<&str> = stripped.lines().collect();
+    let mut lines: Vec<&str> = stripped.lines().collect();
+    // tmux pads a capture out to the full pane height, so a screen that paints
+    // at the TOP of an otherwise empty display — codex's startup gate is the
+    // motivating case — arrives as a few lines of content followed by dozens of
+    // blank rows. Slicing the tail verbatim would then keep only the padding
+    // and classify the pane as unknown. Trailing blanks carry no signal for any
+    // rule, so dropping them first costs nothing and makes the tail mean "the
+    // last `max_lines` lines that exist" for scrolling transcripts and
+    // top-anchored screens alike.
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
     let start = lines.len().saturating_sub(max_lines);
     lines[start..].join("\n")
 }
@@ -359,6 +370,54 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Verbatim from a real `tmux capture-pane` of codex's startup gate on a
+    /// 50-row pane: nine lines of content, then padding to the pane height.
+    /// The gate is the one screen codex's hooks structurally cannot report, so
+    /// if this capture does not classify, nothing reports it at all.
+    #[test]
+    fn codex_startup_gate_survives_tail_slicing() {
+        let gate = "> You are in /tmp/gate-probe\n\
+                    \n\
+                    \x20 Do you trust the contents of this directory?\n\
+                    \x20 the directory allows project-local config to load.\n\
+                    \n\
+                    \u{203a} 1. Yes, continue\n\
+                    \x20 2. No, quit\n\
+                    \n\
+                    \x20 Press enter to continue\n";
+        let raw = format!("{gate}{}", "\n".repeat(54));
+
+        let prepared = prepare_capture(&raw, 40);
+        assert!(
+            prepared.contains("1. Yes, continue"),
+            "tail slicing must not discard a top-anchored screen; got {prepared:?}",
+        );
+
+        let set = load_manifests();
+        let codex = set
+            .manifest_for_name("codex")
+            .expect("bundled codex manifest");
+        assert_eq!(
+            codex.classify(&prepared),
+            Some(ScreenState::Blocked),
+            "a pane sitting on the trust gate is blocked on the operator",
+        );
+    }
+
+    /// The tail must still be a tail: a transcript longer than `max_lines`
+    /// keeps its END, which is where a scrolling agent's current state lives.
+    #[test]
+    fn prepare_capture_still_keeps_the_end_of_a_long_transcript() {
+        use std::fmt::Write as _;
+        let raw = (0..100).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
+        let prepared = prepare_capture(&raw, 10);
+        assert!(prepared.starts_with("line 90"));
+        assert!(prepared.ends_with("line 99"));
+    }
     use super::*;
 
     fn cursor() -> AgentManifest {

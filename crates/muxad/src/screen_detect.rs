@@ -186,11 +186,23 @@ impl ScreenDetector {
             .collect();
 
         let backends = self.backends.clone();
-        let panes: Vec<(usize, PaneInfo)> = spawn_blocking(move || {
+        // `discover_from_panes` walks the process tree for wrapper panes, which
+        // is the only way to identify an agent that has NO registry row yet —
+        // exactly the startup gate, since the row is minted by the first hook
+        // and the gate paints before any hook exists. Blocking (/proc), so it
+        // rides along inside the same `spawn_blocking` as `list_panes`.
+        let panes: Vec<(usize, PaneInfo, Option<AgentKind>)> = spawn_blocking(move || {
             let mut out = Vec::new();
             for (i, backend) in backends.iter().enumerate() {
-                for pane in backend.list_panes() {
-                    out.push((i, pane));
+                let listed = backend.list_panes();
+                let discovered: HashMap<String, AgentKind> =
+                    muxa::discovery::discover_from_panes(&listed)
+                        .into_iter()
+                        .map(|d| (d.pane.pane_id, d.kind))
+                        .collect();
+                for pane in listed {
+                    let kind = discovered.get(&pane.pane_id).copied();
+                    out.push((i, pane, kind));
                 }
             }
             out
@@ -200,7 +212,7 @@ impl ScreenDetector {
 
         panes
             .into_iter()
-            .filter_map(|(i, p)| {
+            .filter_map(|(i, p, discovered)| {
                 let direct = self.manifests.manifest_for_command(&p.current_command);
                 // The registry knows which agent muxa put on the pane; the
                 // foreground command only knows which process is in front, and
@@ -209,15 +221,14 @@ impl ScreenDetector {
                 // agent host. A pane that fell back to a shell has lost its
                 // agent, and must drop out of candidacy even though a row may
                 // still (briefly) point at it.
-                let by_kind = (direct.is_some()
+                let registry = (direct.is_some()
                     || muxa::discovery::is_wrapper_command(&p.current_command))
-                .then(|| {
-                    by_pane
-                        .get(&p.pane_id)
-                        .and_then(|kind| kind.screen_manifest_name())
-                })
-                .flatten()
-                .and_then(|name| self.manifests.manifest_for_name(name));
+                .then(|| by_pane.get(&p.pane_id).copied())
+                .flatten();
+                let by_kind = registry
+                    .or(discovered)
+                    .and_then(AgentKind::screen_manifest_name)
+                    .and_then(|name| self.manifests.manifest_for_name(name));
                 by_kind.or(direct).map(|m| (i, p, m.clone()))
             })
             .collect()
