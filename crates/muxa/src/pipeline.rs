@@ -63,6 +63,14 @@ pub enum PipelineError {
     EmptyPipeline(String),
     #[error("pipeline {pipeline:?} uses alias {alias:?} twice; aliases key the pane diff and must be unique")]
     DuplicateAlias { pipeline: String, alias: String },
+    #[error("pipeline {pipeline:?} agent {alias:?} waits on {missing:?}, which is not an alias in this pipeline")]
+    UnknownDependency {
+        pipeline: String,
+        alias: String,
+        missing: String,
+    },
+    #[error("pipeline {pipeline:?} has a cycle through {alias:?}; nothing in it could ever start")]
+    DependencyCycle { pipeline: String, alias: String },
     #[error("{scope} pattern {pattern:?} is not a valid regex: {source}")]
     BadPattern {
         scope: &'static str,
@@ -586,6 +594,9 @@ pub struct DesiredAgent {
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// Aliases that must report done before this one may start.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
 }
 
 /// Render a pipeline into the panes it asks for.
@@ -619,7 +630,49 @@ pub fn desired_agents(
             vars,
         ));
     }
+    check_dependencies(name, &agents)?;
     Ok(agents)
+}
+
+/// Refuse an edge set that could never run: an edge to an alias this
+/// pipeline does not define, or a cycle. Both fail silently otherwise —
+/// the dependent agent simply never launches, and `work up` keeps
+/// reporting a window that will not converge without saying why.
+fn check_dependencies(pipeline: &str, agents: &[DesiredAgent]) -> Result<(), PipelineError> {
+    let known: BTreeSet<&str> = agents.iter().map(|agent| agent.alias.as_str()).collect();
+    for agent in agents {
+        for dependency in &agent.after {
+            if !known.contains(dependency.as_str()) {
+                return Err(PipelineError::UnknownDependency {
+                    pipeline: pipeline.to_string(),
+                    alias: agent.alias.clone(),
+                    missing: dependency.clone(),
+                });
+            }
+        }
+    }
+    // Kahn's algorithm: whatever cannot be peeled off is in a cycle.
+    let mut remaining: Vec<&DesiredAgent> = agents.iter().collect();
+    let mut settled: BTreeSet<&str> = BTreeSet::new();
+    while !remaining.is_empty() {
+        let (ready, blocked): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|agent| {
+            agent
+                .after
+                .iter()
+                .all(|dependency| settled.contains(dependency.as_str()))
+        });
+        if ready.is_empty() {
+            return Err(PipelineError::DependencyCycle {
+                pipeline: pipeline.to_string(),
+                alias: blocked[0].alias.clone(),
+            });
+        }
+        for agent in ready {
+            settled.insert(agent.alias.as_str());
+        }
+        remaining = blocked;
+    }
+    Ok(())
 }
 
 fn render_agent(
@@ -662,6 +715,12 @@ fn render_agent(
         task: agent.task.as_deref().map(|task| vars.render(task)),
         prompt,
         direction: agent.direction.clone(),
+        after: agent
+            .after
+            .iter()
+            .map(|alias| alias.trim().to_ascii_lowercase())
+            .filter(|alias| !alias.is_empty())
+            .collect(),
     }
 }
 
@@ -715,6 +774,12 @@ pub enum PlanStep {
         #[serde(skip_serializing_if = "Option::is_none")]
         state: Option<AgentState>,
     },
+    /// The alias is not started yet because something it waits on has not
+    /// reported finishing. Not a failure — the next `work up` launches it.
+    Waiting {
+        alias: String,
+        waiting_on: Vec<String>,
+    },
     /// The alias is blocked on a person — an approval prompt or an error.
     /// Never prompted over: the dialog would eat the message, and the
     /// operator would be left believing it was delivered.
@@ -732,6 +797,7 @@ impl PlanStep {
             Self::Launch(agent) => &agent.alias,
             Self::Reprompt { alias, .. }
             | Self::Keep { alias, .. }
+            | Self::Waiting { alias, .. }
             | Self::Attention { alias, .. } => alias,
         }
     }
@@ -768,6 +834,16 @@ impl Plan {
     /// say to any of them.
     /// Aliases blocked on a person. Converging is not possible until
     /// somebody answers them, so they are counted separately.
+    /// Aliases held back by an unmet edge. The window is not converged
+    /// while any remain, but nothing is wrong — the next run starts them.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step, PlanStep::Waiting { .. }))
+            .count()
+    }
+
     #[must_use]
     pub fn attention(&self) -> usize {
         self.steps
@@ -778,7 +854,10 @@ impl Plan {
 
     #[must_use]
     pub fn converged(&self) -> bool {
-        self.launches() == 0 && self.reprompts() == 0 && self.attention() == 0
+        self.launches() == 0
+            && self.reprompts() == 0
+            && self.attention() == 0
+            && self.waiting() == 0
     }
 }
 
@@ -790,7 +869,12 @@ impl Plan {
 /// prompt into an agent that is mid-turn is disruptive enough to deserve
 /// an explicit ask.
 #[must_use]
-pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Option<&str>) -> Plan {
+pub fn plan(
+    desired: &[DesiredAgent],
+    existing: &[ExistingAgent],
+    broadcast: Option<&str>,
+    done: &[String],
+) -> Plan {
     let steps = desired
         .iter()
         .map(|agent| {
@@ -800,6 +884,29 @@ pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Opt
                     .as_deref()
                     .is_some_and(|alias| alias.eq_ignore_ascii_case(&agent.alias))
             });
+            // An edge only gates the *start*. Once an agent exists it is
+            // managed like any other; re-gating it would tear down work
+            // already in flight every time an upstream alias was re-opened.
+            let waiting_on = if live.is_none() {
+                agent
+                    .after
+                    .iter()
+                    .filter(|dependency| {
+                        !done
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(dependency))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !waiting_on.is_empty() {
+                return PlanStep::Waiting {
+                    alias: agent.alias.clone(),
+                    waiting_on,
+                };
+            }
             match (live, broadcast) {
                 (None, _) => PlanStep::Launch(agent.clone()),
                 // Blocked on a person beats everything: do not type at it,
@@ -1124,6 +1231,7 @@ program = 'claude'
                 task: None,
                 prompt: None,
                 direction: None,
+                after: Vec::new(),
             })
             .collect()
     }
@@ -1143,16 +1251,113 @@ program = 'claude'
             .collect()
     }
 
+    /// `plan` with nothing reported done — the shape every pre-edge test
+    /// was written against.
+    fn plan_at(
+        desired: &[DesiredAgent],
+        existing: &[ExistingAgent],
+        broadcast: Option<&str>,
+    ) -> Plan {
+        plan(desired, existing, broadcast, &[])
+    }
+
+    fn desired_after(alias: &str, after: &[&str]) -> DesiredAgent {
+        DesiredAgent {
+            alias: alias.to_string(),
+            program: "codex".into(),
+            role: None,
+            task: None,
+            prompt: None,
+            direction: None,
+            after: after.iter().map(|a| (*a).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_edge_holds_an_agent_back_until_its_upstream_reports_done() {
+        let agents = vec![
+            desired_after("impl", &[]),
+            desired_after("review", &["impl"]),
+        ];
+
+        // Nothing reported: the reviewer is not launched beside the
+        // implementer, which is the whole point — it would be reviewing a
+        // tree that changes while it reads.
+        let held = plan(&agents, &[], None, &[]);
+        assert_eq!(held.launches(), 1);
+        assert_eq!(held.waiting(), 1);
+        assert!(!held.converged(), "a held-back agent is not convergence");
+        assert!(matches!(
+            held.steps.iter().find(|s| s.alias() == "review"),
+            Some(PlanStep::Waiting { waiting_on, .. }) if waiting_on == &["impl".to_string()]
+        ));
+
+        // Reported: the edge opens and the next run starts it.
+        let opened = plan(&agents, &[], None, &["impl".to_string()]);
+        assert_eq!(opened.launches(), 2);
+        assert_eq!(opened.waiting(), 0);
+    }
+
+    #[test]
+    fn an_edge_gates_the_start_only_not_an_agent_already_running() {
+        // Re-gating a live agent would tear down work in flight whenever an
+        // upstream alias was re-opened.
+        let agents = vec![desired_after("review", &["impl"])];
+        let live = existing(&[("%1", Some("review"))]);
+        let plan = plan(&agents, &live, None, &[]);
+        assert_eq!(plan.waiting(), 0);
+        assert!(plan.converged());
+    }
+
+    #[test]
+    fn an_edge_to_an_alias_nobody_defines_is_refused() {
+        let config: Config = toml::from_str(
+            r"
+[[pipeline.p.agent]]
+alias = 'review'
+program = 'codex'
+after = ['ghost']
+",
+        )
+        .unwrap();
+        let error = desired_agents("p", &config.pipeline["p"], &Vars::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn a_cycle_is_refused_rather_than_deadlocking_forever() {
+        let config: Config = toml::from_str(
+            r"
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'codex'
+after = ['b']
+
+[[pipeline.p.agent]]
+alias = 'b'
+program = 'codex'
+after = ['a']
+",
+        )
+        .unwrap();
+        let error = desired_agents("p", &config.pipeline["p"], &Vars::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cycle"), "{error}");
+    }
+
     #[test]
     fn an_empty_window_launches_everything() {
-        let plan = plan(&desired(&["plan", "impl"]), &[], None);
+        let plan = plan_at(&desired(&["plan", "impl"]), &[], None);
         assert_eq!(plan.launches(), 2);
         assert!(!plan.converged());
     }
 
     #[test]
     fn re_running_a_staffed_window_is_a_no_op() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan", "impl"]),
             &existing(&[("%1", Some("plan")), ("%2", Some("impl"))]),
             None,
@@ -1163,7 +1368,7 @@ program = 'claude'
 
     #[test]
     fn only_the_missing_alias_is_launched() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan", "impl", "review"]),
             &existing(&[("%1", Some("plan")), ("%2", Some("impl"))]),
             None,
@@ -1177,7 +1382,7 @@ program = 'claude'
 
     #[test]
     fn a_broadcast_reaches_live_panes_and_still_launches_missing_ones() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan", "review"]),
             &existing(&[("%1", Some("plan"))]),
             Some("rebase onto main first"),
@@ -1200,7 +1405,7 @@ program = 'claude'
             AgentState::WaitingChoice,
             AgentState::Error,
         ] {
-            let plan = plan(
+            let plan = plan_at(
                 &desired(&["impl"]),
                 &existing_in(&[("%1", Some("impl"))], Some(state)),
                 Some("carry on"),
@@ -1214,9 +1419,9 @@ program = 'claude'
     #[test]
     fn a_working_agent_is_kept_and_a_broadcast_still_reaches_it() {
         let working = existing_in(&[("%1", Some("impl"))], Some(AgentState::Working));
-        assert!(plan(&desired(&["impl"]), &working, None).converged());
+        assert!(plan_at(&desired(&["impl"]), &working, None).converged());
         assert_eq!(
-            plan(&desired(&["impl"]), &working, Some("go")).reprompts(),
+            plan_at(&desired(&["impl"]), &working, Some("go")).reprompts(),
             1
         );
 
@@ -1224,8 +1429,11 @@ program = 'claude'
         // Distinguishing it from Working is the operator's call, not a
         // reason to relaunch.
         let idle = existing_in(&[("%1", Some("impl"))], Some(AgentState::Idle));
-        assert!(plan(&desired(&["impl"]), &idle, None).converged());
-        assert_eq!(plan(&desired(&["impl"]), &idle, Some("go")).reprompts(), 1);
+        assert!(plan_at(&desired(&["impl"]), &idle, None).converged());
+        assert_eq!(
+            plan_at(&desired(&["impl"]), &idle, Some("go")).reprompts(),
+            1
+        );
     }
 
     #[test]
@@ -1239,7 +1447,7 @@ program = 'claude'
 
     #[test]
     fn a_pane_no_alias_claims_is_reported_and_left_alone() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan"]),
             &existing(&[("%1", Some("plan")), ("%9", None), ("%8", Some("retired"))]),
             None,

@@ -174,11 +174,16 @@ pub async fn run(
 /// act on the difference.
 pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
     let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
+    // The completion set lives on the work window, so a re-run reads what
+    // previous runs' agents reported even though none of them still exist.
+    let done = crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?
+        .map(|info| info.done)
+        .unwrap_or_default();
     let broadcast = resolved
         .request
         .as_ref()
         .map(|request| request.text.as_str());
-    let plan = pipeline::plan(&resolved.desired, &existing, broadcast);
+    let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
 
     if dry_run {
         return Ok(finish(
@@ -206,7 +211,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
                     .with_context(|| format!("send --prompt to {alias} in pane {pane}"))?;
                 reprompted.push(alias.clone());
             }
-            PlanStep::Keep { .. } | PlanStep::Attention { .. } => {}
+            PlanStep::Keep { .. } | PlanStep::Attention { .. } | PlanStep::Waiting { .. } => {}
         }
     }
 
@@ -894,6 +899,14 @@ fn print_plan_rows(result: &UpResult) {
                     ""
                 );
             }
+            PlanStep::Waiting { alias, waiting_on } => {
+                println!(
+                    "  ⋯ {alias:<10} {:<9} {:<12} {}",
+                    "waiting",
+                    "after",
+                    waiting_on.join(", ")
+                );
+            }
             PlanStep::Attention { alias, pane, state } => {
                 println!(
                     "  ! {alias:<10} {:<9} {:<12} {pane}",
@@ -1031,6 +1044,12 @@ fn print_result(result: &UpResult) {
     if let Some(layout) = &result.layout {
         println!("  layout   {layout}");
     }
+    if result.plan.waiting() > 0 {
+        println!(
+            "\n{} agent(s) wait on an upstream alias; they start once it reports `muxa work done`.",
+            result.plan.waiting()
+        );
+    }
     if result.plan.attention() > 0 {
         println!(
             "\n{} agent(s) are waiting on you; muxa did not type over their prompt.",
@@ -1136,6 +1155,7 @@ mod tests {
             window_name: "CAL-1".into(),
             cwd: PathBuf::from("/tmp/already-here"),
             external_item: None,
+            done: Vec::new(),
             agents: Vec::new(),
         };
         let (cwd, worktree, created) =

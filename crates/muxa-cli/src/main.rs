@@ -408,6 +408,9 @@ enum WorkCmd {
     List(tmux_work::WorkListArgs),
     /// Show one work window and its agent panes.
     Show(tmux_work::WorkShowArgs),
+    /// Report that this agent finished its part of the work, which opens
+    /// any `after` edge waiting on it. Run it from the agent's own pane.
+    Done(tmux_work::WorkDoneArgs),
     /// Close a work window and every agent pane in it.
     Close(tmux_work::WorkCloseArgs),
     /// Counterpart to `up`: close the work window and every agent in it.
@@ -571,6 +574,7 @@ async fn run_work_cmd(
         WorkCmd::Start(args) => agent_launch::run_work_start(args),
         WorkCmd::List(args) => tmux_work::run_work_list(args),
         WorkCmd::Show(args) => tmux_work::run_work_show(args),
+        WorkCmd::Done(args) => tmux_work::run_work_done(args),
         WorkCmd::Close(args) | WorkCmd::Down(args) => tmux_work::run_work_close(args),
     }
 }

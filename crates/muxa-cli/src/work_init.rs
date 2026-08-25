@@ -94,6 +94,14 @@ role    = 'implementer'       # optional; peers address it as role:<role>
 task    = 'fix the reaper'    # optional; short label in `muxa work show`/`watch`
 prompt  = '...'               # optional; this agent's own instructions
 direction = 'right'           # optional: right (default) or down
+after   = ['impl']            # optional: aliases that must report finishing
+                              # before this one starts. Omit for work that is
+                              # genuinely parallel; use it when one agent must
+                              # not see a tree the other is still changing —
+                              # a reviewer after its implementer, say. The
+                              # upstream agent opens the edge by running
+                              # `muxa work done` from its own pane, so tell it
+                              # to in that agent's prompt.
 
 Placeholders, usable in any prompt/path/workspace string:
 {{id}} lowercased work id, {{work}} as muxa stores it, {{workspace}},

@@ -35,13 +35,20 @@ const PANE_WORK_OPTION: &str = "@muxa_agent_work_id";
 const EXTERNAL_SOURCE_OPTION: &str = "@muxa_external_source";
 const EXTERNAL_SCOPE_OPTION: &str = "@muxa_external_scope";
 const EXTERNAL_STABLE_ID_OPTION: &str = "@muxa_external_stable_id";
+/// Comma-separated pipeline aliases that have reported finishing.
+///
+/// On the window rather than the pane: an agent that has finished may well
+/// have exited, and the fact that it finished has to outlive it. This is
+/// the only completion signal muxa has — agent state cannot supply one,
+/// because `idle` means both "done" and "paused mid-thought".
+const WORK_DONE_OPTION: &str = "@muxa_work_done";
 const EXTERNAL_KEY_OPTION: &str = "@muxa_external_key";
 const EXTERNAL_TITLE_OPTION: &str = "@muxa_external_title";
 const EXTERNAL_URL_OPTION: &str = "@muxa_external_url";
 const EXTERNAL_STATUS_OPTION: &str = "@muxa_external_status";
 
 const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
-const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}";
+const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_work_done}";
 const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_agent_alias}";
 const WINDOW_IDENTITY_FORMAT: &str =
     "#{window_id}\t#{session_id}\t#{session_name}\t#{window_name}\t#{automatic-rename}";
@@ -74,6 +81,9 @@ pub struct WorkInfo {
     pub cwd: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_item: Option<Box<ExternalItemInfo>>,
+    /// Pipeline aliases that reported finishing, in the order recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done: Vec<String>,
     pub agents: Vec<ManagedAgentPane>,
 }
 
@@ -229,6 +239,24 @@ pub struct WindowRenameArgs {
 }
 
 #[derive(Debug, clap::Args)]
+pub struct WorkDoneArgs {
+    /// Pipeline alias reporting done. Defaults to the alias recorded on
+    /// the calling pane, so an agent can just run `muxa work done`.
+    #[arg(long)]
+    pub alias: Option<String>,
+    /// tmux pane to read the alias and work from. Defaults to `TMUX_PANE`.
+    #[arg(long)]
+    pub pane: Option<String>,
+    /// Take the report back, so the next `muxa work up` holds dependants
+    /// again.
+    #[arg(long)]
+    pub undo: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct WorkListArgs {
     /// Limit work windows to one managed workspace.
     #[arg(long)]
@@ -323,6 +351,50 @@ pub fn run_window_rename(args: WindowRenameArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Report that this agent has finished its part, which is what opens an
+/// `after` edge for whatever waits on it.
+///
+/// muxa cannot observe "done" any other way: agent state says `idle` both
+/// when an agent has finished and when it is between thoughts, and a pane
+/// stays open either way. So the agent says so, and muxa records the claim
+/// rather than inferring one.
+pub fn run_work_done(args: WorkDoneArgs) -> Result<()> {
+    let pane = args
+        .pane
+        .clone()
+        .or_else(|| std::env::var("TMUX_PANE").ok())
+        .filter(|pane| !pane.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no pane to read; run inside tmux or pass --pane"))?;
+    validate_pane_id(&pane)?;
+    let alias = match args.alias.clone() {
+        Some(alias) => alias,
+        None => pane_option(&pane, AGENT_ALIAS_OPTION)?
+            .ok_or_else(|| anyhow::anyhow!("pane {pane} has no pipeline alias; pass --alias"))?,
+    };
+    let window = window_id_for_pane(&pane)?;
+    let done = mark_done(&window, &alias, !args.undo)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "window": window,
+                "alias": alias,
+                "done": done,
+            }))?
+        );
+    } else if args.undo {
+        println!("{alias} is no longer reported done");
+    } else {
+        println!("{alias} reported done ({})", done.join(", "));
+    }
+    Ok(())
+}
+
+fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
+    let raw = tmux_output(&["display-message", "-p", "-t", pane, &format!("#{{{key}}}")])?;
+    Ok(option(raw.trim()))
 }
 
 pub fn run_work_list(args: WorkListArgs) -> Result<()> {
@@ -873,6 +945,44 @@ fn stage_suffix(work: &WorkInfo, records: &[WorkRecord]) -> String {
         .map_or_else(String::new, |stage| format!("  stage={}", stage.label()))
 }
 
+fn parse_done(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Record that `alias` has finished its part of this work, or take it back.
+///
+/// Idempotent: a second report is not an error, because an agent re-reading
+/// its own instructions and reporting twice is likelier than a bug.
+pub fn mark_done(window: &str, alias: &str, done: bool) -> Result<Vec<String>> {
+    let alias = metadata(alias, 64)?.to_ascii_lowercase();
+    let current = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        window,
+        &format!("#{{{WORK_DONE_OPTION}}}"),
+    ])?;
+    let mut aliases = parse_done(current.trim());
+    if done {
+        if !aliases.iter().any(|existing| existing == &alias) {
+            aliases.push(alias);
+        }
+    } else {
+        aliases.retain(|existing| existing != &alias);
+    }
+    set_option(
+        OptionScope::Window,
+        window,
+        WORK_DONE_OPTION,
+        &aliases.join(","),
+    )?;
+    Ok(aliases)
+}
+
 pub fn window_id_for_pane(pane: &str) -> Result<String> {
     validate_pane_id(pane)?;
     let window = tmux_output(&["display-message", "-p", "-t", pane, "#{window_id}"])?;
@@ -1061,6 +1171,7 @@ fn parse_work_window(
         window_name: fields[4].to_string(),
         cwd: PathBuf::from(fields[6]),
         external_item: parse_external_item(&fields),
+        done: parse_done(fields.get(15).copied().unwrap_or_default()),
         agents,
     })
 }
@@ -1408,6 +1519,7 @@ mod tests {
             window_name: work.into(),
             cwd: PathBuf::from("/work"),
             external_item: None,
+            done: Vec::new(),
             agents: Vec::new(),
         }
     }
