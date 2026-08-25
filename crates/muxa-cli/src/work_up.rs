@@ -126,6 +126,11 @@ pub struct UpResult {
     pub launched: Vec<LaunchedAgent>,
     /// Aliases that were sent `--prompt`.
     pub reprompted: Vec<String>,
+    /// Aliases that have reported `muxa work done` on this work, newest run
+    /// included. Carried so a reader can tell a converged pipeline from a
+    /// stalled one: both leave every pane `idle`, and without this the two
+    /// render identically.
+    pub done: Vec<String>,
 }
 
 /// Everything decided before a single tmux command runs.
@@ -201,6 +206,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
             None,
             None,
             true,
+            done,
         ));
     }
 
@@ -240,7 +246,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
         apply_layout(window, layout)?;
     }
     Ok(finish(
-        resolved, plan, launched, reprompted, session, window, false,
+        resolved, plan, launched, reprompted, session, window, false, done,
     ))
 }
 
@@ -253,6 +259,7 @@ fn finish(
     session: Option<String>,
     window: Option<String>,
     dry_run: bool,
+    done: Vec<String>,
 ) -> UpResult {
     UpResult {
         work: resolved.work,
@@ -271,6 +278,7 @@ fn finish(
         plan,
         launched,
         reprompted,
+        done,
     }
 }
 
@@ -978,11 +986,21 @@ fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
                 pane,
             )
         }
-        PlanStep::Keep { pane, state, .. } => (
-            '●',
-            state.map_or("running", state_label).to_string(),
-            pane.clone(),
-        ),
+        PlanStep::Keep { pane, state, .. } => {
+            // Only while it is actually at rest: an agent that reported done
+            // and was then re-prompted is working again, and saying `done`
+            // over live work would be a lie the operator acts on.
+            let at_rest = state.is_none_or(|state| state == AgentState::Idle);
+            if at_rest && result.done.iter().any(|alias| alias == step.alias()) {
+                ('◉', "done".into(), pane.clone())
+            } else {
+                (
+                    '●',
+                    state.map_or("running", state_label).to_string(),
+                    pane.clone(),
+                )
+            }
+        }
         PlanStep::Reprompt { pane, .. } => ('●', "prompted".into(), pane.clone()),
         PlanStep::Waiting { waiting_on, .. } => (
             '○',
@@ -994,6 +1012,70 @@ fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
             state.map_or("blocked", state_label).to_string(),
             format!("{pane}  needs you"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod done_view_tests {
+    use super::*;
+
+    fn result_with(done: &[&str]) -> UpResult {
+        UpResult {
+            work: "CAL-1".into(),
+            workspace: "ws".into(),
+            pipeline: "pair".into(),
+            cwd: std::path::PathBuf::from("/repo"),
+            dry_run: false,
+            ticket: None,
+            worktree: None,
+            created_worktree: false,
+            session: None,
+            window: None,
+            layout: None,
+            request: None,
+            graph: Vec::new(),
+            plan: Plan {
+                steps: Vec::new(),
+                unclaimed: Vec::new(),
+            },
+            launched: Vec::new(),
+            reprompted: Vec::new(),
+            done: done.iter().map(|alias| (*alias).to_string()).collect(),
+        }
+    }
+
+    fn kept(alias: &str, state: Option<AgentState>) -> PlanStep {
+        PlanStep::Keep {
+            alias: alias.to_string(),
+            pane: "%9".into(),
+            state,
+        }
+    }
+
+    /// The gap this closes: a converged pipeline and a stalled one both leave
+    /// every pane `idle`, so the plan view rendered them identically and a
+    /// finished review sat unnoticed.
+    #[test]
+    fn a_reported_agent_reads_as_done_not_idle() {
+        let result = result_with(&["review"]);
+        let (glyph, status, _) = describe(&kept("review", Some(AgentState::Idle)), &result);
+        assert_eq!(status, "done");
+        assert_eq!(glyph, '\u{25c9}');
+
+        let (_, status, _) = describe(&kept("impl", Some(AgentState::Idle)), &result);
+        assert_eq!(status, "idle", "an alias that never reported is just idle");
+    }
+
+    /// Done is a claim about work at rest. An agent re-prompted after
+    /// reporting is working again, and rendering that as `done` would be a
+    /// lie the operator acts on.
+    #[test]
+    fn live_work_outranks_a_stale_done_marker() {
+        let result = result_with(&["review"]);
+        for state in [AgentState::Working, AgentState::Starting] {
+            let (_, status, _) = describe(&kept("review", Some(state)), &result);
+            assert_eq!(status, state_label(state));
+        }
     }
 }
 
