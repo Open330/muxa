@@ -107,6 +107,13 @@ pub struct ExternalItemInfo {
 pub struct WorkspaceInfo {
     pub workspace: String,
     pub session: String,
+    /// Whether muxa created this session, as opposed to adopting one the
+    /// operator already had.
+    ///
+    /// Identity and ownership are different facts. A session muxa adopted
+    /// carries a workspace id so its work windows are findable, but muxa
+    /// must never close it: it is full of windows muxa did not open.
+    pub managed: bool,
     pub cwd: PathBuf,
     pub attached_clients: u32,
     pub windows: u32,
@@ -673,6 +680,21 @@ pub fn list_workspaces() -> Result<Vec<WorkspaceInfo>> {
     Ok(parse_workspaces(&sessions, &windows, &panes))
 }
 
+/// A session muxa may put this workspace's work windows into without
+/// having created it: one already named after the workspace.
+///
+/// Refusing to adopt splits a workspace across `callabo` and `callabo-2`,
+/// which contradicts the whole model — one session is one workspace. The
+/// safety that mattered was never "do not touch it"; it is that
+/// `close_workspace` refuses a session muxa did not create.
+pub fn adoptable_session(workspace: &str) -> Result<Option<String>> {
+    let normalized = normalize_workspace_id(workspace)?;
+    let wanted = sanitize_session_name(&normalized.to_ascii_lowercase());
+    Ok(all_session_names()?
+        .into_iter()
+        .find(|name| name == &wanted))
+}
+
 pub fn session_name_for_workspace(workspace: &str) -> Result<String> {
     let normalized = normalize_workspace_id(workspace)?;
     let base = sanitize_session_name(&normalized.to_ascii_lowercase());
@@ -793,6 +815,21 @@ fn set_window_automatic_rename(window: &str, enabled: bool) -> Result<()> {
         window,
         "automatic-rename",
         if enabled { "on" } else { "off" },
+    )
+}
+
+/// Give an adopted session a workspace identity without claiming it.
+///
+/// Deliberately does not set `@muxa_managed_workspace`: that flag is what
+/// `close_workspace` reads, and muxa must not offer to kill a session full
+/// of windows somebody else opened.
+pub fn adopt_workspace(session: &str, workspace: &str) -> Result<()> {
+    let workspace = normalize_workspace_id(workspace)?;
+    set_option(
+        OptionScope::Session,
+        session,
+        WORKSPACE_ID_OPTION,
+        &workspace,
     )
 }
 
@@ -1049,6 +1086,13 @@ fn close_workspace(raw: &str, confirm: bool) -> Result<ManageResult> {
     }
     let workspace = find_workspace(raw)?
         .ok_or_else(|| anyhow::anyhow!("managed workspace {raw:?} not found"))?;
+    if !workspace.managed {
+        bail!(
+            "workspace {raw:?} lives in session {:?}, which muxa adopted rather than created; \
+             close its work windows instead, or kill the session yourself",
+            workspace.session
+        );
+    }
     tmux_status(&["kill-session", "-t", &format!("={}", workspace.session)])?;
     Ok(ManageResult::WorkspaceClosed {
         workspace: workspace.workspace,
@@ -1117,7 +1161,9 @@ fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<Workspace
     let mut workspaces = Vec::new();
     for line in sessions.lines() {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 7 || fields[2].trim().is_empty() || fields[4] != "1" {
+        // A workspace id is enough to be findable; `managed` decides what
+        // muxa may do to the session, not whether it can see it.
+        if fields.len() < 7 || fields[2].trim().is_empty() {
             continue;
         }
         let session = fields[0].to_string();
@@ -1131,6 +1177,7 @@ fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<Workspace
         workspaces.push(WorkspaceInfo {
             workspace,
             session,
+            managed: fields[4] == "1",
             cwd: PathBuf::from(fields[3]),
             attached_clients: fields[5].parse().unwrap_or(0),
             windows: fields[6].parse().unwrap_or(0),
@@ -1571,6 +1618,26 @@ mod tests {
             external_option_value(Some("  Needs\n review  "), 32),
             "Needs review"
         );
+    }
+
+    #[test]
+    fn an_adopted_session_is_findable_but_not_closable() {
+        // Identity and ownership are separate facts. muxa must be able to
+        // find work in a session it adopted, and must never offer to kill
+        // it — it is full of windows muxa did not open.
+        let sessions = "callabo\t$1\tcallabo\t/repo\t\t1\t3\n\
+                        owned\t$2\towned\t/repo\t1\t1\t1\n";
+        let workspaces = parse_workspaces(sessions, "", "");
+        let adopted = workspaces
+            .iter()
+            .find(|w| w.workspace == "callabo")
+            .expect("an adopted session is still visible");
+        assert!(!adopted.managed, "adoption must not claim ownership");
+        let owned = workspaces
+            .iter()
+            .find(|w| w.workspace == "owned")
+            .expect("a created session is visible too");
+        assert!(owned.managed);
     }
 
     #[test]
