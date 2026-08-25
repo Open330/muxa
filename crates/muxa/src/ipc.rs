@@ -3594,6 +3594,7 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "collaboration".into(),
@@ -4759,6 +4760,7 @@ mod tests {
         let pane = PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: "zellij:3".into(),
             session_id: String::new(),

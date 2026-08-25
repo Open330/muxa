@@ -2350,6 +2350,7 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -2719,6 +2720,7 @@ mod tests {
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: "herdr:p1".into(),
             session_id: "ws1".into(),
@@ -2748,6 +2750,7 @@ mod tests {
             vec![crate::tmux::PaneInfo {
                 agent_role: None,
                 agent_alias: None,
+                work_done: Vec::new(),
                 socket: Some("/tmp/rmux-user/default".into()),
                 pane_id: "rmux:%4".into(),
                 session_id: "$1".into(),
@@ -2779,6 +2782,7 @@ mod tests {
             panes: vec![crate::tmux::PaneInfo {
                 agent_role: None,
                 agent_alias: None,
+                work_done: Vec::new(),
                 socket: Some("/tmp/rmux-secondary/default".into()),
                 pane_id: "rmux:%8".into(),
                 session_id: "$2".into(),

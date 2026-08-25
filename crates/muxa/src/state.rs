@@ -2561,6 +2561,7 @@ mod tests {
         let pane = PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: "%1".into(),
             session_id: String::new(),
@@ -4353,6 +4354,7 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),

@@ -504,6 +504,7 @@ fn to_pane_info(pane: &HerdrPaneInfo, process: Option<&HerdrProcessInfo>) -> Pan
     PaneInfo {
         agent_role: None,
         agent_alias: None,
+        work_done: Vec::new(),
         pane_id: format!("{PANE_ID_PREFIX}{}", pane.pane_id),
         session_id: pane.workspace_id.clone(),
         session: pane.workspace_id.clone(),

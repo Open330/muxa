@@ -8,6 +8,7 @@
 //! Identity is stored in tmux user options so it survives muxad and MCP
 //! process restarts without adding another database.
 
+use crate::theme::TableTone;
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use muxa::work::{WorkRecord, WorkStage};
@@ -416,21 +417,151 @@ pub fn run_work_list(args: WorkListArgs) -> Result<()> {
     } else if works.is_empty() {
         println!("no muxa-managed work windows");
     } else {
-        let records = work_annotations();
-        for work in works {
-            println!(
-                "{}  workspace={}  session={}  window={}  agents={}  cwd={}{}",
-                work.work,
-                work.workspace,
-                work.session,
-                work.window,
-                work.agents.len(),
-                work.cwd.display(),
-                stage_suffix(&work, &records)
-            );
-        }
+        let theme = crate::theme::for_theme(
+            muxa::config::Config::load_or_default(None)
+                .map(|cfg| cfg.ui.theme)
+                .unwrap_or_default(),
+            crate::use_colors(),
+        );
+        print!("{}", work_list_table(&works, &work_annotations(), theme));
     }
     Ok(())
+}
+
+/// Render the work table.
+///
+/// Pure on its inputs so the layout is testable without a tmux server; the
+/// caller supplies the works, their annotations, and the theme.
+fn work_list_table(
+    works: &[WorkInfo],
+    records: &[WorkRecord],
+    theme: crate::theme::CliTheme,
+) -> String {
+    use comfy_table::{ContentArrangement, Table};
+
+    let staged: Vec<Option<String>> = works
+        .iter()
+        .map(|work| {
+            stage_for(work, records)
+                .filter(|stage| *stage != WorkStage::Auto)
+                .map(|stage| stage.label().to_string())
+        })
+        .collect();
+    // The column only earns its width when something is actually staged.
+    let show_stage = staged.iter().any(Option::is_some);
+
+    let mut header = vec!["WORK", "WORKSPACE", "AGENTS", "DONE"];
+    if show_stage {
+        header.push("STAGE");
+    }
+    header.push("CWD");
+
+    let mut table = Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(
+            header
+                .into_iter()
+                .map(|label| theme.cell(label, TableTone::Header))
+                .collect::<Vec<_>>(),
+        );
+
+    for (work, stage) in works.iter().zip(&staged) {
+        let (done, total) = done_ratio(work);
+        let mut row = vec![
+            theme.cell(&work.work, TableTone::Accent),
+            theme.cell(&work.workspace, TableTone::Dim),
+            theme.cell(agent_summary(work), TableTone::Tmux),
+            match total {
+                // Not a pipeline: nothing ever reports, so a ratio would
+                // read as "0 of 1 finished" for work that is simply running.
+                0 => theme.right_cell("-", TableTone::Dim),
+                total if done == total => {
+                    theme.right_cell(format!("{done}/{total}"), TableTone::Good)
+                }
+                total => theme.right_cell(format!("{done}/{total}"), TableTone::Warn),
+            },
+        ];
+        if show_stage {
+            row.push(theme.cell(stage.as_deref().unwrap_or("-"), TableTone::Dim));
+        }
+        row.push(theme.cell(shorten_home(&work.cwd), TableTone::Dim));
+        table.add_row(row);
+    }
+    format!("{table}\n")
+}
+
+/// How many of this work's pipeline agents have reported finishing.
+///
+/// Counted over *aliased* panes only: `done` records aliases, so a pane the
+/// operator opened by hand could never be in it and must not inflate the
+/// denominator.
+fn done_ratio(work: &WorkInfo) -> (usize, usize) {
+    let aliases: Vec<&str> = work
+        .agents
+        .iter()
+        .filter_map(|agent| agent.alias.as_deref())
+        .collect();
+    let done = aliases
+        .iter()
+        .filter(|alias| {
+            work.done
+                .iter()
+                .any(|reported| reported.eq_ignore_ascii_case(alias))
+        })
+        .count();
+    (done, aliases.len())
+}
+
+/// Who is in the window: pipeline aliases when it has them, otherwise the
+/// agent programs, collapsed so three claudes read as `claude x3` rather than
+/// as a list.
+fn agent_summary(work: &WorkInfo) -> String {
+    let aliases: Vec<&str> = work
+        .agents
+        .iter()
+        .filter_map(|agent| agent.alias.as_deref())
+        .collect();
+    if !aliases.is_empty() {
+        return aliases.join(" \u{b7} ");
+    }
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for agent in &work.agents {
+        match counts.iter_mut().find(|(name, _)| *name == agent.agent) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((agent.agent.as_str(), 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(name, count)| {
+            if count > 1 {
+                format!("{name} x{count}")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+/// `/home/june/x` -> `~/x`, so the column spends its width on the part that
+/// differs between rows.
+fn shorten_home(path: &Path) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return path.display().to_string();
+    };
+    path.strip_prefix(&home).map_or_else(
+        |_| path.display().to_string(),
+        |rest| {
+            if rest.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rest.display())
+            }
+        },
+    )
 }
 
 pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
@@ -980,6 +1111,119 @@ fn stage_suffix(work: &WorkInfo, records: &[WorkRecord]) -> String {
     stage_for(work, records)
         .filter(|stage| *stage != WorkStage::Auto)
         .map_or_else(String::new, |stage| format!("  stage={}", stage.label()))
+}
+
+#[cfg(test)]
+mod work_list_view_tests {
+    use super::*;
+
+    fn agent(pane: &str, program: &str, alias: Option<&str>) -> ManagedAgentPane {
+        ManagedAgentPane {
+            pane: pane.into(),
+            agent: program.into(),
+            alias: alias.map(Into::into),
+            role: None,
+            task: None,
+            command: program.into(),
+            cwd: PathBuf::from("/repo"),
+        }
+    }
+
+    fn work(name: &str, agents: Vec<ManagedAgentPane>, done: &[&str]) -> WorkInfo {
+        WorkInfo {
+            work: name.into(),
+            workspace: "callabo".into(),
+            session: "callabo".into(),
+            session_id: "$1".into(),
+            window: "@1".into(),
+            window_index: 0,
+            window_name: name.into(),
+            cwd: PathBuf::from("/repo"),
+            external_item: None,
+            done: done.iter().map(|d| (*d).to_string()).collect(),
+            agents,
+        }
+    }
+
+    /// `done` records aliases, so only aliased panes can ever be in it. A pane
+    /// the operator split by hand must not inflate the denominator and make a
+    /// converged pipeline read as unfinished.
+    #[test]
+    fn done_counts_only_pipeline_agents() {
+        let piped = work(
+            "CAL-1",
+            vec![
+                agent("%1", "claude", Some("impl")),
+                agent("%2", "codex", Some("review")),
+                agent("%3", "codex", None),
+            ],
+            &["impl", "review"],
+        );
+        assert_eq!(done_ratio(&piped), (2, 2));
+
+        let partial = work(
+            "CAL-2",
+            vec![
+                agent("%1", "claude", Some("impl")),
+                agent("%2", "codex", Some("review")),
+            ],
+            &["impl"],
+        );
+        assert_eq!(done_ratio(&partial), (1, 2));
+
+        // Hand-built window: no aliases at all, so there is no ratio to show.
+        let manual = work("ad-hoc", vec![agent("%1", "claude", None)], &[]);
+        assert_eq!(done_ratio(&manual), (0, 0));
+    }
+
+    #[test]
+    fn agents_read_as_aliases_or_collapsed_programs() {
+        let piped = work(
+            "CAL-1",
+            vec![
+                agent("%1", "claude", Some("impl")),
+                agent("%2", "codex", Some("review")),
+            ],
+            &[],
+        );
+        assert_eq!(agent_summary(&piped), "impl \u{b7} review");
+
+        let manual = work(
+            "RELEASE-1",
+            vec![
+                agent("%1", "claude", None),
+                agent("%2", "claude", None),
+                agent("%3", "codex", None),
+            ],
+            &[],
+        );
+        assert_eq!(agent_summary(&manual), "claude x2 \u{b7} codex");
+    }
+
+    /// A converged pipeline and a stalled one differ by one cell, so that cell
+    /// has to be present and correct.
+    #[test]
+    fn table_shows_the_completion_ratio() {
+        let works = vec![
+            work(
+                "CAL-1",
+                vec![
+                    agent("%1", "claude", Some("impl")),
+                    agent("%2", "codex", Some("review")),
+                ],
+                &["impl", "review"],
+            ),
+            work("RELEASE-1", vec![agent("%3", "claude", None)], &[]),
+        ];
+        let out = work_list_table(&works, &[], crate::theme::CliTheme::plain());
+        assert!(out.contains("CAL-1"), "{out}");
+        assert!(out.contains("2/2"), "{out}");
+        assert!(out.contains("impl \u{b7} review"), "{out}");
+        // No pipeline aliases, so no ratio — not `0/1`.
+        assert!(!out.contains("0/1"), "{out}");
+        // The stage column stays out of the way when nothing is staged.
+        assert!(!out.contains("STAGE"), "{out}");
+    }
 }
 
 fn parse_done(raw: &str) -> Vec<String> {

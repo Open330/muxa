@@ -636,6 +636,7 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
+            work_done: Vec::new(),
             pane_id: "%1".into(),
             session_id: "$1".into(),
             session: session_name.into(),
