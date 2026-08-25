@@ -5212,34 +5212,22 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
     }
 }
 
-/// `(reported, total)` over the pipeline agents among `panes`.
-///
-/// Only aliased panes count: `@muxa_work_done` records aliases, so a pane the
-/// operator split by hand can never appear in it and must not drag the ratio
-/// down. `None` when nothing in the window is aliased — that window is not a
-/// pipeline and has no completion to report.
+/// Completion for the flat work row, over the same rule the topology uses —
+/// deferred to rather than restated, so the tree and the list can never
+/// disagree about whether a pipeline finished.
 fn work_completion(panes: &[PaneInfo]) -> Option<(usize, usize)> {
-    let aliases: Vec<&str> = panes
-        .iter()
-        .filter_map(|pane| pane.agent_alias.as_deref())
-        .collect();
-    if aliases.is_empty() {
-        return None;
-    }
-    // Every pane of one work carries the same window-scoped list.
+    // `@muxa_work_done` is a window option, so whichever pane carries it speaks
+    // for the window.
     let done = panes
         .iter()
         .find(|pane| !pane.work_done.is_empty())
         .map(|pane| pane.work_done.clone())
         .unwrap_or_default();
-    let reported = aliases
-        .iter()
-        .filter(|alias| {
-            done.iter()
-                .any(|reported| reported.eq_ignore_ascii_case(alias))
-        })
-        .count();
-    Some((reported, aliases.len()))
+    muxa::topology::work_completion(
+        panes.iter().filter_map(|pane| pane.agent_alias.as_deref()),
+        &done,
+    )
+    .map(|completion| (completion.done, completion.total))
 }
 
 fn build_work_rows(
@@ -13612,6 +13600,21 @@ fn tree_node_label(
         ));
     } else {
         spans.push(Span::raw(label));
+    }
+    // A work window that has finished looks exactly like one that stalled —
+    // every agent idle — unless the row says so.
+    if let TopologyNodeRef::Window(window) = node {
+        if let Some(completion) = window.completion {
+            let style = if completion.is_complete() {
+                Style::default().fg(theme.state_idle)
+            } else {
+                theme.dim_style()
+            };
+            spans.push(Span::styled(
+                format!("  {}/{}", completion.done, completion.total),
+                style,
+            ));
+        }
     }
     Text::from(Line::from(spans))
 }
