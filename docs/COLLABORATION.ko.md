@@ -203,7 +203,7 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 | `muxa_inbox` | 현재 agent session의 요청 claim/read |
 | `muxa_list_messages` | incoming/sent/all request 상태 조회(미claim) |
 | `muxa_reply` | completed/blocked/declined/failed 구조화 응답 |
-| `muxa_wait_reply` | 요청의 terminal reply 대기 |
+| `muxa_wait_reply` | event-driven 방식으로 요청의 terminal reply 대기 |
 | `muxa_cancel_message` | 아직 queued인 발신 요청 취소 |
 
 ## Agent 대화에서 자연스럽게 호출하기
@@ -232,6 +232,20 @@ agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
 때 Muxa는 자동으로 만들지 않고 확인을 요청하며, 사용자가 승인한 뒤에만
 `spawn_if_missing=true`로 다시 호출할 수 있습니다. MCP process는 시작할 때 도구와
 스킬을 읽으므로 스킬 변경이나 Muxa 업그레이드 뒤에는 기존 agent를 재시작하세요.
+승인된 자동 spawn에서는 pane을 만들기 전에 daemon transition stream을 먼저 구독하고,
+해당 pane의 agent 등록 이벤트가 왔을 때만 room context를 다시 읽습니다. 기존의
+500ms 등록 polling loop는 사용하지 않습니다.
+
+대기는 model이 주도하는 polling loop가 아니라 MCP tool call 하나를 blocking하는
+방식입니다. muxad는 durable mailbox의 단조 증가 revision을 구독하고, revision이
+바뀌거나 최종 timeout 경계에 도달했을 때만 해당 request를 다시 읽습니다.
+새 client가 `collaboration_wait`를 거부하는 구형 daemon에 연결된 경우에는 같은 tool
+call 내부에서만 bounded `collaboration_get` 호환 polling을 사용하므로 model turn은
+추가되지 않습니다. 최신 daemon은 항상 event-driven 경로를 사용합니다.
+`wait=false`로 보냈다면 발신 agent는 독립 작업을 계속할 수 있고, muxad가 reply
+revision과 발신 pane의 Idle 전환에 반응해 짧은 알림 prompt를 한 번 전달합니다.
+Muxa가 관리하는 peer를 `sleep`, raw `tmux capture-pane`, 반복 status/capture 호출로
+모니터링하지 마세요.
 
 일반적인 흐름:
 
@@ -306,7 +320,7 @@ participant나 자동 wake 대상이 아닙니다. `wake = "never"`로 설정하
 요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다. wake prompt가 중복돼도
 동일 request id의 작업을 새 요청으로 만들지 않습니다.
 
-모든 collaboration IPC 호출(context, identity, send, inbox, list, reply, get,
+모든 collaboration IPC 호출(context, identity, send, inbox, list, reply, get, wait,
 cancel)은 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`에도 append-only로
 기록됩니다. 이 로그는 `0600`이며 message/reply 본문을 중복 저장하지 않고 operation,
 request id, 대상, 결과, represented origin/session과 OS-observed caller만 담습니다.

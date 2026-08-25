@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Peer reply waits and idle wake delivery are event-driven.** Durable
+  collaboration mutations now advance a retained mailbox revision that wakes
+  every interested waiter. `muxa_wait_reply`, `muxa_call_peer(wait=true)`, and
+  `muxa msg wait` use one bounded `collaboration_wait` IPC request instead of
+  500 ms mailbox polling, while the daemon waker reacts to mailbox revisions
+  and agent Idle transitions instead of a two-second scan. A slow 30-second
+  reconcile remains only as a recovery backstop. MCP instructions explicitly
+  steer agents away from `sleep`/raw `tmux capture-pane` monitoring loops.
+  New clients fall back inside the same tool call when an older daemon rejects
+  `collaboration_wait`, and confirmed peer spawning now arms the transition
+  stream before pane creation instead of polling registration every 500 ms.
+- **Route-owned environment preparation is accepted by every binary.** A
+  `[[route]].prepare` command can provision the rendered `cwd` once before a
+  new Work window is created, remains inert during `--dry-run`, refuses
+  unresolved placeholders, and cannot be combined with `[route.worktree]`.
 - **Multi-node Fleet watch now follows native watch interaction semantics.**
   `j`/`k` and arrows navigate siblings with singleton-parent fallback, while
   `J`/`K` keep the fast global agent-pane jump. The renderer now uses the same

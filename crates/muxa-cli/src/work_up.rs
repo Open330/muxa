@@ -353,6 +353,12 @@ fn resolve_cwd(
     vars: &Vars,
     existing: Option<&crate::tmux_work::WorkInfo>,
 ) -> Result<(PathBuf, Option<WorktreePlan>, bool)> {
+    if route.worktree.is_some() && route.prepare.is_some() {
+        bail!("route sets both `worktree` and `prepare`; pick whichever owns provisioning");
+    }
+    if let Some(command) = route.prepare.as_deref() {
+        return prepared_cwd(args, route, vars, existing, command);
+    }
     if let Some(config) = &route.worktree {
         if args.cwd.is_some() {
             bail!(
@@ -381,6 +387,62 @@ fn resolve_cwd(
         bail!("cwd is not a directory: {}", cwd.display());
     }
     Ok((cwd, None, false))
+}
+
+/// Provision through the route's `prepare` command, then work in `cwd`.
+///
+/// Run only when the work window does not exist yet: re-running `muxa
+/// work up` must converge, and a provisioning command asked to create
+/// something twice usually fails — loudly and for the wrong reason.
+fn prepared_cwd(
+    args: &UpArgs,
+    route: &muxa::config::RouteConfig,
+    vars: &Vars,
+    existing: Option<&crate::tmux_work::WorkInfo>,
+    command: &str,
+) -> Result<(PathBuf, Option<WorktreePlan>, bool)> {
+    if let Some(existing) = existing {
+        // Already provisioned; adopt what it recorded.
+        return Ok((existing.cwd.clone(), None, false));
+    }
+    let command = vars.render(command);
+    if command.contains("{{") {
+        bail!("prepare command still has unresolved placeholders: {command}");
+    }
+    let target = match (&args.cwd, route.cwd.as_deref()) {
+        (Some(cwd), _) => cwd.clone(),
+        (None, Some(template)) => PathBuf::from(expand_tilde(&vars.render(template))),
+        (None, None) => bail!("route uses `prepare`; set `cwd` so muxa knows where it lands"),
+    };
+    if args.dry_run {
+        println!("would run: {command}");
+        // Nothing exists yet, so canonicalize would fail. Report the
+        // intended path rather than inventing one.
+        return Ok((target, None, false));
+    }
+    if !target.exists() {
+        println!("preparing: {command}");
+        run_prepare(&command)?;
+    }
+    let cwd = std::fs::canonicalize(&target).with_context(|| {
+        format!(
+            "prepare ran but {} does not exist; check the route's cwd",
+            target.display()
+        )
+    })?;
+    Ok((cwd, None, true))
+}
+
+fn run_prepare(command: &str) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .with_context(|| format!("running prepare: {command}"))?;
+    if !status.success() {
+        bail!("prepare command failed ({status}): {command}");
+    }
+    Ok(())
 }
 
 fn expand_tilde(value: &str) -> String {
@@ -768,6 +830,84 @@ mod tests {
             refresh: false,
             json: false,
         }
+    }
+
+    #[test]
+    fn a_route_cannot_own_provisioning_two_ways() {
+        let both = muxa::config::RouteConfig {
+            cwd: Some("/tmp/{{id}}".into()),
+            prepare: Some("echo hi".into()),
+            worktree: Some(muxa::config::WorktreeConfig {
+                repo: "/repo".into(),
+                ..muxa::config::WorktreeConfig::default()
+            }),
+            ..muxa::config::RouteConfig::default()
+        };
+        let error = resolve_cwd(&up_args(None), &both, &Vars::new(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("pick whichever owns provisioning"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prepare_needs_somewhere_to_land() {
+        // The directory does not exist until the command has run, so muxa
+        // cannot discover it — the route has to say.
+        let route = muxa::config::RouteConfig {
+            prepare: Some("echo hi".into()),
+            ..muxa::config::RouteConfig::default()
+        };
+        let error = resolve_cwd(&up_args(None), &route, &Vars::new(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("set `cwd`"), "{error}");
+    }
+
+    #[test]
+    fn an_unresolved_placeholder_never_reaches_the_shell() {
+        // `{{ticket.branch}}` with no ticket would otherwise be passed to
+        // sh verbatim and create a workspace named after the placeholder.
+        let route = muxa::config::RouteConfig {
+            prepare: Some("provision {{id}} {{ticket.branch}}".into()),
+            cwd: Some("/tmp/{{id}}".into()),
+            ..muxa::config::RouteConfig::default()
+        };
+        let vars = Vars::new().set("id", "cal-1");
+        let error = resolve_cwd(&up_args(None), &route, &vars, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unresolved placeholders"), "{error}");
+        assert!(error.contains("ticket.branch"), "{error}");
+    }
+
+    #[test]
+    fn an_already_provisioned_work_is_not_provisioned_again() {
+        // Re-running must converge. A provisioning command asked to create
+        // something twice usually fails, loudly and for the wrong reason.
+        let route = muxa::config::RouteConfig {
+            prepare: Some("false".into()), // would fail if it ran
+            cwd: Some("/tmp/{{id}}".into()),
+            ..muxa::config::RouteConfig::default()
+        };
+        let existing = crate::tmux_work::WorkInfo {
+            work: "CAL-1".into(),
+            workspace: "callabo".into(),
+            session: "callabo".into(),
+            window: "@1".into(),
+            window_index: 0,
+            window_name: "CAL-1".into(),
+            cwd: PathBuf::from("/tmp/already-here"),
+            external_item: None,
+            agents: Vec::new(),
+        };
+        let (cwd, worktree, created) =
+            resolve_cwd(&up_args(None), &route, &Vars::new(), Some(&existing)).expect("adopts");
+        assert_eq!(cwd, PathBuf::from("/tmp/already-here"));
+        assert!(worktree.is_none());
+        assert!(!created);
     }
 
     #[test]

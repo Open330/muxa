@@ -256,6 +256,7 @@ Capability tags currently advertised:
 | `waiting_choice` | server emits `AgentState::waiting_choice` (otherwise: `waiting_input`). |
 | `needs_choice`   | server emits `NotificationLevel::needs_choice` (otherwise: `needs_input`). |
 | `rate_limited`   | server emits the `rate_limited` event type and the `rate_limit_*` fields on `Agent`. |
+| `collaboration_wait` | server accepts event-driven bounded waits for durable request completion. |
 | `restart`        | server accepts `restart` and can re-exec itself in place. |
 
 #### v1-compat downgrade
@@ -428,6 +429,10 @@ other agent occupies the same stable tmux window.
   "origin": { "pane": "%12", "socket": "default" },
   "request_id": "req_..." }
 
+{ "protocol": 4, "kind": "collaboration_wait",
+  "origin": { "pane": "%12", "socket": "default" },
+  "request_id": "req_...", "timeout_secs": 300 }
+
 { "protocol": 3, "kind": "collaboration_cancel",
   "origin": { "pane": "%12", "socket": "default" },
   "request_id": "req_..." }
@@ -440,7 +445,16 @@ persisted before an optional idle-only wake prompt is injected.
 `collaboration_list` is non-claiming and accepts `incoming`, `sent`, or `all`.
 `collaboration_cancel` succeeds only while the request is still `queued`.
 Terminal replies also receive an idle-only wake; a sender-side
-`collaboration_get` acknowledges the reply so it is not woken again.
+`collaboration_get` or terminal `collaboration_wait` acknowledges the reply so
+it is not woken again. `collaboration_wait` subscribes before its first read,
+then blocks on a monotonic mailbox revision instead of polling. The mailbox is
+still authoritative: each revision causes an exact request read, and the
+deadline performs one final read before returning the latest request. The
+daemon clamps each wait to 1–600 seconds and advertises the method through the
+`collaboration_wait` capability. A newer client talking to a daemon that
+explicitly rejects this request kind falls back to bounded client-side
+`collaboration_get` polling inside the same CLI/MCP call; it does not create
+model turns. All other errors remain errors and do not trigger the fallback.
 Identity is pinned to the registering agent session. `@alias` targets a unique
 live alias, while `role:<name>` succeeds only when exactly one live peer in the
 room carries that role.

@@ -88,6 +88,17 @@ const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// wedged or half-dead daemon.
 const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A collaboration wait occupies one bounded IPC handler and client
+/// connection. Keep the ceiling aligned with the MCP surface so a caller
+/// cannot pin daemon resources indefinitely.
+const MAX_COLLABORATION_WAIT_SECS: u64 = 600;
+
+/// Compatibility cadence used only when an older daemon explicitly rejects
+/// the event-driven `collaboration_wait` request kind. This loop lives wholly
+/// inside one CLI/MCP tool call, so it never consumes model turns; current
+/// daemons always take the revision-driven path instead.
+const LEGACY_COLLABORATION_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Tighter deadline for hook ingest, which runs on the agent's critical path
 /// (every prompt / every tool call). A wedged daemon must never stall the
 /// agent, so fail fast and let `best_effort_ingest` treat it as a no-op.
@@ -282,6 +293,15 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Block on the mailbox's durable revision signal until this exact
+    /// participant-visible request becomes terminal, or return its latest
+    /// state at the bounded deadline. Unlike `collaboration_get` loops, one
+    /// request occupies no client/model polling turns.
+    CollaborationWait {
+        origin: CollaborationOrigin,
+        request_id: String,
+        timeout_secs: u64,
+    },
     CollaborationCancel {
         origin: CollaborationOrigin,
         request_id: String,
@@ -383,6 +403,7 @@ const CAPABILITIES: &[&str] = &[
     "rate_limited",
     "collaboration_mailbox",
     "collaboration_lifecycle",
+    "collaboration_wait",
     "collaboration_identity",
     "collaboration_provenance",
     "fleet_v1",
@@ -1101,11 +1122,10 @@ fn lagged_marker_bytes(
 /// fallback polling tick) will reconcile any holes.
 async fn stream_transitions(
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    store: SharedStore,
+    mut rx: broadcast::Receiver<crate::state::Transition>,
     protocol: u32,
     emit_lagged: bool,
 ) -> Result<(), RuntimeError> {
-    let mut rx = store.subscribe();
     // Periodic keepalive so a watch client that dies without a clean close is
     // detected on the next write (broken pipe) rather than lingering until the
     // next real transition — which, on an idle daemon, might be never.
@@ -2267,6 +2287,45 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationWait {
+                    origin,
+                    request_id,
+                    timeout_secs,
+                } => {
+                    kind = "collaboration_wait";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Wait,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .wait_for_terminal(
+                                &current,
+                                &request_id,
+                                Duration::from_secs(
+                                    timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS),
+                                ),
+                            )
+                            .await
+                        {
+                            Ok(request) => Response::with_collaboration_request(request),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
                     collaboration_actor.observe_pane(&backends).await;
@@ -2392,6 +2451,10 @@ async fn handle(
                 RequestBody::Subscribe { lagged_markers } => {
                     kind = "subscribe";
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    // Arm the receiver before acknowledging the subscription.
+                    // Once the client sees the ack, every later transition is
+                    // therefore either queued here or already being written.
+                    let transitions = store.subscribe();
                     // Stream takeover. Send ack, then write transitions
                     // until the client disconnects or muxad shuts down.
                     // We deliberately do NOT return to the request loop
@@ -2407,7 +2470,8 @@ async fn handle(
                         kind,
                         "ipc.handle (stream takeover)",
                     );
-                    return stream_transitions(writer, store, stream_proto, lagged_markers).await;
+                    return stream_transitions(writer, transitions, stream_proto, lagged_markers)
+                        .await;
                 }
             },
             Err(e) => {
@@ -2512,6 +2576,14 @@ fn is_lagged_marker(line: &str) -> bool {
                 .map(|e| e == "lagged")
         })
         .unwrap_or(false)
+}
+
+/// Old daemons deserialize a request kind they do not know as a tagged-enum
+/// `unknown variant` error. Limit compatibility fallback to that exact shape:
+/// authorization, lookup, and persistence failures from a current daemon must
+/// remain visible to the caller rather than being disguised as a poll loop.
+fn collaboration_wait_is_unsupported(error: &str) -> bool {
+    error.contains("unknown variant") && error.contains("collaboration_wait")
 }
 
 fn decode_agents(resp: &serde_json::Value) -> Vec<Agent> {
@@ -2988,6 +3060,67 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Wait for a request to become terminal through muxad's collaboration
+    /// revision signal. The daemon returns the latest request on timeout, so
+    /// callers distinguish completion from timeout via `status.is_terminal()`.
+    pub async fn collaboration_wait(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        timeout_secs: u64,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let timeout_secs = timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS);
+        let legacy_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_wait",
+            "origin": origin,
+            "request_id": request_id,
+            "timeout_secs": timeout_secs,
+        });
+        // Allow the normal connect/hello/serialization budget beyond the
+        // daemon-side wait deadline. This remains bounded even if muxad wedges.
+        let deadline = Duration::from_secs(timeout_secs).saturating_add(CLIENT_CALL_TIMEOUT);
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        if resp["ok"].as_bool().unwrap_or(false) {
+            return serde_json::from_value(resp["collaboration_request"].clone())
+                .map_err(RuntimeError::Json);
+        }
+        let error = resp["error"]
+            .as_str()
+            .unwrap_or("collaboration wait failed");
+        if collaboration_wait_is_unsupported(error) {
+            tracing::debug!(
+                request_id,
+                "daemon lacks collaboration_wait; using bounded client-side compatibility wait"
+            );
+            return self
+                .collaboration_wait_legacy(origin, request_id, legacy_deadline)
+                .await;
+        }
+        Err(RuntimeError::Json(serde::de::Error::custom(
+            error.to_string(),
+        )))
+    }
+
+    async fn collaboration_wait_legacy(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        loop {
+            let request = self.collaboration_get(origin, request_id).await?;
+            if request.status.is_terminal() || tokio::time::Instant::now() >= deadline {
+                return Ok(request);
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + LEGACY_COLLABORATION_WAIT_POLL_INTERVAL),
+            )
+            .await;
+        }
     }
 
     pub async fn collaboration_cancel(
@@ -3496,6 +3629,98 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn collaboration_wait_falls_back_for_legacy_daemon() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("legacy-collaboration.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let terminal_request = serde_json::json!({
+            "id": "legacy-request",
+            "from": {
+                "agent_kind": "codex",
+                "agent_session_id": "sender",
+                "pane": "%1",
+                "socket": "default",
+                "room": { "host": "tmux", "socket": "default", "window_id": "@1" },
+                "state": "idle"
+            },
+            "to": {
+                "agent_kind": "claude_code",
+                "agent_session_id": "recipient",
+                "pane": "%2",
+                "socket": "default",
+                "room": { "host": "tmux", "socket": "default", "window_id": "@1" },
+                "state": "idle"
+            },
+            "kind": "question",
+            "body": "legacy",
+            "expects_reply": true,
+            "work_mode": "read_only",
+            "status": "completed",
+            "created_at": "2026-08-25T00:00:00Z",
+            "reply": {
+                "status": "completed",
+                "body": "done",
+                "at": "2026-08-25T00:00:01Z"
+            }
+        });
+        let server = tokio::spawn(async move {
+            for expected_kind in ["collaboration_wait", "collaboration_get"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+                writer.flush().await.unwrap();
+
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(request["kind"], expected_kind);
+                let response = if expected_kind == "collaboration_wait" {
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "bad request: unknown variant `collaboration_wait`, expected `collaboration_get`"
+                    })
+                } else {
+                    serde_json::json!({
+                        "ok": true,
+                        "collaboration_request": terminal_request
+                    })
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+                writer.flush().await.unwrap();
+            }
+        });
+
+        let client = Client::new(socket);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+        };
+        let request = client
+            .collaboration_wait(&origin, "legacy-request", 2)
+            .await
+            .unwrap();
+        assert_eq!(request.status, RequestStatus::Completed);
+        assert_eq!(request.reply.unwrap().body, "done");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn collaboration_wait_fallback_only_matches_unknown_request_kind() {
+        assert!(collaboration_wait_is_unsupported(
+            "bad request: unknown variant `collaboration_wait`, expected `collaboration_get`"
+        ));
+        assert!(!collaboration_wait_is_unsupported(
+            "collaboration wait failed: request not found"
+        ));
+    }
+
     #[test]
     fn caller_pane_mismatch_is_audit_evidence_not_a_refusal() {
         let actor = CollaborationConnectionActor {
@@ -3637,6 +3862,15 @@ mod tests {
         );
         let inbox = client.collaboration_inbox(&recipient).await.unwrap();
         assert_eq!(inbox[0].status, RequestStatus::Claimed);
+        let waiting_client = client.clone();
+        let waiting_sender = sender.clone();
+        let waiting_request_id = request.id.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_client
+                .collaboration_wait(&waiting_sender, &waiting_request_id, 2)
+                .await
+        });
+        tokio::task::yield_now().await;
         client
             .collaboration_reply(
                 &recipient,
@@ -3648,24 +3882,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            client
-                .collaboration_context(&sender)
-                .await
-                .unwrap()
-                .unread_replies,
-            1
-        );
+        let observed = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("IPC wait should resume from the mailbox revision")
+            .expect("IPC wait task should not panic")
+            .expect("IPC wait should succeed");
+        assert_eq!(observed.status, RequestStatus::Completed);
+        assert!(observed.reply_notified_at.is_some());
+        assert!(observed.reply_read_at.is_some());
         let sent = client
             .collaboration_list(&sender, RequestMailbox::Sent)
             .await
             .unwrap();
         assert_eq!(sent[0].status, RequestStatus::Completed);
-        assert!(sent[0].reply_notified_at.is_none());
-        let observed = client
-            .collaboration_get(&sender, &request.id)
-            .await
-            .unwrap();
+        // The waiting read acknowledges the result and suppresses a later
+        // idle-only reply wake.
         assert!(observed.reply_notified_at.is_some());
         assert!(observed.reply_read_at.is_some());
         assert_eq!(
@@ -3739,6 +3970,10 @@ mod tests {
         assert!(audit_entries
             .iter()
             .any(|entry| entry.operation == CollaborationAuditOperation::Reply));
+        assert!(audit_entries.iter().any(|entry| {
+            entry.operation == CollaborationAuditOperation::Wait
+                && entry.request_id.as_deref() == Some(request.id.as_str())
+        }));
         assert!(audit_entries.iter().any(|entry| {
             entry.operation == CollaborationAuditOperation::Send
                 && entry.request_id.as_deref() == Some(console_request.id.as_str())
@@ -4172,6 +4407,7 @@ mod tests {
         assert!(caps.contains(&"waiting_choice"));
         assert!(caps.contains(&"needs_choice"));
         assert!(caps.contains(&"rate_limited"));
+        assert!(caps.contains(&"collaboration_wait"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(resp["generation"].is_null());
 

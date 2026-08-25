@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 pub const COLLABORATION_SCHEMA_VERSION: u32 = 1;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -539,6 +540,12 @@ pub struct CollaborationStore {
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
     transaction_lock: Mutex<()>,
+    /// Monotonic invalidation signal for durable collaboration state. The
+    /// mailbox remains the source of truth: waiters wake on a revision change
+    /// and re-read the exact request they care about. `watch` retains the
+    /// latest revision and wakes every subscriber, avoiding both lost
+    /// notifications and broadcast-lag recovery machinery.
+    changes: watch::Sender<u64>,
 }
 
 impl CollaborationStore {
@@ -549,6 +556,7 @@ impl CollaborationStore {
     }
 
     pub fn in_memory(options: CollaborationOptions) -> Arc<Self> {
+        let (changes, _) = watch::channel(0);
         Arc::new(Self {
             opts: CollaborationOptions {
                 path: None,
@@ -557,6 +565,7 @@ impl CollaborationStore {
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
+            changes,
         })
     }
 
@@ -577,16 +586,30 @@ impl CollaborationStore {
                 Err(error) => return Err(error.into()),
             }
         }
+        let (changes, _) = watch::channel(0);
         Ok(Arc::new(Self {
             opts: options,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
             transaction_lock: Mutex::new(()),
+            changes,
         }))
     }
 
     pub fn enabled(&self) -> bool {
         self.opts.enabled
+    }
+
+    /// Subscribe to durable mailbox/identity invalidations. Callers must
+    /// subscribe before reading their baseline state, then re-read after each
+    /// change; the revision deliberately carries no request body.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn publish_change(&self) {
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// Attach persisted aliases and roles only to the exact live agent
@@ -658,6 +681,7 @@ impl CollaborationStore {
             *self.identities.write().await = previous;
             return Err(error);
         }
+        self.publish_change();
         let mut updated = caller.clone();
         updated.alias = alias;
         updated.roles = roles;
@@ -721,6 +745,7 @@ impl CollaborationStore {
             *self.requests.write().await = previous;
             return Err(error);
         }
+        self.publish_change();
         Ok(request)
     }
 
@@ -762,6 +787,7 @@ impl CollaborationStore {
                 *self.requests.write().await = previous;
                 return Err(error);
             }
+            self.publish_change();
         }
         Ok(inbox)
     }
@@ -818,6 +844,7 @@ impl CollaborationStore {
             *self.requests.write().await = previous;
             return Err(error);
         }
+        self.publish_change();
         Ok(updated)
     }
 
@@ -852,8 +879,35 @@ impl CollaborationStore {
                 *self.requests.write().await = previous;
                 return Err(error);
             }
+            self.publish_change();
         }
         Ok(request)
+    }
+
+    /// Wait for one participant-visible request to become terminal without
+    /// polling. Subscription happens before the first read, closing the race
+    /// where a reply could land between observing `claimed` and beginning to
+    /// wait. A final authoritative read at the deadline covers a reply racing
+    /// with timeout and returns the latest non-terminal request on timeout.
+    pub async fn wait_for_terminal(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        self.ensure_enabled()?;
+        let mut changes = self.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let request = self.get_for(caller, request_id).await?;
+            if request.status.is_terminal() {
+                return Ok(request);
+            }
+            match tokio::time::timeout_at(deadline, changes.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return self.get_for(caller, request_id).await,
+            }
+        }
     }
 
     pub async fn list_for(
@@ -910,6 +964,7 @@ impl CollaborationStore {
             *self.requests.write().await = previous;
             return Err(error);
         }
+        self.publish_change();
         Ok(cancelled)
     }
 
@@ -962,8 +1017,10 @@ impl CollaborationStore {
         if changed {
             // The terminal injection already happened. Keep the in-memory
             // marker even if disk persistence fails so the live daemon does
-            // not inject the same wake every two seconds.
-            self.persist_current().await?;
+            // not inject the same wake on the next revision/reconcile scan.
+            let result = self.persist_current().await;
+            self.publish_change();
+            result?;
         }
         Ok(())
     }
@@ -986,7 +1043,9 @@ impl CollaborationStore {
         };
         if changed {
             // As above, a delivered side effect cannot be rolled back.
-            self.persist_current().await?;
+            let result = self.persist_current().await;
+            self.publish_change();
+            result?;
         }
         Ok(())
     }
@@ -1574,6 +1633,121 @@ mod tests {
         );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 0);
         assert!(mailbox.pending_reply_unnotified().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_changes_wake_every_subscriber() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut first = mailbox.subscribe();
+        let mut second = mailbox.subscribe();
+
+        mailbox
+            .create(
+                participant("%1", "sender"),
+                participant("%2", "recipient"),
+                NewRequest {
+                    kind: RequestKind::Question,
+                    body: "wake both subscribers".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(100), first.changed())
+            .await
+            .expect("first subscriber should wake")
+            .expect("change sender remains live");
+        tokio::time::timeout(Duration::from_millis(100), second.changed())
+            .await
+            .expect("second subscriber should wake")
+            .expect("change sender remains live");
+        assert_eq!(*first.borrow_and_update(), 1);
+        assert_eq!(*second.borrow_and_update(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_terminal_resumes_on_reply_without_polling() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "event-driven review".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_for(&recipient).await.unwrap();
+
+        let waiting_mailbox = mailbox.clone();
+        let waiting_sender = sender.clone();
+        let request_id = request.id.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_mailbox
+                .wait_for_terminal(&waiting_sender, &request_id, Duration::from_secs(2))
+                .await
+        });
+        tokio::task::yield_now().await;
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let completed = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("revision should wake the waiter immediately")
+            .expect("wait task should not panic")
+            .expect("wait should succeed");
+        assert_eq!(completed.status, RequestStatus::Completed);
+        assert_eq!(completed.reply.unwrap().body, "done");
+        assert_eq!(mailbox.unread_reply_count(&sender).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_terminal_timeout_returns_latest_authoritative_state() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let request = mailbox
+            .create(
+                sender.clone(),
+                participant("%2", "recipient"),
+                NewRequest {
+                    kind: RequestKind::Question,
+                    body: "not answered".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let latest = mailbox
+            .wait_for_terminal(&sender, &request.id, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(latest.status, RequestStatus::Queued);
+        assert_eq!(latest.id, request.id);
     }
 
     #[tokio::test]
