@@ -222,9 +222,10 @@ fn command_basename(cmd: &str) -> String {
 /// The bundled manifest sources, shipped in the binary via `include_str!`.
 /// These are muxa-authored and MUST parse — a parse failure is a build-time
 /// bug caught by [`tests::every_bundled_manifest_parses`].
-fn bundled_sources() -> [(&'static str, &'static str); 6] {
+fn bundled_sources() -> [(&'static str, &'static str); 7] {
     [
         ("agy", include_str!("screen/agents/agy.toml")),
+        ("codex", include_str!("screen/agents/codex.toml")),
         ("cursor", include_str!("screen/agents/cursor.toml")),
         ("amp", include_str!("screen/agents/amp.toml")),
         ("copilot", include_str!("screen/agents/copilot.toml")),
@@ -462,7 +463,7 @@ idle = ['^> $']
     #[test]
     fn every_bundled_manifest_parses() {
         let set = bundled_manifests();
-        assert_eq!(set.len(), 6);
+        assert_eq!(set.len(), bundled_sources().len());
         for m in &set {
             assert!(!m.name.is_empty());
         }
@@ -549,6 +550,33 @@ idle = ['^> $']
             m.classify("Allow access to this file?\n> Yes, allow access\n  No, deny access"),
             Some(ScreenState::Blocked),
         );
+        // Codex's startup gate, captured verbatim from a live pane. Note the
+        // cursor glyph: codex renders U+203A, and matching only ASCII `>` is
+        // exactly why muxa read a blocked agent as idle.
+        let codex = bundled_manifests()
+            .into_iter()
+            .find(|m| m.name == "codex")
+            .expect("codex manifest is bundled");
+        assert_eq!(
+            codex.classify(
+                "policies to load.\n› 1. Yes, continue\n  2. No, quit\n  Press enter to continue"
+            ),
+            Some(ScreenState::Blocked),
+            "codex startup gate must read as blocked",
+        );
+        // The same widget with an ASCII cursor still matches.
+        assert_eq!(
+            codex.classify("> 1. Yes, proceed\n  2. No"),
+            Some(ScreenState::Blocked),
+        );
+        // And ordinary output must not.
+        assert_eq!(
+            codex.classify("Steps:\n1. Yes it compiles\n2. No warnings remain"),
+            None,
+            "a plain numbered list is not a selection widget",
+        );
+        assert_eq!(codex.classify("› "), Some(ScreenState::Idle));
+
         // The folder-trust gate blocks the very first prompt of a session.
         assert_eq!(
             m.classify(
