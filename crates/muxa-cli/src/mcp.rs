@@ -1545,7 +1545,7 @@ async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config
         context: text("context"),
         dry_run: flag("dry_run"),
         show_prompts: false,
-        graph: false,
+        yes: true,
         no_ticket: flag("no_ticket"),
         refresh: flag("refresh"),
         json: true,

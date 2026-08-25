@@ -79,10 +79,9 @@ pub struct UpArgs {
     /// anything on it.
     #[arg(long)]
     pub show_prompts: bool,
-    /// Draw the pipeline as a dependency graph: what runs together, what
-    /// waits, and where this work currently sits in it.
-    #[arg(long)]
-    pub graph: bool,
+    /// Skip the confirmation before a billed ticket lookup.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -119,6 +118,10 @@ pub struct UpResult {
     /// The composed request, when the caller supplied one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<ComposedRequest>,
+    /// Dependency layout of the pipeline that produced this plan, so a
+    /// reader (or the dashboard) sees what runs together without
+    /// re-deriving it from the config.
+    pub graph: Vec<muxa::pipeline::GraphNode>,
     pub plan: Plan,
     pub launched: Vec<LaunchedAgent>,
     /// Aliases that were sent `--prompt`.
@@ -161,13 +164,9 @@ pub async fn run(
     let json = args.json;
     let dry_run = args.dry_run;
     let show_prompts = args.show_prompts;
-    let args_graph = args.graph;
     let resolved = resolve_or_onboard(&args, config, config_path, client).await?;
     if show_prompts {
         print_prompts(&resolved.desired);
-    }
-    if args_graph {
-        print_graph(&resolved.desired);
     }
     let result = apply(resolved, dry_run)?;
     if json {
@@ -268,6 +267,7 @@ fn finish(
         window,
         layout: resolved.layout,
         request: resolved.request,
+        graph: muxa::pipeline::graph(&resolved.desired),
         plan,
         launched,
         reprompted,
@@ -316,10 +316,14 @@ pub(crate) async fn resolve(
         }
     };
 
+    // Ask for the request first: it is free, and it is the last thing the
+    // operator can change once money starts moving.
+    let request = compose_request(args, config, &work)?;
+
     let ticket = if args.no_ticket {
         None
     } else {
-        resolve_ticket(&config.ticket, external_lookup, args.refresh).await?
+        resolve_ticket(&config.ticket, external_lookup, args.refresh, args.yes).await?
     };
 
     // Two ids because the two forms are both load-bearing: `work` is what
@@ -330,13 +334,6 @@ pub(crate) async fn resolve(
         vars = vars.with_ticket(ticket);
     }
 
-    // The caller's request is a var like any other, so a pipeline template
-    // can place it — and so it reaches the ticket-less path unchanged.
-    //
-    // Asked for when nothing was supplied: muxa has no idea what
-    // "cal-7210 callabo resolve" means and does not need to. It is opaque
-    // text the operator writes, carried to every agent verbatim.
-    let request = compose_request(args, config, &work)?;
     vars.set_opt(
         REQUEST_KEY,
         request.as_ref().map(|request| request.text.as_str()),
@@ -528,7 +525,12 @@ struct CachedTicket {
     ticket: Ticket,
 }
 
-async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Result<Option<Ticket>> {
+async fn resolve_ticket(
+    config: &TicketConfig,
+    id: &str,
+    refresh: bool,
+    assume_yes: bool,
+) -> Result<Option<Ticket>> {
     let Some((source_name, source)) = pipeline::select_source(config, id)? else {
         return Ok(None);
     };
@@ -538,12 +540,13 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
             return Ok(Some(ticket));
         }
     }
-    // Say what is being spawned before spawning it. Only on a cache miss:
-    // the common re-run costs nothing and does not need announcing.
-    eprintln!(
-        "resolving {id} via ticket source {source_name:?} — one headless {} turn, billed to your account",
-        config.agent
-    );
+    // Ask before spending, not after. Only on a cache miss: the common
+    // re-run costs nothing, so the prompt appears exactly when money would
+    // move — including under `--dry-run`, which skips creating panes but
+    // still pays for the lookup.
+    if !confirm_lookup(id, source_name, &config.agent, assume_yes)? {
+        return Ok(None);
+    }
     let prompt = Vars::new().set("id", id).render(&source.prompt);
     let cwd = config
         .cwd
@@ -833,6 +836,25 @@ fn compose_request(args: &UpArgs, config: &Config, work: &str) -> Result<Option<
     )?)
 }
 
+/// Ask before the lookup spends a turn.
+///
+/// `--dry-run` does not exempt this: it skips creating panes, not the
+/// agent turn that resolves the ticket, and an operator who reads "dry
+/// run" as "nothing happens" would be paying without being asked.
+fn confirm_lookup(id: &str, source: &str, agent: &str, assume_yes: bool) -> Result<bool> {
+    use std::io::IsTerminal;
+    println!("{id} is not cached. Looking it up costs one headless {agent} turn, billed to your account (source {source:?}).");
+    if assume_yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("looking up {id} spends a billed agent turn; pass --yes, or --no-ticket to skip it");
+    }
+    Ok(cliclack::confirm("Look it up?")
+        .initial_value(true)
+        .interact()?)
+}
+
 /// Ask what the agents should work on. Empty is a valid answer: a
 /// ticket-driven pipeline already knows the task.
 fn ask_for_request(work: &str) -> Result<Option<String>> {
@@ -880,49 +902,98 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
     })
 }
 
-/// One line per pipeline alias: what it is, and what it is doing.
+/// One line per pipeline alias, grouped by dependency depth.
+///
+/// The graph and the plan used to print as two blocks, so every agent
+/// appeared twice — once as a shape, once as a row — and neither view was
+/// complete on its own. They are the same thing: what runs when, and where
+/// it currently is. Grouping only kicks in when the pipeline actually has
+/// edges; a flat pipeline stays a flat list rather than gaining ceremony
+/// it does not need.
+///
+/// Glyphs stay inside Geometric Shapes U+25A0–25CF. The half-filled
+/// circles just past that range fall back to a different font in most
+/// terminals and render at the wrong size.
 fn print_plan_rows(result: &UpResult) {
-    for step in &result.plan.steps {
-        match step {
-            PlanStep::Launch(agent) => {
-                let pane = result
-                    .launched
-                    .iter()
-                    .find(|launched| launched.alias == agent.alias)
-                    .map_or_else(|| "-".to_string(), |launched| launched.pane.clone());
-                println!(
-                    "  + {:<10} {:<9} {:<12} {pane}",
-                    agent.alias,
-                    agent.program,
-                    agent.role.as_deref().unwrap_or("-")
-                );
-            }
-            PlanStep::Reprompt { alias, pane, .. } => {
-                println!("  » {alias:<10} {:<9} {:<12} {pane}", "prompted", "");
-            }
-            PlanStep::Keep { alias, pane, state } => {
-                println!(
-                    "  = {alias:<10} {:<9} {:<12} {pane}",
-                    state.map_or("running", state_label),
-                    ""
-                );
-            }
-            PlanStep::Waiting { alias, waiting_on } => {
-                println!(
-                    "  ⋯ {alias:<10} {:<9} {:<12} {}",
-                    "waiting",
-                    "after",
-                    waiting_on.join(", ")
-                );
-            }
-            PlanStep::Attention { alias, pane, state } => {
-                println!(
-                    "  ! {alias:<10} {:<9} {:<12} {pane}",
-                    state.map_or("blocked", state_label),
-                    "needs you"
-                );
-            }
+    let nodes = &result.graph;
+    let layered = nodes.iter().any(|node| node.depth > 0);
+    let mut depth = usize::MAX;
+    for node in nodes {
+        let Some(step) = result
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.alias() == node.alias)
+        else {
+            continue;
+        };
+        if layered && node.depth != depth {
+            depth = node.depth;
+            println!(
+                "  {}",
+                if depth == 0 {
+                    "now".to_string()
+                } else {
+                    format!("then · after {}", node.after.join(", "))
+                }
+            );
         }
+        let indent = if layered { "   " } else { "  " };
+        let (glyph, status, detail) = describe(step, result);
+        println!(
+            "{indent}{glyph} {:<10} {:<8} {:<10} {status:<9} {detail}",
+            node.alias,
+            node.program,
+            node.role.as_deref().unwrap_or("-"),
+        );
+    }
+    for extra in &result.plan.unclaimed {
+        println!(
+            "  ◇ {:<10} {:<8} {:<10} {:<9} {}",
+            extra.alias.as_deref().unwrap_or("(no alias)"),
+            extra.program,
+            "-",
+            "unclaimed",
+            extra.pane
+        );
+    }
+}
+
+/// Glyph, status word, and trailing detail for one alias.
+fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
+    match step {
+        PlanStep::Launch(agent) => {
+            let pane = result
+                .launched
+                .iter()
+                .find(|launched| launched.alias == agent.alias)
+                .map_or_else(String::new, |launched| launched.pane.clone());
+            (
+                '●',
+                if result.dry_run {
+                    "will start".into()
+                } else {
+                    "started".into()
+                },
+                pane,
+            )
+        }
+        PlanStep::Keep { pane, state, .. } => (
+            '●',
+            state.map_or("running", state_label).to_string(),
+            pane.clone(),
+        ),
+        PlanStep::Reprompt { pane, .. } => ('●', "prompted".into(), pane.clone()),
+        PlanStep::Waiting { waiting_on, .. } => (
+            '○',
+            "waiting".into(),
+            format!("for {}", waiting_on.join(", ")),
+        ),
+        PlanStep::Attention { pane, state, .. } => (
+            '◆',
+            state.map_or("blocked", state_label).to_string(),
+            format!("{pane}  needs you"),
+        ),
     }
 }
 
@@ -990,46 +1061,6 @@ fn print_prompts(desired: &[DesiredAgent]) {
             None => println!("(no prompt — starts interactive)\n"),
         }
     }
-}
-
-/// Draw the pipeline as layers of a dependency graph.
-///
-/// The config lists agents in a flat table array and buries the ordering
-/// in an `after` key, so the one thing an operator wants to know before
-/// paying for a run — what starts now and what waits — is the one thing
-/// the file does not show. Equal depth means parallel.
-///
-/// Glyphs stay inside Geometric Shapes U+25A0–25CF: the half-filled
-/// circles just past that range fall back to a different font in most
-/// terminals and render at the wrong size.
-fn print_graph(desired: &[DesiredAgent]) {
-    let nodes = muxa::pipeline::graph(desired);
-    println!("pipeline graph:\n");
-    let mut depth = usize::MAX;
-    for node in &nodes {
-        if node.depth != depth {
-            depth = node.depth;
-            let label = if depth == 0 {
-                "starts immediately".to_string()
-            } else {
-                format!("waits for depth {}", depth - 1)
-            };
-            println!("  ── {label} ──");
-        }
-        let glyph = if node.after.is_empty() { '●' } else { '○' };
-        println!(
-            "   {glyph} {:<10} {:<9} {:<12}{}",
-            node.alias,
-            node.program,
-            node.role.as_deref().unwrap_or("-"),
-            if node.after.is_empty() {
-                String::new()
-            } else {
-                format!("after {}", node.after.join(", "))
-            }
-        );
-    }
-    println!();
 }
 
 fn print_result(result: &UpResult) {
@@ -1127,7 +1158,7 @@ mod tests {
             context: None,
             dry_run: false,
             show_prompts: false,
-            graph: false,
+            yes: false,
             no_ticket: true,
             refresh: false,
             json: false,
