@@ -1690,7 +1690,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach via active window/pane or exact pane",
-        "  n              new window or sibling agent pane",
+        "  n / w          new window or agent pane / work up a pipeline",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -1759,6 +1759,17 @@ struct AskComposer {
     /// Ask shares the reusable text palette with message composition, but
     /// selection never changes the daemon-owned agent/permission contract.
     skill_palette: Option<MessageSkillPalette>,
+}
+
+/// The `w` composer: a work id, nothing else.
+///
+/// Deliberately not folded into [`AskComposer`]. Ask is a read-only question
+/// to a headless agent; this one spends money and creates panes, and the two
+/// wanting the same text box is not a reason to give them the same key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkComposer {
+    input: String,
+    cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2688,6 +2699,7 @@ pub(crate) struct App {
     spawn: Option<SpawnComposer>,
     /// `Some` while the `a` ask composer is open.
     ask_composer: Option<AskComposer>,
+    work_composer: Option<WorkComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
     /// Agent the next question goes to, as the daemon reports it.
@@ -2943,6 +2955,7 @@ impl App {
             collaboration_compose_defaults,
             spawn: None,
             ask_composer: None,
+            work_composer: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
             ask_agent: "claude".into(),
@@ -5646,6 +5659,82 @@ fn state_summary_gutter_spans(
 }
 
 #[cfg(test)]
+mod work_up_key_tests {
+    use super::*;
+
+    /// `normalize_work_id` only rejects tabs, newlines and over-long input, so
+    /// anything else a work id carries reaches a shell. It must arrive as one
+    /// argument, not as a second command.
+    #[test]
+    fn a_work_id_cannot_break_out_of_the_shell_command() {
+        let nasty = "cal-1'; rm -rf ~; echo '";
+        let args = work_up_window_args("/usr/bin/muxa", nasty);
+        let command = args.last().expect("command").clone();
+        // Every embedded quote is closed, escaped and reopened, so the whole
+        // id stays one word.
+        assert!(command.contains(&shell_quote(nasty)), "{command}");
+        // The only `; printf` is the one this function wrote.
+        assert_eq!(command.matches("; printf").count(), 1, "{command}");
+        assert!(!command.contains("; rm -rf ~; echo ';"), "{command}");
+    }
+
+    /// An install path with a space is ordinary on macOS.
+    #[test]
+    fn the_binary_path_is_quoted_too() {
+        let command = work_up_window_args("/Applications/My Tools/muxa", "CAL-1")
+            .last()
+            .expect("command")
+            .clone();
+        assert!(
+            command.starts_with("'/Applications/My Tools/muxa' work up 'CAL-1'"),
+            "{command}",
+        );
+    }
+
+    /// The window has to outlive the command, or the plan `work up` prints
+    /// scrolls past before it can be read.
+    #[test]
+    fn the_window_waits_before_closing() {
+        let args = work_up_window_args("/usr/bin/muxa", "CAL-1");
+        assert_eq!(args[0], "new-window");
+        assert!(args.last().expect("command").ends_with("read _"));
+    }
+
+    /// Enter on an empty field must not spawn anything.
+    #[test]
+    fn an_empty_work_id_is_refused_before_it_spends_anything() {
+        let mut app = App::new();
+        app.work_composer = Some(WorkComposer::default());
+        assert!(matches!(
+            handle_work_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app.work_composer.is_some(), "the composer stays open");
+
+        app.work_composer = Some(WorkComposer {
+            input: "cal-7229".into(),
+            cursor: 8,
+        });
+        assert!(matches!(
+            handle_work_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::SubmitWorkUp
+        ));
+    }
+
+    /// Backspace on an empty field closes the composer, matching `a`.
+    #[test]
+    fn backspace_on_an_empty_field_closes_the_composer() {
+        let mut app = App::new();
+        app.work_composer = Some(WorkComposer::default());
+        assert!(matches!(
+            handle_work_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app.work_composer.is_none());
+    }
+}
+
+#[cfg(test)]
 mod work_completion_tests {
     use super::*;
 
@@ -6927,6 +7016,20 @@ pub async fn run(
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
                 }
+                Action::OpenWorkUp => {
+                    app.work_composer = Some(WorkComposer::default());
+                }
+                Action::SubmitWorkUp => {
+                    if let Some(work) = app.work_composer.take() {
+                        match open_work_up_window(&work.input) {
+                            Ok(id) => app.set_hint(
+                                format!("work up {id} — confirm in the new window"),
+                                HintLevel::Ok,
+                            ),
+                            Err(e) => app.set_hint(format!("work up failed: {e}"), HintLevel::Err),
+                        }
+                    }
+                }
                 Action::OpenAsk => {
                     if let Ok(agent) = client.ask_agent(None).await {
                         app.ask_agent = agent;
@@ -8183,6 +8286,10 @@ fn drain_pending_events() -> io::Result<Vec<Event>> {
 
 #[derive(Debug)]
 pub(crate) enum Action {
+    /// Open the work composer (`w`).
+    OpenWorkUp,
+    /// Run `muxa work up` for whatever the composer holds.
+    SubmitWorkUp,
     None,
     Quit,
     Refresh,
@@ -8517,6 +8624,9 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_spawn_event(code, modifiers, app);
     }
 
+    if app.work_composer.is_some() {
+        return handle_work_composer_event(code, modifiers, app);
+    }
     if app.ask_composer.is_some() {
         return handle_ask_composer_event(code, modifiers, app);
     }
@@ -8721,6 +8831,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::InspectorSplitChanged
         }
         KeyCode::Char('a') if app.browse_keys_active() => Action::OpenAsk,
+        KeyCode::Char('w') if app.browse_keys_active() => Action::OpenWorkUp,
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_work_parent();
@@ -8857,6 +8968,92 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
 
 /// Ask composer: one field, Enter submits, `Ctrl-V` pastes. `/` opens the
 /// shared text-skill palette; it does not alter the daemon-owned ask contract.
+/// Open a tmux window running `muxa work up <id>` and hand the operator over
+/// to it.
+///
+/// Watch does not run the pipeline itself on purpose. `work up` resolves a
+/// ticket, which costs money, and the CLI already owns the flow that says so
+/// and waits for a yes. Re-implementing that inside the TUI would mean two
+/// places where muxa decides whether it may spend the operator's money, and
+/// the second one would be the one nobody reviewed. So the TUI's job ends at
+/// putting the operator in front of the real thing.
+fn open_work_up_window(raw: &str) -> std::result::Result<String, String> {
+    let work = crate::tmux_work::normalize_work_id(raw).map_err(|error| error.to_string())?;
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("locate the muxa binary: {error}"))?
+        .display()
+        .to_string();
+    let args = work_up_window_args(&exe, &work);
+    let output = muxa::tmux::tmux_command_scoped()
+        .args(&args)
+        .output()
+        .map_err(|error| format!("tmux: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(work)
+}
+
+/// The tmux argv for that window.
+///
+/// Split out to be tested without a tmux server, because the interesting part
+/// is the quoting: `normalize_work_id` rejects only tabs, newlines and
+/// over-long input, so a work id can still carry a quote or a semicolon and
+/// this string is handed to a shell.
+fn work_up_window_args(exe: &str, work: &str) -> Vec<String> {
+    let command = format!(
+        "{} work up {}; printf '\\n-- enter to close --'; read _",
+        shell_quote(exe),
+        shell_quote(work),
+    );
+    vec!["new-window".into(), "-n".into(), "work-up".into(), command]
+}
+
+/// POSIX single-quote quoting: wrap in `'`, and close/escape/reopen around any
+/// embedded `'`.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn handle_work_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    if code == KeyCode::Backspace
+        && app
+            .work_composer
+            .as_ref()
+            .is_some_and(|work| work.input.is_empty())
+    {
+        app.work_composer = None;
+        return Action::None;
+    }
+    let Some(work) = app.work_composer.as_mut() else {
+        return Action::None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.work_composer = None;
+            Action::None
+        }
+        KeyCode::Enter => {
+            if work.input.trim().is_empty() {
+                app.set_hint("work up needs a work id", HintLevel::Warn);
+                Action::None
+            } else {
+                Action::SubmitWorkUp
+            }
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(pasted) = system_clipboard_text() {
+                insert_str_at(&mut work.input, &mut work.cursor, &pasted);
+            }
+            Action::None
+        }
+        other => {
+            spawn_edit_text(other, modifiers, &mut work.input, &mut work.cursor);
+            Action::None
+        }
+    }
+}
+
 fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
     if app
         .ask_composer
@@ -10090,6 +10287,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_ask_panel(f, popup_area, app);
     }
+    render_work_composer_overlay(f, chunks[1], app);
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
@@ -10356,6 +10554,55 @@ fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
         y: r.y + r.height - height,
         width: r.width,
         height,
+    }
+}
+
+/// Draw the `w` composer over `area`, or nothing when it is closed. Folded
+/// into one call so `render` stays inside its line budget.
+fn render_work_composer_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if app.work_composer.is_none() {
+        return;
+    }
+    let popup_area = message_composer_rect(area, false);
+    f.render_widget(Clear, popup_area);
+    render_work_composer(f, popup_area, app);
+}
+
+fn render_work_composer(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(work) = app.work_composer.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " work up ",
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let view = truncate_prompt_input(&work.input, usize::from(inner.width.saturating_sub(2)));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("> "),
+            Span::raw(view.text.clone()),
+        ]))
+        .block(block),
+        area,
+    );
+    let before: String = view
+        .text
+        .chars()
+        .take(work.cursor.saturating_sub(view.skipped_chars))
+        .collect();
+    let x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
+    if x < inner.x + inner.width {
+        f.set_cursor_position((x, inner.y));
     }
 }
 
@@ -21859,6 +22106,10 @@ sort = ["state"]
                 app.preview = None;
                 app.pane_capture = None;
             }
+            Action::OpenWorkUp => app.work_composer = Some(WorkComposer::default()),
+            // The real handler shells out to tmux; the test harness stops at
+            // the state change so nothing spawns a window.
+            Action::SubmitWorkUp => app.work_composer = None,
             Action::TogglePreviewMode => {
                 if let Some(p) = app.preview.as_mut() {
                     p.mode = match p.mode {
@@ -22975,6 +23226,7 @@ sort = ["state"]
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
+        assert!(body.contains("n / w          new window or agent pane / work up a pipeline"));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.
