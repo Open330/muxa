@@ -130,6 +130,12 @@ pub enum RuntimeError {
 
     #[error("ipc request timed out after {0:?}")]
     Timeout(Duration),
+
+    /// The daemon answered, and said no. Carries the server's own message so
+    /// a refusal reaches the user as a refusal instead of being flattened
+    /// into an empty result — see [`decode_agents`].
+    #[error("{0}")]
+    Daemon(String),
 }
 
 impl RuntimeError {
@@ -2729,12 +2735,44 @@ fn collaboration_wait_is_unsupported(error: &str) -> bool {
     error.contains("unknown variant") && error.contains("collaboration_wait")
 }
 
-fn decode_agents(resp: &serde_json::Value) -> Vec<Agent> {
-    resp["agents"]
-        .as_array()
-        .cloned()
-        .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
-        .unwrap_or_default()
+/// Build the error for an `ok: false` response, from the daemon's own message.
+///
+/// A protocol mismatch gets a hint appended. It is the one refusal whose
+/// message names a cause the reader cannot act on — two version numbers say
+/// nothing about which half is stale or how to move it — and it is the
+/// refusal a mixed install produces every single call.
+fn response_error(resp: &serde_json::Value) -> RuntimeError {
+    let message = resp["error"].as_str().unwrap_or("request failed");
+    if message.starts_with("protocol mismatch") {
+        RuntimeError::Daemon(format!(
+            "{message} — the running daemon is older than this CLI. \
+             Restart it: `muxa upgrade` (add `--no-pull` to rebuild the current source)"
+        ))
+    } else {
+        RuntimeError::Daemon(message.to_string())
+    }
+}
+
+/// Decode the `agents` array out of a response, or surface the daemon's error.
+///
+/// The `ok` check is the point. A refusal and a genuinely empty registry are
+/// indistinguishable to a lenient decoder — neither carries an `agents` array
+/// — so returning `Vec::new()` for both turned every failure into "no active
+/// agents": a confident, wrong, and perfectly stable answer that looks like
+/// news about the user's agents rather than a broken connection.
+///
+/// Measured on a live host: a `muxad` built before the protocol 5 bump
+/// answered `protocol mismatch: server=4 client=5` to every request, and
+/// `muxa status` reported no agents for a full day while 58 were registered
+/// and the daemon was writing all 58 to its state snapshot every 30 seconds.
+fn decode_agents(resp: &serde_json::Value) -> Result<Vec<Agent>, RuntimeError> {
+    if !resp["ok"].as_bool().unwrap_or(false) {
+        return Err(response_error(resp));
+    }
+    let Some(agents) = resp["agents"].as_array().cloned() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(serde_json::Value::Array(agents)).map_err(RuntimeError::Json)
 }
 
 impl TransitionStream {
@@ -2834,7 +2872,7 @@ impl Client {
     pub async fn snapshot(&self) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     /// Read the central physical-host cache. This is a local Unix-socket
@@ -3287,7 +3325,7 @@ impl Client {
     ) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call_with_timeout(&req, deadline).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     pub async fn pipeline_runs(&self) -> Result<Vec<PipelineRun>, RuntimeError> {
@@ -3394,7 +3432,7 @@ impl Client {
             "pane": pane
         });
         let resp = self.call(&req).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     pub async fn by_pane_with_timeout(
@@ -3408,7 +3446,7 @@ impl Client {
             "pane": pane
         });
         let resp = self.call_with_timeout(&req, deadline).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     /// [`Self::recent_prompts`] under an explicit deadline, for callers on
@@ -3770,12 +3808,9 @@ impl Client {
         if resp["ok"].as_bool().unwrap_or(false) {
             Ok(resp)
         } else {
-            Err(RuntimeError::Json(serde::de::Error::custom(
-                resp["error"]
-                    .as_str()
-                    .unwrap_or("request failed")
-                    .to_string(),
-            )))
+            // One error shape for every refusal, so a protocol mismatch reads
+            // the same here as it does through `decode_agents`.
+            Err(response_error(&resp))
         }
     }
 }
@@ -3788,6 +3823,59 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
     use time::OffsetDateTime;
+
+    #[test]
+    fn decode_agents_surfaces_a_refusal_instead_of_an_empty_registry() {
+        // The regression this guards: an `ok:false` response carries no
+        // `agents` array, and the lenient decoder read that absence as "no
+        // agents". A refusal must not be able to impersonate an answer.
+        let resp = serde_json::json!({ "ok": false, "error": "store unavailable" });
+        let error = decode_agents(&resp).expect_err("a refusal must not decode as agents");
+        assert!(
+            matches!(&error, RuntimeError::Daemon(message) if message == "store unavailable"),
+            "expected the daemon's own message, got: {error}"
+        );
+    }
+
+    #[test]
+    fn decode_agents_explains_a_protocol_mismatch() {
+        // Two bare version numbers do not tell the reader which half is stale
+        // or what to do about it, and a mixed install answers this to every
+        // single call — so this is the one refusal that earns a hint.
+        let resp = serde_json::json!({
+            "ok": false,
+            "error": "protocol mismatch: server=4 client=5",
+        });
+        let error = decode_agents(&resp).expect_err("a mismatch must not decode as agents");
+        let message = error.to_string();
+        assert!(
+            message.contains("protocol mismatch: server=4 client=5"),
+            "{message}"
+        );
+        assert!(message.contains("older than this CLI"), "{message}");
+        assert!(message.contains("muxa upgrade"), "{message}");
+    }
+
+    #[test]
+    fn decode_agents_keeps_a_genuinely_empty_registry_empty() {
+        // The other half of the distinction: a successful response really can
+        // carry no agents, and that must still read as none rather than as an
+        // error. Both the explicit empty array and an absent field count.
+        assert!(
+            decode_agents(&serde_json::json!({ "ok": true, "agents": [] }))
+                .expect("an empty registry is a valid answer")
+                .is_empty()
+        );
+        assert!(decode_agents(&serde_json::json!({ "ok": true }))
+            .expect("an absent agents field is a valid answer")
+            .is_empty());
+    }
+
+    #[test]
+    fn response_error_falls_back_when_the_daemon_sends_no_message() {
+        let error = response_error(&serde_json::json!({ "ok": false }));
+        assert_eq!(error.to_string(), "request failed");
+    }
 
     struct CollaborationTestBackend {
         panes: Vec<PaneInfo>,

@@ -206,6 +206,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A refused IPC request no longer reports "no active agents".** `snapshot`,
+  `by_pane`, and their timeout variants handed the response straight to a
+  lenient decoder that read the absent `agents` array as an empty registry, so
+  every daemon refusal became a confident, wrong, and perfectly stable answer
+  — and exited 0. The failure this hides in practice is a mixed install: a
+  `muxad` predating the protocol 5 bump answers `protocol mismatch: server=4
+  client=5` to every call, and `muxa status` reported no agents for a full day
+  on a host with 58 registered. Refusals now surface as `RuntimeError::Daemon`
+  carrying the daemon's own message, a protocol mismatch adds the restart it
+  needs, and a genuinely empty registry still reads as empty.
+
 - **Jumping from watch no longer drags a second terminal off its window.** The
   jump addressed the target as a bare pane id, which names a pane but not a
   session; tmux filled the gap from recent client activity. Under a session
