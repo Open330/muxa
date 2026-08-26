@@ -512,7 +512,7 @@ fn local_sessions_for_backend(kind: HostKind) -> Vec<SessionInfo> {
                 })
                 .collect()
         }
-        HostKind::Rmux | HostKind::Zellij => Vec::new(),
+        HostKind::Cmux | HostKind::Rmux | HostKind::Zellij => Vec::new(),
     }
 }
 

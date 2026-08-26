@@ -1681,7 +1681,7 @@ fn spawn_session_activity_task(
             muxa::HostKind::Herdr => sources.push(muxa::SessionActivitySource::Herdr {
                 socket_path: muxa::backend::herdr::default_socket_path(),
             }),
-            muxa::HostKind::Rmux | muxa::HostKind::Zellij => {}
+            muxa::HostKind::Cmux | muxa::HostKind::Rmux | muxa::HostKind::Zellij => {}
         }
     }
     let source_kinds: Vec<muxa::HostKind> = backends

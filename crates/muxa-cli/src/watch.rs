@@ -5021,6 +5021,7 @@ fn sort_agents(
 fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
     match host {
         Some(muxa::HostKind::Tmux) => format!("tmux:{session}"),
+        Some(muxa::HostKind::Cmux) => format!("cmux:{session}"),
         Some(muxa::HostKind::Rmux) => format!("rmux:{session}"),
         Some(muxa::HostKind::Herdr) => format!("herdr:{session}"),
         Some(muxa::HostKind::Zellij) => format!("zellij:{session}"),
@@ -5439,6 +5440,7 @@ fn rows_multi_host(rows: &[WatchRow]) -> bool {
 fn host_badge_label(host: muxa::HostKind) -> &'static str {
     match host {
         muxa::HostKind::Tmux => "tmux",
+        muxa::HostKind::Cmux => "cmux",
         muxa::HostKind::Rmux => "rmux",
         muxa::HostKind::Zellij => "zellij",
         muxa::HostKind::Herdr => "herdr",
@@ -6551,7 +6553,7 @@ fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
                 })
                 .collect()
         }
-        muxa::HostKind::Rmux | muxa::HostKind::Zellij => Vec::new(),
+        muxa::HostKind::Cmux | muxa::HostKind::Rmux | muxa::HostKind::Zellij => Vec::new(),
     }
 }
 
@@ -6768,6 +6770,7 @@ fn current_backend_endpoint(host: muxa::HostKind, pane_id: &str) -> Option<Backe
                 .filter(|socket| !socket.trim().is_empty())
         }),
         muxa::HostKind::Rmux => muxa::backend::rmux::endpoint_from_env(),
+        muxa::HostKind::Cmux => Some(muxa::backend::cmux::endpoint_from_env()),
         muxa::HostKind::Zellij => Some("zellij".into()),
         muxa::HostKind::Herdr => Some("herdr".into()),
     }?;
@@ -7587,6 +7590,7 @@ fn watch_collaboration_origin_from(
     let pane = initial_pane.filter(|pane| !pane.is_empty());
     let socket = pane.as_deref().and_then(|pane| {
         let endpoint = match muxa::backend::pane_id_host_kind(pane)? {
+            muxa::HostKind::Cmux => Some(muxa::backend::cmux::endpoint_from_env()),
             muxa::HostKind::Rmux => rmux,
             muxa::HostKind::Tmux => tmux,
             muxa::HostKind::Zellij | muxa::HostKind::Herdr => None,

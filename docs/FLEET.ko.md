@@ -18,7 +18,7 @@ host마다 독립적인 OpenSSH process 하나를 유지합니다. 원격에서�
 통신합니다. 원격 TCP port를 열거나 agent socket을 forwarding하지 않으며 terminal
 내용도 상시 복제하지 않습니다.
 
-여기서 Fleet host는 물리 node입니다. 기존 문서에서 사용하던 tmux/rmux/herdr/
+여기서 Fleet host는 물리 node입니다. 기존 문서에서 사용하던 tmux/cmux/rmux/herdr/
 zellij “pane host”는 각 node 내부의 backend kind로 그대로 유지됩니다.
 
 ## 준비

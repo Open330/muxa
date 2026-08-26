@@ -118,6 +118,7 @@ pub enum AgentState {
 #[strum(serialize_all = "snake_case")]
 pub enum SurfaceKind {
     Tmux,
+    Cmux,
     Zellij,
     Pty,
 }
@@ -126,6 +127,10 @@ pub enum SurfaceKind {
 pub struct SurfaceRef {
     pub kind: SurfaceKind,
     pub id: String,
+    /// Optional backend-native parent context. cmux uses its workspace UUID;
+    /// muxa-owned PTY sessions and legacy snapshots leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// Identity of an agent instance.

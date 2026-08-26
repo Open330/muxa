@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::backend::{pane_endpoint_identity, pane_id_host_kind, HostKind};
-use crate::event::AgentState;
+use crate::event::{AgentState, SurfaceKind};
 use crate::state::Agent;
 use crate::tmux::PaneInfo;
 
@@ -126,6 +126,12 @@ impl BackendTopologyCapabilities {
             HostKind::Herdr => Self {
                 host,
                 session: HierarchyCapability::Mapped,
+                window: HierarchyCapability::Mapped,
+                pane: HierarchyCapability::Native,
+            },
+            HostKind::Cmux => Self {
+                host,
+                session: HierarchyCapability::Native,
                 window: HierarchyCapability::Mapped,
                 pane: HierarchyCapability::Native,
             },
@@ -400,6 +406,7 @@ impl TopologySnapshot {
                 unmapped_panes.extend(input.panes);
             }
         }
+        append_cmux_hook_panes(&mut pane_rows, &agents, &mut capabilities);
         capabilities.sort_by_key(|caps| caps.host);
 
         let candidate_counts = pane_candidate_counts(&pane_rows);
@@ -602,6 +609,7 @@ fn stable_window_id(pane: &PaneInfo) -> String {
 fn default_socket(host: HostKind) -> &'static str {
     match host {
         HostKind::Tmux | HostKind::Rmux => "default",
+        HostKind::Cmux => "cmux",
         HostKind::Zellij => "zellij",
         HostKind::Herdr => "herdr",
     }
@@ -621,6 +629,75 @@ fn pane_candidate_counts(panes: &[(HostKind, PaneInfo)]) -> HashMap<(HostKind, S
         *counts.entry((*host, pane.pane_id.clone())).or_default() += 1;
     }
     counts
+}
+
+/// Turn authoritative cmux hook metadata into a topology pane when the
+/// environment-only backend cannot enumerate that surface. This is not a fake
+/// durable Work node: the hook supplies the exact surface UUID, workspace UUID,
+/// and socket endpoint, so the row is an execution binding with the same shape
+/// a future full cmux inventory scan will produce.
+fn append_cmux_hook_panes(
+    panes: &mut Vec<(HostKind, PaneInfo)>,
+    agents: &[Agent],
+    capabilities: &mut Vec<BackendTopologyCapabilities>,
+) {
+    for agent in agents {
+        let Some(surface) = agent
+            .surface
+            .as_ref()
+            .filter(|surface| surface.kind == SurfaceKind::Cmux)
+        else {
+            continue;
+        };
+        let Some(workspace) = surface
+            .workspace
+            .as_deref()
+            .filter(|workspace| !workspace.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(pane_id) = agent.pane.as_deref() else {
+            continue;
+        };
+        if pane_id != crate::backend::cmux::namespace_pane_id(&surface.id) {
+            continue;
+        }
+        let wanted_endpoint = agent.tmux_socket.as_deref().map_or_else(
+            || default_socket(HostKind::Cmux).to_string(),
+            |socket| pane_endpoint_identity(Some(pane_id), socket),
+        );
+        let already_observed = panes.iter().any(|(host, pane)| {
+            *host == HostKind::Cmux
+                && pane.pane_id == pane_id
+                && endpoint_for(*host, pane).socket == wanted_endpoint
+        });
+        if already_observed {
+            continue;
+        }
+        if !capabilities.iter().any(|caps| caps.host == HostKind::Cmux) {
+            capabilities.push(BackendTopologyCapabilities::for_host(HostKind::Cmux));
+        }
+        panes.push((
+            HostKind::Cmux,
+            PaneInfo {
+                agent_role: None,
+                agent_alias: None,
+                socket: agent.tmux_socket.clone(),
+                pane_id: pane_id.to_string(),
+                session_id: workspace.to_string(),
+                session: workspace.to_string(),
+                window_id: workspace.to_string(),
+                window_name: String::new(),
+                window_index: "0".into(),
+                pane_index: "0".into(),
+                tty: String::new(),
+                current_command: agent.kind.to_string(),
+                title: String::new(),
+                pane_pid: agent.pid.unwrap_or(0),
+                current_path: agent.cwd.clone().unwrap_or_default(),
+            },
+        ));
+    }
 }
 
 fn matching_agent(
@@ -655,7 +732,7 @@ fn matching_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::AgentKind;
+    use crate::event::{AgentKind, SurfaceRef};
     use crate::process_tree::WorkloadSummary;
 
     struct IsolatedTmuxServers(Vec<std::path::PathBuf>);
@@ -813,6 +890,35 @@ mod tests {
             snapshot.capabilities[0].session,
             HierarchyCapability::Unsupported
         );
+    }
+
+    #[test]
+    fn cmux_hook_metadata_builds_workspace_topology_without_daemon_env() {
+        let mut hooked = agent("cmux-agent", Some("/tmp/cmux-debug.sock"));
+        hooked.pane = Some("cmux:surface-7".into());
+        hooked.surface = Some(SurfaceRef {
+            kind: SurfaceKind::Cmux,
+            id: "surface-7".into(),
+            workspace: Some("workspace-2".into()),
+        });
+
+        let snapshot =
+            TopologySnapshot::build(OffsetDateTime::UNIX_EPOCH, Vec::new(), vec![hooked]);
+
+        assert_eq!(snapshot.sessions.len(), 1);
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.key.endpoint.host, HostKind::Cmux);
+        assert_eq!(session.key.endpoint.socket, "/tmp/cmux-debug.sock");
+        assert_eq!(session.key.session_id, "workspace-2");
+        assert_eq!(session.windows[0].panes[0].key.pane_id, "cmux:surface-7");
+        assert_eq!(
+            session.windows[0].panes[0]
+                .agent
+                .as_ref()
+                .map(|agent| agent.session_id.as_str()),
+            Some("cmux-agent"),
+        );
+        assert!(snapshot.unassigned_agents.is_empty());
     }
 
     /// Exercise the contract against two real isolated tmux servers. Each

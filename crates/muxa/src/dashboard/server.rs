@@ -287,10 +287,10 @@ fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> sca
         .into_iter()
         .map(|pane| {
             let socket = match kind {
-                HostKind::Rmux => pane
+                HostKind::Rmux | HostKind::Cmux => pane
                     .socket
                     .as_deref()
-                    .map_or_else(|| PathBuf::from("rmux"), PathBuf::from),
+                    .map_or_else(|| PathBuf::from(kind.to_string()), PathBuf::from),
                 HostKind::Herdr => PathBuf::from("herdr"),
                 HostKind::Zellij => PathBuf::from("zellij"),
                 HostKind::Tmux => pane

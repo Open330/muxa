@@ -296,8 +296,8 @@ forward합니다. 자세한 내용은 [SINKS.md](SINKS.md).
 
 ## Pane host 선택
 
-`MUXA_HOST=tmux|rmux|herdr|zellij`로 단일 host를 고정할 수 있습니다.
+`MUXA_HOST=tmux|cmux|rmux|herdr|zellij`로 단일 host를 고정할 수 있습니다.
 `MUXA_HOSTS`에는 `MUXA_HOSTS=rmux,tmux`처럼 순서가 있는 host 목록을 지정합니다.
 rmux가 tmux 호환 환경변수도 함께 설정하므로 native `RMUX` 환경변수를 먼저
-판별합니다. 자세한 내용은 [RMUX.md](RMUX.md), [HERDR.md](HERDR.md),
+판별합니다. 자세한 내용은 [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md),
 [ZELLIJ.md](ZELLIJ.md)을 참고하세요.

@@ -11,6 +11,7 @@
 use crate::theme::TableTone;
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
+use muxa::ipc::Client;
 use muxa::work::{WorkRecord, WorkStage};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -195,6 +196,10 @@ pub enum ManageResult {
         action: AgentControlAction,
         pane: String,
     },
+    SessionControl {
+        action: AgentControlAction,
+        session: String,
+    },
     WorkClosed {
         work: String,
         workspace: String,
@@ -209,10 +214,13 @@ pub enum ManageResult {
 
 #[derive(Debug, clap::Args)]
 pub struct AgentControlArgs {
-    /// Exact managed tmux pane id, for example %42.
-    #[arg(long)]
-    pub pane: String,
-    /// Interrupt the current turn or terminate the whole pane.
+    /// Exact managed tmux pane id, for example %42. Conflicts with --session.
+    #[arg(long, required_unless_present = "session", conflicts_with = "session")]
+    pub pane: Option<String>,
+    /// Muxa-owned native PTY session id or display name. Conflicts with --pane.
+    #[arg(long, required_unless_present = "pane", conflicts_with = "pane")]
+    pub session: Option<String>,
+    /// Interrupt the current turn or terminate the whole pane/session.
     #[arg(long, value_enum)]
     pub action: AgentControlAction,
     /// Confirm the destructive terminate action.
@@ -330,17 +338,51 @@ pub struct WorkspaceCloseArgs {
     pub json: bool,
 }
 
-pub fn run_agent_control(args: AgentControlArgs) -> Result<()> {
-    if args.action == AgentControlAction::Terminate
-        && !confirm_destructive(
-            args.yes,
-            &format!("Terminate managed agent pane {}?", args.pane),
-        )?
-    {
-        println!("cancelled");
-        return Ok(());
-    }
-    let result = control_agent(&args.pane, args.action, args.yes)?;
+pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {
+    let result = if let Some(session) = args.session.as_deref() {
+        let sessions = client
+            .list_sessions()
+            .await
+            .context("listing native muxa sessions")?;
+        let session_id = sessions
+            .iter()
+            .find(|candidate| {
+                candidate.id == session || candidate.display_name.as_deref() == Some(session)
+            })
+            .map_or_else(|| session.to_string(), |candidate| candidate.id.clone());
+        if args.action == AgentControlAction::Terminate
+            && !confirm_destructive(
+                args.yes,
+                &format!("Terminate native agent session {session_id}?"),
+            )?
+        {
+            println!("cancelled");
+            return Ok(());
+        }
+        match args.action {
+            AgentControlAction::Interrupt => client
+                .write_session(&session_id, "\u{3}")
+                .await
+                .context("interrupting native agent session")?,
+            AgentControlAction::Terminate => client
+                .terminate_session(&session_id)
+                .await
+                .context("terminating native agent session")?,
+        }
+        ManageResult::SessionControl {
+            action: args.action,
+            session: session_id,
+        }
+    } else {
+        let pane = args.pane.as_deref().expect("clap requires pane or session");
+        if args.action == AgentControlAction::Terminate
+            && !confirm_destructive(args.yes, &format!("Terminate managed agent pane {pane}?"))?
+        {
+            println!("cancelled");
+            return Ok(());
+        }
+        control_agent(pane, args.action, args.yes)?
+    };
     print_result(&result, args.json)
 }
 
@@ -1876,6 +1918,9 @@ fn print_result(result: &ManageResult, json: bool) -> Result<()> {
         match result {
             ManageResult::AgentControl { action, pane } => {
                 println!("{action:?} agent pane {pane}");
+            }
+            ManageResult::SessionControl { action, session } => {
+                println!("{action:?} native agent session {session}");
             }
             ManageResult::WorkClosed {
                 work,

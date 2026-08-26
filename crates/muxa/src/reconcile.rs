@@ -161,10 +161,12 @@ impl<L: LivenessSource> Reconciler<L> {
     /// multi-host analog of [`Self::new`]. Every source is observed
     /// concurrently and reconciled under its own [`HostKind`]; the ghost
     /// age-out sweep ([`Store::mark_stale_cross_host_stopped`](crate::state::Store::mark_stale_cross_host_stopped))
-    /// receives the kinds whose observation was *complete* this tick, so a row
-    /// on a host that answered is governed by that host's reconcile pass while a
-    /// row on a host NOT in the set — or one that can't answer past the
-    /// inactivity window — ages out. An empty `sources` degrades to a store-maintenance-only
+    /// receives complete kinds plus intentionally-partial kinds. A complete
+    /// source governs its rows directly; a partial source (such as cmux's
+    /// current-surface-only adapter) protects hook-authoritative rows it cannot
+    /// enumerate. A host outside the set, or a normally-authoritative source
+    /// that cannot answer past the inactivity window, ages out. An empty
+    /// `sources` degrades to a store-maintenance-only
     /// loop (no observation, but the stuck/paneless/codex sweeps still run);
     /// the daemon never constructs one that way — `active_backends()` is never
     /// empty.
@@ -407,6 +409,17 @@ impl<L: LivenessSource> Reconciler<L> {
             .filter(|(_, o)| o.is_complete())
             .map(|(k, _)| *k)
             .collect();
+        // Complete scans govern their namespace directly. Intentionally
+        // partial adapters cannot use absence as negative liveness evidence,
+        // but their successful partial observation still proves the host is
+        // structurally present and must protect hook rows from cross-host
+        // stale aging. Transiently incomplete/failed scans do not join this
+        // set and retain the existing 24h age-out behavior.
+        let stale_protected_kinds: Vec<HostKind> = observations
+            .iter()
+            .filter(|(_, o)| o.protects_stale_rows())
+            .map(|(k, _)| *k)
+            .collect();
         let total_panes: usize = observations.iter().map(|(_, o)| o.panes.len()).sum();
         // Fix 3/5: the union of panes from COMPLETE observations only. An
         // incompletely-observed host contributes no panes, so its rows are
@@ -503,26 +516,25 @@ impl<L: LivenessSource> Reconciler<L> {
                 "orphan-row sweep flipped {stale_paneless} paneless agent(s) to Stopped",
             );
         }
-        // Age out rows whose pane belongs to a host that did NOT answer with a
-        // complete observation this tick (e.g. a `zellij:` row while the set is
-        // tmux + herdr, a `herdr:` row left behind after narrowing the set back
-        // to tmux, or a host in the set that is chronically unable to answer).
+        // Age out rows whose pane belongs to a host that neither answered with
+        // a complete observation nor intentionally exposes a partial namespace
+        // this tick (e.g. a `zellij:` row while the set is tmux + herdr, a
+        // `herdr:` row left behind after narrowing the set back to tmux, or a
+        // normally-authoritative host that is chronically unable to answer).
         // The cross-host guard exempts foreign rows from *immediate* reaping,
         // and no observation reaps them, so without this they'd ghost forever.
-        // Fix 4: pass the COMPLETE-this-tick kinds, not every kind in the set —
-        // a host that answers governs its rows via reaping and is spared here,
-        // while a host that can't answer past the inactivity window ages out
-        // exactly like a host outside the set. Transient incompleteness is safe:
-        // the threshold is the (24h-default) paneless window on last-activity,
-        // not a single tick. Same inactivity window as the paneless sweep.
+        // Pass complete + intentionally-partial kinds, not every configured
+        // kind. A failed authoritative host still ages out after the inactivity
+        // window, while a structurally partial host such as cmux never turns an
+        // unobserved-but-valid surface into a false Stopped row.
         let stale_cross_host = self
             .store
-            .mark_stale_cross_host_stopped(&complete_kinds, self.paneless_stale_timeout)
+            .mark_stale_cross_host_stopped(&stale_protected_kinds, self.paneless_stale_timeout)
             .await;
         if stale_cross_host > 0 {
             tracing::info!(
                 stale_cross_host,
-                complete = ?complete_kinds,
+                protected = ?stale_protected_kinds,
                 "cross-host sweep flipped {stale_cross_host} foreign-host agent(s) to Stopped",
             );
         }
@@ -662,6 +674,12 @@ mod tests {
         fn incomplete(panes: Vec<PaneInfo>) -> Self {
             Self {
                 observation: Mutex::new(PaneObservation::incomplete(panes)),
+                kind: HostKind::Tmux,
+            }
+        }
+        fn partial(panes: Vec<PaneInfo>) -> Self {
+            Self {
+                observation: Mutex::new(PaneObservation::partial(panes)),
                 kind: HostKind::Tmux,
             }
         }
@@ -889,6 +907,33 @@ mod tests {
                 .map(|a| a.state),
             Some(AgentState::Idle),
             "a freshly-active row on the same host survives",
+        );
+    }
+
+    #[tokio::test]
+    async fn intentionally_partial_host_protects_unobserved_hook_rows() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&started("cmux-unobserved", "cmux:surface-2", old))
+            .await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        // cmux's first slice deliberately sees only the invoking surface. An
+        // empty partial result is not evidence that another hooked surface
+        // exited, even when its last event is older than the stale window.
+        let cmux = FakeLiveness::partial(Vec::new()).with_kind(HostKind::Cmux);
+        let r =
+            Reconciler::with_sources(store.clone(), vec![tmux, cmux], Duration::from_millis(10))
+                .with_paneless_stale_timeout(Duration::from_secs(1));
+        r.reconcile_once().await;
+
+        assert_eq!(
+            store
+                .by_session("cmux-unobserved")
+                .await
+                .map(|agent| agent.state),
+            Some(AgentState::Idle),
         );
     }
 

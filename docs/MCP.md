@@ -34,7 +34,7 @@ args = ["mcp"]
 env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 ```
 
-This preserves the exact pane, tmux/rmux endpoint, and non-default muxa socket.
+This preserves the exact pane, tmux/cmux/rmux endpoint, and non-default muxa socket.
 For existing Codex registrations, muxa can recover a default-endpoint pane by
 walking the MCP process ancestry across active backends back to the pane shell.
 Explicit forwarding remains the reliable configuration for custom or multiple
@@ -138,7 +138,7 @@ it:
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
-only reaches the focused pane. tmux, rmux, and herdr support it.
+only reaches the focused pane. tmux, cmux, rmux, and herdr support targeted input.
 
 Pane ids carry their host namespace: tmux `%12`, rmux `rmux:%12`, herdr
 `herdr:p1`. Use the `pane` field from `muxa_status` verbatim.

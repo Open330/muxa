@@ -302,8 +302,8 @@ prompts to oh-my-prompt. See [SINKS.md](SINKS.md).
 
 ## Pane host selection
 
-`MUXA_HOST=tmux|rmux|herdr|zellij` pins a single host. `MUXA_HOSTS` accepts an
+`MUXA_HOST=tmux|cmux|rmux|herdr|zellij` pins a single host. `MUXA_HOSTS` accepts an
 ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
 `RMUX` variables take precedence over the `TMUX` compatibility variables it
-also exports. See [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
+also exports. See [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
 [ZELLIJ.md](ZELLIJ.md).
