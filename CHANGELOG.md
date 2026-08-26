@@ -206,6 +206,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A workspace open in two terminals is one tree again.** A tmux session group
+  shares one window list across several sessions — the supported way to put two
+  terminals on two Work windows of one workspace — and `list-panes -a` walks
+  sessions, so it reports every pane once per member. Topology showed the same
+  workspace two or three times over, with the agent attached to whichever copy
+  was scanned first and the rest rendered as bare panes. Grouped sessions now
+  fold onto the member the group is named after, deduplicated by pane; if that
+  session is gone the choice falls back to the lexically first id so it stays
+  put across ticks. `watch` sums `attached_clients` across the group, since the
+  members it no longer shows are still terminals on that workspace. `PaneInfo`
+  and `SessionInfo` carry `#{session_group}`, both `serde(default)` for peers
+  built before the field.
+
 - **A refused IPC request no longer reports "no active agents".** `snapshot`,
   `by_pane`, and their timeout variants handed the response straight to a
   lenient decoder that read the absent `agents` array as an empty registry, so

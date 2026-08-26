@@ -4115,6 +4115,7 @@ mod tests {
                 observed_at: OffsetDateTime::now_utc(),
                 agents: Vec::new(),
                 panes: vec![PaneInfo {
+                    session_group: None,
                     agent_role: None,
                     agent_alias: None,
                     pane_id: "%1".into(),

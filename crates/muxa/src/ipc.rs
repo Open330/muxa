@@ -3919,6 +3919,7 @@ mod tests {
 
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             pane_id: pane_id.into(),
@@ -5162,6 +5163,7 @@ mod tests {
         assert!(backend.list_panes().is_empty());
 
         let pane = PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
