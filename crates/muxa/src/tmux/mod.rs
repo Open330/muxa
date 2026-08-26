@@ -933,6 +933,79 @@ pub fn current_client() -> Option<String> {
     (!client.is_empty()).then(|| client.to_string())
 }
 
+/// The stable session id (`$N`) the named client is currently attached to,
+/// on the server identified by `socket` (`None` ⇒ env-scoped default).
+///
+/// Pinned with `-t <client>` so the answer describes *that* terminal.
+/// An unpinned `display-message` resolves against whichever client tmux
+/// last saw activity on, which with two terminals attached is routinely
+/// the other one — the same hazard [`current_client`] documents.
+///
+/// `None` when tmux is unavailable, the client has detached mid-call, or
+/// the field comes back empty; callers treat that as "session unknown".
+pub fn client_session_id_on(socket: Option<&str>, client: &str) -> Option<String> {
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(["display-message", "-p", "-t", client, "#{session_id}"]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux display-message -t {client}"),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let session = stdout.lines().next().unwrap_or("").trim();
+    (!session.is_empty()).then(|| session.to_string())
+}
+
+/// Whether `window_id` (`@N`) is linked into the session `session_id` (`$N`)
+/// on `socket`.
+///
+/// One window belongs to exactly one session in an ordinary tmux server, so
+/// this is normally just "is that the pane's session". It stops being a
+/// tautology under a *session group* (`tmux new-session -t <session>`), where
+/// one window is linked into every session in the group — which is what the
+/// jump path needs to know before it can address a window without guessing.
+///
+/// `false` on any failure: the caller's fallback is the un-qualified target
+/// it used before, so a failed probe degrades to the old behaviour rather
+/// than to a broken one.
+pub fn window_in_session_on(socket: Option<&str>, session_id: &str, window_id: &str) -> bool {
+    if session_id.is_empty() || window_id.is_empty() {
+        return false;
+    }
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(["list-windows", "-t", session_id, "-F", "#{window_id}"]);
+    let Ok(out) = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux list-windows -t {session_id}"),
+    ) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(out.stdout) else {
+        return false;
+    };
+    window_listed(&stdout, window_id)
+}
+
+/// Whether `list-windows -F '#{window_id}'` output contains exactly
+/// `window_id`.
+///
+/// Split out from [`window_in_session_on`] so the match rule is testable
+/// without a tmux server. Equality, never a prefix or substring: tmux window
+/// ids are `@` plus a decimal counter, so `@1` is a prefix of `@10` and a
+/// looser rule would report a window as linked into a session that has a
+/// different, higher-numbered one.
+fn window_listed(stdout: &str, window_id: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == window_id)
+}
+
 pub fn current_pane() -> Option<String> {
     if let Some(p) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) {
         return Some(p);
@@ -1031,6 +1104,26 @@ pub(crate) fn parse_pane_pid_map(stdout: &str) -> std::collections::HashMap<u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_listed_matches_whole_ids_only() {
+        let listing = "@0\n@1\n@12\n";
+        assert!(window_listed(listing, "@1"));
+        assert!(window_listed(listing, "@12"));
+        // `@1` is a prefix of `@12`, and `@2` a suffix — neither is a match.
+        assert!(!window_listed(listing, "@2"));
+        assert!(!window_listed(listing, "@120"));
+        // `lines()` yields no entry for the trailing newline, so an empty
+        // needle finds nothing here either; `window_in_session_on` rejects
+        // an empty id up front regardless.
+        assert!(!window_listed(listing, ""));
+    }
+
+    #[test]
+    fn window_listed_tolerates_padding_and_empty_output() {
+        assert!(window_listed("  @7  \n", "@7"));
+        assert!(!window_listed("", "@7"));
+    }
 
     /// Locks the `send-keys` argv shape: literal (`-l`) injection targeting
     /// the pane id, with `--` terminating options and the text passed verbatim

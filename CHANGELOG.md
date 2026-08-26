@@ -206,6 +206,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Jumping from watch no longer drags a second terminal off its window.** The
+  jump addressed the target as a bare pane id, which names a pane but not a
+  session; tmux filled the gap from recent client activity. Under a session
+  group — `tmux new-session -t <session>`, the supported way to keep two
+  terminals on two Work windows of one workspace — the same window is linked
+  into several sessions, and the guess was routinely wrong: measured on tmux
+  3.4, jumping one client pulled it into the grouped sibling and dragged the
+  other terminal's view along, re-coupling the terminals the group exists to
+  separate. Jumps now address the window as `<session_id>:<window_id>`,
+  preferring the asking client's own session when the window is linked there
+  and otherwise the pane's recorded session, so a cross-session jump is
+  deterministic instead of activity-dependent. The bare-shell path carried the
+  same defect more visibly — its pre-attach `select-window` moved a grouped
+  bystander session and left the session it then attached to on the wrong
+  window — and it now targets the session it is about to attach. That attach
+  also addresses the session by id rather than by name, which matched by
+  prefix (`callabo` against `callabo-set`).
+
 - **`muxa upgrade` no longer strands an old daemon when no service manager is
   usable.** A capable muxad now drains and re-execs itself on the exact socket
   being upgraded, preserving its pid and launch context. The CLI confirms the

@@ -239,6 +239,94 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s`가 관측과 협업의 기본 진입점입니다. `prefix+D`는 더 상세한 Dashboard를
 바로 여는 선택 단축키입니다.
 
+## 한 workspace를 터미널 두 개로 보기
+
+tmux session은 current window를 하나만 가지며, attach된 모든 client가 그 window를
+봅니다. 따라서 같은 session에 두 터미널을 붙이면 서로 다른 Work window에 머무를 수
+없고, 한쪽에서 window를 바꾸면 다른 쪽도 따라갑니다. muxa의 제약이 아니라 tmux의
+모델입니다.
+
+한 workspace의 Work Run 두 개를 나란히 보려면 두 번째 터미널을 *session group*으로
+attach하세요. window는 그대로 공유하되 group 안의 각 session이 자기 current window를
+따로 가집니다.
+
+```sh
+# 터미널 1
+tmux attach -t callabo
+
+# 터미널 2 — 같은 window, 독립적인 view, detach하면 사라짐
+tmux new-session -t callabo \; set-option destroy-unattached on
+```
+
+`tmux attach -t <session>` 자체가 이렇게 동작하게 하려면 — 따로 외울 명령 없이 —
+grouping을 `client-attached` hook 뒤에 둡니다. 이미 다른 client가 붙어 있을 때만
+동작하므로, 터미널이 하나뿐이면 평소대로 진짜 session에 붙고 여분의 session도
+생기지 않습니다.
+
+```tmux
+set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"~/.local/bin/tmux-attach-view #{session_name} #{client_name} #{client_pid}\"'"
+```
+
+스크립트는 view를 만들고 도착한 client를 그쪽으로 옮깁니다.
+
+```sh
+name="view~$3~$1"
+new=$(tmux new-session -dP -F '#{session_id}' -t "=$1" -s "$name")
+tmux switch-client -c "$2" -t "$new"
+tmux set-option -t "$new" destroy-unattached on
+```
+
+세 가지가 결정적이며 모두 tmux 3.4에서 실측했습니다. `destroy-unattached`는
+반드시 `switch-client` **뒤에** 걸어야 합니다 — client가 아직 없는 session에 걸면
+그 자리에서 reap되어 전체가 조용히 무효화됩니다. `#{session_id}`가 아니라 session
+이름을 넘깁니다 — id는 `$0`이고 `run-shell`은 명령을 셸에 넘기므로 셸이 이를
+확장해 버립니다. view 이름은 원본 session 이름이 아니라 `view~<pid>~<session>`
+입니다 — 그래야 `callabo`를 찾는 prefix 조회가 진짜 session 대신 view를 집어가는
+일이 없습니다.
+
+한 session만 예외로 두려면 `tmux set-option -t <session> @no_auto_view 1` —
+두 터미널이 *일부러* 같은 화면을 봐야 할 때(페어링, 화면 공유)입니다.
+
+`command-alias`로는 안 됩니다. tmux는 내장 명령 이름을 alias보다 먼저 해석하므로
+`attach-session` alias는 참조되지 않습니다.
+
+window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보고
+있는 터미널 기준으로 잡으려면 window 단위 sizing을 함께 켭니다.
+
+```tmux
+set -g window-size smallest
+setw -g aggressive-resize on
+```
+
+두 줄 모두 필요하며 `aggressive-resize`만으로는 아무 효과가 없습니다 — 이 옵션은
+`window-size`가 `smallest` 또는 `largest`인 window에만 적용되는데 tmux 3.x의
+기본값은 `latest`입니다. tmux 3.4에서 200x50과 80x24 client를 각각 다른 window에
+두고 실측한 결과:
+
+| 설정 | 200x50 client가 보는 window | 80x24 client가 보는 window |
+| --- | --- | --- |
+| `window-size latest` (기본값) | 80x23 | 80x23 |
+| `smallest` + `aggressive-resize on` | **200x49** | 80x23 |
+| `smallest` + `aggressive-resize off` | 80x23 | 80x23 |
+
+`smallest` 단독은 전형적인 함정입니다 — 어디든 작은 client가 하나 붙어 있으면
+내 window가 쪼그라듭니다. `aggressive-resize`가 "아무 client"를 "이 window를
+current로 갖는 client"로 좁혀 주는데, 이것이 위에서 만든 view 분리와 정확히
+맞물립니다. 터미널이 하나뿐이면 smallest가 곧 그 터미널이므로 일반적인 단일
+터미널 사용에는 변화가 없습니다.
+
+watch에서 `Enter`로 이동할 때는 대상 window를 session까지 포함해 지정하므로, 요청한
+터미널만 움직이고 group의 다른 session은 보고 있던 window를 유지합니다. 이때 watch가
+어느 client에서 키를 눌렀는지 알아야 하는데, `muxa init`이 심는 `prefix+s` 바인딩이
+`--caller-client '#{client_name}'`으로 그 값을 넘깁니다. 이 플래그가 없는 수동
+바인딩은 tmux의 활동 기반 추측으로 되돌아가고, 터미널이 둘일 때 그 추측은 자주
+틀립니다.
+
+알려진 거친 부분: grouped session은 별개의 tmux session id이므로 watch topology에
+같은 window/pane을 담은 두 번째 트리로 나타납니다. agent 메타데이터는 첫 트리에
+붙고 중복 트리는 맨 pane으로 보입니다. 집계와 통계는 pane 단위 키라서 중복으로
+세지지 않습니다.
+
 ## macOS 메뉴바 (BarShelf)
 
 [BarShelf](https://github.com/Open330/barshelf)에 포함된 `muxa Watch` widget을
