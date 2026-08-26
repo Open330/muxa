@@ -5029,6 +5029,23 @@ fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
     }
 }
 
+/// Terminals attached to the workspace `info` names, counting the whole
+/// session group.
+///
+/// `attached_clients` is per session, and topology folds a session group into
+/// one node — so the members' counts belong on that node too. Without the sum
+/// a workspace open in two terminals reports one, which is the count for a row
+/// the user is deliberately no longer being shown.
+fn group_attached_clients(info: &SessionInfo, all: &[SessionInfo]) -> u32 {
+    let Some(group) = info.group.as_deref() else {
+        return info.attached_clients;
+    };
+    all.iter()
+        .filter(|member| member.group.as_deref() == Some(group))
+        .map(|member| member.attached_clients)
+        .sum()
+}
+
 fn build_watch_topology(
     agents: &[Agent],
     panes: &[PaneInfo],
@@ -5081,7 +5098,12 @@ fn build_watch_topology(
         if let Some(info) = matches.next() {
             if matches.next().is_none() {
                 node.name.clone_from(&info.name);
-                node.attached_clients = Some(info.attached_clients);
+                // `attached_clients` is per session, and topology folded this
+                // node's session group into one row — so the count for the
+                // group's other members belongs here too. Without the sum a
+                // workspace open in two terminals reports one, which is the
+                // number for the row the user is no longer being shown.
+                node.attached_clients = Some(group_attached_clients(info, session_info));
             }
         }
     }
@@ -6544,6 +6566,7 @@ fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
             muxa::backend::herdr::herdr_list_workspaces(&socket)
                 .into_iter()
                 .map(|ws| SessionInfo {
+                    group: None,
                     session_id: ws.id,
                     name: ws.label,
                     // herdr's socket API exposes no client-attach state
@@ -15563,6 +15586,7 @@ mod tests {
 
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
@@ -15593,6 +15617,7 @@ mod tests {
         pane_index: u32,
     ) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: Some(socket.into()),
@@ -18339,8 +18364,48 @@ mod tests {
         assert!(dump.contains("review the auth change"));
     }
 
+    fn grouped_session(id: &str, name: &str, attached: u32, group: &str) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            name: name.into(),
+            attached_clients: attached,
+            group: Some(group.into()),
+        }
+    }
+
+    #[test]
+    fn a_folded_workspace_counts_every_terminal_on_it() {
+        // Two terminals on one workspace via a session group: tmux reports one
+        // attached client per member, and topology shows the members as a
+        // single node. Reporting either member's own count would understate
+        // the workspace by exactly the terminals the group exists to allow.
+        let all = vec![
+            grouped_session("$0", "callabo", 1, "callabo"),
+            grouped_session("$1", "view~9~callabo", 1, "callabo"),
+            fake_session("$2", "unrelated", 3),
+        ];
+        assert_eq!(group_attached_clients(&all[0], &all), 2);
+        // Either member answers for the whole group — the caller does not have
+        // to know which one topology kept.
+        assert_eq!(group_attached_clients(&all[1], &all), 2);
+        // An ungrouped session is only ever itself.
+        assert_eq!(group_attached_clients(&all[2], &all), 3);
+    }
+
+    #[test]
+    fn a_detached_group_member_adds_nothing() {
+        // A view whose terminal has gone is still a session until tmux reaps
+        // it. It must not inflate the count while it lingers.
+        let all = vec![
+            grouped_session("$0", "callabo", 1, "callabo"),
+            grouped_session("$1", "view~9~callabo", 0, "callabo"),
+        ];
+        assert_eq!(group_attached_clients(&all[0], &all), 1);
+    }
+
     fn fake_session(id: &str, name: &str, attached_clients: u32) -> SessionInfo {
         SessionInfo {
+            group: None,
             session_id: id.into(),
             name: name.into(),
             attached_clients,
@@ -20014,6 +20079,7 @@ sort = ["state"]
     #[test]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,

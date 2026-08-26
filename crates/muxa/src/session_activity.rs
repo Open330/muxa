@@ -586,6 +586,7 @@ fn sample_activity() -> Result<ActivitySample, String> {
 fn sample_herdr_activity(socket_path: &Path) -> ActivitySample {
     let sessions = match herdr::herdr_focused_workspace(socket_path) {
         Some(ws) => vec![SessionInfo {
+            group: None,
             session_id: ws.id,
             name: ws.label,
             attached_clients: 1,
@@ -724,6 +725,7 @@ mod tests {
 
     fn session(id: &str, name: &str, attached_clients: u32) -> SessionInfo {
         SessionInfo {
+            group: None,
             session_id: id.into(),
             name: name.into(),
             attached_clients,

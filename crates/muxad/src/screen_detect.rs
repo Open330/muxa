@@ -439,6 +439,7 @@ mod tests {
 
     fn pane(pane_id: &str, command: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: Some("default".into()),
