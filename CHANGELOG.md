@@ -217,7 +217,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate. Jumps now address the window as `<session_id>:<window_id>`,
   preferring the asking client's own session when the window is linked there
   and otherwise the pane's recorded session, so a cross-session jump is
-  deterministic instead of activity-dependent.
+  deterministic instead of activity-dependent. The bare-shell path carried the
+  same defect more visibly — its pre-attach `select-window` moved a grouped
+  bystander session and left the session it then attached to on the wrong
+  window — and it now targets the session it is about to attach. That attach
+  also addresses the session by id rather than by name, which matched by
+  prefix (`callabo` against `callabo-set`).
 
 - **`muxa upgrade` no longer strands an old daemon when no service manager is
   usable.** A capable muxad now drains and re-execs itself on the exact socket
