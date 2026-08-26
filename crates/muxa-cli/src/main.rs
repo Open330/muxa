@@ -1661,6 +1661,54 @@ fn jump_to_topology_pane(key: &muxa::PaneKey) {
     }
 }
 
+/// Address for the *window* half of a jump.
+///
+/// `switch-client -t %pane` names a pane but not a session, and tmux fills the
+/// gap from recent client activity. That is unambiguous only while every
+/// window belongs to exactly one session. A **session group** — created by
+/// `tmux new-session -t <session>`, the supported way to keep two terminals on
+/// two different windows of one workspace — links the same window into every
+/// session in the group, and there the guess is routinely wrong. Measured on
+/// tmux 3.4 with two attached clients: jumping client A pulled it out of its
+/// own session into the grouped sibling and dragged client B's view along with
+/// it, re-coupling the two terminals the group exists to separate.
+///
+/// `<session_id>:<window_id>` closes the gap. Both are backend-native ids, so
+/// neither can prefix-match a neighbouring object the way session *names* do
+/// (`callabo` against `callabo-set`), and together they name exactly one
+/// window in exactly one session. Falls back to the bare pane id when no
+/// session id is known, which is the behaviour every jump had before.
+fn window_target(session_id: Option<&str>, window_id: &str, pane_id: &str) -> String {
+    match session_id {
+        Some(session) if !session.is_empty() && !window_id.is_empty() => {
+            format!("{session}:{window_id}")
+        }
+        _ => pane_id.to_string(),
+    }
+}
+
+/// Stable `$N` session id a jump should address on behalf of `client`.
+///
+/// Prefers the session the asking client is *already* in whenever the target
+/// window is linked into it: inside a session group that makes the jump a pure
+/// window change, so no sibling session — and therefore no other terminal —
+/// moves. Otherwise this is a genuine cross-session jump, and `pane_session`
+/// (the session recorded for the pane itself) names a definite destination
+/// where tmux would otherwise pick one from client activity.
+///
+/// `None` only when neither is known, leaving [`window_target`] to fall back.
+fn jump_session_id(
+    socket: Option<&str>,
+    client: Option<&str>,
+    window_id: &str,
+    pane_session: &str,
+) -> Option<String> {
+    let own = client
+        .and_then(|client| muxa::tmux::client_session_id_on(socket, client))
+        .filter(|session| muxa::tmux::window_in_session_on(socket, session, window_id));
+    own.or_else(|| (!pane_session.is_empty()).then(|| pane_session.to_string()))
+}
+
 fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
     let socket = Some(key.window.session.endpoint.socket.as_str());
     let pane = key.pane_id.as_str();
@@ -1671,12 +1719,20 @@ fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
     };
     if tmux::inside_tmux() {
         let pinned = CALLER_CLIENT.get().cloned().or_else(tmux::current_client);
+        // Address the window by session, not just by pane — see `window_target`.
+        let session = jump_session_id(
+            socket,
+            pinned.as_deref(),
+            &key.window.window_id,
+            &key.window.session.session_id,
+        );
+        let target = window_target(session.as_deref(), &key.window.window_id, pane);
         if let Some(client) = pinned.as_deref() {
-            run(&["switch-client", "-c", client, "-t", pane]);
+            run(&["switch-client", "-c", client, "-t", &target]);
         } else {
-            run(&["switch-client", "-t", pane]);
+            run(&["switch-client", "-t", &target]);
         }
-        run(&["select-window", "-t", pane]);
+        run(&["select-window", "-t", &target]);
         run(&["select-pane", "-t", pane]);
         return;
     }
@@ -1787,10 +1843,11 @@ fn jump_to_pane_tmux(pane_id: &str) {
         return;
     };
     if tmux::inside_tmux() {
-        // One command, addressed by pane id, pinned to the asking client.
+        // Switch after pre-positioning, addressed by stable ids, pinned to
+        // the asking client.
         //
-        // Each of those three matters, and the previous version had none
-        // of them. It pre-positioned with `select-window -t "<name>:<idx>"`
+        // Each of those three matters, and the version before them had
+        // none. It pre-positioned with `select-window -t "<name>:<idx>"`
         // *before* switching anyone: that mutates the target session's
         // current window immediately, so any other terminal already
         // attached to that session jumped on the spot — a window the user
@@ -1802,27 +1859,32 @@ fn jump_to_pane_tmux(pane_id: &str) {
         // activity, which with two terminals attached is routinely the
         // other one.
         //
-        // `switch-client -t <pane-id>` resolves session, window and pane
-        // together from an identifier that cannot be ambiguous, and only
-        // for the client we name.
+        // A pane id alone is *not* the unambiguous identifier it looks
+        // like. It names one pane, but `switch-client` needs a session,
+        // and a window can be linked into more than one — that is exactly
+        // what a session group is. `window_target` explains what tmux does
+        // with the ambiguity and why the answer is wrong often enough to
+        // matter. Address the window by `<session_id>:<window_id>` instead.
         // Prefer the binding-expanded client: it names who pressed the key.
         // `current_client()` is an activity-based guess and only acceptable
         // when nothing better exists (an old binding without the flag);
         // unpinned is last, safe only when a single client is attached.
         let pinned = CALLER_CLIENT.get().cloned().or_else(tmux::current_client);
+        let session = jump_session_id(None, pinned.as_deref(), &info.window_id, &info.session_id);
+        let target = window_target(session.as_deref(), &info.window_id, pane_id);
         if let Some(client) = pinned {
-            run_tmux(&["switch-client", "-c", &client, "-t", pane_id]);
+            run_tmux(&["switch-client", "-c", &client, "-t", &target]);
         } else {
-            run_tmux(&["switch-client", "-t", pane_id]);
+            run_tmux(&["switch-client", "-t", &target]);
         }
-        // `switch-client -t <pane>` resolves only the *session*: the client
-        // lands on whatever window that session had current, which in a
-        // multi-window session is not the pane's window. Selecting the
-        // window *after* the switch confines the shared-state mutation to
-        // the session we are entering — clients attached to it follow, which
-        // is tmux's model for a session's current window, but no bystander
-        // session is touched the way the old pre-switch select-window did.
-        run_tmux(&["select-window", "-t", pane_id]);
+        // Selecting the window *after* the switch confines the shared-state
+        // mutation to the session we are entering — clients attached to *it*
+        // follow, which is tmux's model for a session's current window, but
+        // no bystander session is touched the way the old pre-switch
+        // select-window did. With the session-qualified target above, a
+        // grouped sibling is a bystander too: it keeps its own current
+        // window, so the other terminal stays where the user left it.
+        run_tmux(&["select-window", "-t", &target]);
         run_tmux(&["select-pane", "-t", pane_id]);
     } else {
         // Pre-position for the fresh attach below; there is no client of
@@ -2614,6 +2676,23 @@ mod tests {
         // Unrecognized ids fall back to the process-global host.
         assert_eq!(dispatch_kind("legacy-id", HostKind::Tmux), HostKind::Tmux);
         assert_eq!(dispatch_kind("legacy-id", HostKind::Herdr), HostKind::Herdr);
+    }
+
+    #[test]
+    fn window_target_qualifies_the_window_with_its_session() {
+        // The whole point: a window addressed together with its session
+        // cannot be resolved into a *different* session of the same group.
+        assert_eq!(window_target(Some("$1"), "@4", "%9"), "$1:@4");
+    }
+
+    #[test]
+    fn window_target_falls_back_to_the_pane_id() {
+        // No session, no window, or an empty id from an older PANE_FMT: the
+        // pane id is what every jump used before, so degrade to it rather
+        // than emit a malformed target like `:@4` that tmux would reject.
+        assert_eq!(window_target(None, "@4", "%9"), "%9");
+        assert_eq!(window_target(Some("$1"), "", "%9"), "%9");
+        assert_eq!(window_target(Some(""), "@4", "%9"), "%9");
     }
 
     fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {

@@ -296,6 +296,45 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s` is the normal watch and collaboration entry point. `prefix+D` is an
 optional shortcut to the richer Dashboard.
 
+## Two Terminals on One Workspace
+
+One tmux session has one current window, and every client attached to it shows
+that window. Two terminals attached to the same session therefore cannot sit on
+two different Work windows — switching one switches the other. That is tmux's
+model, not a muxa limitation.
+
+To watch two Work Runs of one workspace side by side, attach the second
+terminal to a *session group* instead. Windows stay shared, but each session in
+the group keeps its own current window:
+
+```sh
+# terminal 1
+tmux attach -t callabo
+
+# terminal 2 — same windows, independent view, disappears on detach
+tmux new-session -t callabo \; set-option destroy-unattached on
+```
+
+`aggressive-resize` is worth pairing with it, so a window is sized to the
+clients actually viewing it rather than to the smallest client on the session:
+
+```tmux
+setw -g aggressive-resize on
+```
+
+Jumping from watch (`Enter`) addresses the target window by session, so it
+moves only the terminal that asked and leaves the grouped sibling on the window
+it was showing. For that to hold, watch needs to know which client pressed the
+key — the `prefix+s` binding written by `muxa init` passes it as
+`--caller-client '#{client_name}'`. A hand-rolled binding without that flag
+falls back to tmux's activity-based guess, which with two terminals attached is
+routinely the wrong one.
+
+Known rough edge: the grouped session is a distinct tmux session id, so the
+watch topology lists it as a second tree carrying the same windows and panes.
+Agent metadata attaches to the first tree; the duplicate shows as bare panes.
+Counts and stats are keyed per pane and are not doubled.
+
 ## macOS Menu Bar with BarShelf
 
 The bundled [BarShelf](https://github.com/Open330/barshelf) `muxa Watch`

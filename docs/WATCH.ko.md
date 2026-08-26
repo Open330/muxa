@@ -239,6 +239,44 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s`가 관측과 협업의 기본 진입점입니다. `prefix+D`는 더 상세한 Dashboard를
 바로 여는 선택 단축키입니다.
 
+## 한 workspace를 터미널 두 개로 보기
+
+tmux session은 current window를 하나만 가지며, attach된 모든 client가 그 window를
+봅니다. 따라서 같은 session에 두 터미널을 붙이면 서로 다른 Work window에 머무를 수
+없고, 한쪽에서 window를 바꾸면 다른 쪽도 따라갑니다. muxa의 제약이 아니라 tmux의
+모델입니다.
+
+한 workspace의 Work Run 두 개를 나란히 보려면 두 번째 터미널을 *session group*으로
+attach하세요. window는 그대로 공유하되 group 안의 각 session이 자기 current window를
+따로 가집니다.
+
+```sh
+# 터미널 1
+tmux attach -t callabo
+
+# 터미널 2 — 같은 window, 독립적인 view, detach하면 사라짐
+tmux new-session -t callabo \; set-option destroy-unattached on
+```
+
+window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보는
+client 기준으로 잡으려면 `aggressive-resize`를 함께 켜는 편이 좋습니다.
+
+```tmux
+setw -g aggressive-resize on
+```
+
+watch에서 `Enter`로 이동할 때는 대상 window를 session까지 포함해 지정하므로, 요청한
+터미널만 움직이고 group의 다른 session은 보고 있던 window를 유지합니다. 이때 watch가
+어느 client에서 키를 눌렀는지 알아야 하는데, `muxa init`이 심는 `prefix+s` 바인딩이
+`--caller-client '#{client_name}'`으로 그 값을 넘깁니다. 이 플래그가 없는 수동
+바인딩은 tmux의 활동 기반 추측으로 되돌아가고, 터미널이 둘일 때 그 추측은 자주
+틀립니다.
+
+알려진 거친 부분: grouped session은 별개의 tmux session id이므로 watch topology에
+같은 window/pane을 담은 두 번째 트리로 나타납니다. agent 메타데이터는 첫 트리에
+붙고 중복 트리는 맨 pane으로 보입니다. 집계와 통계는 pane 단위 키라서 중복으로
+세지지 않습니다.
+
 ## macOS 메뉴바 (BarShelf)
 
 [BarShelf](https://github.com/Open330/barshelf)에 포함된 `muxa Watch` widget을
