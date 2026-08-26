@@ -178,7 +178,7 @@ seed_ask_history() {
     {
       "id": "ask-0001",
       "prompt": "what is the difference between wake = 'never' and wake = 'idle_only'?",
-      "answer": "\`never\` is pull-only: a request lands in the recipient's mailbox and\nsits there until that agent calls muxa_inbox of its own accord. Nothing\nis ever written into its pane.\n\n\`idle_only\` adds one narrow push: when the recipient is idle at its\ntop-level prompt — not mid-turn, not mid-tool-call — muxad injects a\nshort wake line telling it to check the mailbox.\n\nThe restriction is the whole design. Waking a working agent would\ninterleave text into whatever it was composing.",
+      "answer": "\`never\` is pull-only: a request lands in the recipient's mailbox and\nsits there until that agent calls muxa_inbox of its own accord. Nothing\nis ever written into its pane.\n\n\`idle_only\` adds one narrow push only at the recipient's top-level Idle\nprompt — not mid-turn or mid-tool-call. Its default \`wake_payload =\nnotice\` injects a short mailbox line; opt-in \`full\` atomically claims\nand injects one structured request body per idle generation. Reply bodies\nalways stay in the mailbox.\n\nThe Idle restriction prevents incoming text from interleaving with work\nthe agent is already composing.",
       "status": "answered",
       "agent": "claude",
       "agent_session_id": "demo-thread-claude",

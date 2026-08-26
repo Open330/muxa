@@ -480,8 +480,8 @@ pub struct PipelineAgentConfig {
 }
 
 /// `[collaboration]` config — same-window durable agent request/reply.
-/// Disabled by default because idle wake-up injects a short prompt into a
-/// peer pane. Enabling it is an explicit grant for local peer coordination.
+/// Disabled by default because idle wake-up injects a prompt into a peer pane.
+/// Enabling it is an explicit grant for local peer coordination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollaborationConfig {
@@ -492,6 +492,10 @@ pub struct CollaborationConfig {
     /// `never` keeps delivery pull-only; `idle_only` wakes hook-authoritative
     /// agents only at their top-level idle prompt.
     pub wake: CollaborationWake,
+    /// `notice` injects only a mailbox notification. `full` atomically claims
+    /// each request and injects its metadata and body into the recipient's
+    /// prompt, avoiding a separate inbox tool round.
+    pub wake_payload: CollaborationWakePayload,
     /// How far an explicit `pane:%N` target may reach. `window` (default)
     /// keeps requests inside the sender's tmux window — co-locating agents
     /// in a window is the consent to let them talk. `host` lets a request
@@ -510,6 +514,7 @@ impl Default for CollaborationConfig {
             enabled: false,
             path: None,
             wake: CollaborationWake::IdleOnly,
+            wake_payload: CollaborationWakePayload::Notice,
             scope: CollaborationScope::default(),
             max_message_bytes: default_collaboration_max_message_bytes(),
         }
@@ -530,6 +535,14 @@ pub enum CollaborationWake {
     Never,
     #[default]
     IdleOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationWakePayload {
+    #[default]
+    Notice,
+    Full,
 }
 
 fn default_collaboration_max_message_bytes() -> usize {
@@ -1980,12 +1993,22 @@ agent-review = "create a codex pane and pass our changes for review"
     fn collaboration_is_opt_in_and_parses_wake_policy() {
         assert!(!Config::default().collaboration.enabled);
         let cfg: Config = toml::from_str(
-            "[collaboration]\nenabled = true\nwake = \"never\"\nmax_message_bytes = 4096\n",
+            "[collaboration]\nenabled = true\nwake = \"never\"\nwake_payload = \"full\"\nmax_message_bytes = 4096\n",
         )
         .unwrap();
         assert!(cfg.collaboration.enabled);
         assert_eq!(cfg.collaboration.wake, CollaborationWake::Never);
+        assert_eq!(
+            cfg.collaboration.wake_payload,
+            CollaborationWakePayload::Full
+        );
         assert_eq!(cfg.collaboration.max_message_bytes, 4096);
+
+        let defaults: Config = toml::from_str("[collaboration]\nenabled = true\n").unwrap();
+        assert_eq!(
+            defaults.collaboration.wake_payload,
+            CollaborationWakePayload::Notice
+        );
     }
 
     #[test]

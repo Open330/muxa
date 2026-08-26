@@ -64,6 +64,8 @@ muxa init --component collaboration
 [collaboration]
 enabled = true
 wake = "idle_only"
+# 선택 사항: 기본값 "notice", 원문 직접 전달은 "full"
+wake_payload = "notice"
 ```
 
 이미 있는 `wake` 값은 덮어쓰지 않습니다. `never`는 "mailbox는 쓰되 내 pane은
@@ -263,6 +265,13 @@ Agent A: wait 중이 아니고 Idle이면 짧은 reply wake prompt 수신
 Agent A: muxa_wait_reply(request_id="req_...")
 ```
 
+`wake_payload = "full"`이면 Agent B의 두 단계는 다음처럼 바뀝니다.
+
+```text
+Agent B: idle 상태에서 metadata와 원문이 포함된 claimed request prompt 수신
+Agent B: inbox 호출 없이 작업 후 muxa_reply(request_id="req_...", ...)
+```
+
 ## Reviewer와 subagent로 활용하기
 
 agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니다.
@@ -304,8 +313,7 @@ prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
 
 메시지와 응답 본문은 `$XDG_DATA_HOME/muxa/collaboration.json`에 먼저
 저장됩니다. `idle_only` wake는 새 요청뿐 아니라 아직 발신자가 읽지 않은 terminal
-응답에도 적용됩니다. 다음 조건을 모두 만족할 때만 짧은 notification prompt를
-pane에 넣으며 본문은 terminal에 주입하지 않습니다.
+응답에도 적용됩니다. 다음 조건을 모두 만족할 때만 pane에 입력합니다.
 
 - hook 기반의 실제 agent session
 - state가 `Idle`
@@ -317,8 +325,23 @@ pane에 넣으며 본문은 terminal에 주입하지 않습니다.
 participant나 자동 wake 대상이 아닙니다. `wake = "never"`로 설정하면 mailbox는
 유지하면서 모든 입력 주입을 끌 수 있습니다.
 
-요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다. wake prompt가 중복돼도
-동일 request id의 작업을 새 요청으로 만들지 않습니다.
+기본값인 `wake_payload = "notice"`는 짧은 mailbox 알림만 넣고 본문을 terminal에
+주입하지 않습니다. 요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다.
+
+`wake_payload = "full"`은 terminal에 입력하기 전에 queued request 하나를
+원자적으로 claim하고, request id/source/kind/work mode/paths/AIR reference와 원문을
+구조화된 prompt로 직접 전달합니다. 이 request에는 inbox를 다시 호출할 필요가 없어
+tool round와 전체 JSON envelope를 줄입니다. idle generation 하나에는 원문 하나만
+제출하고, 실제 Idle transition이 온 뒤 다음 요청을 전달합니다. reply 본문은 이
+모드에서도 항상 mailbox에만 둡니다.
+
+`full`은 요청 본문을 terminal과 agent prompt history에도 남기므로 민감한 본문을
+mailbox에만 두려면 `notice`를 사용하세요. terminal 제어문자가 포함된 본문은
+변형하거나 위험하게 paste하지 않고 자동으로 `notice` 경로를 사용합니다. muxad는
+prompt text 기록과 별도 Enter 제출 단계를 durable state로 구분합니다. 중단 후
+text가 이미 기록된 것이 확실하면 Enter만 재시도하고, 기록 여부가 불확실하면 원문을
+다시 넣는 대신 짧은 inbox 복구 알림을 보냅니다. agent가 먼저 inbox를 읽으면 이
+자동 복구는 취소됩니다.
 
 모든 collaboration IPC 호출(context, identity, send, inbox, list, reply, get, wait,
 cancel)은 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`에도 append-only로
