@@ -13,15 +13,25 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SANDBOX="$SCRIPT_DIR/muxa-sandbox.sh"
 NAME=muxa-smoke
 
 # The suite deliberately runs inside whatever the caller is sitting in, so the
 # nesting refusal has to be waived for every call except the one testing it.
+# `--extra-path` puts the freshly built `muxa` on the sandbox PATH. Without it
+# the isolation checks below reach for whatever `muxa` the host happens to have
+# installed, which passes on a developer machine and fails on a clean runner —
+# and a suite that only works where muxa is already installed is testing the
+# wrong thing.
 sb() { # <command> [args…]
   local command=$1
   shift
-  bash "$SANDBOX" "$command" --name "$NAME" --allow-inside-tmux "$@"
+  bash "$SANDBOX" "$command" \
+    --name "$NAME" \
+    --allow-inside-tmux \
+    --extra-path "$REPO_DIR/target/debug" \
+    "$@"
 }
 
 passed=0
