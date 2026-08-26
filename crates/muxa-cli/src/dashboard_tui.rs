@@ -5263,6 +5263,7 @@ mod tests {
             status,
             created_at: now,
             claimed_at: (status == RequestStatus::Claimed).then_some(now),
+            wake_delivery: None,
             notified_at: None,
             reply_notified_at: None,
             reply_read_at: None,

@@ -69,6 +69,8 @@ collaboration --uninstall` removes it). Hand-editing works just as well:
 [collaboration]
 enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
+# Optional: "notice" (default) or "full" for direct request delivery.
+wake_payload = "notice"
 ```
 
 An existing `wake` is never overwritten — a deliberate `never` means "give me
@@ -265,12 +267,31 @@ session snapshot.
 ## Wake-up safety
 
 The mailbox is persisted to `$XDG_DATA_HOME/muxa/collaboration.json` before
-delivery. With `idle_only`, muxad injects a short notification for new requests
-and terminal replies, and only when the exact hook-authoritative participant
-is `Idle`. Message bodies never enter the terminal. It never injects into
-`Working`, `WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic
-screen-detected agents have no stable session identity, so they are not room
-participants or auto-wake targets.
+delivery. With `idle_only`, muxad injects only when the exact
+hook-authoritative participant is `Idle`. It never injects into `Working`,
+`WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic screen-detected
+agents have no stable session identity, so they are not room participants or
+auto-wake targets.
+
+`wake_payload = "notice"` is the default. It injects a short mailbox prompt;
+the recipient calls `muxa_inbox`, which atomically claims and returns the body.
+`wake_payload = "full"` instead claims one queued request before any terminal
+side effect, then injects a structured envelope containing request id, source,
+kind, work mode, paths, AIR references, and the original body. The recipient
+must not call inbox for that request, so one tool round and its JSON envelope
+are removed. Only one direct request is submitted per idle agent generation;
+the next waits for a real Idle transition. Terminal reply bodies always remain
+in the mailbox in both modes.
+
+Direct delivery deliberately makes the request body part of terminal and
+agent prompt history. Use `notice` for secrets that should remain only in the
+private mailbox. A body containing terminal control characters automatically
+falls back to `notice` rather than being transformed or pasted unsafely.
+Direct delivery records whether prompt text was written
+before the separate Enter keystroke. After interruption, muxad retries only
+Enter when text is known to be buffered; if writing was uncertain, it falls
+back to a short inbox recovery notice instead of injecting the body twice. A
+manual inbox read supersedes either recovery path.
 
 Reading a terminal result through `muxa_wait_reply` acknowledges it and
 prevents a later reply wake. Room context reports incoming unread requests and

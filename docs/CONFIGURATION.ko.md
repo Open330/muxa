@@ -88,6 +88,7 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 [collaboration]
 enabled = true
 wake = "idle_only" # idle_only | never
+wake_payload = "notice" # notice | full
 scope = "window"   # window | host
 max_message_bytes = 16384
 ```
@@ -95,8 +96,11 @@ max_message_bytes = 16384
 같은 stable tmux window에 있는 agent 사이의 durable request/reply 기능입니다.
 optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`이며 mailbox와
 exact-session alias/role을 함께 저장합니다.
-`idle_only`는 hook 기반 top-level agent가 Idle일 때만 짧은 request/reply
-notification을 입력하며 본문은 mailbox에 둡니다.
+`idle_only`는 hook 기반 top-level agent가 Idle일 때만 입력합니다.
+기본값인 `wake_payload = "notice"`는 요청 본문을 mailbox에 두고, `full`은 idle
+generation마다 요청 하나를 원자적으로 claim한 뒤 구조화된 metadata와 본문을 직접
+입력하여 별도 inbox tool round를 없앱니다. reply wake는 두 모드 모두 본문 없는
+알림입니다.
 `scope = "host"`이면 watch에서 다른 tmux window나 session의 선택된 tracked
 agent를 정확한 pane id로 지정할 수 있습니다.
 [COLLABORATION.ko.md](COLLABORATION.ko.md)를 참고하세요.

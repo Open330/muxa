@@ -153,6 +153,8 @@ One-time setup: add the following to `~/.config/muxa/config.toml`, restart
 [collaboration]
 enabled = true
 wake = "idle_only"
+# Optional: claim and deliver request bodies directly to idle agent prompts.
+wake_payload = "full"
 ```
 
 Register the MCP server once for both agent hosts, then restart agents that

@@ -91,6 +91,7 @@ wall-clock safety limit, not an inactivity detector.
 [collaboration]
 enabled = true
 wake = "idle_only" # idle_only | never
+wake_payload = "notice" # notice | full
 scope = "window"   # window | host
 max_message_bytes = 16384
 ```
@@ -98,8 +99,11 @@ max_message_bytes = 16384
 Opt-in durable request/reply between agents in the same stable tmux window.
 The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json` and
 stores both mailbox state and exact-session aliases/roles.
-`idle_only` injects short request/reply notifications only at a
-hook-authoritative top-level Idle prompt; message bodies stay in the mailbox.
+`idle_only` injects only at a hook-authoritative top-level Idle prompt.
+`wake_payload = "notice"` (the default) keeps request bodies in the mailbox;
+`full` atomically claims one request per idle generation and injects its
+structured metadata and body, avoiding a separate inbox tool round. Reply
+wakes remain body-free notifications in both modes.
 `scope = "host"` lets watch address the selected tracked agent in another
 tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).

@@ -361,6 +361,16 @@ pub enum RequestStatus {
     Cancelled,
 }
 
+/// Durable recovery state for a request body being delivered directly into
+/// an idle agent prompt. This is normally absent: it exists only between the
+/// automatic claim and successful prompt submission.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeDeliveryState {
+    Prepared,
+    PromptWritten,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestMailbox {
@@ -422,6 +432,8 @@ pub struct CollaborationRequest {
         with = "time::serde::rfc3339::option"
     )]
     pub claimed_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_delivery: Option<WakeDeliveryState>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -738,6 +750,7 @@ impl CollaborationStore {
             status: RequestStatus::Queued,
             created_at: now,
             claimed_at: None,
+            wake_delivery: None,
             notified_at: None,
             reply_notified_at: None,
             reply_read_at: None,
@@ -782,6 +795,15 @@ impl CollaborationStore {
                         };
                         request.claimed_at = Some(now);
                         changed = true;
+                    } else if request.wake_delivery.take().is_some() {
+                        // A direct wake was prepared but the recipient pulled
+                        // its inbox first. Manual retrieval wins and suppresses
+                        // any recovery injection from the daemon.
+                        request.notified_at.get_or_insert(now);
+                        if !request.expects_reply {
+                            request.status = RequestStatus::Completed;
+                        }
+                        changed = true;
                     }
                     inbox.push(request.clone());
                 }
@@ -796,6 +818,73 @@ impl CollaborationStore {
             self.publish_change();
         }
         Ok(inbox)
+    }
+
+    /// Atomically reserve one queued request for direct prompt delivery.
+    /// Claiming before the terminal side effect closes the sender-cancel race:
+    /// once a body may reach the agent, the request can no longer be cancelled.
+    pub async fn prepare_direct_wake(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+    ) -> Result<Option<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let prepared = {
+            let mut requests = self.requests.write().await;
+            let Some(request) = requests.get_mut(request_id) else {
+                return Err(CollaborationError::NotFound(request_id.to_string()));
+            };
+            if !request.to.same_endpoint(caller) {
+                return Err(CollaborationError::NotParticipant(request_id.to_string()));
+            }
+            if request.status != RequestStatus::Queued || request.notified_at.is_some() {
+                None
+            } else {
+                request.status = RequestStatus::Claimed;
+                request.claimed_at = Some(OffsetDateTime::now_utc());
+                request.wake_delivery = Some(WakeDeliveryState::Prepared);
+                Some(request.clone())
+            }
+        };
+        if prepared.is_some() {
+            if let Err(error) = self.persist_current().await {
+                *self.requests.write().await = previous;
+                return Err(error);
+            }
+            self.publish_change();
+        }
+        Ok(prepared)
+    }
+
+    /// Record that the direct prompt text reached the pane. Submission is a
+    /// separate keystroke, so a daemon restart can retry only Enter rather
+    /// than injecting the request body a second time.
+    pub async fn mark_wake_prompt_written(
+        &self,
+        request_id: &str,
+    ) -> Result<(), CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let changed = {
+            let mut requests = self.requests.write().await;
+            requests.get_mut(request_id).is_some_and(|request| {
+                if request.wake_delivery == Some(WakeDeliveryState::Prepared) {
+                    request.wake_delivery = Some(WakeDeliveryState::PromptWritten);
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if changed {
+            // The text side effect cannot be rolled back. Retain the in-memory
+            // phase even if persistence fails, matching notification markers.
+            let result = self.persist_current().await;
+            self.publish_change();
+            result?;
+        }
+        Ok(())
     }
 
     pub async fn reply(
@@ -976,13 +1065,19 @@ impl CollaborationStore {
 
     pub async fn pending_unnotified(&self) -> Vec<CollaborationRequest> {
         let _transaction = self.transaction_lock.lock().await;
-        self.requests
+        let mut requests: Vec<_> = self
+            .requests
             .read()
             .await
             .values()
-            .filter(|r| r.status == RequestStatus::Queued && r.notified_at.is_none())
+            .filter(|request| {
+                request.notified_at.is_none()
+                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
+            })
             .cloned()
-            .collect()
+            .collect();
+        requests.sort_by_key(|request| request.created_at);
+        requests
     }
 
     /// Replies still owed a wake to their sender.
@@ -993,7 +1088,8 @@ impl CollaborationStore {
     /// is delivered by being readable in the recipient's mailbox.
     pub async fn pending_reply_unnotified(&self) -> Vec<CollaborationRequest> {
         let _transaction = self.transaction_lock.lock().await;
-        self.requests
+        let mut requests: Vec<_> = self
+            .requests
             .read()
             .await
             .values()
@@ -1004,7 +1100,9 @@ impl CollaborationStore {
                     && !request.from.console
             })
             .cloned()
-            .collect()
+            .collect();
+        requests.sort_by_key(|request| request.created_at);
+        requests
     }
 
     pub async fn mark_notified(&self, request_id: &str) -> Result<(), CollaborationError> {
@@ -1012,8 +1110,14 @@ impl CollaborationStore {
         let changed = {
             let mut requests = self.requests.write().await;
             requests.get_mut(request_id).is_some_and(|request| {
-                if request.status == RequestStatus::Queued && request.notified_at.is_none() {
+                if request.notified_at.is_none()
+                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
+                {
                     request.notified_at = Some(OffsetDateTime::now_utc());
+                    request.wake_delivery = None;
+                    if !request.expects_reply && request.status == RequestStatus::Claimed {
+                        request.status = RequestStatus::Completed;
+                    }
                     true
                 } else {
                     false
@@ -1062,7 +1166,10 @@ impl CollaborationStore {
             .read()
             .await
             .values()
-            .filter(|r| r.status == RequestStatus::Queued && r.to.same_endpoint(participant))
+            .filter(|request| {
+                request.to.same_endpoint(participant)
+                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
+            })
             .count()
     }
 
@@ -1757,6 +1864,163 @@ mod tests {
         );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 0);
         assert!(mailbox.pending_reply_unnotified().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_wake_claims_before_delivery_and_tracks_submission_phase() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Task,
+                    body: "apply the scoped change".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::Execute,
+                    paths: vec!["src/auth.rs".into()],
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let prepared = mailbox
+            .prepare_direct_wake(&recipient, &request.id)
+            .await
+            .unwrap()
+            .expect("queued request should be reserved");
+        assert_eq!(prepared.status, RequestStatus::Claimed);
+        assert_eq!(prepared.wake_delivery, Some(WakeDeliveryState::Prepared));
+        assert!(matches!(
+            mailbox.cancel_for(&sender, &request.id).await,
+            Err(CollaborationError::AlreadyClaimed(_))
+        ));
+        assert_eq!(mailbox.pending_unnotified().await.len(), 1);
+
+        mailbox.mark_wake_prompt_written(&request.id).await.unwrap();
+        assert_eq!(
+            mailbox.pending_unnotified().await[0].wake_delivery,
+            Some(WakeDeliveryState::PromptWritten)
+        );
+
+        mailbox.mark_notified(&request.id).await.unwrap();
+        assert!(mailbox.pending_unnotified().await.is_empty());
+        let delivered = mailbox.get_for(&recipient, &request.id).await.unwrap();
+        assert_eq!(delivered.status, RequestStatus::Claimed);
+        assert_eq!(delivered.wake_delivery, None);
+        assert!(delivered.notified_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn inbox_pull_supersedes_prepared_direct_wake() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let recipient = participant("%2", "recipient");
+        let request = mailbox
+            .create(
+                participant("%1", "sender"),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Notice,
+                    body: "deployment finished".into(),
+                    expects_reply: false,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .prepare_direct_wake(&recipient, &request.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let inbox = mailbox.claim_for(&recipient).await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].body, "deployment finished");
+        assert_eq!(inbox[0].status, RequestStatus::Completed);
+        assert_eq!(inbox[0].wake_delivery, None);
+        assert!(inbox[0].notified_at.is_some());
+        assert!(mailbox.pending_unnotified().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_wake_recovery_phase_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("collaboration.json")),
+            ..CollaborationOptions::default()
+        };
+        let recipient = participant("%2", "recipient");
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let request = mailbox
+            .create(
+                participant("%1", "sender"),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Task,
+                    body: "survive a daemon restart".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::Execute,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .prepare_direct_wake(&recipient, &request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        mailbox.mark_wake_prompt_written(&request.id).await.unwrap();
+        drop(mailbox);
+
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        let pending = reloaded.pending_unnotified().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, RequestStatus::Claimed);
+        assert_eq!(
+            pending[0].wake_delivery,
+            Some(WakeDeliveryState::PromptWritten)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_direct_notice_completes_without_a_reply() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let recipient = participant("%2", "recipient");
+        let request = mailbox
+            .create(
+                participant("%1", "sender"),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Notice,
+                    body: "build completed".into(),
+                    expects_reply: false,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .prepare_direct_wake(&recipient, &request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        mailbox.mark_wake_prompt_written(&request.id).await.unwrap();
+        mailbox.mark_notified(&request.id).await.unwrap();
+
+        let delivered = mailbox.get_for(&recipient, &request.id).await.unwrap();
+        assert_eq!(delivered.status, RequestStatus::Completed);
+        assert!(delivered.reply.is_none());
+        assert!(mailbox.pending_unnotified().await.is_empty());
     }
 
     #[tokio::test]
