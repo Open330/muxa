@@ -5838,6 +5838,14 @@ mod work_up_key_tests {
         );
     }
 
+    /// Outside tmux the window would be created somewhere the operator is not
+    /// looking, and the run would sit on a confirmation prompt nobody sees.
+    #[test]
+    fn outside_tmux_it_refuses_and_names_the_command() {
+        let error = open_work_up_window("cal-7229", false).expect_err("must refuse");
+        assert!(error.contains("muxa work up CAL-7229"), "{error}");
+    }
+
     /// The window has to outlive the command, or the plan `work up` prints
     /// scrolls past before it can be read.
     #[test]
@@ -7190,7 +7198,8 @@ pub async fn run(
                 }
                 Action::SubmitWorkUp => {
                     if let Some(work) = app.work_composer.take() {
-                        match open_work_up_window(&work.input) {
+                        let in_tmux = std::env::var_os("TMUX").is_some();
+                        match open_work_up_window(&work.input, in_tmux) {
                             Ok(id) => app.set_hint(
                                 format!("work up {id} — confirm in the new window"),
                                 HintLevel::Ok,
@@ -9146,8 +9155,18 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
 /// places where muxa decides whether it may spend the operator's money, and
 /// the second one would be the one nobody reviewed. So the TUI's job ends at
 /// putting the operator in front of the real thing.
-fn open_work_up_window(raw: &str) -> std::result::Result<String, String> {
+fn open_work_up_window(raw: &str, in_tmux: bool) -> std::result::Result<String, String> {
     let work = crate::tmux_work::normalize_work_id(raw).map_err(|error| error.to_string())?;
+    // Outside tmux, `new-window` still succeeds — it lands in whichever session
+    // the server saw last, which is not one the operator is looking at. They
+    // would be told to confirm in a window they cannot find, and the run would
+    // hang on a prompt nobody sees. Refusing and naming the command is the
+    // honest outcome.
+    if !in_tmux {
+        return Err(format!(
+            "not inside tmux; run `muxa work up {work}` from a shell instead"
+        ));
+    }
     let exe = std::env::current_exe()
         .map_err(|error| format!("locate the muxa binary: {error}"))?
         .display()

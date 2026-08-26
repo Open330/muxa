@@ -502,15 +502,18 @@ pub struct PaneInfo {
     /// self-registered by the agent, so it survives the window before the
     /// agent's first hook and lets `role:` routing resolve a pipeline peer.
     /// `None` for unmanaged panes and non-tmux backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
     /// `@muxa_agent_alias` — the pipeline-local name for this pane (`impl`,
     /// `review`). Same provenance and caveats as [`Self::agent_role`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
     /// `@muxa_work_done` — the aliases that have reported finishing on this
     /// pane's *work*. A window option, so every pane of one work carries the
     /// same list; it rides along here so a reader that already has the panes
     /// can tell a converged pipeline from a stalled one without a second
     /// tmux round trip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_done: Vec<String>,
 }
 
@@ -1235,6 +1238,51 @@ mod tests {
     /// `PANE_FMT` asked tmux for `@muxa_agent_role` long before anything kept
     /// it, so `role:` routing had nothing to match and pipeline peers were
     /// unaddressable. Both columns are now retained.
+    /// These three fields are additive on the wire, and `PaneInfo` crosses it:
+    /// pane snapshots go CLI → daemon over IPC and host → host over the fleet
+    /// relay. A peer built before they existed sends a payload without them,
+    /// and without `serde(default)` the newer side rejects the whole snapshot
+    /// — which is exactly the version skew an upgrade creates.
+    #[test]
+    fn a_snapshot_from_a_peer_without_the_pipeline_fields_still_loads() {
+        let json = r#"{"pane_id":"%1","session":"s","window_index":"0",
+            "pane_index":"0","tty":"","current_command":"claude","title":"",
+            "pane_pid":0}"#;
+        let pane: PaneInfo = serde_json::from_str(json).expect("older peer payload");
+        assert_eq!(pane.pane_id, "%1");
+        assert_eq!(pane.agent_role, None);
+        assert_eq!(pane.agent_alias, None);
+        assert!(pane.work_done.is_empty());
+    }
+
+    /// And the reverse: an unaliased pane must not grow the payload it sends
+    /// to an older peer with keys that peer has no field for.
+    #[test]
+    fn an_unaliased_pane_serializes_without_the_new_keys() {
+        let pane = PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
+            pane_id: "%1".into(),
+            session_id: String::new(),
+            session: "s".into(),
+            window_id: String::new(),
+            window_name: String::new(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: String::new(),
+            socket: None,
+        };
+        let json = serde_json::to_string(&pane).expect("serialize");
+        assert!(!json.contains("agent_role"), "{json}");
+        assert!(!json.contains("agent_alias"), "{json}");
+        assert!(!json.contains("work_done"), "{json}");
+    }
+
     #[test]
     fn parses_managed_agent_role_and_alias() {
         let mut cols = vec!["%10", "main", "0", "0", "/dev/pts/0", "codex", "title"];
