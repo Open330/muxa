@@ -315,6 +315,38 @@ tmux attach -t callabo
 tmux new-session -t callabo \; set-option destroy-unattached on
 ```
 
+To keep `tmux attach -t <session>` itself doing this — no second command to
+remember — put the grouping behind a `client-attached` hook. It fires only when
+the session already had another client, so a lone terminal still attaches to the
+real session and no extra session is created:
+
+```tmux
+set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"~/.local/bin/tmux-attach-view #{session_name} #{client_name} #{client_pid}\"'"
+```
+
+where the script creates the view and moves the arriving client into it:
+
+```sh
+name="view~$3~$1"
+new=$(tmux new-session -dP -F '#{session_id}' -t "=$1" -s "$name")
+tmux switch-client -c "$2" -t "$new"
+tmux set-option -t "$new" destroy-unattached on
+```
+
+Three details are load-bearing, each measured on tmux 3.4. `destroy-unattached`
+must be set *after* `switch-client`: on a session that still has no client tmux
+reaps it on the spot, silently undoing the whole thing. The session name is
+passed, not `#{session_id}` — the id is `$0`, and `run-shell` hands its command
+to a shell that expands it. And the view is named `view~<pid>~<session>` rather
+than after the session it mirrors, so a prefix lookup for `callabo` can never
+match a view instead of the real thing.
+
+`tmux set-option -t <session> @no_auto_view 1` opts one session out, for when
+two terminals *should* mirror each other (pairing, screen sharing).
+
+`command-alias` cannot do this: tmux resolves built-in command names before
+aliases, so an alias for `attach-session` is never consulted.
+
 `aggressive-resize` is worth pairing with it, so a window is sized to the
 clients actually viewing it rather than to the smallest client on the session:
 

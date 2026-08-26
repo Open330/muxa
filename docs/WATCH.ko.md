@@ -258,6 +258,38 @@ tmux attach -t callabo
 tmux new-session -t callabo \; set-option destroy-unattached on
 ```
 
+`tmux attach -t <session>` 자체가 이렇게 동작하게 하려면 — 따로 외울 명령 없이 —
+grouping을 `client-attached` hook 뒤에 둡니다. 이미 다른 client가 붙어 있을 때만
+동작하므로, 터미널이 하나뿐이면 평소대로 진짜 session에 붙고 여분의 session도
+생기지 않습니다.
+
+```tmux
+set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"~/.local/bin/tmux-attach-view #{session_name} #{client_name} #{client_pid}\"'"
+```
+
+스크립트는 view를 만들고 도착한 client를 그쪽으로 옮깁니다.
+
+```sh
+name="view~$3~$1"
+new=$(tmux new-session -dP -F '#{session_id}' -t "=$1" -s "$name")
+tmux switch-client -c "$2" -t "$new"
+tmux set-option -t "$new" destroy-unattached on
+```
+
+세 가지가 결정적이며 모두 tmux 3.4에서 실측했습니다. `destroy-unattached`는
+반드시 `switch-client` **뒤에** 걸어야 합니다 — client가 아직 없는 session에 걸면
+그 자리에서 reap되어 전체가 조용히 무효화됩니다. `#{session_id}`가 아니라 session
+이름을 넘깁니다 — id는 `$0`이고 `run-shell`은 명령을 셸에 넘기므로 셸이 이를
+확장해 버립니다. view 이름은 원본 session 이름이 아니라 `view~<pid>~<session>`
+입니다 — 그래야 `callabo`를 찾는 prefix 조회가 진짜 session 대신 view를 집어가는
+일이 없습니다.
+
+한 session만 예외로 두려면 `tmux set-option -t <session> @no_auto_view 1` —
+두 터미널이 *일부러* 같은 화면을 봐야 할 때(페어링, 화면 공유)입니다.
+
+`command-alias`로는 안 됩니다. tmux는 내장 명령 이름을 alias보다 먼저 해석하므로
+`attach-session` alias는 참조되지 않습니다.
+
 window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보는
 client 기준으로 잡으려면 `aggressive-resize`를 함께 켜는 편이 좋습니다.
 
