@@ -49,7 +49,7 @@ const EXTERNAL_URL_OPTION: &str = "@muxa_external_url";
 const EXTERNAL_STATUS_OPTION: &str = "@muxa_external_status";
 
 const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
-const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_work_done}";
+const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}";
 const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_agent_alias}";
 const WINDOW_IDENTITY_FORMAT: &str =
     "#{window_id}\t#{session_id}\t#{session_name}\t#{window_name}\t#{automatic-rename}";
@@ -82,9 +82,6 @@ pub struct WorkInfo {
     pub cwd: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_item: Option<Box<ExternalItemInfo>>,
-    /// Pipeline aliases that reported finishing, in the order recorded.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub done: Vec<String>,
     pub agents: Vec<ManagedAgentPane>,
 }
 
@@ -544,10 +541,7 @@ fn work_list_table(
         let run = runs.iter().find(|run| {
             run.identity.workspace_id == work.workspace && run.identity.work_id == work.work
         });
-        let (done, total) = run.map_or_else(
-            || done_ratio(work),
-            muxa::pipeline_run::PipelineRun::completion,
-        );
+        let completion = run.map(muxa::pipeline_run::PipelineRun::completion);
         let mut row = vec![
             theme.cell(&work.work, TableTone::Accent),
             theme.cell(&work.workspace, TableTone::Dim),
@@ -559,14 +553,14 @@ fn work_list_table(
                 run.map_or_else(|| agent_summary(work), pipeline_alias_summary),
                 TableTone::Tmux,
             ),
-            match total {
-                // Not a pipeline: nothing ever reports, so a ratio would
-                // read as "0 of 1 finished" for work that is simply running.
-                0 => theme.right_cell("-", TableTone::Dim),
-                total if done == total => {
+            match completion {
+                // No Run, or a Run that named no agents: nothing here was ever
+                // asked to report, and `0/N` would say the opposite.
+                None | Some((_, 0)) => theme.right_cell("-", TableTone::Dim),
+                Some((done, total)) if done == total => {
                     theme.right_cell(format!("{done}/{total}"), TableTone::Good)
                 }
-                total => theme.right_cell(format!("{done}/{total}"), TableTone::Warn),
+                Some((done, total)) => theme.right_cell(format!("{done}/{total}"), TableTone::Warn),
             },
         ];
         if show_stage {
@@ -611,28 +605,6 @@ fn pipeline_alias_summary(run: &muxa::pipeline_run::PipelineRun) -> String {
         })
         .collect::<Vec<_>>()
         .join(" \u{b7} ")
-}
-
-/// How many of this work's pipeline agents have reported finishing.
-///
-/// Counted over *aliased* panes only: `done` records aliases, so a pane the
-/// operator opened by hand could never be in it and must not inflate the
-/// denominator.
-fn done_ratio(work: &WorkInfo) -> (usize, usize) {
-    let aliases: Vec<&str> = work
-        .agents
-        .iter()
-        .filter_map(|agent| agent.alias.as_deref())
-        .collect();
-    let done = aliases
-        .iter()
-        .filter(|alias| {
-            work.done
-                .iter()
-                .any(|reported| reported.eq_ignore_ascii_case(alias))
-        })
-        .count();
-    (done, aliases.len())
 }
 
 /// Who is in the window: pipeline aliases when it has them, otherwise the
@@ -1278,7 +1250,54 @@ mod work_list_view_tests {
         }
     }
 
-    fn work(name: &str, agents: Vec<ManagedAgentPane>, done: &[&str]) -> WorkInfo {
+    fn run(work: &str, aliases: &[(&str, bool)]) -> muxa::pipeline_run::PipelineRun {
+        use muxa::pipeline_run::{PipelineAliasState, PipelineAliasStatus};
+        muxa::pipeline_run::PipelineRun {
+            identity: muxa::work::WorkIdentity::new("callabo", work),
+            pipeline: "pair".into(),
+            desired: aliases
+                .iter()
+                .map(|(alias, _)| muxa::pipeline::DesiredAgent {
+                    alias: (*alias).to_string(),
+                    program: "claude".into(),
+                    role: None,
+                    task: None,
+                    prompt: None,
+                    direction: None,
+                    after: Vec::new(),
+                })
+                .collect(),
+            cwd: PathBuf::from("/repo"),
+            generation: 1,
+            window_id: None,
+            aliases: aliases
+                .iter()
+                .map(|(alias, done)| {
+                    (
+                        (*alias).to_string(),
+                        PipelineAliasState {
+                            alias: (*alias).to_string(),
+                            status: if *done {
+                                PipelineAliasStatus::Done
+                            } else {
+                                PipelineAliasStatus::Pending
+                            },
+                            generation: 1,
+                            completion_generation: None,
+                            pane: None,
+                            error: None,
+                            reconcile_pending: false,
+                            claim_started_at: None,
+                            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                        },
+                    )
+                })
+                .collect(),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn work(name: &str, agents: Vec<ManagedAgentPane>) -> WorkInfo {
         WorkInfo {
             work: name.into(),
             workspace: "callabo".into(),
@@ -1289,7 +1308,6 @@ mod work_list_view_tests {
             window_name: name.into(),
             cwd: PathBuf::from("/repo"),
             external_item: None,
-            done: done.iter().map(|d| (*d).to_string()).collect(),
             agents,
         }
     }
@@ -1343,35 +1361,6 @@ mod work_list_view_tests {
 
     /// `done` records aliases, so only aliased panes can ever be in it. A pane
     /// the operator split by hand must not inflate the denominator and make a
-    /// converged pipeline read as unfinished.
-    #[test]
-    fn done_counts_only_pipeline_agents() {
-        let piped = work(
-            "CAL-1",
-            vec![
-                agent("%1", "claude", Some("impl")),
-                agent("%2", "codex", Some("review")),
-                agent("%3", "codex", None),
-            ],
-            &["impl", "review"],
-        );
-        assert_eq!(done_ratio(&piped), (2, 2));
-
-        let partial = work(
-            "CAL-2",
-            vec![
-                agent("%1", "claude", Some("impl")),
-                agent("%2", "codex", Some("review")),
-            ],
-            &["impl"],
-        );
-        assert_eq!(done_ratio(&partial), (1, 2));
-
-        // Hand-built window: no aliases at all, so there is no ratio to show.
-        let manual = work("ad-hoc", vec![agent("%1", "claude", None)], &[]);
-        assert_eq!(done_ratio(&manual), (0, 0));
-    }
-
     #[test]
     fn agents_read_as_aliases_or_collapsed_programs() {
         let piped = work(
@@ -1380,7 +1369,6 @@ mod work_list_view_tests {
                 agent("%1", "claude", Some("impl")),
                 agent("%2", "codex", Some("review")),
             ],
-            &[],
         );
         assert_eq!(agent_summary(&piped), "impl \u{b7} review");
 
@@ -1391,7 +1379,6 @@ mod work_list_view_tests {
                 agent("%2", "claude", None),
                 agent("%3", "codex", None),
             ],
-            &[],
         );
         assert_eq!(agent_summary(&manual), "claude x2 \u{b7} codex");
     }
@@ -1407,27 +1394,41 @@ mod work_list_view_tests {
                     agent("%1", "claude", Some("impl")),
                     agent("%2", "codex", Some("review")),
                 ],
-                &["impl", "review"],
             ),
-            work("RELEASE-1", vec![agent("%3", "claude", None)], &[]),
+            work("RELEASE-1", vec![agent("%3", "claude", None)]),
         ];
-        let out = work_list_table(&works, &[], &[], crate::theme::CliTheme::plain());
+        let runs = vec![run("CAL-1", &[("impl", true), ("review", true)])];
+        let out = work_list_table(&works, &[], &runs, crate::theme::CliTheme::plain());
         assert!(out.contains("CAL-1"), "{out}");
         assert!(out.contains("2/2"), "{out}");
-        assert!(out.contains("impl \u{b7} review"), "{out}");
-        // No pipeline aliases, so no ratio — not `0/1`.
-        assert!(!out.contains("0/1"), "{out}");
         // The stage column stays out of the way when nothing is staged.
         assert!(!out.contains("STAGE"), "{out}");
     }
 
+    /// The denominator is what the pipeline *asked for*, not what has been
+    /// launched — otherwise a pair whose reviewer has not started yet reads
+    /// `1/1`, which is indistinguishable from converged.
+    #[test]
+    fn an_unlaunched_agent_still_counts_against_the_total() {
+        let works = vec![work("CAL-1", vec![agent("%1", "claude", Some("impl"))])];
+        let runs = vec![run("CAL-1", &[("impl", true), ("review", false)])];
+        let out = work_list_table(&works, &[], &runs, crate::theme::CliTheme::plain());
+        assert!(out.contains("1/2"), "{out}");
+    }
+
+    /// A window with no Run has no completion record at all. `0/N` would say
+    /// nothing finished; the truth is that nothing here was ever asked to.
+    #[test]
+    fn a_work_without_a_run_reports_no_ratio() {
+        let works = vec![work("CAL-1", vec![agent("%1", "claude", Some("impl"))])];
+        let out = work_list_table(&works, &[], &[], crate::theme::CliTheme::plain());
+        assert!(!out.contains("0/1"), "{out}");
+        assert!(out.contains("CAL-1"), "{out}");
+    }
+
     #[test]
     fn table_uses_durable_desired_aliases_before_downstream_has_a_pane() {
-        let works = vec![work(
-            "CAL-1",
-            vec![agent("%1", "codex", Some("impl"))],
-            &["impl"],
-        )];
+        let works = vec![work("CAL-1", vec![agent("%1", "codex", Some("impl"))])];
         let out = work_list_table(
             &works,
             &[],
@@ -1449,14 +1450,6 @@ mod work_list_view_tests {
         assert!(out.contains("review:pending"), "{out}");
         assert!(out.contains("1/2"), "{out}");
     }
-}
-
-fn parse_done(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|alias| !alias.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
 }
 
 pub fn window_id_for_pane(pane: &str) -> Result<String> {
@@ -1657,7 +1650,6 @@ fn parse_work_window(
         window_name: fields[4].to_string(),
         cwd: PathBuf::from(fields[6]),
         external_item: parse_external_item(&fields),
-        done: parse_done(fields.get(15).copied().unwrap_or_default()),
         agents,
     })
 }
@@ -2001,7 +1993,6 @@ mod tests {
             window_name: work.into(),
             cwd: PathBuf::from("/work"),
             external_item: None,
-            done: Vec::new(),
             agents: Vec::new(),
         }
     }

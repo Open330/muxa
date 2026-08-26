@@ -222,9 +222,13 @@ pub struct WindowNode {
     pub cwd: Option<String>,
     pub states: StateDistribution,
     pub panes: Vec<PaneNode>,
-    /// How far this window's pipeline has reported, or `None` when the window
-    /// is not a pipeline. Computed here so every surface — TUI tree, flat
-    /// list, dashboard — reads the same number instead of each deriving it.
+    /// How far this window's pipeline has reported, or `None` when nothing
+    /// knows.
+    ///
+    /// The durable pipeline Run is the only source: it holds both what the
+    /// pipeline asked for and what reported back. tmux carries neither, so
+    /// `TopologySnapshot::build` leaves this `None` and the surfaces that can
+    /// reach a Run fill it in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<WorkCompletion>,
     /// Durable daemon-owned pipeline state, when this window is bound to a
@@ -438,11 +442,7 @@ impl TopologySnapshot {
                     },
                     index: pane.window_index.clone(),
                     panes: Vec::new(),
-                    done: Vec::new(),
                 });
-            if window.done.is_empty() {
-                window.done.clone_from(&pane.work_done);
-            }
             window.panes.push(PaneNode {
                 key: pane_key,
                 index: pane.pane_index,
@@ -545,9 +545,6 @@ struct WindowBuilder {
     name: String,
     index: String,
     panes: Vec<PaneNode>,
-    /// Aliases this window has recorded as finished, from `@muxa_work_done`.
-    /// A window option, so whichever pane is seen first supplies it.
-    done: Vec<String>,
 }
 
 impl WindowBuilder {
@@ -562,12 +559,6 @@ impl WindowBuilder {
         for agent in self.panes.iter().filter_map(|pane| pane.agent.as_ref()) {
             states.add(agent.state);
         }
-        let completion = work_completion(
-            self.panes
-                .iter()
-                .filter_map(|pane| pane.agent_alias.as_deref()),
-            &self.done,
-        );
         WindowNode {
             key: self.key,
             name: self.name,
@@ -575,37 +566,12 @@ impl WindowBuilder {
             cwd,
             states,
             panes: self.panes,
-            completion,
+            // Both are filled in by whoever holds the durable pipeline Run;
+            // the tmux topology cannot know either.
+            completion: None,
             pipeline_run: None,
         }
     }
-}
-
-/// Completion over the *aliased* panes only.
-///
-/// `@muxa_work_done` records aliases, so a pane the operator split by hand can
-/// never appear in it; counting it would show a converged pair as 2/3 forever.
-/// A window with no aliases was never a pipeline and gets `None` rather than
-/// `0/1`, which would libel an agent nobody asked to report.
-pub fn work_completion<'a>(
-    aliases: impl IntoIterator<Item = &'a str>,
-    done: &[String],
-) -> Option<WorkCompletion> {
-    let aliases: Vec<&str> = aliases.into_iter().collect();
-    if aliases.is_empty() {
-        return None;
-    }
-    let reported = aliases
-        .iter()
-        .filter(|alias| {
-            done.iter()
-                .any(|reported| reported.eq_ignore_ascii_case(alias))
-        })
-        .count();
-    Some(WorkCompletion {
-        done: reported,
-        total: aliases.len(),
-    })
 }
 
 fn numeric_index(value: &str) -> u64 {
@@ -708,7 +674,6 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
-            work_done: Vec::new(),
             pane_id: "%1".into(),
             session_id: "$1".into(),
             session: session_name.into(),

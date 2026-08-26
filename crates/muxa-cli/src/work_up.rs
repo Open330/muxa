@@ -212,19 +212,16 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
         bail!("non-dry pipeline reconciliation must use muxad's durable Run state");
     }
     let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
-    // The completion set lives on the work window, so a re-run reads what
-    // previous runs' agents reported even though none of them still exist.
-    let done = if let Some(run) = resolved.durable_run.as_ref() {
+    // The durable Run is the completion record: it outlives the agents that
+    // reported, so a re-run reads what previous ones said. Before a Run is
+    // registered nothing has reported yet, which is what an empty set means.
+    let done: Vec<String> = resolved.durable_run.as_ref().map_or_else(Vec::new, |run| {
         run.aliases
             .values()
             .filter(|state| state.status == PipelineAliasStatus::Done)
             .map(|state| state.alias.clone())
             .collect()
-    } else {
-        crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?
-            .map(|info| info.done)
-            .unwrap_or_default()
-    };
+    });
     let broadcast = resolved
         .request
         .as_ref()
@@ -1675,7 +1672,6 @@ mod tests {
             window_name: "CAL-1".into(),
             cwd: PathBuf::from("/tmp/already-here"),
             external_item: None,
-            done: Vec::new(),
             agents: Vec::new(),
         };
         let (cwd, worktree, created) =

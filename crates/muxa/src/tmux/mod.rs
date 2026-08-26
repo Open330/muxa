@@ -508,13 +508,6 @@ pub struct PaneInfo {
     /// `review`). Same provenance and caveats as [`Self::agent_role`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
-    /// `@muxa_work_done` — the aliases that have reported finishing on this
-    /// pane's *work*. A window option, so every pane of one work carries the
-    /// same list; it rides along here so a reader that already has the panes
-    /// can tell a converged pipeline from a stalled one without a second
-    /// tmux round trip.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub work_done: Vec<String>,
 }
 
 /// The short display name for a tmux socket path: its file basename
@@ -575,7 +568,7 @@ pub struct ClientInfo {
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}\t#{@muxa_work_done}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}";
 
 pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
 pub(crate) const CLIENT_FMT: &str =
@@ -625,15 +618,6 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             socket: socket.map(Into::into),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
-            work_done: non_empty(cols.get(32))
-                .map(|raw| {
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|alias| !alias.is_empty())
-                        .map(str::to_ascii_lowercase)
-                        .collect()
-                })
-                .unwrap_or_default(),
         });
     }
     panes
@@ -1252,7 +1236,6 @@ mod tests {
         assert_eq!(pane.pane_id, "%1");
         assert_eq!(pane.agent_role, None);
         assert_eq!(pane.agent_alias, None);
-        assert!(pane.work_done.is_empty());
     }
 
     /// And the reverse: an unaliased pane must not grow the payload it sends
@@ -1262,7 +1245,6 @@ mod tests {
         let pane = PaneInfo {
             agent_role: None,
             agent_alias: None,
-            work_done: Vec::new(),
             pane_id: "%1".into(),
             session_id: String::new(),
             session: "s".into(),
@@ -1280,7 +1262,6 @@ mod tests {
         let json = serde_json::to_string(&pane).expect("serialize");
         assert!(!json.contains("agent_role"), "{json}");
         assert!(!json.contains("agent_alias"), "{json}");
-        assert!(!json.contains("work_done"), "{json}");
     }
 
     #[test]
