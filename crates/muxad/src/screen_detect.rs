@@ -170,12 +170,39 @@ impl ScreenDetector {
     /// not re-resolve it. The `list_panes` calls (blocking tmux shell-outs) run
     /// inside one `spawn_blocking`.
     async fn gather_candidates(&self) -> Vec<(usize, PaneInfo, AgentManifest)> {
+        // What the registry believes occupies each pane, built once per tick.
+        // This is the stronger of the two selectors: an npm-installed codex
+        // reports `node` as its foreground command, which names no manifest,
+        // so command-only selection skipped those panes entirely and their
+        // startup gate was never seen. Stopped rows are tombstones, not
+        // occupants.
+        let by_pane: HashMap<String, AgentKind> = self
+            .store
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|a| a.state != muxa::AgentState::Stopped)
+            .filter_map(|a| a.pane.clone().map(|pane| (pane, a.kind)))
+            .collect();
+
         let backends = self.backends.clone();
-        let panes: Vec<(usize, PaneInfo)> = spawn_blocking(move || {
+        // `discover_from_panes` walks the process tree for wrapper panes, which
+        // is the only way to identify an agent that has NO registry row yet —
+        // exactly the startup gate, since the row is minted by the first hook
+        // and the gate paints before any hook exists. Blocking (/proc), so it
+        // rides along inside the same `spawn_blocking` as `list_panes`.
+        let panes: Vec<(usize, PaneInfo, Option<AgentKind>)> = spawn_blocking(move || {
             let mut out = Vec::new();
             for (i, backend) in backends.iter().enumerate() {
-                for pane in backend.list_panes() {
-                    out.push((i, pane));
+                let listed = backend.list_panes();
+                let discovered: HashMap<String, AgentKind> =
+                    muxa::discovery::discover_from_panes(&listed)
+                        .into_iter()
+                        .map(|d| (d.pane.pane_id, d.kind))
+                        .collect();
+                for pane in listed {
+                    let kind = discovered.get(&pane.pane_id).copied();
+                    out.push((i, pane, kind));
                 }
             }
             out
@@ -185,10 +212,24 @@ impl ScreenDetector {
 
         panes
             .into_iter()
-            .filter_map(|(i, p)| {
-                self.manifests
-                    .manifest_for_command(&p.current_command)
-                    .map(|m| (i, p, m.clone()))
+            .filter_map(|(i, p, discovered)| {
+                let direct = self.manifests.manifest_for_command(&p.current_command);
+                // The registry knows which agent muxa put on the pane; the
+                // foreground command only knows which process is in front, and
+                // for an npm install that is the `node` shim. So prefer the
+                // registry — but only while the command still looks like an
+                // agent host. A pane that fell back to a shell has lost its
+                // agent, and must drop out of candidacy even though a row may
+                // still (briefly) point at it.
+                let registry = (direct.is_some()
+                    || muxa::discovery::is_wrapper_command(&p.current_command))
+                .then(|| by_pane.get(&p.pane_id).copied())
+                .flatten();
+                let by_kind = registry
+                    .or(discovered)
+                    .and_then(AgentKind::screen_manifest_name)
+                    .and_then(|name| self.manifests.manifest_for_name(name));
+                by_kind.or(direct).map(|m| (i, p, m.clone()))
             })
             .collect()
     }
@@ -207,7 +248,7 @@ impl ScreenDetector {
         let pane_id = pane.pane_id.clone();
 
         let occupants = self.store.by_pane(&pane_id).await;
-        let ownership = synthetic::pane_ownership(&occupants);
+        let ownership = synthetic::pane_ownership(&occupants, OffsetDateTime::now_utc());
         if matches!(ownership, synthetic::PaneOwnership::Hooked) {
             // Hook-authoritative: a live real row owns the pane and its hooks
             // report every state — don't even capture. Forget any tracking so
@@ -398,6 +439,9 @@ mod tests {
 
     fn pane(pane_id: &str, command: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: Some("default".into()),
             pane_id: pane_id.into(),
             session_id: String::new(),
@@ -452,6 +496,62 @@ mod tests {
             "only the capture-capable tmux backend remains"
         );
         assert_eq!(out[0].kind(), HostKind::Tmux);
+    }
+
+    /// The regression this pairs with the `STARTUP_ATTENTION_WINDOW` carve-out:
+    /// an npm-installed codex runs as `node`, so command-based manifest
+    /// selection never even considered the pane, and its startup gate — the one
+    /// screen codex's own hooks structurally cannot report, because it paints
+    /// before the session exists — showed up in muxa as a plain `idle` agent.
+    ///
+    /// Both halves have to hold for this to pass: the kind must select the
+    /// manifest, and the fresh hooked row must still be refinable.
+    #[tokio::test]
+    async fn codex_startup_gate_is_detected_on_a_pane_running_as_node() {
+        let captures = Arc::new(Mutex::new(HashMap::new()));
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "  Do you trust this folder?\n› 1. Yes, continue\n  2. No, quit\n".into(),
+        );
+        // `node`, not `codex` — exactly what an npm install reports.
+        let backend: SharedBackend = Arc::new(FakeBackend::tmux(
+            vec![pane("%1", "node")],
+            captures.clone(),
+        ));
+        let store = Store::shared();
+
+        // A live codex row muxa just launched: Idle, because no hook has fired.
+        let launched_at = OffsetDateTime::now_utc();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "sess-1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: launched_at,
+            })
+            .await;
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Idle);
+
+        let mut det = detector(vec![backend], store.clone());
+        assert_eq!(det.run_tick().await, 1, "the gate must be detected");
+
+        let rows = store.by_pane("%1").await;
+        assert_eq!(rows.len(), 1, "refinement targets the REAL row, adds none");
+        assert_eq!(rows[0].kind, AgentKind::Codex);
+        assert_eq!(
+            rows[0].state,
+            AgentState::WaitingInput,
+            "a pane sitting on the trust gate is waiting on the operator",
+        );
+        assert!(
+            !det.tracked.contains("%1"),
+            "a real row is not ours to stop-sweep",
+        );
     }
 
     #[tokio::test]

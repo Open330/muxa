@@ -2348,6 +2348,9 @@ mod tests {
         window_name: &str,
     ) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -2715,6 +2718,9 @@ mod tests {
             fetched_at: OffsetDateTime::now_utc(),
         };
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: "herdr:p1".into(),
             session_id: "ws1".into(),
@@ -2742,6 +2748,9 @@ mod tests {
         let scan = backend_scan_result(
             HostKind::Rmux,
             vec![crate::tmux::PaneInfo {
+                agent_role: None,
+                agent_alias: None,
+                work_done: Vec::new(),
                 socket: Some("/tmp/rmux-user/default".into()),
                 pane_id: "rmux:%4".into(),
                 session_id: "$1".into(),
@@ -2771,6 +2780,9 @@ mod tests {
         let rmux: SharedBackend = Arc::new(InventoryBackend {
             kind: HostKind::Rmux,
             panes: vec![crate::tmux::PaneInfo {
+                agent_role: None,
+                agent_alias: None,
+                work_done: Vec::new(),
                 socket: Some("/tmp/rmux-secondary/default".into()),
                 pane_id: "rmux:%8".into(),
                 session_id: "$2".into(),
@@ -3141,15 +3153,31 @@ mod tests {
             .unwrap();
         let snapshot = body_json(snapshot).await;
         assert_eq!(snapshot["schema_version"], work::WORK_SCHEMA_VERSION);
-        assert_eq!(snapshot["works"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["works"][0]["stage"], "review");
-        assert_eq!(snapshot["works"][0]["runs"].as_array().unwrap().len(), 1);
+        // Select the work this test created rather than asserting a global
+        // count. The pane scan always includes the host's own tmux server,
+        // so a machine with any muxa-managed work of its own would fail an
+        // assertion about how many works exist — a real failure this test
+        // hit once the developer's box had one.
+        let mine = snapshot["works"]
+            .as_array()
+            .expect("works array")
+            .iter()
+            .find(|work| work["title"] == "Repair auth")
+            .expect("the work this test annotated is present");
+        assert_eq!(mine["stage"], "review");
+        assert_eq!(mine["runs"].as_array().unwrap().len(), 1);
 
+        // Reload from disk and look for this test's own record. Counting is
+        // not safe here: `GET /api/works` upserts an external item for every
+        // pane it discovers, and the scan includes the host's real tmux — so
+        // the file legitimately holds a row per work running on the machine.
         let reloaded = WorkStore::load(Some(path));
-        assert_eq!(reloaded.records().len(), 1);
-        assert_eq!(
-            reloaded.records()[0].metadata.title.as_deref(),
-            Some("Repair auth")
+        assert!(
+            reloaded
+                .records()
+                .iter()
+                .any(|record| record.metadata.title.as_deref() == Some("Repair auth")),
+            "the annotated work survived the round trip"
         );
     }
 

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Work pipelines now have daemon-owned, generation-aware Run state.** The
+  selected pipeline, rendered desired aliases, dependency graph, Run
+  generation, and each alias's `pending`/`running`/`blocked`/`done`/`failed`
+  state persist in an owner-only store. `work done` is an atomic
+  alias-generation event, automatically reconciles newly-ready downstream
+  aliases, and rejects stale completions; restart/re-prompt invalidates the
+  affected downstream closure. `work list` and `watch` render this durable
+  state, including aliases that do not have panes yet. Local IPC protocol 5
+  advertises this contract as `pipeline_runs_v1`.
 - **Peer reply waits and idle wake delivery are event-driven.** Durable
   collaboration mutations now advance a retained mailbox revision that wakes
   every interested waiter. `muxa_wait_reply`, `muxa_call_peer(wait=true)`, and

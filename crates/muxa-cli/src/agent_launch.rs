@@ -214,6 +214,9 @@ pub struct StartRequest {
     pub role: Option<String>,
     pub task: Option<String>,
     pub alias: Option<String>,
+    /// Durable pipeline generation stamped on an aliased pane. A later
+    /// `work done` reads it back so an old pane cannot complete a new run.
+    pub generation: Option<u64>,
     pub direction: SplitDirection,
 }
 
@@ -231,6 +234,7 @@ impl From<&StartArgs> for StartRequest {
             role: args.role.clone(),
             task: args.task.clone(),
             alias: args.alias.clone(),
+            generation: None,
             direction: args.direction,
         }
     }
@@ -297,6 +301,7 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
         role: args.role,
         task: args.task,
         alias: args.alias,
+        generation: None,
         direction: args.direction,
     })?;
     if json {
@@ -323,6 +328,7 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
 /// Start one allowlisted agent in a detached tmux surface and return its exact
 /// pane id. The operation is synchronous and should be wrapped in
 /// `spawn_blocking` by async callers.
+#[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let PreparedLaunch {
         cwd,
@@ -330,6 +336,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         work,
         created_workspace,
         created_work,
+        adopted_session,
     } = prepare_launch(&mut request)?;
     let prompt = request
         .prompt
@@ -369,6 +376,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .transpose()?;
 
     let mark = (|| {
+        if let (Some(session), Some(workspace)) = (&adopted_session, workspace.as_deref()) {
+            crate::tmux_work::adopt_workspace(session, workspace)?;
+        }
         if created_workspace {
             crate::tmux_work::mark_workspace(
                 session
@@ -399,6 +409,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             request.role.as_deref(),
             request.task.as_deref(),
             request.alias.as_deref(),
+            request.generation,
         )
     })();
     if let Err(error) = mark {
@@ -427,6 +438,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
 
 struct PreparedLaunch {
     cwd: PathBuf,
+    /// Session muxa put this work into without having created it. It gets a
+    /// workspace identity, never the managed flag.
+    adopted_session: Option<String>,
     workspace: Option<String>,
     work: Option<String>,
     created_workspace: bool,
@@ -497,7 +511,15 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
         }
     }
 
-    let created_workspace = workspace.is_some() && existing_workspace.is_none();
+    // A session already named after this workspace is this workspace. Making
+    // `callabo-2` beside it splits one workspace across two sessions, which
+    // is the opposite of what session=workspace means.
+    let adopted_session = match (&workspace, &existing_workspace) {
+        (Some(workspace), None) => crate::tmux_work::adoptable_session(workspace)?,
+        _ => None,
+    };
+    let created_workspace =
+        workspace.is_some() && existing_workspace.is_none() && adopted_session.is_none();
     let created_work = work.is_some() && existing_work.is_none();
     if let Some(existing) = &existing_work {
         request.placement = Placement::Pane;
@@ -506,6 +528,12 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
     } else if let Some(existing) = &existing_workspace {
         request.placement = Placement::Window;
         request.target = Some(existing.session.clone());
+        request.name = Some(crate::tmux_work::window_name_for_work(
+            work.as_deref().expect("managed work has id"),
+        )?);
+    } else if let Some(session) = adopted_session.as_deref() {
+        request.placement = Placement::Window;
+        request.target = Some(session.to_string());
         request.name = Some(crate::tmux_work::window_name_for_work(
             work.as_deref().expect("managed work has id"),
         )?);
@@ -518,6 +546,7 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
     resolve_placement_target(request, &cwd)?;
     Ok(PreparedLaunch {
         cwd,
+        adopted_session,
         workspace,
         work,
         created_workspace,
@@ -737,6 +766,7 @@ mod tests {
             role: None,
             task: None,
             alias: None,
+            generation: None,
             direction: SplitDirection::Right,
         }
     }

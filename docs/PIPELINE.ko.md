@@ -20,6 +20,43 @@ work auth-cleanup is in workspace callabo via pipeline triad
 Workspace를, window는 현재 Run을, pane은 agent session을 바인딩합니다.
 ([WORK_MODEL.md](WORK_MODEL.md))
 
+## 설정부터
+
+`[ticket]`·`[[route]]`·`[pipeline.*]`는 muxa가 요구하는 가장 구조적인 설정이고
+가장 짐작하기 어렵습니다 — 중첩 테이블, 순서 있는 route 배열, 정규식, 플레이스홀더
+템플릿. 그래서 이 문서를 보며 손으로 쓰지 않아도 됩니다.
+
+```console
+$ muxa work init
+◇  Describe the work pipeline you want
+│  cal-* 티켓은 codex 기획, codex 구현, claude 리뷰로
+```
+
+muxa는 headless agent 한 턴으로 그 문장을 TOML로 바꾸고, **위임하지 않는 부분**을
+합니다 — 결과를 파싱하고, 정규식을 전부 컴파일하고, route가 지목한 pipeline이
+존재하는지와 나열된 agent가 실제로 뜰 수 있는지 확인하고, 무엇이 바뀔지 출력한
+뒤 확인을 받고서야 씁니다. 모델이 없는 키를 만들거나 `vim`을 agent라고 하면 이유를
+대고 거부하며 config는 그대로 둡니다. `Config`는 unknown field를 거부하므로,
+오타가 디스크에 쓰이면 다음 데몬 시작이 죽습니다.
+
+건드리는 건 `[ticket]`·`[[route]]`·`[pipeline.*]` 셋뿐입니다. `toml_edit`으로 다시
+쓰므로 주석과 나머지 섹션은 그대로 살아남습니다.
+
+여기의 모든 경로는 **headless agent 턴 하나를 쓰고, 그 비용은 계정에 과금됩니다.**
+muxa는 실행 전에 무엇을 호출하는지 먼저 알리고, `--dry-run`은 파일 쓰기만
+건너뜁니다 — 턴은 그대로 돌고 그대로 과금됩니다. 비대화형 호출은 `--yes`로
+그 지출을 확인해야 합니다.
+
+```console
+muxa work init                                # 대화형으로 묻기
+muxa work init --describe "..."               # 비대화형
+muxa work init --dry-run                      # 제안만 보고 안 씀
+muxa work init --agent codex                  # 다른 resolver 사용
+```
+
+손으로 쓰는 게 편하시면 주석 달린 레퍼런스가
+[`config.example.toml`](../config.example.toml)에 있고, 아래가 각 부분의 설명입니다.
+
 ## 구조
 
 ```
@@ -235,6 +272,7 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 ## 명령 정리
 
 ```console
+muxa work init                       # 말로 설명해 설정 쓰기
 muxa work up <work> --external <id>  # 외부 이슈 연결 → routing → 없는 것만 생성
 muxa work up <id>                    # 호환 경로: <id>를 외부 이슈로도 조회
 muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음

@@ -21,10 +21,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use muxa::config::{Config, TicketConfig};
+use muxa::event::AgentState;
 use muxa::pipeline::{
     self, DesiredAgent, ExistingAgent, Plan, PlanStep, Ticket, Vars, WorktreePlan, REQUEST_KEY,
 };
+use muxa::pipeline_run::{PipelineAliasObservation, PipelineAliasStatus, PipelineRunRegistration};
 use muxa::request::{ComposedRequest, RequestParts};
+use muxa::work::WorkIdentity;
+use std::collections::HashMap;
 
 use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest};
 
@@ -62,7 +66,9 @@ pub struct UpArgs {
     /// it from the instruction.
     #[arg(long)]
     pub context: Option<String>,
-    /// Resolve and diff, then print what would happen and change nothing.
+    /// Resolve and diff, then print what would happen and create nothing.
+    /// Ticket lookup still runs on a cache miss, and that is a billed agent
+    /// turn; `--no-ticket` skips it entirely.
     #[arg(long)]
     pub dry_run: bool,
     /// Skip external issue lookup and launch on the Work id alone.
@@ -71,9 +77,27 @@ pub struct UpArgs {
     /// Ignore a cached external issue and ask the resolver again.
     #[arg(long)]
     pub refresh: bool,
+    /// Print the exact prompt each agent would receive, before spending
+    /// anything on it.
+    #[arg(long)]
+    pub show_prompts: bool,
+    /// Skip the confirmation before a billed ticket lookup.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ReconcileArgs {
+    /// Reconcile every durable Run with a dependency-ready alias.
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long, requires = "work")]
+    pub workspace: Option<String>,
+    #[arg(long, requires = "workspace")]
+    pub work: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,10 +131,19 @@ pub struct UpResult {
     /// The composed request, when the caller supplied one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<ComposedRequest>,
+    /// Dependency layout of the pipeline that produced this plan, so a
+    /// reader (or the dashboard) sees what runs together without
+    /// re-deriving it from the config.
+    pub graph: Vec<muxa::pipeline::GraphNode>,
     pub plan: Plan,
     pub launched: Vec<LaunchedAgent>,
     /// Aliases that were sent `--prompt`.
     pub reprompted: Vec<String>,
+    /// Aliases that have reported `muxa work done` on this work, newest run
+    /// included. Carried so a reader can tell a converged pipeline from a
+    /// stalled one: both leave every pane `idle`, and without this the two
+    /// render identically.
+    pub done: Vec<String>,
 }
 
 /// Everything decided before a single tmux command runs.
@@ -134,13 +167,36 @@ pub(crate) struct Resolved {
     layout: Option<String>,
     request: Option<ComposedRequest>,
     desired: Vec<DesiredAgent>,
+    /// Existing daemon-owned state, used by dry-run rendering. A real apply
+    /// performs an atomic register and reads the returned Run instead.
+    durable_run: Option<muxa::pipeline_run::PipelineRun>,
+    /// pane → what the daemon says that agent is doing. Empty when the
+    /// daemon is unreachable, which degrades to the old pane-only view
+    /// rather than failing the launch.
+    states: HashMap<String, AgentState>,
 }
 
-pub async fn run(args: UpArgs, config: &Config) -> Result<()> {
+pub async fn run(
+    args: UpArgs,
+    config: &Config,
+    config_path: Option<PathBuf>,
+    client: Option<&muxa::ipc::Client>,
+) -> Result<()> {
     let json = args.json;
     let dry_run = args.dry_run;
-    let resolved = resolve(&args, config).await?;
-    let result = apply(resolved, dry_run)?;
+    let show_prompts = args.show_prompts;
+    let resolved = resolve_or_onboard(&args, config, config_path, client).await?;
+    if show_prompts {
+        print_prompts(&resolved.desired);
+    }
+    let result = if dry_run {
+        apply(resolved, true)?
+    } else {
+        let client = client.ok_or_else(|| {
+            anyhow::anyhow!("muxa work up requires muxad for durable pipeline state")
+        })?;
+        apply_durable(resolved, client).await?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -152,46 +208,208 @@ pub async fn run(args: UpArgs, config: &Config) -> Result<()> {
 /// The blocking half: read the window, diff it against the pipeline, and
 /// act on the difference.
 pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
-    let existing = existing_agents(&resolved.work, &resolved.workspace)?;
+    if !dry_run {
+        bail!("non-dry pipeline reconciliation must use muxad's durable Run state");
+    }
+    let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
+    // The completion set lives on the work window, so a re-run reads what
+    // previous runs' agents reported even though none of them still exist.
+    let done = if let Some(run) = resolved.durable_run.as_ref() {
+        run.aliases
+            .values()
+            .filter(|state| state.status == PipelineAliasStatus::Done)
+            .map(|state| state.alias.clone())
+            .collect()
+    } else {
+        crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?
+            .map(|info| info.done)
+            .unwrap_or_default()
+    };
     let broadcast = resolved
         .request
         .as_ref()
         .map(|request| request.text.as_str());
-    let plan = pipeline::plan(&resolved.desired, &existing, broadcast);
+    let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
 
-    if dry_run {
-        return Ok(finish(
-            resolved,
-            plan,
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-            true,
-        ));
+    Ok(finish(
+        resolved,
+        plan,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        true,
+        done,
+    ))
+}
+
+/// Register desired state with muxad, atomically claim dependency-ready
+/// aliases, then report the physical launch/re-prompt result. Completion and
+/// dependency gating are never inferred from the live pane set here.
+#[allow(clippy::too_many_lines)] // register, claim, physical apply, and report are one reconciliation flow
+pub(crate) async fn apply_durable(
+    resolved: Resolved,
+    client: &muxa::ipc::Client,
+) -> Result<UpResult> {
+    let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
+    let work_info = crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?;
+    let observed = existing
+        .iter()
+        .filter_map(|agent| {
+            let alias = agent.alias.clone()?;
+            Some(PipelineAliasObservation {
+                alias,
+                pane: agent.pane.clone(),
+                status: match agent.state {
+                    Some(AgentState::WaitingInput | AgentState::WaitingChoice) => {
+                        PipelineAliasStatus::Blocked
+                    }
+                    Some(AgentState::Error | AgentState::Stopped) => PipelineAliasStatus::Failed,
+                    Some(AgentState::Starting | AgentState::Working | AgentState::Idle) | None => {
+                        PipelineAliasStatus::Running
+                    }
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    // `--body`/`--prompt` is a real restart of every existing pipeline
+    // participant. The store expands these roots transitively and advances
+    // the Run generation before any prompt can be delivered.
+    let mut invalidate = resolved.request.as_ref().map_or_else(Vec::new, |_| {
+        existing
+            .iter()
+            .filter_map(|agent| agent.alias.clone())
+            .collect()
+    });
+    // An explicit `work up` is also the retry control for a launch that
+    // failed before producing a pane. Pane-backed failures remain visible
+    // for the operator to inspect/close; blindly typing a prompt into a
+    // stopped shell could execute it as a command.
+    if let Some(previous) = resolved.durable_run.as_ref() {
+        invalidate.extend(
+            previous
+                .aliases
+                .values()
+                .filter(|state| state.status == PipelineAliasStatus::Failed && state.pane.is_none())
+                .map(|state| state.alias.clone()),
+        );
     }
-
+    invalidate.sort();
+    invalidate.dedup();
+    let identity = WorkIdentity::new(resolved.workspace.clone(), resolved.work.clone());
+    let registration = PipelineRunRegistration {
+        identity: identity.clone(),
+        pipeline: resolved.pipeline.clone(),
+        desired: resolved.desired.clone(),
+        cwd: resolved.cwd.clone(),
+        window_id: work_info.as_ref().map(|work| work.window.clone()),
+        observed,
+        invalidate,
+    };
+    let mut run = client
+        .pipeline_register(&registration)
+        .await
+        .context("register durable pipeline Run with muxad")?;
+    // Migration/adoption path: panes created before durable Runs have no
+    // generation option yet. Stamp every active alias with its own expected
+    // generation; pending invalidated descendants keep the old value until
+    // dependency reconciliation reaches them.
+    for agent in &existing {
+        let Some(alias) = agent.alias.as_deref() else {
+            continue;
+        };
+        let Some(state) = run.aliases.get(alias) else {
+            continue;
+        };
+        if !state.reconcile_pending {
+            crate::tmux_work::mark_agent_generation(&agent.pane, state.generation)
+                .with_context(|| format!("stamp pipeline generation on alias {alias:?}"))?;
+        }
+    }
+    let done = run
+        .aliases
+        .values()
+        .filter(|state| state.status == PipelineAliasStatus::Done)
+        .map(|state| state.alias.clone())
+        .collect::<Vec<_>>();
+    let broadcast = resolved
+        .request
+        .as_ref()
+        .map(|request| request.text.as_str());
+    let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
+    let claims = client
+        .pipeline_claim(&identity, run.generation)
+        .await
+        .context("claim dependency-ready pipeline aliases")?;
     let mut launched = Vec::new();
     let mut reprompted = Vec::new();
-    for step in &plan.steps {
-        match step {
-            PlanStep::Launch(agent) => launched.push(launch(agent, &resolved)?),
-            PlanStep::Reprompt {
-                alias,
-                pane,
-                prompt,
-            } => {
-                send_prompt(pane, prompt)
-                    .with_context(|| format!("send --prompt to {alias} in pane {pane}"))?;
-                reprompted.push(alias.clone());
+    for claim in claims {
+        let outcome = if let Some(pane) = claim.pane.as_deref() {
+            let result = (|| {
+                crate::tmux_work::mark_agent_generation(pane, claim.generation)?;
+                if let Some(prompt) = claim.agent.prompt.as_deref() {
+                    send_prompt(pane, prompt).with_context(|| {
+                        format!(
+                            "re-prompt pipeline alias {:?} in pane {pane}",
+                            claim.agent.alias
+                        )
+                    })?;
+                }
+                reprompted.push(claim.agent.alias.clone());
+                Ok((pane.to_string(), run.window_id.clone()))
+            })();
+            result
+        } else {
+            match recover_unreported_alias(&identity, &claim.agent.alias, claim.generation) {
+                Ok(Some(target)) => Ok(target),
+                Ok(None) => launch(&claim.agent, &resolved, claim.generation).map(|agent| {
+                    let pane = agent.pane.clone();
+                    launched.push(agent);
+                    let window =
+                        crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))
+                            .ok()
+                            .flatten()
+                            .map(|work| work.window);
+                    (pane, window)
+                }),
+                Err(error) => Err(error),
             }
-            PlanStep::Keep { .. } => {}
+        };
+        match outcome {
+            Ok((pane, window)) => {
+                run = client
+                    .pipeline_report(
+                        &identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Running,
+                        Some(&pane),
+                        None,
+                        window.as_deref(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("report pipeline alias {:?} running", claim.agent.alias)
+                    })?;
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                let _ = client
+                    .pipeline_report(
+                        &identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Failed,
+                        claim.pane.as_deref(),
+                        Some(&detail),
+                        run.window_id.as_deref(),
+                    )
+                    .await;
+                return Err(error);
+            }
         }
     }
 
-    // Read identity back from tmux rather than from the launch results:
-    // when every agent was already running, nothing was launched and there
-    // is no result to read it from.
     let (session, window) =
         match crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))? {
             Some(info) => (Some(info.session), Some(info.window)),
@@ -202,13 +420,154 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
             .with_context(|| format!("record external issue on work window {window}"))?;
     }
     if let (Some(window), Some(layout)) = (window.as_deref(), resolved.layout.as_deref()) {
-        // Splitting an existing window repeatedly halves whichever pane was
-        // active, so geometry is only sane once every pane exists.
         apply_layout(window, layout)?;
     }
+    let done = run
+        .aliases
+        .values()
+        .filter(|state| state.status == PipelineAliasStatus::Done)
+        .map(|state| state.alias.clone())
+        .collect();
     Ok(finish(
-        resolved, plan, launched, reprompted, session, window, false,
+        resolved, plan, launched, reprompted, session, window, false, done,
     ))
+}
+
+/// Reconcile one already-registered Run from its persisted desired agents.
+/// This is used immediately after a completion event and by muxad's restart
+/// safety-net worker, so neither path needs to resolve the ticket again.
+pub(crate) async fn reconcile_run(
+    client: &muxa::ipc::Client,
+    identity: &WorkIdentity,
+    generation: u64,
+) -> Result<Vec<LaunchedAgent>> {
+    let claims = client
+        .pipeline_claim(identity, generation)
+        .await
+        .context("claim dependency-ready pipeline aliases")?;
+    let mut launched = Vec::new();
+    for claim in claims {
+        let outcome: Result<(String, Option<String>)> = if let Some(pane) = claim.pane.as_deref() {
+            (|| {
+                crate::tmux_work::mark_agent_generation(pane, claim.generation)?;
+                if let Some(prompt) = claim.agent.prompt.as_deref() {
+                    send_prompt(pane, prompt).with_context(|| {
+                        format!(
+                            "re-prompt pipeline alias {:?} in pane {pane}",
+                            claim.agent.alias
+                        )
+                    })?;
+                }
+                Ok((pane.to_string(), claim.window_id.clone()))
+            })()
+        } else {
+            (|| {
+                if let Some(target) =
+                    recover_unreported_alias(identity, &claim.agent.alias, claim.generation)?
+                {
+                    return Ok(target);
+                }
+                {
+                    let program = AgentProgram::parse(&claim.agent.program).map_err(|error| {
+                        anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
+                    })?;
+                    let direction = SplitDirection::parse(claim.agent.direction.as_deref())
+                        .map_err(|error| {
+                            anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
+                        })?;
+                    crate::agent_launch::start(StartRequest {
+                        agent: program,
+                        placement: Placement::Pane,
+                        target: None,
+                        cwd: Some(claim.cwd.clone()),
+                        prompt: claim.agent.prompt.clone(),
+                        name: None,
+                        workspace: Some(identity.workspace_id.clone()),
+                        work: Some(identity.work_id.clone()),
+                        role: claim.agent.role.clone(),
+                        task: claim.agent.task.clone(),
+                        alias: Some(claim.agent.alias.clone()),
+                        generation: Some(claim.generation),
+                        direction,
+                    })
+                    .with_context(|| format!("launch pipeline agent {:?}", claim.agent.alias))
+                    .map(|result| {
+                        launched.push(LaunchedAgent {
+                            alias: claim.agent.alias.clone(),
+                            pane: result.pane.clone(),
+                            program: claim.agent.program.clone(),
+                            role: claim.agent.role.clone(),
+                        });
+                        (result.pane, result.window)
+                    })
+                }
+            })()
+        };
+        match outcome {
+            Ok((pane, window)) => {
+                client
+                    .pipeline_report(
+                        identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Running,
+                        Some(&pane),
+                        None,
+                        window.as_deref(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("report pipeline alias {:?} running", claim.agent.alias)
+                    })?;
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                let _ = client
+                    .pipeline_report(
+                        identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Failed,
+                        claim.pane.as_deref(),
+                        Some(&detail),
+                        claim.window_id.as_deref(),
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(launched)
+}
+
+pub async fn run_reconcile(args: ReconcileArgs, client: &muxa::ipc::Client) -> Result<()> {
+    let runs = client
+        .pipeline_runs()
+        .await
+        .context("list durable pipeline Runs")?;
+    let selected = runs.into_iter().filter(|run| {
+        if args.all {
+            return run.has_ready_alias();
+        }
+        args.workspace
+            .as_deref()
+            .zip(args.work.as_deref())
+            .is_some_and(|(workspace, work)| {
+                run.identity.workspace_id.eq_ignore_ascii_case(workspace)
+                    && run.identity.work_id.eq_ignore_ascii_case(work)
+            })
+    });
+    for run in selected {
+        if let Err(error) = reconcile_run(client, &run.identity, run.generation).await {
+            tracing::warn!(
+                work = %run.identity.key(),
+                generation = run.generation,
+                %error,
+                "pipeline reconciliation failed",
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,6 +579,7 @@ fn finish(
     session: Option<String>,
     window: Option<String>,
     dry_run: bool,
+    done: Vec<String>,
 ) -> UpResult {
     UpResult {
         work: resolved.work,
@@ -234,15 +594,22 @@ fn finish(
         window,
         layout: resolved.layout,
         request: resolved.request,
+        graph: muxa::pipeline::graph(&resolved.desired),
         plan,
         launched,
         reprompted,
+        done,
     }
 }
 
 // ---------------------------------------------------------------- resolve
 
-pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> {
+pub(crate) async fn resolve(
+    args: &UpArgs,
+    config: &Config,
+    client: Option<&muxa::ipc::Client>,
+) -> Result<Resolved> {
+    let states = agent_states(client).await;
     let work = crate::tmux_work::normalize_work_id(&args.work)?;
     let id = work.to_ascii_lowercase();
     if args.no_ticket
@@ -277,10 +644,14 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         }
     };
 
+    // Ask for the request first: it is free, and it is the last thing the
+    // operator can change once money starts moving.
+    let request = compose_request(args, config, &work)?;
+
     let ticket = if args.no_ticket {
         None
     } else {
-        resolve_ticket(&config.ticket, external_lookup, args.refresh).await?
+        resolve_ticket(&config.ticket, external_lookup, args.refresh, args.yes).await?
     };
 
     // Two ids because the two forms are both load-bearing: `work` is what
@@ -291,16 +662,6 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         vars = vars.with_ticket(ticket);
     }
 
-    // The caller's request is a var like any other, so a pipeline template
-    // can place it — and so it reaches the ticket-less path unchanged.
-    let request = muxa::request::compose(
-        RequestParts {
-            skill: args.skill.as_deref(),
-            body: args.body.as_deref(),
-            context: args.context.as_deref(),
-        },
-        &config.message.skills,
-    )?;
     vars.set_opt(
         REQUEST_KEY,
         request.as_ref().map(|request| request.text.as_str()),
@@ -347,6 +708,13 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         anyhow::Error::from(pipeline::PipelineError::UnknownPipeline(name.clone()))
     })?;
     let desired = pipeline::desired_agents(&name, spec, &vars)?;
+    let durable_run = match client {
+        Some(client) => client.pipeline_runs().await.ok().and_then(|runs| {
+            runs.into_iter()
+                .find(|run| run.identity.workspace_id == workspace && run.identity.work_id == work)
+        }),
+        None => None,
+    };
 
     Ok(Resolved {
         work,
@@ -360,6 +728,8 @@ pub(crate) async fn resolve(args: &UpArgs, config: &Config) -> Result<Resolved> 
         layout: spec.layout.clone(),
         request,
         desired,
+        durable_run,
+        states,
     })
 }
 
@@ -468,7 +838,7 @@ fn run_prepare(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn expand_tilde(value: &str) -> String {
+pub(crate) fn expand_tilde(value: &str) -> String {
     let Some(rest) = value.strip_prefix('~') else {
         return value.to_string();
     };
@@ -491,7 +861,12 @@ struct CachedTicket {
     ticket: Ticket,
 }
 
-async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Result<Option<Ticket>> {
+async fn resolve_ticket(
+    config: &TicketConfig,
+    id: &str,
+    refresh: bool,
+    assume_yes: bool,
+) -> Result<Option<Ticket>> {
     let Some((source_name, source)) = pipeline::select_source(config, id)? else {
         return Ok(None);
     };
@@ -500,6 +875,13 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
             ticket.source = Some(source_name.to_string());
             return Ok(Some(ticket));
         }
+    }
+    // Ask before spending, not after. Only on a cache miss: the common
+    // re-run costs nothing, so the prompt appears exactly when money would
+    // move — including under `--dry-run`, which skips creating panes but
+    // still pays for the lookup.
+    if !confirm_lookup(id, source_name, &config.agent, assume_yes)? {
+        return Ok(None);
     }
     let prompt = Vars::new().set("id", id).render(&source.prompt);
     let cwd = config
@@ -520,6 +902,9 @@ async fn resolve_ticket(config: &TicketConfig, id: &str, refresh: bool) -> Resul
     .with_context(|| {
         format!("ticket source {source_name:?} could not look up {id} (use --no-ticket to launch without it)")
     })?;
+    if let Some(cost) = answer.cost_usd {
+        eprintln!("that lookup cost ${cost:.4}.");
+    }
     let mut ticket = Ticket::parse_reply(id, &answer.text).with_context(|| {
         format!("ticket source {source_name:?} answered for {id} but not with a ticket")
     })?;
@@ -668,12 +1053,43 @@ fn git(repo: &Path, args: &[String]) -> Result<String> {
 
 // ----------------------------------------------------------------- apply
 
-fn existing_agents(work: &str, workspace: &str) -> Result<Vec<ExistingAgent>> {
+/// Read the window's panes and, for each, what the daemon says the agent
+/// on it is doing.
+///
+/// A pane proves someone was started there. Whether they are working,
+/// idle, or stuck on a permission prompt is a different question, and the
+/// daemon is the only thing that can answer it.
+/// Ask the daemon what every tracked agent is doing, keyed by pane.
+///
+/// Best-effort: `muxa work up` does not otherwise need the daemon, and a
+/// launch should not fail because the control plane is down. Without it,
+/// the plan falls back to "a pane exists", which is what it always did.
+async fn agent_states(client: Option<&muxa::ipc::Client>) -> HashMap<String, AgentState> {
+    let Some(client) = client else {
+        return HashMap::new();
+    };
+    client.snapshot().await.map_or_else(
+        |_| HashMap::new(),
+        |agents| {
+            agents
+                .into_iter()
+                .filter_map(|agent| agent.pane.map(|pane| (pane, agent.state)))
+                .collect()
+        },
+    )
+}
+
+fn existing_agents(
+    work: &str,
+    workspace: &str,
+    states: &HashMap<String, AgentState>,
+) -> Result<Vec<ExistingAgent>> {
     Ok(crate::tmux_work::find_work_in(work, Some(workspace))?
         .map(|info| {
             info.agents
                 .into_iter()
                 .map(|agent| ExistingAgent {
+                    state: states.get(&agent.pane).copied(),
                     pane: agent.pane,
                     program: agent.agent,
                     alias: agent.alias,
@@ -683,7 +1099,114 @@ fn existing_agents(work: &str, workspace: &str) -> Result<Vec<ExistingAgent>> {
         .unwrap_or_default())
 }
 
-fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
+/// Resolve, and on a first run with nothing configured, offer to set it
+/// up rather than failing with instructions the operator then has to
+/// follow by hand.
+///
+/// "No route matches" is only an error for someone who already has a
+/// config. For everyone else it is the first thing muxa ever says to
+/// them, and answering it with TOML syntax is how a feature goes unused.
+/// `muxa work init` is already the conversation that fixes it, so this
+/// hands over to it and retries once with the config it wrote.
+async fn resolve_or_onboard(
+    args: &UpArgs,
+    config: &Config,
+    config_path: Option<PathBuf>,
+    client: Option<&muxa::ipc::Client>,
+) -> Result<Resolved> {
+    let error = match resolve(args, config, client).await {
+        Ok(resolved) => return Ok(resolved),
+        Err(error) => error,
+    };
+    let unconfigured = error
+        .downcast_ref::<pipeline::PipelineError>()
+        .is_some_and(|error| matches!(error, pipeline::PipelineError::NoRoute(_)));
+    if !unconfigured || !offer_onboarding()? {
+        return Err(error);
+    }
+    crate::work_init::run(
+        crate::work_init::InitArgs {
+            describe: None,
+            agent: None,
+            dry_run: false,
+            yes: false,
+        },
+        config,
+        config_path.clone(),
+    )
+    .await?;
+    // Reload: the file just changed underneath the config this process
+    // started with.
+    let config = Config::load_or_default(config_path.as_deref())
+        .context("re-reading the config muxa work init just wrote")?;
+    resolve(args, &config, client).await
+}
+
+/// Ask whether to set muxa up now. Non-interactive callers keep the plain
+/// error — a script wants a failure it can read, not a prompt.
+fn offer_onboarding() -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(false);
+    }
+    println!("muxa has no work pipeline configured yet.");
+    Ok(cliclack::confirm("Set one up now?")
+        .initial_value(true)
+        .interact()?)
+}
+
+/// Build the caller's request, asking for one when nothing was supplied.
+fn compose_request(args: &UpArgs, config: &Config, work: &str) -> Result<Option<ComposedRequest>> {
+    let body = match args.body.clone() {
+        Some(body) => Some(body),
+        None if args.skill.is_none() && args.context.is_none() => ask_for_request(work)?,
+        None => None,
+    };
+    Ok(muxa::request::compose(
+        RequestParts {
+            skill: args.skill.as_deref(),
+            body: body.as_deref(),
+            context: args.context.as_deref(),
+        },
+        &config.message.skills,
+    )?)
+}
+
+/// Ask before the lookup spends a turn.
+///
+/// `--dry-run` does not exempt this: it skips creating panes, not the
+/// agent turn that resolves the ticket, and an operator who reads "dry
+/// run" as "nothing happens" would be paying without being asked.
+fn confirm_lookup(id: &str, source: &str, agent: &str, assume_yes: bool) -> Result<bool> {
+    use std::io::IsTerminal;
+    println!("{id} is not cached. Looking it up costs one headless {agent} turn, billed to your account (source {source:?}).");
+    if assume_yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("looking up {id} spends a billed agent turn; pass --yes, or --no-ticket to skip it");
+    }
+    Ok(cliclack::confirm("Look it up?")
+        .initial_value(true)
+        .interact()?)
+}
+
+/// Ask what the agents should work on. Empty is a valid answer: a
+/// ticket-driven pipeline already knows the task.
+fn ask_for_request(work: &str) -> Result<Option<String>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None);
+    }
+    let text: String = cliclack::input(format!("What should the agents do for {work}?"))
+        .placeholder("leave empty to use the pipeline's own instructions")
+        .required(false)
+        .interact()?;
+    let text = text.trim().to_string();
+    Ok((!text.is_empty()).then_some(text))
+}
+
+fn launch(agent: &DesiredAgent, resolved: &Resolved, generation: u64) -> Result<LaunchedAgent> {
     let program = AgentProgram::parse(&agent.program)
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let direction = SplitDirection::parse(agent.direction.as_deref())
@@ -704,6 +1227,7 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
         role: agent.role.clone(),
         task: agent.task.clone(),
         alias: Some(agent.alias.clone()),
+        generation: Some(generation),
         direction,
     })
     .with_context(|| format!("launch pipeline agent {:?}", agent.alias))?;
@@ -713,6 +1237,216 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
         program: agent.program.clone(),
         role: agent.role.clone(),
     })
+}
+
+/// Recover the pane created in the narrow crash window between physical
+/// launch and `pipeline_report`. The durable claim lease is intentionally
+/// retryable, but retrying must adopt that pane instead of launching the
+/// same alias twice.
+fn recover_unreported_alias(
+    identity: &WorkIdentity,
+    alias: &str,
+    generation: u64,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(work) =
+        crate::tmux_work::find_work_in(&identity.work_id, Some(&identity.workspace_id))?
+    else {
+        return Ok(None);
+    };
+    let mut matching = work
+        .agents
+        .iter()
+        .filter(|agent| agent.alias.as_deref() == Some(alias));
+    let Some(agent) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        bail!("cannot recover pipeline alias {alias:?}: multiple matching panes already exist");
+    }
+    crate::tmux_work::mark_agent_generation(&agent.pane, generation)
+        .with_context(|| format!("adopt pipeline alias {alias:?} in pane {}", agent.pane))?;
+    Ok(Some((agent.pane.clone(), Some(work.window))))
+}
+
+/// One line per pipeline alias, grouped by dependency depth.
+///
+/// The graph and the plan used to print as two blocks, so every agent
+/// appeared twice — once as a shape, once as a row — and neither view was
+/// complete on its own. They are the same thing: what runs when, and where
+/// it currently is. Grouping only kicks in when the pipeline actually has
+/// edges; a flat pipeline stays a flat list rather than gaining ceremony
+/// it does not need.
+///
+/// Glyphs stay inside Geometric Shapes U+25A0–25CF. The half-filled
+/// circles just past that range fall back to a different font in most
+/// terminals and render at the wrong size.
+fn print_plan_rows(result: &UpResult) {
+    let nodes = &result.graph;
+    let layered = nodes.iter().any(|node| node.depth > 0);
+    let mut depth = usize::MAX;
+    for node in nodes {
+        let Some(step) = result
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.alias() == node.alias)
+        else {
+            continue;
+        };
+        if layered && node.depth != depth {
+            depth = node.depth;
+            println!(
+                "  {}",
+                if depth == 0 {
+                    "now".to_string()
+                } else {
+                    format!("then · after {}", node.after.join(", "))
+                }
+            );
+        }
+        let indent = if layered { "   " } else { "  " };
+        let (glyph, status, detail) = describe(step, result);
+        println!(
+            "{indent}{glyph} {:<10} {:<8} {:<10} {status:<9} {detail}",
+            node.alias,
+            node.program,
+            node.role.as_deref().unwrap_or("-"),
+        );
+    }
+    for extra in &result.plan.unclaimed {
+        println!(
+            "  ◇ {:<10} {:<8} {:<10} {:<9} {}",
+            extra.alias.as_deref().unwrap_or("(no alias)"),
+            extra.program,
+            "-",
+            "unclaimed",
+            extra.pane
+        );
+    }
+}
+
+/// Glyph, status word, and trailing detail for one alias.
+fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
+    match step {
+        PlanStep::Launch(agent) => {
+            let pane = result
+                .launched
+                .iter()
+                .find(|launched| launched.alias == agent.alias)
+                .map_or_else(String::new, |launched| launched.pane.clone());
+            (
+                '●',
+                if result.dry_run {
+                    "will start".into()
+                } else {
+                    "started".into()
+                },
+                pane,
+            )
+        }
+        PlanStep::Keep { pane, state, .. } => {
+            // Only while it is actually at rest: an agent that reported done
+            // and was then re-prompted is working again, and saying `done`
+            // over live work would be a lie the operator acts on.
+            let at_rest = state.is_none_or(|state| state == AgentState::Idle);
+            if at_rest && result.done.iter().any(|alias| alias == step.alias()) {
+                ('◉', "done".into(), pane.clone())
+            } else {
+                (
+                    '●',
+                    state.map_or("running", state_label).to_string(),
+                    pane.clone(),
+                )
+            }
+        }
+        PlanStep::Reprompt { pane, .. } => ('●', "prompted".into(), pane.clone()),
+        PlanStep::Waiting { waiting_on, .. } => (
+            '○',
+            "waiting".into(),
+            format!("for {}", waiting_on.join(", ")),
+        ),
+        PlanStep::Attention { pane, state, .. } => (
+            '◆',
+            state.map_or("blocked", state_label).to_string(),
+            format!("{pane}  needs you"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod done_view_tests {
+    use super::*;
+
+    fn result_with(done: &[&str]) -> UpResult {
+        UpResult {
+            work: "CAL-1".into(),
+            workspace: "ws".into(),
+            pipeline: "pair".into(),
+            cwd: std::path::PathBuf::from("/repo"),
+            dry_run: false,
+            ticket: None,
+            worktree: None,
+            created_worktree: false,
+            session: None,
+            window: None,
+            layout: None,
+            request: None,
+            graph: Vec::new(),
+            plan: Plan {
+                steps: Vec::new(),
+                unclaimed: Vec::new(),
+            },
+            launched: Vec::new(),
+            reprompted: Vec::new(),
+            done: done.iter().map(|alias| (*alias).to_string()).collect(),
+        }
+    }
+
+    fn kept(alias: &str, state: Option<AgentState>) -> PlanStep {
+        PlanStep::Keep {
+            alias: alias.to_string(),
+            pane: "%9".into(),
+            state,
+        }
+    }
+
+    /// The gap this closes: a converged pipeline and a stalled one both leave
+    /// every pane `idle`, so the plan view rendered them identically and a
+    /// finished review sat unnoticed.
+    #[test]
+    fn a_reported_agent_reads_as_done_not_idle() {
+        let result = result_with(&["review"]);
+        let (glyph, status, _) = describe(&kept("review", Some(AgentState::Idle)), &result);
+        assert_eq!(status, "done");
+        assert_eq!(glyph, '\u{25c9}');
+
+        let (_, status, _) = describe(&kept("impl", Some(AgentState::Idle)), &result);
+        assert_eq!(status, "idle", "an alias that never reported is just idle");
+    }
+
+    /// Done is a claim about work at rest. An agent re-prompted after
+    /// reporting is working again, and rendering that as `done` would be a
+    /// lie the operator acts on.
+    #[test]
+    fn live_work_outranks_a_stale_done_marker() {
+        let result = result_with(&["review"]);
+        for state in [AgentState::Working, AgentState::Starting] {
+            let (_, status, _) = describe(&kept("review", Some(state)), &result);
+            assert_eq!(status, state_label(state));
+        }
+    }
+}
+
+fn state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Starting => "starting",
+        AgentState::Working => "working",
+        AgentState::Idle => "idle",
+        AgentState::WaitingInput => "waiting",
+        AgentState::WaitingChoice => "choosing",
+        AgentState::Error => "error",
+        AgentState::Stopped => "stopped",
+    }
 }
 
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
@@ -745,6 +1479,29 @@ fn apply_layout(window: &str, layout: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- output
+
+/// Show what each agent would actually receive. The rendered prompt is
+/// the thing worth reviewing before spending a turn on it — a leftover
+/// `{{ticket.title}}` or a role instruction that says the wrong thing is
+/// obvious here and invisible in the plan summary.
+fn print_prompts(desired: &[DesiredAgent]) {
+    println!("prompts that would be sent:\n");
+    for agent in desired {
+        println!(
+            "─── {} ({}{}) ───",
+            agent.alias,
+            agent.program,
+            agent
+                .role
+                .as_deref()
+                .map_or_else(String::new, |role| format!(", {role}"))
+        );
+        match agent.prompt.as_deref() {
+            Some(prompt) => println!("{prompt}\n"),
+            None => println!("(no prompt — starts interactive)\n"),
+        }
+    }
+}
 
 fn print_result(result: &UpResult) {
     let verb = if result.dry_run { "would be" } else { "is" };
@@ -793,29 +1550,7 @@ fn print_result(result: &UpResult) {
             }
         );
     }
-    for step in &result.plan.steps {
-        match step {
-            PlanStep::Launch(agent) => {
-                let pane = result
-                    .launched
-                    .iter()
-                    .find(|launched| launched.alias == agent.alias)
-                    .map_or_else(|| "-".to_string(), |launched| launched.pane.clone());
-                println!(
-                    "  + {:<10} {:<9} {:<12} {pane}",
-                    agent.alias,
-                    agent.program,
-                    agent.role.as_deref().unwrap_or("-")
-                );
-            }
-            PlanStep::Reprompt { alias, pane, .. } => {
-                println!("  » {alias:<10} {:<9} {:<12} {pane}", "prompted", "");
-            }
-            PlanStep::Keep { alias, pane } => {
-                println!("  = {alias:<10} {:<9} {:<12} {pane}", "running", "");
-            }
-        }
-    }
+    print_plan_rows(result);
     for extra in &result.plan.unclaimed {
         println!(
             "  ? {:<10} {:<9} {:<12} {}",
@@ -827,6 +1562,18 @@ fn print_result(result: &UpResult) {
     }
     if let Some(layout) = &result.layout {
         println!("  layout   {layout}");
+    }
+    if result.plan.waiting() > 0 {
+        println!(
+            "\n{} agent(s) wait on an upstream alias; they start once it reports `muxa work done`.",
+            result.plan.waiting()
+        );
+    }
+    if result.plan.attention() > 0 {
+        println!(
+            "\n{} agent(s) are waiting on you; muxa did not type over their prompt.",
+            result.plan.attention()
+        );
     }
     if result.dry_run {
         println!("\ndry run: nothing was created. Re-run without --dry-run to apply.");
@@ -850,6 +1597,8 @@ mod tests {
             skill: None,
             context: None,
             dry_run: false,
+            show_prompts: false,
+            yes: false,
             no_ticket: true,
             refresh: false,
             json: false,
@@ -926,6 +1675,7 @@ mod tests {
             window_name: "CAL-1".into(),
             cwd: PathBuf::from("/tmp/already-here"),
             external_item: None,
+            done: Vec::new(),
             agents: Vec::new(),
         };
         let (cwd, worktree, created) =

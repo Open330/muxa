@@ -1,0 +1,43 @@
+# Bundled screen-detection manifest — OpenAI Codex CLI (`codex`).
+#
+# muxa ships hooks for codex and they win everywhere except one window: the
+# startup gate. Codex asks about policies/trust *before* the session exists,
+# so no hook has been created yet and none can fire. A pane sitting on that
+# question therefore reads as `idle` — indistinguishable from an agent that
+# finished its turn — until something looks at the screen.
+#
+# The `blocked` rules below exist for that window. They were derived from a
+# REAL captured pane:
+#
+#     › 1. Yes, continue
+#       2. No, quit
+#       Press enter to continue
+#
+# Note the cursor marker: codex renders U+203A (`›`), not ASCII `>`. Matching
+# only `>` is why this gate went undetected. See docs/SCREEN_DETECTION.md.
+# Override at $XDG_CONFIG_HOME/muxa/agents/codex.toml.
+
+[agent]
+name = "codex"
+command = ["codex"]
+
+[rules]
+blocked = [
+    # The highlighted row of a numbered selection widget. Anchored to a
+    # cursor marker AND the number, so ordinary prose and plain numbered
+    # lists can never match. `[>›❯]` covers ASCII and the two angle glyphs
+    # TUIs actually render.
+    '(?m)^\s*[>›❯]\s*\d+\.\s+(?i:Yes|No)\b',
+    # The startup gate's own footer, constant across its variants.
+    '(?i)Press enter to continue',
+    # Approval prompts that render a yes/no pair without numbering.
+    '(?m)^\s*[>›❯]\s*(?i:Yes|No),\s',
+]
+working = [
+    # Codex prints an elapsed-time working line while a turn runs.
+    '(?m)^\s*(?i:Esc to interrupt)\b',
+]
+idle = [
+    # The bare composer prompt, nothing pending.
+    '(?m)^\s*[>›❯]\s*$',
+]

@@ -5183,6 +5183,9 @@ mod tests {
 
     fn fake_pane(pane_id: &str, session: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: pane_id.to_string(),
             session_id: String::new(),

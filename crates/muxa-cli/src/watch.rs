@@ -827,6 +827,14 @@ pub(crate) struct WorkRow {
     pub pane_count: usize,
     pub bare_summary: Option<String>,
     pub activity: Option<SessionActivity>,
+    /// `(reported, total)` over this work's pipeline agents, or `None` when
+    /// the window has none — a hand-split pane never reports, so a ratio
+    /// there would read as unfinished work that was never a pipeline.
+    ///
+    /// Without this a converged pipeline and a stalled one are the same
+    /// picture: every agent idle, nothing to say the review already landed.
+    pub completion: Option<(usize, usize)>,
+    pub pipeline_run: Option<muxa::pipeline_run::PipelineRunSummary>,
     agent_states: HashMap<(AgentKind, String), AgentState>,
 }
 
@@ -1419,6 +1427,7 @@ impl Effects for RealEffects {
                 None,
                 None,
                 None,
+                None,
             )
         })();
         if let Err(error) = marked {
@@ -1683,7 +1692,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach via active window/pane or exact pane",
-        "  n              new window or sibling agent pane",
+        "  n / w          new window or agent pane / work up a pipeline",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -1752,6 +1761,17 @@ struct AskComposer {
     /// Ask shares the reusable text palette with message composition, but
     /// selection never changes the daemon-owned agent/permission contract.
     skill_palette: Option<MessageSkillPalette>,
+}
+
+/// The `w` composer: a work id, nothing else.
+///
+/// Deliberately not folded into [`AskComposer`]. Ask is a read-only question
+/// to a headless agent; this one spends money and creates panes, and the two
+/// wanting the same text box is not a reason to give them the same key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkComposer {
+    input: String,
+    cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2611,6 +2631,8 @@ pub(crate) struct App {
     pub sessions: Vec<SessionInfo>,
     /// Persisted cumulative attached-time counters keyed by tmux session id.
     pub session_activity: Vec<SessionActivity>,
+    /// Daemon-owned pipeline Runs from the last coherent refresh.
+    pub pipeline_runs: Vec<muxa::pipeline_run::PipelineRun>,
     /// True between a user-triggered refresh request (`r`) and the
     /// matching outcome landing on the channel. Surfaces a brief
     /// "↻ refreshing…" hint in the header so mashing `r` during a
@@ -2681,6 +2703,7 @@ pub(crate) struct App {
     spawn: Option<SpawnComposer>,
     /// `Some` while the `a` ask composer is open.
     ask_composer: Option<AskComposer>,
+    work_composer: Option<WorkComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
     /// Agent the next question goes to, as the daemon reports it.
@@ -2917,6 +2940,7 @@ impl App {
             panes: Vec::new(),
             sessions: Vec::new(),
             session_activity: Vec::new(),
+            pipeline_runs: Vec::new(),
             refresh_pending: false,
             initial_pane: None,
             preview: None,
@@ -2936,6 +2960,7 @@ impl App {
             collaboration_compose_defaults,
             spawn: None,
             ask_composer: None,
+            work_composer: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
             ask_agent: "claude".into(),
@@ -3092,7 +3117,7 @@ impl App {
         // Build the shared topology before presentation-specific filtering.
         // This retains paneless/ambiguous agents in `unassigned_agents` and
         // gives every tree action a collision-free target.
-        self.topology = build_watch_topology(&agents, &panes, &sessions);
+        self.topology = build_watch_topology(&agents, &panes, &sessions, &self.pipeline_runs);
         self.reconcile_tree_expansion(&previous_topology_keys);
 
         // Filter out paneless agents up front when the user has opted in
@@ -3127,6 +3152,7 @@ impl App {
                 &session_activity,
                 &self.watch_cfg.sort,
             );
+            annotate_work_rows(&mut self.rows, &self.pipeline_runs);
             self.panes = panes;
             self.sessions = sessions;
             self.session_activity = session_activity;
@@ -5006,6 +5032,7 @@ fn build_watch_topology(
     agents: &[Agent],
     panes: &[PaneInfo],
     session_info: &[SessionInfo],
+    pipeline_runs: &[muxa::pipeline_run::PipelineRun],
 ) -> TopologySnapshot {
     let mut panes_by_host: HashMap<muxa::HostKind, Vec<PaneInfo>> = HashMap::new();
     for pane in panes {
@@ -5054,6 +5081,40 @@ fn build_watch_topology(
             if matches.next().is_none() {
                 node.name.clone_from(&info.name);
                 node.attached_clients = Some(info.attached_clients);
+            }
+        }
+    }
+    let window_id_counts = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .fold(HashMap::<String, usize>::new(), |mut counts, window| {
+            *counts.entry(window.key.window_id.clone()).or_default() += 1;
+            counts
+        });
+    for session in &mut snapshot.sessions {
+        for window in &mut session.windows {
+            // Durable Runs are launched on the locally scoped tmux server.
+            // Raw `@N` ids repeat across backends and sockets, so an
+            // ambiguous id must remain unjoined instead of displaying one
+            // Work's state on another window.
+            if window.key.session.endpoint.host != muxa::HostKind::Tmux
+                || window_id_counts
+                    .get(window.key.window_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    != 1
+            {
+                continue;
+            }
+            if let Some(run) = pipeline_runs
+                .iter()
+                .filter(|run| run.window_id.as_deref() == Some(window.key.window_id.as_str()))
+                .max_by_key(|run| run.updated_at)
+            {
+                let (done, total) = run.completion();
+                window.completion = Some(muxa::topology::WorkCompletion { done, total });
+                window.pipeline_run = Some(run.summary());
             }
         }
     }
@@ -5170,6 +5231,7 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
             },
         )
     });
+    let completion = work_completion(&builder.panes);
     WorkRow {
         display_name,
         group_key: builder.group_key,
@@ -5186,8 +5248,93 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
         pane_count: builder.panes.len(),
         bare_summary,
         activity: builder.activity,
+        completion,
+        pipeline_run: None,
         agent_states,
     }
+}
+
+fn annotate_work_rows(rows: &mut Vec<WatchRow>, runs: &[muxa::pipeline_run::PipelineRun]) {
+    let window_id_counts = rows
+        .iter()
+        .filter_map(|row| match row {
+            WatchRow::Work(work) => work.window_key.as_ref(),
+            WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
+        })
+        .fold(HashMap::<String, usize>::new(), |mut counts, window| {
+            *counts.entry(window.window_id.clone()).or_default() += 1;
+            counts
+        });
+    let mut displayed = std::collections::BTreeSet::new();
+    for row in rows.iter_mut() {
+        let WatchRow::Work(work) = row else {
+            continue;
+        };
+        let Some(window) = work.window_key.as_ref() else {
+            continue;
+        };
+        if window.session.endpoint.host != muxa::HostKind::Tmux
+            || window_id_counts
+                .get(window.window_id.as_str())
+                .copied()
+                .unwrap_or_default()
+                != 1
+        {
+            continue;
+        }
+        let Some(run) = runs
+            .iter()
+            .filter(|run| run.window_id.as_deref() == Some(window.window_id.as_str()))
+            .max_by_key(|run| run.updated_at)
+        else {
+            continue;
+        };
+        work.completion = Some(run.completion());
+        work.pipeline_run = Some(run.summary());
+        displayed.insert(run.identity.key());
+    }
+    // The Run is the durable object; a tmux window is only its current
+    // binding. Keep a prompt-free row visible after that binding disappears
+    // so watch and list tell the same operational truth.
+    for run in runs
+        .iter()
+        .filter(|run| !displayed.contains(&run.identity.key()))
+    {
+        rows.push(WatchRow::Work(Box::new(WorkRow {
+            session: run.identity.workspace_id.clone(),
+            group_key: format!("pipeline:{}", run.identity.key()),
+            window_key: None,
+            display_name: format!("{} › {}", run.identity.workspace_id, run.identity.work_id),
+            pane_ids: Vec::new(),
+            representative_pane: None,
+            latest_agent: None,
+            agents: Vec::new(),
+            pane_count: 0,
+            bare_summary: Some("durable Run · no live window".to_string()),
+            activity: None,
+            completion: Some(run.completion()),
+            pipeline_run: Some(run.summary()),
+            agent_states: HashMap::new(),
+        })));
+    }
+}
+
+/// Completion for the flat work row, over the same rule the topology uses —
+/// deferred to rather than restated, so the tree and the list can never
+/// disagree about whether a pipeline finished.
+fn work_completion(panes: &[PaneInfo]) -> Option<(usize, usize)> {
+    // `@muxa_work_done` is a window option, so whichever pane carries it speaks
+    // for the window.
+    let done = panes
+        .iter()
+        .find(|pane| !pane.work_done.is_empty())
+        .map(|pane| pane.work_done.clone())
+        .unwrap_or_default();
+    muxa::topology::work_completion(
+        panes.iter().filter_map(|pane| pane.agent_alias.as_deref()),
+        &done,
+    )
+    .map(|completion| (completion.done, completion.total))
 }
 
 fn build_work_rows(
@@ -5606,6 +5753,200 @@ fn state_summary_gutter_spans(
     spans
 }
 
+#[cfg(test)]
+mod pane_label_tests {
+    use super::*;
+    use muxa::topology::{BackendEndpoint, PaneKey, PaneNode, SessionKey, WindowKey};
+
+    fn pane(alias: Option<&str>, command: &str, agent: Option<Agent>) -> PaneNode {
+        PaneNode {
+            key: PaneKey {
+                window: WindowKey {
+                    session: SessionKey {
+                        endpoint: BackendEndpoint {
+                            host: muxa::HostKind::Tmux,
+                            socket: "default".into(),
+                        },
+                        session_id: "$1".into(),
+                    },
+                    window_id: "@1".into(),
+                },
+                pane_id: "%1".into(),
+            },
+            index: "0".into(),
+            tty: String::new(),
+            current_command: command.into(),
+            title: String::new(),
+            cwd: "/repo".into(),
+            pane_pid: 0,
+            agent,
+            agent_alias: alias.map(Into::into),
+        }
+    }
+
+    /// The case the program name cannot express: one work, two claudes. Both
+    /// rows read `claude` and the tree stops telling them apart.
+    #[test]
+    fn the_pipeline_alias_names_the_pane() {
+        assert_eq!(
+            pane_label_owner(&pane(Some("impl"), "claude", None)),
+            "impl"
+        );
+        assert_eq!(
+            pane_label_owner(&pane(Some("review"), "claude", None)),
+            "review",
+        );
+    }
+
+    /// A pane nobody aliased still says what is running in it.
+    #[test]
+    fn an_unaliased_pane_falls_back_to_its_command() {
+        assert_eq!(pane_label_owner(&pane(None, "vim", None)), "vim");
+    }
+}
+
+#[cfg(test)]
+mod work_up_key_tests {
+    use super::*;
+
+    /// `normalize_work_id` only rejects tabs, newlines and over-long input, so
+    /// anything else a work id carries reaches a shell. It must arrive as one
+    /// argument, not as a second command.
+    #[test]
+    fn a_work_id_cannot_break_out_of_the_shell_command() {
+        let nasty = "cal-1'; rm -rf ~; echo '";
+        let args = work_up_window_args("/usr/bin/muxa", nasty);
+        let command = args.last().expect("command").clone();
+        // Every embedded quote is closed, escaped and reopened, so the whole
+        // id stays one word.
+        assert!(command.contains(&shell_quote(nasty)), "{command}");
+        // The only `; printf` is the one this function wrote.
+        assert_eq!(command.matches("; printf").count(), 1, "{command}");
+        assert!(!command.contains("; rm -rf ~; echo ';"), "{command}");
+    }
+
+    /// An install path with a space is ordinary on macOS.
+    #[test]
+    fn the_binary_path_is_quoted_too() {
+        let command = work_up_window_args("/Applications/My Tools/muxa", "CAL-1")
+            .last()
+            .expect("command")
+            .clone();
+        assert!(
+            command.starts_with("'/Applications/My Tools/muxa' work up 'CAL-1'"),
+            "{command}",
+        );
+    }
+
+    /// The window has to outlive the command, or the plan `work up` prints
+    /// scrolls past before it can be read.
+    #[test]
+    fn the_window_waits_before_closing() {
+        let args = work_up_window_args("/usr/bin/muxa", "CAL-1");
+        assert_eq!(args[0], "new-window");
+        assert!(args.last().expect("command").ends_with("read _"));
+    }
+
+    /// Enter on an empty field must not spawn anything.
+    #[test]
+    fn an_empty_work_id_is_refused_before_it_spends_anything() {
+        let mut app = App::new();
+        app.work_composer = Some(WorkComposer::default());
+        assert!(matches!(
+            handle_work_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app.work_composer.is_some(), "the composer stays open");
+
+        app.work_composer = Some(WorkComposer {
+            input: "cal-7229".into(),
+            cursor: 8,
+        });
+        assert!(matches!(
+            handle_work_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::SubmitWorkUp
+        ));
+    }
+
+    /// Backspace on an empty field closes the composer, matching `a`.
+    #[test]
+    fn backspace_on_an_empty_field_closes_the_composer() {
+        let mut app = App::new();
+        app.work_composer = Some(WorkComposer::default());
+        assert!(matches!(
+            handle_work_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+        assert!(app.work_composer.is_none());
+    }
+}
+
+#[cfg(test)]
+mod work_completion_tests {
+    use super::*;
+
+    fn pane(id: &str, alias: Option<&str>, done: &[&str]) -> PaneInfo {
+        PaneInfo {
+            agent_role: None,
+            agent_alias: alias.map(Into::into),
+            work_done: done.iter().map(|d| (*d).to_string()).collect(),
+            pane_id: id.into(),
+            session_id: "$1".into(),
+            session: "callabo".into(),
+            window_id: "@1".into(),
+            window_name: "CAL-1".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: "/repo".into(),
+            socket: Some("default".into()),
+        }
+    }
+
+    /// The signal the TUI was missing: idle-and-converged looked exactly like
+    /// idle-and-stalled.
+    #[test]
+    fn a_converged_pipeline_reports_every_alias() {
+        let panes = vec![
+            pane("%1", Some("impl"), &["impl", "review"]),
+            pane("%2", Some("review"), &["impl", "review"]),
+        ];
+        assert_eq!(work_completion(&panes), Some((2, 2)));
+    }
+
+    #[test]
+    fn a_half_finished_pipeline_is_not_complete() {
+        let panes = vec![
+            pane("%1", Some("impl"), &["impl"]),
+            pane("%2", Some("review"), &["impl"]),
+        ];
+        assert_eq!(work_completion(&panes), Some((1, 2)));
+    }
+
+    /// A hand-split pane can never report, so counting it would show a
+    /// converged pair as 2/3 forever.
+    #[test]
+    fn hand_split_panes_stay_out_of_the_ratio() {
+        let panes = vec![
+            pane("%1", Some("impl"), &["impl", "review"]),
+            pane("%2", Some("review"), &["impl", "review"]),
+            pane("%3", None, &["impl", "review"]),
+        ];
+        assert_eq!(work_completion(&panes), Some((2, 2)));
+    }
+
+    /// A window with no pipeline at all has no completion to show — `0/1`
+    /// would libel an agent that was never asked to report.
+    #[test]
+    fn a_window_without_a_pipeline_has_no_ratio() {
+        assert_eq!(work_completion(&[pane("%1", None, &[])]), None);
+        assert_eq!(work_completion(&[]), None);
+    }
+}
+
 fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'static>> {
     parts
         .iter()
@@ -5624,6 +5965,22 @@ fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'stati
 fn work_label(s: &WorkRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static> {
     let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme, spin);
     spans.push(Span::raw(s.display_name.clone()));
+    if let Some((done, total)) = s.completion {
+        // Complete reads as a finished thing, not as another dim detail: this
+        // badge is the only place the TUI says a pipeline converged.
+        let style = if done == total {
+            Style::default().fg(theme.state_idle)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        spans.push(Span::styled(format!("  {done}/{total}"), style));
+    }
+    if let Some(run) = s.pipeline_run.as_ref() {
+        spans.push(Span::styled(
+            format!("  {}", pipeline_status_label(run)),
+            theme.dim_style(),
+        ));
+    }
 
     Text::from(Line::from(spans))
 }
@@ -5939,6 +6296,7 @@ pub(crate) struct FullRefresh {
     pub sessions: Vec<SessionInfo>,
     pub session_activity: Vec<SessionActivity>,
     pub error: Option<DaemonError>,
+    pub pipeline_runs: Vec<muxa::pipeline_run::PipelineRun>,
 }
 
 pub(crate) struct MessageComposerConfig {
@@ -5989,7 +6347,12 @@ fn apply_outcome_inner(app: &mut App, outcome: RefreshOutcome) {
         RefreshOutcome::Full(full) => apply_full(app, full),
         RefreshOutcome::SingleAgent(agent) => {
             apply_single_agent(app, agent);
-            app.topology = build_watch_topology(&app.current_agents(), &app.panes, &app.sessions);
+            app.topology = build_watch_topology(
+                &app.current_agents(),
+                &app.panes,
+                &app.sessions,
+                &app.pipeline_runs,
+            );
             // Re-sort immediately so a pushed state/activity change moves the
             // row to its sorted position now instead of waiting for the 5 s
             // `Full` fallback tick. This matters most for `sort = ["state",
@@ -6186,6 +6549,9 @@ fn apply_single_agent_to_work(app: &mut App, agent: Agent) {
         pane_count: 0,
         bare_summary: None,
         activity: None,
+        // No pane topology behind this row, so nothing to read aliases from.
+        completion: None,
+        pipeline_run: None,
         agent_states,
     })));
 }
@@ -6197,9 +6563,11 @@ fn apply_full(app: &mut App, full: FullRefresh) {
         sessions,
         session_activity,
         error,
+        pipeline_runs,
     } = full;
 
     app.last_error = error;
+    app.pipeline_runs = pipeline_runs;
 
     // Build a lookup of the previously-known agents so the merge can
     // distinguish a genuine daemon-driven change from a transient
@@ -6308,7 +6676,12 @@ async fn compute_refresh(
 
     // The blocking tasks already run concurrently on the blocking pool;
     // await the daemon snapshot + ledger load alongside them, then collect.
-    let (session_activity, snapshot) = tokio::join!(session_activity_task, client.snapshot());
+    let (session_activity, snapshot, pipeline_runs) = tokio::join!(
+        session_activity_task,
+        client.snapshot(),
+        client.pipeline_runs()
+    );
+    let pipeline_runs = pipeline_runs.unwrap_or_default();
 
     let mut panes: Vec<PaneInfo> = Vec::new();
     for task in pane_tasks {
@@ -6326,6 +6699,7 @@ async fn compute_refresh(
             sessions,
             session_activity,
             error: None,
+            pipeline_runs,
         },
         Err(e) => FullRefresh {
             agents: Vec::new(),
@@ -6336,6 +6710,7 @@ async fn compute_refresh(
                 self_describing: matches!(e, RuntimeError::NotConnected(_)),
                 message: e.to_string(),
             }),
+            pipeline_runs,
         },
     };
     RefreshOutcome::Full(full)
@@ -6809,6 +7184,20 @@ pub async fn run(
                 }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
+                }
+                Action::OpenWorkUp => {
+                    app.work_composer = Some(WorkComposer::default());
+                }
+                Action::SubmitWorkUp => {
+                    if let Some(work) = app.work_composer.take() {
+                        match open_work_up_window(&work.input) {
+                            Ok(id) => app.set_hint(
+                                format!("work up {id} — confirm in the new window"),
+                                HintLevel::Ok,
+                            ),
+                            Err(e) => app.set_hint(format!("work up failed: {e}"), HintLevel::Err),
+                        }
+                    }
                 }
                 Action::OpenAsk => {
                     if let Ok(agent) = client.ask_agent(None).await {
@@ -8066,6 +8455,10 @@ fn drain_pending_events() -> io::Result<Vec<Event>> {
 
 #[derive(Debug)]
 pub(crate) enum Action {
+    /// Open the work composer (`w`).
+    OpenWorkUp,
+    /// Run `muxa work up` for whatever the composer holds.
+    SubmitWorkUp,
     None,
     Quit,
     Refresh,
@@ -8400,6 +8793,9 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_spawn_event(code, modifiers, app);
     }
 
+    if app.work_composer.is_some() {
+        return handle_work_composer_event(code, modifiers, app);
+    }
     if app.ask_composer.is_some() {
         return handle_ask_composer_event(code, modifiers, app);
     }
@@ -8604,6 +9000,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::InspectorSplitChanged
         }
         KeyCode::Char('a') if app.browse_keys_active() => Action::OpenAsk,
+        KeyCode::Char('w') if app.browse_keys_active() => Action::OpenWorkUp,
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_work_parent();
@@ -8740,6 +9137,92 @@ fn handle_command_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -
 
 /// Ask composer: one field, Enter submits, `Ctrl-V` pastes. `/` opens the
 /// shared text-skill palette; it does not alter the daemon-owned ask contract.
+/// Open a tmux window running `muxa work up <id>` and hand the operator over
+/// to it.
+///
+/// Watch does not run the pipeline itself on purpose. `work up` resolves a
+/// ticket, which costs money, and the CLI already owns the flow that says so
+/// and waits for a yes. Re-implementing that inside the TUI would mean two
+/// places where muxa decides whether it may spend the operator's money, and
+/// the second one would be the one nobody reviewed. So the TUI's job ends at
+/// putting the operator in front of the real thing.
+fn open_work_up_window(raw: &str) -> std::result::Result<String, String> {
+    let work = crate::tmux_work::normalize_work_id(raw).map_err(|error| error.to_string())?;
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("locate the muxa binary: {error}"))?
+        .display()
+        .to_string();
+    let args = work_up_window_args(&exe, &work);
+    let output = muxa::tmux::tmux_command_scoped()
+        .args(&args)
+        .output()
+        .map_err(|error| format!("tmux: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(work)
+}
+
+/// The tmux argv for that window.
+///
+/// Split out to be tested without a tmux server, because the interesting part
+/// is the quoting: `normalize_work_id` rejects only tabs, newlines and
+/// over-long input, so a work id can still carry a quote or a semicolon and
+/// this string is handed to a shell.
+fn work_up_window_args(exe: &str, work: &str) -> Vec<String> {
+    let command = format!(
+        "{} work up {}; printf '\\n-- enter to close --'; read _",
+        shell_quote(exe),
+        shell_quote(work),
+    );
+    vec!["new-window".into(), "-n".into(), "work-up".into(), command]
+}
+
+/// POSIX single-quote quoting: wrap in `'`, and close/escape/reopen around any
+/// embedded `'`.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn handle_work_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    if code == KeyCode::Backspace
+        && app
+            .work_composer
+            .as_ref()
+            .is_some_and(|work| work.input.is_empty())
+    {
+        app.work_composer = None;
+        return Action::None;
+    }
+    let Some(work) = app.work_composer.as_mut() else {
+        return Action::None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.work_composer = None;
+            Action::None
+        }
+        KeyCode::Enter => {
+            if work.input.trim().is_empty() {
+                app.set_hint("work up needs a work id", HintLevel::Warn);
+                Action::None
+            } else {
+                Action::SubmitWorkUp
+            }
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(pasted) = system_clipboard_text() {
+                insert_str_at(&mut work.input, &mut work.cursor, &pasted);
+            }
+            Action::None
+        }
+        other => {
+            spawn_edit_text(other, modifiers, &mut work.input, &mut work.cursor);
+            Action::None
+        }
+    }
+}
+
 fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
     if app
         .ask_composer
@@ -9973,6 +10456,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_ask_panel(f, popup_area, app);
     }
+    render_work_composer_overlay(f, chunks[1], app);
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
@@ -10239,6 +10723,55 @@ fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
         y: r.y + r.height - height,
         width: r.width,
         height,
+    }
+}
+
+/// Draw the `w` composer over `area`, or nothing when it is closed. Folded
+/// into one call so `render` stays inside its line budget.
+fn render_work_composer_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if app.work_composer.is_none() {
+        return;
+    }
+    let popup_area = message_composer_rect(area, false);
+    f.render_widget(Clear, popup_area);
+    render_work_composer(f, popup_area, app);
+}
+
+fn render_work_composer(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(work) = app.work_composer.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " work up ",
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let view = truncate_prompt_input(&work.input, usize::from(inner.width.saturating_sub(2)));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("> "),
+            Span::raw(view.text.clone()),
+        ]))
+        .block(block),
+        area,
+    );
+    let before: String = view
+        .text
+        .chars()
+        .take(work.cursor.saturating_sub(view.skipped_chars))
+        .collect();
+    let x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
+    if x < inner.x + inner.width {
+        f.set_cursor_position((x, inner.y));
     }
 }
 
@@ -12870,6 +13403,16 @@ fn render_topology_inspector(
     }
 }
 
+fn pipeline_status_label(run: &muxa::pipeline_run::PipelineRunSummary) -> String {
+    let aliases = run
+        .aliases
+        .iter()
+        .map(|alias| format!("{}:{}", alias.alias, alias.status))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{} g{} {aliases}", run.pipeline, run.generation)
+}
+
 // cli-spinners frames: `dots` for parent agents, `dots2` (denser) for
 // subagents, and a half-circle set for starting.
 const SWARM_DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -13181,6 +13724,23 @@ fn tree_state_is_redundant(target: &TreeTarget, node: TopologyNodeRef<'_>) -> bo
     }
 }
 
+/// What to call a pane in the tree, after its id.
+///
+/// The pipeline alias wins when there is one. `claude` and `codex` name the
+/// CLI, which stops distinguishing anything the moment one work runs two of
+/// the same kind — and a pair whose reviewer and implementer are both claude
+/// then reads as two identical rows. `impl` and `review` say what the pane is
+/// *for*. The CLI stays visible on the row (state glyph, model column) and in
+/// the inspector, so nothing is lost.
+fn pane_label_owner(pane: &muxa::topology::PaneNode) -> String {
+    pane.agent_alias.clone().unwrap_or_else(|| {
+        pane.agent.as_ref().map_or_else(
+            || pane.current_command.clone(),
+            |agent| agent_kind_short(agent.kind).to_string(),
+        )
+    })
+}
+
 fn tree_node_label(
     target: &TreeTarget,
     node: TopologyNodeRef<'_>,
@@ -13230,10 +13790,7 @@ fn tree_node_label(
         TopologyNodeRef::Session(session) => session.name.clone(),
         TopologyNodeRef::Window(window) => window.name.clone(),
         TopologyNodeRef::Pane(pane) => {
-            let owner = pane.agent.as_ref().map_or_else(
-                || pane.current_command.clone(),
-                |agent| agent_kind_short(agent.kind).to_string(),
-            );
+            let owner = pane_label_owner(pane);
             if owner.trim().is_empty() {
                 pane.key.pane_id.clone()
             } else {
@@ -13248,6 +13805,27 @@ fn tree_node_label(
         ));
     } else {
         spans.push(Span::raw(label));
+    }
+    // A work window that has finished looks exactly like one that stalled —
+    // every agent idle — unless the row says so.
+    if let TopologyNodeRef::Window(window) = node {
+        if let Some(completion) = window.completion {
+            let style = if completion.is_complete() {
+                Style::default().fg(theme.state_idle)
+            } else {
+                theme.dim_style()
+            };
+            spans.push(Span::styled(
+                format!("  {}/{}", completion.done, completion.total),
+                style,
+            ));
+        }
+        if let Some(run) = window.pipeline_run.as_ref() {
+            spans.push(Span::styled(
+                format!("  {}", pipeline_status_label(run)),
+                theme.dim_style(),
+            ));
+        }
     }
     Text::from(Line::from(spans))
 }
@@ -15045,6 +15623,9 @@ mod tests {
 
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: pane.into(),
             session_id: String::new(),
@@ -15073,6 +15654,9 @@ mod tests {
         pane_index: u32,
     ) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: Some(socket.into()),
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -19491,6 +20075,9 @@ sort = ["state"]
     #[test]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: "%42".into(),
             session_id: String::new(),
@@ -20114,6 +20701,7 @@ sort = ["state"]
             panes: vec![],
             sessions: vec![],
             session_activity: vec![],
+            pipeline_runs: vec![],
             error: None,
         })
     }
@@ -20912,6 +21500,7 @@ sort = ["state"]
             panes: vec![fake_pane("%99", "side", 0, 0, "vim")],
             sessions: vec![],
             session_activity: vec![],
+            pipeline_runs: vec![],
             error: Some(DaemonError {
                 self_describing: false,
                 message: "boom".into(),
@@ -20952,6 +21541,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -20981,6 +21571,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21013,6 +21604,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21045,6 +21637,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21094,6 +21687,7 @@ sort = ["state"]
                 ],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21180,6 +21774,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21234,6 +21829,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21255,6 +21851,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21305,6 +21902,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21733,6 +22331,10 @@ sort = ["state"]
                 app.preview = None;
                 app.pane_capture = None;
             }
+            Action::OpenWorkUp => app.work_composer = Some(WorkComposer::default()),
+            // The real handler shells out to tmux; the test harness stops at
+            // the state change so nothing spawns a window.
+            Action::SubmitWorkUp => app.work_composer = None,
             Action::TogglePreviewMode => {
                 if let Some(p) = app.preview.as_mut() {
                     p.mode = match p.mode {
@@ -22849,6 +23451,7 @@ sort = ["state"]
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
+        assert!(body.contains("n / w          new window or agent pane / work up a pipeline"));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.

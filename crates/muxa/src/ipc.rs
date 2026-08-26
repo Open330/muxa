@@ -34,12 +34,16 @@ use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::fleet::{
     FleetCommandResult, FleetOperation, FleetRuntime, FleetSnapshot, FleetUpdate, LabelSelector,
 };
+use crate::pipeline_run::{
+    PipelineAliasStatus, PipelineClaim, PipelineRun, PipelineRunRegistration, PipelineRunStore,
+};
 use crate::session::{
     PtySessionBackend, SessionBackend, SessionOutput, SessionRef, SharedSessionBackend,
     SpawnSession, TerminalSnapshot,
 };
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
+use crate::work::WorkIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
@@ -141,6 +145,42 @@ enum RequestBody {
         event: AgentEvent,
     },
     Snapshot,
+    /// Durable desired graph and per-alias execution state for every Work Run.
+    PipelineRuns,
+    /// Create or update one desired Run and reconcile live pane evidence.
+    PipelineRegister {
+        registration: PipelineRunRegistration,
+    },
+    /// Atomic, generation-checked completion event.
+    PipelineDone {
+        identity: WorkIdentity,
+        alias: String,
+        generation: u64,
+    },
+    /// Start a new generation for an alias and its downstream closure.
+    PipelineInvalidate {
+        identity: WorkIdentity,
+        alias: String,
+        generation: u64,
+    },
+    /// Atomically reserve every dependency-ready pending alias.
+    PipelineClaim {
+        identity: WorkIdentity,
+        generation: u64,
+    },
+    /// Report the physical outcome of a claimed launch or re-prompt.
+    PipelineReport {
+        identity: WorkIdentity,
+        alias: String,
+        generation: u64,
+        status: PipelineAliasStatus,
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        window_id: Option<String>,
+    },
     /// Snapshot of every configured physical SSH host. `selector` follows
     /// Kubernetes label-selector syntax and is evaluated against central
     /// inventory metadata, never against untrusted remote data.
@@ -408,6 +448,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_provenance",
     "fleet_v1",
     "fleet_subscribe",
+    "pipeline_runs_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -481,6 +522,12 @@ pub struct Response {
     pub fleet: Option<FleetSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet_result: Option<FleetCommandResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_runs: Option<Vec<PipelineRun>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_run: Option<PipelineRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_claims: Option<Vec<PipelineClaim>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -518,6 +565,9 @@ impl Response {
             ask_agent: None,
             fleet: None,
             fleet_result: None,
+            pipeline_runs: None,
+            pipeline_run: None,
+            pipeline_claims: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -539,6 +589,21 @@ impl Response {
     fn with_fleet_result(result: FleetCommandResult) -> Self {
         let mut response = Self::ok();
         response.fleet_result = Some(result);
+        response
+    }
+    fn with_pipeline_runs(runs: Vec<PipelineRun>) -> Self {
+        let mut response = Self::ok();
+        response.pipeline_runs = Some(runs);
+        response
+    }
+    fn with_pipeline_run(run: PipelineRun) -> Self {
+        let mut response = Self::ok();
+        response.pipeline_run = Some(run);
+        response
+    }
+    fn with_pipeline_claims(claims: Vec<PipelineClaim>) -> Self {
+        let mut response = Self::ok();
+        response.pipeline_claims = Some(claims);
         response
     }
     fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
@@ -720,6 +785,7 @@ pub struct Server {
     ask: Arc<AskStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
+    pipeline_runs: Arc<PipelineRunStore>,
     handler_limit: usize,
 }
 
@@ -737,6 +803,7 @@ impl Server {
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             restart: None,
             fleet: None,
+            pipeline_runs: PipelineRunStore::in_memory(),
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -805,6 +872,12 @@ impl Server {
     #[must_use]
     pub fn with_fleet(mut self, fleet: FleetRuntime) -> Self {
         self.fleet = Some(fleet);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pipeline_runs(mut self, pipeline_runs: Arc<PipelineRunStore>) -> Self {
+        self.pipeline_runs = pipeline_runs;
         self
     }
 
@@ -902,6 +975,7 @@ impl Server {
                     let ask = self.ask.clone();
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
+                    let pipeline_runs = self.pipeline_runs.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -917,6 +991,7 @@ impl Server {
                                 ask,
                                 restart,
                                 fleet,
+                                pipeline_runs,
                             ))
                             .await
                         {
@@ -1599,7 +1674,8 @@ async fn record_collaboration_audit(
         collaboration_audit,
         ask,
         restart,
-        fleet
+        fleet,
+        pipeline_runs
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -1614,6 +1690,7 @@ async fn handle(
     ask: Arc<AskStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
+    pipeline_runs: Arc<PipelineRunStore>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -1773,6 +1850,72 @@ async fn handle(
                 RequestBody::Snapshot => {
                     kind = "snapshot";
                     Response::with_agents(store.snapshot().await)
+                }
+                RequestBody::PipelineRuns => {
+                    kind = "pipeline_runs";
+                    Response::with_pipeline_runs(pipeline_runs.list().await)
+                }
+                RequestBody::PipelineRegister { registration } => {
+                    kind = "pipeline_register";
+                    match pipeline_runs.register(registration).await {
+                        Ok(run) => Response::with_pipeline_run(run),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::PipelineDone {
+                    identity,
+                    alias,
+                    generation,
+                } => {
+                    kind = "pipeline_done";
+                    match pipeline_runs.done(&identity, &alias, generation).await {
+                        Ok(run) => Response::with_pipeline_run(run),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::PipelineInvalidate {
+                    identity,
+                    alias,
+                    generation,
+                } => {
+                    kind = "pipeline_invalidate";
+                    match pipeline_runs
+                        .invalidate(&identity, &alias, generation)
+                        .await
+                    {
+                        Ok(run) => Response::with_pipeline_run(run),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::PipelineClaim {
+                    identity,
+                    generation,
+                } => {
+                    kind = "pipeline_claim";
+                    match pipeline_runs.claim_ready(&identity, generation).await {
+                        Ok(claims) => Response::with_pipeline_claims(claims),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::PipelineReport {
+                    identity,
+                    alias,
+                    generation,
+                    status,
+                    pane,
+                    error,
+                    window_id,
+                } => {
+                    kind = "pipeline_report";
+                    match pipeline_runs
+                        .report(
+                            &identity, &alias, generation, status, pane, error, window_id,
+                        )
+                        .await
+                    {
+                        Ok(run) => Response::with_pipeline_run(run),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::FleetSnapshot { selector } => {
                     kind = "fleet_snapshot";
@@ -3147,6 +3290,103 @@ impl Client {
         Ok(decode_agents(&resp))
     }
 
+    pub async fn pipeline_runs(&self) -> Result<Vec<PipelineRun>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_runs",
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["pipeline_runs"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn pipeline_register(
+        &self,
+        registration: &PipelineRunRegistration,
+    ) -> Result<PipelineRun, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_register",
+            "registration": registration,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn pipeline_done(
+        &self,
+        identity: &WorkIdentity,
+        alias: &str,
+        generation: u64,
+    ) -> Result<PipelineRun, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_done",
+            "identity": identity,
+            "alias": alias,
+            "generation": generation,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn pipeline_invalidate(
+        &self,
+        identity: &WorkIdentity,
+        alias: &str,
+        generation: u64,
+    ) -> Result<PipelineRun, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_invalidate",
+            "identity": identity,
+            "alias": alias,
+            "generation": generation,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn pipeline_claim(
+        &self,
+        identity: &WorkIdentity,
+        generation: u64,
+    ) -> Result<Vec<PipelineClaim>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_claim",
+            "identity": identity,
+            "generation": generation,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["pipeline_claims"].clone()).map_err(RuntimeError::Json)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn pipeline_report(
+        &self,
+        identity: &WorkIdentity,
+        alias: &str,
+        generation: u64,
+        status: PipelineAliasStatus,
+        pane: Option<&str>,
+        error: Option<&str>,
+        window_id: Option<&str>,
+    ) -> Result<PipelineRun, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_report",
+            "identity": identity,
+            "alias": alias,
+            "generation": generation,
+            "status": status,
+            "pane": pane,
+            "error": error,
+            "window_id": window_id,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn by_pane(&self, pane: &str) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
@@ -3592,6 +3832,9 @@ mod tests {
 
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "collaboration".into(),
@@ -4099,6 +4342,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_done_is_atomic_and_opens_downstream_over_ipc() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-pipeline.sock");
+        let pipeline_runs = PipelineRunStore::in_memory();
+        let server =
+            Server::new(sock.clone(), Store::shared()).with_pipeline_runs(pipeline_runs.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let desired = |alias: &str, after: Vec<String>| crate::pipeline::DesiredAgent {
+            alias: alias.to_string(),
+            program: "codex".to_string(),
+            role: None,
+            task: None,
+            prompt: None,
+            direction: None,
+            after,
+        };
+        let identity = WorkIdentity::new("ws", "WORK-1");
+        let client = Client::new(sock.clone());
+        let run = client
+            .pipeline_register(&PipelineRunRegistration {
+                identity: identity.clone(),
+                pipeline: "chain".to_string(),
+                desired: vec![
+                    desired("plan", Vec::new()),
+                    desired("impl", vec!["plan".to_string()]),
+                ],
+                cwd: PathBuf::from("/tmp"),
+                window_id: Some("@1".to_string()),
+                observed: Vec::new(),
+                invalidate: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let root = client
+            .pipeline_claim(&identity, run.generation)
+            .await
+            .unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].agent.alias, "plan");
+
+        client
+            .pipeline_done(&identity, "plan", run.generation)
+            .await
+            .unwrap();
+        let downstream = client
+            .pipeline_claim(&identity, run.generation)
+            .await
+            .unwrap();
+        assert_eq!(downstream.len(), 1);
+        assert_eq!(downstream[0].agent.alias, "impl");
+
+        let invalidated = client
+            .pipeline_invalidate(&identity, "plan", run.generation)
+            .await
+            .unwrap();
+        assert!(client
+            .pipeline_done(&identity, "plan", run.generation)
+            .await
+            .is_err());
+        assert_eq!(
+            invalidated.aliases["impl"].status,
+            PipelineAliasStatus::Pending
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn not_connected_when_socket_missing() {
         // ENOENT path: tempdir exists but the socket file doesn't.
         let dir = tempdir().unwrap();
@@ -4244,6 +4564,7 @@ mod tests {
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             None,
             None,
+            PipelineRunStore::in_memory(),
         ));
 
         let req = serde_json::json!({
@@ -4755,6 +5076,9 @@ mod tests {
         assert!(backend.list_panes().is_empty());
 
         let pane = PaneInfo {
+            agent_role: None,
+            agent_alias: None,
+            work_done: Vec::new(),
             socket: None,
             pane_id: "zellij:3".into(),
             session_id: String::new(),

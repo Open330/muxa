@@ -34,8 +34,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    PipelineAgentConfig, PipelineConfig, RouteConfig, TicketConfig, TicketSource, WorktreeConfig,
+    Config, PipelineAgentConfig, PipelineConfig, RouteConfig, TicketConfig, TicketSource,
+    WorktreeConfig,
 };
+use crate::event::AgentState;
 
 /// Ticket body characters kept in a rendered prompt. A description can run
 /// to thousands of words; the prompt carries the shape of the task and the
@@ -61,6 +63,14 @@ pub enum PipelineError {
     EmptyPipeline(String),
     #[error("pipeline {pipeline:?} uses alias {alias:?} twice; aliases key the pane diff and must be unique")]
     DuplicateAlias { pipeline: String, alias: String },
+    #[error("pipeline {pipeline:?} agent {alias:?} waits on {missing:?}, which is not an alias in this pipeline")]
+    UnknownDependency {
+        pipeline: String,
+        alias: String,
+        missing: String,
+    },
+    #[error("pipeline {pipeline:?} has a cycle through {alias:?}; nothing in it could ever start")]
+    DependencyCycle { pipeline: String, alias: String },
     #[error("{scope} pattern {pattern:?} is not a valid regex: {source}")]
     BadPattern {
         scope: &'static str,
@@ -71,6 +81,18 @@ pub enum PipelineError {
     NoTicketJson(String),
     #[error("the ticket resolver answered with JSON that is not a ticket: {0}")]
     BadTicketJson(String),
+    #[error("the reply carried no TOML; it began: {0}")]
+    NoToml(String),
+    #[error("the generated TOML does not parse: {0}")]
+    BadToml(String),
+    #[error("the generated config configures nothing: expected at least one [[route]] and one [pipeline.*]")]
+    EmptyProposal,
+    #[error("pipeline {pipeline:?} agent {alias:?} names program {program:?}, which is not an allowlisted agent CLI (claude, codex, gemini, opencode)")]
+    UnknownProgram {
+        pipeline: String,
+        alias: String,
+        program: String,
+    },
 }
 
 /// Ticket context, as the resolver agent reported it.
@@ -208,6 +230,136 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
     }
     let (start, end) = best?;
     text.get(start..end)
+}
+
+/// Agent CLIs a pipeline may name. Kept here so a generated config can be
+/// rejected before it reaches tmux, rather than failing one pane at a time.
+pub const ALLOWLISTED_PROGRAMS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
+
+/// Pull a TOML document out of an agent's reply.
+///
+/// Prefers a fenced `toml` code block, because that is what the prompt asks
+/// for and what models reliably produce. Falls back to the whole reply so
+/// a model that answered with bare TOML still works.
+#[must_use]
+pub fn extract_toml_block(reply: &str) -> Option<&str> {
+    let mut rest = reply;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        let (tag, body) = after.split_once('\n')?;
+        let tag = tag.trim();
+        let Some(close) = body.find("```") else {
+            // Unterminated fence: take what is there rather than nothing.
+            return (tag.is_empty() || tag.eq_ignore_ascii_case("toml"))
+                .then_some(body)
+                .filter(|body| !body.trim().is_empty());
+        };
+        if tag.is_empty() || tag.eq_ignore_ascii_case("toml") {
+            let block = &body[..close];
+            if !block.trim().is_empty() {
+                return Some(block);
+            }
+        }
+        rest = &body[close + 3..];
+    }
+    (!reply.trim().is_empty()).then_some(reply)
+}
+
+/// What a generated config actually configures, for the confirmation the
+/// operator sees before anything is written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProposalSummary {
+    pub ticket_sources: Vec<String>,
+    pub routes: Vec<String>,
+    /// `name → agent count`, in the order a pipeline's agents are declared.
+    pub pipelines: Vec<(String, usize)>,
+}
+
+/// Parse and check a generated `[ticket]`/`[[route]]`/`[pipeline.*]` block
+/// before it is allowed anywhere near the operator's config file.
+///
+/// A model that invents a key, a bad regex, or a pipeline nobody defined
+/// would otherwise take the daemon down at its next start —
+/// [`crate::config::Config`] denies unknown fields, so a typo is a parse
+/// error rather than a shrug. Better to refuse here, while the text is
+/// still just text.
+///
+/// # Errors
+/// [`PipelineError::BadToml`] when the text is not a valid config,
+/// [`PipelineError::EmptyProposal`] when it configures nothing,
+/// [`PipelineError::BadPattern`] for a regex that will not compile,
+/// [`PipelineError::UnknownPipeline`] for a route naming a pipeline that
+/// does not exist, [`PipelineError::EmptyPipeline`] /
+/// [`PipelineError::DuplicateAlias`] / [`PipelineError::UnknownProgram`]
+/// for a line-up that could never launch.
+pub fn validate_proposal(toml_text: &str) -> Result<(Config, ProposalSummary), PipelineError> {
+    let config: Config =
+        toml::from_str(toml_text).map_err(|error| PipelineError::BadToml(error.to_string()))?;
+    if config.route.is_empty() || config.pipeline.is_empty() {
+        return Err(PipelineError::EmptyProposal);
+    }
+    for source in config.ticket.source.values() {
+        if !source.pattern.is_empty() {
+            compile("ticket source", &source.pattern)?;
+        }
+    }
+    for route in &config.route {
+        if !route.pattern.is_empty() {
+            compile("route", &route.pattern)?;
+        }
+        if let Some(name) = route.pipeline.as_deref() {
+            if !config.pipeline.contains_key(name) {
+                return Err(PipelineError::UnknownPipeline(name.to_string()));
+            }
+        }
+    }
+    for (name, pipeline) in &config.pipeline {
+        // Rendering with empty vars is the cheapest way to reuse the same
+        // emptiness and duplicate-alias rules the launcher enforces.
+        desired_agents(name, pipeline, &Vars::new())?;
+        for agent in &pipeline.agent {
+            let program = agent.program.trim().to_ascii_lowercase();
+            if !ALLOWLISTED_PROGRAMS.contains(&program.as_str()) {
+                return Err(PipelineError::UnknownProgram {
+                    pipeline: name.clone(),
+                    alias: agent.alias.clone(),
+                    program: agent.program.clone(),
+                });
+            }
+        }
+    }
+    let summary = ProposalSummary {
+        ticket_sources: config.ticket.source.keys().cloned().collect(),
+        routes: config
+            .route
+            .iter()
+            .map(|route| {
+                format!(
+                    "{} → {}",
+                    route.pattern,
+                    route.pipeline.as_deref().unwrap_or("(no pipeline)")
+                )
+            })
+            .collect(),
+        pipelines: config
+            .pipeline
+            .iter()
+            .map(|(name, pipeline)| (name.clone(), pipeline.agent.len()))
+            .collect(),
+    };
+    Ok((config, summary))
+}
+
+fn compile(scope: &'static str, pattern: &str) -> Result<(), PipelineError> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map(|_| ())
+        .map_err(|source| PipelineError::BadPattern {
+            scope,
+            pattern: pattern.to_string(),
+            source,
+        })
 }
 
 /// Placeholder values available to `[ticket.source]` prompts, `[[route]]`
@@ -430,7 +582,7 @@ fn default_worktree_path(repo: &Path, work: &str) -> std::path::PathBuf {
 }
 
 /// One pane the pipeline wants, with every template already rendered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct DesiredAgent {
     pub alias: String,
     pub program: String,
@@ -442,6 +594,9 @@ pub struct DesiredAgent {
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// Aliases that must report done before this one may start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
 }
 
 /// Render a pipeline into the panes it asks for.
@@ -475,7 +630,49 @@ pub fn desired_agents(
             vars,
         ));
     }
+    check_dependencies(name, &agents)?;
     Ok(agents)
+}
+
+/// Refuse an edge set that could never run: an edge to an alias this
+/// pipeline does not define, or a cycle. Both fail silently otherwise —
+/// the dependent agent simply never launches, and `work up` keeps
+/// reporting a window that will not converge without saying why.
+fn check_dependencies(pipeline: &str, agents: &[DesiredAgent]) -> Result<(), PipelineError> {
+    let known: BTreeSet<&str> = agents.iter().map(|agent| agent.alias.as_str()).collect();
+    for agent in agents {
+        for dependency in &agent.after {
+            if !known.contains(dependency.as_str()) {
+                return Err(PipelineError::UnknownDependency {
+                    pipeline: pipeline.to_string(),
+                    alias: agent.alias.clone(),
+                    missing: dependency.clone(),
+                });
+            }
+        }
+    }
+    // Kahn's algorithm: whatever cannot be peeled off is in a cycle.
+    let mut remaining: Vec<&DesiredAgent> = agents.iter().collect();
+    let mut settled: BTreeSet<&str> = BTreeSet::new();
+    while !remaining.is_empty() {
+        let (ready, blocked): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|agent| {
+            agent
+                .after
+                .iter()
+                .all(|dependency| settled.contains(dependency.as_str()))
+        });
+        if ready.is_empty() {
+            return Err(PipelineError::DependencyCycle {
+                pipeline: pipeline.to_string(),
+                alias: blocked[0].alias.clone(),
+            });
+        }
+        for agent in ready {
+            settled.insert(agent.alias.as_str());
+        }
+        remaining = blocked;
+    }
+    Ok(())
 }
 
 fn render_agent(
@@ -518,16 +715,44 @@ fn render_agent(
         task: agent.task.as_deref().map(|task| vars.render(task)),
         prompt,
         direction: agent.direction.clone(),
+        after: agent
+            .after
+            .iter()
+            .map(|alias| alias.trim().to_ascii_lowercase())
+            .filter(|alias| !alias.is_empty())
+            .collect(),
     }
 }
 
 /// A pane that already exists in the work window.
+///
+/// `state` is what makes a re-run a reconcile rather than a headcount. A
+/// pane proves someone was started there; it says nothing about whether
+/// that agent is working, idle, or stuck on a permission prompt nobody
+/// will ever answer. Those look identical from tmux and could not be
+/// further apart in what they need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExistingAgent {
     pub pane: String,
     pub program: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// From the daemon's registry. `None` means the daemon had nothing for
+    /// this pane — usually that it is not running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<AgentState>,
+}
+
+/// Whether this agent is blocked on a person.
+///
+/// A prompt typed at an agent sitting on an approval dialog is swallowed
+/// by the dialog, so muxa must report it rather than talk over it.
+#[must_use]
+pub fn needs_a_human(state: Option<AgentState>) -> bool {
+    matches!(
+        state,
+        Some(AgentState::WaitingInput | AgentState::WaitingChoice | AgentState::Error)
+    )
 }
 
 /// What `muxa work up` intends to do to one pane.
@@ -543,7 +768,26 @@ pub enum PlanStep {
         prompt: String,
     },
     /// The alias has a live pane and nothing to say to it. Converged.
-    Keep { alias: String, pane: String },
+    Keep {
+        alias: String,
+        pane: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<AgentState>,
+    },
+    /// The alias is not started yet because something it waits on has not
+    /// reported finishing. Not a failure — the next `work up` launches it.
+    Waiting {
+        alias: String,
+        waiting_on: Vec<String>,
+    },
+    /// The alias is blocked on a person — an approval prompt or an error.
+    /// Never prompted over: the dialog would eat the message, and the
+    /// operator would be left believing it was delivered.
+    Attention {
+        alias: String,
+        pane: String,
+        state: Option<AgentState>,
+    },
 }
 
 impl PlanStep {
@@ -551,7 +795,10 @@ impl PlanStep {
     pub fn alias(&self) -> &str {
         match self {
             Self::Launch(agent) => &agent.alias,
-            Self::Reprompt { alias, .. } | Self::Keep { alias, .. } => alias,
+            Self::Reprompt { alias, .. }
+            | Self::Keep { alias, .. }
+            | Self::Waiting { alias, .. }
+            | Self::Attention { alias, .. } => alias,
         }
     }
 }
@@ -585,10 +832,91 @@ impl Plan {
 
     /// True when every desired pane already exists and there is nothing to
     /// say to any of them.
+    /// Aliases blocked on a person. Converging is not possible until
+    /// somebody answers them, so they are counted separately.
+    /// Aliases held back by an unmet edge. The window is not converged
+    /// while any remain, but nothing is wrong — the next run starts them.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step, PlanStep::Waiting { .. }))
+            .count()
+    }
+
+    #[must_use]
+    pub fn attention(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step, PlanStep::Attention { .. }))
+            .count()
+    }
+
     #[must_use]
     pub fn converged(&self) -> bool {
-        self.launches() == 0 && self.reprompts() == 0
+        self.launches() == 0
+            && self.reprompts() == 0
+            && self.attention() == 0
+            && self.waiting() == 0
     }
+}
+
+/// One row of a rendered pipeline graph: an agent, how deep its longest
+/// dependency chain runs, and what it is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphNode {
+    pub alias: String,
+    pub program: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// 0 for anything that can start immediately; otherwise one past the
+    /// deepest thing it waits on. Everything sharing a depth can run at the
+    /// same time, which is the fact a list of tables hides.
+    pub depth: usize,
+    pub after: Vec<String>,
+}
+
+/// Lay a pipeline out by dependency depth.
+///
+/// The TOML says which agents exist and, buried in an `after` key, which
+/// ones wait. It does not say what runs *together*, and that is the thing
+/// an operator actually wants to know before spending money on a run.
+/// Depth answers it: equal depth means parallel.
+///
+/// Assumes the edges are already validated — [`desired_agents`] refuses
+/// unknown aliases and cycles, so a node here always resolves.
+#[must_use]
+pub fn graph(agents: &[DesiredAgent]) -> Vec<GraphNode> {
+    let mut depths: BTreeMap<&str, usize> = BTreeMap::new();
+    // Repeated relaxation rather than a recursive walk: the set is tiny and
+    // this cannot blow the stack on a pathological config.
+    for _ in 0..agents.len() {
+        for agent in agents {
+            let depth = agent
+                .after
+                .iter()
+                .map(|dependency| depths.get(dependency.as_str()).map_or(0, |depth| depth + 1))
+                .max()
+                .unwrap_or(0);
+            depths.insert(agent.alias.as_str(), depth);
+        }
+    }
+    let mut nodes: Vec<GraphNode> = agents
+        .iter()
+        .map(|agent| GraphNode {
+            alias: agent.alias.clone(),
+            program: agent.program.clone(),
+            role: agent.role.clone(),
+            depth: depths.get(agent.alias.as_str()).copied().unwrap_or(0),
+            after: agent.after.clone(),
+        })
+        .collect();
+    nodes.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.alias.cmp(&right.alias))
+    });
+    nodes
 }
 
 /// Compare the pipeline's panes against the window's panes.
@@ -599,7 +927,12 @@ impl Plan {
 /// prompt into an agent that is mid-turn is disruptive enough to deserve
 /// an explicit ask.
 #[must_use]
-pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Option<&str>) -> Plan {
+pub fn plan(
+    desired: &[DesiredAgent],
+    existing: &[ExistingAgent],
+    broadcast: Option<&str>,
+    done: &[String],
+) -> Plan {
     let steps = desired
         .iter()
         .map(|agent| {
@@ -609,8 +942,38 @@ pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Opt
                     .as_deref()
                     .is_some_and(|alias| alias.eq_ignore_ascii_case(&agent.alias))
             });
+            // An edge only gates the *start*. Once an agent exists it is
+            // managed like any other; re-gating it would tear down work
+            // already in flight every time an upstream alias was re-opened.
+            let waiting_on = if live.is_none() {
+                agent
+                    .after
+                    .iter()
+                    .filter(|dependency| {
+                        !done
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(dependency))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !waiting_on.is_empty() {
+                return PlanStep::Waiting {
+                    alias: agent.alias.clone(),
+                    waiting_on,
+                };
+            }
             match (live, broadcast) {
                 (None, _) => PlanStep::Launch(agent.clone()),
+                // Blocked on a person beats everything: do not type at it,
+                // and do not report it as converged either.
+                (Some(live), _) if needs_a_human(live.state) => PlanStep::Attention {
+                    alias: agent.alias.clone(),
+                    pane: live.pane.clone(),
+                    state: live.state,
+                },
                 (Some(live), Some(message)) => PlanStep::Reprompt {
                     alias: agent.alias.clone(),
                     pane: live.pane.clone(),
@@ -619,6 +982,7 @@ pub fn plan(desired: &[DesiredAgent], existing: &[ExistingAgent], broadcast: Opt
                 (Some(live), None) => PlanStep::Keep {
                     alias: agent.alias.clone(),
                     pane: live.pane.clone(),
+                    state: live.state,
                 },
             }
         })
@@ -925,30 +1289,159 @@ program = 'claude'
                 task: None,
                 prompt: None,
                 direction: None,
+                after: Vec::new(),
             })
             .collect()
     }
 
     fn existing(rows: &[(&str, Option<&str>)]) -> Vec<ExistingAgent> {
+        existing_in(rows, Some(AgentState::Working))
+    }
+
+    fn existing_in(rows: &[(&str, Option<&str>)], state: Option<AgentState>) -> Vec<ExistingAgent> {
         rows.iter()
             .map(|(pane, alias)| ExistingAgent {
                 pane: (*pane).to_string(),
                 program: "codex".into(),
                 alias: alias.map(str::to_string),
+                state,
             })
             .collect()
     }
 
+    /// `plan` with nothing reported done — the shape every pre-edge test
+    /// was written against.
+    fn plan_at(
+        desired: &[DesiredAgent],
+        existing: &[ExistingAgent],
+        broadcast: Option<&str>,
+    ) -> Plan {
+        plan(desired, existing, broadcast, &[])
+    }
+
+    fn desired_after(alias: &str, after: &[&str]) -> DesiredAgent {
+        DesiredAgent {
+            alias: alias.to_string(),
+            program: "codex".into(),
+            role: None,
+            task: None,
+            prompt: None,
+            direction: None,
+            after: after.iter().map(|a| (*a).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn depth_says_what_runs_together_which_the_toml_never_does() {
+        let agents = vec![
+            desired_after("impl", &[]),
+            desired_after("docs", &[]),
+            desired_after("review", &["impl"]),
+            desired_after("ship", &["review", "docs"]),
+        ];
+        let nodes = graph(&agents);
+        let depth = |alias: &str| {
+            nodes
+                .iter()
+                .find(|node| node.alias == alias)
+                .expect("node")
+                .depth
+        };
+        // impl and docs have nothing to wait for, so they run together.
+        assert_eq!(depth("impl"), 0);
+        assert_eq!(depth("docs"), 0);
+        assert_eq!(depth("review"), 1);
+        // ship waits on the *deepest* of its edges, not the first.
+        assert_eq!(depth("ship"), 2);
+        // Rendered shallowest-first so the reading order is the run order.
+        assert!(nodes.windows(2).all(|w| w[0].depth <= w[1].depth));
+    }
+
+    #[test]
+    fn an_edge_holds_an_agent_back_until_its_upstream_reports_done() {
+        let agents = vec![
+            desired_after("impl", &[]),
+            desired_after("review", &["impl"]),
+        ];
+
+        // Nothing reported: the reviewer is not launched beside the
+        // implementer, which is the whole point — it would be reviewing a
+        // tree that changes while it reads.
+        let held = plan(&agents, &[], None, &[]);
+        assert_eq!(held.launches(), 1);
+        assert_eq!(held.waiting(), 1);
+        assert!(!held.converged(), "a held-back agent is not convergence");
+        assert!(matches!(
+            held.steps.iter().find(|s| s.alias() == "review"),
+            Some(PlanStep::Waiting { waiting_on, .. }) if waiting_on == &["impl".to_string()]
+        ));
+
+        // Reported: the edge opens and the next run starts it.
+        let opened = plan(&agents, &[], None, &["impl".to_string()]);
+        assert_eq!(opened.launches(), 2);
+        assert_eq!(opened.waiting(), 0);
+    }
+
+    #[test]
+    fn an_edge_gates_the_start_only_not_an_agent_already_running() {
+        // Re-gating a live agent would tear down work in flight whenever an
+        // upstream alias was re-opened.
+        let agents = vec![desired_after("review", &["impl"])];
+        let live = existing(&[("%1", Some("review"))]);
+        let plan = plan(&agents, &live, None, &[]);
+        assert_eq!(plan.waiting(), 0);
+        assert!(plan.converged());
+    }
+
+    #[test]
+    fn an_edge_to_an_alias_nobody_defines_is_refused() {
+        let config: Config = toml::from_str(
+            r"
+[[pipeline.p.agent]]
+alias = 'review'
+program = 'codex'
+after = ['ghost']
+",
+        )
+        .unwrap();
+        let error = desired_agents("p", &config.pipeline["p"], &Vars::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn a_cycle_is_refused_rather_than_deadlocking_forever() {
+        let config: Config = toml::from_str(
+            r"
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'codex'
+after = ['b']
+
+[[pipeline.p.agent]]
+alias = 'b'
+program = 'codex'
+after = ['a']
+",
+        )
+        .unwrap();
+        let error = desired_agents("p", &config.pipeline["p"], &Vars::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cycle"), "{error}");
+    }
+
     #[test]
     fn an_empty_window_launches_everything() {
-        let plan = plan(&desired(&["plan", "impl"]), &[], None);
+        let plan = plan_at(&desired(&["plan", "impl"]), &[], None);
         assert_eq!(plan.launches(), 2);
         assert!(!plan.converged());
     }
 
     #[test]
     fn re_running_a_staffed_window_is_a_no_op() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan", "impl"]),
             &existing(&[("%1", Some("plan")), ("%2", Some("impl"))]),
             None,
@@ -959,7 +1452,7 @@ program = 'claude'
 
     #[test]
     fn only_the_missing_alias_is_launched() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan", "impl", "review"]),
             &existing(&[("%1", Some("plan")), ("%2", Some("impl"))]),
             None,
@@ -973,7 +1466,7 @@ program = 'claude'
 
     #[test]
     fn a_broadcast_reaches_live_panes_and_still_launches_missing_ones() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan", "review"]),
             &existing(&[("%1", Some("plan"))]),
             Some("rebase onto main first"),
@@ -988,8 +1481,57 @@ program = 'claude'
     }
 
     #[test]
+    fn an_agent_blocked_on_a_person_is_never_prompted_over() {
+        // A prompt typed at an approval dialog is eaten by the dialog, and
+        // the operator is left believing it was delivered.
+        for state in [
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+        ] {
+            let plan = plan_at(
+                &desired(&["impl"]),
+                &existing_in(&[("%1", Some("impl"))], Some(state)),
+                Some("carry on"),
+            );
+            assert_eq!(plan.reprompts(), 0, "{state:?} must not be prompted");
+            assert_eq!(plan.attention(), 1, "{state:?}");
+            assert!(!plan.converged(), "{state:?} is not converged");
+        }
+    }
+
+    #[test]
+    fn a_working_agent_is_kept_and_a_broadcast_still_reaches_it() {
+        let working = existing_in(&[("%1", Some("impl"))], Some(AgentState::Working));
+        assert!(plan_at(&desired(&["impl"]), &working, None).converged());
+        assert_eq!(
+            plan_at(&desired(&["impl"]), &working, Some("go")).reprompts(),
+            1
+        );
+
+        // Idle is still staffed — it just has nothing to say for itself.
+        // Distinguishing it from Working is the operator's call, not a
+        // reason to relaunch.
+        let idle = existing_in(&[("%1", Some("impl"))], Some(AgentState::Idle));
+        assert!(plan_at(&desired(&["impl"]), &idle, None).converged());
+        assert_eq!(
+            plan_at(&desired(&["impl"]), &idle, Some("go")).reprompts(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unknown_state_is_treated_as_present_not_blocked() {
+        // The daemon may simply not have this pane; that is not a reason to
+        // claim a human is needed.
+        assert!(!needs_a_human(None));
+        assert!(!needs_a_human(Some(AgentState::Starting)));
+        assert!(!needs_a_human(Some(AgentState::Stopped)));
+    }
+
+    #[test]
     fn a_pane_no_alias_claims_is_reported_and_left_alone() {
-        let plan = plan(
+        let plan = plan_at(
             &desired(&["plan"]),
             &existing(&[("%1", Some("plan")), ("%9", None), ("%8", Some("retired"))]),
             None,
@@ -1051,6 +1593,128 @@ program = 'claude'
         assert_eq!(plan.path, Path::new("/wt/cal-7"));
         assert_eq!(plan.branch, "june/cal-7");
         assert_eq!(plan.base.as_deref(), Some("origin/main"));
+    }
+
+    const GOOD: &str = r"
+[[route]]
+match = '^cal-'
+pipeline = 'triad'
+
+[pipeline.triad]
+[[pipeline.triad.agent]]
+alias = 'impl'
+program = 'codex'
+[[pipeline.triad.agent]]
+alias = 'review'
+program = 'claude'
+";
+
+    #[test]
+    fn a_fenced_toml_block_is_lifted_out_of_the_prose_around_it() {
+        let reply = format!("Sure, here you go:\n\n```toml{GOOD}```\n\nPaste that in.");
+        let block = extract_toml_block(&reply).expect("block");
+        assert!(block.contains("[pipeline.triad]"), "{block}");
+        assert!(!block.contains("Paste that in"), "{block}");
+    }
+
+    #[test]
+    fn bare_toml_with_no_fence_still_works() {
+        let block = extract_toml_block(GOOD).expect("block");
+        assert!(block.contains("[[route]]"));
+        assert!(extract_toml_block("   ").is_none());
+    }
+
+    #[test]
+    fn a_valid_proposal_reports_what_it_configures() {
+        let (_, summary) = validate_proposal(GOOD).expect("valid");
+        assert_eq!(summary.routes, vec!["^cal- → triad"]);
+        assert_eq!(summary.pipelines, vec![("triad".to_string(), 2)]);
+        assert!(summary.ticket_sources.is_empty());
+    }
+
+    #[test]
+    fn an_invented_key_is_refused_before_it_reaches_the_config_file() {
+        // Config denies unknown fields, so a model's typo would take the
+        // daemon down at its next start. Catch it while it is still text.
+        let error = validate_proposal(
+            r"
+[[route]]
+match = '.*'
+piepline = 'triad'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn a_route_naming_a_pipeline_nobody_defined_is_refused() {
+        let error = validate_proposal(
+            r"
+[[route]]
+match = '.*'
+pipeline = 'ghost'
+
+[pipeline.real]
+[[pipeline.real.agent]]
+alias = 'a'
+program = 'codex'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn a_program_that_is_not_an_agent_cli_is_refused() {
+        let error = validate_proposal(
+            r"
+[[route]]
+match = '.*'
+pipeline = 'p'
+
+[pipeline.p]
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'vim'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vim"), "{error}");
+        assert!(
+            error.contains("claude"),
+            "should list what is allowed: {error}"
+        );
+    }
+
+    #[test]
+    fn an_uncompilable_pattern_is_refused_with_the_pattern_named() {
+        let error = validate_proposal(
+            r"
+[[route]]
+match = 'cal-['
+pipeline = 'p'
+
+[pipeline.p]
+[[pipeline.p.agent]]
+alias = 'a'
+program = 'codex'
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cal-["), "{error}");
+    }
+
+    #[test]
+    fn a_proposal_that_configures_nothing_is_refused() {
+        assert!(matches!(
+            validate_proposal("[ticket]\nagent = 'claude'\n"),
+            Err(PipelineError::EmptyProposal)
+        ));
     }
 
     #[test]

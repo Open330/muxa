@@ -172,6 +172,17 @@ impl ManifestSet {
         self.manifests.len()
     }
 
+    /// The manifest whose `name` matches, for callers that know *which* agent
+    /// occupies a pane rather than only what its foreground command is called.
+    /// An npm-installed codex reports `node`, so the command is the weaker of
+    /// the two keys whenever the registry has an answer.
+    #[must_use]
+    pub fn manifest_for_name(&self, name: &str) -> Option<&AgentManifest> {
+        self.manifests
+            .iter()
+            .find(|manifest| manifest.name.eq_ignore_ascii_case(name))
+    }
+
     /// Names of the loaded manifests, for startup logging.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.manifests.iter().map(|m| m.name.as_str())
@@ -222,9 +233,10 @@ fn command_basename(cmd: &str) -> String {
 /// The bundled manifest sources, shipped in the binary via `include_str!`.
 /// These are muxa-authored and MUST parse — a parse failure is a build-time
 /// bug caught by [`tests::every_bundled_manifest_parses`].
-fn bundled_sources() -> [(&'static str, &'static str); 6] {
+fn bundled_sources() -> [(&'static str, &'static str); 7] {
     [
         ("agy", include_str!("screen/agents/agy.toml")),
+        ("codex", include_str!("screen/agents/codex.toml")),
         ("cursor", include_str!("screen/agents/cursor.toml")),
         ("amp", include_str!("screen/agents/amp.toml")),
         ("copilot", include_str!("screen/agents/copilot.toml")),
@@ -325,7 +337,18 @@ fn load_user_overrides(dir: &std::path::Path, manifests: &mut Vec<AgentManifest>
 #[must_use]
 pub fn prepare_capture(raw: &str, max_lines: usize) -> String {
     let stripped = strip_ansi(raw);
-    let lines: Vec<&str> = stripped.lines().collect();
+    let mut lines: Vec<&str> = stripped.lines().collect();
+    // tmux pads a capture out to the full pane height, so a screen that paints
+    // at the TOP of an otherwise empty display — codex's startup gate is the
+    // motivating case — arrives as a few lines of content followed by dozens of
+    // blank rows. Slicing the tail verbatim would then keep only the padding
+    // and classify the pane as unknown. Trailing blanks carry no signal for any
+    // rule, so dropping them first costs nothing and makes the tail mean "the
+    // last `max_lines` lines that exist" for scrolling transcripts and
+    // top-anchored screens alike.
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
     let start = lines.len().saturating_sub(max_lines);
     lines[start..].join("\n")
 }
@@ -347,6 +370,54 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Verbatim from a real `tmux capture-pane` of codex's startup gate on a
+    /// 50-row pane: nine lines of content, then padding to the pane height.
+    /// The gate is the one screen codex's hooks structurally cannot report, so
+    /// if this capture does not classify, nothing reports it at all.
+    #[test]
+    fn codex_startup_gate_survives_tail_slicing() {
+        let gate = "> You are in /tmp/gate-probe\n\
+                    \n\
+                    \x20 Do you trust the contents of this directory?\n\
+                    \x20 the directory allows project-local config to load.\n\
+                    \n\
+                    \u{203a} 1. Yes, continue\n\
+                    \x20 2. No, quit\n\
+                    \n\
+                    \x20 Press enter to continue\n";
+        let raw = format!("{gate}{}", "\n".repeat(54));
+
+        let prepared = prepare_capture(&raw, 40);
+        assert!(
+            prepared.contains("1. Yes, continue"),
+            "tail slicing must not discard a top-anchored screen; got {prepared:?}",
+        );
+
+        let set = load_manifests();
+        let codex = set
+            .manifest_for_name("codex")
+            .expect("bundled codex manifest");
+        assert_eq!(
+            codex.classify(&prepared),
+            Some(ScreenState::Blocked),
+            "a pane sitting on the trust gate is blocked on the operator",
+        );
+    }
+
+    /// The tail must still be a tail: a transcript longer than `max_lines`
+    /// keeps its END, which is where a scrolling agent's current state lives.
+    #[test]
+    fn prepare_capture_still_keeps_the_end_of_a_long_transcript() {
+        use std::fmt::Write as _;
+        let raw = (0..100).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
+        let prepared = prepare_capture(&raw, 10);
+        assert!(prepared.starts_with("line 90"));
+        assert!(prepared.ends_with("line 99"));
+    }
     use super::*;
 
     fn cursor() -> AgentManifest {
@@ -462,7 +533,7 @@ idle = ['^> $']
     #[test]
     fn every_bundled_manifest_parses() {
         let set = bundled_manifests();
-        assert_eq!(set.len(), 6);
+        assert_eq!(set.len(), bundled_sources().len());
         for m in &set {
             assert!(!m.name.is_empty());
         }
@@ -549,6 +620,33 @@ idle = ['^> $']
             m.classify("Allow access to this file?\n> Yes, allow access\n  No, deny access"),
             Some(ScreenState::Blocked),
         );
+        // Codex's startup gate, captured verbatim from a live pane. Note the
+        // cursor glyph: codex renders U+203A, and matching only ASCII `>` is
+        // exactly why muxa read a blocked agent as idle.
+        let codex = bundled_manifests()
+            .into_iter()
+            .find(|m| m.name == "codex")
+            .expect("codex manifest is bundled");
+        assert_eq!(
+            codex.classify(
+                "policies to load.\n› 1. Yes, continue\n  2. No, quit\n  Press enter to continue"
+            ),
+            Some(ScreenState::Blocked),
+            "codex startup gate must read as blocked",
+        );
+        // The same widget with an ASCII cursor still matches.
+        assert_eq!(
+            codex.classify("> 1. Yes, proceed\n  2. No"),
+            Some(ScreenState::Blocked),
+        );
+        // And ordinary output must not.
+        assert_eq!(
+            codex.classify("Steps:\n1. Yes it compiles\n2. No warnings remain"),
+            None,
+            "a plain numbered list is not a selection widget",
+        );
+        assert_eq!(codex.classify("› "), Some(ScreenState::Idle));
+
         // The folder-trust gate blocks the very first prompt of a session.
         assert_eq!(
             m.classify(

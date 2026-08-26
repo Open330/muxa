@@ -266,6 +266,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa sync` | Backfill the registry by scanning active pane hosts. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
+| `muxa work init` | Describe a work pipeline in your own words; an agent writes the `[ticket]`/`[[route]]`/`[pipeline.*]` config, validated and shown before anything is written. |
 | `muxa work up cal-1234 --body "..."` | Resolve the ticket, route it to a workspace, and create whichever pipeline agent panes are missing — delivering the request to the ones already running. Re-running converges; also `muxa_start_work` over MCP. See [docs/PIPELINE.md](docs/PIPELINE.md). |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
 | `muxa workspace list/show/close` | Inspect or explicitly close workspace/project sessions. |

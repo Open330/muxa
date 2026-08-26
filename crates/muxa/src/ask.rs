@@ -424,6 +424,17 @@ pub struct OneShot<'a> {
     pub timeout: Duration,
 }
 
+/// Agent CLIs this bridge can drive headlessly, in preference order.
+///
+/// Membership is not "muxa knows this agent" — the launcher knows more
+/// (gemini, agy, opencode) — but "it has a print mode that reports
+/// completion as a fact": an exit code plus a parseable envelope. Without
+/// that, reading an answer back means screen-scraping a moving target.
+#[must_use]
+pub fn supported_agents() -> &'static [&'static str] {
+    &["claude", "codex"]
+}
+
 /// Run one headless turn and return its answer.
 ///
 /// # Errors

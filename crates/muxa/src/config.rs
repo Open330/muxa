@@ -468,6 +468,15 @@ pub struct PipelineAgentConfig {
     /// Split direction when this pane joins an existing window: `right`
     /// (default) or `down`.
     pub direction: Option<String>,
+    /// Aliases in this pipeline that must report finishing before this
+    /// agent is launched at all.
+    ///
+    /// Without it every agent starts at once, which is right for work that
+    /// is genuinely parallel and wrong for work that is not: a reviewer
+    /// launched beside its implementer reviews a tree that changes while it
+    /// reads, and spends its rounds rediscovering that the code moved. An
+    /// edge here is what makes the difference expressible.
+    pub after: Vec<String>,
 }
 
 /// `[collaboration]` config — same-window durable agent request/reply.
