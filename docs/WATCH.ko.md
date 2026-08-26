@@ -290,12 +290,30 @@ tmux set-option -t "$new" destroy-unattached on
 `command-alias`로는 안 됩니다. tmux는 내장 명령 이름을 alias보다 먼저 해석하므로
 `attach-session` alias는 참조되지 않습니다.
 
-window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보는
-client 기준으로 잡으려면 `aggressive-resize`를 함께 켜는 편이 좋습니다.
+window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보고
+있는 터미널 기준으로 잡으려면 window 단위 sizing을 함께 켭니다.
 
 ```tmux
+set -g window-size smallest
 setw -g aggressive-resize on
 ```
+
+두 줄 모두 필요하며 `aggressive-resize`만으로는 아무 효과가 없습니다 — 이 옵션은
+`window-size`가 `smallest` 또는 `largest`인 window에만 적용되는데 tmux 3.x의
+기본값은 `latest`입니다. tmux 3.4에서 200x50과 80x24 client를 각각 다른 window에
+두고 실측한 결과:
+
+| 설정 | 200x50 client가 보는 window | 80x24 client가 보는 window |
+| --- | --- | --- |
+| `window-size latest` (기본값) | 80x23 | 80x23 |
+| `smallest` + `aggressive-resize on` | **200x49** | 80x23 |
+| `smallest` + `aggressive-resize off` | 80x23 | 80x23 |
+
+`smallest` 단독은 전형적인 함정입니다 — 어디든 작은 client가 하나 붙어 있으면
+내 window가 쪼그라듭니다. `aggressive-resize`가 "아무 client"를 "이 window를
+current로 갖는 client"로 좁혀 주는데, 이것이 위에서 만든 view 분리와 정확히
+맞물립니다. 터미널이 하나뿐이면 smallest가 곧 그 터미널이므로 일반적인 단일
+터미널 사용에는 변화가 없습니다.
 
 watch에서 `Enter`로 이동할 때는 대상 window를 session까지 포함해 지정하므로, 요청한
 터미널만 움직이고 group의 다른 session은 보고 있던 window를 유지합니다. 이때 watch가

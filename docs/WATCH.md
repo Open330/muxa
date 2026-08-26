@@ -347,12 +347,30 @@ two terminals *should* mirror each other (pairing, screen sharing).
 `command-alias` cannot do this: tmux resolves built-in command names before
 aliases, so an alias for `attach-session` is never consulted.
 
-`aggressive-resize` is worth pairing with it, so a window is sized to the
-clients actually viewing it rather than to the smallest client on the session:
+Pair it with per-window sizing, so a window is sized to the terminals actually
+looking at it rather than to the smallest client anywhere on the session:
 
 ```tmux
+set -g window-size smallest
 setw -g aggressive-resize on
 ```
+
+Both lines are required, and `aggressive-resize` alone does nothing — it only
+applies to windows whose `window-size` is `smallest` or `largest`, and tmux 3.x
+defaults to `latest`. Measured on tmux 3.4 with a 200x50 and an 80x24 client,
+each on its own window:
+
+| setting | window the 200x50 client is on | window the 80x24 client is on |
+| --- | --- | --- |
+| `window-size latest` (default) | 80x23 | 80x23 |
+| `smallest` + `aggressive-resize on` | **200x49** | 80x23 |
+| `smallest` + `aggressive-resize off` | 80x23 | 80x23 |
+
+`smallest` on its own is the classic footgun — any small client anywhere
+shrinks your window. `aggressive-resize` is what narrows "any client" to "a
+client whose current window this is", which is exactly the separation the views
+above create. With one terminal attached, smallest is that terminal, so nothing
+changes for ordinary single-terminal use.
 
 Jumping from watch (`Enter`) addresses the target window by session, so it
 moves only the terminal that asked and leaves the grouped sibling on the window
