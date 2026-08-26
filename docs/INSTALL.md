@@ -16,12 +16,19 @@ This page keeps the detailed install and wiring notes out of the README.
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
 ```
 
-This path needs none of the requirements above. The fetched shell script is the
-entire 20-step fullscreen tour: it uses ANSI terminal controls to preserve the
-virtual shell, tmux status line, window/pane layouts, and Muxa watch UI without
-downloading a Muxa binary, creating temporary files, changing config, starting
-a daemon, or operating a real tmux session. It works in a normal Unix-like
-terminal regardless of CPU architecture. Forward tour flags after `sh -s --`:
+This path needs none of the requirements above, and installs nothing. The
+script fetches the release binary for your platform into a temporary directory,
+verifies its published SHA-256, runs the real `muxa onboard`, and deletes it on
+exit — no daemon, no config, no PATH entry, no real tmux session.
+
+With no network, on a platform without a release build, without a checksum
+tool, or with `--no-download`, the script falls back to the 20-step simulation
+embedded in it, which draws the same scenario with plain ANSI terminal controls
+and runs in any Unix-like terminal regardless of CPU architecture. The fallback
+walks the same steps in the same order and accepts the same keys — CI holds it
+to `muxa onboard --emit step-table` — but it does not reproduce the real tour's
+mock watch simulation, per-step callout placement, `F2` language switching, or
+backwards navigation. Forward tour flags after `sh -s --`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
