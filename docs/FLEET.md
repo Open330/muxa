@@ -19,7 +19,7 @@ owner-only muxad Unix socket. Fleet does not expose a remote TCP port, forward
 an agent socket, or copy terminal contents continuously.
 
 This is distinct from Muxa's historical “pane host” terminology. A Fleet host
-is a physical node. tmux, rmux, herdr, and zellij remain backend kinds inside
+is a physical node. tmux, cmux, rmux, herdr, and zellij remain backend kinds inside
 that node.
 
 ## Prerequisites

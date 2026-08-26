@@ -1796,19 +1796,18 @@ async fn handle(
                 }
                 RequestBody::Ingest { event } => {
                     kind = "ingest";
-                    // Drop events from tmux servers outside the configured
-                    // `MUXA_TMUX_SOCKET` scope. muxa's agent hooks are
-                    // installed globally, so an agent another multiplexer
-                    // (e.g. cmux) launched on its own server would otherwise
-                    // register here with pane ids muxa can't correlate —
-                    // unmappable `%NN` ghost rows. Ack it either way so the
-                    // agent's hook never sees an error on its critical path.
+                    // Drop only tmux events from servers outside the configured
+                    // `MUXA_TMUX_SOCKET` scope. Namespaced non-tmux panes have
+                    // their own endpoint rules and must not be compared with a
+                    // tmux socket path (notably cmux, which also retains a full
+                    // Unix-socket endpoint). Ack it either way so the agent's
+                    // hook never sees an error on its critical path.
                     let pane_host = event
                         .id()
                         .pane
                         .as_deref()
                         .and_then(crate::backend::pane_id_host_kind);
-                    let in_scope = pane_host == Some(HostKind::Rmux)
+                    let in_scope = pane_host.is_some_and(|host| host != HostKind::Tmux)
                         || crate::tmux::scanner::event_tmux_socket_in_scope(
                             event.id().tmux_socket.as_deref(),
                         );
@@ -2522,14 +2521,14 @@ async fn handle(
                             // Best-effort: a name collision with a real agent
                             // just skips the task row, the session still runs.
                             let _ = store
-                                .register_task(
+                                .register_surface_task(
                                     session
                                         .display_name
                                         .clone()
                                         .unwrap_or_else(|| session.id.clone()),
                                     session.pid,
                                     session.cwd.clone(),
-                                    None,
+                                    session.surface(),
                                     None,
                                 )
                                 .await;

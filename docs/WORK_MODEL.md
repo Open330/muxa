@@ -9,7 +9,7 @@ Workspace
     ├── External issue reference (optional: Linear, GitHub, Jira, ...)
     └── Run (execution attempt)
         └── Agent session
-            └── tmux/rmux/herdr/zellij binding
+            └── tmux/cmux/rmux/herdr/zellij/native PTY binding
 ```
 
 | Entity | Identity | State |

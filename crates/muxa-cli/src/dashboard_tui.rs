@@ -554,6 +554,7 @@ fn push_action_target(targets: &mut Vec<ActionTarget>, target: ActionTarget) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardHost {
     Tmux,
+    Cmux,
     Rmux,
     Zellij,
     Herdr,
@@ -567,6 +568,7 @@ impl CardHost {
     fn label(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
+            Self::Cmux => "cmux",
             Self::Rmux => "rmux",
             Self::Zellij => "zellij",
             Self::Herdr => "herdr",
@@ -1498,6 +1500,7 @@ fn dashboard_collaboration_origin_from(
     let pane = pane.filter(|pane| !pane.is_empty());
     let socket = pane.as_deref().and_then(|pane| {
         let endpoint = match muxa::backend::pane_id_host_kind(pane)? {
+            HostKind::Cmux => Some(muxa::backend::cmux::endpoint_from_env()),
             HostKind::Rmux => rmux,
             HostKind::Tmux => tmux,
             HostKind::Zellij | HostKind::Herdr => None,
@@ -1684,6 +1687,7 @@ fn build_work_dashboard_data(
 fn card_host(host: HostKind) -> CardHost {
     match host {
         HostKind::Tmux => CardHost::Tmux,
+        HostKind::Cmux => CardHost::Cmux,
         HostKind::Rmux => CardHost::Rmux,
         HostKind::Zellij => CardHost::Zellij,
         HostKind::Herdr => CardHost::Herdr,
@@ -1719,12 +1723,7 @@ fn build_dashboard_data(
     let mut builders = BTreeMap::<String, CardBuilder>::new();
 
     for pane in &panes {
-        let card_host = match host {
-            HostKind::Tmux => CardHost::Tmux,
-            HostKind::Rmux => CardHost::Rmux,
-            HostKind::Zellij => CardHost::Zellij,
-            HostKind::Herdr => CardHost::Herdr,
-        };
+        let card_host = card_host(host);
         let key = format!("{}:{}", card_host.label(), pane.session);
         let builder = builders
             .entry(key.clone())
@@ -1884,12 +1883,7 @@ fn card_identity(
 
     if let Some(pane) = agent.pane.as_ref() {
         if let Some(info) = pane_by_id.get(pane) {
-            let card_host = match host {
-                HostKind::Tmux => CardHost::Tmux,
-                HostKind::Rmux => CardHost::Rmux,
-                HostKind::Zellij => CardHost::Zellij,
-                HostKind::Herdr => CardHost::Herdr,
-            };
+            let card_host = card_host(host);
             return CardIdentity {
                 key: format!("{}:{}", card_host.label(), info.session),
                 label: info.session.clone(),
@@ -3411,7 +3405,7 @@ fn card_title(card: &SessionCard) -> String {
         return format!("{work_id} · {}", card.label);
     }
     let prefix = match card.host {
-        CardHost::Tmux | CardHost::Rmux | CardHost::Zellij | CardHost::Herdr => "",
+        CardHost::Tmux | CardHost::Cmux | CardHost::Rmux | CardHost::Zellij | CardHost::Herdr => "",
         CardHost::Pty => "pty:",
         CardHost::Pane => "pane:",
         CardHost::Agent => "agent:",
@@ -5359,6 +5353,7 @@ mod tests {
         agent.surface = Some(SurfaceRef {
             kind: SurfaceKind::Pty,
             id: "pty-1".into(),
+            workspace: None,
         });
         let data = build_dashboard_data(
             now,

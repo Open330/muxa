@@ -380,9 +380,9 @@ enum MsgCmd {
 
 #[derive(Debug, Subcommand)]
 enum AgentCmd {
-    /// Start an allowlisted agent in a detached pane, window, or session.
+    /// Start an allowlisted agent in tmux or a muxa-owned PTY session.
     Start(agent_launch::StartArgs),
-    /// Interrupt or terminate one muxa-managed agent pane.
+    /// Interrupt or terminate one muxa-managed tmux pane or native PTY session.
     Control(tmux_work::AgentControlArgs),
 }
 
@@ -552,10 +552,10 @@ impl WatchSortArg {
     }
 }
 
-fn run_agent_cmd(action: AgentCmd) -> Result<()> {
+async fn run_agent_cmd(action: AgentCmd, client: &Client, socket_path: &Path) -> Result<()> {
     match action {
-        AgentCmd::Start(args) => agent_launch::run(args),
-        AgentCmd::Control(args) => tmux_work::run_agent_control(args),
+        AgentCmd::Start(args) => agent_launch::run(args, client, socket_path).await,
+        AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
     }
 }
 
@@ -654,7 +654,7 @@ async fn main() -> Result<()> {
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
-        Cmd::Agent { action } => run_agent_cmd(action),
+        Cmd::Agent { action } => run_agent_cmd(action, &client, &socket).await,
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
@@ -1145,7 +1145,7 @@ async fn cmd_run(
     Ok(())
 }
 
-fn caller_env(socket_path: &Path) -> Vec<(String, String)> {
+pub(crate) fn caller_env(socket_path: &Path) -> Vec<(String, String)> {
     let mut env = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect::<Vec<_>>();
@@ -1312,7 +1312,7 @@ fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
 }
 
 /// Jump to (or list) the agent that needs you. `attend::run` picks the
-/// pane — reusing the same selection that drives `--list` — and we perform
+/// pane and endpoint — reusing the same selection that drives `--list` — and we perform
 /// the actual focus through `jump_to_pane`, the identical machinery the
 /// `muxa watch` Enter action uses, so a jump lands the same way from both.
 async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
@@ -1320,8 +1320,16 @@ async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
     // a human is jumpable from a tmux-primary shell (and vice versa). The
     // jump itself dispatches per-row in `jump_to_pane`.
     let panes = all_panes().await;
-    if let Some(pane) = attend::run(client, panes, args).await? {
-        jump_to_pane(&pane);
+    if let Some(target) = attend::run(client, panes, args).await? {
+        if muxa::backend::pane_id_host_kind(&target.pane) == Some(muxa::HostKind::Cmux) {
+            let backend = target.endpoint.map_or_else(
+                muxa::backend::cmux::CmuxBackend::new,
+                muxa::backend::cmux::CmuxBackend::with_endpoint,
+            );
+            jump_to_pane_cmux(&backend, &target.pane);
+        } else {
+            jump_to_pane(&target.pane);
+        }
     }
     Ok(())
 }
@@ -1637,6 +1645,10 @@ fn jump_to_pane(pane_id: &str) {
     match kind {
         // tmux jumps go straight through `tmux::` helpers and need no backend.
         muxa::HostKind::Tmux => jump_to_pane_tmux(pane_id),
+        muxa::HostKind::Cmux => {
+            let backend = backend_for_dispatch(kind, &fallback);
+            jump_to_pane_cmux(backend.as_ref(), pane_id);
+        }
         muxa::HostKind::Rmux => {
             let backend = backend_for_dispatch(kind, &fallback);
             jump_to_pane_rmux(backend.as_ref(), pane_id);
@@ -1655,6 +1667,12 @@ fn jump_to_pane(pane_id: &str) {
 fn jump_to_topology_pane(key: &muxa::PaneKey) {
     match key.window.session.endpoint.host {
         muxa::HostKind::Tmux => jump_to_pane_tmux_key(key),
+        muxa::HostKind::Cmux => {
+            let backend = muxa::backend::cmux::CmuxBackend::with_endpoint(
+                key.window.session.endpoint.socket.clone(),
+            );
+            jump_to_pane_cmux(&backend, &key.pane_id);
+        }
         muxa::HostKind::Rmux | muxa::HostKind::Zellij | muxa::HostKind::Herdr => {
             jump_to_pane(&key.pane_id);
         }
@@ -1729,6 +1747,7 @@ fn backend_for_dispatch(
 pub(crate) fn backend_for_kind(kind: muxa::HostKind) -> muxa::SharedBackend {
     match kind {
         muxa::HostKind::Tmux => std::sync::Arc::new(muxa::TmuxBackend::new()),
+        muxa::HostKind::Cmux => std::sync::Arc::new(muxa::backend::cmux::CmuxBackend::new()),
         muxa::HostKind::Rmux => std::sync::Arc::new(muxa::RmuxBackend::new()),
         muxa::HostKind::Zellij => std::sync::Arc::new(muxa::ZellijBackend::new()),
         muxa::HostKind::Herdr => std::sync::Arc::new(muxa::backend::herdr::HerdrBackend::new()),
@@ -1856,6 +1875,14 @@ fn jump_to_pane_tmux(pane_id: &str) {
 fn jump_to_pane_zellij(backend: &dyn muxa::PaneBackend, pane_id: &str) {
     if !backend.focus_pane(pane_id) {
         eprintln!("muxa: zellij focus-pane-with-id {pane_id} failed — pane may have closed");
+    }
+}
+
+fn jump_to_pane_cmux(backend: &dyn muxa::PaneBackend, pane_id: &str) {
+    if !backend.focus_pane(pane_id) {
+        eprintln!(
+            "muxa: cmux surface.focus {pane_id} failed — surface may have closed or socket access may be disabled"
+        );
     }
 }
 
@@ -2259,6 +2286,9 @@ fn cmd_panes() -> Result<()> {
 fn empty_pane_hint(backend: &dyn muxa::PaneBackend) -> &'static str {
     match backend.kind() {
         muxa::HostKind::Tmux => "(no tmux panes — server may be down)",
+        muxa::HostKind::Cmux => {
+            "(cmux first slice: only the current env surface is visible; full inventory is pending)"
+        }
         muxa::HostKind::Rmux => "(no rmux panes — server may be down or endpoint unreachable)",
         muxa::HostKind::Zellij if !backend.caps().current_command => {
             "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
@@ -2744,6 +2774,7 @@ mod tests {
             panic!("expected agent start");
         };
         assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
+        assert_eq!(start.host, agent_launch::LaunchHost::Auto);
         assert_eq!(start.placement, agent_launch::Placement::Pane);
         assert_eq!(start.target.as_deref(), Some("%42"));
         assert_eq!(start.direction, agent_launch::SplitDirection::Down);
@@ -2905,12 +2936,47 @@ mod tests {
             "interrupt",
         ])
         .unwrap();
-        assert!(matches!(
-            args.cmd,
-            Cmd::Agent {
-                action: AgentCmd::Control(_)
-            }
-        ));
+        let Cmd::Agent {
+            action: AgentCmd::Control(control),
+        } = args.cmd
+        else {
+            panic!("expected agent control");
+        };
+        assert_eq!(control.pane.as_deref(), Some("%42"));
+        assert!(control.session.is_none());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "agent",
+            "control",
+            "--session",
+            "pty-7",
+            "--action",
+            "terminate",
+            "--yes",
+        ])
+        .unwrap();
+        let Cmd::Agent {
+            action: AgentCmd::Control(control),
+        } = args.cmd
+        else {
+            panic!("expected native agent control");
+        };
+        assert_eq!(control.session.as_deref(), Some("pty-7"));
+        assert!(control.pane.is_none());
+
+        assert!(Args::try_parse_from([
+            "muxa",
+            "agent",
+            "control",
+            "--pane",
+            "%42",
+            "--session",
+            "pty-7",
+            "--action",
+            "interrupt",
+        ])
+        .is_err());
 
         let args = Args::try_parse_from(["muxa", "onboard", "--print", "--no-quiz"]).unwrap();
         let Cmd::Onboard(onboard) = args.cmd else {

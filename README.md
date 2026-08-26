@@ -268,13 +268,14 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa sync` | Backfill the registry by scanning active pane hosts. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
+| `muxa agent start --agent codex [--host auto\|native\|tmux]` | Start an allowlisted agent. `auto` uses tmux inside tmux and a muxa-owned PTY in a plain terminal. |
 | `muxa work init` | Describe a work pipeline in your own words; an agent writes the `[ticket]`/`[[route]]`/`[pipeline.*]` config, validated and shown before anything is written. |
 | `muxa work up cal-1234 --body "..."` | Resolve the ticket, route it to a workspace, and create whichever pipeline agent panes are missing — delivering the request to the ones already running. Re-running converges; also `muxa_start_work` over MCP. See [docs/PIPELINE.md](docs/PIPELINE.md). |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
 | `muxa workspace list/show/close` | Inspect or explicitly close workspace/project sessions. |
 | `muxa work list/show/close [--workspace muxa]` | Inspect Work and its current Run binding, or explicitly close that Run window. |
-| `muxa agent start --workspace muxa --work muxa-onboarding ...` | Add an allowlisted agent pane to one work window; also exposed as MCP `muxa_start_agent`. |
-| `muxa agent control --pane %N --action interrupt` | Interrupt or explicitly terminate one managed agent pane. |
+| `muxa agent start --host tmux --workspace muxa --work muxa-onboarding ...` | Add an allowlisted agent pane to one managed tmux Work window; also exposed as MCP `muxa_start_agent`. |
+| `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | Interrupt or explicitly terminate one managed tmux pane or muxa-owned PTY agent session. |
 | `muxa onboard [--lang auto\|en\|ko]` | Unified shell → tmux → Muxa fullscreen walkthrough. `F2` switches language, `--no-quiz` skips gates, and `--print` emits the combined guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
