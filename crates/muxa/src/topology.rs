@@ -227,6 +227,11 @@ pub struct WindowNode {
     /// list, dashboard — reads the same number instead of each deriving it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<WorkCompletion>,
+    /// Durable daemon-owned pipeline state, when this window is bound to a
+    /// declarative Work Run. Unlike `panes`, this includes aliases that have
+    /// not launched yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_run: Option<crate::pipeline_run::PipelineRunSummary>,
 }
 
 /// `done` of `total` pipeline agents have reported `muxa work done`.
@@ -571,6 +576,7 @@ impl WindowBuilder {
             states,
             panes: self.panes,
             completion,
+            pipeline_run: None,
         }
     }
 }

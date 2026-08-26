@@ -25,7 +25,9 @@ use muxa::event::AgentState;
 use muxa::pipeline::{
     self, DesiredAgent, ExistingAgent, Plan, PlanStep, Ticket, Vars, WorktreePlan, REQUEST_KEY,
 };
+use muxa::pipeline_run::{PipelineAliasObservation, PipelineAliasStatus, PipelineRunRegistration};
 use muxa::request::{ComposedRequest, RequestParts};
+use muxa::work::WorkIdentity;
 use std::collections::HashMap;
 
 use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest};
@@ -85,6 +87,17 @@ pub struct UpArgs {
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ReconcileArgs {
+    /// Reconcile every durable Run with a dependency-ready alias.
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long, requires = "work")]
+    pub workspace: Option<String>,
+    #[arg(long, requires = "workspace")]
+    pub work: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +167,9 @@ pub(crate) struct Resolved {
     layout: Option<String>,
     request: Option<ComposedRequest>,
     desired: Vec<DesiredAgent>,
+    /// Existing daemon-owned state, used by dry-run rendering. A real apply
+    /// performs an atomic register and reads the returned Run instead.
+    durable_run: Option<muxa::pipeline_run::PipelineRun>,
     /// pane → what the daemon says that agent is doing. Empty when the
     /// daemon is unreachable, which degrades to the old pane-only view
     /// rather than failing the launch.
@@ -173,7 +189,14 @@ pub async fn run(
     if show_prompts {
         print_prompts(&resolved.desired);
     }
-    let result = apply(resolved, dry_run)?;
+    let result = if dry_run {
+        apply(resolved, true)?
+    } else {
+        let client = client.ok_or_else(|| {
+            anyhow::anyhow!("muxa work up requires muxad for durable pipeline state")
+        })?;
+        apply_durable(resolved, client).await?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -185,52 +208,208 @@ pub async fn run(
 /// The blocking half: read the window, diff it against the pipeline, and
 /// act on the difference.
 pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
+    if !dry_run {
+        bail!("non-dry pipeline reconciliation must use muxad's durable Run state");
+    }
     let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
     // The completion set lives on the work window, so a re-run reads what
     // previous runs' agents reported even though none of them still exist.
-    let done = crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?
-        .map(|info| info.done)
-        .unwrap_or_default();
+    let done = if let Some(run) = resolved.durable_run.as_ref() {
+        run.aliases
+            .values()
+            .filter(|state| state.status == PipelineAliasStatus::Done)
+            .map(|state| state.alias.clone())
+            .collect()
+    } else {
+        crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?
+            .map(|info| info.done)
+            .unwrap_or_default()
+    };
     let broadcast = resolved
         .request
         .as_ref()
         .map(|request| request.text.as_str());
     let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
 
-    if dry_run {
-        return Ok(finish(
-            resolved,
-            plan,
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-            true,
-            done,
-        ));
-    }
+    Ok(finish(
+        resolved,
+        plan,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        true,
+        done,
+    ))
+}
 
+/// Register desired state with muxad, atomically claim dependency-ready
+/// aliases, then report the physical launch/re-prompt result. Completion and
+/// dependency gating are never inferred from the live pane set here.
+#[allow(clippy::too_many_lines)] // register, claim, physical apply, and report are one reconciliation flow
+pub(crate) async fn apply_durable(
+    resolved: Resolved,
+    client: &muxa::ipc::Client,
+) -> Result<UpResult> {
+    let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
+    let work_info = crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?;
+    let observed = existing
+        .iter()
+        .filter_map(|agent| {
+            let alias = agent.alias.clone()?;
+            Some(PipelineAliasObservation {
+                alias,
+                pane: agent.pane.clone(),
+                status: match agent.state {
+                    Some(AgentState::WaitingInput | AgentState::WaitingChoice) => {
+                        PipelineAliasStatus::Blocked
+                    }
+                    Some(AgentState::Error | AgentState::Stopped) => PipelineAliasStatus::Failed,
+                    Some(AgentState::Starting | AgentState::Working | AgentState::Idle) | None => {
+                        PipelineAliasStatus::Running
+                    }
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    // `--body`/`--prompt` is a real restart of every existing pipeline
+    // participant. The store expands these roots transitively and advances
+    // the Run generation before any prompt can be delivered.
+    let mut invalidate = resolved.request.as_ref().map_or_else(Vec::new, |_| {
+        existing
+            .iter()
+            .filter_map(|agent| agent.alias.clone())
+            .collect()
+    });
+    // An explicit `work up` is also the retry control for a launch that
+    // failed before producing a pane. Pane-backed failures remain visible
+    // for the operator to inspect/close; blindly typing a prompt into a
+    // stopped shell could execute it as a command.
+    if let Some(previous) = resolved.durable_run.as_ref() {
+        invalidate.extend(
+            previous
+                .aliases
+                .values()
+                .filter(|state| state.status == PipelineAliasStatus::Failed && state.pane.is_none())
+                .map(|state| state.alias.clone()),
+        );
+    }
+    invalidate.sort();
+    invalidate.dedup();
+    let identity = WorkIdentity::new(resolved.workspace.clone(), resolved.work.clone());
+    let registration = PipelineRunRegistration {
+        identity: identity.clone(),
+        pipeline: resolved.pipeline.clone(),
+        desired: resolved.desired.clone(),
+        cwd: resolved.cwd.clone(),
+        window_id: work_info.as_ref().map(|work| work.window.clone()),
+        observed,
+        invalidate,
+    };
+    let mut run = client
+        .pipeline_register(&registration)
+        .await
+        .context("register durable pipeline Run with muxad")?;
+    // Migration/adoption path: panes created before durable Runs have no
+    // generation option yet. Stamp every active alias with its own expected
+    // generation; pending invalidated descendants keep the old value until
+    // dependency reconciliation reaches them.
+    for agent in &existing {
+        let Some(alias) = agent.alias.as_deref() else {
+            continue;
+        };
+        let Some(state) = run.aliases.get(alias) else {
+            continue;
+        };
+        if !state.reconcile_pending {
+            crate::tmux_work::mark_agent_generation(&agent.pane, state.generation)
+                .with_context(|| format!("stamp pipeline generation on alias {alias:?}"))?;
+        }
+    }
+    let done = run
+        .aliases
+        .values()
+        .filter(|state| state.status == PipelineAliasStatus::Done)
+        .map(|state| state.alias.clone())
+        .collect::<Vec<_>>();
+    let broadcast = resolved
+        .request
+        .as_ref()
+        .map(|request| request.text.as_str());
+    let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
+    let claims = client
+        .pipeline_claim(&identity, run.generation)
+        .await
+        .context("claim dependency-ready pipeline aliases")?;
     let mut launched = Vec::new();
     let mut reprompted = Vec::new();
-    for step in &plan.steps {
-        match step {
-            PlanStep::Launch(agent) => launched.push(launch(agent, &resolved)?),
-            PlanStep::Reprompt {
-                alias,
-                pane,
-                prompt,
-            } => {
-                send_prompt(pane, prompt)
-                    .with_context(|| format!("send --prompt to {alias} in pane {pane}"))?;
-                reprompted.push(alias.clone());
+    for claim in claims {
+        let outcome = if let Some(pane) = claim.pane.as_deref() {
+            let result = (|| {
+                crate::tmux_work::mark_agent_generation(pane, claim.generation)?;
+                if let Some(prompt) = claim.agent.prompt.as_deref() {
+                    send_prompt(pane, prompt).with_context(|| {
+                        format!(
+                            "re-prompt pipeline alias {:?} in pane {pane}",
+                            claim.agent.alias
+                        )
+                    })?;
+                }
+                reprompted.push(claim.agent.alias.clone());
+                Ok((pane.to_string(), run.window_id.clone()))
+            })();
+            result
+        } else {
+            match recover_unreported_alias(&identity, &claim.agent.alias, claim.generation) {
+                Ok(Some(target)) => Ok(target),
+                Ok(None) => launch(&claim.agent, &resolved, claim.generation).map(|agent| {
+                    let pane = agent.pane.clone();
+                    launched.push(agent);
+                    let window =
+                        crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))
+                            .ok()
+                            .flatten()
+                            .map(|work| work.window);
+                    (pane, window)
+                }),
+                Err(error) => Err(error),
             }
-            PlanStep::Keep { .. } | PlanStep::Attention { .. } | PlanStep::Waiting { .. } => {}
+        };
+        match outcome {
+            Ok((pane, window)) => {
+                run = client
+                    .pipeline_report(
+                        &identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Running,
+                        Some(&pane),
+                        None,
+                        window.as_deref(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("report pipeline alias {:?} running", claim.agent.alias)
+                    })?;
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                let _ = client
+                    .pipeline_report(
+                        &identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Failed,
+                        claim.pane.as_deref(),
+                        Some(&detail),
+                        run.window_id.as_deref(),
+                    )
+                    .await;
+                return Err(error);
+            }
         }
     }
 
-    // Read identity back from tmux rather than from the launch results:
-    // when every agent was already running, nothing was launched and there
-    // is no result to read it from.
     let (session, window) =
         match crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))? {
             Some(info) => (Some(info.session), Some(info.window)),
@@ -241,13 +420,154 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
             .with_context(|| format!("record external issue on work window {window}"))?;
     }
     if let (Some(window), Some(layout)) = (window.as_deref(), resolved.layout.as_deref()) {
-        // Splitting an existing window repeatedly halves whichever pane was
-        // active, so geometry is only sane once every pane exists.
         apply_layout(window, layout)?;
     }
+    let done = run
+        .aliases
+        .values()
+        .filter(|state| state.status == PipelineAliasStatus::Done)
+        .map(|state| state.alias.clone())
+        .collect();
     Ok(finish(
         resolved, plan, launched, reprompted, session, window, false, done,
     ))
+}
+
+/// Reconcile one already-registered Run from its persisted desired agents.
+/// This is used immediately after a completion event and by muxad's restart
+/// safety-net worker, so neither path needs to resolve the ticket again.
+pub(crate) async fn reconcile_run(
+    client: &muxa::ipc::Client,
+    identity: &WorkIdentity,
+    generation: u64,
+) -> Result<Vec<LaunchedAgent>> {
+    let claims = client
+        .pipeline_claim(identity, generation)
+        .await
+        .context("claim dependency-ready pipeline aliases")?;
+    let mut launched = Vec::new();
+    for claim in claims {
+        let outcome: Result<(String, Option<String>)> = if let Some(pane) = claim.pane.as_deref() {
+            (|| {
+                crate::tmux_work::mark_agent_generation(pane, claim.generation)?;
+                if let Some(prompt) = claim.agent.prompt.as_deref() {
+                    send_prompt(pane, prompt).with_context(|| {
+                        format!(
+                            "re-prompt pipeline alias {:?} in pane {pane}",
+                            claim.agent.alias
+                        )
+                    })?;
+                }
+                Ok((pane.to_string(), claim.window_id.clone()))
+            })()
+        } else {
+            (|| {
+                if let Some(target) =
+                    recover_unreported_alias(identity, &claim.agent.alias, claim.generation)?
+                {
+                    return Ok(target);
+                }
+                {
+                    let program = AgentProgram::parse(&claim.agent.program).map_err(|error| {
+                        anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
+                    })?;
+                    let direction = SplitDirection::parse(claim.agent.direction.as_deref())
+                        .map_err(|error| {
+                            anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
+                        })?;
+                    crate::agent_launch::start(StartRequest {
+                        agent: program,
+                        placement: Placement::Pane,
+                        target: None,
+                        cwd: Some(claim.cwd.clone()),
+                        prompt: claim.agent.prompt.clone(),
+                        name: None,
+                        workspace: Some(identity.workspace_id.clone()),
+                        work: Some(identity.work_id.clone()),
+                        role: claim.agent.role.clone(),
+                        task: claim.agent.task.clone(),
+                        alias: Some(claim.agent.alias.clone()),
+                        generation: Some(claim.generation),
+                        direction,
+                    })
+                    .with_context(|| format!("launch pipeline agent {:?}", claim.agent.alias))
+                    .map(|result| {
+                        launched.push(LaunchedAgent {
+                            alias: claim.agent.alias.clone(),
+                            pane: result.pane.clone(),
+                            program: claim.agent.program.clone(),
+                            role: claim.agent.role.clone(),
+                        });
+                        (result.pane, result.window)
+                    })
+                }
+            })()
+        };
+        match outcome {
+            Ok((pane, window)) => {
+                client
+                    .pipeline_report(
+                        identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Running,
+                        Some(&pane),
+                        None,
+                        window.as_deref(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("report pipeline alias {:?} running", claim.agent.alias)
+                    })?;
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                let _ = client
+                    .pipeline_report(
+                        identity,
+                        &claim.agent.alias,
+                        claim.generation,
+                        PipelineAliasStatus::Failed,
+                        claim.pane.as_deref(),
+                        Some(&detail),
+                        claim.window_id.as_deref(),
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(launched)
+}
+
+pub async fn run_reconcile(args: ReconcileArgs, client: &muxa::ipc::Client) -> Result<()> {
+    let runs = client
+        .pipeline_runs()
+        .await
+        .context("list durable pipeline Runs")?;
+    let selected = runs.into_iter().filter(|run| {
+        if args.all {
+            return run.has_ready_alias();
+        }
+        args.workspace
+            .as_deref()
+            .zip(args.work.as_deref())
+            .is_some_and(|(workspace, work)| {
+                run.identity.workspace_id.eq_ignore_ascii_case(workspace)
+                    && run.identity.work_id.eq_ignore_ascii_case(work)
+            })
+    });
+    for run in selected {
+        if let Err(error) = reconcile_run(client, &run.identity, run.generation).await {
+            tracing::warn!(
+                work = %run.identity.key(),
+                generation = run.generation,
+                %error,
+                "pipeline reconciliation failed",
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -388,6 +708,13 @@ pub(crate) async fn resolve(
         anyhow::Error::from(pipeline::PipelineError::UnknownPipeline(name.clone()))
     })?;
     let desired = pipeline::desired_agents(&name, spec, &vars)?;
+    let durable_run = match client {
+        Some(client) => client.pipeline_runs().await.ok().and_then(|runs| {
+            runs.into_iter()
+                .find(|run| run.identity.workspace_id == workspace && run.identity.work_id == work)
+        }),
+        None => None,
+    };
 
     Ok(Resolved {
         work,
@@ -401,6 +728,7 @@ pub(crate) async fn resolve(
         layout: spec.layout.clone(),
         request,
         desired,
+        durable_run,
         states,
     })
 }
@@ -878,7 +1206,7 @@ fn ask_for_request(work: &str) -> Result<Option<String>> {
     Ok((!text.is_empty()).then_some(text))
 }
 
-fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
+fn launch(agent: &DesiredAgent, resolved: &Resolved, generation: u64) -> Result<LaunchedAgent> {
     let program = AgentProgram::parse(&agent.program)
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let direction = SplitDirection::parse(agent.direction.as_deref())
@@ -899,6 +1227,7 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
         role: agent.role.clone(),
         task: agent.task.clone(),
         alias: Some(agent.alias.clone()),
+        generation: Some(generation),
         direction,
     })
     .with_context(|| format!("launch pipeline agent {:?}", agent.alias))?;
@@ -908,6 +1237,35 @@ fn launch(agent: &DesiredAgent, resolved: &Resolved) -> Result<LaunchedAgent> {
         program: agent.program.clone(),
         role: agent.role.clone(),
     })
+}
+
+/// Recover the pane created in the narrow crash window between physical
+/// launch and `pipeline_report`. The durable claim lease is intentionally
+/// retryable, but retrying must adopt that pane instead of launching the
+/// same alias twice.
+fn recover_unreported_alias(
+    identity: &WorkIdentity,
+    alias: &str,
+    generation: u64,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(work) =
+        crate::tmux_work::find_work_in(&identity.work_id, Some(&identity.workspace_id))?
+    else {
+        return Ok(None);
+    };
+    let mut matching = work
+        .agents
+        .iter()
+        .filter(|agent| agent.alias.as_deref() == Some(alias));
+    let Some(agent) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        bail!("cannot recover pipeline alias {alias:?}: multiple matching panes already exist");
+    }
+    crate::tmux_work::mark_agent_generation(&agent.pane, generation)
+        .with_context(|| format!("adopt pipeline alias {alias:?} in pane {}", agent.pane))?;
+    Ok(Some((agent.pane.clone(), Some(work.window))))
 }
 
 /// One line per pipeline alias, grouped by dependency depth.

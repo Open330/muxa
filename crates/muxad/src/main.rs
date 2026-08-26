@@ -23,6 +23,7 @@ use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PaneSessionCache, PromptHistory};
 use muxa::ipc::{harden_permissions, Client, RestartController, Server};
 use muxa::notify::Notifier;
+use muxa::pipeline_run::PipelineRunStore;
 use muxa::reconcile::Reconciler;
 use muxa::sinks::{webhook as webhook_sink, OhMyPromptSink, WebhookSink};
 use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
@@ -166,6 +167,8 @@ async fn main() -> Result<()> {
     let collaboration = build_collaboration(&cfg).await;
     let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg).await;
+    let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
+        .context("loading durable pipeline Runs")?;
 
     // The set of backends this daemon observes simultaneously — tmux + herdr
     // during a migration (see `docs/MULTI_HOST.md`). Resolution honors
@@ -267,6 +270,8 @@ async fn main() -> Result<()> {
         backends.clone(),
         &shutdown_tx,
     );
+    let pipeline_state_handle =
+        spawn_pipeline_state_task(pipeline_runs.clone(), store.clone(), &shutdown_tx);
 
     // The snapshotter listens on its own dedicated channel rather than
     // the main shutdown broadcast: it has to be the last thing to die
@@ -375,6 +380,7 @@ async fn main() -> Result<()> {
         .with_collaboration_audit(collaboration_audit)
         .with_ask(ask)
         .with_fleet(fleet_runtime)
+        .with_pipeline_runs(pipeline_runs.clone())
         .with_restart_controller(Arc::clone(&restart));
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -391,6 +397,12 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    // Subscribe only after the socket is accepting connections: the worker
+    // delegates physical launch to the sibling `muxa` CLI over this IPC path.
+    // Its initial authoritative scan still catches completions committed
+    // between server start and subscription.
+    let pipeline_reconciler_handle =
+        spawn_pipeline_reconciler_task(pipeline_runs, socket.clone(), &shutdown_tx);
 
     // Self-heal: if a tmux server is already running, inject our socket
     // path into its environment so that every pane — including any that
@@ -427,6 +439,8 @@ async fn main() -> Result<()> {
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;
     await_shutdown_task("collaboration waker", collaboration_waker_handle).await;
+    await_shutdown_task("pipeline reconciler", Some(pipeline_reconciler_handle)).await;
+    await_shutdown_task("pipeline state projection", Some(pipeline_state_handle)).await;
     await_shutdown_task("fleet manager", Some(fleet_handle)).await;
 
     let _ = activity_transition_shutdown_tx.send(());
@@ -576,6 +590,136 @@ fn build_collaboration_audit(cfg: &Config) -> Arc<CollaborationAuditLog> {
         }
     }
     CollaborationAuditLog::in_memory()
+}
+
+/// Completion changes wake a daemon-owned reconciliation loop. The worker
+/// deliberately invokes the installed `muxa` binary instead of duplicating
+/// its allowlisted agent-launch policy inside muxad; the CLI atomically claims
+/// ready aliases over IPC before touching tmux, so a user-triggered `work up`
+/// racing this worker cannot launch a duplicate.
+fn spawn_pipeline_reconciler_task(
+    pipeline_runs: Arc<PipelineRunStore>,
+    socket: PathBuf,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    let mut changes = pipeline_runs.subscribe();
+    let mut shutdown = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut safety_scan = tokio::time::interval(std::time::Duration::from_secs(30));
+        safety_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let ready = pipeline_runs
+                .list()
+                .await
+                .iter()
+                .any(muxa::pipeline_run::PipelineRun::has_ready_alias);
+            if ready {
+                run_pipeline_reconciler(&socket).await;
+            }
+            tokio::select! {
+                revision = changes.changed() => {
+                    if revision.is_err() {
+                        break;
+                    }
+                }
+                _ = safety_scan.tick() => {}
+                _ = shutdown.recv() => break,
+            }
+        }
+    })
+}
+
+fn spawn_pipeline_state_task(
+    pipeline_runs: Arc<PipelineRunStore>,
+    store: muxa::SharedStore,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    let mut transitions = store.subscribe();
+    let mut shutdown = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        // Rehydrate the projection immediately. This covers agent state loaded
+        // from state.json before the subscriber was installed.
+        for agent in store.snapshot().await {
+            if let Some(pane) = agent.pane.as_deref() {
+                observe_pipeline_agent(&pipeline_runs, pane, agent.state).await;
+            }
+        }
+        loop {
+            tokio::select! {
+                transition = transitions.recv() => match transition {
+                    Ok(transition) => {
+                        if let Some(pane) = transition.agent.pane.as_deref() {
+                            observe_pipeline_agent(&pipeline_runs, pane, transition.to).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        for agent in store.snapshot().await {
+                            if let Some(pane) = agent.pane.as_deref() {
+                                observe_pipeline_agent(&pipeline_runs, pane, agent.state).await;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = shutdown.recv() => break,
+            }
+        }
+    })
+}
+
+async fn observe_pipeline_agent(
+    pipeline_runs: &PipelineRunStore,
+    pane: &str,
+    state: muxa::AgentState,
+) {
+    let status = match state {
+        muxa::AgentState::WaitingInput | muxa::AgentState::WaitingChoice => {
+            muxa::pipeline_run::PipelineAliasStatus::Blocked
+        }
+        muxa::AgentState::Error | muxa::AgentState::Stopped => {
+            muxa::pipeline_run::PipelineAliasStatus::Failed
+        }
+        muxa::AgentState::Starting | muxa::AgentState::Working | muxa::AgentState::Idle => {
+            muxa::pipeline_run::PipelineAliasStatus::Running
+        }
+    };
+    if let Err(error) = pipeline_runs.observe_pane(pane, status).await {
+        tracing::warn!(pane, %error, "could not project agent state into pipeline Run");
+    }
+}
+
+async fn run_pipeline_reconciler(socket: &Path) {
+    let program = std::env::var_os("MUXA_PIPELINE_CLI").map_or_else(
+        || {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.with_file_name("muxa"))
+                .filter(|path| path.exists())
+                .unwrap_or_else(|| PathBuf::from("muxa"))
+        },
+        PathBuf::from,
+    );
+    match tokio::process::Command::new(&program)
+        .args(["work", "reconcile", "--all"])
+        .env("MUXA_SOCKET", socket)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            tracing::debug!(program = %program.display(), "pipeline reconcile completed");
+        }
+        Ok(output) => {
+            tracing::warn!(
+                program = %program.display(),
+                status = %output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "pipeline reconcile command failed",
+            );
+        }
+        Err(error) => {
+            tracing::warn!(program = %program.display(), %error, "could not start pipeline reconciler");
+        }
+    }
 }
 
 fn spawn_collaboration_waker_task(

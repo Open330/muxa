@@ -214,6 +214,9 @@ pub struct StartRequest {
     pub role: Option<String>,
     pub task: Option<String>,
     pub alias: Option<String>,
+    /// Durable pipeline generation stamped on an aliased pane. A later
+    /// `work done` reads it back so an old pane cannot complete a new run.
+    pub generation: Option<u64>,
     pub direction: SplitDirection,
 }
 
@@ -231,6 +234,7 @@ impl From<&StartArgs> for StartRequest {
             role: args.role.clone(),
             task: args.task.clone(),
             alias: args.alias.clone(),
+            generation: None,
             direction: args.direction,
         }
     }
@@ -297,6 +301,7 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
         role: args.role,
         task: args.task,
         alias: args.alias,
+        generation: None,
         direction: args.direction,
     })?;
     if json {
@@ -323,6 +328,7 @@ pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
 /// Start one allowlisted agent in a detached tmux surface and return its exact
 /// pane id. The operation is synchronous and should be wrapped in
 /// `spawn_blocking` by async callers.
+#[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let PreparedLaunch {
         cwd,
@@ -403,6 +409,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             request.role.as_deref(),
             request.task.as_deref(),
             request.alias.as_deref(),
+            request.generation,
         )
     })();
     if let Err(error) = mark {
@@ -759,6 +766,7 @@ mod tests {
             role: None,
             task: None,
             alias: None,
+            generation: None,
             direction: SplitDirection::Right,
         }
     }

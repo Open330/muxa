@@ -893,6 +893,7 @@ async fn call_tool(
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 task: args.get("task").and_then(Value::as_str).map(str::to_string),
+                generation: None,
                 direction,
             };
             Ok(
@@ -1554,13 +1555,25 @@ async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config
         Ok(resolved) => resolved,
         Err(error) => return error_result(&format!("{error:#}")),
     };
-    let dry_run = up.dry_run;
-    let result =
-        match tokio::task::spawn_blocking(move || crate::work_up::apply(resolved, dry_run)).await {
+    let result = if up.dry_run {
+        match tokio::task::spawn_blocking(move || crate::work_up::apply(resolved, true)).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => return error_result(&format!("{error:#}")),
             Err(error) => return error_result(&format!("muxa_start_work worker failed: {error}")),
-        };
+        }
+    } else {
+        let runtime = tokio::runtime::Handle::current();
+        let client = client.clone();
+        match tokio::task::spawn_blocking(move || {
+            runtime.block_on(crate::work_up::apply_durable(resolved, &client))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return error_result(&format!("{error:#}")),
+            Err(error) => return error_result(&format!("muxa_start_work worker failed: {error}")),
+        }
+    };
     match serde_json::to_value(&result) {
         Ok(value) => json_result(&value),
         Err(error) => error_result(&format!("muxa_start_work could not serialize: {error}")),
@@ -1828,6 +1841,7 @@ async fn spawn_peer(
         // unaliased and `muxa work up` reports it as unclaimed rather than
         // mistaking it for a role it should own.
         alias: None,
+        generation: None,
         direction: crate::agent_launch::SplitDirection::Right,
     };
     // Arm the daemon transition subscription before creating the pane. A

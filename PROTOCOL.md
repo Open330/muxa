@@ -3,7 +3,7 @@
 This document describes the wire protocol spoken between
 `muxa` (the CLI), third-party adapters, and `muxad` (the daemon).
 
-Current version: **`2`** (defined in `muxa-core/src/event.rs`).
+Current version: **`5`** (defined in `crates/muxa/src/event.rs`).
 
 ## Stability
 
@@ -82,6 +82,29 @@ Response:
 ```json
 { "ok": true, "protocol": 1, "agents": [ <Agent>, ... ] }
 ```
+
+#### Durable pipeline Runs (v5)
+
+The `pipeline_runs_v1` capability covers the daemon-owned Work pipeline
+state machine. A Run persists its logical Work identity, pipeline, rendered
+desired agents, monotonic generation, window binding, and each alias's
+`pending | running | blocked | done | failed` state.
+
+- `pipeline_runs` returns every durable Run.
+- `pipeline_register` upserts desired state and live-pane observations.
+- `pipeline_done` atomically accepts `identity`, `alias`, and that alias's
+  expected `generation`; stale events are rejected.
+- `pipeline_invalidate` generation-checks the target alias, advances the Run
+  generation, and clears completion for it and its transitive downstream
+  closure.
+- `pipeline_claim` atomically reserves dependency-ready aliases, preventing
+  concurrent reconcilers from launching duplicates.
+- `pipeline_report` records a claimed launch/re-prompt as `running`,
+  `blocked`, or `failed` and binds its pane/window.
+
+All mutations are committed to `pipeline-runs.json` before a successful
+response. The rendered prompts in this file are user content; the file and
+IPC socket are owner-only (`0600`).
 
 #### `fleet_snapshot`
 
@@ -694,3 +717,8 @@ is gone.
 - Added `AgentState::waiting_choice` — menu-style user block, distinct
   from `waiting_input`.
 - Added `NotificationLevel::needs_choice` — routes to `waiting_choice`.
+
+### v4 → v5 (2026-08-25)
+
+- Added generation-aware durable pipeline Run request variants and the
+  `pipeline_runs_v1` capability.

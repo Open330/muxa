@@ -582,7 +582,7 @@ fn default_worktree_path(repo: &Path, work: &str) -> std::path::PathBuf {
 }
 
 /// One pane the pipeline wants, with every template already rendered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct DesiredAgent {
     pub alias: String,
     pub program: String,
@@ -595,7 +595,7 @@ pub struct DesiredAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     /// Aliases that must report done before this one may start.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
 }
 

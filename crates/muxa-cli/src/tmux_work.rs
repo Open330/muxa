@@ -31,6 +31,7 @@ const AGENT_TASK_OPTION: &str = "@muxa_agent_task";
 /// than in the daemon: it has to outlive muxad, the CLI process, and
 /// the agent restarting inside the pane.
 const AGENT_ALIAS_OPTION: &str = "@muxa_agent_alias";
+const AGENT_GENERATION_OPTION: &str = "@muxa_pipeline_generation";
 const PANE_WORKSPACE_OPTION: &str = "@muxa_agent_workspace_id";
 const PANE_WORK_OPTION: &str = "@muxa_agent_work_id";
 const EXTERNAL_SOURCE_OPTION: &str = "@muxa_external_source";
@@ -42,7 +43,6 @@ const EXTERNAL_STABLE_ID_OPTION: &str = "@muxa_external_stable_id";
 /// have exited, and the fact that it finished has to outlive it. This is
 /// the only completion signal muxa has — agent state cannot supply one,
 /// because `idle` means both "done" and "paused mid-thought".
-const WORK_DONE_OPTION: &str = "@muxa_work_done";
 const EXTERNAL_KEY_OPTION: &str = "@muxa_external_key";
 const EXTERNAL_TITLE_OPTION: &str = "@muxa_external_title";
 const EXTERNAL_URL_OPTION: &str = "@muxa_external_url";
@@ -255,8 +255,12 @@ pub struct WorkDoneArgs {
     /// tmux pane to read the alias and work from. Defaults to `TMUX_PANE`.
     #[arg(long)]
     pub pane: Option<String>,
-    /// Take the report back, so the next `muxa work up` holds dependants
-    /// again.
+    /// Run generation being completed. Defaults to the generation stamped on
+    /// the calling pane. Useful when automation supplies an explicit pane.
+    #[arg(long)]
+    pub generation: Option<u64>,
+    /// Restart this alias's completion generation and hold/reconcile its
+    /// downstream aliases again.
     #[arg(long)]
     pub undo: bool,
     /// Emit JSON.
@@ -368,7 +372,7 @@ pub fn run_window_rename(args: WindowRenameArgs) -> Result<()> {
 /// when an agent has finished and when it is between thoughts, and a pane
 /// stays open either way. So the agent says so, and muxa records the claim
 /// rather than inferring one.
-pub fn run_work_done(args: WorkDoneArgs) -> Result<()> {
+pub async fn run_work_done(args: WorkDoneArgs, client: &muxa::ipc::Client) -> Result<()> {
     let pane = args
         .pane
         .clone()
@@ -380,15 +384,55 @@ pub fn run_work_done(args: WorkDoneArgs) -> Result<()> {
         Some(alias) => alias,
         None => pane_option(&pane, AGENT_ALIAS_OPTION)?
             .ok_or_else(|| anyhow::anyhow!("pane {pane} has no pipeline alias; pass --alias"))?,
+    }
+    .trim()
+    .to_ascii_lowercase();
+    let workspace = pane_option(&pane, PANE_WORKSPACE_OPTION)?.ok_or_else(|| {
+        anyhow::anyhow!("pane {pane} has no pipeline workspace; run `muxa work up` first")
+    })?;
+    let work = pane_option(&pane, PANE_WORK_OPTION)?.ok_or_else(|| {
+        anyhow::anyhow!("pane {pane} has no pipeline Work; run `muxa work up` first")
+    })?;
+    let generation = match args.generation {
+        Some(generation) => generation,
+        None => pane_option(&pane, AGENT_GENERATION_OPTION)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pane {pane} has no pipeline generation; run `muxa work up` to adopt it"
+                )
+            })?
+            .parse::<u64>()
+            .with_context(|| format!("pane {pane} has an invalid pipeline generation"))?,
     };
-    let window = window_id_for_pane(&pane)?;
-    let done = mark_done(&window, &alias, !args.undo)?;
+    let identity = muxa::work::WorkIdentity::new(workspace, work);
+    let run = if args.undo {
+        client
+            .pipeline_invalidate(&identity, &alias, generation)
+            .await
+            .with_context(|| format!("invalidate pipeline alias {alias:?}"))?
+    } else {
+        client
+            .pipeline_done(&identity, &alias, generation)
+            .await
+            .with_context(|| format!("atomically complete pipeline alias {alias:?}"))?
+    };
+    // Completion is the event that drives reconciliation; callers never need
+    // to remember a second `work up`. The daemon also subscribes to this same
+    // durable revision as a crash/restart safety net.
+    crate::work_up::reconcile_run(client, &identity, run.generation).await?;
+    let done = run
+        .aliases
+        .values()
+        .filter(|state| state.status == muxa::pipeline_run::PipelineAliasStatus::Done)
+        .map(|state| state.alias.clone())
+        .collect::<Vec<_>>();
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "window": window,
+                "work": identity,
                 "alias": alias,
+                "generation": run.generation,
                 "done": done,
             }))?
         );
@@ -405,17 +449,34 @@ fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
     Ok(option(raw.trim()))
 }
 
-pub fn run_work_list(args: WorkListArgs) -> Result<()> {
+pub async fn run_work_list(args: WorkListArgs, client: &muxa::ipc::Client) -> Result<()> {
     let works = match args.workspace.as_deref() {
         Some(workspace) => find_workspace(workspace)?
             .map(|workspace| workspace.works)
             .unwrap_or_default(),
         None => list_works()?,
     };
+    let visible_runs = client
+        .pipeline_runs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|run| {
+            args.workspace
+                .as_deref()
+                .is_none_or(|workspace| run.identity.workspace_id == workspace)
+        })
+        .collect::<Vec<_>>();
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&json_works(&works))?);
-    } else if works.is_empty() {
-        println!("no muxa-managed work windows");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "works": works,
+                "pipeline_runs": visible_runs,
+            }))?
+        );
+    } else if works.is_empty() && visible_runs.is_empty() {
+        println!("no muxa-managed work or durable pipeline Runs");
     } else {
         let theme = crate::theme::for_theme(
             muxa::config::Config::load_or_default(None)
@@ -423,7 +484,10 @@ pub fn run_work_list(args: WorkListArgs) -> Result<()> {
                 .unwrap_or_default(),
             crate::use_colors(),
         );
-        print!("{}", work_list_table(&works, &work_annotations(), theme));
+        print!(
+            "{}",
+            work_list_table(&works, &work_annotations(), &visible_runs, theme)
+        );
     }
     Ok(())
 }
@@ -435,6 +499,7 @@ pub fn run_work_list(args: WorkListArgs) -> Result<()> {
 fn work_list_table(
     works: &[WorkInfo],
     records: &[WorkRecord],
+    runs: &[muxa::pipeline_run::PipelineRun],
     theme: crate::theme::CliTheme,
 ) -> String {
     use comfy_table::{ContentArrangement, Table};
@@ -447,10 +512,18 @@ fn work_list_table(
                 .map(|stage| stage.label().to_string())
         })
         .collect();
+    let run_stages = runs
+        .iter()
+        .map(|run| {
+            stage_for_identity(&run.identity, records)
+                .filter(|stage| *stage != WorkStage::Auto)
+                .map(|stage| stage.label().to_string())
+        })
+        .collect::<Vec<_>>();
     // The column only earns its width when something is actually staged.
-    let show_stage = staged.iter().any(Option::is_some);
+    let show_stage = staged.iter().chain(&run_stages).any(Option::is_some);
 
-    let mut header = vec!["WORK", "WORKSPACE", "AGENTS", "DONE"];
+    let mut header = vec!["WORK", "WORKSPACE", "GEN", "ALIASES", "DONE"];
     if show_stage {
         header.push("STAGE");
     }
@@ -468,11 +541,24 @@ fn work_list_table(
         );
 
     for (work, stage) in works.iter().zip(&staged) {
-        let (done, total) = done_ratio(work);
+        let run = runs.iter().find(|run| {
+            run.identity.workspace_id == work.workspace && run.identity.work_id == work.work
+        });
+        let (done, total) = run.map_or_else(
+            || done_ratio(work),
+            muxa::pipeline_run::PipelineRun::completion,
+        );
         let mut row = vec![
             theme.cell(&work.work, TableTone::Accent),
             theme.cell(&work.workspace, TableTone::Dim),
-            theme.cell(agent_summary(work), TableTone::Tmux),
+            run.map_or_else(
+                || theme.right_cell("-", TableTone::Dim),
+                |run| theme.right_cell(run.generation, TableTone::Dim),
+            ),
+            theme.cell(
+                run.map_or_else(|| agent_summary(work), pipeline_alias_summary),
+                TableTone::Tmux,
+            ),
             match total {
                 // Not a pipeline: nothing ever reports, so a ratio would
                 // read as "0 of 1 finished" for work that is simply running.
@@ -489,7 +575,42 @@ fn work_list_table(
         row.push(theme.cell(shorten_home(&work.cwd), TableTone::Dim));
         table.add_row(row);
     }
+    for (run, stage) in runs.iter().zip(&run_stages).filter(|(run, _)| {
+        !works.iter().any(|work| {
+            run.identity.workspace_id == work.workspace && run.identity.work_id == work.work
+        })
+    }) {
+        let (done, total) = run.completion();
+        let mut row = vec![
+            theme.cell(&run.identity.work_id, TableTone::Accent),
+            theme.cell(&run.identity.workspace_id, TableTone::Dim),
+            theme.right_cell(run.generation, TableTone::Dim),
+            theme.cell(pipeline_alias_summary(run), TableTone::Tmux),
+            if done == total {
+                theme.right_cell(format!("{done}/{total}"), TableTone::Good)
+            } else {
+                theme.right_cell(format!("{done}/{total}"), TableTone::Warn)
+            },
+        ];
+        if show_stage {
+            row.push(theme.cell(stage.as_deref().unwrap_or("-"), TableTone::Dim));
+        }
+        row.push(theme.cell(shorten_home(&run.cwd), TableTone::Dim));
+        table.add_row(row);
+    }
     format!("{table}\n")
+}
+
+fn pipeline_alias_summary(run: &muxa::pipeline_run::PipelineRun) -> String {
+    run.desired
+        .iter()
+        .filter_map(|agent| {
+            run.aliases
+                .get(&agent.alias)
+                .map(|state| format!("{}:{}", agent.alias, state.status))
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
 }
 
 /// How many of this work's pipeline agents have reported finishing.
@@ -1033,6 +1154,7 @@ pub fn mark_work_external(window: &str, ticket: &muxa::pipeline::Ticket) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // pane metadata is an explicit flat tmux option contract
 pub fn mark_agent(
     pane: &str,
     agent: &str,
@@ -1041,6 +1163,7 @@ pub fn mark_agent(
     role: Option<&str>,
     task: Option<&str>,
     alias: Option<&str>,
+    generation: Option<u64>,
 ) -> Result<()> {
     validate_pane_id(pane)?;
     set_option(OptionScope::Pane, pane, AGENT_OPTION, &metadata(agent, 64)?)?;
@@ -1085,18 +1208,44 @@ pub fn mark_agent(
             &metadata(alias, 64)?,
         )?;
     }
+    if let Some(generation) = generation {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_GENERATION_OPTION,
+            &generation.to_string(),
+        )?;
+    }
     Ok(())
+}
+
+pub fn mark_agent_generation(pane: &str, generation: u64) -> Result<()> {
+    validate_pane_id(pane)?;
+    set_option(
+        OptionScope::Pane,
+        pane,
+        AGENT_GENERATION_OPTION,
+        &generation.to_string(),
+    )
 }
 
 /// The stage a human (or the dashboard) recorded for this logical Work.
 /// A new Run in another tmux window retains the same stage because execution
 /// coordinates are deliberately not part of Work identity.
 fn stage_for(work: &WorkInfo, records: &[WorkRecord]) -> Option<WorkStage> {
+    stage_for_identity(
+        &muxa::work::WorkIdentity::new(&work.workspace, &work.work),
+        records,
+    )
+}
+
+fn stage_for_identity(
+    identity: &muxa::work::WorkIdentity,
+    records: &[WorkRecord],
+) -> Option<WorkStage> {
     records
         .iter()
-        .find(|record| {
-            record.identity.workspace_id == work.workspace && record.identity.work_id == work.work
-        })
+        .find(|record| &record.identity == identity)
         .map(|record| record.metadata.stage)
 }
 
@@ -1142,6 +1291,53 @@ mod work_list_view_tests {
             external_item: None,
             done: done.iter().map(|d| (*d).to_string()).collect(),
             agents,
+        }
+    }
+
+    fn durable_run() -> muxa::pipeline_run::PipelineRun {
+        use muxa::pipeline_run::{PipelineAliasState, PipelineAliasStatus, PipelineRun};
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let desired = [("impl", Vec::new()), ("review", vec!["impl".to_string()])]
+            .into_iter()
+            .map(|(alias, after)| muxa::pipeline::DesiredAgent {
+                alias: alias.to_string(),
+                program: "codex".to_string(),
+                role: None,
+                task: None,
+                prompt: None,
+                direction: None,
+                after,
+            })
+            .collect();
+        let state = |alias: &str, status, completion_generation| PipelineAliasState {
+            alias: alias.to_string(),
+            status,
+            generation: 1,
+            completion_generation,
+            pane: (alias == "impl").then(|| "%1".to_string()),
+            error: None,
+            reconcile_pending: false,
+            claim_started_at: None,
+            updated_at: now,
+        };
+        PipelineRun {
+            identity: muxa::work::WorkIdentity::new("callabo", "CAL-1"),
+            pipeline: "delivery".to_string(),
+            desired,
+            cwd: PathBuf::from("/repo"),
+            generation: 1,
+            window_id: Some("@1".to_string()),
+            aliases: std::collections::BTreeMap::from([
+                (
+                    "impl".to_string(),
+                    state("impl", PipelineAliasStatus::Done, Some(1)),
+                ),
+                (
+                    "review".to_string(),
+                    state("review", PipelineAliasStatus::Pending, None),
+                ),
+            ]),
+            updated_at: now,
         }
     }
 
@@ -1215,7 +1411,7 @@ mod work_list_view_tests {
             ),
             work("RELEASE-1", vec![agent("%3", "claude", None)], &[]),
         ];
-        let out = work_list_table(&works, &[], crate::theme::CliTheme::plain());
+        let out = work_list_table(&works, &[], &[], crate::theme::CliTheme::plain());
         assert!(out.contains("CAL-1"), "{out}");
         assert!(out.contains("2/2"), "{out}");
         assert!(out.contains("impl \u{b7} review"), "{out}");
@@ -1223,6 +1419,35 @@ mod work_list_view_tests {
         assert!(!out.contains("0/1"), "{out}");
         // The stage column stays out of the way when nothing is staged.
         assert!(!out.contains("STAGE"), "{out}");
+    }
+
+    #[test]
+    fn table_uses_durable_desired_aliases_before_downstream_has_a_pane() {
+        let works = vec![work(
+            "CAL-1",
+            vec![agent("%1", "codex", Some("impl"))],
+            &["impl"],
+        )];
+        let out = work_list_table(
+            &works,
+            &[],
+            &[durable_run()],
+            crate::theme::CliTheme::plain(),
+        );
+        assert!(out.contains("1/2"), "{out}");
+        assert!(out.contains("impl:done"), "{out}");
+        assert!(out.contains("review:pending"), "{out}");
+        assert!(!out.contains("1/1"), "{out}");
+    }
+
+    #[test]
+    fn table_keeps_a_durable_run_visible_without_a_tmux_window() {
+        let out = work_list_table(&[], &[], &[durable_run()], crate::theme::CliTheme::plain());
+        assert!(out.contains("CAL-1"), "{out}");
+        assert!(out.contains("callabo"), "{out}");
+        assert!(out.contains("impl:done"), "{out}");
+        assert!(out.contains("review:pending"), "{out}");
+        assert!(out.contains("1/2"), "{out}");
     }
 }
 
@@ -1232,36 +1457,6 @@ fn parse_done(raw: &str) -> Vec<String> {
         .filter(|alias| !alias.is_empty())
         .map(str::to_ascii_lowercase)
         .collect()
-}
-
-/// Record that `alias` has finished its part of this work, or take it back.
-///
-/// Idempotent: a second report is not an error, because an agent re-reading
-/// its own instructions and reporting twice is likelier than a bug.
-pub fn mark_done(window: &str, alias: &str, done: bool) -> Result<Vec<String>> {
-    let alias = metadata(alias, 64)?.to_ascii_lowercase();
-    let current = tmux_output(&[
-        "display-message",
-        "-p",
-        "-t",
-        window,
-        &format!("#{{{WORK_DONE_OPTION}}}"),
-    ])?;
-    let mut aliases = parse_done(current.trim());
-    if done {
-        if !aliases.iter().any(|existing| existing == &alias) {
-            aliases.push(alias);
-        }
-    } else {
-        aliases.retain(|existing| existing != &alias);
-    }
-    set_option(
-        OptionScope::Window,
-        window,
-        WORK_DONE_OPTION,
-        &aliases.join(","),
-    )?;
-    Ok(aliases)
 }
 
 pub fn window_id_for_pane(pane: &str) -> Result<String> {
@@ -1676,10 +1871,6 @@ fn required<'a>(value: Option<&'a str>, message: &str) -> Result<&'a str> {
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!(message.to_string()))
-}
-
-fn json_works(works: &[WorkInfo]) -> serde_json::Value {
-    serde_json::json!({ "works": works })
 }
 
 fn json_workspaces(workspaces: &[WorkspaceInfo]) -> serde_json::Value {

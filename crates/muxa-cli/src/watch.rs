@@ -834,6 +834,7 @@ pub(crate) struct WorkRow {
     /// Without this a converged pipeline and a stalled one are the same
     /// picture: every agent idle, nothing to say the review already landed.
     pub completion: Option<(usize, usize)>,
+    pub pipeline_run: Option<muxa::pipeline_run::PipelineRunSummary>,
     agent_states: HashMap<(AgentKind, String), AgentState>,
 }
 
@@ -1423,6 +1424,7 @@ impl Effects for RealEffects {
                 agent,
                 Some(&workspace),
                 Some(&work),
+                None,
                 None,
                 None,
                 None,
@@ -2629,6 +2631,8 @@ pub(crate) struct App {
     pub sessions: Vec<SessionInfo>,
     /// Persisted cumulative attached-time counters keyed by tmux session id.
     pub session_activity: Vec<SessionActivity>,
+    /// Daemon-owned pipeline Runs from the last coherent refresh.
+    pub pipeline_runs: Vec<muxa::pipeline_run::PipelineRun>,
     /// True between a user-triggered refresh request (`r`) and the
     /// matching outcome landing on the channel. Surfaces a brief
     /// "↻ refreshing…" hint in the header so mashing `r` during a
@@ -2936,6 +2940,7 @@ impl App {
             panes: Vec::new(),
             sessions: Vec::new(),
             session_activity: Vec::new(),
+            pipeline_runs: Vec::new(),
             refresh_pending: false,
             initial_pane: None,
             preview: None,
@@ -3112,7 +3117,7 @@ impl App {
         // Build the shared topology before presentation-specific filtering.
         // This retains paneless/ambiguous agents in `unassigned_agents` and
         // gives every tree action a collision-free target.
-        self.topology = build_watch_topology(&agents, &panes, &sessions);
+        self.topology = build_watch_topology(&agents, &panes, &sessions, &self.pipeline_runs);
         self.reconcile_tree_expansion(&previous_topology_keys);
 
         // Filter out paneless agents up front when the user has opted in
@@ -3147,6 +3152,7 @@ impl App {
                 &session_activity,
                 &self.watch_cfg.sort,
             );
+            annotate_work_rows(&mut self.rows, &self.pipeline_runs);
             self.panes = panes;
             self.sessions = sessions;
             self.session_activity = session_activity;
@@ -5026,6 +5032,7 @@ fn build_watch_topology(
     agents: &[Agent],
     panes: &[PaneInfo],
     session_info: &[SessionInfo],
+    pipeline_runs: &[muxa::pipeline_run::PipelineRun],
 ) -> TopologySnapshot {
     let mut panes_by_host: HashMap<muxa::HostKind, Vec<PaneInfo>> = HashMap::new();
     for pane in panes {
@@ -5074,6 +5081,40 @@ fn build_watch_topology(
             if matches.next().is_none() {
                 node.name.clone_from(&info.name);
                 node.attached_clients = Some(info.attached_clients);
+            }
+        }
+    }
+    let window_id_counts = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .fold(HashMap::<String, usize>::new(), |mut counts, window| {
+            *counts.entry(window.key.window_id.clone()).or_default() += 1;
+            counts
+        });
+    for session in &mut snapshot.sessions {
+        for window in &mut session.windows {
+            // Durable Runs are launched on the locally scoped tmux server.
+            // Raw `@N` ids repeat across backends and sockets, so an
+            // ambiguous id must remain unjoined instead of displaying one
+            // Work's state on another window.
+            if window.key.session.endpoint.host != muxa::HostKind::Tmux
+                || window_id_counts
+                    .get(window.key.window_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    != 1
+            {
+                continue;
+            }
+            if let Some(run) = pipeline_runs
+                .iter()
+                .filter(|run| run.window_id.as_deref() == Some(window.key.window_id.as_str()))
+                .max_by_key(|run| run.updated_at)
+            {
+                let (done, total) = run.completion();
+                window.completion = Some(muxa::topology::WorkCompletion { done, total });
+                window.pipeline_run = Some(run.summary());
             }
         }
     }
@@ -5208,7 +5249,73 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
         bare_summary,
         activity: builder.activity,
         completion,
+        pipeline_run: None,
         agent_states,
+    }
+}
+
+fn annotate_work_rows(rows: &mut Vec<WatchRow>, runs: &[muxa::pipeline_run::PipelineRun]) {
+    let window_id_counts = rows
+        .iter()
+        .filter_map(|row| match row {
+            WatchRow::Work(work) => work.window_key.as_ref(),
+            WatchRow::Agent(_) | WatchRow::BarePane(_) => None,
+        })
+        .fold(HashMap::<String, usize>::new(), |mut counts, window| {
+            *counts.entry(window.window_id.clone()).or_default() += 1;
+            counts
+        });
+    let mut displayed = std::collections::BTreeSet::new();
+    for row in rows.iter_mut() {
+        let WatchRow::Work(work) = row else {
+            continue;
+        };
+        let Some(window) = work.window_key.as_ref() else {
+            continue;
+        };
+        if window.session.endpoint.host != muxa::HostKind::Tmux
+            || window_id_counts
+                .get(window.window_id.as_str())
+                .copied()
+                .unwrap_or_default()
+                != 1
+        {
+            continue;
+        }
+        let Some(run) = runs
+            .iter()
+            .filter(|run| run.window_id.as_deref() == Some(window.window_id.as_str()))
+            .max_by_key(|run| run.updated_at)
+        else {
+            continue;
+        };
+        work.completion = Some(run.completion());
+        work.pipeline_run = Some(run.summary());
+        displayed.insert(run.identity.key());
+    }
+    // The Run is the durable object; a tmux window is only its current
+    // binding. Keep a prompt-free row visible after that binding disappears
+    // so watch and list tell the same operational truth.
+    for run in runs
+        .iter()
+        .filter(|run| !displayed.contains(&run.identity.key()))
+    {
+        rows.push(WatchRow::Work(Box::new(WorkRow {
+            session: run.identity.workspace_id.clone(),
+            group_key: format!("pipeline:{}", run.identity.key()),
+            window_key: None,
+            display_name: format!("{} › {}", run.identity.workspace_id, run.identity.work_id),
+            pane_ids: Vec::new(),
+            representative_pane: None,
+            latest_agent: None,
+            agents: Vec::new(),
+            pane_count: 0,
+            bare_summary: Some("durable Run · no live window".to_string()),
+            activity: None,
+            completion: Some(run.completion()),
+            pipeline_run: Some(run.summary()),
+            agent_states: HashMap::new(),
+        })));
     }
 }
 
@@ -5868,6 +5975,12 @@ fn work_label(s: &WorkRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static
         };
         spans.push(Span::styled(format!("  {done}/{total}"), style));
     }
+    if let Some(run) = s.pipeline_run.as_ref() {
+        spans.push(Span::styled(
+            format!("  {}", pipeline_status_label(run)),
+            theme.dim_style(),
+        ));
+    }
 
     Text::from(Line::from(spans))
 }
@@ -6183,6 +6296,7 @@ pub(crate) struct FullRefresh {
     pub sessions: Vec<SessionInfo>,
     pub session_activity: Vec<SessionActivity>,
     pub error: Option<DaemonError>,
+    pub pipeline_runs: Vec<muxa::pipeline_run::PipelineRun>,
 }
 
 pub(crate) struct MessageComposerConfig {
@@ -6233,7 +6347,12 @@ fn apply_outcome_inner(app: &mut App, outcome: RefreshOutcome) {
         RefreshOutcome::Full(full) => apply_full(app, full),
         RefreshOutcome::SingleAgent(agent) => {
             apply_single_agent(app, agent);
-            app.topology = build_watch_topology(&app.current_agents(), &app.panes, &app.sessions);
+            app.topology = build_watch_topology(
+                &app.current_agents(),
+                &app.panes,
+                &app.sessions,
+                &app.pipeline_runs,
+            );
             // Re-sort immediately so a pushed state/activity change moves the
             // row to its sorted position now instead of waiting for the 5 s
             // `Full` fallback tick. This matters most for `sort = ["state",
@@ -6432,6 +6551,7 @@ fn apply_single_agent_to_work(app: &mut App, agent: Agent) {
         activity: None,
         // No pane topology behind this row, so nothing to read aliases from.
         completion: None,
+        pipeline_run: None,
         agent_states,
     })));
 }
@@ -6443,9 +6563,11 @@ fn apply_full(app: &mut App, full: FullRefresh) {
         sessions,
         session_activity,
         error,
+        pipeline_runs,
     } = full;
 
     app.last_error = error;
+    app.pipeline_runs = pipeline_runs;
 
     // Build a lookup of the previously-known agents so the merge can
     // distinguish a genuine daemon-driven change from a transient
@@ -6554,7 +6676,12 @@ async fn compute_refresh(
 
     // The blocking tasks already run concurrently on the blocking pool;
     // await the daemon snapshot + ledger load alongside them, then collect.
-    let (session_activity, snapshot) = tokio::join!(session_activity_task, client.snapshot());
+    let (session_activity, snapshot, pipeline_runs) = tokio::join!(
+        session_activity_task,
+        client.snapshot(),
+        client.pipeline_runs()
+    );
+    let pipeline_runs = pipeline_runs.unwrap_or_default();
 
     let mut panes: Vec<PaneInfo> = Vec::new();
     for task in pane_tasks {
@@ -6572,6 +6699,7 @@ async fn compute_refresh(
             sessions,
             session_activity,
             error: None,
+            pipeline_runs,
         },
         Err(e) => FullRefresh {
             agents: Vec::new(),
@@ -6582,6 +6710,7 @@ async fn compute_refresh(
                 self_describing: matches!(e, RuntimeError::NotConnected(_)),
                 message: e.to_string(),
             }),
+            pipeline_runs,
         },
     };
     RefreshOutcome::Full(full)
@@ -13274,6 +13403,16 @@ fn render_topology_inspector(
     }
 }
 
+fn pipeline_status_label(run: &muxa::pipeline_run::PipelineRunSummary) -> String {
+    let aliases = run
+        .aliases
+        .iter()
+        .map(|alias| format!("{}:{}", alias.alias, alias.status))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{} g{} {aliases}", run.pipeline, run.generation)
+}
+
 // cli-spinners frames: `dots` for parent agents, `dots2` (denser) for
 // subagents, and a half-circle set for starting.
 const SWARM_DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -13679,6 +13818,12 @@ fn tree_node_label(
             spans.push(Span::styled(
                 format!("  {}/{}", completion.done, completion.total),
                 style,
+            ));
+        }
+        if let Some(run) = window.pipeline_run.as_ref() {
+            spans.push(Span::styled(
+                format!("  {}", pipeline_status_label(run)),
+                theme.dim_style(),
             ));
         }
     }
@@ -20556,6 +20701,7 @@ sort = ["state"]
             panes: vec![],
             sessions: vec![],
             session_activity: vec![],
+            pipeline_runs: vec![],
             error: None,
         })
     }
@@ -21354,6 +21500,7 @@ sort = ["state"]
             panes: vec![fake_pane("%99", "side", 0, 0, "vim")],
             sessions: vec![],
             session_activity: vec![],
+            pipeline_runs: vec![],
             error: Some(DaemonError {
                 self_describing: false,
                 message: "boom".into(),
@@ -21394,6 +21541,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21423,6 +21571,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21455,6 +21604,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21487,6 +21637,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21536,6 +21687,7 @@ sort = ["state"]
                 ],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21622,6 +21774,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21676,6 +21829,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21697,6 +21851,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
@@ -21747,6 +21902,7 @@ sort = ["state"]
                 panes: vec![fake_pane("%1", "main", 0, 0, "claude")],
                 sessions: vec![],
                 session_activity: vec![],
+                pipeline_runs: vec![],
                 error: None,
             }),
         );
