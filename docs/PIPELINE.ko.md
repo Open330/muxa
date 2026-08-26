@@ -320,10 +320,20 @@ blocked와 attention은 별도 signal로 남습니다.
 
 ```console
 $ muxa work list
-auth-cleanup  workspace=callabo  session=callabo  window=@7  agents=3  cwd=…  stage=review
+┌────────────────────────────────────────────────────────────────────────┐
+│ WORK           WORKSPACE   AGENTS          DONE   STAGE    CWD         │
+╞════════════════════════════════════════════════════════════════════════╡
+│ auth-cleanup   callabo     impl · review    1/2   review   ~/work/auth │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-`stage=auto`는 아무것도 출력하지 않습니다. auto는 "아무도 말한 적 없음"이라,
+`DONE`은 pipeline이 이름 붙인 agent 중 `muxa work done`을 보고한 수입니다.
+수렴한 실행과 정체한 실행을 가르는 값입니다 — 둘 다 모든 pane이 idle이기
+때문입니다. pipeline alias가 없는 window는 `0/1`이 아니라 `-`입니다.
+거기서는 아무도 보고를 요구받지 않았습니다.
+
+`STAGE` 칼럼은 stage가 붙은 work가 있을 때만 나타납니다. auto는 "아무도 말한
+적 없음"이라,
 항상 붙어 있는 칼럼보다 할 말이 있을 때만 나타나는 칼럼이 더 많은 걸 말합니다.
 CLI는 그 저장소를 읽기만 하고, 쓰기는 daemon이 소유합니다.
 [DASHBOARD.md](DASHBOARD.md) 참고.
