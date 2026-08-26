@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
+  one.** The isolation the demo recordings had grown privately is now a
+  supported command: `up` / `daemon` / `env` / `status` / `down` over a private
+  `MUXA_SOCKET`, `MUXA_CONFIG` and `XDG_DATA_HOME`, an isolated tmux server
+  pinned through `MUXA_TMUX_SOCKET`, and a `tmux` PATH shim so child processes
+  land on that server too. `up` refuses to nest inside an existing tmux session
+  unless told otherwise, checks that `muxa` and `muxad` are the same build, and
+  tears down anything a previous run left behind before building. `status`
+  distinguishes healthy from partial and names every artifact it found; `down`
+  reaps daemons the pidfile lost track of, waits for them to actually exit, then
+  verifies and reports what survived. `scripts/sandbox-smoke.sh` holds it to
+  that, asserting teardown is total from each state a crash can leave.
+  `docs/demo-setup.sh` is the first consumer and now carries only the fixture.
+
+### Fixed
+
+- **The demo fixture could not be rebuilt.** `docs/demo-setup.sh` wrote
+  `[watch] view = 'work'`, a value that stopped existing when the watch view
+  enum became `session` / `window` / `pane`, so `muxad` refused the config and
+  every GIF regeneration failed at daemon start.
+
 ### Changed
 
 - **Work pipelines now have daemon-owned, generation-aware Run state.** The

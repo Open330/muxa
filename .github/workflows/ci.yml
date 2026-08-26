@@ -52,6 +52,22 @@ jobs:
       - run: cargo build --workspace --bins
       - run: cargo test --workspace
 
+  sandbox:
+    name: sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: cargo build --workspace --bins
+      - run: shellcheck scripts/muxa-sandbox.sh scripts/sandbox-smoke.sh
+      # A sandbox that leaks a daemon or a tmux server is worse than no
+      # sandbox, so the suite asserts teardown is total from every state.
+      - run: scripts/sandbox-smoke.sh
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
