@@ -228,7 +228,9 @@ cmd_status() {
 cmd_down() {
   resolve_bins
 
-  [ -n "$TMUX_BIN" ] && tm kill-server 2>/dev/null || true
+  if [ -n "$TMUX_BIN" ]; then
+    tm kill-server 2>/dev/null || true
+  fi
 
   local pid
   if pid=$(daemon_pid); then
@@ -292,8 +294,8 @@ preflight() {
   resolve_bins
 
   [ -n "$TMUX_BIN" ] || die 'tmux not found; pass --tmux <path>'
-  [ -n "$MUXAD_BIN" ] && [ -x "$MUXAD_BIN" ] || die 'muxad not found; pass --muxad <path> or run cargo build'
-  [ -n "$MUXA_BIN" ] && [ -x "$MUXA_BIN" ] || die 'muxa not found; pass --muxa <path> or run cargo build'
+  [ -x "${MUXAD_BIN:-}" ] || die 'muxad not found; pass --muxad <path> or run cargo build'
+  [ -x "${MUXA_BIN:-}" ] || die 'muxa not found; pass --muxa <path> or run cargo build'
 
   # A CLI and a daemon from different builds negotiate a protocol version that
   # does not exist, and the symptom — "no active agents" while agents are
