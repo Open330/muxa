@@ -364,10 +364,20 @@ attention remain signals:
 
 ```console
 $ muxa work list
-auth-cleanup  workspace=callabo  session=callabo  window=@7  agents=3  cwd=…  stage=review
+┌────────────────────────────────────────────────────────────────────────┐
+│ WORK           WORKSPACE   AGENTS          DONE   STAGE    CWD         │
+╞════════════════════════════════════════════════════════════════════════╡
+│ auth-cleanup   callabo     impl · review    1/2   review   ~/work/auth │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-`stage=auto` prints nothing — auto means nobody has said anything, and a
+`DONE` counts the agents that reported `muxa work done` against the ones
+the pipeline named. It is the difference between a run that converged and
+one that stalled — both leave every pane idle. A window with no pipeline
+aliases shows `-` rather than `0/1`: nothing there was asked to report.
+
+The `STAGE` column appears only when something is staged — `auto` means
+nobody has said anything, and a
 column that is always there says less than one that appears when it has
 something to report. The CLI only ever reads that store; the daemon owns
 writing it. See [DASHBOARD.md](DASHBOARD.md).

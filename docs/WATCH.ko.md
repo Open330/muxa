@@ -36,6 +36,7 @@ child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane에 바로 attach. |
 | `n` | workspace session과 work window를 생성/재사용하고 agent pane 추가. |
+| `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
 | `m` / `M` | 선택한 agent에게 request 보내기 / incoming·sent mailbox 열기. |

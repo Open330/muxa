@@ -57,6 +57,7 @@ children keep their aggregate state markers.
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
+| `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
 | `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
