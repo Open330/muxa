@@ -5231,7 +5231,6 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
             },
         )
     });
-    let completion = work_completion(&builder.panes);
     WorkRow {
         display_name,
         group_key: builder.group_key,
@@ -5248,7 +5247,9 @@ fn finish_work_row(mut builder: WorkRowBuilder, sort_context: &SortContext<'_>) 
         pane_count: builder.panes.len(),
         bare_summary,
         activity: builder.activity,
-        completion,
+        // Set from the durable pipeline Run once one is matched to this row;
+        // tmux alone cannot say how far a pipeline has got.
+        completion: None,
         pipeline_run: None,
         agent_states,
     }
@@ -5317,24 +5318,6 @@ fn annotate_work_rows(rows: &mut Vec<WatchRow>, runs: &[muxa::pipeline_run::Pipe
             agent_states: HashMap::new(),
         })));
     }
-}
-
-/// Completion for the flat work row, over the same rule the topology uses —
-/// deferred to rather than restated, so the tree and the list can never
-/// disagree about whether a pipeline finished.
-fn work_completion(panes: &[PaneInfo]) -> Option<(usize, usize)> {
-    // `@muxa_work_done` is a window option, so whichever pane carries it speaks
-    // for the window.
-    let done = panes
-        .iter()
-        .find(|pane| !pane.work_done.is_empty())
-        .map(|pane| pane.work_done.clone())
-        .unwrap_or_default();
-    muxa::topology::work_completion(
-        panes.iter().filter_map(|pane| pane.agent_alias.as_deref()),
-        &done,
-    )
-    .map(|completion| (completion.done, completion.total))
 }
 
 fn build_work_rows(
@@ -5886,72 +5869,6 @@ mod work_up_key_tests {
             Action::None
         ));
         assert!(app.work_composer.is_none());
-    }
-}
-
-#[cfg(test)]
-mod work_completion_tests {
-    use super::*;
-
-    fn pane(id: &str, alias: Option<&str>, done: &[&str]) -> PaneInfo {
-        PaneInfo {
-            agent_role: None,
-            agent_alias: alias.map(Into::into),
-            work_done: done.iter().map(|d| (*d).to_string()).collect(),
-            pane_id: id.into(),
-            session_id: "$1".into(),
-            session: "callabo".into(),
-            window_id: "@1".into(),
-            window_name: "CAL-1".into(),
-            window_index: "0".into(),
-            pane_index: "0".into(),
-            tty: String::new(),
-            current_command: "claude".into(),
-            title: String::new(),
-            pane_pid: 0,
-            current_path: "/repo".into(),
-            socket: Some("default".into()),
-        }
-    }
-
-    /// The signal the TUI was missing: idle-and-converged looked exactly like
-    /// idle-and-stalled.
-    #[test]
-    fn a_converged_pipeline_reports_every_alias() {
-        let panes = vec![
-            pane("%1", Some("impl"), &["impl", "review"]),
-            pane("%2", Some("review"), &["impl", "review"]),
-        ];
-        assert_eq!(work_completion(&panes), Some((2, 2)));
-    }
-
-    #[test]
-    fn a_half_finished_pipeline_is_not_complete() {
-        let panes = vec![
-            pane("%1", Some("impl"), &["impl"]),
-            pane("%2", Some("review"), &["impl"]),
-        ];
-        assert_eq!(work_completion(&panes), Some((1, 2)));
-    }
-
-    /// A hand-split pane can never report, so counting it would show a
-    /// converged pair as 2/3 forever.
-    #[test]
-    fn hand_split_panes_stay_out_of_the_ratio() {
-        let panes = vec![
-            pane("%1", Some("impl"), &["impl", "review"]),
-            pane("%2", Some("review"), &["impl", "review"]),
-            pane("%3", None, &["impl", "review"]),
-        ];
-        assert_eq!(work_completion(&panes), Some((2, 2)));
-    }
-
-    /// A window with no pipeline at all has no completion to show — `0/1`
-    /// would libel an agent that was never asked to report.
-    #[test]
-    fn a_window_without_a_pipeline_has_no_ratio() {
-        assert_eq!(work_completion(&[pane("%1", None, &[])]), None);
-        assert_eq!(work_completion(&[]), None);
     }
 }
 
@@ -15644,7 +15561,6 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
-            work_done: Vec::new(),
             socket: None,
             pane_id: pane.into(),
             session_id: String::new(),
@@ -15675,7 +15591,6 @@ mod tests {
         PaneInfo {
             agent_role: None,
             agent_alias: None,
-            work_done: Vec::new(),
             socket: Some(socket.into()),
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -20097,7 +20012,6 @@ sort = ["state"]
         let panes = vec![PaneInfo {
             agent_role: None,
             agent_alias: None,
-            work_done: Vec::new(),
             socket: None,
             pane_id: "%42".into(),
             session_id: String::new(),
