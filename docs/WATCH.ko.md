@@ -37,6 +37,7 @@ child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로
 | `Enter` | 선택한 pane에 바로 attach. |
 | `n` | workspace session과 work window를 생성/재사용하고 agent pane 추가. |
 | `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
+| `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
 | `m` / `M` | 선택한 agent에게 request 보내기 / incoming·sent mailbox 열기. |
@@ -239,56 +240,54 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s`가 관측과 협업의 기본 진입점입니다. `prefix+D`는 더 상세한 Dashboard를
 바로 여는 선택 단축키입니다.
 
+## 안정적인 tmux 이름
+
+`muxa init`은 `tmux-window-names` 컴포넌트를 기본으로 켭니다. tmux의 process 기반
+`automatic-rename`을 꺼서 Work window가 `node`나 `claude`로 덮어써지지 않게 하고,
+익숙한 `prefix + ,` prompt를 `muxa window rename`으로 연결합니다. window 이름의
+공백은 `-`로 정규화하며 같은 session 안의 중복 이름은 거부합니다. 특정 window만
+동적 이름으로 되돌리려면 `muxa window rename --auto`를 실행합니다.
+
 ## 한 workspace를 터미널 두 개로 보기
 
 tmux session은 current window를 하나만 가지며, attach된 모든 client가 그 window를
 봅니다. 따라서 같은 session에 두 터미널을 붙이면 서로 다른 Work window에 머무를 수
-없고, 한쪽에서 window를 바꾸면 다른 쪽도 따라갑니다. muxa의 제약이 아니라 tmux의
-모델입니다.
+없습니다. muxa의 제약이 아니라 tmux의 모델이고, 이를 바꾸는 유일한 수단이
+*session group*입니다 — window 목록은 공유하되 group 안의 각 session이 자기
+current window를 따로 가집니다.
 
-한 workspace의 Work Run 두 개를 나란히 보려면 두 번째 터미널을 *session group*으로
-attach하세요. window는 그대로 공유하되 group 안의 각 session이 자기 current window를
-따로 가집니다.
-
-```sh
-# 터미널 1
-tmux attach -t callabo
-
-# 터미널 2 — 같은 window, 독립적인 view, detach하면 사라짐
-tmux new-session -t callabo \; set-option destroy-unattached on
-```
-
-`tmux attach -t <session>` 자체가 이렇게 동작하게 하려면 — 따로 외울 명령 없이 —
-grouping을 `client-attached` hook 뒤에 둡니다. 이미 다른 client가 붙어 있을 때만
-동작하므로, 터미널이 하나뿐이면 평소대로 진짜 session에 붙고 여분의 session도
-생기지 않습니다.
+`muxa init`이 이를 `tmux-auto-view` 컴포넌트로 설치하며 기본으로 켜집니다. 도착한
+client에게 자기 view를 주는 훅 두 개를 겁니다.
 
 ```tmux
-set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"~/.local/bin/tmux-attach-view #{session_name} #{client_name} #{client_pid}\"'"
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-session-changed[9000]' "…같은 내용…"
 ```
 
-스크립트는 view를 만들고 도착한 client를 그쪽으로 옮깁니다.
+전용 hook array slot을 쓰므로 config를 다시 source해도 중복되지 않고, 사용자가 같은
+이벤트에 설치한 다른 hook도 덮어쓰지 않습니다.
+
+**훅이 두 개여야 합니다.** `client-attached`는 `tmux attach`로 붙는 터미널을,
+`client-session-changed`는 `switch-client`를 덮습니다 — 후자가 watch의 `Enter`가
+하는 일이고, 컴포넌트 설치 이전부터 열려 있던 터미널이 지나는 경로입니다. tmux
+3.4에서 실측: attach 훅만 있으면 watch에서 점프할 때 두 터미널이 다시 한 session에
+묶이고 그때부터 서로를 따라다닙니다.
+
+터미널이 하나면 아무 일도 일어나지 않습니다. `muxa workspace view`는 자기가 그
+session의 유일한 client이면 no-op이므로 단일 터미널 workspace에 여분의 session이
+생기지 않고, 재그룹하는 터미널은 자기 view를 재사용해 점프마다 session이 쌓이지
+않습니다.
+
+이미 붙어 있는 터미널에는 직접 실행할 수도 있습니다.
 
 ```sh
-name="view~$3~$1"
-new=$(tmux new-session -dP -F '#{session_id}' -t "=$1" -s "$name")
-tmux switch-client -c "$2" -t "$new"
-tmux set-option -t "$new" destroy-unattached on
+muxa workspace view
 ```
 
-세 가지가 결정적이며 모두 tmux 3.4에서 실측했습니다. `destroy-unattached`는
-반드시 `switch-client` **뒤에** 걸어야 합니다 — client가 아직 없는 session에 걸면
-그 자리에서 reap되어 전체가 조용히 무효화됩니다. `#{session_id}`가 아니라 session
-이름을 넘깁니다 — id는 `$0`이고 `run-shell`은 명령을 셸에 넘기므로 셸이 이를
-확장해 버립니다. view 이름은 원본 session 이름이 아니라 `view~<pid>~<session>`
-입니다 — 그래야 `callabo`를 찾는 prefix 조회가 진짜 session 대신 view를 집어가는
-일이 없습니다.
-
-한 session만 예외로 두려면 `tmux set-option -t <session> @no_auto_view 1` —
-두 터미널이 *일부러* 같은 화면을 봐야 할 때(페어링, 화면 공유)입니다.
-
-`command-alias`로는 안 됩니다. tmux는 내장 명령 이름을 alias보다 먼저 해석하므로
-`attach-session` alias는 참조되지 않습니다.
+view 이름은 `<session>~view~<pid>`라 원본 session 옆에 정렬됩니다. tmux가 session
+이름을 prefix로 매칭하는데도 안전한 이유는 **정확 일치가 우선**하기 때문입니다 —
+`callabo`, `callabo-set`, `callabo~view~1734560`이 모두 있어도 `-t callabo`는
+`callabo`로 해석됩니다. detach하면 사라지므로 view가 쌓이지 않습니다.
 
 window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보고
 있는 터미널 기준으로 잡으려면 window 단위 sizing을 함께 켭니다.
@@ -309,23 +308,20 @@ setw -g aggressive-resize on
 | `smallest` + `aggressive-resize on` | **200x49** | 80x23 |
 | `smallest` + `aggressive-resize off` | 80x23 | 80x23 |
 
-`smallest` 단독은 전형적인 함정입니다 — 어디든 작은 client가 하나 붙어 있으면
-내 window가 쪼그라듭니다. `aggressive-resize`가 "아무 client"를 "이 window를
-current로 갖는 client"로 좁혀 주는데, 이것이 위에서 만든 view 분리와 정확히
-맞물립니다. 터미널이 하나뿐이면 smallest가 곧 그 터미널이므로 일반적인 단일
-터미널 사용에는 변화가 없습니다.
+`smallest` 단독은 전형적인 함정입니다 — 어디든 작은 client가 붙어 있으면 내
+window가 쪼그라듭니다. `aggressive-resize`가 "아무 client"를 "이 window를 current로
+갖는 client"로 좁혀 주고, 이것이 view 분리와 정확히 맞물립니다. 터미널이 하나뿐이면
+smallest가 곧 그 터미널이라 단일 터미널 사용에는 변화가 없습니다.
 
-watch에서 `Enter`로 이동할 때는 대상 window를 session까지 포함해 지정하므로, 요청한
-터미널만 움직이고 group의 다른 session은 보고 있던 window를 유지합니다. 이때 watch가
-어느 client에서 키를 눌렀는지 알아야 하는데, `muxa init`이 심는 `prefix+s` 바인딩이
-`--caller-client '#{client_name}'`으로 그 값을 넘깁니다. 이 플래그가 없는 수동
-바인딩은 tmux의 활동 기반 추측으로 되돌아가고, 터미널이 둘일 때 그 추측은 자주
-틀립니다.
+watch에서 `Enter`로 이동할 때는 대상 window를 `<session_id>:<window_id>`로
+지정하므로, 요청한 터미널만 움직이고 group의 다른 session은 보고 있던 window를
+유지합니다.
 
-알려진 거친 부분: grouped session은 별개의 tmux session id이므로 watch topology에
-같은 window/pane을 담은 두 번째 트리로 나타납니다. agent 메타데이터는 첫 트리에
-붙고 중복 트리는 맨 pane으로 보입니다. 집계와 통계는 pane 단위 키라서 중복으로
-세지지 않습니다.
+반대로 두 터미널이 *일부러* 같은 화면을 봐야 한다면(페어링, 화면 공유):
+
+```sh
+tmux set-option -t <session> @no_auto_view 1
+```
 
 ## macOS 메뉴바 (BarShelf)
 

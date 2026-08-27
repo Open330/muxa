@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Every terminal on a workspace gets its own current window.** New
+  `tmux-auto-view` init component, on by default: two tmux hooks hand an
+  arriving client its own session-group view, so two terminals on one workspace
+  stop following each other's window switches. Both hooks matter —
+  `client-attached` covers `tmux attach`, and `client-session-changed` covers
+  `switch-client`, which is what `muxa watch`'s Enter does and what a terminal
+  that was already open goes through. `muxa workspace view` does the work and
+  can be run by hand; it is a no-op for a session's sole client and reuses one
+  view per terminal, so nothing accumulates. Views are named
+  `<session>~view~<pid>` and vanish on detach. Opt one session out with
+  `tmux set-option -t <session> @no_auto_view 1`.
+- **`R` renames the session, window, or pane under the cursor in `muxa
+  watch`.** The form opens prefilled with the current name and cursor at the
+  end, since renaming is usually an edit; Enter on an untouched prefill is a
+  cancel rather than a write. Window renames go through muxa's naming policy —
+  whitespace normalized to `-`, and a name already used in that session refused,
+  because tmux matches `session:window` targets by prefix. A pane has no name in
+  tmux, so that level sets the pane title, which is the string watch displays.
+- **New `tmux-window-names` init component**, on by default: turns off tmux's
+  `automatic-rename` and binds `prefix + ,` to `muxa window rename`. A window
+  is a Work Run under muxa's model, so naming it after whatever process is
+  running in it overwrites the Work with `node` or `claude` the moment an agent
+  starts.
+
 ### Changed
 
 - **Work pipelines now have daemon-owned, generation-aware Run state.** The
@@ -48,7 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.35] - 2026-08-22
 
 ### Added
-
 - **Google Antigravity CLI (`agy`) is a first-class agent.** agy replaced the
   Gemini CLI upstream but shares none of its hook contract, so muxa's existing
   Gemini support was silently inert against it: agy reads

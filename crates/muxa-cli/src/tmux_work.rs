@@ -236,15 +236,24 @@ pub struct WindowRenameArgs {
     /// New stable display name. Whitespace is normalized to `-`.
     #[arg(
         value_name = "NAME",
-        required_unless_present = "auto",
-        conflicts_with = "auto"
+        required_unless_present_any = ["auto", "buffer"],
+        conflicts_with_all = ["auto", "buffer"]
     )]
     pub name: Option<String>,
+    /// Read the name from a tmux paste buffer and delete it. Used by the
+    /// generated `prefix + ,` binding so prompt text never enters a shell.
+    #[arg(
+        long,
+        value_name = "BUFFER",
+        hide = true,
+        conflicts_with_all = ["name", "auto"]
+    )]
+    pub buffer: Option<String>,
     /// Exact window target such as @42. Defaults to the current tmux pane's window.
     #[arg(long, value_name = "TARGET")]
     pub window: Option<String>,
     /// Restore tmux's dynamic process-based automatic window name.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "buffer")]
     pub auto: bool,
     /// Emit JSON.
     #[arg(long)]
@@ -338,6 +347,323 @@ pub struct WorkspaceCloseArgs {
     pub json: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceViewArgs {
+    /// Session to view. Defaults to the session the calling client is in.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// tmux client to move, e.g. `/dev/pts/71`. Defaults to the calling one.
+    #[arg(long)]
+    pub client: Option<String>,
+    /// Suffix that names the view. Defaults to the client's pid, which keeps
+    /// one terminal to one view instead of a new session per jump.
+    #[arg(long = "client-pid")]
+    pub client_pid: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Name for a client's private view of `session`.
+///
+/// `<session>~view~<suffix>` sorts next to the session it mirrors and reads as
+/// what it is. Safe despite tmux matching session names by prefix, because an
+/// exact match wins over prefix candidates — measured on tmux 3.4 with
+/// `callabo`, `callabo-set` and `callabo~view~1734560` all present, `-t
+/// callabo` resolves to `callabo`.
+fn view_session_name(session: &str, suffix: &str) -> String {
+    format!("{session}~view~{suffix}")
+}
+
+const VIEW_SESSION_FORMAT: &str =
+    "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_group}\t#{destroy-unattached}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewSession {
+    id: String,
+    name: String,
+    attached: u32,
+    group: Option<String>,
+    destroy_unattached: bool,
+}
+
+fn parse_view_session(line: &str) -> Result<ViewSession> {
+    let mut fields = line.trim_end_matches(['\r', '\n']).splitn(5, '\t');
+    let id = fields.next().unwrap_or_default().to_string();
+    let name = fields.next().unwrap_or_default().to_string();
+    let attached = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("tmux did not report session_attached"))?
+        .parse::<u32>()
+        .context("tmux reported an invalid session_attached value")?;
+    let group = fields
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let destroy_unattached = match fields.next().unwrap_or_default().trim() {
+        "1" | "on" => true,
+        "0" | "off" => false,
+        value => bail!("tmux reported an invalid destroy-unattached value {value:?}"),
+    };
+    if id.is_empty() || name.is_empty() {
+        bail!("tmux did not report a session id and name");
+    }
+    Ok(ViewSession {
+        id,
+        name,
+        attached,
+        group,
+        destroy_unattached,
+    })
+}
+
+fn list_view_sessions() -> Result<Vec<ViewSession>> {
+    tmux_output(&["list-sessions", "-F", VIEW_SESSION_FORMAT])?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(parse_view_session)
+        .collect()
+}
+
+fn resolve_view_session(target: &str) -> Result<ViewSession> {
+    parse_view_session(&tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        VIEW_SESSION_FORMAT,
+    ])?)
+}
+
+fn tmux_session_id_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let sequence = |id: &str| id.strip_prefix('$').and_then(|raw| raw.parse::<u64>().ok());
+    match (sequence(left), sequence(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+/// Pick the same representative as topology folding. `session_group` keeps
+/// the original name after `rename-session`, so the only durable ordering is
+/// tmux's monotonically allocated numeric session id.
+fn canonical_view_source(target: &ViewSession, sessions: &[ViewSession]) -> ViewSession {
+    let Some(group) = target.group.as_deref() else {
+        return target.clone();
+    };
+    sessions
+        .iter()
+        .filter(|session| session.group.as_deref() == Some(group))
+        .min_by(|left, right| tmux_session_id_cmp(&left.id, &right.id))
+        .cloned()
+        .unwrap_or_else(|| target.clone())
+}
+
+fn expected_view_group(source: &ViewSession) -> &str {
+    source.group.as_deref().unwrap_or(&source.name)
+}
+
+/// A renamed original session should lend its new name to future views. If
+/// that original is gone and the oldest survivor is itself a generated view,
+/// remove its final view suffix instead of producing
+/// `base~view~1~view~2` on every regroup. The session-group name cannot be
+/// used as the base because tmux does not update it after `rename-session`.
+fn view_name_base(source: &ViewSession) -> &str {
+    let differs_from_group = source
+        .group
+        .as_deref()
+        .is_some_and(|group| group != source.name);
+    if source.destroy_unattached || differs_from_group {
+        if let Some((base, suffix)) = source.name.rsplit_once("~view~") {
+            if !base.is_empty() && !suffix.is_empty() {
+                return base;
+            }
+        }
+    }
+    &source.name
+}
+
+/// Reuse only a view created but not yet occupied by a racing invocation, or
+/// the view the same client has already entered. An attached session owned by
+/// another client is a name collision, not this terminal's private view.
+fn reusable_view<'a>(
+    sessions: &'a [ViewSession],
+    name: &str,
+    source: &ViewSession,
+    client_session_id: &str,
+) -> Option<&'a ViewSession> {
+    sessions.iter().find(|session| {
+        session.name == name
+            && session.group.as_deref() == Some(expected_view_group(source))
+            && (session.attached == 0 || session.id == client_session_id)
+    })
+}
+
+struct PreparedView {
+    id: String,
+    name: String,
+    created: bool,
+}
+
+fn prepare_view(
+    client: &str,
+    source: &ViewSession,
+    suffix: &str,
+    sessions: &[ViewSession],
+) -> Result<PreparedView> {
+    let base_name = view_session_name(view_name_base(source), suffix);
+    let current_id = resolve_view_session(client)?.id;
+    let existing = reusable_view(sessions, &base_name, source, &current_id);
+    let mut name = base_name;
+    if existing.is_none() && sessions.iter().any(|session| session.name == name) {
+        name = unique_name(name, |candidate| {
+            sessions.iter().any(|session| session.name == candidate)
+        });
+    }
+    if let Some(existing) = existing {
+        return Ok(PreparedView {
+            id: existing.id.clone(),
+            name,
+            created: false,
+        });
+    }
+
+    let create = tmux_output(&[
+        "new-session",
+        "-dP",
+        "-F",
+        "#{session_id}",
+        "-t",
+        &source.id,
+        "-s",
+        &name,
+    ]);
+    match create {
+        Ok(id) => Ok(PreparedView {
+            id: id.trim().to_string(),
+            name,
+            created: true,
+        }),
+        Err(create_error) => {
+            // Another hook invocation may have won the create between our
+            // listing and `new-session`. Reuse only its unattached view or the
+            // session this same client already entered.
+            let refreshed = list_view_sessions()?;
+            let refreshed_client_id = resolve_view_session(client)?.id;
+            let Some(existing) = reusable_view(&refreshed, &name, source, &refreshed_client_id)
+            else {
+                return Err(create_error);
+            };
+            Ok(PreparedView {
+                id: existing.id.clone(),
+                name,
+                created: false,
+            })
+        }
+    }
+}
+
+fn activate_view(client: &str, original_session_id: &str, view: &PreparedView) -> Result<()> {
+    // Move the client in BEFORE `destroy-unattached`. Setting that option on a
+    // session that still has no client makes tmux reap it on the spot.
+    if let Err(error) = tmux_status(&["switch-client", "-c", client, "-t", &view.id]) {
+        if view.created {
+            let _ = tmux_status(&["kill-session", "-t", &view.id]);
+        }
+        return Err(error);
+    }
+    if let Err(error) = tmux_status(&["set-option", "-t", &view.id, "destroy-unattached", "on"]) {
+        if let Err(rollback) =
+            tmux_status(&["switch-client", "-c", client, "-t", original_session_id])
+        {
+            bail!("{error}; could not return client to {original_session_id}: {rollback}");
+        }
+        if view.created {
+            let _ = tmux_status(&["kill-session", "-t", &view.id]);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Give one tmux client its own view of a session, so two terminals on one
+/// workspace stop following each other's window switches.
+///
+/// A tmux session has a single current window shared by every client attached
+/// to it. A *session group* is the only thing that separates them: the window
+/// list stays shared, but each session in the group keeps its own current
+/// window. This puts the client into one.
+///
+/// A no-op when the client is the session's only one — a lone terminal needs
+/// no view, and creating one anyway would leave a second session in every
+/// listing for nothing.
+pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
+    let client = match args.client.clone() {
+        Some(client) => client,
+        None => tmux_output(&["display-message", "-p", "#{client_name}"])?
+            .trim()
+            .to_string(),
+    };
+    if client.is_empty() {
+        bail!("no tmux client to move; pass --client");
+    }
+    let client_session = resolve_view_session(&client)
+        .with_context(|| format!("resolve the current session for client {client:?}"))?;
+    let target = match args.session.as_deref() {
+        Some(session) => resolve_view_session(session)
+            .with_context(|| format!("resolve requested session {session:?}"))?,
+        None => client_session.clone(),
+    };
+    let other_clients = client_session.attached.saturating_sub(1);
+    if other_clients == 0 {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "client": client,
+                    "session": target.name,
+                    "view": serde_json::Value::Null,
+                    "reason": "sole client",
+                }))?
+            );
+        }
+        return Ok(());
+    }
+
+    let suffix = match args.client_pid.clone() {
+        Some(suffix) => suffix,
+        None => tmux_output(&["display-message", "-p", "-t", &client, "#{client_pid}"])?
+            .trim()
+            .to_string(),
+    };
+    let suffix = if suffix.is_empty() {
+        std::process::id().to_string()
+    } else {
+        suffix
+    };
+    let sessions = list_view_sessions()?;
+    let source = canonical_view_source(&target, &sessions);
+    let view = prepare_view(&client, &source, &suffix, &sessions)?;
+    activate_view(&client, &client_session.id, &view)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "client": client,
+                "session": source.name,
+                "view": view.name,
+                "view_id": view.id,
+            }))?
+        );
+    } else {
+        println!("client {client} now views {} as {}", source.name, view.name);
+    }
+    Ok(())
+}
+
 pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {
     let result = if let Some(session) = args.session.as_deref() {
         let sessions = client
@@ -387,7 +713,11 @@ pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Resul
 }
 
 pub fn run_window_rename(args: WindowRenameArgs) -> Result<()> {
-    let result = rename_window(args.window.as_deref(), args.name.as_deref(), args.auto)?;
+    let name = match args.buffer.as_deref() {
+        Some(buffer) => Some(take_window_name_buffer(buffer)?),
+        None => args.name.clone(),
+    };
+    let result = rename_window(args.window.as_deref(), name.as_deref(), args.auto)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else if result.automatic {
@@ -402,6 +732,19 @@ pub fn run_window_rename(args: WindowRenameArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Move one command-prompt response across the tmux boundary without ever
+/// interpolating it into a shell command. The binding stores the response in
+/// a per-client named buffer; this reads and immediately deletes that buffer.
+fn take_window_name_buffer(buffer: &str) -> Result<String> {
+    if buffer.trim().is_empty() {
+        bail!("tmux buffer name cannot be empty");
+    }
+    let value = tmux_output(&["show-buffer", "-b", buffer])?;
+    tmux_status(&["delete-buffer", "-b", buffer])
+        .with_context(|| format!("delete consumed tmux buffer {buffer:?}"))?;
+    Ok(value.trim_end_matches(['\r', '\n']).to_string())
 }
 
 /// Report that this agent has finished its part, which is what opens an
@@ -1785,10 +2128,16 @@ fn sanitize_window_name(name: &str) -> String {
     sanitize_session_name(name)
 }
 
-fn normalize_window_name(raw: &str) -> Result<String> {
+/// Normalize a user-supplied name: whitespace to `-`, no control characters,
+/// bounded length. Shared with `watch`'s rename form so both entry points
+/// produce the same name for the same keystrokes.
+pub(crate) fn normalize_window_name(raw: &str) -> Result<String> {
     let value = metadata(raw, 64)?;
     if value.chars().any(char::is_control) {
         bail!("window name cannot contain control characters");
+    }
+    if value.contains("#{") || value.contains("#(") {
+        bail!("window name cannot contain tmux format expansions");
     }
     let mut normalized = String::new();
     for ch in value.chars() {
@@ -1950,6 +2299,115 @@ fn print_result(result: &ManageResult, json: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn view_session(
+        id: &str,
+        name: &str,
+        attached: u32,
+        group: Option<&str>,
+        destroy_unattached: bool,
+    ) -> ViewSession {
+        ViewSession {
+            id: id.into(),
+            name: name.into(),
+            attached,
+            group: group.map(str::to_string),
+            destroy_unattached,
+        }
+    }
+
+    #[test]
+    fn view_session_name_sorts_beside_the_session_it_mirrors() {
+        // `<session>~view~<pid>` rather than `view~<pid>~<session>`: the view
+        // lands next to its session in `list-sessions` and in watch's tree.
+        // Safe despite tmux's prefix matching because an exact name match wins
+        // — `-t callabo` resolves to `callabo`, not to this.
+        assert_eq!(
+            view_session_name("callabo", "1734560"),
+            "callabo~view~1734560"
+        );
+    }
+
+    #[test]
+    fn view_session_name_keeps_one_terminal_to_one_view() {
+        // The suffix is the client's pid, so the same terminal regrouping
+        // twice asks for the same name instead of leaving a trail of sessions
+        // behind every jump.
+        assert_eq!(
+            view_session_name("muxa", "42"),
+            view_session_name("muxa", "42")
+        );
+        assert_ne!(
+            view_session_name("muxa", "42"),
+            view_session_name("muxa", "43")
+        );
+    }
+
+    #[test]
+    fn canonical_view_source_survives_base_session_rename() {
+        let renamed = view_session("$99", "renamed", 2, Some("base"), false);
+        let later_view = view_session("$107", "base~view~42", 1, Some("base"), true);
+        let sessions = vec![later_view.clone(), renamed.clone()];
+
+        assert_eq!(canonical_view_source(&later_view, &sessions), renamed);
+    }
+
+    #[test]
+    fn orphaned_view_strips_one_view_suffix_without_nesting() {
+        let orphan = view_session("$107", "base~view~42", 2, Some("base"), true);
+        assert_eq!(view_name_base(&orphan), "base");
+        assert_eq!(
+            view_session_name(view_name_base(&orphan), "43"),
+            "base~view~43"
+        );
+
+        let leaked_orphan = view_session("$108", "base~view~44", 2, Some("base"), false);
+        assert_eq!(view_name_base(&leaked_orphan), "base");
+
+        let renamed_orphan = view_session("$109", "renamed~view~45", 2, Some("base"), false);
+        assert_eq!(view_name_base(&renamed_orphan), "renamed");
+        assert_eq!(
+            view_session_name(view_name_base(&renamed_orphan), "46"),
+            "renamed~view~46"
+        );
+
+        let renamed_base = view_session("$99", "renamed", 2, Some("base"), false);
+        assert_eq!(view_name_base(&renamed_base), "renamed");
+
+        let deliberate_name = view_session(
+            "$100",
+            "project~view~draft",
+            2,
+            Some("project~view~draft"),
+            false,
+        );
+        assert_eq!(view_name_base(&deliberate_name), "project~view~draft");
+    }
+
+    #[test]
+    fn reusable_view_does_not_take_over_another_clients_session() {
+        let source = view_session("$1", "base", 2, Some("base"), false);
+        let occupied = view_session("$2", "base~view~42", 1, Some("base"), true);
+        let sessions = vec![source.clone(), occupied.clone()];
+
+        assert!(reusable_view(&sessions, &occupied.name, &source, "$1").is_none());
+        assert_eq!(
+            reusable_view(&sessions, &occupied.name, &source, "$2"),
+            Some(&occupied)
+        );
+
+        let available = view_session("$3", "base~view~43", 0, Some("base"), false);
+        let sessions = vec![source.clone(), available.clone()];
+        assert_eq!(
+            reusable_view(&sessions, &available.name, &source, "$1"),
+            Some(&available)
+        );
+    }
+
+    #[test]
+    fn parse_view_session_refuses_a_malformed_attached_count() {
+        assert!(parse_view_session("$1\tbase\tnot-a-number\t\toff").is_err());
+    }
+
     #[test]
     fn workspace_and_work_ids_are_normalized_and_tmux_safe() {
         assert_eq!(normalize_workspace_id(" Muxa ").unwrap(), "muxa");
@@ -1972,6 +2430,8 @@ mod tests {
             "topology-watch"
         );
         assert!(normalize_window_name("\n").is_err());
+        assert!(normalize_window_name("#(printf hidden)").is_err());
+        assert!(normalize_window_name("#{session_name}").is_err());
     }
 
     #[test]

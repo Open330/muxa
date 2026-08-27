@@ -428,6 +428,9 @@ enum WorkspaceCmd {
     Show(tmux_work::WorkspaceShowArgs),
     /// Close a workspace session, including every work and agent.
     Close(tmux_work::WorkspaceCloseArgs),
+    /// Give this terminal its own view of a workspace, so two terminals on one
+    /// session stop following each other's window switches.
+    View(tmux_work::WorkspaceViewArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -588,6 +591,7 @@ fn run_workspace_cmd(action: WorkspaceCmd) -> Result<()> {
         WorkspaceCmd::List(args) => tmux_work::run_workspace_list(args),
         WorkspaceCmd::Show(args) => tmux_work::run_workspace_show(args),
         WorkspaceCmd::Close(args) => tmux_work::run_workspace_close(args),
+        WorkspaceCmd::View(args) => tmux_work::run_workspace_view(args),
     }
 }
 
@@ -3071,7 +3075,7 @@ mod tests {
     }
 
     #[test]
-    fn window_rename_cli_supports_explicit_and_automatic_names() {
+    fn window_rename_cli_supports_explicit_automatic_and_buffered_names() {
         let args = Args::try_parse_from([
             "muxa",
             "window",
@@ -3089,6 +3093,7 @@ mod tests {
             panic!("expected window rename");
         };
         assert_eq!(rename.name.as_deref(), Some("CAL-7175 auth refactor"));
+        assert!(rename.buffer.is_none());
         assert_eq!(rename.window.as_deref(), Some("@42"));
         assert!(!rename.auto);
         assert!(rename.json);
@@ -3105,6 +3110,25 @@ mod tests {
             "muxa", "window", "rename", "name", "--window", "@42", "--auto"
         ])
         .is_err());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "window",
+            "rename",
+            "--window",
+            "@42",
+            "--buffer",
+            "muxa-window-name-123",
+        ])
+        .unwrap();
+        let Cmd::Window {
+            action: WindowCmd::Rename(rename),
+        } = args.cmd
+        else {
+            panic!("expected buffered window rename");
+        };
+        assert_eq!(rename.buffer.as_deref(), Some("muxa-window-name-123"));
+        assert!(rename.name.is_none());
     }
 
     #[test]
