@@ -33,8 +33,8 @@ use muxa::adapters::{
     OpencodeAdapter,
 };
 use muxa::collaboration::{
-    AirArtifactReference, CollaborationClientKind, CollaborationOrigin, NewRequest, RequestKind,
-    RequestMailbox, RequestStatus, WorkMode,
+    AirArtifactReference, CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch,
+    NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
 };
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
@@ -1137,16 +1137,24 @@ fn print_collaboration_messages(
             } else {
                 format!("from {}", request.from.label())
             };
-            let provenance = request.provenance.as_ref().map_or_else(String::new, |p| {
-                let caller = p
-                    .observed_pane
-                    .as_deref()
-                    .map_or_else(|| "pane=?".into(), |pane| format!("pane={pane}"));
-                let pid = p
-                    .caller_pid
-                    .map_or_else(String::new, |pid| format!(" pid={pid}"));
-                format!("  [via {} {caller}{pid} {}]", p.client_kind, p.origin_match)
-            });
+            // Only when it is worth knowing. `matched` is every ordinary
+            // request, and printing the caller's pid and pane on each of them
+            // turns a mailbox into a debug log — which is what a first look at
+            // `muxa msg list` used to be.
+            let provenance = request
+                .provenance
+                .as_ref()
+                .filter(|p| p.origin_match != CollaborationOriginMatch::Matched)
+                .map_or_else(String::new, |p| {
+                    let caller = p
+                        .observed_pane
+                        .as_deref()
+                        .map_or_else(|| "pane=?".into(), |pane| format!("pane={pane}"));
+                    let pid = p
+                        .caller_pid
+                        .map_or_else(String::new, |pid| format!(" pid={pid}"));
+                    format!("  [via {} {caller}{pid} {}]", p.client_kind, p.origin_match)
+                });
             println!(
                 "{}  {:?}  {:?}  {}{}\n  {}",
                 request.id, request.status, request.kind, direction, provenance, request.body,
