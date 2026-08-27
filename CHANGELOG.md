@@ -145,6 +145,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `%1242` or `@claude2` is still a well-formed address for a different
   pane.
 
+### Changed
+
+- **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
+  release binary for the host into a temporary directory, verifies its
+  published SHA-256, runs the onboarding, and deletes it — a download, not an
+  install: no daemon, no config, no PATH entry. The embedded shell simulation
+  remains the fallback for `--no-download`, an unsupported platform, a missing
+  checksum tool, or no network, so the pipe-to-`sh` entry point keeps working
+  offline. The fallback was realigned to the real tour's step decomposition and
+  keys — the splits are one step, detach and reattach are two, pane movement
+  takes `→`, and the attention sort takes `Alt-T` (the macOS compose glyphs
+  `†`/`ˇ` included) rather than a stand-in `t`. `muxa onboard --emit
+  step-table` publishes the key each step waits for, derived by walking the
+  real gates, and `scripts/onboarding-parity.py` presses exactly those keys at
+  the fallback in CI so the two cannot drift apart again.
+
+### Fixed
+
+- **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
+  it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
+  so a terminal that composes Option instead of sending Meta — the macOS
+  default — could never satisfy it. The gate now also accepts the compose
+  glyph (`†`, `ˇ`), and two missed attempts surface the terminal
+  setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
+  `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
+  relayed through tmux or a slow pty could tear the tour down mid-step; both
+  the tour and the tmux track now confirm an `Esc` before quitting and
+  reassemble the split sequence. `scripts/onboard.sh` read one byte per key
+  and so quit on *every* arrow key; it now classifies the escape tail the same
+  way and accepts the real `Alt-T`.
+
 ## [0.8.35] - 2026-08-22
 
 ### Added

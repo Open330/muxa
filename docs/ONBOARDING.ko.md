@@ -71,6 +71,26 @@ tmux 구간과 watch 구간도 설명을 읽고 Enter만 누르는 방식이 아
 - `M`: mailbox 열기와 닫기
 - `q`: 온보딩 완료. 실제 watch에서도 종료 키
 
+macOS는 터미널이 Meta를 보내도록 설정하기 전까지 Option을 조합 키로 쓰기 때문에
+`Alt-T`가 `†`로 도착합니다. 온보딩은 이 조합 문자도 `Alt-T`로 인식하며, 두 번
+막히면 터미널 설정 안내와 함께 `→`로 건너뛸 수 있게 알려줍니다. 실제 watch에서
+`Alt` 조합을 쓰려면 `docs/WATCH.md`의 터미널 설정을 적용하세요.
+
+## 설치 없이 실행하기
+
+`scripts/onboard.sh`는 release 바이너리를 임시 디렉터리로 받아 SHA-256을 검증한
+뒤 진짜 `muxa onboard`를 실행하고, 끝나면 지웁니다. 설치가 아니라 다운로드라서
+daemon도 config도 PATH 항목도 남지 않습니다.
+
+네트워크가 없거나, 지원하지 않는 플랫폼이거나, `--no-download`를 주면 스크립트에
+내장된 shell simulation으로 넘어갑니다. 이 fallback은 실제 tour와 같은 20단계를
+같은 키로 진행하며, `muxa onboard --emit step-table`이 그 계약입니다.
+`scripts/onboarding-parity.py`가 CI에서 fallback을 이 계약에 맞춰 검증합니다.
+
+fallback은 단계와 키만 맞추고, 실제 tour의 mock watch 시뮬레이션(선택 이동에 따른
+tree 확장, 단계별 callout 배치, `F2` 언어 전환, 뒤로 가기)까지 재현하지는
+않습니다.
+
 shell 명령은 실제 tmux 진입과 재접속에 필요한 `tmux new-session`과
 `tmux attach` 두 개만 직접 입력합니다. Muxa의 긴 work/agent 명령은 따라 치지
 않으며, `n`으로 form을 열고 위치와 조작 키를 확인한 다음 `Esc`를 누르면 바로
