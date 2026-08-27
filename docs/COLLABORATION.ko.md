@@ -112,7 +112,7 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 
 - 같은 `(tmux socket, stable window id)`를 공유하는 agent가 한 room입니다.
 - agent가 정확히 둘이면 상대를 `peer`로 지정할 수 있습니다.
-- 셋 이상이면 `%12` 또는 `pane:%12`처럼 pane을 명시합니다.
+- 셋 이상이면 `@claude`처럼 handle로, 없으면 `%12` / `pane:%12`로 지정합니다.
 - identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
 - `scope = "window"`에서는 다른 window의 pane을 거부합니다. `scope = "host"`는
   명시적 `pane:%12` 대상을 다른 window/session까지 넓힙니다.
@@ -126,10 +126,25 @@ muxa peers
 muxa peers --json
 ```
 
+## 기본 handle
+
+agent pane은 아무도 이름을 붙이지 않아도 handle을 하나 받습니다. room에서 그
+런타임의 첫 agent가 `@claude`, `@codex`, `@gemini`, `@agy`, `@opencode`가 되고
+같은 종류의 두 번째가 `@claude2`가 됩니다. session의 첫 hook 이벤트에서 부여되며, pane 옵션 `@muxa_agent_alias`에
+저장되어 muxad·CLI·agent 재시작보다 오래 남습니다.
+
+handle 발급은 전부 daemon이 합니다. pane 옵션·등록된 identity·아직 기록되지
+않은 예약까지 room 전체를 보는 유일한 지점이고, 그보다 좁은 시야에서 할당하면
+한 room이 `@claude`에 두 번 응답하게 됩니다. explicit alias도 stamp 전에 여기
+등록합니다. daemon에 닿지 못하면 이름을 붙이지 않고 `%1242`로 남깁니다.
+
+이미 이름이 있는 pane은 건드리지 않으므로 pipeline alias나 직접 지정한 이름이
+우선합니다. `muxa peek`은 각 pane 헤더에 pane id와 함께 handle을 표시합니다.
+
 ## Agent identity
 
 pane이 셋 이상인 room에서는 각 agent가 의미 있는 alias와 role을 등록할 수
-있습니다. identity는 pane이 아니라 현재 agent session에 고정되므로 pane을 새
+있습니다. 등록한 이름은 기본 handle을 덮어씁니다. identity는 pane이 아니라 현재 agent session에 고정되므로 pane을 새
 agent가 재사용해도 이전 이름이나 역할을 상속하지 않습니다.
 
 ```bash

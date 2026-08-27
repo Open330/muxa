@@ -826,6 +826,70 @@ pub async fn run_work_done(args: WorkDoneArgs, client: &muxa::ipc::Client) -> Re
     Ok(())
 }
 
+/// Give `pane` a room-local handle if nothing has named it yet. Returns the
+/// alias the pane now answers to, or `None` when it already had one or the
+/// room has no free name left.
+///
+/// The addressing vocabulary was never what was missing — `resolve_target`
+/// has understood `@alias` for as long as collaboration has existed. What
+/// was missing is that nothing *minted* one: an alias appeared only if
+/// `muxa work up` stamped a pipeline name or the agent called
+/// `muxa identity set` on itself, which an agent started by hand never
+/// does. So in practice every peer call fell back to `%1242` — unique,
+/// correct, and unreadable. You cannot tell which pane it is without
+/// asking tmux, and you certainly cannot remember it between two calls.
+///
+/// The name goes on the pane rather than into the daemon, for the same
+/// reason the pipeline alias does: it has to outlive muxad, this CLI
+/// process, and the agent restarting in place, so the *slot* keeps its
+/// name across all three. It dies with the pane, which is exactly right —
+/// a handle is worth keeping only while the thing it addresses exists.
+/// Budget for registering an explicit alias. A launch must not stall on a
+/// wedged daemon; past this the name is written unrefereed.
+const RESERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether anything has already named `pane`.
+///
+/// One tmux call, and the answer for every session start after the first —
+/// which is why it comes before asking the daemon for anything.
+pub fn pane_is_named(pane: &str) -> Result<bool> {
+    validate_pane_id(pane)?;
+    Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.is_some())
+}
+
+/// Write a handle the room's arbiter issued onto `pane`, but only if nothing
+/// has named it. Returns the name the pane ends up answering to, or `None`
+/// when somebody else got there first.
+///
+/// The daemon decides *which* name; this only writes it, and the write stays
+/// conditional because the daemon is not the only writer of a pane option.
+/// `agent_launch::start` launches the agent — which fires its session-start
+/// hook immediately — and only then stamps a pipeline's explicit alias, so a
+/// hook that read "unnamed" before that stamp landed would overwrite a
+/// `review` with a `claude`.
+///
+/// `set-option -o` refuses an option that is already set, which settles both
+/// orders in the pipeline's favour without either side coordinating: an
+/// explicit alias landing first makes this a no-op, and one landing second
+/// overwrites it with a plain set. `-q` keeps tmux's "already set" message
+/// off the agent's stderr, which also makes the exit status the same either
+/// way — so the pane option itself is the verdict, read back rather than
+/// inferred from a status whose shape is tmux's business.
+pub fn claim_alias(pane: &str, alias: &str) -> Result<Option<String>> {
+    validate_pane_id(pane)?;
+    tmux_status(&[
+        "set-option",
+        "-p",
+        "-o",
+        "-q",
+        "-t",
+        pane,
+        AGENT_ALIAS_OPTION,
+        alias,
+    ])?;
+    Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.filter(|held| held == alias))
+}
+
 fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
     let raw = tmux_output(&["display-message", "-p", "-t", pane, &format!("#{{{key}}}")])?;
     Ok(option(raw.trim()))
@@ -1558,12 +1622,20 @@ pub fn mark_agent(
         )?;
     }
     if let Some(alias) = alias.filter(|value| !value.trim().is_empty()) {
-        set_option(
-            OptionScope::Pane,
+        let alias = metadata(alias, 64)?;
+        // Register it with the room's arbiter before writing, so a handle
+        // being minted for another pane at this moment cannot be handed the
+        // same name. The write itself stays unconditional: an explicit alias
+        // comes from the user's configuration and outranks anything muxa
+        // minted for the slot.
+        muxa::ipc::blocking_reserve_handle(
+            &muxa::paths::default_socket(),
             pane,
-            AGENT_ALIAS_OPTION,
-            &metadata(alias, 64)?,
-        )?;
+            &alias,
+            RESERVE_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
     }
     if let Some(generation) = generation {
         set_option(

@@ -16921,6 +16921,7 @@ mod tests {
             height: 20,
             active: true,
             command: "codex".into(),
+            alias: None,
         };
         let right = PaneGeometry {
             pane_id: "%2".into(),
@@ -16931,6 +16932,7 @@ mod tests {
             height: 20,
             active: false,
             command: "codex".into(),
+            alias: None,
         };
         let area = Rect::new(10, 4, 80, 12);
 
@@ -16967,6 +16969,7 @@ mod tests {
                         height: 20,
                         active: true,
                         command: "codex".into(),
+                        alias: None,
                     },
                     text: Some(Text::from("LEFT CAPTURE")),
                 },
@@ -16980,6 +16983,7 @@ mod tests {
                         height: 20,
                         active: false,
                         command: "codex".into(),
+                        alias: None,
                     },
                     text: Some(Text::from("RIGHT CAPTURE")),
                 },
@@ -17027,6 +17031,7 @@ mod tests {
                     height: 30,
                     active: true,
                     command: "codex".into(),
+                    alias: None,
                 },
                 text: Some(Text::from("SHOULD USE ROSTER WHEN TOO SHORT")),
             }],

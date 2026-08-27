@@ -635,6 +635,12 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         crate::tmux_work::cleanup_pane(&pane);
         return Err(error).context("record muxa tmux metadata");
     }
+    // Minting belongs to the agent's session-start hook, which reaches the
+    // room's arbiter. Doing it here too would allocate from a namespace this
+    // process cannot see all of — the bug the arbiter exists to close — so an
+    // unaliased launch reports no handle and the hook names the pane a moment
+    // later.
+    let alias = request.alias;
 
     Ok(StartResult {
         host: LaunchHost::Tmux,
@@ -650,7 +656,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         window,
         role: request.role,
         task: request.task,
-        alias: request.alias,
+        alias,
         cwd,
         prompt_supplied: prompt.is_some(),
     })

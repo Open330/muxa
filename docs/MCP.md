@@ -85,7 +85,7 @@ Hand-rolled JSON-RPC 2.0 over stdio — a **tools-only** server implementing
 `initialize`, `tools/list`, `tools/call`, `ping`, and the `initialized`
 notification. That subset is small and stable, so muxa implements it directly
 on its existing `serde_json`/`tokio` deps rather than pulling the `rmcp` SDK's
-dependency tree (which would have to clear MSRV 1.88 and the workspace's
+dependency tree (which would have to clear MSRV 1.89 and the workspace's
 cargo-deny policy). No new dependencies. Protocol revision: `2024-11-05`.
 
 ### Concurrency and framing

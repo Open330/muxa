@@ -32,6 +32,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a Work Run under muxa's model, so naming it after whatever process is
   running in it overwrites the Work with `node` or `claude` the moment an agent
   starts.
+- **Minimum supported Rust is now 1.89.** Nothing in the tree requires it
+  today; the floor moves so future work can reach for stabilized std APIs
+  without the design bending around an old one. Raised while the project is
+  young enough for the cost to be small.
+- **The daemon arbitrates a room's handle namespace.** A room-local handle
+  had three writers — the `@muxa_agent_alias` pane option, a launcher's
+  explicit alias, and a registered identity — each enforcing its own rule
+  against its own view, so every ordering between them produced a different
+  way for one room to answer to `@claude` twice. The daemon is the only
+  place that sees all three, so allocation now goes through it via
+  `collaboration_issue_handle` (local IPC protocol 6, capability
+  `handle_namespace_v1`), which also tracks handles promised to callers that
+  have not written them yet. Lifetimes are unchanged: a handle still lives
+  on the pane option and outlives the agent restarting in place, while a
+  registered identity still belongs to one agent session. Without a daemon
+  to referee, a pane stays unnamed rather than being named from a partial
+  view.
+- **Every agent pane gets a handle, so peers are addressable by name rather
+  than by `%1242`.** The first agent of a runtime in a room becomes
+  `@claude` / `@codex` / `@gemini` / `@agy` / `@opencode`, a second of the
+  same kind becomes `@claude2`, and so on. muxa mints it on the session's
+  first hook event — the one installed by `muxa init` — and immediately for
+  a pane `muxa agent start` opened, which also reports it in `--json`. The
+  name is stored on the pane as `@muxa_agent_alias` so the slot keeps it
+  across muxad, CLI, and agent restarts, and a pane that already carries a
+  pipeline or hand-set alias is never renamed. `resolve_target` has always
+  understood `@alias`; what was missing was anything that minted one.
+  Allocation runs under a per-room file lock, because the claim is a
+  read-modify-write over a shared namespace and tmux user options have no
+  compare-and-set — re-checking after the write cannot close that, since the
+  pane writing second can finish its check before the first write lands. The
+  claim itself goes through `set-option -o`, so a pipeline's explicit alias
+  wins whichever side of it the minting lands on.
 
 ### Changed
 
@@ -70,6 +103,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `/` skills with in-watch add/remove, and mailbox claim/reply. Remote
   collaboration stays owned by the selected node and travels over the existing
   exact-pane SSH relay behind an explicit capability gate.
+- **`muxa peek` names each pane by its handle and its tmux id.** The
+  `prefix + q` overlay now prints `@claude %1242` in every pane's header,
+  next to the jump digit — the digit addresses the pane inside peek, but
+  peer calls, `muxa send`, and raw tmux are addressed by the other two, and
+  peek is where you are already looking to work out which pane is which. A
+  narrow box gives up the pane id before the handle and the runtime name
+  before either, dropping each rather than clipping it: a truncated
+  `%1242` or `@claude2` is still a well-formed address for a different
+  pane.
 
 ## [0.8.35] - 2026-08-22
 
