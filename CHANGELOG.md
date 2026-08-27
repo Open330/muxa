@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--no-quiz` offers that from the first step; and skipping performs whatever
   the learner would have done, so Act II still has a session to put its agents
   in. The first step prints its instruction rather than painting it, because
-  nobody is attached to a status bar yet.
+  nobody is attached to a status bar yet. `F2` switches the narration language
+  mid-tour, as the simulation's footer did.
 
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a

@@ -58,6 +58,9 @@ const SKIP_AFTER: Duration = Duration::from_secs(45);
 /// in the same place.
 const SKIP_OPTION: &str = "@muxa-onboarding-skip";
 
+/// Same mechanism for the language toggle the simulation had on `F2`.
+const LANGUAGE_OPTION: &str = "@muxa-onboarding-language";
+
 const SANDBOX_CONFIG: &str = "\
 [discovery]
 enabled = false
@@ -379,22 +382,41 @@ impl Sandbox {
         self.tmux_command(&["set", "-g", "status-position", "top"])?;
         self.tmux_command(&["set", "-g", "status-style", "bg=#0b1220,fg=#c9d1d9"])?;
         self.tmux_command(&["set", "-g", "status-interval", "2"])?;
-        // Root table, so it needs no prefix and cannot be confused with typing.
+        // Root table, so they need no prefix and cannot be confused with typing.
         self.tmux_command(&["bind-key", "-n", "F12", "set", "-g", SKIP_OPTION, "1"])?;
+        self.tmux_command(&["bind-key", "-n", "F2", "set", "-g", LANGUAGE_OPTION, "1"])?;
         Ok(())
     }
 
-    fn skip_requested(&self) -> bool {
-        if self.tmux_quiet(&["show", "-gv", SKIP_OPTION]) != "1" {
+    /// Reads the flag and clears it, so one keypress is one request.
+    fn consume_flag(&self, option: &str) -> bool {
+        if self.tmux_quiet(&["show", "-gv", option]) != "1" {
             return false;
         }
-        let _ = self.tmux_command(&["set", "-gu", SKIP_OPTION]);
+        let _ = self.tmux_command(&["set", "-gu", option]);
         true
     }
 
-    fn narrate(&self, index: usize, total: usize, title: &str, cue: &str, escape: Option<&str>) {
+    fn skip_requested(&self) -> bool {
+        self.consume_flag(SKIP_OPTION)
+    }
+
+    fn language_toggled(&self) -> bool {
+        self.consume_flag(LANGUAGE_OPTION)
+    }
+
+    fn narrate(
+        &self,
+        index: usize,
+        total: usize,
+        title: &str,
+        cue: &str,
+        escape: Option<&str>,
+        other_language: &str,
+    ) {
         let banner = format!(
-            "#[align=centre bg=#1f6feb,fg=#0b1220,bold] muxa onboarding · {index}/{total} #[default]"
+            "#[align=centre bg=#1f6feb,fg=#0b1220,bold] muxa onboarding · {index}/{total} \
+             #[default]#[fg=#8b949e]  F2 {other_language}"
         );
         let title = format!("#[align=centre]{title}");
         let cue = match escape {
@@ -674,6 +696,7 @@ const ACT_TWO_START: usize = 4;
 
 struct Tour<'a> {
     sandbox: &'a Sandbox,
+    /// Mutable: `F2` switches it mid-tour, the way the simulation's footer did.
     language: UiLanguage,
     fleet: Option<Fleet>,
     /// `--no-quiz` does not remove the steps — there is nothing to remove, the
@@ -834,8 +857,19 @@ impl Tour<'_> {
             )
         });
 
-        self.sandbox
-            .narrate(index + 1, STEPS.len(), title, cue, hint);
+        self.sandbox.narrate(
+            index + 1,
+            STEPS.len(),
+            title,
+            cue,
+            hint,
+            // Named in the language it switches *to*, so it reads as an offer
+            // rather than a label for where you already are.
+            match self.language {
+                UiLanguage::En => "한국어",
+                UiLanguage::Ko => "English",
+            },
+        );
 
         // The status bar only exists for someone attached to the server, and
         // the first step is the one where they are not — they are at a bare
@@ -886,6 +920,14 @@ impl Tour<'_> {
                     self.on_enter(index)?;
                     self.narrate(index, offered_escape);
                 }
+                continue;
+            }
+            if self.sandbox.language_toggled() {
+                self.language = match self.language {
+                    UiLanguage::En => UiLanguage::Ko,
+                    UiLanguage::Ko => UiLanguage::En,
+                };
+                self.narrate(index, offered_escape);
                 continue;
             }
             if self.sandbox.skip_requested() {

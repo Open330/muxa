@@ -116,6 +116,10 @@ def cue() -> str:
     return tmux("show", "-g", "status-format[2]").stdout
 
 
+def title_row() -> str:
+    return tmux("show", "-g", "status-format[1]").stdout.strip()
+
+
 def wait_step(terminal: Terminal, target: int, timeout: float = 60) -> bool:
     end = time.time() + timeout
     while time.time() < end:
@@ -178,6 +182,17 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
         # that it is a plain command.
         terminal.type(b"tmux new-session -s muxa-onboarding\r", 4)
         report.check("step 1 done for real", wait_step(terminal, 2), f"step={step()}")
+
+        # F2 was the simulation's language switch; losing it in the live tour
+        # would be a regression for anyone who starts in the wrong one.
+        before = title_row()
+        terminal.type(b"\x1bOQ", 2)  # F2
+        after = title_row()
+        report.check("F2 switches the narration language", before != after and after != "",
+                     f"{before!r} -> {after!r}")
+        terminal.type(b"\x1bOQ", 2)
+        report.check("F2 switches it back", title_row() == before,
+                     f"{title_row()!r} != {before!r}")
 
         target = 3
         while target <= len(STEPS_TOTAL):
