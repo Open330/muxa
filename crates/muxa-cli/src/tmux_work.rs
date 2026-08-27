@@ -826,6 +826,131 @@ pub async fn run_work_done(args: WorkDoneArgs, client: &muxa::ipc::Client) -> Re
     Ok(())
 }
 
+/// Longest alias muxa will mint before giving up, and the widest base it
+/// will build one from. The collaboration store caps an alias at 32 bytes
+/// (`valid_identity_token`), so a base is trimmed with room left for the
+/// collision suffix rather than minting a name the daemon would reject.
+const DEFAULT_ALIAS_BASE_MAX: usize = 28;
+/// How many `claude`, `claude2`, `claude3`… candidates to try. A room with
+/// 64 agents of one kind is not a room; this is a loop bound, not a policy.
+const DEFAULT_ALIAS_TRIES: usize = 64;
+
+/// Give `pane` a room-local handle if nothing has named it yet. Returns the
+/// alias the pane now answers to, or `None` when it already had one or the
+/// room has no free name left.
+///
+/// The addressing vocabulary was never what was missing — `resolve_target`
+/// has understood `@alias` for as long as collaboration has existed. What
+/// was missing is that nothing *minted* one: an alias appeared only if
+/// `muxa work up` stamped a pipeline name or the agent called
+/// `muxa identity set` on itself, which an agent started by hand never
+/// does. So in practice every peer call fell back to `%1242` — unique,
+/// correct, and unreadable. You cannot tell which pane it is without
+/// asking tmux, and you certainly cannot remember it between two calls.
+///
+/// The name goes on the pane rather than into the daemon, for the same
+/// reason the pipeline alias does: it has to outlive muxad, this CLI
+/// process, and the agent restarting in place, so the *slot* keeps its
+/// name across all three. It dies with the pane, which is exactly right —
+/// a handle is worth keeping only while the thing it addresses exists.
+pub fn ensure_default_alias(pane: &str, base: &str) -> Result<Option<String>> {
+    validate_pane_id(pane)?;
+    // The overwhelmingly common case: a pane that was named the first time
+    // its agent started, on every session start since. One tmux call, out.
+    if pane_option(pane, AGENT_ALIAS_OPTION)?.is_some() {
+        return Ok(None);
+    }
+    let window = window_id_for_pane(pane)?;
+    let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
+        return Ok(None);
+    };
+    set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
+
+    // Two agents starting in one window at the same moment both read an
+    // empty room and both pick `claude`. tmux user options have no
+    // compare-and-set, so the race is settled after the fact instead:
+    // re-read, and the pane tmux numbered later yields. An ambiguous
+    // `@claude` only ever refuses a peer call rather than misrouting it,
+    // but a refusal the user has to go debug is still a defect.
+    let contested = aliases_besides(&window, pane)?.iter().any(|(other, name)| {
+        name.eq_ignore_ascii_case(&alias) && pane_ordinal(other) < pane_ordinal(pane)
+    });
+    if !contested {
+        return Ok(Some(alias));
+    }
+    let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
+        return Ok(None);
+    };
+    set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
+    Ok(Some(alias))
+}
+
+/// `(pane id, alias)` for every *other* pane in `window` that carries one.
+fn aliases_besides(window: &str, pane: &str) -> Result<Vec<(String, String)>> {
+    let raw = tmux_output(&[
+        "list-panes",
+        "-t",
+        window,
+        "-F",
+        "#{pane_id}\t#{@muxa_agent_alias}",
+    ])?;
+    Ok(parse_window_aliases(&raw, pane))
+}
+
+fn parse_window_aliases(raw: &str, pane: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| {
+            let (other, alias) = line.split_once('\t')?;
+            let (other, alias) = (other.trim(), alias.trim());
+            (other != pane && !alias.is_empty()).then(|| (other.to_string(), alias.to_string()))
+        })
+        .collect()
+}
+
+/// `claude`, then `claude2`, `claude3`… — the first name in the series the
+/// room is not already using.
+///
+/// The first agent of a kind gets the bare name deliberately. A room
+/// usually holds one of each, `@claude` is what people actually type, and
+/// the MCP instructions already tell agents to route by exactly that name.
+/// Numbering only on collision keeps the common case memorable instead of
+/// making everyone track whether they are 1 or 2.
+fn pick_default_alias(base: &str, taken: &[(String, String)]) -> Option<String> {
+    let base = sanitize_alias_base(base)?;
+    (1..=DEFAULT_ALIAS_TRIES).find_map(|n| {
+        let candidate = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}{n}")
+        };
+        taken
+            .iter()
+            .all(|(_, name)| !name.eq_ignore_ascii_case(&candidate))
+            .then_some(candidate)
+    })
+}
+
+/// Reduce an agent-kind label to something `valid_identity_token` accepts,
+/// so a name muxa mints is never one the collaboration store then refuses.
+fn sanitize_alias_base(base: &str) -> Option<String> {
+    let mut cleaned: String = base
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .collect();
+    cleaned.truncate(DEFAULT_ALIAS_BASE_MAX);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// tmux hands out pane ids monotonically, so the numeric part orders two
+/// panes by which existed first. Unparseable ids sort last, which keeps an
+/// unexpected id shape from winning a contest it should lose.
+fn pane_ordinal(pane: &str) -> u64 {
+    pane.strip_prefix('%')
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
 fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
     let raw = tmux_output(&["display-message", "-p", "-t", pane, &format!("#{{{key}}}")])?;
     Ok(option(raw.trim()))
@@ -2595,5 +2720,86 @@ mod tests {
         assert!(validate_pane_id("%42").is_ok());
         assert!(validate_pane_id("42").is_err());
         assert!(validate_pane_id("%4x").is_err());
+    }
+
+    fn taken(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(pane, alias)| ((*pane).to_string(), (*alias).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_first_agent_of_a_kind_gets_the_bare_name() {
+        // `@claude` is what people type and what the MCP instructions
+        // already tell agents to route by; numbering it `claude1` from the
+        // start would make the common case the awkward one.
+        assert_eq!(pick_default_alias("claude", &[]).unwrap(), "claude");
+    }
+
+    #[test]
+    fn a_second_agent_of_a_kind_is_numbered_from_two() {
+        let room = taken(&[("%1", "claude")]);
+        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude2");
+        let room = taken(&[("%1", "claude"), ("%2", "claude2")]);
+        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude3");
+    }
+
+    #[test]
+    fn a_freed_name_is_reused_rather_than_left_as_a_hole() {
+        // Aliases die with their panes, so `claude` going away means the
+        // next agent is `claude`, not `claude3` forever.
+        let room = taken(&[("%2", "claude2")]);
+        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude");
+    }
+
+    #[test]
+    fn a_name_taken_by_another_kind_is_still_taken() {
+        // Aliases share one namespace per room: `resolve_target` matches on
+        // the name alone, so a codex pane already called `claude` (renamed
+        // by hand, say) has to push the real claude to `claude2`.
+        let room = taken(&[("%1", "CLAUDE")]);
+        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude2");
+    }
+
+    #[test]
+    fn minted_names_are_ones_the_collaboration_store_accepts() {
+        // `valid_identity_token`: 1-32 of [alnum . _ -].
+        let long = "a".repeat(80);
+        let alias = pick_default_alias(&long, &[]).unwrap();
+        assert!(alias.len() <= DEFAULT_ALIAS_BASE_MAX);
+        assert_eq!(sanitize_alias_base("Claude Code!").unwrap(), "claudecode");
+        assert_eq!(sanitize_alias_base(" \t "), None);
+    }
+
+    #[test]
+    fn a_full_room_mints_nothing_rather_than_looping() {
+        let room: Vec<(String, String)> = (1..=DEFAULT_ALIAS_TRIES + 1)
+            .map(|n| {
+                let alias = if n == 1 {
+                    "claude".to_string()
+                } else {
+                    format!("claude{n}")
+                };
+                (format!("%{n}"), alias)
+            })
+            .collect();
+        assert_eq!(pick_default_alias("claude", &room), None);
+    }
+
+    #[test]
+    fn window_aliases_skip_our_own_pane_and_the_unnamed() {
+        let raw = "%1\tclaude\n%2\t\n%3\treviewer\n";
+        assert_eq!(
+            parse_window_aliases(raw, "%1"),
+            taken(&[("%3", "reviewer")]),
+            "our own row and the empty one are both dropped"
+        );
+    }
+
+    #[test]
+    fn pane_ordinal_orders_by_age_and_sorts_junk_last() {
+        assert!(pane_ordinal("%9") < pane_ordinal("%10"));
+        assert!(pane_ordinal("%10") < pane_ordinal("nonsense"));
     }
 }

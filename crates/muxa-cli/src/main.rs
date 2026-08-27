@@ -2052,6 +2052,41 @@ async fn best_effort_ingest(client: &Client, ev: &muxa::event::AgentEvent) {
     }
 }
 
+/// Name the agent's pane the first time a session starts in it, so it is
+/// addressable as `@claude` rather than only as `%1242`.
+///
+/// Gated on `Started` — the one hook event that fires once per session —
+/// because everything else on this path fires per tool call, and a tmux
+/// round-trip per tool call is a tax on the agent's critical path for a
+/// fact that cannot have changed.
+///
+/// Best-effort like the ingest above, and for a stronger reason: this runs
+/// inside the agent's own hook, where a non-zero exit is the agent's
+/// problem. A pane stuck with `%1242` as its only handle is a worse
+/// interface, not a broken agent.
+fn best_effort_default_alias(ev: &muxa::event::AgentEvent) {
+    let muxa::event::AgentEvent::Started { id, .. } = ev else {
+        return;
+    };
+    // `Task` rows are pid-tracked subagents rather than panes, and an
+    // unrecognised runtime has no name worth minting from.
+    if matches!(id.kind, AgentKind::Task | AgentKind::Unknown) {
+        return;
+    }
+    let Some(pane) = id
+        .pane
+        .clone()
+        .or_else(|| muxa::default_backend().current_pane())
+    else {
+        return;
+    };
+    match tmux_work::ensure_default_alias(&pane, watch::agent_kind_short(id.kind)) {
+        Ok(Some(alias)) => tracing::debug!(pane, alias, "named pane"),
+        Ok(None) => {}
+        Err(e) => tracing::debug!(error = %e, pane, "could not name pane"),
+    }
+}
+
 /// Spawn `cmd` via `/bin/sh -c`, feed it `stdin_bytes`, stream its stdout to
 /// our stdout, and return its exit code (128 + signal if killed by signal).
 fn run_forward(cmd: &str, stdin_bytes: &[u8]) -> Result<i32> {
@@ -2100,6 +2135,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(&ev);
         }
         HookCmd::ClaudeStatusline { forward } => {
             if let Some(cmd) = forward {
@@ -2149,10 +2185,12 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Codex { event } => {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(&ev);
         }
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(&ev);
         }
         HookCmd::Agy { event } => {
             // FAIL-OPEN, and deliberately unlike the other hook arms.
@@ -2164,13 +2202,17 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             // change in a future agy, a truncated stdin — is logged and
             // swallowed rather than propagated to a non-zero exit.
             match run_hook::<AntigravityAdapter, _>(&event, &mut std::io::stdin()) {
-                Ok(ev) => best_effort_ingest(client, &ev).await,
+                Ok(ev) => {
+                    best_effort_ingest(client, &ev).await;
+                    best_effort_default_alias(&ev);
+                }
                 Err(e) => tracing::debug!(error = %e, event, "agy hook payload ignored"),
             }
         }
         HookCmd::Opencode { event } => {
             let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(&ev);
         }
     }
     Ok(())

@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a Work Run under muxa's model, so naming it after whatever process is
   running in it overwrites the Work with `node` or `claude` the moment an agent
   starts.
+- **Every agent pane gets a handle, so peers are addressable by name rather
+  than by `%1242`.** The first agent of a runtime in a room becomes
+  `@claude` / `@codex` / `@gemini` / `@agy` / `@opencode`, a second of the
+  same kind becomes `@claude2`, and so on. muxa mints it on the session's
+  first hook event — the one installed by `muxa init` — and immediately for
+  a pane `muxa agent start` opened, which also reports it in `--json`. The
+  name is stored on the pane as `@muxa_agent_alias` so the slot keeps it
+  across muxad, CLI, and agent restarts, and a pane that already carries a
+  pipeline or hand-set alias is never renamed. `resolve_target` has always
+  understood `@alias`; what was missing was anything that minted one.
 
 ### Changed
 
@@ -70,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `/` skills with in-watch add/remove, and mailbox claim/reply. Remote
   collaboration stays owned by the selected node and travels over the existing
   exact-pane SSH relay behind an explicit capability gate.
+- **`muxa peek` names each pane by its handle and its tmux id.** The
+  `prefix + q` overlay now prints `@claude %1242` in every pane's header,
+  next to the jump digit — the digit addresses the pane inside peek, but
+  peer calls, `muxa send`, and raw tmux are addressed by the other two, and
+  peek is where you are already looking to work out which pane is which. A
+  narrow box gives up the pane id before the handle and the runtime name
+  before either, dropping each rather than clipping it: a truncated
+  `%1242` or `@claude2` is still a well-formed address for a different
+  pane.
 
 ## [0.8.35] - 2026-08-22
 
