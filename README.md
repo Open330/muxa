@@ -20,7 +20,10 @@ status line, a live TUI, desktop notifications, and local reports.
 
 ## Try Muxa onboarding before reading
 
-Launch the complete fullscreen tour—no Muxa binary download or installation:
+Launch the complete fullscreen tour. The script runs the real `muxa onboard`
+from a temporary copy of the release binary — checksum-verified, deleted on
+exit, nothing installed — and falls back to an equivalent shell simulation
+when that is unavailable (`--no-download` forces the fallback):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh

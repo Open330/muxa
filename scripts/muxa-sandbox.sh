@@ -37,7 +37,6 @@ MUXA_BIN=
 TMUX_BIN=
 TMUX_CONFIG=
 ALLOW_INSIDE_TMUX=0
-KEEP_HOLDER=0
 EXTRA_PATHS=()
 
 HOLDER_SESSION=_sandbox
@@ -63,7 +62,6 @@ Options:
   --tmux-config <path>  tmux config for the sandbox server; /dev/null for none
   --extra-path <dir>    Prepend to the sandbox PATH; repeatable
   --allow-inside-tmux   Permit `up` while $TMUX is set
-  --keep-holder         Leave the placeholder session alive after `up`
   -h, --help            Show this help
 USAGE
 }
@@ -102,27 +100,31 @@ while [ "$#" -gt 0 ]; do
     --extra-path) [ "$#" -ge 2 ] || die '--extra-path needs a directory'; EXTRA_PATHS+=("$2"); shift 2 ;;
     --extra-path=*) EXTRA_PATHS+=("${1#--extra-path=}"); shift ;;
     --allow-inside-tmux) ALLOW_INSIDE_TMUX=1; shift ;;
-    --keep-holder) KEEP_HOLDER=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
 
-# `down` rm -rf's these paths, so the name they are built from is validated
-# rather than trusted. Anything outside this alphabet — a slash, a `..`, an
-# empty string — would aim the cleanup somewhere it has no business being.
+# `down` recursively removes two directories below an owned root, so the name
+# that root is built from is validated rather than trusted. Anything outside
+# this alphabet — a slash, a `..`, an empty string — would aim cleanup somewhere
+# it has no business being.
 [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] \
   || die "invalid --name '$NAME' (expected lowercase letters, digits and dashes)"
 
-SB_SOCKET=/tmp/$NAME.sock
-SB_CONFIG=/tmp/$NAME-config.toml
-SB_DATA=/tmp/$NAME-data
-SB_SHIM=/tmp/$NAME-shim
-SB_PID=/tmp/$NAME.pid
-SB_LOG=/tmp/$NAME-muxad.log
+SB_ROOT=/tmp/$NAME-sandbox
+SB_OWNER=$SB_ROOT/.owner
+SB_SOCKET=$SB_ROOT/muxad.sock
+SB_CONFIG=$SB_ROOT/config.toml
+SB_DATA=$SB_ROOT/data
+SB_SHIM=$SB_ROOT/shim
+SB_PID=$SB_ROOT/muxad.pid
+SB_LOG=$SB_ROOT/muxad.log
+SB_TMUX_SOCKET=$SB_ROOT/tmux.sock
 # Recorded at `up` so `env` reproduces the same PATH without the caller
 # having to repeat --extra-path on every invocation.
-SB_EXTRA=/tmp/$NAME-shim/.extra-path
+SB_EXTRA=$SB_SHIM/.extra-path
+OWNER_MARK="muxa-sandbox-v1:$NAME"
 
 resolve_bins() {
   if [ -z "$MUXAD_BIN" ]; then
@@ -141,13 +143,13 @@ resolve_bins() {
   fi
 }
 
-# `-f` is recorded at `up` so later commands — and `env` consumers — reach the
-# same server the same way.
+# `-f` affects server creation; the explicit socket keeps every later command
+# on that same server even if TMUX_TMPDIR changes.
 tm() {
   if [ -n "$TMUX_CONFIG" ]; then
-    "$TMUX_BIN" -u -f "$TMUX_CONFIG" -L "$NAME" "$@"
+    "$TMUX_BIN" -u -f "$TMUX_CONFIG" -S "$SB_TMUX_SOCKET" "$@"
   else
-    "$TMUX_BIN" -u -L "$NAME" "$@"
+    "$TMUX_BIN" -u -S "$SB_TMUX_SOCKET" "$@"
   fi
 }
 
@@ -155,12 +157,28 @@ tm() {
 # status / down
 # --------------------------------------------------------------------------
 
+owned_sandbox() {
+  [ -d "$SB_ROOT" ] && [ ! -L "$SB_ROOT" ] \
+    && [ -f "$SB_OWNER" ] && [ ! -L "$SB_OWNER" ] \
+    && [ "$(cat "$SB_OWNER" 2>/dev/null)" = "$OWNER_MARK" ]
+}
+
+daemon_belongs_to_sandbox() {
+  local pid=$1 process_command
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  process_command=$(ps -ww -o command= -p "$pid" 2>/dev/null) || return 1
+  case " $process_command " in
+    *" --config $SB_CONFIG "* | *" --config=$SB_CONFIG "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 daemon_pid() {
   [ -f "$SB_PID" ] || return 1
   local pid
   pid=$(cat "$SB_PID" 2>/dev/null) || return 1
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  daemon_belongs_to_sandbox "$pid" || return 1
   printf '%s' "$pid"
 }
 
@@ -169,15 +187,14 @@ server_running() {
   [ -n "$TMUX_BIN" ] && tm list-sessions >/dev/null 2>&1
 }
 
-# Every daemon belonging to this sandbox. Matched by the sandbox config path
-# and then confirmed by process name — `pkill -f` alone would also match the
-# shell running this script, and `pkill muxad` would take out the real daemon.
+# Every daemon belonging to this sandbox. The initial pgrep is only a candidate
+# set; each result is checked for the exact config argument before it can be
+# killed. No executable-name check: --muxad deliberately supports renamed
+# same-version binaries.
 all_daemons() {
   local pid
-  for pid in $(pgrep -f "$NAME-config\\.toml" 2>/dev/null || true); do
-    case "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')" in
-      muxad) printf '%s\n' "$pid" ;;
-    esac
+  for pid in $(pgrep -f "$SB_ROOT/config\\.toml" 2>/dev/null || true); do
+    daemon_belongs_to_sandbox "$pid" && printf '%s\n' "$pid"
   done
 }
 
@@ -198,6 +215,7 @@ present_artifacts() {
   server_running && found+=("tmux server ($NAME)")
   daemon_pid >/dev/null && found+=("muxad pid $(daemon_pid)")
   [ -S "$SB_SOCKET" ] && found+=("socket $SB_SOCKET")
+  [ -S "$SB_TMUX_SOCKET" ] && found+=("tmux socket $SB_TMUX_SOCKET")
   [ -f "$SB_CONFIG" ] && found+=("config $SB_CONFIG")
   [ -d "$SB_DATA" ] && found+=("data $SB_DATA")
   [ -d "$SB_SHIM" ] && found+=("shims $SB_SHIM")
@@ -210,14 +228,23 @@ present_artifacts() {
 
 cmd_status() {
   resolve_bins
+  if [ ! -e "$SB_ROOT" ] && [ ! -L "$SB_ROOT" ]; then
+    echo "absent — nothing named '$NAME' exists"
+    return 4
+  fi
+  if ! owned_sandbox; then
+    echo "partial — $SB_ROOT exists but is not owned by muxa-sandbox; refusing to inspect it"
+    return 3
+  fi
   local artifacts=() line
   while IFS= read -r line; do
     [ -n "$line" ] && artifacts+=("$line")
   done < <(present_artifacts)
 
   if [ "${#artifacts[@]}" -eq 0 ]; then
-    echo "absent — nothing named '$NAME' exists"
-    return 4
+    printf 'present:\n  owned root %s\n' "$SB_ROOT"
+    echo "partial — sandbox '$NAME' has no live components; run 'down'"
+    return 3
   fi
 
   printf 'present:\n'
@@ -239,6 +266,12 @@ cmd_status() {
 
 cmd_down() {
   resolve_bins
+
+  if [ ! -e "$SB_ROOT" ] && [ ! -L "$SB_ROOT" ]; then
+    return 0
+  fi
+  owned_sandbox \
+    || die "$SB_ROOT exists but is not owned by muxa-sandbox; refusing to delete it"
 
   if [ -n "$TMUX_BIN" ]; then
     tm kill-server 2>/dev/null || true
@@ -264,11 +297,11 @@ cmd_down() {
     kill -9 "$pid" 2>/dev/null || true
   done
 
-  rm -f "$SB_SOCKET" "$SB_CONFIG" "$SB_PID" "$SB_LOG"
-  # Belt and braces on top of the --name validation: never recurse into
-  # anything that is not the /tmp path this sandbox owns.
-  case "$SB_DATA" in /tmp/"$NAME"-data) rm -rf "$SB_DATA" ;; esac
-  case "$SB_SHIM" in /tmp/"$NAME"-shim) rm -rf "$SB_SHIM" ;; esac
+  rm -f "$SB_SOCKET" "$SB_TMUX_SOCKET" "$SB_CONFIG" "$SB_PID" "$SB_LOG"
+  # Belt and braces on top of the ownership marker: recurse only into the two
+  # exact child directories created by this script.
+  case "$SB_DATA" in "$SB_ROOT"/data) rm -rf "$SB_DATA" ;; esac
+  case "$SB_SHIM" in "$SB_ROOT"/shim) rm -rf "$SB_SHIM" ;; esac
 
   local survivors=() line
   while IFS= read -r line; do
@@ -279,6 +312,15 @@ cmd_down() {
     printf '  %s\n' "${survivors[@]}" >&2
     return 1
   fi
+  local unknown
+  unknown=$(find "$SB_ROOT" -mindepth 1 -maxdepth 1 ! -name .owner -print 2>/dev/null | head -1)
+  if [ -n "$unknown" ]; then
+    note "refusing to remove unrecognized sandbox artifact: $unknown"
+    return 1
+  fi
+  rm -f "$SB_OWNER"
+  rmdir "$SB_ROOT" 2>/dev/null \
+    || { note "could not remove sandbox root $SB_ROOT"; return 1; }
   return 0
 }
 
@@ -340,7 +382,14 @@ cmd_up() {
   # Required, not defensive: an interrupted previous run leaves a daemon that
   # still holds its own copy of the socket, and two of them trading it back and
   # forth looks exactly like muxa crashing at random.
-  cmd_down >/dev/null 2>&1 || true
+  if [ -e "$SB_ROOT" ] || [ -L "$SB_ROOT" ]; then
+    owned_sandbox \
+      || die "$SB_ROOT already exists and is not owned by muxa-sandbox"
+    cmd_down >/dev/null
+  fi
+
+  mkdir -m 700 "$SB_ROOT" || die "could not create sandbox root $SB_ROOT"
+  printf '%s\n' "$OWNER_MARK" > "$SB_OWNER"
 
   # From here until the sandbox is complete, any failure or interrupt must take
   # the half-built sandbox with it — a partial sandbox is the state that costs
@@ -360,7 +409,7 @@ cmd_up() {
 #!/bin/sh
 # Sandbox shim: every tmux call, including ones muxa's children make, lands on
 # the sandbox server rather than the caller's.
-exec $TMUX_BIN -u -L $NAME "\$@"
+exec "$TMUX_BIN" -u -S "$SB_TMUX_SOCKET" "\$@"
 EOF
   chmod +x "$SB_SHIM/tmux"
 
@@ -382,12 +431,9 @@ EOF
   tm set-environment -g MUXA_CONFIG "$SB_CONFIG"
   tm set-environment -g XDG_DATA_HOME "$SB_DATA"
 
-  if [ "$KEEP_HOLDER" -eq 0 ]; then
-    # Left running on purpose: killing it before the consumer creates its own
-    # sessions would take the server down with it. `env` reports the name so a
-    # consumer can drop it once its own sessions exist.
-    :
-  fi
+  # Left running on purpose: killing it before the consumer creates its own
+  # sessions would take the server down with it. `env` reports the name so a
+  # consumer can drop it once its own sessions exist.
 
   trap - EXIT INT TERM HUP
   return 0
@@ -399,8 +445,21 @@ EOF
 
 cmd_daemon() {
   resolve_bins
+  owned_sandbox || die "sandbox '$NAME' is not up; run 'up' first"
   [ -f "$SB_CONFIG" ] || die "sandbox '$NAME' is not up; run 'up' first"
   server_running || die "sandbox '$NAME' has no tmux server; run 'up' first"
+
+  local pid existing
+  if pid=$(daemon_pid); then
+    if [ -S "$SB_SOCKET" ]; then
+      echo "already running — sandbox '$NAME' muxad pid $pid"
+      return 0
+    fi
+    die "sandbox '$NAME' muxad pid $pid is running without its socket; run 'down'"
+  fi
+  existing=$(all_daemons | tr '\n' ' ')
+  [ -z "${existing// /}" ] \
+    || die "sandbox '$NAME' already has untracked muxad: ${existing% }; run 'down'"
 
   local tmux_socket
   tmux_socket=$(tm display-message -p '#{socket_path}')
@@ -433,6 +492,7 @@ cmd_daemon() {
 
 cmd_env() {
   resolve_bins
+  owned_sandbox || die "sandbox '$NAME' is not up; run 'up' first"
   [ -f "$SB_CONFIG" ] || die "sandbox '$NAME' is not up; run 'up' first"
   server_running || die "sandbox '$NAME' has no tmux server; run 'up' first"
 

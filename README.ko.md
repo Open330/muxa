@@ -20,7 +20,10 @@
 
 ## README를 읽기 전에 Muxa 온보딩부터 체험해 보세요
 
-Muxa binary를 내려받거나 설치하지 않고 전체 화면 tour를 바로 체험하세요.
+설치 없이 전체 화면 tour를 바로 체험하세요. script가 release 바이너리를 임시
+디렉터리로 받아 checksum을 검증한 뒤 진짜 `muxa onboard`를 실행하고 끝나면
+지웁니다. 사용할 수 없는 환경에서는 같은 시나리오의 shell simulation으로
+넘어갑니다(`--no-download`로 강제할 수 있습니다).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
