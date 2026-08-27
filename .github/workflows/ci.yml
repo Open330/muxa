@@ -64,9 +64,25 @@ jobs:
       - run: cargo build -p muxa-cli --bin muxa
       - run: shellcheck scripts/onboard.sh
       # The shell fallback in onboard.sh must teach the same keys as the real
-      # tour; `muxa onboard --emit-step-table` is the contract it is held to.
+      # tour; `muxa onboard --emit step-table` is the contract it is held to.
       - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa
       - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa --lang ko
+
+  sandbox:
+    name: sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: cargo build --workspace --bins
+      - run: shellcheck scripts/muxa-sandbox.sh scripts/sandbox-smoke.sh
+      # A sandbox that leaks a daemon or a tmux server is worse than no
+      # sandbox, so the suite asserts teardown is total from every state.
+      - run: scripts/sandbox-smoke.sh
 
   msrv:
     name: MSRV (1.88)

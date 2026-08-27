@@ -8,16 +8,21 @@
 # isolated tmux server, feed muxad the same hook payloads the real agent
 # CLIs send, and seed the mailbox through the real `muxa msg` path.
 #
+# The isolation itself is not this script's job — `scripts/muxa-sandbox.sh`
+# owns the private socket, config, data directory, tmux server and PATH shim,
+# and `scripts/sandbox-smoke.sh` is what proves its teardown is total. This
+# script is the fixture layered on top.
+#
 # Steps:
-#   1. Write the demo config and the PATH shims. The `tmux` shim routes
-#      every later tmux call (ours *and* muxa's children) at the labelled
-#      demo server; the `claude`/`codex` shims make `muxa watch`'s ask
-#      feature answer instantly, for free, and identically on every render.
-#   2. Stand up the isolated tmux server and its sessions.
-#   3. Start muxad against that server only.
+#   1. Write the demo config, then bring up the sandbox with it. Add the
+#      `claude`/`codex` shims, which make `muxa watch`'s ask feature answer
+#      instantly, for free, and identically on every render.
+#   2. Create the demo's own sessions on the sandbox tmux server.
+#   3. Seed the ask history, then start the daemon — in that order, because
+#      the ask store is read once at boot.
 #   4. Seed agents across every state muxa can render, including two with
 #      live Task subagents so the swarm view has trees to expand.
-#   5. Seed the collaboration mailbox and the ask history.
+#   5. Seed the collaboration mailbox.
 #   6. Seed the activity ledger so durations read as real.
 #
 # Idempotent — safe to re-run between vhs renders. `demo-teardown.sh`
@@ -25,32 +30,22 @@
 
 set -euo pipefail
 
-# Hardcoded, not `${VAR:=default}`. This script starts a daemon and then
-# feeds it a dozen fabricated agents; if it inherited a real MUXA_SOCKET
-# from the caller's shell it would inject that fixture fleet into the
-# user's actual registry. There is no scenario where the demo wants to
-# talk to a non-demo daemon, so the override simply is not offered.
-MUXA_SOCKET=/tmp/muxa-demo.sock
-MUXA_CONFIG=/tmp/muxa-demo-config.toml
-XDG_DATA_HOME=/tmp/muxa-demo-data
-export MUXA_SOCKET MUXA_CONFIG XDG_DATA_HOME
-
 TMUX_LBL=muxa-demo
-SHIM_DIR=/tmp/muxa-demo-shim
-PID_FILE=/tmp/muxa-demo.pid
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SANDBOX="$REPO_DIR/scripts/muxa-sandbox.sh"
 PAINT="$SCRIPT_DIR/demo-paint.sh"  # believable agent frames instead of bare `cat`
-MUXAD_BIN="${MUXA_DEMO_MUXAD:-$REPO_DIR/target/debug/muxad}"
-MUXAD_LOG=/tmp/muxa-demo-muxad.log
+CONFIG_SRC=/tmp/muxa-demo-config.src.toml
 
+MUXAD_BIN="${MUXA_DEMO_MUXAD:-$REPO_DIR/target/debug/muxad}"
 if [ ! -x "$MUXAD_BIN" ]; then
   MUXAD_BIN=$(command -v muxad)
 fi
 
-# Real tmux binary, resolved absolutely so it bypasses the PATH shim below.
-# Docker/CI has it at /usr/bin/tmux; a Homebrew mac has it elsewhere, so the
-# tape passes MUXA_DEMO_TMUX after resolving `command -v tmux` pre-shim.
+# Real tmux binary, resolved absolutely so it bypasses the PATH shim the
+# sandbox installs. Docker/CI has it at /usr/bin/tmux; a Homebrew mac has it
+# elsewhere, so the tape passes MUXA_DEMO_TMUX after resolving `command -v
+# tmux` pre-shim.
 TM="${MUXA_DEMO_TMUX:-/usr/bin/tmux}"
 
 rfc3339_ago() {
@@ -65,15 +60,14 @@ rfc3339_ago() {
 # ---------------------------------------------------------------------------
 # 0) Clear whatever the last run left behind
 # ---------------------------------------------------------------------------
-# Not belt-and-braces — required. This script unlinks the demo socket and
-# starts a fresh muxad, but a daemon left over from an interrupted render
-# is still running and still holds its own copy. Two of them then trade the
-# socket back and forth and the recording shows "daemon not reachable" at
-# random points, which reads as muxa crashing.
+# Not belt-and-braces — required. A daemon left over from an interrupted
+# render is still running and still holds its own copy of the socket. Two of
+# them then trade it back and forth and the recording shows "daemon not
+# reachable" at random points, which reads as muxa crashing.
 bash "$SCRIPT_DIR/demo-teardown.sh"
 
 # ---------------------------------------------------------------------------
-# 1) Config + PATH shims
+# 1) Config + sandbox + PATH shims
 # ---------------------------------------------------------------------------
 
 # Config lives here rather than in the tape so the tape's prelude stays
@@ -83,7 +77,11 @@ bash "$SCRIPT_DIR/demo-teardown.sh"
 # `wake = "never"` matters. The default `idle_only` lets muxad inject the
 # wake prompt into a recipient's pane — which, in a recording whose panes
 # are painted fixtures, would scribble over the frame mid-take.
-cat > "$MUXA_CONFIG" <<'TOML'
+#
+# The subsystems are off because the fleet is fabricated: a live reconciler
+# would reap panes parked on `cat`, and a live state store would survive the
+# teardown into the next render.
+cat > "$CONFIG_SRC" <<'TOML'
 [ui]
 theme = 'oh-my-muxa'
 
@@ -116,19 +114,29 @@ cwd = '/tmp'
 
 [watch]
 theme = 'oh-my-muxa'
-view = 'work'
+# `window` is the work level: a window is a Work's current Run.
+view = 'window'
 sort = ['state']
 
 [watch.preview]
 default_content = 'prompt_response'
 TOML
 
-mkdir -p "$SHIM_DIR"
-cat > "$SHIM_DIR/tmux" <<EOF
-#!/bin/sh
-exec $TM -u -L $TMUX_LBL "\$@"
-EOF
-chmod +x "$SHIM_DIR/tmux"
+# `--allow-inside-tmux` because regenerating the GIFs from inside your own
+# tmux session is the normal case for a maintainer; the seeding below already
+# stamps every hook event with the sandbox server explicitly.
+bash "$SANDBOX" up \
+  --name "$TMUX_LBL" \
+  --config "$CONFIG_SRC" \
+  --tmux "$TM" \
+  --muxad "$MUXAD_BIN" \
+  --extra-path "$REPO_DIR/target/debug" \
+  --allow-inside-tmux
+
+# MUXA_SOCKET, MUXA_CONFIG, XDG_DATA_HOME, MUXA_TMUX_SOCKET and the shimmed
+# PATH all arrive here. Nothing below may reach a real muxa surface.
+eval "$(bash "$SANDBOX" env --name "$TMUX_LBL")"
+SHIM_DIR=$MUXA_SANDBOX_SHIM
 
 # Ask stand-ins. `muxa watch`'s `a` shells out to the real agent CLI, which
 # would bill the user, take an unpredictable 10-40s, and answer differently
@@ -225,24 +233,15 @@ EOF
 # Every other pane sits on `cat` or a painted frame so there is no prompt
 # noise behind the TUI.
 
-"$TM" -u -L "$TMUX_LBL" kill-server 2>/dev/null || true
 cat > /tmp/muxa-demo-bashrc <<'BASHRC'
 export PS1='$ '
 unset PROMPT_COMMAND
 BASHRC
 
-# Bring the server up on a throwaway session first, purely to learn its
-# socket path. MUXA_TMUX_SOCKET has to be exported *before* the real
-# sessions are created, because every pane inherits its environment at
-# creation time — and a pane without the pin enumerates every tmux server
-# on the host, so the recording fills up with the maintainer's own
-# sessions. Learned the hard way: the first take showed 59.
-"$TM" -u -L "$TMUX_LBL" new-session -d -s _boot cat
-MUXA_TMUX_SOCKET=$("$TM" -u -L "$TMUX_LBL" display-message -p '#{socket_path}')
-export MUXA_TMUX_SOCKET
-# Belt-and-braces for panes created by hand later, which inherit from the
-# server rather than from this script.
-"$TM" -u -L "$TMUX_LBL" set-environment -g MUXA_TMUX_SOCKET "$MUXA_TMUX_SOCKET"
+# The server, and the MUXA_TMUX_SOCKET pin every pane inherits at creation
+# time, are already in place from `sandbox up`. Without that pin a pane
+# enumerates every tmux server on the host and the recording fills up with
+# the maintainer's own sessions — the first take showed 59.
 
 # Every agent pane gets a painted frame. The inspector and the preview both
 # render the selected pane's live screen, so a fleet parked on bare `cat`
@@ -337,7 +336,9 @@ P_WEB_E2E=$(mkpane web 0 "$(frame web-e2e claude done 're-record the playwright 
 
 # Belt-and-suspenders: be explicit about which window the recording
 # should attach to.
-"$TM" -u -L "$TMUX_LBL" kill-session -t _boot
+# The sandbox's placeholder kept the server alive until the demo had sessions
+# of its own; it would otherwise show up as an empty row in the recording.
+"$TM" -u -L "$TMUX_LBL" kill-session -t "$MUXA_SANDBOX_HOLDER"
 "$TM" -u -L "$TMUX_LBL" select-window -t ctl:0
 
 # The operator's pane: where the recording types, and the origin the
@@ -349,34 +350,12 @@ PB=$("$TM" -u -L "$TMUX_LBL" display-message -p -t main:1.0 '#{pane_id}')
 # ---------------------------------------------------------------------------
 # 3) muxad, scoped to the demo server
 # ---------------------------------------------------------------------------
-# MUXA_TMUX_SOCKET was pinned back in step 2 and muxad inherits it here, so
-# its scan cannot reach a real fleet on the same host.
-
 # The ask store is read once, at daemon start. Seeding it afterwards and
 # restarting muxad to pick it up would be worse than useless: `[state]` is
 # disabled for the demo, so the restart would drop the whole seeded fleet.
 seed_ask_history
 
-rm -f "$MUXA_SOCKET" "$MUXAD_LOG"
-# `nohup` so the daemon outlives this script's shell. Without it, running
-# setup on its own — seed now, render later — leaves you with a fleet and
-# no daemon to serve it. demo-teardown.sh kills it by pid.
-nohup "$MUXAD_BIN" --config "$MUXA_CONFIG" >"$MUXAD_LOG" 2>&1 &
-echo $! > "$PID_FILE"
-for _ in $(seq 1 100); do
-  [ -S "$MUXA_SOCKET" ] && break
-  if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "demo muxad exited before creating its socket" >&2
-    cat "$MUXAD_LOG" >&2
-    exit 1
-  fi
-  sleep 0.1
-done
-if [ ! -S "$MUXA_SOCKET" ]; then
-  echo "demo muxad did not create $MUXA_SOCKET within 10 seconds" >&2
-  cat "$MUXAD_LOG" >&2
-  exit 1
-fi
+bash "$SANDBOX" daemon --name "$TMUX_LBL" --tmux "$TM" --muxad "$MUXAD_BIN"
 
 # ---------------------------------------------------------------------------
 # 4) Seed the fleet
@@ -388,7 +367,7 @@ fi
 # your real server and every seeded event is silently skipped. So each
 # seeding call claims the demo server explicitly rather than inheriting
 # whatever the caller happens to be sitting in.
-DEMO_TMUX_ENV="$MUXA_TMUX_SOCKET,0,0"
+DEMO_TMUX_ENV=$MUXA_SANDBOX_TMUX_ENV
 
 hook() { # <pane> <agent> <event> <json>
   TMUX="$DEMO_TMUX_ENV" TMUX_PANE="$1" muxa hook "$2" --event "$3" <<<"$4"
