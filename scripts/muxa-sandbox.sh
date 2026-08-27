@@ -35,6 +35,7 @@ CONFIG_SRC=
 MUXAD_BIN=
 MUXA_BIN=
 TMUX_BIN=
+TMUX_CONFIG=
 ALLOW_INSIDE_TMUX=0
 KEEP_HOLDER=0
 EXTRA_PATHS=()
@@ -59,6 +60,7 @@ Options:
   --muxad <path>        muxad binary (default: target/debug, then $PATH)
   --muxa <path>         muxa binary (default: target/debug, then $PATH)
   --tmux <path>         Real tmux binary, resolved before the shim shadows it
+  --tmux-config <path>  tmux config for the sandbox server; /dev/null for none
   --extra-path <dir>    Prepend to the sandbox PATH; repeatable
   --allow-inside-tmux   Permit `up` while $TMUX is set
   --keep-holder         Leave the placeholder session alive after `up`
@@ -95,6 +97,8 @@ while [ "$#" -gt 0 ]; do
     --muxa=*) MUXA_BIN=${1#--muxa=}; shift ;;
     --tmux) [ "$#" -ge 2 ] || die '--tmux needs a path'; TMUX_BIN=$2; shift 2 ;;
     --tmux=*) TMUX_BIN=${1#--tmux=}; shift ;;
+    --tmux-config) [ "$#" -ge 2 ] || die '--tmux-config needs a path'; TMUX_CONFIG=$2; shift 2 ;;
+    --tmux-config=*) TMUX_CONFIG=${1#--tmux-config=}; shift ;;
     --extra-path) [ "$#" -ge 2 ] || die '--extra-path needs a directory'; EXTRA_PATHS+=("$2"); shift 2 ;;
     --extra-path=*) EXTRA_PATHS+=("${1#--extra-path=}"); shift ;;
     --allow-inside-tmux) ALLOW_INSIDE_TMUX=1; shift ;;
@@ -137,7 +141,15 @@ resolve_bins() {
   fi
 }
 
-tm() { "$TMUX_BIN" -u -L "$NAME" "$@"; }
+# `-f` is recorded at `up` so later commands — and `env` consumers — reach the
+# same server the same way.
+tm() {
+  if [ -n "$TMUX_CONFIG" ]; then
+    "$TMUX_BIN" -u -f "$TMUX_CONFIG" -L "$NAME" "$@"
+  else
+    "$TMUX_BIN" -u -L "$NAME" "$@"
+  fi
+}
 
 # --------------------------------------------------------------------------
 # status / down
@@ -446,6 +458,7 @@ export MUXA_SANDBOX_NAME='$NAME'
 export MUXA_SANDBOX_SHIM='$SB_SHIM'
 export MUXA_SANDBOX_HOLDER='$HOLDER_SESSION'
 export MUXA_SANDBOX_TMUX='$TMUX_BIN'
+export MUXA_SANDBOX_TMUX_CONFIG='$TMUX_CONFIG'
 export MUXA_SANDBOX_LOG='$SB_LOG'
 # A hook client stamps events with \$TMUX. Seeding from your own tmux session
 # without this makes muxad drop every event as out-of-scope.

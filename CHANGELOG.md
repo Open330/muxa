@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   simulation remains the default (`--tour simulated`) until the live tour has
   replaced it outright.
 
+  No step is a dead end. The sandbox server starts with `-f /dev/null`, so a
+  learner who rebound their prefix is not told to press `Ctrl-b` and left
+  stranded; any step offers `F12` to move past it after 45 seconds, and
+  `--no-quiz` offers that from the first step; and skipping performs whatever
+  the learner would have done, so Act II still has a session to put its agents
+  in. The first step prints its instruction rather than painting it, because
+  nobody is attached to a status bar yet.
+
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
   supported command: `up` / `daemon` / `env` / `status` / `down` over a private

@@ -83,6 +83,9 @@ jobs:
       # reachable by typing the command the narration asks for. This types them.
       - run: scripts/live-tour-smoke.py --muxa target/debug/muxa
       - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --lang ko
+      # Issue #76 was a gate with no way around it; this is the check that
+      # the live tour cannot repeat that.
+      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --mode skip
 
   msrv:
     name: MSRV (1.88)

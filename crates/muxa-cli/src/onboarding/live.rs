@@ -45,6 +45,19 @@ const POLL: Duration = Duration::from_millis(250);
 /// an abandoned terminal does not hold a sandbox open all afternoon.
 const STEP_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// How long a step waits before it offers a way past itself.
+///
+/// Issue #76 was an onboarding with one gate and no way around it, and a live
+/// tour can strand someone just as easily — a terminal that swallows a key, a
+/// step that will not register. Long enough not to invite skipping, short
+/// enough that nobody sits there wondering.
+const SKIP_AFTER: Duration = Duration::from_secs(45);
+
+/// Set by the skip key, read by the poll loop. A tmux user option rather than a
+/// file: the narration already lives in tmux, and this keeps the escape hatch
+/// in the same place.
+const SKIP_OPTION: &str = "@muxa-onboarding-skip";
+
 const SANDBOX_CONFIG: &str = "\
 [discovery]
 enabled = false
@@ -153,6 +166,11 @@ impl Sandbox {
         }
         if args[0] == "up" {
             cmd.arg("--config").arg(&self.config);
+            // Without this the sandbox server reads the learner's own
+            // `~/.tmux.conf`. Somebody who rebound their prefix to `C-a` would
+            // then be told to press `Ctrl-b c`, and step 2 would be a dead end
+            // with no explanation — exactly the shape of issue #76.
+            cmd.args(["--tmux-config", "/dev/null"]);
             if let Some(dir) = self.exe.parent() {
                 cmd.arg("--extra-path").arg(dir);
             }
@@ -361,15 +379,30 @@ impl Sandbox {
         self.tmux_command(&["set", "-g", "status-position", "top"])?;
         self.tmux_command(&["set", "-g", "status-style", "bg=#0b1220,fg=#c9d1d9"])?;
         self.tmux_command(&["set", "-g", "status-interval", "2"])?;
+        // Root table, so it needs no prefix and cannot be confused with typing.
+        self.tmux_command(&["bind-key", "-n", "F12", "set", "-g", SKIP_OPTION, "1"])?;
         Ok(())
     }
 
-    fn narrate(&self, index: usize, total: usize, title: &str, cue: &str) {
+    fn skip_requested(&self) -> bool {
+        if self.tmux_quiet(&["show", "-gv", SKIP_OPTION]) != "1" {
+            return false;
+        }
+        let _ = self.tmux_command(&["set", "-gu", SKIP_OPTION]);
+        true
+    }
+
+    fn narrate(&self, index: usize, total: usize, title: &str, cue: &str, escape: Option<&str>) {
         let banner = format!(
             "#[align=centre bg=#1f6feb,fg=#0b1220,bold] muxa onboarding · {index}/{total} #[default]"
         );
         let title = format!("#[align=centre]{title}");
-        let cue = format!("#[align=centre fg=#d29922,bold]{cue}");
+        let cue = match escape {
+            Some(hint) => {
+                format!("#[align=centre fg=#d29922,bold]{cue}#[default]#[fg=#8b949e]    {hint}")
+            }
+            None => format!("#[align=centre fg=#d29922,bold]{cue}"),
+        };
         let _ = self.tmux_command(&["set", "-g", "status-format[0]", &banner]);
         let _ = self.tmux_command(&["set", "-g", "status-format[1]", &title]);
         let _ = self.tmux_command(&["set", "-g", "status-format[2]", &cue]);
@@ -398,17 +431,22 @@ impl Sandbox {
     /// Joining *their* window rather than a prepared one is the point: the room
     /// they can address peers in is the window they are already in, and
     /// watching the panes arrive is what makes "a pane is an agent" land.
-    fn add_agents(&self, language: UiLanguage) -> Result<Fleet> {
+    fn add_agents(&self, session: &str, language: UiLanguage) -> Result<Fleet> {
         let note = tr(
             language,
             "scripted agent — everything muxa does with it is real",
             "스크립트 agent — muxa가 하는 동작은 전부 진짜입니다",
         );
 
-        let learner = self.tmux_command(&["display-message", "-p", "#{pane_id}"])?;
-        let window = self.tmux_command(&["display-message", "-p", "#{window_id}"])?;
+        // Resolved through the session rather than the attached client: a
+        // learner who skipped their way here may not be attached to anything,
+        // and the agents still have to land in a real window.
+        let target = format!("{session}:");
+        let learner = self.tmux_command(&["display-message", "-p", "-t", &target, "#{pane_id}"])?;
+        let window =
+            self.tmux_command(&["display-message", "-p", "-t", &target, "#{window_id}"])?;
         if learner.is_empty() || window.is_empty() {
-            bail!("could not resolve the pane you are sitting in");
+            bail!("could not find a window to put the agents in");
         }
 
         let claude = self.split(
@@ -638,6 +676,10 @@ struct Tour<'a> {
     sandbox: &'a Sandbox,
     language: UiLanguage,
     fleet: Option<Fleet>,
+    /// `--no-quiz` does not remove the steps — there is nothing to remove, the
+    /// tour is the real thing — so it offers the way past from the start
+    /// instead of after a wait.
+    no_quiz: bool,
 }
 
 impl Tour<'_> {
@@ -703,6 +745,41 @@ impl Tour<'_> {
         }
     }
 
+    /// What a skipped step would have done to the world.
+    ///
+    /// Skipping has to leave the tour consistent, not just further along: Act II
+    /// cannot introduce agents into a session that was never created. Anything
+    /// the learner would have done that the tour can do for them, it does.
+    fn perform(&self, index: usize) {
+        match index {
+            0 => {
+                let _ = self.sandbox.tmux_command(&[
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "muxa-onboarding",
+                    "-x",
+                    "200",
+                    "-y",
+                    "50",
+                ]);
+            }
+            1 => {
+                if let Some(session) = self.own_sessions().first() {
+                    let _ = self.sandbox.tmux_command(&[
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &format!("{session}:"),
+                    ]);
+                }
+            }
+            // The rest are either about where the learner is looking, which the
+            // tour will not fake, or about state it has already produced.
+            _ => {}
+        }
+    }
+
     /// Fired as a step opens, so the world moves on its own rather than only in
     /// response to the learner.
     fn on_enter(&mut self, index: usize) -> Result<()> {
@@ -713,7 +790,12 @@ impl Tour<'_> {
             if !holder.is_empty() {
                 let _ = self.sandbox.tmux_command(&["kill-session", "-t", &holder]);
             }
-            self.fleet = Some(self.sandbox.add_agents(self.language)?);
+            let session = self
+                .own_sessions()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "muxa-onboarding".to_string());
+            self.fleet = Some(self.sandbox.add_agents(&session, self.language)?);
             return Ok(());
         }
         let Some(fleet) = self.fleet.as_ref() else {
@@ -740,18 +822,38 @@ impl Tour<'_> {
         }
     }
 
-    fn narrate(&self, index: usize) {
+    fn narrate(&self, index: usize, escape: bool) {
         let step = &STEPS[index];
-        self.sandbox.narrate(
-            index + 1,
-            STEPS.len(),
-            tr(self.language, step.title_en, step.title_ko),
-            tr(self.language, step.cue_en, step.cue_ko),
-        );
+        let title = tr(self.language, step.title_en, step.title_ko);
+        let cue = tr(self.language, step.cue_en, step.cue_ko);
+        let hint = escape.then(|| {
+            tr(
+                self.language,
+                "stuck?  F12  skips this step",
+                "막혔나요?  F12  로 이 단계를 건너뜁니다",
+            )
+        });
+
+        self.sandbox
+            .narrate(index + 1, STEPS.len(), title, cue, hint);
+
+        // The status bar only exists for someone attached to the server, and
+        // the first step is the one where they are not — they are at a bare
+        // shell being asked to create the session. Narrating only through tmux
+        // would leave that instruction invisible, which is the same dead end as
+        // a gate with no way past it, just earlier.
+        if self.clients().is_empty() {
+            eprintln!();
+            eprintln!("  muxa onboarding · {}/{}", index + 1, STEPS.len());
+            eprintln!("  {title}");
+            eprintln!("  {cue}");
+            eprintln!();
+        }
     }
 
     fn drive(&mut self) -> Result<usize> {
-        self.narrate(0);
+        // Prints rather than paints: nobody is attached yet.
+        self.narrate(0, self.no_quiz);
 
         // The learner's own shell, in their own terminal. They are not attached
         // to anything yet — Act I is where they attach themselves, which is the
@@ -763,7 +865,8 @@ impl Tour<'_> {
             .context("starting your shell")?;
 
         let mut index = 0usize;
-        let mut deadline = Instant::now() + STEP_TIMEOUT;
+        let mut entered = Instant::now();
+        let mut offered_escape = self.no_quiz;
 
         while index < STEPS.len() {
             if INTERRUPTED.load(Ordering::SeqCst) {
@@ -772,17 +875,33 @@ impl Tour<'_> {
             if shell.try_wait().context("watching your shell")?.is_some() {
                 break;
             }
-            if Instant::now() > deadline {
+            if entered.elapsed() > STEP_TIMEOUT {
                 break;
             }
             if self.satisfied(&STEPS[index].detect) {
                 index += 1;
-                deadline = Instant::now() + STEP_TIMEOUT;
+                entered = Instant::now();
+                offered_escape = self.no_quiz;
                 if index < STEPS.len() {
                     self.on_enter(index)?;
-                    self.narrate(index);
+                    self.narrate(index, offered_escape);
                 }
                 continue;
+            }
+            if self.sandbox.skip_requested() {
+                self.perform(index);
+                index += 1;
+                entered = Instant::now();
+                offered_escape = self.no_quiz;
+                if index < STEPS.len() {
+                    self.on_enter(index)?;
+                    self.narrate(index, offered_escape);
+                }
+                continue;
+            }
+            if !offered_escape && entered.elapsed() > SKIP_AFTER {
+                offered_escape = true;
+                self.narrate(index, true);
             }
             std::thread::sleep(POLL);
         }
@@ -794,7 +913,7 @@ impl Tour<'_> {
     }
 }
 
-pub(super) fn run(language: UiLanguage) -> Result<()> {
+pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
     preflight(language)?;
     trap_signals();
 
@@ -817,6 +936,7 @@ pub(super) fn run(language: UiLanguage) -> Result<()> {
             sandbox: &sandbox,
             language,
             fleet: None,
+            no_quiz,
         };
         tour.drive()?
         // `Drop` tears the sandbox down here, on every path including a panic.

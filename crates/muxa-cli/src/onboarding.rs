@@ -296,7 +296,7 @@ const SECTIONS: &[Section] = &[
 pub fn run(args: Args) -> Result<()> {
     apply_icon_preference();
     if args.tour == Tour::Live && !args.print {
-        return live::run(args.lang.resolve());
+        return live::run(args.lang.resolve(), args.no_quiz);
     }
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();

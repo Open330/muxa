@@ -28,12 +28,13 @@ import time
 
 SANDBOX = "muxa-onboarding"
 STEP_MARK = re.compile(r"onboarding · (\d+)/(\d+)")
+STEPS_TOTAL = range(9)
 
 
 class Terminal:
     """A pty with a `muxa onboard --tour live` running in it."""
 
-    def __init__(self, muxa: str, lang: str) -> None:
+    def __init__(self, muxa: str, lang: str, no_quiz: bool = False) -> None:
         self.buffer = b""
         self.exited = False
         self.pid, self.fd = pty.fork()
@@ -42,7 +43,10 @@ class Terminal:
             # The tour refuses to nest, and CI may well run inside tmux.
             for stale in ("TMUX", "TMUX_PANE"):
                 os.environ.pop(stale, None)
-            os.execv(muxa, [muxa, "onboard", "--tour", "live", "--lang", lang])
+            argv = [muxa, "onboard", "--tour", "live", "--lang", lang]
+            if no_quiz:
+                argv.append("--no-quiz")
+            os.execv(muxa, argv)
             os._exit(127)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
         os.set_blocking(self.fd, False)
@@ -121,6 +125,20 @@ def wait_step(terminal: Terminal, target: int, timeout: float = 60) -> bool:
     return False
 
 
+def wait_past(terminal: Terminal, target: int, timeout: float = 60) -> bool:
+    """At least `target`. One skip can advance more than one step: skipping
+    "detach" lands on "attach", which is already true for someone who never
+    left, so the tour moves straight on."""
+    end = time.time() + timeout
+    while time.time() < end:
+        current = step()
+        if current is not None and current >= target:
+            return True
+        terminal.pump(0.4)
+    current = step()
+    return current is not None and current >= target
+
+
 class Report:
     def __init__(self) -> None:
         self.failures: list[str] = []
@@ -136,14 +154,80 @@ class Report:
         return ok
 
 
+def escape_hatch(muxa: str, args, report: "Report") -> int:
+    """Issue #76 was a gate with no way around it. This checks the live tour
+    cannot repeat that: `--no-quiz` offers the way past from the first step, and
+    F12 walks the whole tour without the learner doing any of it.
+
+    Skipping has to leave the world consistent too — Act II introduces agents,
+    and there has to be a session for them to arrive in."""
+    print("escape hatch")
+    terminal = Terminal(muxa, args.lang, no_quiz=True)
+    try:
+        terminal.pump(12)
+        report.check("step 1 is showing", step() == 1, f"step={step()}")
+        report.check("--no-quiz offers the way past immediately", "F12" in cue(), cue())
+        report.check(
+            "step 1 is legible before anyone is attached",
+            "tmux new-session" in terminal.text(),
+            terminal.text()[-400:],
+        )
+
+        # F12 is a tmux binding, so it only reaches the tour once the learner is
+        # attached. Step 1 is the single step outside tmux, and its way past is
+        # that it is a plain command.
+        terminal.type(b"tmux new-session -s muxa-onboarding\r", 4)
+        report.check("step 1 done for real", wait_step(terminal, 2), f"step={step()}")
+
+        target = 3
+        while target <= len(STEPS_TOTAL):
+            terminal.type(b"\x1b[24~", 1.5)  # F12
+            if not report.check(f"F12 reaches step {target} or past it",
+                                wait_past(terminal, target, 45), f"step={step()}"):
+                break
+            reached = step() or target
+            if reached >= 5 and target < 5:
+                # The agents joined a session the learner never made themselves.
+                panes = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
+                report.check("the agents still had a window to arrive in", len(panes) >= 3,
+                             str(panes))
+            target = reached + 1
+
+        terminal.type(b"\x1b[24~", 2)  # F12 past the last step
+        for _ in range(10):
+            if terminal.finished():
+                break
+            terminal.pump(2)
+        report.check("the tour exits", terminal.finished())
+    finally:
+        terminal.kill()
+
+    report.check("no tmux server survives", tmux("list-sessions").returncode != 0)
+    strays = subprocess.run(
+        ["pgrep", "-f", f"{SANDBOX}-config"], capture_output=True, text=True
+    ).stdout.strip()
+    report.check("no daemon survives", strays == "", strays)
+    print(f"\n{report.passes} passed, {len(report.failures)} failed")
+    return 1 if report.failures else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--muxa", default=os.environ.get("MUXA_BIN", "target/debug/muxa"))
     parser.add_argument("--lang", default="en")
+    parser.add_argument(
+        "--mode",
+        choices=["tour", "skip"],
+        default="tour",
+        help="tour: type a learner's commands. skip: use the escape hatch instead.",
+    )
     args = parser.parse_args()
     muxa = os.path.abspath(args.muxa)
 
     report = Report()
+    if args.mode == "skip":
+        return escape_hatch(muxa, args, report)
+
     terminal = Terminal(muxa, args.lang)
     try:
         # Sandbox up, daemon up, the learner's shell.
