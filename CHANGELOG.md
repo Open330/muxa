@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`muxa msg send`, `reply`, and `cancel` print a one-line receipt instead of
+  the whole stored request.** They dumped every field of the record — each
+  timestamp, each `null` — which buries the two facts the caller wants (it went
+  through, and whether an answer is coming) under thirty lines of JSON. `--json`
+  still prints the record.
+
+- **`muxa msg list` and `muxa msg inbox` show the reply.** They printed the
+  request and its status and stopped there, so the sender saw their own question
+  marked `Completed` with the answer they came for nowhere on screen.
+
 ### Added
 
 - **`muxa onboard --tour live` — the onboarding stops simulating muxa and

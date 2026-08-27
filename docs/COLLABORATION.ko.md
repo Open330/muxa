@@ -175,6 +175,10 @@ muxa msg list --mailbox incoming --json
 muxa msg cancel req_...
 ```
 
+`send`, `reply`, `cancel`은 한 줄 영수증만 출력하고, `list`와 `inbox`는 각
+요청과 (도착했다면) 그 답장을 함께 보여줍니다. 저장된 레코드 전체가 필요하면
+`--json`을 붙이세요.
+
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
 사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는
 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. `muxa dashboard`는
