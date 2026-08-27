@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`muxa onboard --tour live` — the onboarding stops simulating muxa and
-  becomes it.** Nine steps in two acts, against a sandbox on its own tmux
+  becomes it.** Fifteen steps in two acts, against a sandbox on its own tmux
   server: Act I is real `tmux new-session`, a real second window, a real detach
   proving the work kept running, and a real reattach; Act II adds two scripted
   agents to the learner's own window and walks them through real `muxa watch`,

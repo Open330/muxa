@@ -1416,14 +1416,12 @@ struct Step {
     detect: Detect,
 }
 
-/// Nine steps in two acts.
+/// Fifteen steps in two acts, one action each.
 ///
 /// Act I keeps only the one tmux idea muxa is built on — a session outlives the
 /// terminal attached to it. Zoom, copy mode and pane-navigation drills are
 /// deliberately absent: they are tmux trivia, and the pane concept lands in Act
 /// II when the agents themselves arrive as panes.
-/// Fourteen steps in two acts, one action each.
-///
 /// An earlier pass fit this into nine by putting two actions on some cues —
 /// "see both: Ctrl-b s · then leave: Ctrl-b d". That reads as one instruction
 /// and leaves the learner unsure which half registered, which is the opposite
