@@ -107,17 +107,23 @@ def tmux(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+def banner() -> str:
+    """Row 0 belongs to tmux — its own session and window list, which the tour
+    deliberately leaves alone so the learner can see what their keystrokes did."""
+    return tmux("show", "-g", "status-format[1]").stdout
+
+
 def step() -> int | None:
-    found = STEP_MARK.search(tmux("show", "-g", "status-format[0]").stdout)
+    found = STEP_MARK.search(banner())
     return int(found.group(1)) if found else None
 
 
 def cue() -> str:
-    return tmux("show", "-g", "status-format[2]").stdout
+    return tmux("show", "-g", "status-format[3]").stdout
 
 
 def title_text() -> str:
-    return tmux("show", "-g", "status-format[1]").stdout
+    return tmux("show", "-g", "status-format[2]").stdout
 
 
 def sandbox_muxa(muxa: str, *args: str) -> str:
@@ -271,12 +277,20 @@ def main() -> int:
         print("act I — tmux")
         report.check("step 1 is showing", step() == 1, f"step={step()}")
         report.check("the cue asks for tmux new-session", "tmux new-session" in cue(), cue())
+        report.check(
+            "tmux's own status row is left alone",
+            "status-format[0]" in tmux("show", "-g", "status-format[0]").stdout
+            and "window-status" in tmux("show", "-g", "status-format[0]").stdout,
+            tmux("show", "-g", "status-format[0]").stdout[:120],
+        )
 
         terminal.type(b"tmux new-session -s muxa-onboarding\r", 4)
         report.check("creating a session advances", wait_step(terminal, 2), f"step={step()}")
 
         terminal.type(b"\x02c", 3)  # Ctrl-b c
         report.check("a second window advances", wait_step(terminal, 3), f"step={step()}")
+        # "Did that work?" is the question the learner is holding at every step.
+        report.check("the step confirms what the last action did", "✓" in banner(), banner())
 
         terminal.type(b"\x02d", 3)  # Ctrl-b d
         report.check("detaching advances", wait_step(terminal, 4), f"step={step()}")
