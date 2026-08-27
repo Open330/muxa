@@ -660,13 +660,35 @@ fn resolve_split_escape() -> Result<Option<KeyEvent>> {
         )));
     }
     // Parameter bytes precede the final byte that terminates the sequence.
+    // Return the represented key instead of dropping it with the phantom Esc:
+    // the pane-navigation gate accepts only Right, so swallowing `[C` would
+    // still strand terminals that consistently split escape sequences.
+    let mut final_byte = None;
     while let Some(key) = next_pending_key()? {
-        let is_parameter = matches!(key.code, KeyCode::Char(byte) if !('@'..='~').contains(&byte));
-        if !is_parameter {
+        let KeyCode::Char(byte) = key.code else {
+            break;
+        };
+        if ('@'..='~').contains(&byte) {
+            final_byte = Some(byte);
             break;
         }
     }
-    Ok(None)
+    Ok(final_byte
+        .and_then(csi_key)
+        .map(|code| KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+/// The keys a split CSI/SS3 sequence may represent in this tour.
+fn csi_key(final_byte: char) -> Option<KeyCode> {
+    match final_byte {
+        'A' => Some(KeyCode::Up),
+        'B' => Some(KeyCode::Down),
+        'C' => Some(KeyCode::Right),
+        'D' => Some(KeyCode::Left),
+        'H' => Some(KeyCode::Home),
+        'F' => Some(KeyCode::End),
+        _ => None,
+    }
 }
 
 fn next_pending_key() -> Result<Option<KeyEvent>> {
@@ -2239,6 +2261,17 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
+    }
+
+    #[test]
+    fn split_csi_sequences_preserve_the_key_the_tour_is_waiting_for() {
+        assert_eq!(csi_key('A'), Some(KeyCode::Up));
+        assert_eq!(csi_key('B'), Some(KeyCode::Down));
+        assert_eq!(csi_key('C'), Some(KeyCode::Right));
+        assert_eq!(csi_key('D'), Some(KeyCode::Left));
+        assert_eq!(csi_key('H'), Some(KeyCode::Home));
+        assert_eq!(csi_key('F'), Some(KeyCode::End));
+        assert_eq!(csi_key('~'), None);
     }
 
     #[test]
