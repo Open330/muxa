@@ -2065,26 +2065,35 @@ async fn best_effort_ingest(client: &Client, ev: &muxa::event::AgentEvent) {
 /// problem. A pane stuck with `%1242` as its only handle is a worse
 /// interface, not a broken agent.
 fn best_effort_default_alias(ev: &muxa::event::AgentEvent) {
-    let muxa::event::AgentEvent::Started { id, .. } = ev else {
+    let Some((pane, base)) = alias_target(ev) else {
         return;
     };
-    // `Task` rows are pid-tracked subagents rather than panes, and an
-    // unrecognised runtime has no name worth minting from.
-    if matches!(id.kind, AgentKind::Task | AgentKind::Unknown) {
-        return;
-    }
-    let Some(pane) = id
-        .pane
-        .clone()
-        .or_else(|| muxa::default_backend().current_pane())
-    else {
-        return;
-    };
-    match tmux_work::ensure_default_alias(&pane, watch::agent_kind_short(id.kind)) {
+    match tmux_work::ensure_default_alias(&pane, base) {
         Ok(Some(alias)) => tracing::debug!(pane, alias, "named pane"),
         Ok(None) => {}
         Err(e) => tracing::debug!(error = %e, pane, "could not name pane"),
     }
+}
+
+/// The pane this event should name and the runtime to name it after, or
+/// `None` when the event names nothing.
+fn alias_target(ev: &muxa::event::AgentEvent) -> Option<(String, &'static str)> {
+    let muxa::event::AgentEvent::Started { id, .. } = ev else {
+        return None;
+    };
+    // `Task` rows are pid-tracked subagents rather than panes, and an
+    // unrecognised runtime has no name worth minting from.
+    if matches!(id.kind, AgentKind::Task | AgentKind::Unknown) {
+        return None;
+    }
+    // No second-guessing the hook layer's pane resolution. `run_hook` has
+    // already tried the host env vars and walked the parent-pid chain, and
+    // it deliberately reports `None` for a muxa-owned PTY surface: that
+    // agent's shell inherits `$TMUX_PANE` from the terminal that *requested*
+    // the PTY, which owns nothing. Reading the environment again here would
+    // name that outer pane after the runtime running inside the PTY.
+    let pane = id.pane.clone()?;
+    Some((pane, watch::agent_kind_short(id.kind)))
 }
 
 /// Spawn `cmd` via `/bin/sh -c`, feed it `stdin_bytes`, stream its stdout to
@@ -2797,6 +2806,60 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    fn started(kind: AgentKind, pane: Option<&str>) -> muxa::event::AgentEvent {
+        muxa::event::AgentEvent::Started {
+            id: muxa::event::AgentId {
+                kind,
+                session_id: "s".into(),
+                surface: None,
+                pane: pane.map(ToString::to_string),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[test]
+    fn a_paneless_start_names_nothing() {
+        // `run_hook` reports `pane: None` for a muxa-owned PTY surface on
+        // purpose: that agent's shell inherited `$TMUX_PANE` from whatever
+        // terminal asked for the PTY, and that pane owns nothing. Reaching
+        // for the environment here would name the outer pane after the
+        // runtime running inside the PTY.
+        assert_eq!(alias_target(&started(AgentKind::ClaudeCode, None)), None);
+    }
+
+    #[test]
+    fn only_a_session_start_names_a_pane() {
+        assert_eq!(
+            alias_target(&started(AgentKind::ClaudeCode, Some("%7"))),
+            Some(("%7".to_string(), "claude")),
+        );
+        // Everything else on the hook path fires per tool call.
+        let tool = muxa::event::AgentEvent::ToolStarted {
+            id: muxa::event::AgentId {
+                kind: AgentKind::ClaudeCode,
+                session_id: "s".into(),
+                surface: None,
+                pane: Some("%7".into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            tool: "Bash".into(),
+            subagent: None,
+            at: time::OffsetDateTime::now_utc(),
+        };
+        assert_eq!(alias_target(&tool), None);
+    }
+
+    #[test]
+    fn pid_tracked_and_unknown_rows_name_nothing() {
+        // A `Task` row is a subagent under a pane, not a pane of its own.
+        assert_eq!(alias_target(&started(AgentKind::Task, Some("%7"))), None);
+        assert_eq!(alias_target(&started(AgentKind::Unknown, Some("%7"))), None);
+    }
 
     #[test]
     fn dispatch_kind_prefers_pane_namespace_over_fallback() {

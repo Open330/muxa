@@ -834,6 +834,10 @@ const DEFAULT_ALIAS_BASE_MAX: usize = 28;
 /// How many `claude`, `claude2`, `claude3`… candidates to try. A room with
 /// 64 agents of one kind is not a room; this is a loop bound, not a policy.
 const DEFAULT_ALIAS_TRIES: usize = 64;
+/// How many claim/verify rounds to spend settling a naming race. One round
+/// per racer is enough to converge, so this bounds how many agents may start
+/// in one window in the same instant before muxa stops trying.
+const DEFAULT_ALIAS_ROUNDS: usize = 16;
 
 /// Give `pane` a room-local handle if nothing has named it yet. Returns the
 /// alias the pane now answers to, or `None` when it already had one or the
@@ -861,28 +865,35 @@ pub fn ensure_default_alias(pane: &str, base: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let window = window_id_for_pane(pane)?;
-    let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
-        return Ok(None);
-    };
-    set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
 
-    // Two agents starting in one window at the same moment both read an
-    // empty room and both pick `claude`. tmux user options have no
-    // compare-and-set, so the race is settled after the fact instead:
-    // re-read, and the pane tmux numbered later yields. An ambiguous
-    // `@claude` only ever refuses a peer call rather than misrouting it,
-    // but a refusal the user has to go debug is still a defect.
-    let contested = aliases_besides(&window, pane)?.iter().any(|(other, name)| {
-        name.eq_ignore_ascii_case(&alias) && pane_ordinal(other) < pane_ordinal(pane)
-    });
-    if !contested {
-        return Ok(Some(alias));
+    // Agents starting in one window at the same moment all read an empty
+    // room and all pick `claude`. tmux user options have no compare-and-set,
+    // so the race is settled after the fact: claim, re-read, and yield to
+    // any lower-numbered pane holding the same name.
+    //
+    // It has to be a loop rather than one retry. With three racers, the two
+    // that yield both re-pick from a read taken before either wrote, so they
+    // land on the same `claude2` and — with nothing checking a second time —
+    // keep it. Each round does settle the lowest unsettled racer, though,
+    // and a pane that settles never moves again, so N racers converge in at
+    // most N rounds.
+    for _ in 0..DEFAULT_ALIAS_ROUNDS {
+        let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
+            return Ok(None);
+        };
+        set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
+        if !yields_to_lower(&alias, pane, &aliases_besides(&window, pane)?) {
+            return Ok(Some(alias));
+        }
     }
-    let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
-        return Ok(None);
-    };
-    set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
-    Ok(Some(alias))
+
+    // Out of rounds with a name somebody lower still holds. Give it up
+    // rather than leave the duplicate standing: a contested `@claude2` is
+    // refused as ambiguous for *both* panes, so keeping ours would take down
+    // the pane that legitimately owns it too. Unset, this pane simply falls
+    // back to being addressed as `%1242`.
+    unset_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION)?;
+    Ok(None)
 }
 
 /// `(pane id, alias)` for every *other* pane in `window` that carries one.
@@ -940,6 +951,15 @@ fn sanitize_alias_base(base: &str) -> Option<String> {
         .collect();
     cleaned.truncate(DEFAULT_ALIAS_BASE_MAX);
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Whether `pane` has to give up `alias` because a pane tmux numbered
+/// earlier is holding the same name. The tie-break has to be total and
+/// stable, or two racers each decide the *other* one yields.
+fn yields_to_lower(alias: &str, pane: &str, others: &[(String, String)]) -> bool {
+    others.iter().any(|(other, name)| {
+        name.eq_ignore_ascii_case(alias) && pane_ordinal(other) < pane_ordinal(pane)
+    })
 }
 
 /// tmux hands out pane ids monotonically, so the numeric part orders two
@@ -2312,6 +2332,17 @@ fn set_option(scope: OptionScope, target: &str, key: &str, value: &str) -> Resul
     tmux_status(&args)
 }
 
+fn unset_option(scope: OptionScope, target: &str, key: &str) -> Result<()> {
+    let mut args = vec!["set-option", "-u"];
+    match scope {
+        OptionScope::Session => {}
+        OptionScope::Window => args.push("-w"),
+        OptionScope::Pane => args.push("-p"),
+    }
+    args.extend(["-t", target, key]);
+    tmux_status(&args)
+}
+
 fn tmux_status(args: &[&str]) -> Result<()> {
     let output = muxa::tmux::tmux_command_scoped()
         .args(args)
@@ -2795,6 +2826,110 @@ mod tests {
             taken(&[("%3", "reviewer")]),
             "our own row and the empty one are both dropped"
         );
+    }
+
+    /// One round of the settle loop under the worst schedule: every racer
+    /// reads the room as it stood before any of them wrote, then all the
+    /// writes land, then each verifies against the result. Returns the room
+    /// and who settled — composing the same two decisions
+    /// (`pick_default_alias`, `yields_to_lower`) the real loop runs.
+    fn settle_round(
+        racers: &[String],
+        room: &mut Vec<(String, String)>,
+        settled: &mut Vec<String>,
+    ) {
+        let snapshot = room.clone();
+        let writes: Vec<(String, String)> = racers
+            .iter()
+            .filter(|pane| !settled.contains(pane))
+            .map(|pane| {
+                let others: Vec<_> = snapshot
+                    .iter()
+                    .filter(|(other, _)| other != pane)
+                    .cloned()
+                    .collect();
+                let alias = pick_default_alias("claude", &others).expect("a free name");
+                (pane.clone(), alias)
+            })
+            .collect();
+        for (pane, alias) in &writes {
+            room.retain(|(held, _)| held != pane);
+            room.push((pane.clone(), alias.clone()));
+        }
+        for (pane, alias) in &writes {
+            let others: Vec<_> = room
+                .iter()
+                .filter(|(other, _)| other != pane)
+                .cloned()
+                .collect();
+            if !yields_to_lower(alias, pane, &others) {
+                settled.push(pane.clone());
+            }
+        }
+    }
+
+    fn racers(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("%{i}")).collect()
+    }
+
+    #[test]
+    fn a_single_retry_leaves_the_losers_colliding() {
+        // Why the settle is a loop and not the one retry this started as.
+        // Round one: everyone claims `claude`, and only the lowest-numbered
+        // racer survives the check. Round two: the three that yielded each
+        // re-pick from a read taken before any of them wrote, so all three
+        // choose `claude2` — and the old code returned right there, with no
+        // second check. This is the shape the live 7-pane barrier test
+        // produced before the fix.
+        let panes = racers(4);
+        let (mut room, mut settled) = (Vec::new(), Vec::new());
+        settle_round(&panes, &mut room, &mut settled);
+        assert_eq!(settled, vec!["%1"], "only the lowest ordinal settles");
+        settle_round(&panes, &mut room, &mut settled);
+        let losers: Vec<&str> = room
+            .iter()
+            .filter(|(pane, _)| pane != "%1")
+            .map(|(_, alias)| alias.as_str())
+            .collect();
+        assert_eq!(losers, ["claude2", "claude2", "claude2"], "{room:?}");
+    }
+
+    #[test]
+    fn repeated_rounds_settle_every_racer_on_its_own_name() {
+        // A settled pane never moves again, so each round frees the next
+        // racer: N racers converge in at most N rounds, well inside the
+        // bound.
+        let panes = racers(7);
+        let (mut room, mut settled) = (Vec::new(), Vec::new());
+        let mut rounds = 0;
+        while settled.len() < panes.len() && rounds < DEFAULT_ALIAS_ROUNDS {
+            settle_round(&panes, &mut room, &mut settled);
+            rounds += 1;
+        }
+        assert_eq!(settled.len(), panes.len(), "did not converge: {room:?}");
+        assert!(
+            rounds <= panes.len(),
+            "{rounds} rounds for {} racers",
+            panes.len()
+        );
+        let mut names: Vec<&str> = room.iter().map(|(_, alias)| alias.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            panes.len(),
+            "duplicate names survived: {room:?}"
+        );
+    }
+
+    #[test]
+    fn the_tie_break_never_makes_both_racers_yield() {
+        // If two panes each decided the other one wins, the loop would swap
+        // names forever instead of converging.
+        let room = vec![("%1".to_string(), "claude".to_string())];
+        assert!(yields_to_lower("claude", "%2", &room));
+        let room = vec![("%2".to_string(), "claude".to_string())];
+        assert!(!yields_to_lower("claude", "%1", &room));
     }
 
     #[test]
