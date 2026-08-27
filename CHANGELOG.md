@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
+  one.** The isolation the demo recordings had grown privately is now a
+  supported command: `up` / `daemon` / `env` / `status` / `down` over a private
+  `MUXA_SOCKET`, `MUXA_CONFIG` and `XDG_DATA_HOME`, an isolated tmux server
+  pinned through `MUXA_TMUX_SOCKET`, and a `tmux` PATH shim so child processes
+  land on that server too. `up` refuses to nest inside an existing tmux session
+  unless told otherwise, checks that `muxa` and `muxad` are the same build, and
+  tears down anything a previous run left behind before building. `status`
+  distinguishes healthy from partial and names every artifact it found; `down`
+  reaps daemons the pidfile lost track of, waits for them to actually exit, then
+  verifies and reports what survived. Every artifact lives below a mode-0700
+  root carrying an ownership marker, so a same-named `/tmp` path is refused
+  rather than deleted, and tmux uses an explicit socket path that stays stable
+  across `TMUX_TMPDIR` changes. A pidfile is only trusted after its process is
+  confirmed against this sandbox's exact config, while custom-named `muxad`
+  binaries remain discoverable; starting the daemon again reuses the healthy
+  process rather than creating a socket race.
+  `scripts/sandbox-smoke.sh` holds it to that, asserting teardown is total from
+  each state a crash can leave.
+  `docs/demo-setup.sh` is the first consumer and now carries only the fixture.
+
 ### Changed
 
 - **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
@@ -25,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The demo fixture could not be rebuilt.** `docs/demo-setup.sh` wrote
+  `[watch] view = 'work'`, a value that stopped existing when the watch view
+  enum became `session` / `window` / `pane`, so `muxad` refused the config and
+  every GIF regeneration failed at daemon start.
+- **An arrow torn across two reads still counts.** The handler added here to
+  drop the phantom `Esc` of a split escape sequence swallowed the CSI tail and
+  returned nothing, which drops the arrow along with the `Esc` — on the one
+  step whose contract accepts an arrow and no letter. A terminal that ships
+  `\x1b` and `[C` in separate writes therefore hit the same dead end this
+  change exists to remove. The final byte now says which key it was.
+  `scripts/split-arrow-check.py` drives the real tour with the sequence torn at
+  1, 20 and 45 ms and is wired into CI.
 - **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
   it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
   so a terminal that composes Option instead of sending Meta — the macOS

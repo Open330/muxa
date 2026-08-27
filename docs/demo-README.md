@@ -11,9 +11,11 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo.tape`          | [VHS](https://github.com/charmbracelet/vhs) script for the hero GIF.                      |
 | `docs/demo-collab.tape`   | VHS script for the collaboration GIF.                                                     |
 | `docs/demo-onboard.tape`  | Unified shell → tmux → Muxa fullscreen walkthrough; no fixture or daemon needed.           |
-| `docs/demo-setup.sh`      | Builds the whole fixture: config, PATH shims, tmux server, `muxad`, the seeded fleet, the mailbox, and the ask history. |
+| `scripts/muxa-sandbox.sh` | The isolation itself: private socket, config, data dir, tmux server, and the `tmux` PATH shim. `up` / `daemon` / `env` / `status` / `down`. |
+| `scripts/sandbox-smoke.sh`| Lifecycle test for the sandbox — proves `down` returns the machine to clean from every state, including the ones a crash leaves. |
+| `docs/demo-setup.sh`      | The fixture layered on the sandbox: the seeded fleet, the mailbox, the ask history, and the painted panes. |
 | `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
-| `docs/demo-teardown.sh`   | Removes all of it. Safe to run at any time, including after a half-finished render.        |
+| `docs/demo-teardown.sh`   | Removes all of it — delegates to the sandbox, then clears the fixture-only files. Safe at any time, including after a half-finished render. |
 | `docs/demo-optimize.sh`   | Rebuilds a rendered GIF on a 64-colour palette. Run it after `vhs`, before committing.     |
 | `docs/demo.gif`           | Hero output. 1320 × 620, ~1.7 MB after optimizing.                                          |
 | `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.7 MB after optimizing.                                 |

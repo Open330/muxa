@@ -67,6 +67,25 @@ jobs:
       # tour; `muxa onboard --emit step-table` is the contract it is held to.
       - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa
       - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa --lang ko
+      # Step 6 accepts an arrow and nothing else, so an arrow the terminal
+      # tears in two has to survive the split-escape handler.
+      - run: python3 scripts/split-arrow-check.py --muxa target/debug/muxa
+
+  sandbox:
+    name: sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: cargo build --workspace --bins
+      - run: shellcheck scripts/muxa-sandbox.sh scripts/sandbox-smoke.sh
+      # A sandbox that leaks a daemon or a tmux server is worse than no
+      # sandbox, so the suite asserts teardown is total from every state.
+      - run: scripts/sandbox-smoke.sh
 
   msrv:
     name: MSRV (1.89)
