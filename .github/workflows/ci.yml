@@ -82,6 +82,7 @@ jobs:
       # The tour claims it never intercepts a keystroke, so every step has to be
       # reachable by typing the command the narration asks for. This types them.
       - run: scripts/live-tour-smoke.py --muxa target/debug/muxa
+      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --lang ko
 
   msrv:
     name: MSRV (1.88)

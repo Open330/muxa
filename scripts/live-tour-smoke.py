@@ -194,9 +194,12 @@ def main() -> int:
                 break
             terminal.pump(2)
         report.check("the tour exits on its own", terminal.finished())
+        # Both languages, because the summary is the only place the tour tells
+        # the learner nothing was left on their machine.
+        gone = {"en": "sandbox is gone", "ko": "sandbox는 사라졌습니다"}[args.lang]
         report.check(
             "it says the sandbox is gone",
-            "sandbox is gone" in terminal.text(),
+            gone in terminal.text(),
             terminal.text()[-300:],
         )
     finally:
