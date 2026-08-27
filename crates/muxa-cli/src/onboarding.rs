@@ -660,13 +660,41 @@ fn resolve_split_escape() -> Result<Option<KeyEvent>> {
         )));
     }
     // Parameter bytes precede the final byte that terminates the sequence.
+    // Swallowing the tail and returning nothing drops the *key* along with the
+    // phantom `Esc`, which is the same dead end this function exists to
+    // remove: `Step::Panes` accepts nothing but `Right`, so a transport that
+    // splits `Esc` `[C` across reads leaves the learner pressing an arrow that
+    // never arrives. The final byte says which key it was.
+    let mut final_byte = None;
     while let Some(key) = next_pending_key()? {
-        let is_parameter = matches!(key.code, KeyCode::Char(byte) if !('@'..='~').contains(&byte));
-        if !is_parameter {
+        let KeyCode::Char(byte) = key.code else {
+            break;
+        };
+        if ('@'..='~').contains(&byte) {
+            final_byte = Some(byte);
             break;
         }
     }
-    Ok(None)
+    Ok(final_byte
+        .and_then(csi_key)
+        .map(|code| KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+/// The key a CSI/SS3 sequence terminating in this byte stands for.
+///
+/// Only the keys the tour gates on. Anything else stays swallowed: reporting a
+/// wrong key is worse than reporting none, because a gate that advances on the
+/// wrong press teaches the wrong thing.
+fn csi_key(final_byte: char) -> Option<KeyCode> {
+    match final_byte {
+        'A' => Some(KeyCode::Up),
+        'B' => Some(KeyCode::Down),
+        'C' => Some(KeyCode::Right),
+        'D' => Some(KeyCode::Left),
+        'H' => Some(KeyCode::Home),
+        'F' => Some(KeyCode::End),
+        _ => None,
+    }
 }
 
 fn next_pending_key() -> Result<Option<KeyEvent>> {
