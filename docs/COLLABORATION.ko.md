@@ -64,8 +64,8 @@ muxa init --component collaboration
 [collaboration]
 enabled = true
 wake = "idle_only"
-# 선택 사항: 기본값 "notice", 원문 직접 전달은 "full"
-wake_payload = "notice"
+# 선택 사항: 기본값 "operator_full", 또는 "notice" / "full"
+wake_payload = "operator_full"
 ```
 
 이미 있는 `wake` 값은 덮어쓰지 않습니다. `never`는 "mailbox는 쓰되 내 pane은
@@ -112,7 +112,7 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 
 - 같은 `(tmux socket, stable window id)`를 공유하는 agent가 한 room입니다.
 - agent가 정확히 둘이면 상대를 `peer`로 지정할 수 있습니다.
-- 셋 이상이면 `%12` 또는 `pane:%12`처럼 pane을 명시합니다.
+- 셋 이상이면 `@claude`처럼 handle로, 없으면 `%12` / `pane:%12`로 지정합니다.
 - identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
 - `scope = "window"`에서는 다른 window의 pane을 거부합니다. `scope = "host"`는
   명시적 `pane:%12` 대상을 다른 window/session까지 넓힙니다.
@@ -126,10 +126,25 @@ muxa peers
 muxa peers --json
 ```
 
+## 기본 handle
+
+agent pane은 아무도 이름을 붙이지 않아도 handle을 하나 받습니다. room에서 그
+런타임의 첫 agent가 `@claude`, `@codex`, `@gemini`, `@agy`, `@opencode`가 되고
+같은 종류의 두 번째가 `@claude2`가 됩니다. session의 첫 hook 이벤트에서 부여되며, pane 옵션 `@muxa_agent_alias`에
+저장되어 muxad·CLI·agent 재시작보다 오래 남습니다.
+
+handle 발급은 전부 daemon이 합니다. pane 옵션·등록된 identity·아직 기록되지
+않은 예약까지 room 전체를 보는 유일한 지점이고, 그보다 좁은 시야에서 할당하면
+한 room이 `@claude`에 두 번 응답하게 됩니다. explicit alias도 stamp 전에 여기
+등록합니다. daemon에 닿지 못하면 이름을 붙이지 않고 `%1242`로 남깁니다.
+
+이미 이름이 있는 pane은 건드리지 않으므로 pipeline alias나 직접 지정한 이름이
+우선합니다. `muxa peek`은 각 pane 헤더에 pane id와 함께 handle을 표시합니다.
+
 ## Agent identity
 
 pane이 셋 이상인 room에서는 각 agent가 의미 있는 alias와 role을 등록할 수
-있습니다. identity는 pane이 아니라 현재 agent session에 고정되므로 pane을 새
+있습니다. 등록한 이름은 기본 handle을 덮어씁니다. identity는 pane이 아니라 현재 agent session에 고정되므로 pane을 새
 agent가 재사용해도 이전 이름이나 역할을 상속하지 않습니다.
 
 ```bash
@@ -329,18 +344,26 @@ prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
 participant나 자동 wake 대상이 아닙니다. `wake = "never"`로 설정하면 mailbox는
 유지하면서 모든 입력 주입을 끌 수 있습니다.
 
-기본값인 `wake_payload = "notice"`는 짧은 mailbox 알림만 넣고 본문을 terminal에
-주입하지 않습니다. 요청을 `muxa_inbox`로 읽는 순간 원자적으로 claim합니다.
+기본값인 `wake_payload = "operator_full"`은 resolved sender가 operator console인
+watch/dashboard 요청을 원자적으로 claim해 직접 전달하고, agent가 MCP/CLI로 보낸
+요청은 짧은 mailbox 알림만 넣습니다. `notice`는 모든 요청 본문을 mailbox에 두며,
+`full`은 모든 요청을 직접 전달합니다.
 
-`wake_payload = "full"`은 terminal에 입력하기 전에 queued request 하나를
-원자적으로 claim하고, request id/source/kind/work mode/paths/AIR reference와 원문을
-구조화된 prompt로 직접 전달합니다. 이 request에는 inbox를 다시 호출할 필요가 없어
-tool round와 전체 JSON envelope를 줄입니다. idle generation 하나에는 원문 하나만
-제출하고, 실제 Idle transition이 온 뒤 다음 요청을 전달합니다. reply 본문은 이
-모드에서도 항상 mailbox에만 둡니다.
+직접 전달은 terminal에 입력하기 전에 queued request 하나를 원자적으로 claim하고,
+request id/source/kind/work mode/paths/AIR reference와 원문을 구조화된 prompt로
+전달합니다. 이 request에는 inbox를 다시 호출할 필요가 없어 tool round와 전체 JSON
+envelope를 줄입니다. idle generation 하나에는 원문 하나만 제출하고, 실제 Idle
+transition이 온 뒤 다음 요청을 전달합니다. reply 본문은 모든 모드에서 항상
+mailbox에만 둡니다.
 
-`full`은 요청 본문을 terminal과 agent prompt history에도 남기므로 민감한 본문을
-mailbox에만 두려면 `notice`를 사용하세요. terminal 제어문자가 포함된 본문은
+`operator_full`은 전달 정책이지 사람의 승인을 증명하는 장치가 아닙니다. muxad가
+resolve한 sender identity를 기준으로 하며, `work_mode = "execute"`만으로 agent 발신
+요청을 operator 요청으로 승격하거나 payload 정책을 바꾸지 않습니다. 직접 전달된
+envelope의 source 줄에는 operator surface와 caller provenance가 계속 표시됩니다.
+
+직접 전달은 요청 본문을 terminal과 agent prompt history에도 남기므로 민감한 본문을
+항상 mailbox에만 두려면 `notice`를 사용하세요. `operator_full`은 agent 발신 본문만
+mailbox에 유지합니다. terminal 제어문자가 포함된 본문은
 변형하거나 위험하게 paste하지 않고 자동으로 `notice` 경로를 사용합니다. muxad는
 prompt text 기록과 별도 Enter 제출 단계를 durable state로 구분합니다. 중단 후
 text가 이미 기록된 것이 확실하면 Enter만 재시도하고, 기록 여부가 불확실하면 원문을

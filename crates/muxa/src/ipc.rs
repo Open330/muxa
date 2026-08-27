@@ -151,6 +151,15 @@ enum RequestBody {
         event: AgentEvent,
     },
     Snapshot,
+    /// Ask the room's namespace arbiter for a handle. The daemon is the only
+    /// place that sees pane options, registered identities, and handles
+    /// promised to callers that have not written them yet.
+    CollaborationIssueHandle {
+        pane: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<String>,
+        request: collaboration::HandleRequest,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     /// Create or update one desired Run and reconcile live pane evidence.
@@ -455,6 +464,7 @@ const CAPABILITIES: &[&str] = &[
     "fleet_v1",
     "fleet_subscribe",
     "pipeline_runs_v1",
+    "handle_namespace_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -514,6 +524,10 @@ pub struct Response {
     pub submitted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomContext>,
+    /// Handle issued by the room's namespace arbiter. Absent when the room
+    /// had no free name, or when the pane could not be placed in one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_requests: Option<Vec<CollaborationRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -564,6 +578,7 @@ impl Response {
             sent: None,
             submitted: None,
             room: None,
+            handle: None,
             collaboration_requests: None,
             collaboration_request: None,
             ask_entries: None,
@@ -663,6 +678,11 @@ impl Response {
         let mut r = Self::ok();
         r.sent = Some(sent);
         r.submitted = Some(submitted);
+        r
+    }
+    fn with_handle(handle: Option<String>) -> Self {
+        let mut r = Self::ok();
+        r.handle = handle;
         r
     }
     fn with_room(room: RoomContext) -> Self {
@@ -1399,6 +1419,24 @@ struct CollaborationTopology {
 }
 
 impl CollaborationTopology {
+    /// The room a pane belongs to, whether or not it hosts a tracked agent.
+    /// A handle is allocated at session start, which is exactly when the pane
+    /// may not be a participant yet.
+    fn room_of(&self, pane: &str, socket: Option<&str>) -> Option<collaboration::RoomId> {
+        self.panes
+            .iter()
+            .find(|info| info.pane_id == pane)
+            .map(|info| {
+                collaboration::room_of_pane(
+                    pane,
+                    info,
+                    socket
+                        .map(ToString::to_string)
+                        .or_else(|| info.socket.clone()),
+                )
+            })
+    }
+
     fn resolve_origin(
         &self,
         origin: &CollaborationOrigin,
@@ -2189,6 +2227,28 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationIssueHandle {
+                    pane,
+                    socket,
+                    request,
+                } => {
+                    kind = "collaboration_issue_handle";
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match topology.room_of(&pane, socket.as_deref()) {
+                        Some(room) => match collaboration
+                            .issue_handle(&room, &pane, &topology.participants, request)
+                            .await
+                        {
+                            Ok(handle) => Response::with_handle(handle),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        // A pane the scan cannot place has no room, so it has
+                        // no namespace to allocate from. The caller falls back
+                        // to leaving it unnamed rather than guessing.
+                        None => Response::with_handle(None),
+                    }
+                }
                 RequestBody::CollaborationSetIdentity {
                     origin,
                     alias,
@@ -2656,6 +2716,75 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 }
 
 /// After `UnixListener::bind`, chmod the path so only the owner can connect.
+/// One blocking request/response against the daemon, for callers that have no
+/// runtime to await on.
+///
+/// `agent_launch::start` and the `work up` pipeline stamp a pane's explicit
+/// alias from synchronous code that is reached from both async and blocking
+/// contexts, and threading a runtime through every one of them to register a
+/// name would be a large change in service of one small call. The wire is
+/// line-delimited JSON over a Unix socket, so a synchronous client is a
+/// connect, a write, and a read.
+///
+/// Every failure is `None`: the caller's job is to name a pane, and losing
+/// the daemon means it names it without the arbiter's blessing rather than
+/// not at all.
+pub fn blocking_call(
+    socket_path: &Path,
+    req: &serde_json::Value,
+    deadline: Duration,
+) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader as SyncBufReader, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
+    stream.set_read_timeout(Some(deadline)).ok()?;
+    stream.set_write_timeout(Some(deadline)).ok()?;
+    let mut bytes = serde_json::to_vec(req).ok()?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).ok()?;
+    stream.flush().ok()?;
+    let mut line = String::new();
+    let read = SyncBufReader::new(&stream).read_line(&mut line).ok()?;
+    if read == 0 {
+        return None;
+    }
+    serde_json::from_str(&line).ok()
+}
+
+/// Register an explicit alias with the room's namespace arbiter.
+///
+/// `Ok(())` means the room accepted it, `Err` that another pane already
+/// answers to that name. `Ok(())` is also what a missing or older daemon
+/// yields — an explicit alias comes from the user's own configuration, so a
+/// daemon that cannot referee is no reason to refuse to honour it.
+pub fn blocking_reserve_handle(
+    socket_path: &Path,
+    pane: &str,
+    handle: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    let req = serde_json::json!({
+        "protocol": PROTOCOL_VERSION,
+        "kind": "collaboration_issue_handle",
+        "pane": pane,
+        "request": { "reserve": { "handle": handle } },
+    });
+    let Some(resp) = blocking_call(socket_path, &req, deadline) else {
+        return Ok(());
+    };
+    if resp["ok"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    match resp["error"].as_str() {
+        Some(message) if message.contains("already used by a live peer") => {
+            Err(message.to_string())
+        }
+        // Anything else is the daemon failing to referee rather than
+        // refusing: an unknown request kind on an older build, a room it
+        // cannot resolve. Honour the caller's own configuration.
+        _ => Ok(()),
+    }
+}
+
 pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(socket_path, perms)
@@ -3085,6 +3214,39 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Ask the room's arbiter for a handle for `pane`.
+    ///
+    /// `Ok(None)` covers every "carry on without a name" case — no free name,
+    /// a pane the daemon cannot place, or a daemon too old to know the
+    /// request — so callers do not have to tell them apart. `Err` is reserved
+    /// for a `Reserve` the room refused, which the caller does need to see.
+    pub async fn collaboration_issue_handle(
+        &self,
+        pane: &str,
+        socket: Option<&str>,
+        request: &crate::collaboration::HandleRequest,
+        deadline: Duration,
+    ) -> Result<Option<String>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_issue_handle",
+            "pane": pane,
+            "socket": socket,
+            "request": request,
+        });
+        // A daemon that predates the arbiter cannot referee the namespace, and
+        // naming a pane without one is what this change exists to stop.
+        // Leaving it unnamed costs a `%1242`.
+        let Ok(resp) = self.call_with_timeout(&req, deadline).await else {
+            return Ok(None);
+        };
+        if resp["ok"].as_bool() != Some(true) {
+            let message = resp["error"].as_str().unwrap_or("issue handle failed");
+            return Err(RuntimeError::Daemon(message.to_string()));
+        }
+        Ok(resp["handle"].as_str().map(ToString::to_string))
     }
 
     pub async fn collaboration_set_identity(

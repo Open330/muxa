@@ -4,7 +4,7 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 
 ## 필요 조건
 
-- Rust 1.88+
+- Rust 1.89+
 - tmux 3.x
 - Unix-like OS
 - Claude Code, OpenAI Codex, Google Gemini CLI, Google Antigravity CLI(`agy`) 중 하나

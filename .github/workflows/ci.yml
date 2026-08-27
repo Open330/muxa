@@ -88,13 +88,13 @@ jobs:
       - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --mode skip
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 

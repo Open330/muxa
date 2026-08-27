@@ -95,6 +95,22 @@ pub enum TopologyNodeKey {
     Pane(PaneKey),
 }
 
+impl TopologyNodeKey {
+    /// The backend endpoint this node lives on, whatever level it is.
+    ///
+    /// Every level carries the same endpoint through its ancestry, so callers
+    /// that only need "which server, which multiplexer" — a rename, a control
+    /// command — do not have to match the variant to find out.
+    #[must_use]
+    pub fn endpoint(&self) -> &BackendEndpoint {
+        match self {
+            TopologyNodeKey::Session(session) => &session.endpoint,
+            TopologyNodeKey::Window(window) => &window.session.endpoint,
+            TopologyNodeKey::Pane(pane) => &pane.window.session.endpoint,
+        }
+    }
+}
+
 /// Whether a hierarchy level is native, mapped without inventing nodes, or
 /// unavailable from a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,12 +393,12 @@ pub struct TopologySnapshot {
 /// Left alone the topology shows the same workspace two or three times over,
 /// with the agents attached to whichever copy happened to be scanned first.
 ///
-/// The surviving member is the one whose name *is* the group name: tmux names
-/// a group after the session it was created from, so that one is the real
-/// workspace and the rest are per-terminal views of it. If it is gone — a view
-/// outliving the session it was opened from — the lexically first session id
-/// wins. Which member that is matters less than that it is the same one on
-/// every tick, instead of whichever the scan happened to reach first.
+/// The oldest live member (the lowest numeric `$N` session id) survives. tmux
+/// creates every grouped sibling after the session it was created from, so the
+/// original workspace is the oldest member even after it is renamed. The
+/// group name cannot identify it: `rename-session` does not update
+/// `#{session_group}`. If the original is gone, the oldest remaining view is a
+/// stable fallback instead of whichever row the scan happened to return first.
 ///
 /// Rows for the other members are rewritten onto the survivor's identity and
 /// then deduplicated by pane, which is what actually merges the trees: the
@@ -402,9 +418,7 @@ fn fold_session_groups(rows: Vec<(HostKind, PaneInfo)>) -> Vec<(HostKind, PaneIn
         let key = (*host, pane.socket.clone(), group.clone());
         let candidate = (pane.session_id.clone(), pane.session.clone());
         match survivors.get(&key) {
-            // The group's namesake always wins, whatever order it arrives in.
-            Some((_, name)) if *name == group => {}
-            Some((id, _)) if *id <= candidate.0 && pane.session != group => {}
+            Some((id, _)) if !tmux_session_id_is_earlier(&candidate.0, id) => {}
             _ => {
                 survivors.insert(key, candidate);
             }
@@ -430,6 +444,19 @@ fn fold_session_groups(rows: Vec<(HostKind, PaneInfo)>) -> Vec<(HostKind, PaneIn
         }
     }
     folded
+}
+
+/// tmux session ids are monotonically allocated decimal numbers prefixed by
+/// `$`. Compare that numeric payload rather than the rendered string: `$107`
+/// is newer than `$99`, despite sorting before it lexically.
+fn tmux_session_id_is_earlier(candidate: &str, current: &str) -> bool {
+    let sequence = |id: &str| id.strip_prefix('$').and_then(|raw| raw.parse::<u64>().ok());
+    match (sequence(candidate), sequence(current)) {
+        (Some(candidate), Some(current)) => candidate < current,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate < current,
+    }
 }
 
 impl TopologySnapshot {
@@ -878,24 +905,24 @@ mod tests {
     }
 
     #[test]
-    fn folding_keeps_the_session_the_group_is_named_after() {
-        // `view~9~base` is a per-terminal view of `base`; `base` is the
-        // workspace. Whichever order the scan reports them in, the workspace
-        // is what survives — the view is an artifact of how someone attached.
+    fn folding_keeps_the_original_session_after_it_is_renamed() {
+        // tmux leaves `session_group` as `base` after the original session is
+        // renamed. The original still survives because it has the older
+        // numeric id; relying on the stale group name would select no member.
         for rows in [
             vec![
-                grouped("$0", "base", "base"),
-                grouped("$1", "view~9~base", "base"),
+                grouped("$99", "renamed", "base"),
+                grouped("$107", "base~view~9", "base"),
             ],
             vec![
-                grouped("$1", "view~9~base", "base"),
-                grouped("$0", "base", "base"),
+                grouped("$107", "base~view~9", "base"),
+                grouped("$99", "renamed", "base"),
             ],
         ] {
             let folded = fold_session_groups(rows);
             assert_eq!(folded.len(), 1, "the duplicate row must be dropped");
-            assert_eq!(folded[0].1.session, "base");
-            assert_eq!(folded[0].1.session_id, "$0");
+            assert_eq!(folded[0].1.session, "renamed");
+            assert_eq!(folded[0].1.session_id, "$99");
         }
     }
 
@@ -904,12 +931,12 @@ mod tests {
         // A view can outlive the session it was opened from. There is then no
         // right answer, only a stable one: the same member every tick, not
         // whichever the scan reached first.
-        let a = grouped("$1", "view~9~base", "base");
-        let b = grouped("$2", "view~8~base", "base");
+        let a = grouped("$9", "view~9~base", "base");
+        let b = grouped("$107", "view~8~base", "base");
         let forward = fold_session_groups(vec![a.clone(), b.clone()]);
         let reverse = fold_session_groups(vec![b, a]);
         assert_eq!(forward.len(), 1);
-        assert_eq!(forward[0].1.session_id, "$1");
+        assert_eq!(forward[0].1.session_id, "$9");
         assert_eq!(reverse[0].1.session_id, forward[0].1.session_id);
     }
 

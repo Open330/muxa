@@ -294,6 +294,29 @@ pub fn run_control_on(socket: Option<&str>, args: &[&str]) -> Result<(), TmuxErr
     }
 }
 
+/// Run one tmux control command against an explicitly identified server and
+/// return its stdout.
+///
+/// The reading counterpart to [`run_control_on`], for the control ops that
+/// need an answer rather than an exit status — checking whether a name is
+/// already taken in a session before renaming into it, say. Same server
+/// pinning and the same bounded error shape.
+pub fn capture_control_on(socket: Option<&str>, args: &[&str]) -> Result<String, TmuxError> {
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(args);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux {}", args.join(" ")),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
 /// The `send-keys` argv (after any server-scope flags) for a literal text
 /// injection. Split out from [`send_text_on`] so the argument construction is
 /// unit-testable without a running tmux server.

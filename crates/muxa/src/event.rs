@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 /// when the IPC envelope schema evolves. Pinning to a specific value across
 /// muxa upgrades is not supported; treat it as a runtime negotiation token,
 /// not a stable API constant.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[serde(rename_all = "snake_case")]

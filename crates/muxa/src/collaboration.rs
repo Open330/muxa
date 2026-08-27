@@ -462,6 +462,37 @@ pub struct CollaborationRequest {
     pub reply: Option<CollaborationReply>,
 }
 
+/// A handle the daemon has promised to one pane, pending the scan that will
+/// show the pane holding it.
+#[derive(Debug, Clone)]
+struct HandleReservation {
+    room: RoomId,
+    pane: String,
+    handle: String,
+    at: OffsetDateTime,
+}
+
+/// How long a promise outlives the answer.
+///
+/// Long enough to cover a reconcile tick plus the CLI's tmux write, short
+/// enough that a caller which died before writing does not hold a name out of
+/// circulation for a session. A reservation is also dropped early, the moment
+/// a scan shows its pane actually holding the handle.
+const HANDLE_RESERVATION_TTL: time::Duration = time::Duration::minutes(2);
+
+/// What a caller wants from the namespace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HandleRequest {
+    /// Take the first free name in the `base`, `base2`, `base3`… family —
+    /// what muxa mints for a pane nobody named.
+    Mint { base: String },
+    /// Claim this exact name, because a launcher was told to use it. Fails
+    /// rather than picking something else: a pipeline's `reviewer` that
+    /// silently became `reviewer2` would break the config that named it.
+    Reserve { handle: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomContext {
     #[serde(rename = "self")]
@@ -552,6 +583,15 @@ pub struct CollaborationStore {
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
     transaction_lock: Mutex<()>,
+    /// Handles issued but not yet visible in a pane scan.
+    ///
+    /// The daemon arbitrates the namespace but does not write pane options;
+    /// the CLI that asked does, and the scan that would prove it lands a tick
+    /// later. Without this, two agents starting in the same instant both ask,
+    /// both see a free `claude`, and both are told to take it. A reservation
+    /// closes that window from the arbiter's side, which is the only side
+    /// that sees every request.
+    reservations: RwLock<Vec<HandleReservation>>,
     /// Monotonic invalidation signal for durable collaboration state. The
     /// mailbox remains the source of truth: waiters wake on a revision change
     /// and re-read the exact request they care about. `watch` retains the
@@ -576,6 +616,7 @@ impl CollaborationStore {
             },
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
+            reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             changes,
         })
@@ -603,6 +644,7 @@ impl CollaborationStore {
             opts: options,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
+            reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             changes,
         }))
@@ -649,6 +691,101 @@ impl CollaborationStore {
         }
     }
 
+    /// Issue a room-local handle for `pane`, or refuse if the room already
+    /// answers to the one being asked for.
+    ///
+    /// This is the single gate the three writers of a handle now share.
+    /// Before it existed each enforced its own rule against its own view —
+    /// the minting allocator saw tmux pane options, the launcher's explicit
+    /// stamp saw nothing at all, and `set_identity` saw the identity store —
+    /// so every ordering between them produced a different way for one room
+    /// to answer to `@claude` twice. Only the daemon sees all three at once.
+    ///
+    /// What is unified is the moment of *issue*, not the lifetimes. A handle
+    /// still lands on the pane option, where it outlives muxad and the agent
+    /// restarting in place, and a registered identity still belongs to one
+    /// agent session and dies with it.
+    pub async fn issue_handle(
+        &self,
+        room: &RoomId,
+        pane: &str,
+        participants: &[Participant],
+        request: HandleRequest,
+    ) -> Result<Option<String>, CollaborationError> {
+        self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let now = OffsetDateTime::now_utc();
+        let taken = self.taken_handles(room, pane, participants, now).await;
+        let issued = match request {
+            HandleRequest::Reserve { handle } => {
+                let handle = normalize_alias(Some(handle))?
+                    .ok_or_else(|| CollaborationError::InvalidAlias(String::new()))?;
+                if taken.iter().any(|held| held.eq_ignore_ascii_case(&handle)) {
+                    return Err(CollaborationError::AliasInUse(handle));
+                }
+                handle
+            }
+            HandleRequest::Mint { base } => {
+                let Some(base) = normalize_alias(Some(base)).ok().flatten() else {
+                    return Ok(None);
+                };
+                let Some(handle) = mint_from_family(&base, &taken) else {
+                    return Ok(None);
+                };
+                handle
+            }
+        };
+        let mut reservations = self.reservations.write().await;
+        reservations.retain(|held| !(held.pane == pane && held.room == *room));
+        reservations.push(HandleReservation {
+            room: room.clone(),
+            pane: pane.to_string(),
+            handle: issued.clone(),
+            at: now,
+        });
+        Ok(Some(issued))
+    }
+
+    /// Every handle this room currently answers to, other than `pane`'s own.
+    ///
+    /// Two sources, because a handle can be live without being visible in
+    /// either alone: what participants carry (a pane option, or the identity
+    /// that overrode it) and what has been promised but not yet written.
+    async fn taken_handles(
+        &self,
+        room: &RoomId,
+        pane: &str,
+        participants: &[Participant],
+        now: OffsetDateTime,
+    ) -> Vec<String> {
+        let mut taken: Vec<String> = participants
+            .iter()
+            .filter(|participant| participant.room == *room && participant.pane != pane)
+            .filter_map(|participant| participant.alias.clone())
+            .collect();
+        let mut reservations = self.reservations.write().await;
+        // Drop promises that expired, and those a scan has since confirmed —
+        // the participant list already speaks for those, and keeping them
+        // would hold a name a restarted agent could otherwise reuse.
+        reservations.retain(|held| {
+            now - held.at < HANDLE_RESERVATION_TTL
+                && !participants.iter().any(|participant| {
+                    participant.pane == held.pane
+                        && participant
+                            .alias
+                            .as_deref()
+                            .is_some_and(|alias| alias.eq_ignore_ascii_case(&held.handle))
+                })
+        });
+        taken.extend(
+            reservations
+                .iter()
+                .filter(|held| held.room == *room && held.pane != pane)
+                .map(|held| held.handle.clone()),
+        );
+        taken
+    }
+
     pub async fn set_identity(
         &self,
         caller: &Participant,
@@ -666,19 +803,48 @@ impl CollaborationStore {
         let alias = normalize_alias(alias)?;
         let roles = normalize_roles(roles)?;
         let _transaction = self.transaction_lock.lock().await;
+        // Same namespace, same gate: a name promised to a pane that has not
+        // written it yet is taken, exactly as it is for a mint.
+        let reserved = self
+            .taken_handles(
+                &caller.room,
+                &caller.pane,
+                live_participants,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
         let previous = self.identities.read().await.clone();
         {
             let mut identities = self.identities.write().await;
             if let Some(alias) = alias.as_deref() {
-                let in_use = identities.iter().any(|identity| {
+                // A name is taken if *anything* in the room answers to it,
+                // which is two sources, not one.
+                //
+                // Identities registered through here are the obvious half.
+                // The other half is what a participant was seeded with:
+                // `@muxa_agent_alias`, the name a launcher stamped on the
+                // pane or that muxa minted for it. Checking only the store
+                // let an agent register a name a live peer already answers
+                // to, leaving `@claude` ambiguous for both — a hole only
+                // pipeline panes could fall into before, and one any room
+                // can now that every pane carries a minted handle.
+                //
+                // Both, rather than the seeded alias alone, because a caller
+                // is not required to hand us enriched participants; the
+                // store is always current.
+                let registered = identities.iter().any(|identity| {
                     identity.room == caller.room
-                        && identity.alias.as_deref() == Some(alias)
+                        && identity
+                            .alias
+                            .as_deref()
+                            .is_some_and(|held| held.eq_ignore_ascii_case(alias))
                         && !identity.matches(caller)
                         && live_participants
                             .iter()
                             .any(|participant| identity.matches(participant))
                 });
-                if in_use {
+                let answered_to = reserved.iter().any(|held| held.eq_ignore_ascii_case(alias));
+                if registered || answered_to {
                     return Err(CollaborationError::AliasInUse(alias.to_string()));
                 }
             }
@@ -698,6 +864,21 @@ impl CollaborationStore {
         if let Err(error) = self.persist_current().await {
             *self.identities.write().await = previous;
             return Err(error);
+        }
+        // Reserve it too. `enrich_participants` will carry this alias into
+        // the next scan, but a mint asking in between would not see it, which
+        // is the identity-then-mint ordering that made `@codex` ambiguous.
+        {
+            let mut reservations = self.reservations.write().await;
+            reservations.retain(|held| !(held.pane == caller.pane && held.room == caller.room));
+            if let Some(alias) = alias.as_deref() {
+                reservations.push(HandleReservation {
+                    room: caller.room.clone(),
+                    pane: caller.pane.clone(),
+                    handle: alias.to_string(),
+                    at: OffsetDateTime::now_utc(),
+                });
+            }
         }
         self.publish_change();
         let mut updated = caller.clone();
@@ -1323,6 +1504,12 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
 
 /// The durable room identity of a pane: `(host, socket, window_id)`, never the
 /// mutable window name or index.
+/// Public view of [`pane_room`], for callers that need a room for a pane the
+/// participant table does not cover yet.
+pub fn room_of_pane(pane_id: &str, pane: &PaneInfo, socket: Option<String>) -> RoomId {
+    pane_room(pane_id, pane, socket)
+}
+
 fn pane_room(pane_id: &str, pane: &PaneInfo, socket: Option<String>) -> RoomId {
     RoomId {
         host: crate::backend::pane_id_host_kind(pane_id)
@@ -1572,6 +1759,30 @@ fn validate_air_artifact_references(
     }
     Ok(())
 }
+
+/// `claude`, then `claude2`, `claude3`… — the first name in the family the
+/// room is not already using.
+///
+/// The first agent of a runtime gets the bare name: it is what people type,
+/// and what the MCP instructions already tell agents to route by. Numbering
+/// only on collision keeps the common case memorable.
+fn mint_from_family(base: &str, taken: &[String]) -> Option<String> {
+    (1..=MINT_FAMILY_LIMIT).find_map(|n| {
+        let candidate = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base}{n}")
+        };
+        taken
+            .iter()
+            .all(|held| !held.eq_ignore_ascii_case(&candidate))
+            .then_some(candidate)
+    })
+}
+
+/// A room with this many agents of one runtime is not a room; this bounds the
+/// walk rather than expressing a policy.
+const MINT_FAMILY_LIMIT: usize = 64;
 
 fn normalize_alias(alias: Option<String>) -> Result<Option<String>, CollaborationError> {
     let Some(alias) = alias else {
@@ -2687,6 +2898,233 @@ mod tests {
                 .await,
             Err(CollaborationError::ConsoleIdentity)
         ));
+    }
+
+    fn room_of(participant: &Participant) -> RoomId {
+        participant.room.clone()
+    }
+
+    fn mint(base: &str) -> HandleRequest {
+        HandleRequest::Mint {
+            base: base.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn minting_walks_the_family_until_it_finds_a_free_name() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let a = participant("%1", "a");
+        let room = room_of(&a);
+        let live = vec![a.clone(), participant("%2", "b"), participant("%3", "c")];
+
+        // Nothing is named yet, so each pane in turn takes the next name —
+        // and the reservation, not the pane option, is what makes the second
+        // caller skip `claude`. No scan has happened.
+        let mut issued = Vec::new();
+        for pane in ["%1", "%2", "%3"] {
+            issued.push(
+                mailbox
+                    .issue_handle(&room, pane, &live, mint("claude"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(issued, ["claude", "claude2", "claude3"]);
+    }
+
+    #[tokio::test]
+    async fn identity_then_mint_does_not_hand_out_the_identity_name() {
+        // The ordering the pane-option-only allocator could not see: `%1`
+        // carries a minted `claude` but has registered itself as `codex`, so
+        // a codex pane starting next must not be handed `codex`.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let registered = Participant {
+            alias: Some("claude".into()),
+            ..participant("%1", "registered-session")
+        };
+        let newcomer = participant("%2", "newcomer-session");
+        let live = vec![registered.clone(), newcomer.clone()];
+        let room = room_of(&registered);
+
+        mailbox
+            .set_identity(&registered, &live, Some("codex".into()), Vec::new())
+            .await
+            .unwrap();
+
+        let issued = mailbox
+            .issue_handle(&room, "%2", &live, mint("codex"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            issued, "codex2",
+            "the registered identity holds `codex` even though no pane option says so",
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_then_identity_refuses_the_minted_name() {
+        // The mirror ordering: a name promised to `%2` is taken before `%2`
+        // has written it, so `%1` cannot register it in the meantime.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let first = participant("%1", "first-session");
+        let second = participant("%2", "second-session");
+        let live = vec![first.clone(), second.clone()];
+        let room = room_of(&first);
+
+        let issued = mailbox
+            .issue_handle(&room, "%2", &live, mint("claude"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issued, "claude");
+
+        assert!(matches!(
+            mailbox
+                .set_identity(&first, &live, Some("claude".into()), Vec::new())
+                .await,
+            Err(CollaborationError::AliasInUse(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_reservation_and_a_mint_cannot_collide() {
+        // A launcher's explicit alias registers before it stamps the pane, so
+        // a mint in flight for another pane skips the name — the cross-pane
+        // hole that neither the pane option check nor `set-option -o` closed.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let a = participant("%1", "a");
+        let live = vec![a.clone(), participant("%2", "b")];
+        let room = room_of(&a);
+
+        mailbox
+            .issue_handle(
+                &room,
+                "%1",
+                &live,
+                HandleRequest::Reserve {
+                    handle: "claude".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let issued = mailbox
+            .issue_handle(&room, "%2", &live, mint("claude"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issued, "claude2");
+    }
+
+    #[tokio::test]
+    async fn two_explicit_reservations_of_one_name_are_refused() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let a = participant("%1", "a");
+        let live = vec![a.clone(), participant("%2", "b")];
+        let room = room_of(&a);
+        let reserve = || HandleRequest::Reserve {
+            handle: "reviewer".into(),
+        };
+
+        mailbox
+            .issue_handle(&room, "%1", &live, reserve())
+            .await
+            .unwrap();
+        assert!(matches!(
+            mailbox.issue_handle(&room, "%2", &live, reserve()).await,
+            Err(CollaborationError::AliasInUse(_)),
+        ));
+        // The same pane re-reserving its own name is not a conflict — a
+        // relaunch into the same slot keeps the name the config gave it.
+        assert!(mailbox
+            .issue_handle(&room, "%1", &live, reserve())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_reservation_stops_holding_the_name() {
+        // Once a scan shows the pane actually carrying the handle, the
+        // participant list speaks for it. Keeping the promise as well would
+        // hold a name out of circulation after the pane released it.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let a = participant("%1", "a");
+        let live = vec![a.clone(), participant("%2", "b")];
+        let room = room_of(&a);
+        mailbox
+            .issue_handle(&room, "%1", &live, mint("claude"))
+            .await
+            .unwrap();
+
+        let scanned = vec![
+            Participant {
+                alias: Some("claude".into()),
+                ..a.clone()
+            },
+            participant("%2", "b"),
+        ];
+        // `%1` gave the name up between scans; nothing holds it now.
+        let released = vec![participant("%1", "a"), participant("%2", "b")];
+        assert_eq!(
+            mailbox
+                .issue_handle(&room, "%2", &scanned, mint("claude"))
+                .await
+                .unwrap()
+                .unwrap(),
+            "claude2",
+            "a confirmed handle is still taken while the pane holds it",
+        );
+        assert_eq!(
+            mailbox
+                .issue_handle(&room, "%2", &released, mint("claude"))
+                .await
+                .unwrap()
+                .unwrap(),
+            "claude",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_minted_handle_cannot_be_squatted_by_a_registered_identity() {
+        // The seeded half of "taken". `%2` answers to `claude` because muxa
+        // minted it onto the pane, not because anybody registered it — and
+        // an agent registering the same name would leave `@claude`
+        // ambiguous for both of them.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let minted = Participant {
+            alias: Some("claude".into()),
+            ..participant("%2", "minted-session")
+        };
+        let other = participant("%3", "other-session");
+        let live = vec![minted, other.clone()];
+
+        assert!(matches!(
+            mailbox
+                .set_identity(&other, &live, Some("CLAUDE".into()), Vec::new())
+                .await,
+            Err(CollaborationError::AliasInUse(_)),
+        ));
+        // A free name still goes through.
+        mailbox
+            .set_identity(&other, &live, Some("verifier".into()), Vec::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_may_re_register_the_handle_it_already_answers_to() {
+        // Its own seeded name is not somebody else's claim on it.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mine = Participant {
+            alias: Some("claude".into()),
+            ..participant("%2", "my-session")
+        };
+        let live = vec![mine.clone()];
+        mailbox
+            .set_identity(&mine, &live, Some("claude".into()), vec!["review".into()])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

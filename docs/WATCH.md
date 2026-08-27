@@ -58,6 +58,7 @@ children keep their aggregate state markers.
 | `Enter` | Attach to the selected pane. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
 | `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
+| `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
 | `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
@@ -296,56 +297,59 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s` is the normal watch and collaboration entry point. `prefix+D` is an
 optional shortcut to the richer Dashboard.
 
+## Stable tmux Names
+
+`muxa init` enables the `tmux-window-names` component by default. It turns off
+tmux's process-based `automatic-rename`, so a Work window keeps its useful name
+instead of becoming `node` or `claude`, and routes the familiar `prefix + ,`
+prompt through `muxa window rename`. Window whitespace is normalized to `-`
+and duplicate names in one session are refused. Restore dynamic naming for one
+window with `muxa window rename --auto`.
+
 ## Two Terminals on One Workspace
 
 One tmux session has one current window, and every client attached to it shows
 that window. Two terminals attached to the same session therefore cannot sit on
 two different Work windows — switching one switches the other. That is tmux's
-model, not a muxa limitation.
+model, not a muxa limitation, and a *session group* is the only thing that
+changes it: the window list stays shared, but each session in the group keeps
+its own current window.
 
-To watch two Work Runs of one workspace side by side, attach the second
-terminal to a *session group* instead. Windows stay shared, but each session in
-the group keeps its own current window:
-
-```sh
-# terminal 1
-tmux attach -t callabo
-
-# terminal 2 — same windows, independent view, disappears on detach
-tmux new-session -t callabo \; set-option destroy-unattached on
-```
-
-To keep `tmux attach -t <session>` itself doing this — no second command to
-remember — put the grouping behind a `client-attached` hook. It fires only when
-the session already had another client, so a lone terminal still attaches to the
-real session and no extra session is created:
+`muxa init` installs this as the `tmux-auto-view` component, on by default. It
+sets two hooks that hand an arriving client its own view:
 
 ```tmux
-set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"~/.local/bin/tmux-attach-view #{session_name} #{client_name} #{client_pid}\"'"
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-session-changed[9000]' "…same…"
 ```
 
-where the script creates the view and moves the arriving client into it:
+The dedicated hook-array slot keeps reloading idempotent and leaves unrelated
+user hooks in their own slots intact.
+
+**Both hooks are needed.** `client-attached` covers a terminal running `tmux
+attach`. `client-session-changed` covers `switch-client` — which is what
+watch's `Enter` does, and what a terminal that was already open when the
+component was installed goes through. Measured on tmux 3.4: with only the
+attach hook, jumping from watch put both terminals back into one session and
+they followed each other from there.
+
+Nothing runs for a lone terminal. `muxa workspace view` is a no-op when its
+client is the session's only one, so a single-terminal workspace never grows a
+second session, and a terminal that regroups reuses its own view rather than
+leaving a trail of sessions behind every jump.
+
+You can also run it by hand — on a terminal that was already attached, for
+instance:
 
 ```sh
-name="view~$3~$1"
-new=$(tmux new-session -dP -F '#{session_id}' -t "=$1" -s "$name")
-tmux switch-client -c "$2" -t "$new"
-tmux set-option -t "$new" destroy-unattached on
+muxa workspace view
 ```
 
-Three details are load-bearing, each measured on tmux 3.4. `destroy-unattached`
-must be set *after* `switch-client`: on a session that still has no client tmux
-reaps it on the spot, silently undoing the whole thing. The session name is
-passed, not `#{session_id}` — the id is `$0`, and `run-shell` hands its command
-to a shell that expands it. And the view is named `view~<pid>~<session>` rather
-than after the session it mirrors, so a prefix lookup for `callabo` can never
-match a view instead of the real thing.
-
-`tmux set-option -t <session> @no_auto_view 1` opts one session out, for when
-two terminals *should* mirror each other (pairing, screen sharing).
-
-`command-alias` cannot do this: tmux resolves built-in command names before
-aliases, so an alias for `attach-session` is never consulted.
+The view is named `<session>~view~<pid>`, so it sorts beside the session it
+mirrors. That is safe despite tmux matching session names by prefix, because an
+exact match wins: with `callabo`, `callabo-set` and `callabo~view~1734560` all
+present, `-t callabo` resolves to `callabo`. It disappears on detach, so views
+never pile up.
 
 Pair it with per-window sizing, so a window is sized to the terminals actually
 looking at it rather than to the smallest client anywhere on the session:
@@ -367,23 +371,21 @@ each on its own window:
 | `smallest` + `aggressive-resize off` | 80x23 | 80x23 |
 
 `smallest` on its own is the classic footgun — any small client anywhere
-shrinks your window. `aggressive-resize` is what narrows "any client" to "a
-client whose current window this is", which is exactly the separation the views
-above create. With one terminal attached, smallest is that terminal, so nothing
+shrinks your window. `aggressive-resize` narrows "any client" to "a client
+whose current window this is", which is exactly the separation the views
+create. With one terminal attached, smallest is that terminal, so nothing
 changes for ordinary single-terminal use.
 
-Jumping from watch (`Enter`) addresses the target window by session, so it
-moves only the terminal that asked and leaves the grouped sibling on the window
-it was showing. For that to hold, watch needs to know which client pressed the
-key — the `prefix+s` binding written by `muxa init` passes it as
-`--caller-client '#{client_name}'`. A hand-rolled binding without that flag
-falls back to tmux's activity-based guess, which with two terminals attached is
-routinely the wrong one.
+Jumping from watch (`Enter`) addresses the target window as
+`<session_id>:<window_id>`, so it moves only the terminal that asked and leaves
+the grouped sibling on the window it was showing.
 
-Known rough edge: the grouped session is a distinct tmux session id, so the
-watch topology lists it as a second tree carrying the same windows and panes.
-Agent metadata attaches to the first tree; the duplicate shows as bare panes.
-Counts and stats are keyed per pane and are not doubled.
+To mirror instead — two terminals deliberately showing the same thing, for
+pairing or screen sharing:
+
+```sh
+tmux set-option -t <session> @no_auto_view 1
+```
 
 ## macOS Menu Bar with BarShelf
 

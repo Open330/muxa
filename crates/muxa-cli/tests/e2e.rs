@@ -253,7 +253,12 @@ fn claude_hook_round_trip() {
 
     // Query via the CLI.
     let out = d.cli().arg("status").output().expect("run status");
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "status failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("hello e2e"),
