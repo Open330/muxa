@@ -2064,16 +2064,39 @@ async fn best_effort_ingest(client: &Client, ev: &muxa::event::AgentEvent) {
 /// inside the agent's own hook, where a non-zero exit is the agent's
 /// problem. A pane stuck with `%1242` as its only handle is a worse
 /// interface, not a broken agent.
-fn best_effort_default_alias(ev: &muxa::event::AgentEvent) {
+async fn best_effort_default_alias(client: &Client, ev: &muxa::event::AgentEvent) {
     let Some((pane, base)) = alias_target(ev) else {
         return;
     };
-    match tmux_work::ensure_default_alias(&pane, base) {
-        Ok(Some(alias)) => tracing::debug!(pane, alias, "named pane"),
+    // The answer for every session start after the first, and one tmux call
+    // rather than an IPC round-trip on the agent's critical path.
+    if tmux_work::pane_is_named(&pane).unwrap_or(true) {
+        return;
+    }
+    let request = muxa::collaboration::HandleRequest::Mint {
+        base: base.to_string(),
+    };
+    let issued = client
+        .collaboration_issue_handle(&pane, None, &request, HANDLE_IPC_TIMEOUT)
+        .await;
+    match issued {
+        Ok(Some(handle)) => match tmux_work::claim_alias(&pane, &handle) {
+            Ok(Some(alias)) => tracing::debug!(pane, alias, "named pane"),
+            Ok(None) => tracing::debug!(pane, handle, "pane was named first"),
+            Err(e) => tracing::debug!(error = %e, pane, "could not name pane"),
+        },
+        // No free name, no room for the pane, or no daemon to referee. Naming
+        // a pane without the arbiter is exactly what this path stopped doing,
+        // so the pane keeps `%1242` until its next session start.
         Ok(None) => {}
-        Err(e) => tracing::debug!(error = %e, pane, "could not name pane"),
+        Err(e) => tracing::debug!(error = %e, pane, "handle refused"),
     }
 }
+
+/// Budget for the one namespace round-trip. This runs inside an agent's
+/// session-start hook, so a wedged daemon must cost the pane its name rather
+/// than the agent its startup.
+const HANDLE_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The pane this event should name and the runtime to name it after, or
 /// `None` when the event names nothing.
@@ -2144,7 +2167,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(&ev);
+            best_effort_default_alias(client, &ev).await;
         }
         HookCmd::ClaudeStatusline { forward } => {
             if let Some(cmd) = forward {
@@ -2194,12 +2217,12 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Codex { event } => {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(&ev);
+            best_effort_default_alias(client, &ev).await;
         }
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(&ev);
+            best_effort_default_alias(client, &ev).await;
         }
         HookCmd::Agy { event } => {
             // FAIL-OPEN, and deliberately unlike the other hook arms.
@@ -2213,7 +2236,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             match run_hook::<AntigravityAdapter, _>(&event, &mut std::io::stdin()) {
                 Ok(ev) => {
                     best_effort_ingest(client, &ev).await;
-                    best_effort_default_alias(&ev);
+                    best_effort_default_alias(client, &ev).await;
                 }
                 Err(e) => tracing::debug!(error = %e, event, "agy hook payload ignored"),
             }
@@ -2221,7 +2244,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Opencode { event } => {
             let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(&ev);
+            best_effort_default_alias(client, &ev).await;
         }
     }
     Ok(())

@@ -8,7 +8,7 @@ See which agents are working, waiting, idle, or blocked from your tmux
 status line, a live TUI, desktop notifications, and local reports.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
-![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
+![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
 
@@ -109,7 +109,7 @@ brew install open330/tap/muxa
 muxa init
 ```
 
-Or the one-shot installer (builds from source, requires Rust 1.89+):
+Or the one-shot installer (builds from source, requires Rust 1.88+):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh

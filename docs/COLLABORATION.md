@@ -119,12 +119,18 @@ only other agent; with three or more participants use a handle — `@claude`,
 Every agent pane gets a handle without anyone asking for one. The first agent
 of a runtime in a room becomes `@claude`, `@codex`, `@gemini`, `@agy`, or
 `@opencode`; a second of the same kind becomes `@claude2`, and so on. muxa
-mints it on the agent's first hook event of a session (and immediately for a
-pane `muxa agent start` opened), and stores it on the pane as
-`@muxa_agent_alias`, so it outlives muxad, the CLI, and the agent restarting
-in place. It is not minted over a name that already exists, so a pipeline
-alias or a hand-set one wins. `muxa peek` prints the handle in each pane's
-header next to its pane id.
+mints it on the agent's first hook event of a session and stores it on the pane
+as `@muxa_agent_alias`, so it outlives muxad, the CLI, and the agent restarting
+in place. It is not minted over a name that already exists, so a pipeline alias
+or a hand-set one wins. `muxa peek` prints the handle in each pane's header
+next to its pane id.
+
+The daemon issues every handle. It is the only place that sees a room whole —
+pane options, registered identities, and names promised to callers that have
+not written them yet — and a handle allocated from anything less is how a room
+ends up answering to `@claude` twice. Explicit aliases register with it too,
+before they are stamped. With no daemon reachable a pane simply stays unnamed
+and keeps `%1242`.
 `scope = "window"` refuses cross-window targets; `scope = "host"` widens an
 explicit `pane:%N` target to other windows and sessions. Requests are also
 pinned to the target's current agent session, so a new process reusing that

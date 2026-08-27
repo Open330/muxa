@@ -15,10 +15,6 @@ pub const ASK_FILENAME: &str = "ask.json";
 pub const NODE_ID_FILENAME: &str = "host-id";
 pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
-/// Subdirectory holding short-lived cross-process lock files. Its contents
-/// carry no state — only the kernel's lock on an open descriptor — so it is
-/// safe to delete wholesale when nothing is running.
-pub const LOCK_DIRNAME: &str = "locks";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -53,21 +49,6 @@ pub fn default_activity_file() -> Option<PathBuf> {
 /// Default agent-registry snapshot file: `$XDG_DATA_HOME/muxa/state.json`,
 /// falling back to `$HOME/.local/share/muxa/state.json`. Co-located with
 /// the prompt history so a single backup or rotation policy covers both.
-/// Lock file serializing handle allocation for one room, under
-/// `$XDG_DATA_HOME/muxa/locks/`.
-///
-/// Claiming a handle is a read-modify-write over a namespace several
-/// processes share, and tmux user options have no compare-and-set. Checking
-/// again after the write cannot substitute: the pane that writes second can
-/// finish its check before the first write lands, leaving neither willing to
-/// yield. The exclusion has to come from outside tmux, so it comes from here.
-///
-/// Keyed by room — tmux socket plus window id — because that is the scope a
-/// handle is unique within. `key` is expected pre-sanitized by the caller.
-pub fn alias_lock_file(key: &str) -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(LOCK_DIRNAME).join(key))
-}
-
 pub fn default_state_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
 }

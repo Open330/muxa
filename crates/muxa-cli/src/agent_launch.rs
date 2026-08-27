@@ -635,16 +635,12 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         crate::tmux_work::cleanup_pane(&pane);
         return Err(error).context("record muxa tmux metadata");
     }
-    // A pane muxa opened gets its handle here rather than waiting for the
-    // agent's first hook, so `--json` can report the name the caller should
-    // address it by in the same breath as the pane id. Pipelines pass their
-    // own alias and skip this entirely.
-    //
-    // Best-effort: the agent is already running by now. Failing the launch
-    // over a name would kill a working pane to avoid a cosmetic gap.
-    let alias = request.alias.or_else(|| {
-        crate::tmux_work::ensure_default_alias(&pane, request.agent.label()).unwrap_or_default()
-    });
+    // Minting belongs to the agent's session-start hook, which reaches the
+    // room's arbiter. Doing it here too would allocate from a namespace this
+    // process cannot see all of — the bug the arbiter exists to close — so an
+    // unaliased launch reports no handle and the hook names the pane a moment
+    // later.
+    let alias = request.alias;
 
     Ok(StartResult {
         host: LaunchHost::Tmux,

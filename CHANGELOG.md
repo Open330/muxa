@@ -32,16 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a Work Run under muxa's model, so naming it after whatever process is
   running in it overwrites the Work with `node` or `claude` the moment an agent
   starts.
-- **Minimum supported Rust is now 1.89**, for `std::fs::File::lock` — the
-  cross-process exclusion behind handle allocation. It needs no dependency
-  and the kernel releases it when the holding process dies, which a lock
-  file whose staleness had to be guessed from an mtime would not.
-- **Registering an identity can no longer squat a handle a live peer already
-  answers to.** `set_identity`'s uniqueness check consulted only aliases
-  registered through it, missing the ones participants are seeded with from
-  `@muxa_agent_alias`. That was a hole only pipeline panes could fall into
-  before; with every pane carrying a minted handle it is one any room can,
-  so the check now covers both.
+- **The daemon arbitrates a room's handle namespace.** A room-local handle
+  had three writers — the `@muxa_agent_alias` pane option, a launcher's
+  explicit alias, and a registered identity — each enforcing its own rule
+  against its own view, so every ordering between them produced a different
+  way for one room to answer to `@claude` twice. The daemon is the only
+  place that sees all three, so allocation now goes through it via
+  `collaboration_issue_handle` (local IPC protocol 6, capability
+  `handle_namespace_v1`), which also tracks handles promised to callers that
+  have not written them yet. Lifetimes are unchanged: a handle still lives
+  on the pane option and outlives the agent restarting in place, while a
+  registered identity still belongs to one agent session. Without a daemon
+  to referee, a pane stays unnamed rather than being named from a partial
+  view.
 - **Every agent pane gets a handle, so peers are addressable by name rather
   than by `%1242`.** The first agent of a runtime in a room becomes
   `@claude` / `@codex` / `@gemini` / `@agy` / `@opencode`, a second of the

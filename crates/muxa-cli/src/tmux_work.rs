@@ -826,15 +826,6 @@ pub async fn run_work_done(args: WorkDoneArgs, client: &muxa::ipc::Client) -> Re
     Ok(())
 }
 
-/// Longest alias muxa will mint before giving up, and the widest base it
-/// will build one from. The collaboration store caps an alias at 32 bytes
-/// (`valid_identity_token`), so a base is trimmed with room left for the
-/// collision suffix rather than minting a name the daemon would reject.
-const DEFAULT_ALIAS_BASE_MAX: usize = 28;
-/// How many `claude`, `claude2`, `claude3`… candidates to try. A room with
-/// 64 agents of one kind is not a room; this is a loop bound, not a policy.
-const DEFAULT_ALIAS_TRIES: usize = 64;
-
 /// Give `pane` a room-local handle if nothing has named it yet. Returns the
 /// alias the pane now answers to, or `None` when it already had one or the
 /// room has no free name left.
@@ -853,61 +844,39 @@ const DEFAULT_ALIAS_TRIES: usize = 64;
 /// process, and the agent restarting in place, so the *slot* keeps its
 /// name across all three. It dies with the pane, which is exactly right —
 /// a handle is worth keeping only while the thing it addresses exists.
-pub fn ensure_default_alias(pane: &str, base: &str) -> Result<Option<String>> {
-    validate_pane_id(pane)?;
-    // The overwhelmingly common case: a pane named the first time its agent
-    // started, on every session start since. One tmux call, out — and no
-    // lock, because there is nothing to allocate.
-    if pane_option(pane, AGENT_ALIAS_OPTION)?.is_some() {
-        return Ok(None);
-    }
-    let window = window_id_for_pane(pane)?;
+/// Budget for registering an explicit alias. A launch must not stall on a
+/// wedged daemon; past this the name is written unrefereed.
+const RESERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-    // Everything past here is a read-modify-write over a namespace the whole
-    // room shares, so it runs under the room's lock.
-    //
-    // Verifying after the write is not a substitute, which is what an earlier
-    // version of this got wrong: two panes both read a free `claude`, the
-    // higher-numbered one writes and re-reads *before* the lower one's write
-    // lands, sees nobody above it and settles — then the lower one writes,
-    // sees only a higher holder, and settles too. Neither yields, and no
-    // number of extra rounds changes that, because the flaw is the missing
-    // exclusion rather than too few checks.
-    let Some(_guard) = RoomLock::acquire(&window)? else {
-        // Somebody else is allocating and did not finish inside the budget.
-        // This runs on the agent's critical path at session start, so the
-        // answer is to leave the pane unnamed — addressable as `%1242`, and
-        // named by its next session start — never to block the agent.
-        return Ok(None);
-    };
-    // Re-read inside the lock: the holder we waited on may have been naming
-    // this very pane.
-    if pane_option(pane, AGENT_ALIAS_OPTION)?.is_some() {
-        return Ok(None);
-    }
-    let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
-        return Ok(None);
-    };
-    claim_alias(pane, &alias)
+/// Whether anything has already named `pane`.
+///
+/// One tmux call, and the answer for every session start after the first —
+/// which is why it comes before asking the daemon for anything.
+pub fn pane_is_named(pane: &str) -> Result<bool> {
+    validate_pane_id(pane)?;
+    Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.is_some())
 }
 
-/// Write a minted handle onto `pane`, but only if nothing has named it.
+/// Write a handle the room's arbiter issued onto `pane`, but only if nothing
+/// has named it. Returns the name the pane ends up answering to, or `None`
+/// when somebody else got there first.
 ///
-/// The room lock keeps two *different* panes from claiming one name; it says
-/// nothing about this pane, because the other writer is not an allocator.
+/// The daemon decides *which* name; this only writes it, and the write stays
+/// conditional because the daemon is not the only writer of a pane option.
 /// `agent_launch::start` launches the agent — which fires its session-start
-/// hook immediately — and only then stamps the pipeline's explicit alias, so
-/// a hook that read "unnamed" before that stamp landed would overwrite a
+/// hook immediately — and only then stamps a pipeline's explicit alias, so a
+/// hook that read "unnamed" before that stamp landed would overwrite a
 /// `review` with a `claude`.
 ///
-/// `set-option -o` refuses an option that is already set, which resolves both
+/// `set-option -o` refuses an option that is already set, which settles both
 /// orders in the pipeline's favour without either side coordinating: an
-/// explicit alias that lands first makes this claim a no-op, and one that
-/// lands second overwrites the claim with a plain set. `-q` keeps tmux's
-/// "already set" message off the agent's stderr; the refusal still stands, so
-/// the pane option itself is the answer, and re-reading it beats inspecting
-/// an exit code whose shape is tmux's business.
-fn claim_alias(pane: &str, alias: &str) -> Result<Option<String>> {
+/// explicit alias landing first makes this a no-op, and one landing second
+/// overwrites it with a plain set. `-q` keeps tmux's "already set" message
+/// off the agent's stderr, which also makes the exit status the same either
+/// way — so the pane option itself is the verdict, read back rather than
+/// inferred from a status whose shape is tmux's business.
+pub fn claim_alias(pane: &str, alias: &str) -> Result<Option<String>> {
+    validate_pane_id(pane)?;
     tmux_status(&[
         "set-option",
         "-p",
@@ -919,153 +888,6 @@ fn claim_alias(pane: &str, alias: &str) -> Result<Option<String>> {
         alias,
     ])?;
     Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.filter(|held| held == alias))
-}
-
-/// Exclusive hold on one room's handle namespace.
-///
-/// `File::lock_shared`'s exclusive sibling, so the kernel releases it when
-/// the descriptor closes — including when the process is killed mid-hold.
-/// That is the whole reason it is a kernel lock rather than a lock *file*
-/// whose staleness we would have to guess at from an mtime: a hook that dies
-/// between claim and release must not wedge the next agent's start.
-struct RoomLock(std::fs::File);
-
-/// How long to wait for another process's allocation. Holding the lock costs
-/// two or three tmux round-trips, so anything past this is a wedged host
-/// rather than contention, and the agent's session start should not wait on
-/// it.
-const ROOM_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
-const ROOM_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
-
-impl RoomLock {
-    /// `None` when the budget ran out, or when there is no data directory to
-    /// put a lock in — both "skip naming this time", never an error.
-    fn acquire(window: &str) -> Result<Option<Self>> {
-        let Some(path) = muxa::paths::alias_lock_file(&room_lock_key(window)) else {
-            return Ok(None);
-        };
-        Self::at(&path, ROOM_LOCK_BUDGET)
-    }
-
-    fn at(path: &Path, budget: std::time::Duration) -> Result<Option<Self>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create lock directory {}", parent.display()))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open lock file {}", path.display()))?;
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Some(Self(file))),
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(ROOM_LOCK_POLL);
-                }
-                Err(_) => return Ok(None),
-            }
-        }
-    }
-}
-
-impl Drop for RoomLock {
-    fn drop(&mut self) {
-        // Closing the descriptor would release it anyway; unlocking first
-        // keeps the release explicit rather than incidental.
-        let _ = self.0.unlock();
-    }
-}
-
-/// Filename for a room's lock: the tmux server this window lives on, plus
-/// the window id. Window ids are only unique per server, so a socket-less key
-/// would make two servers' `@30` share one lock — correct, but needlessly
-/// serializing unrelated rooms.
-///
-/// Sanitized to one path segment, since both halves come from the
-/// environment.
-fn room_lock_key(window: &str) -> String {
-    let socket = std::env::var("MUXA_TMUX_SOCKET")
-        .ok()
-        .or_else(|| {
-            std::env::var("TMUX")
-                .ok()
-                .and_then(|value| value.split(',').next().map(str::to_string))
-        })
-        .unwrap_or_default();
-    let socket = muxa::tmux::socket_short_name(socket.trim());
-    sanitize_lock_segment(&format!("alias-{socket}-{window}"))
-}
-
-fn sanitize_lock_segment(raw: &str) -> String {
-    raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// `(pane id, alias)` for every *other* pane in `window` that carries one.
-fn aliases_besides(window: &str, pane: &str) -> Result<Vec<(String, String)>> {
-    let raw = tmux_output(&[
-        "list-panes",
-        "-t",
-        window,
-        "-F",
-        "#{pane_id}\t#{@muxa_agent_alias}",
-    ])?;
-    Ok(parse_window_aliases(&raw, pane))
-}
-
-fn parse_window_aliases(raw: &str, pane: &str) -> Vec<(String, String)> {
-    raw.lines()
-        .filter_map(|line| {
-            let (other, alias) = line.split_once('\t')?;
-            let (other, alias) = (other.trim(), alias.trim());
-            (other != pane && !alias.is_empty()).then(|| (other.to_string(), alias.to_string()))
-        })
-        .collect()
-}
-
-/// `claude`, then `claude2`, `claude3`… — the first name in the series the
-/// room is not already using.
-///
-/// The first agent of a kind gets the bare name deliberately. A room
-/// usually holds one of each, `@claude` is what people actually type, and
-/// the MCP instructions already tell agents to route by exactly that name.
-/// Numbering only on collision keeps the common case memorable instead of
-/// making everyone track whether they are 1 or 2.
-fn pick_default_alias(base: &str, taken: &[(String, String)]) -> Option<String> {
-    let base = sanitize_alias_base(base)?;
-    (1..=DEFAULT_ALIAS_TRIES).find_map(|n| {
-        let candidate = if n == 1 {
-            base.clone()
-        } else {
-            format!("{base}{n}")
-        };
-        taken
-            .iter()
-            .all(|(_, name)| !name.eq_ignore_ascii_case(&candidate))
-            .then_some(candidate)
-    })
-}
-
-/// Reduce an agent-kind label to something `valid_identity_token` accepts,
-/// so a name muxa mints is never one the collaboration store then refuses.
-fn sanitize_alias_base(base: &str) -> Option<String> {
-    let mut cleaned: String = base
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-        .collect();
-    cleaned.truncate(DEFAULT_ALIAS_BASE_MAX);
-    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
@@ -1800,12 +1622,20 @@ pub fn mark_agent(
         )?;
     }
     if let Some(alias) = alias.filter(|value| !value.trim().is_empty()) {
-        set_option(
-            OptionScope::Pane,
+        let alias = metadata(alias, 64)?;
+        // Register it with the room's arbiter before writing, so a handle
+        // being minted for another pane at this moment cannot be handed the
+        // same name. The write itself stays unconditional: an explicit alias
+        // comes from the user's configuration and outranks anything muxa
+        // minted for the slot.
+        muxa::ipc::blocking_reserve_handle(
+            &muxa::paths::default_socket(),
             pane,
-            AGENT_ALIAS_OPTION,
-            &metadata(alias, 64)?,
-        )?;
+            &alias,
+            RESERVE_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
     }
     if let Some(generation) = generation {
         set_option(
@@ -2837,138 +2667,5 @@ mod tests {
         assert!(validate_pane_id("%42").is_ok());
         assert!(validate_pane_id("42").is_err());
         assert!(validate_pane_id("%4x").is_err());
-    }
-
-    fn taken(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(pane, alias)| ((*pane).to_string(), (*alias).to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn the_first_agent_of_a_kind_gets_the_bare_name() {
-        // `@claude` is what people type and what the MCP instructions
-        // already tell agents to route by; numbering it `claude1` from the
-        // start would make the common case the awkward one.
-        assert_eq!(pick_default_alias("claude", &[]).unwrap(), "claude");
-    }
-
-    #[test]
-    fn a_second_agent_of_a_kind_is_numbered_from_two() {
-        let room = taken(&[("%1", "claude")]);
-        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude2");
-        let room = taken(&[("%1", "claude"), ("%2", "claude2")]);
-        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude3");
-    }
-
-    #[test]
-    fn a_freed_name_is_reused_rather_than_left_as_a_hole() {
-        // Aliases die with their panes, so `claude` going away means the
-        // next agent is `claude`, not `claude3` forever.
-        let room = taken(&[("%2", "claude2")]);
-        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude");
-    }
-
-    #[test]
-    fn a_name_taken_by_another_kind_is_still_taken() {
-        // Aliases share one namespace per room: `resolve_target` matches on
-        // the name alone, so a codex pane already called `claude` (renamed
-        // by hand, say) has to push the real claude to `claude2`.
-        let room = taken(&[("%1", "CLAUDE")]);
-        assert_eq!(pick_default_alias("claude", &room).unwrap(), "claude2");
-    }
-
-    #[test]
-    fn minted_names_are_ones_the_collaboration_store_accepts() {
-        // `valid_identity_token`: 1-32 of [alnum . _ -].
-        let long = "a".repeat(80);
-        let alias = pick_default_alias(&long, &[]).unwrap();
-        assert!(alias.len() <= DEFAULT_ALIAS_BASE_MAX);
-        assert_eq!(sanitize_alias_base("Claude Code!").unwrap(), "claudecode");
-        assert_eq!(sanitize_alias_base(" \t "), None);
-    }
-
-    #[test]
-    fn a_full_room_mints_nothing_rather_than_looping() {
-        let room: Vec<(String, String)> = (1..=DEFAULT_ALIAS_TRIES + 1)
-            .map(|n| {
-                let alias = if n == 1 {
-                    "claude".to_string()
-                } else {
-                    format!("claude{n}")
-                };
-                (format!("%{n}"), alias)
-            })
-            .collect();
-        assert_eq!(pick_default_alias("claude", &room), None);
-    }
-
-    #[test]
-    fn window_aliases_skip_our_own_pane_and_the_unnamed() {
-        let raw = "%1\tclaude\n%2\t\n%3\treviewer\n";
-        assert_eq!(
-            parse_window_aliases(raw, "%1"),
-            taken(&[("%3", "reviewer")]),
-            "our own row and the empty one are both dropped"
-        );
-    }
-
-    fn scratch_lock(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("muxa-test-{}-{name}", std::process::id()))
-    }
-
-    #[test]
-    fn one_room_allocates_at_a_time() {
-        // The property the whole naming scheme rests on. Two panes claiming
-        // at once must not both see a free `claude`, and checking again
-        // after writing cannot give us that — only exclusion can.
-        let path = scratch_lock("exclusive");
-        let short = std::time::Duration::from_millis(50);
-        let held = RoomLock::at(&path, short).unwrap().expect("first claim");
-        assert!(
-            RoomLock::at(&path, short).unwrap().is_none(),
-            "a second allocator must not get in while the first holds it",
-        );
-        drop(held);
-        assert!(
-            RoomLock::at(&path, short).unwrap().is_some(),
-            "the room reopens once the holder is done",
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_wedged_room_gives_up_instead_of_blocking_the_agent() {
-        // This runs inside an agent's session-start hook. Waiting forever on
-        // somebody else's lock would hang the agent's startup; an unnamed
-        // pane is merely addressed as `%1242` until its next start.
-        let path = scratch_lock("budget");
-        let short = std::time::Duration::from_millis(50);
-        let _held = RoomLock::at(&path, short).unwrap().expect("first claim");
-        let began = std::time::Instant::now();
-        assert!(RoomLock::at(&path, short).unwrap().is_none());
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(1),
-            "gave up after {:?}, which is not giving up",
-            began.elapsed(),
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_room_key_is_one_path_segment() {
-        // Both halves come from the environment — `$TMUX`'s socket path
-        // carries separators, and `MUXA_TMUX_SOCKET` is whatever the user
-        // exported — so neither may escape the lock directory.
-        assert_eq!(
-            sanitize_lock_segment("alias-/tmp/tmux-1044/default-@30"),
-            "alias-_tmp_tmux-1044_default-_30",
-        );
-        assert_eq!(
-            sanitize_lock_segment("alias-../../etc-@1"),
-            "alias-.._.._etc-_1",
-            "a relative path cannot climb out of the lock directory",
-        );
     }
 }
