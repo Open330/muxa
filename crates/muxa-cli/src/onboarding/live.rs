@@ -512,15 +512,15 @@ impl Sandbox {
         // next leaves the learner typing commands and guessing whether any of
         // them landed.
         let banner = format!(
-            "#[align=centre bg=#1f6feb,fg=#0b1220,bold] muxa onboarding · {index}/{total} \
+            "#[align=left bg=#1f6feb,fg=#0b1220,bold] muxa onboarding · {index}/{total} \
              #[default]  #[fg=#3fb950]{achieved}#[default]#[fg=#8b949e]    F2 {other_language}"
         );
-        let title = format!("#[align=centre]{title}");
+        let title = format!("#[align=left]  {title}");
         let cue = match escape {
             Some(hint) => {
-                format!("#[align=centre fg=#d29922,bold]{cue}#[default]#[fg=#8b949e]    {hint}")
+                format!("#[align=left fg=#d29922,bold]  {cue}#[default]#[fg=#8b949e]    {hint}")
             }
-            None => format!("#[align=centre fg=#d29922,bold]{cue}"),
+            None => format!("#[align=left fg=#d29922,bold]  {cue}"),
         };
         // Row 0 stays tmux's own window list.
         let _ = self.tmux_command(&["set", "-g", "status-format[1]", &banner]);
@@ -697,9 +697,55 @@ const BLUE: &str = "\u{1b}[1;34m";
 const MAGENTA: &str = "\u{1b}[1;35m";
 const CYAN: &str = "\u{1b}[1;36m";
 
-/// Matches `docs/demo-paint.sh` so the tour and the recordings show the same
-/// agent, rather than two different ideas of one.
-fn header(colour: &str, name: &str, language: UiLanguage) -> Vec<String> {
+/// The shape of the CLI a pane is standing in for.
+///
+/// A generic "agent frame" is what made the first version read as a mock: the
+/// learner knows what these two look like, and a screen that matches nothing
+/// they recognise is a screen they discount. Claude Code marks its turns with
+/// `⏺` and folds tool results under `⎿`; Codex prefixes its own with `•` and
+/// `└`. Close enough to be recognised, never close enough to be mistaken for a
+/// real session — the first line says so outright.
+#[derive(Clone, Copy)]
+enum Cli {
+    ClaudeCode,
+    Codex,
+}
+
+impl Cli {
+    fn colour(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => MAGENTA,
+            Self::Codex => CYAN,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// The glyph each CLI puts in front of its own turns.
+    fn turn(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "⏺",
+            Self::Codex => "•",
+        }
+    }
+
+    /// And in front of the result folded underneath.
+    fn result(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "⎿ ",
+            Self::Codex => "└ ",
+        }
+    }
+}
+
+fn header(cli: Cli, language: UiLanguage) -> Vec<String> {
+    let colour = cli.colour();
+    let name = cli.name();
     vec![
         format!(
             "{DIM}⟨{}⟩{RESET}",
@@ -710,17 +756,67 @@ fn header(colour: &str, name: &str, language: UiLanguage) -> Vec<String> {
             )
         ),
         String::new(),
-        format!("{colour}●{RESET} {BOLD}{name}{RESET}"),
+        format!("{colour}▐{RESET} {BOLD}{name}{RESET} {DIM}· ~/checkout-service{RESET}"),
         String::new(),
     ]
 }
 
 fn prompt_line(text: &str) -> Vec<String> {
-    vec![format!("{GREEN}›{RESET} {text}"), String::new()]
+    vec![format!("{GREEN}>{RESET} {text}"), String::new()]
 }
 
-fn tool_line(text: &str) -> String {
-    format!("  {DIM}⚙{RESET} {text}")
+/// One turn: what the agent did, and what came back.
+fn turn(cli: Cli, action: &str, result: &str) -> Vec<String> {
+    let mut lines = vec![format!("{}{}{RESET} {action}", cli.colour(), cli.turn())];
+    if !result.is_empty() {
+        lines.push(format!("  {DIM}{}{result}{RESET}", cli.result()));
+    }
+    lines.push(String::new());
+    lines
+}
+
+/// The input box Claude Code and Codex both park at the bottom of the screen.
+/// Without it the pane reads as a log rather than as a session waiting on you.
+/// Columns a string occupies in a terminal.
+///
+/// Padding by character count leaves the box's right edge ragged the moment any
+/// CJK text is in it, because those glyphs are two cells wide. Close enough for
+/// a fixed-width box without taking a dependency for it.
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch as u32 {
+            0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+fn composer(cli: Cli, language: UiLanguage) -> Vec<String> {
+    let width: usize = 58;
+    // Each CLI's own idle hint. Inviting the learner to type here would be a
+    // lie — they talk to these agents through `muxa msg`, not this box.
+    let hint = match cli {
+        Cli::ClaudeCode => tr(language, "? for shortcuts", "? 로 단축키 보기"),
+        Cli::Codex => tr(language, "Ctrl+C to quit", "Ctrl+C 로 종료"),
+    };
+    let padding = (width - 4).saturating_sub(display_width(hint));
+    vec![
+        format!("{DIM}╭{}╮{RESET}", "─".repeat(width)),
+        format!(
+            "{DIM}│{RESET} {}>{RESET}  {DIM}{hint}{}{RESET}{DIM}│{RESET}",
+            cli.colour(),
+            " ".repeat(padding),
+        ),
+        format!("{DIM}╰{}╯{RESET}", "─".repeat(width)),
+    ]
 }
 
 /// What codex's pane shows once it is blocked. Mirrors the `approval` frame in
@@ -744,12 +840,14 @@ fn approval_block(language: UiLanguage) -> Vec<String> {
 }
 
 fn approved_block(language: UiLanguage) -> Vec<String> {
-    vec![
-        String::new(),
-        tool_line("ran      rg -n \"public_read\" --type rust   ·   3 matches"),
-        String::new(),
-        working(language),
-    ]
+    let mut lines = turn(
+        Cli::Codex,
+        "Ran rg -n \"public_read\" --type rust",
+        tr(language, "3 matches", "3건 일치"),
+    );
+    lines.push(working(language));
+    lines.push(String::new());
+    lines
 }
 
 fn declined_block(language: UiLanguage) -> Vec<String> {
@@ -767,57 +865,53 @@ fn declined_block(language: UiLanguage) -> Vec<String> {
 }
 
 fn incoming_question(language: UiLanguage) -> Vec<String> {
-    vec![
-        String::new(),
-        format!(
-            "  {DIM}✉ {}{RESET}",
-            tr(language, "question from you", "당신이 보낸 질문")
+    let mut lines = turn(
+        Cli::ClaudeCode,
+        &format!(
+            "muxa_inbox()  {DIM}·  {}{RESET}",
+            tr(language, "1 request", "요청 1건")
         ),
-        format!(
-            "     {}",
-            tr(language, "how far along?", "어디까지 됐나요?")
+        tr(language, "how far along?", "어디까지 됐나요?"),
+    );
+    lines.extend(turn(
+        Cli::ClaudeCode,
+        tr(
+            language,
+            "Replied: auth path is covered; writing the regression test now",
+            "답장함: 인증 경로는 끝났고, 지금 회귀 테스트를 쓰는 중입니다",
         ),
-        String::new(),
-        format!(
-            "  {GREEN}›{RESET} {}",
-            tr(
-                language,
-                "auth path is covered; writing the regression test now",
-                "인증 경로는 끝났고, 지금 회귀 테스트를 쓰는 중입니다",
-            )
-        ),
-    ]
+        "",
+    ));
+    lines
 }
 
 fn outgoing_request(language: UiLanguage) -> Vec<String> {
-    vec![
-        String::new(),
-        format!(
-            "  {DIM}✉ {}{RESET}",
-            tr(
-                language,
-                "asked you for a decision",
-                "당신에게 결정을 요청했습니다"
-            )
+    turn(
+        Cli::Codex,
+        &format!(
+            "muxa_send_message(to: \"you\")  {DIM}·  {}{RESET}",
+            tr(language, "waiting on a decision", "결정 대기 중")
         ),
-        format!(
-            "     {}",
-            tr(
-                language,
-                "the public-read boundary needs a decision before I continue",
-                "public-read 경계는 계속하기 전에 결정이 필요합니다",
-            )
+        tr(
+            language,
+            "the public-read boundary needs a decision before I continue",
+            "public-read 경계는 계속하기 전에 결정이 필요합니다",
         ),
-    ]
+    )
 }
 
 fn finished(language: UiLanguage) -> Vec<String> {
-    vec![
-        String::new(),
-        format!("  {DIM}⚙{RESET} test     checkout::auth::rejects_raw_bearer  ok"),
-        String::new(),
-        format!("  {GREEN}✓ {}{RESET}", tr(language, "done", "완료")),
-    ]
+    let mut lines = turn(
+        Cli::ClaudeCode,
+        "Bash(cargo test -p checkout auth)",
+        tr(language, "1 passed", "1건 통과"),
+    );
+    lines.push(format!(
+        "{GREEN}⏺{RESET} {}",
+        tr(language, "Done.", "완료했습니다.")
+    ));
+    lines.push(String::new());
+    lines
 }
 
 fn working(language: UiLanguage) -> String {
@@ -875,19 +969,42 @@ impl Sandbox {
             "public-read 경계를 검토해줘",
         );
 
-        let mut opening = header(MAGENTA, "claude", language);
+        let mut opening = header(Cli::ClaudeCode, language);
         opening.extend(prompt_line(claude_prompt));
-        opening.push(tool_line("read     crates/checkout/src/auth.rs"));
-        opening.push(tool_line("grep     \"bearer\"  ·  12 matches"));
-        opening.push(String::new());
+        opening.extend(turn(
+            Cli::ClaudeCode,
+            tr(
+                language,
+                "I'll start with the token handling in auth.rs.",
+                "auth.rs의 토큰 처리부터 보겠습니다.",
+            ),
+            "",
+        ));
+        opening.extend(turn(
+            Cli::ClaudeCode,
+            "Read(crates/checkout/src/auth.rs)",
+            tr(language, "Read 42 lines", "42줄 읽음"),
+        ));
+        opening.extend(turn(
+            Cli::ClaudeCode,
+            "Search(pattern: \"bearer\")",
+            tr(language, "Found 12 matches", "12건 일치"),
+        ));
         opening.push(working(language));
+        opening.push(String::new());
+        opening.extend(composer(Cli::ClaudeCode, language));
         claude_screen.append(&opening);
 
-        let mut opening = header(CYAN, "codex", language);
+        let mut opening = header(Cli::Codex, language);
         opening.extend(prompt_line(codex_prompt));
-        opening.push(tool_line("read     crates/api/src/public.rs"));
-        opening.push(String::new());
+        opening.extend(turn(
+            Cli::Codex,
+            "Read crates/api/src/public.rs",
+            tr(language, "3 routes listed", "route 3개 확인"),
+        ));
         opening.push(working(language));
+        opening.push(String::new());
+        opening.extend(composer(Cli::Codex, language));
         codex_screen.append(&opening);
 
         // A window is a Work, and in a real fleet it is named after one.
@@ -1085,8 +1202,8 @@ const STEPS: &[Step] = &[
         achieved_ko: "✓ 두 번째 window가 생겼습니다 — 맨 윗줄에 둘 다 보입니다",
         title_en: "Now leave. Detaching removes you, not the work.",
         title_ko: "이제 나가 보세요. detach는 당신만 빠지고 작업은 그대로입니다.",
-        cue_en: "press   Ctrl-b   then   d       ·   then try:   tmux ls",
-        cue_ko: "Ctrl-b 를 눌렀다 떼고   d       ·   그다음:   tmux ls",
+        cue_en: "see both:   Ctrl-b s      ·   then leave:   Ctrl-b d",
+        cue_ko: "둘 다 보기:   Ctrl-b s      ·   그다음 나가기:   Ctrl-b d",
         detect: Detect::NoClient,
     },
     Step {
@@ -1094,8 +1211,8 @@ const STEPS: &[Step] = &[
         achieved_ko: "✓ detach했습니다 — 셸로 돌아왔고, session은 계속 돌고 있습니다",
         title_en: "Still listed, still running. That is the whole reason muxa lives in tmux.",
         title_ko: "여전히 목록에 있고 여전히 돌고 있습니다. muxa가 tmux에 사는 이유입니다.",
-        cue_en: "type:   tmux attach -t muxa-onboarding",
-        cue_ko: "입력:   tmux attach -t muxa-onboarding",
+        cue_en: "check:   tmux ls      ·   then:   tmux attach -t muxa-onboarding",
+        cue_ko: "확인:   tmux ls      ·   그다음:   tmux attach -t muxa-onboarding",
         detect: Detect::ClientAttached,
     },
     // ---- Act II: muxa -----------------------------------------------------
@@ -1126,17 +1243,17 @@ const STEPS: &[Step] = &[
         achieved_ko: "✓ attend가 가장 오래 막힌 agent인 codex로 데려왔습니다",
         title_en: "You are in codex's pane — press y to approve it if you like. `Ctrl-b ;` returns to the last pane you were in, which is your own shell.",
         title_ko: "지금 codex의 pane입니다 — 원하면 y로 승인해 보세요. `Ctrl-b ;`는 직전에 있던 pane, 즉 당신의 셸로 돌아갑니다.",
-        cue_en: "back with   Ctrl-b ;   then run:   muxa msg send @claude \"how far along?\"",
-        cue_ko: "Ctrl-b ; 로 돌아간 뒤 입력:   muxa msg send @claude \"어디까지 됐나요?\"",
+        cue_en: "back:   Ctrl-b ;   (or Ctrl-b o to cycle)   ·   then:   muxa msg send @claude \"how far along?\"",
+        cue_ko: "돌아가기:   Ctrl-b ;   (Ctrl-b o 로 순환)   ·   그다음:   muxa msg send @claude \"어디까지 됐나요?\"",
         detect: Detect::SentMessage,
     },
     Step {
         achieved_en: "✓ your question reached claude and it answered — and codex asked you something",
         achieved_ko: "✓ 질문이 claude에게 닿았고 답이 왔습니다 — 그리고 codex가 당신에게 물어왔습니다",
-        title_en: "Agents use muxa too — codex just sent you a request of its own.",
-        title_ko: "agent도 muxa를 씁니다 — codex가 방금 당신에게 요청을 보냈습니다.",
-        cue_en: "run:   muxa msg inbox",
-        cue_ko: "입력:   muxa msg inbox",
+        title_en: "claude answered into your mailbox. `list` shows what you sent; `inbox` claims what was sent to you — codex just asked you something.",
+        title_ko: "claude가 mailbox로 답했습니다. `list`는 보낸 것, `inbox`는 받은 것을 가져옵니다 — codex가 방금 물어왔습니다.",
+        cue_en: "claude's answer:   muxa msg list      ·   codex's request:   muxa msg inbox",
+        cue_ko: "claude의 답장:   muxa msg list      ·   codex의 요청:   muxa msg inbox",
         detect: Detect::ClaimedInbox,
     },
     Step {
@@ -1364,10 +1481,22 @@ impl Tour<'_> {
         // shell being asked to create the session. Narrating only through tmux
         // would leave that instruction invisible, which is the same dead end as
         // a gate with no way past it, just earlier.
+        // Trailing newlines are stripped by the `$(...)` the prompt reads this
+        // through, which ran the instruction and the prompt together on one
+        // line. A trailing *space* survives, so the prompt starts its own line.
+        //
+        // Coloured and ruled, because a plain paragraph above a shell prompt
+        // reads as output from the last command rather than as the thing to do
+        // next.
+        let rule = "─".repeat(64);
         let _ = std::fs::write(
             &self.sandbox.cue,
             format!(
-                "\n  muxa onboarding · {}/{}   {achieved}\n  {title}\n  {cue}\n\n",
+                "\n{DIM}{rule}{RESET}\n\
+                 {BOLD}muxa onboarding · {}/{}{RESET}   {GREEN}{achieved}{RESET}\n\
+                 {title}\n\
+                 {YELLOW}{BOLD}{cue}{RESET}\n\
+                 {DIM}{rule}{RESET}\n ",
                 index + 1,
                 STEPS.len()
             ),
