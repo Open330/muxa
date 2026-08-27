@@ -1216,6 +1216,10 @@ impl RawModeGuard {
         if let Err(error) =
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)
         {
+            // `execute!` may have written the enable sequence before a later
+            // flush error. Best-effort reversal keeps a failed attach from
+            // leaving the parent terminal in paste mode without a guard.
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
             let _ = crossterm::terminal::disable_raw_mode();
             return Err(error.into());
         }
@@ -1263,6 +1267,9 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
         while crossterm::event::poll(Duration::ZERO)? {
             match crossterm::event::read()? {
                 Event::Paste(text) => {
+                    // A detach prefix applies only to the immediately
+                    // following key, never across a whole paste event.
+                    detach_armed = false;
                     client
                         .write_session(session_id, &bracketed_paste_input(&text))
                         .await?;
