@@ -40,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nobody is attached to a status bar yet. `F2` switches the narration language
   mid-tour, as the simulation's footer did.
 
+  The scripted agents look like agents. Each pane tails a transcript the tour
+  appends to, so the session *grows* — a prompt, tool calls, and, when codex
+  goes to `waiting`, the approval prompt that explains why. `muxa watch`'s
+  inspector and preview both render the selected pane's live screen, so a fleet
+  parked on one static line makes those features look broken and makes the tour
+  assert what it should be showing. Windows are named after the Work rather
+  than after whatever is running in them, so the topology reads as
+  `checkout · 3 agents` instead of `muxa` and `bash`. None of it shells out to
+  an agent CLI, and each transcript says so on its first line.
+
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
   supported command: `up` / `daemon` / `env` / `status` / `down` over a private
