@@ -116,6 +116,26 @@ def cue() -> str:
     return tmux("show", "-g", "status-format[2]").stdout
 
 
+def title_text() -> str:
+    return tmux("show", "-g", "status-format[1]").stdout
+
+
+def sandbox_muxa(muxa: str, *args: str) -> str:
+    """Run muxa as the learner's pane, which is the only origin the daemon
+    accepts for a mailbox query."""
+    env = dict(os.environ)
+    for line in subprocess.run(
+        ["bash", "scripts/muxa-sandbox.sh", "env", "--name", SANDBOX],
+        capture_output=True, text=True,
+    ).stdout.splitlines():
+        if line.startswith("export ") and "=" in line:
+            key, _, value = line[len("export "):].partition("=")
+            env[key] = value.split(':"$PATH"')[0].strip("'")
+    env["TMUX"] = env.get("MUXA_SANDBOX_TMUX_ENV", "")
+    env["TMUX_PANE"] = tmux("display-message", "-p", "#{pane_id}").stdout.strip()
+    return subprocess.run([muxa, *args], capture_output=True, text=True, env=env).stdout
+
+
 def title_row() -> str:
     return tmux("show", "-g", "status-format[1]").stdout.strip()
 
@@ -261,6 +281,12 @@ def main() -> int:
         terminal.type(b"\x02d", 3)  # Ctrl-b d
         report.check("detaching advances", wait_step(terminal, 4), f"step={step()}")
 
+        # Step 3 tells them to run `tmux ls`; the tour's own placeholder session
+        # showing up in that output is plumbing leaking through the lesson.
+        sessions = tmux("list-sessions", "-F", "#{session_name}").stdout.split()
+        report.check("the placeholder session is not in `tmux ls`",
+                     "_sandbox" not in sessions, str(sessions))
+
         terminal.type(b"tmux attach -t muxa-onboarding\r", 4)
         report.check("reattaching advances", wait_step(terminal, 5), f"step={step()}")
 
@@ -286,9 +312,18 @@ def main() -> int:
         terminal.type(b"muxa watch\r", 4)
         report.check("running watch advances", wait_step(terminal, 6), f"step={step()}")
 
+        # A cue that names a command without saying what it does leaves the
+        # learner running things blind.
+        explains_attend = {"en": "blocked longest", "ko": "가장 오래 막힌"}[args.lang]
+        report.check("the attend step says what attend does",
+                     explains_attend in title_text(), title_text())
+
         terminal.type(b"q", 2)
         terminal.type(b"muxa attend\r", 4)
         report.check("attend advances", wait_step(terminal, 7), f"step={step()}")
+        explains_return = {"en": "last pane you were in", "ko": "직전에 있던 pane"}[args.lang]
+        report.check("the return step says what Ctrl-b ; does",
+                     explains_return in title_text(), title_text())
 
         # attend put the learner in codex's pane, which is the point of it —
         # and that pane has no shell. Step 7 teaches `Ctrl-b ;` to get back, so
@@ -298,6 +333,15 @@ def main() -> int:
 
         terminal.type(b'muxa msg send @claude "how far along?"\r', 4)
         report.check("messaging a peer advances", wait_step(terminal, 8), f"step={step()}")
+
+        # claude answers through the mailbox, not just on its own screen, and
+        # before the learner runs anything to fetch it.
+        sent = sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--json")
+        report.check(
+            "claude replied through muxa on its own",
+            '"completed"' in sent,
+            sent[-300:],
+        )
 
         terminal.type(b"muxa msg inbox\r", 4)
         report.check("claiming the inbox advances", wait_step(terminal, 9), f"step={step()}")

@@ -126,6 +126,8 @@ struct Sandbox {
     script: PathBuf,
     config: PathBuf,
     rcfile: PathBuf,
+    /// What the shell prompt shows when nobody is attached to a status bar.
+    cue: PathBuf,
     /// `HOME` for everything the learner runs, so `cd ~` lands here too.
     home: PathBuf,
     /// Where their shell starts, and what `ls` shows.
@@ -141,6 +143,7 @@ impl Sandbox {
         let script = dir.join("muxa-onboarding-sandbox.sh");
         let config = dir.join("muxa-onboarding.src.toml");
         let rcfile = dir.join("muxa-onboarding.bashrc");
+        let cue = dir.join("muxa-onboarding.cue");
         let home = dir.join("muxa-onboarding-home");
         let project = home.join("checkout-service");
         write_executable(&script, SANDBOX_SCRIPT).context("staging the sandbox script")?;
@@ -154,6 +157,7 @@ impl Sandbox {
             script,
             config,
             rcfile,
+            cue,
             home,
             project,
             tmux,
@@ -231,10 +235,22 @@ impl Sandbox {
     /// The learner's shell. It carries the sandbox environment explicitly
     /// rather than relying on inheritance, and a bare prompt so the tour does
     /// not drag anyone's Starship setup into the recording of their own screen.
+    ///
+    /// The prompt also carries the current step. Printing it instead put the
+    /// instruction *below* the prompt bash had already drawn, so whatever the
+    /// learner typed next had nothing in front of it and the shell looked like
+    /// it had gone away. As part of the prompt it sits where every shell puts
+    /// context, and refreshes on every command — only outside tmux, since
+    /// inside the status bar already says it.
     fn write_rcfile(&self) -> Result<()> {
         use std::fmt::Write as _;
 
-        let mut body = String::from("unset PROMPT_COMMAND\nexport PS1='muxa-onboarding $ '\n");
+        let mut body = String::from("unset PROMPT_COMMAND\n");
+        let _ = writeln!(
+            body,
+            "export PS1='$([ -z \"$TMUX\" ] && cat {} 2>/dev/null)muxa-onboarding $ '",
+            self.cue.display()
+        );
         // Every pane, not just the first: a window the learner opens at step 2
         // would otherwise land back in their own home directory.
         let _ = writeln!(body, "export HOME='{}'", self.home.display());
@@ -326,6 +342,36 @@ impl Sandbox {
     /// the tour teaches arrive through the real pipeline rather than being
     /// drawn. Only valid once the daemon is up — events sent before it starts
     /// are simply lost.
+    /// Answer whatever the learner just asked claude.
+    ///
+    /// Their request is real and sits in claude's mailbox; leaving it there
+    /// would teach that messages go nowhere. A reply they can find with
+    /// `muxa msg list` is the point of a durable mailbox — a line in a
+    /// transcript is a drawing of one. Best-effort: a flourish should not stop
+    /// the tour.
+    fn reply_as_claude(&self, fleet: &Fleet, language: UiLanguage) {
+        let Ok(raw) = self.muxa_as(&fleet.claude, &["msg", "inbox", "--json"]) else {
+            return;
+        };
+        let Ok(requests) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        let Some(id) = requests
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("id"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let body = tr(
+            language,
+            "auth path is covered; writing the regression test now",
+            "인증 경로는 끝났고, 지금 회귀 테스트를 쓰는 중입니다",
+        );
+        let _ = self.muxa_as(&fleet.claude, &["msg", "reply", id, body]);
+    }
+
     fn hook(&self, pane: &str, kind: &str, event: &str, body: &str) -> Result<()> {
         let mut cmd = Command::new(&self.exe);
         cmd.args(["hook", kind, "--event", event]);
@@ -351,7 +397,7 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = self.script_command(&["down"]);
-        for path in [&self.script, &self.config, &self.rcfile] {
+        for path in [&self.script, &self.config, &self.rcfile, &self.cue] {
             let _ = std::fs::remove_file(path);
         }
         // The agent transcripts are named deterministically, so they can be
@@ -1040,8 +1086,8 @@ const STEPS: &[Step] = &[
         detect: Detect::PaneRunning("muxa"),
     },
     Step {
-        title_en: "codex stopped and is waiting on you. State is how you find that.",
-        title_ko: "codex가 멈춰서 당신을 기다립니다. 그걸 찾는 방법이 state입니다.",
+        title_en: "codex stopped and needs you. `attend` jumps to whichever agent has been blocked longest — you land in codex's pane.",
+        title_ko: "codex가 멈춰서 당신이 필요합니다. `attend`는 가장 오래 막힌 agent로 이동합니다 — codex의 pane에 도착합니다.",
         cue_en: "leave watch with q, then run:   muxa attend",
         cue_ko: "q로 watch를 나간 뒤 입력:   muxa attend",
         detect: Detect::ActivePaneIsCodex,
@@ -1050,10 +1096,10 @@ const STEPS: &[Step] = &[
         // attend left them sitting in codex's pane, which has no shell to
         // type into. Getting back is a real tmux key, so the step teaches it
         // rather than having the tour move the cursor on their behalf.
-        title_en: "That is codex's own pane. Go back to yours, and ask from there.",
-        title_ko: "여기는 codex의 pane입니다. 당신 pane으로 돌아가서 물어보세요.",
-        cue_en: "press   Ctrl-b   then   ;      then run:   muxa msg send @claude \"how far along?\"",
-        cue_ko: "Ctrl-b 를 눌렀다 떼고   ;      그 뒤 입력:   muxa msg send @claude \"어디까지 됐나요?\"",
+        title_en: "You are in codex's pane — press y to approve it if you like. `Ctrl-b ;` returns to the last pane you were in, which is your own shell.",
+        title_ko: "지금 codex의 pane입니다 — 원하면 y로 승인해 보세요. `Ctrl-b ;`는 직전에 있던 pane, 즉 당신의 셸로 돌아갑니다.",
+        cue_en: "back with   Ctrl-b ;   then run:   muxa msg send @claude \"how far along?\"",
+        cue_ko: "Ctrl-b ; 로 돌아간 뒤 입력:   muxa msg send @claude \"어디까지 됐나요?\"",
         detect: Detect::SentMessage,
     },
     Step {
@@ -1191,13 +1237,17 @@ impl Tour<'_> {
     /// Fired as a step opens, so the world moves on its own rather than only in
     /// response to the learner.
     fn on_enter(&mut self, index: usize) -> Result<()> {
-        if index == ACT_TWO_START {
-            // The placeholder has done its job; left alive it shows up in watch
-            // as a session with no agents in it.
+        // The placeholder only had to keep the server alive until the learner
+        // made a session of their own. Step 3 asks them to run `tmux ls`, and a
+        // mysterious `_sandbox` in that output is the tour's own plumbing
+        // showing through the lesson.
+        if index == 1 {
             let holder = self.sandbox.env_value("MUXA_SANDBOX_HOLDER");
             if !holder.is_empty() {
                 let _ = self.sandbox.tmux_command(&["kill-session", "-t", &holder]);
             }
+        }
+        if index == ACT_TWO_START {
             let session = self
                 .own_sessions()
                 .first()
@@ -1234,6 +1284,8 @@ impl Tour<'_> {
                 fleet
                     .claude_screen
                     .append(&incoming_question(self.language));
+                // And claude answers through muxa, not only on its own screen.
+                self.sandbox.reply_as_claude(fleet, self.language);
                 fleet.codex_screen.append(&outgoing_request(self.language));
                 self.sandbox
                     .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
@@ -1278,13 +1330,14 @@ impl Tour<'_> {
         // shell being asked to create the session. Narrating only through tmux
         // would leave that instruction invisible, which is the same dead end as
         // a gate with no way past it, just earlier.
-        if self.clients().is_empty() {
-            eprintln!();
-            eprintln!("  muxa onboarding · {}/{}", index + 1, STEPS.len());
-            eprintln!("  {title}");
-            eprintln!("  {cue}");
-            eprintln!();
-        }
+        let _ = std::fs::write(
+            &self.sandbox.cue,
+            format!(
+                "\n  muxa onboarding · {}/{}\n  {title}\n  {cue}\n\n",
+                index + 1,
+                STEPS.len()
+            ),
+        );
     }
 
     fn drive(&mut self) -> Result<usize> {
