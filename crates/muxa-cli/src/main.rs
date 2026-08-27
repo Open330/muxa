@@ -428,6 +428,9 @@ enum WorkspaceCmd {
     Show(tmux_work::WorkspaceShowArgs),
     /// Close a workspace session, including every work and agent.
     Close(tmux_work::WorkspaceCloseArgs),
+    /// Give this terminal its own view of a workspace, so two terminals on one
+    /// session stop following each other's window switches.
+    View(tmux_work::WorkspaceViewArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -588,6 +591,7 @@ fn run_workspace_cmd(action: WorkspaceCmd) -> Result<()> {
         WorkspaceCmd::List(args) => tmux_work::run_workspace_list(args),
         WorkspaceCmd::Show(args) => tmux_work::run_workspace_show(args),
         WorkspaceCmd::Close(args) => tmux_work::run_workspace_close(args),
+        WorkspaceCmd::View(args) => tmux_work::run_workspace_view(args),
     }
 }
 

@@ -95,7 +95,11 @@ pub fn build(
 
     for c in &comps {
         match c {
-            Component::TmuxPopup | Component::TmuxStatusLine | Component::TmuxPeek => {
+            Component::TmuxPopup
+            | Component::TmuxStatusLine
+            | Component::TmuxPeek
+            | Component::TmuxWindowNames
+            | Component::TmuxAutoView => {
                 tmux_selected = true;
                 plan_tmux(direction, *c, tmux_path.as_ref(), &mut actions)?;
             }

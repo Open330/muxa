@@ -57,6 +57,69 @@ pub const PEEK_BODY: &str = r#"# prefix + q: display-panes, plus each pane's age
 # Replaces tmux's stock display-panes; `muxa init --uninstall` puts it back.
 bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
 
+/// The body that goes inside the `tmux-auto-view` marker block.
+///
+/// One tmux session has one current window, shared by every client attached to
+/// it. Under muxa's model a window is a Work Run, so two terminals on one
+/// workspace cannot sit on two different Work items — switching one switches
+/// the other. A *session group* is the only mechanism that separates them: the
+/// window list stays shared, each session keeps its own current window.
+///
+/// Two hooks, because there are two ways into a busy session and only covering
+/// one leaves the feature looking broken. `client-attached` is a terminal
+/// running `tmux attach`. `client-session-changed` is `switch-client` — which
+/// is what `muxa watch`'s Enter does, and what a terminal that was already
+/// open when this was installed goes through. Measured on tmux 3.4: with only
+/// the attach hook, jumping from watch put both terminals back in one session
+/// and they followed each other from there.
+///
+/// Self-limiting rather than recursive: the view each hook creates has exactly
+/// one client, so the `session_attached > 1` guard is false for the switch
+/// into it. `muxa workspace view` is a no-op for a sole client, so a single
+/// terminal never grows a second session.
+///
+/// Only `#{client_name}` is interpolated, and deliberately: the hook body is
+/// already three quoting levels deep (`set-hook "…"` → `if -F '…'` →
+/// `run-shell \"…\"`), and a fourth pair around each value terminates the
+/// enclosing one — it broke exactly that way in testing, with tmux reporting
+/// `syntax error` and the client left sharing a session. A client name is a
+/// tty path with no spaces, so it needs no quoting, and `muxa workspace view`
+/// resolves the session and the pid from the client itself.
+///
+/// Per-session opt-out, for when two terminals *should* mirror each other
+/// (pairing, screen sharing): `tmux set-option -t <session> @no_auto_view 1`.
+pub const AUTO_VIEW_BODY: &str = r#"# Each terminal on a workspace gets its own current window, via a session
+# group. Both hooks are needed: attach covers `tmux attach`, session-changed
+# covers `switch-client` — which is what `muxa watch`'s Enter does.
+# Mirror two terminals instead: tmux set-option -t <session> @no_auto_view 1
+set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g client-session-changed "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'""#;
+
+/// The body that goes inside the `tmux-window-names` marker block.
+///
+/// tmux's `automatic-rename` renames each window after the command running in
+/// it. Under muxa's model a window *is* a Work Run, so the name it was given —
+/// by `muxa work up`, or by hand — is overwritten with `node` or `claude` the
+/// moment an agent starts, and the Work the window stands for stops being
+/// visible in tmux's own window list and status line. Off is the setting that
+/// matches what a window means here.
+///
+/// `prefix + ,` keeps tmux's muscle memory but routes through muxa: whitespace
+/// normalizes to `-`, and a name already used in that session is refused,
+/// because tmux matches `session:window` targets by prefix and a duplicate
+/// silently addresses the wrong window. `#{window_id}` is expanded by
+/// `run-shell`, and `%%` by `command-prompt`; `-I "#W"` prefills the name so
+/// the prompt is an edit rather than a retype. Measured end to end on tmux 3.4
+/// by driving a real client's tty.
+///
+/// One window can opt back into tmux's dynamic name with
+/// `muxa window rename --auto`.
+pub const WINDOW_NAMES_BODY: &str = r##"# muxa owns window names: a window is a Work Run, not the process in it.
+# `muxa window rename --auto` opts one window back into tmux's dynamic name.
+set-window-option -g automatic-rename off
+# prefix + , renames through muxa: whitespace to `-`, duplicates refused.
+bind-key , command-prompt -I "#W" "run-shell \"muxa window rename --window '#{window_id}' -- '%%'\""##;
+
 /// The body that goes inside the `tmux-statusline` marker block.
 ///
 /// Two segments: a GLOBAL attention summary (`⚠ N need you`, red, empty
@@ -99,6 +162,8 @@ pub fn upsert(original: &str, component: Component) -> (String, Outcome) {
         Component::TmuxPopup => marker::upsert(original, component.id(), POPUP_BODY),
         Component::TmuxStatusLine => marker::upsert(original, component.id(), STATUSLINE_BODY),
         Component::TmuxPeek => marker::upsert(original, component.id(), PEEK_BODY),
+        Component::TmuxWindowNames => marker::upsert(original, component.id(), WINDOW_NAMES_BODY),
+        Component::TmuxAutoView => marker::upsert(original, component.id(), AUTO_VIEW_BODY),
         _ => (original.to_string(), Outcome::Unchanged),
     }
 }
@@ -106,9 +171,11 @@ pub fn upsert(original: &str, component: Component) -> (String, Outcome) {
 /// Reverse a previous `upsert`. No-op if the block is already absent.
 pub fn remove(original: &str, component: Component) -> (String, Outcome) {
     match component {
-        Component::TmuxPopup | Component::TmuxStatusLine | Component::TmuxPeek => {
-            marker::remove(original, component.id())
-        }
+        Component::TmuxPopup
+        | Component::TmuxStatusLine
+        | Component::TmuxPeek
+        | Component::TmuxWindowNames
+        | Component::TmuxAutoView => marker::remove(original, component.id()),
         _ => (original.to_string(), Outcome::Unchanged),
     }
 }

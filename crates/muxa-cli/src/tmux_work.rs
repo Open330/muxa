@@ -338,6 +338,148 @@ pub struct WorkspaceCloseArgs {
     pub json: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceViewArgs {
+    /// Session to view. Defaults to the session the calling client is in.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// tmux client to move, e.g. `/dev/pts/71`. Defaults to the calling one.
+    #[arg(long)]
+    pub client: Option<String>,
+    /// Suffix that names the view. Defaults to the client's pid, which keeps
+    /// one terminal to one view instead of a new session per jump.
+    #[arg(long = "client-pid")]
+    pub client_pid: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Name for a client's private view of `session`.
+///
+/// `<session>~view~<suffix>` sorts next to the session it mirrors and reads as
+/// what it is. Safe despite tmux matching session names by prefix, because an
+/// exact match wins over prefix candidates — measured on tmux 3.4 with
+/// `callabo`, `callabo-set` and `callabo~view~1734560` all present, `-t
+/// callabo` resolves to `callabo`.
+fn view_session_name(session: &str, suffix: &str) -> String {
+    format!("{session}~view~{suffix}")
+}
+
+/// Give one tmux client its own view of a session, so two terminals on one
+/// workspace stop following each other's window switches.
+///
+/// A tmux session has a single current window shared by every client attached
+/// to it. A *session group* is the only thing that separates them: the window
+/// list stays shared, but each session in the group keeps its own current
+/// window. This puts the client into one.
+///
+/// A no-op when the client is the session's only one — a lone terminal needs
+/// no view, and creating one anyway would leave a second session in every
+/// listing for nothing.
+pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
+    let client = match args.client.clone() {
+        Some(client) => client,
+        None => tmux_output(&["display-message", "-p", "#{client_name}"])?
+            .trim()
+            .to_string(),
+    };
+    if client.is_empty() {
+        bail!("no tmux client to move; pass --client");
+    }
+    let session = match args.session.clone() {
+        Some(session) => session,
+        None => tmux_output(&["display-message", "-p", "-t", &client, "#{session_name}"])?
+            .trim()
+            .to_string(),
+    };
+    if session.is_empty() {
+        bail!("no tmux session for client {client:?}; pass --session");
+    }
+    let attached: u32 = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        &client,
+        "#{session_attached}",
+    ])?
+    .trim()
+    .parse()
+    .unwrap_or(0);
+    if attached <= 1 {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "client": client,
+                    "session": session,
+                    "view": serde_json::Value::Null,
+                    "reason": "sole client",
+                }))?
+            );
+        }
+        return Ok(());
+    }
+
+    let suffix = args.client_pid.clone().unwrap_or_else(|| {
+        tmux_output(&["display-message", "-p", "-t", &client, "#{client_pid}"])
+            .map(|pid| pid.trim().to_string())
+            .unwrap_or_default()
+    });
+    let suffix = if suffix.is_empty() {
+        std::process::id().to_string()
+    } else {
+        suffix
+    };
+    let mut name = view_session_name(&session, &suffix);
+    // A terminal regrouping a second time asks for the name it had before.
+    // That usually succeeds — `destroy-unattached` has reaped the old view by
+    // then — but the ordering is not guaranteed, and a clash would otherwise
+    // abort the regroup and leave the client sharing a session.
+    if tmux_status(&["has-session", "-t", &format!("={name}")]).is_ok() {
+        name = format!("{name}-{}", std::process::id());
+    }
+
+    // `=` anchors the target: tmux matches session names by prefix otherwise,
+    // and real session sets collide (`callabo` also matches `callabo-set`).
+    let view = tmux_output(&[
+        "new-session",
+        "-dP",
+        "-F",
+        "#{session_id}",
+        "-t",
+        &format!("={session}"),
+        "-s",
+        &name,
+    ])?
+    .trim()
+    .to_string();
+
+    // Move the client in BEFORE `destroy-unattached`. Setting that option on a
+    // session that still has no client makes tmux reap it on the spot, which
+    // silently undoes the whole thing.
+    if let Err(error) = tmux_status(&["switch-client", "-c", &client, "-t", &view]) {
+        let _ = tmux_status(&["kill-session", "-t", &view]);
+        return Err(error);
+    }
+    tmux_status(&["set-option", "-t", &view, "destroy-unattached", "on"])?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "client": client,
+                "session": session,
+                "view": name,
+                "view_id": view,
+            }))?
+        );
+    } else {
+        println!("client {client} now views {session} as {name}");
+    }
+    Ok(())
+}
+
 pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {
     let result = if let Some(session) = args.session.as_deref() {
         let sessions = client
@@ -1785,7 +1927,10 @@ fn sanitize_window_name(name: &str) -> String {
     sanitize_session_name(name)
 }
 
-fn normalize_window_name(raw: &str) -> Result<String> {
+/// Normalize a user-supplied name: whitespace to `-`, no control characters,
+/// bounded length. Shared with `watch`'s rename form so both entry points
+/// produce the same name for the same keystrokes.
+pub(crate) fn normalize_window_name(raw: &str) -> Result<String> {
     let value = metadata(raw, 64)?;
     if value.chars().any(char::is_control) {
         bail!("window name cannot contain control characters");
@@ -1948,6 +2093,33 @@ fn print_result(result: &ManageResult, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn view_session_name_sorts_beside_the_session_it_mirrors() {
+        // `<session>~view~<pid>` rather than `view~<pid>~<session>`: the view
+        // lands next to its session in `list-sessions` and in watch's tree.
+        // Safe despite tmux's prefix matching because an exact name match wins
+        // — `-t callabo` resolves to `callabo`, not to this.
+        assert_eq!(
+            view_session_name("callabo", "1734560"),
+            "callabo~view~1734560"
+        );
+    }
+
+    #[test]
+    fn view_session_name_keeps_one_terminal_to_one_view() {
+        // The suffix is the client's pid, so the same terminal regrouping
+        // twice asks for the same name instead of leaving a trail of sessions
+        // behind every jump.
+        assert_eq!(
+            view_session_name("muxa", "42"),
+            view_session_name("muxa", "42")
+        );
+        assert_ne!(
+            view_session_name("muxa", "42"),
+            view_session_name("muxa", "43")
+        );
+    }
     use super::*;
 
     #[test]

@@ -95,6 +95,22 @@ pub enum TopologyNodeKey {
     Pane(PaneKey),
 }
 
+impl TopologyNodeKey {
+    /// The backend endpoint this node lives on, whatever level it is.
+    ///
+    /// Every level carries the same endpoint through its ancestry, so callers
+    /// that only need "which server, which multiplexer" — a rename, a control
+    /// command — do not have to match the variant to find out.
+    #[must_use]
+    pub fn endpoint(&self) -> &BackendEndpoint {
+        match self {
+            TopologyNodeKey::Session(session) => &session.endpoint,
+            TopologyNodeKey::Window(window) => &window.session.endpoint,
+            TopologyNodeKey::Pane(pane) => &pane.window.session.endpoint,
+        }
+    }
+}
+
 /// Whether a hierarchy level is native, mapped without inventing nodes, or
 /// unavailable from a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
