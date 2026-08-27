@@ -21,6 +21,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::time::Duration;
 
 #[derive(Debug, Clone, clap::Args, Default)]
 pub struct Args {
@@ -36,6 +37,16 @@ pub struct Args {
     /// Display language: auto, en, or ko. / 표시 언어: auto, en, ko.
     #[arg(long, value_enum, default_value_t)]
     pub lang: Language,
+    /// Machine-readable dump for tooling, printed instead of the tour.
+    #[arg(long, value_enum, hide = true)]
+    pub emit: Option<Emit>,
+}
+
+/// Machine-readable dumps `muxa onboard` can print instead of running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Emit {
+    /// The key each of the twenty steps waits for, as TSV.
+    StepTable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -276,6 +287,10 @@ const SECTIONS: &[Section] = &[
 ];
 
 pub fn run(args: Args) -> Result<()> {
+    if args.emit == Some(Emit::StepTable) {
+        print!("{}", step_table_tsv());
+        return Ok(());
+    }
     apply_icon_preference();
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();
@@ -362,7 +377,7 @@ fn interactive_guide(no_quiz: bool, language: UiLanguage) -> Result<()> {
         guard
             .terminal_mut()
             .draw(|frame| render_tour(frame, &app))?;
-        if let Event::Key(key) = event::read().context("reading onboarding input")? {
+        if let Some(key) = read_key_event()? {
             handle_key(&mut app, key);
         }
     }
@@ -458,7 +473,7 @@ struct TourApp {
     panel: MockPanel,
     new_work_stage: NewWorkStage,
     collaboration_stage: CollaborationStage,
-    blocked_hint: bool,
+    blocked_attempts: u8,
     done: bool,
 }
 
@@ -484,7 +499,7 @@ impl TourApp {
             panel: MockPanel::None,
             new_work_stage: NewWorkStage::Shortcut,
             collaboration_stage: CollaborationStage::Message,
-            blocked_hint: false,
+            blocked_attempts: 0,
             done: false,
         }
     }
@@ -497,6 +512,26 @@ impl TourApp {
         self.mode == TourMode::Guided
     }
 
+    fn blocked_hint(&self) -> bool {
+        self.blocked_attempts > 0
+    }
+
+    fn note_blocked(&mut self) {
+        self.blocked_attempts = self.blocked_attempts.saturating_add(1);
+    }
+
+    /// `Alt-T` is the only gate without an `Alt`-free equivalent, so a terminal
+    /// that composes Option instead of sending Meta can strand the tour here.
+    fn alt_only_gate(&self) -> bool {
+        self.current() == TourStep::States
+    }
+
+    /// Surface the terminal fix and a way past the gate once the learner has
+    /// visibly tried and failed, instead of teaching the workaround up front.
+    fn offer_alt_bypass(&self) -> bool {
+        self.alt_only_gate() && self.blocked_attempts >= 2
+    }
+
     fn ko(&self) -> bool {
         self.language == UiLanguage::Ko
     }
@@ -506,11 +541,11 @@ impl TourApp {
             UiLanguage::En => UiLanguage::Ko,
             UiLanguage::Ko => UiLanguage::En,
         };
-        self.blocked_hint = false;
+        self.blocked_attempts = 0;
     }
 
     fn advance(&mut self) {
-        self.blocked_hint = false;
+        self.blocked_attempts = 0;
         if self.step + 1 == TourStep::ALL.len() {
             self.done = true;
         } else {
@@ -519,9 +554,207 @@ impl TourApp {
     }
 
     fn previous(&mut self) {
-        self.blocked_hint = false;
+        self.blocked_attempts = 0;
         self.step = self.step.saturating_sub(1);
     }
+}
+
+/// macOS composes `Option` into a glyph unless the terminal is told to send
+/// Meta, so the `Alt-T` this tour teaches arrives as `†` carrying no modifier
+/// at all and the gate can never be satisfied on a stock macOS terminal. Map
+/// the US-layout compose output back to the letter so the walkthrough still
+/// advances; `docs/WATCH.md` covers the terminal settings that restore the real
+/// chord for live watch.
+const OPTION_COMPOSED_LETTERS: [(char, char); 28] = [
+    ('å', 'a'),
+    ('∫', 'b'),
+    ('ç', 'c'),
+    ('∂', 'd'),
+    ('´', 'e'),
+    ('ƒ', 'f'),
+    ('©', 'g'),
+    ('˙', 'h'),
+    ('ˆ', 'i'),
+    ('∆', 'j'),
+    ('˚', 'k'),
+    ('¬', 'l'),
+    ('µ', 'm'),
+    ('˜', 'n'),
+    ('ø', 'o'),
+    ('π', 'p'),
+    ('œ', 'q'),
+    ('®', 'r'),
+    ('ß', 's'),
+    ('†', 't'),
+    ('¨', 'u'),
+    ('√', 'v'),
+    ('∑', 'w'),
+    ('≈', 'x'),
+    ('¥', 'y'),
+    ('Ω', 'z'),
+    // The hints spell the chords with a capital letter, so learners reach for
+    // Shift and compose the shifted glyph instead.
+    ('ˇ', 't'),
+    ('∏', 'p'),
+];
+
+fn option_composed_letter(ch: char) -> Option<char> {
+    OPTION_COMPOSED_LETTERS
+        .iter()
+        .find(|(composed, _)| *composed == ch)
+        .map(|(_, letter)| *letter)
+}
+
+/// True when `key` is the `Alt-<letter>` chord the tour teaches, whether the
+/// terminal sends a real Meta modifier or only the macOS compose glyph.
+fn is_alt_chord(key: KeyEvent, letter: char) -> bool {
+    match key.code {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::ALT) => {
+            ch.eq_ignore_ascii_case(&letter)
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            option_composed_letter(ch) == Some(letter)
+        }
+        _ => false,
+    }
+}
+
+/// crossterm reports a bare `Esc` the moment a read returns a lone `\x1b` with
+/// nothing else in the same syscall, so an escape sequence split across reads —
+/// an arrow key relayed through tmux, or a slow pty — surfaces as a phantom
+/// quit. Wait this long before trusting `Esc`.
+const ESC_SEQUENCE_GRACE: Duration = Duration::from_millis(50);
+
+/// Read one key, dropping the phantom `Esc` of a split escape sequence.
+pub(super) fn read_key_event() -> Result<Option<KeyEvent>> {
+    let Event::Key(key) = event::read().context("reading onboarding input")? else {
+        return Ok(None);
+    };
+    if key.code != KeyCode::Esc
+        || key.kind != KeyEventKind::Press
+        || !event::poll(ESC_SEQUENCE_GRACE).context("checking for a split escape sequence")?
+    {
+        return Ok(Some(key));
+    }
+    resolve_split_escape()
+}
+
+/// The leading `\x1b` was already consumed, so the rest of the sequence arrives
+/// as plain characters. `[` and `O` introduce a CSI/SS3 tail that has to be
+/// swallowed whole; anything else is the two-byte form of an `Alt` chord.
+fn resolve_split_escape() -> Result<Option<KeyEvent>> {
+    let Some(next) = next_pending_key()? else {
+        return Ok(Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    };
+    let KeyCode::Char(introducer) = next.code else {
+        return Ok(Some(next));
+    };
+    if introducer != '[' && introducer != 'O' {
+        return Ok(Some(KeyEvent::new(
+            next.code,
+            next.modifiers | KeyModifiers::ALT,
+        )));
+    }
+    // Parameter bytes precede the final byte that terminates the sequence.
+    while let Some(key) = next_pending_key()? {
+        let is_parameter = matches!(key.code, KeyCode::Char(byte) if !('@'..='~').contains(&byte));
+        if !is_parameter {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn next_pending_key() -> Result<Option<KeyEvent>> {
+    while event::poll(Duration::ZERO).context("draining a split escape sequence")? {
+        if let Event::Key(key) = event::read().context("draining a split escape sequence")? {
+            if key.kind == KeyEventKind::Press {
+                return Ok(Some(key));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The key the current stage is waiting for, as a bare token.
+///
+/// `required_action` phrases the same thing for the learner; keeping both on
+/// one source means the published table cannot promise a key the gate refuses.
+fn expected_key(app: &TourApp) -> &'static str {
+    match app.current() {
+        TourStep::Work => "j",
+        TourStep::Agents | TourStep::Mcp => "l",
+        TourStep::States => "Alt-T",
+        TourStep::Preview => "o",
+        TourStep::Shortcuts if app.panel == MockPanel::Preview => "o",
+        TourStep::Shortcuts => "?",
+        TourStep::NewWork if app.new_work_stage == NewWorkStage::Shortcut => "n",
+        TourStep::NewWork => "Esc",
+        TourStep::Collaboration => match app.collaboration_stage {
+            CollaborationStage::Message => "m",
+            CollaborationStage::Composer => "Backspace",
+            _ => "M",
+        },
+        TourStep::Finish => "q",
+    }
+}
+
+pub(super) fn key_for_token(token: &str) -> KeyEvent {
+    match token {
+        "Alt-T" => KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+        "Esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        "Backspace" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        "Enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        "→" => KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        "↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        other => {
+            let ch = other.chars().next().unwrap_or('?');
+            let modifiers = if ch.is_ascii_uppercase() || ch == '?' {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            KeyEvent::new(KeyCode::Char(ch), modifiers)
+        }
+    }
+}
+
+/// Walk of the guided watch track; see `tmux::step_table` for the contract.
+fn watch_step_table() -> Vec<Vec<String>> {
+    let mut app = TourApp::with_language(false, UiLanguage::En);
+    let mut table: Vec<Vec<String>> = vec![Vec::new(); TourStep::ALL.len()];
+    while !app.done {
+        let index = app.step;
+        while app.step == index && !app.done && table[index].len() < 8 {
+            let token = expected_key(&app).to_string();
+            table[index].push(token.clone());
+            handle_key(&mut app, key_for_token(&token));
+        }
+        if app.step == index && !app.done {
+            break;
+        }
+    }
+    table
+}
+
+/// `<step number>\t<key>…` for all 20 unified steps — the contract the shell
+/// fallback in `scripts/onboard.sh` is held to.
+pub(super) fn step_table_tsv() -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for (index, keys) in tmux::step_table()
+        .into_iter()
+        .chain(watch_step_table())
+        .enumerate()
+    {
+        let _ = writeln!(out, "{}\t{}", index + 1, keys.join("\t"));
+    }
+    out
 }
 
 fn handle_key(app: &mut TourApp, key: KeyEvent) {
@@ -560,7 +793,7 @@ fn handle_key(app: &mut TourApp, key: KeyEvent) {
                 return;
             }
         }
-        app.blocked_hint = false;
+        app.blocked_attempts = 0;
         return;
     }
     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -573,7 +806,7 @@ fn handle_key(app: &mut TourApp, key: KeyEvent) {
         }
         match key.code {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.previous(),
-            _ => app.blocked_hint = true,
+            _ => app.note_blocked(),
         }
         return;
     }
@@ -605,18 +838,20 @@ fn handle_guided_key(app: &mut TourApp, key: KeyEvent) -> bool {
             app.advance();
             true
         }
+        TourStep::States if is_alt_chord(key, 't') => {
+            app.sort = MockSort::State;
+            app.advance();
+            true
+        }
         TourStep::States
-            if matches!(key.code, KeyCode::Char('t' | 'T'))
-                && key.modifiers.contains(KeyModifiers::ALT) =>
+            if app.offer_alt_bypass() && matches!(key.code, KeyCode::Right | KeyCode::Enter) =>
         {
             app.sort = MockSort::State;
             app.advance();
             true
         }
         TourStep::Preview
-            if (plain && key.code == KeyCode::Char('o'))
-                || (key.code == KeyCode::Char('p')
-                    && key.modifiers.contains(KeyModifiers::ALT)) =>
+            if (plain && key.code == KeyCode::Char('o')) || is_alt_chord(key, 'p') =>
         {
             app.panel = MockPanel::Preview;
             app.advance();
@@ -626,7 +861,7 @@ fn handle_guided_key(app: &mut TourApp, key: KeyEvent) -> bool {
             if app.panel == MockPanel::Preview && plain && key.code == KeyCode::Char('o') =>
         {
             app.panel = MockPanel::None;
-            app.blocked_hint = false;
+            app.blocked_attempts = 0;
             true
         }
         TourStep::Shortcuts
@@ -634,7 +869,7 @@ fn handle_guided_key(app: &mut TourApp, key: KeyEvent) -> bool {
                 && matches!(key.code, KeyCode::Char('?') | KeyCode::F(1)) =>
         {
             app.panel = MockPanel::Help;
-            app.blocked_hint = false;
+            app.blocked_attempts = 0;
             true
         }
         TourStep::Shortcuts
@@ -664,7 +899,7 @@ fn handle_new_work_shortcut(app: &mut TourApp, key: KeyEvent, plain: bool) -> bo
         return false;
     }
     app.new_work_stage = NewWorkStage::Form;
-    app.blocked_hint = false;
+    app.blocked_attempts = 0;
     true
 }
 
@@ -686,7 +921,7 @@ fn handle_collaboration_shortcut(app: &mut TourApp, key: KeyEvent, plain: bool) 
         }
         _ => return false,
     }
-    app.blocked_hint = false;
+    app.blocked_attempts = 0;
     true
 }
 
@@ -1446,7 +1681,7 @@ fn step_title(step: TourStep, language: UiLanguage) -> &'static str {
 
 fn step_body(app: &TourApp) -> Text<'static> {
     let mut lines = step_lines(app);
-    if app.blocked_hint {
+    if app.blocked_hint() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!(
@@ -1457,7 +1692,31 @@ fn step_body(app: &TourApp) -> Text<'static> {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
+    if app.offer_alt_bypass() {
+        for hint in alt_bypass_hint(app.language) {
+            lines.push(Line::from(Span::styled(
+                *hint,
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
     Text::from(lines)
+}
+
+/// Shown only after the learner has actually pressed the wrong key twice, so
+/// the terminal caveat stays out of the way of everyone it does not affect.
+fn alt_bypass_hint(language: UiLanguage) -> &'static [&'static str] {
+    if language == UiLanguage::Ko {
+        &[
+            "Alt이 안 눌리나요? macOS는 Option을 조합 키로 씁니다.",
+            "docs/WATCH.md의 터미널 설정을 보거나, →로 넘어가세요.",
+        ]
+    } else {
+        &[
+            "Alt not arriving? macOS composes Option instead of sending Meta.",
+            "See docs/WATCH.md for the terminal setting, or press → to skip.",
+        ]
+    }
 }
 
 fn required_action(app: &TourApp) -> &'static str {
@@ -1858,9 +2117,12 @@ fn dialog_block(title: &str, color: Color) -> Block<'_> {
 fn callout_rect(area: Rect, app: &TourApp) -> Rect {
     let step = app.current();
     let compact = area.width < 100 || area.height < 23;
+    // The terminal-setup hint only appears after repeated misses, so the
+    // callout grows for it rather than reserving the rows on every step.
+    let bypass_rows = if app.offer_alt_bypass() { 5 } else { 0 };
     if compact {
-        let height =
-            if step == TourStep::Finish { 12 } else { 10 }.min(area.height.saturating_sub(2));
+        let height = (if step == TourStep::Finish { 12 } else { 10 } + bypass_rows)
+            .min(area.height.saturating_sub(2));
         let y = if step == TourStep::Shortcuts {
             area.y + 2
         } else {
@@ -1878,9 +2140,12 @@ fn callout_rect(area: Rect, app: &TourApp) -> Rect {
     let width = area.width.saturating_mul(42) / 100;
     let height = 12;
     match step {
-        TourStep::Work | TourStep::Agents | TourStep::States => {
-            Rect::new(area.x + area.width - width - 2, area.y + 5, width, height)
-        }
+        TourStep::Work | TourStep::Agents | TourStep::States => Rect::new(
+            area.x + area.width - width - 2,
+            area.y + 5,
+            width,
+            (height + bypass_rows).min(area.height.saturating_sub(6)),
+        ),
         TourStep::Preview | TourStep::Mcp => {
             Rect::new(area.x + 2, area.y + 8, width.max(52), height)
         }
@@ -2065,7 +2330,7 @@ mod tests {
             KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::NONE),
         );
         assert_eq!(app.step, original);
-        assert!(app.blocked_hint);
+        assert!(app.blocked_hint());
 
         handle_key(
             &mut app,
@@ -2154,6 +2419,165 @@ mod tests {
         assert_eq!(app.current(), TourStep::Mcp);
     }
 
+    fn at_state_step() -> TourApp {
+        let mut app = TourApp::new(false);
+        app.step = TourStep::ALL
+            .iter()
+            .position(|step| *step == TourStep::States)
+            .unwrap();
+        app
+    }
+
+    #[test]
+    fn step_table_walks_every_gate_with_its_published_key() {
+        let table: Vec<Vec<String>> = tmux::step_table()
+            .into_iter()
+            .chain(watch_step_table())
+            .collect();
+        assert_eq!(table.len(), UNIFIED_STEP_COUNT);
+        for (index, keys) in table.iter().enumerate() {
+            assert!(!keys.is_empty(), "step {} publishes no key", index + 1);
+            // The walk caps a step at eight stages, which it only reaches when
+            // a gate refuses the very key it told the learner to press.
+            assert!(
+                keys.len() < 8,
+                "step {} never accepted its published key: {keys:?}",
+                index + 1
+            );
+        }
+        // The gate that stranded the tour in issue #76 — the contract the
+        // shell fallback is held to by scripts/onboarding-parity.py.
+        assert_eq!(table[13], vec!["Alt-T".to_string()]);
+        assert_eq!(table[5], vec!["\u{2192}".to_string()]);
+    }
+
+    #[test]
+    fn step_table_tsv_lists_one_numbered_line_per_step() {
+        let tsv = step_table_tsv();
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(lines.len(), UNIFIED_STEP_COUNT);
+        for (index, line) in lines.iter().enumerate() {
+            let mut fields = line.split('\t');
+            assert_eq!(fields.next(), Some((index + 1).to_string().as_str()));
+            assert!(fields.next().is_some(), "step {} has no key", index + 1);
+        }
+        assert!(tsv.contains("14\tAlt-T\n"));
+    }
+
+    #[test]
+    fn state_step_accepts_the_macos_option_compose_glyph() {
+        // A stock macOS terminal composes Option+T into `†` and sends no
+        // modifier at all, which used to leave the tour with no way forward.
+        let mut app = at_state_step();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('†'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.current(), TourStep::Preview);
+        assert_eq!(app.sort, MockSort::State);
+    }
+
+    #[test]
+    fn state_step_accepts_the_shifted_compose_glyph() {
+        let mut app = at_state_step();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('ˇ'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.current(), TourStep::Preview);
+    }
+
+    #[test]
+    fn state_step_still_refuses_a_bare_t() {
+        // The tour teaches the real watch binding, so an unmodified `t` — which
+        // live watch does not bind — must not stand in for the chord.
+        let mut app = at_state_step();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.current(), TourStep::States);
+        assert!(app.blocked_hint());
+    }
+
+    #[test]
+    fn state_step_offers_a_bypass_only_after_repeated_misses() {
+        let mut app = at_state_step();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current(), TourStep::States);
+        assert!(!app.offer_alt_bypass());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.offer_alt_bypass());
+        let screen = rendered(&app, 120, 34);
+        assert!(screen.contains("docs/WATCH.md"));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current(), TourStep::Preview);
+        assert_eq!(app.sort, MockSort::State);
+    }
+
+    #[test]
+    fn preview_step_accepts_the_option_compose_glyph() {
+        let mut app = TourApp::new(false);
+        app.step = TourStep::ALL
+            .iter()
+            .position(|step| *step == TourStep::Preview)
+            .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('π'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.panel, MockPanel::Preview);
+        assert_eq!(app.current(), TourStep::Shortcuts);
+    }
+
+    #[test]
+    fn alt_chord_matching_covers_meta_and_compose_forms() {
+        assert!(is_alt_chord(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+            't'
+        ));
+        assert!(is_alt_chord(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            't'
+        ));
+        assert!(is_alt_chord(
+            KeyEvent::new(KeyCode::Char('†'), KeyModifiers::NONE),
+            't'
+        ));
+        assert!(!is_alt_chord(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            't'
+        ));
+        assert!(!is_alt_chord(
+            KeyEvent::new(KeyCode::Char('π'), KeyModifiers::NONE),
+            't'
+        ));
+        // Ctrl-composed input never stands in for a compose glyph.
+        assert!(!is_alt_chord(
+            KeyEvent::new(KeyCode::Char('†'), KeyModifiers::CONTROL),
+            't'
+        ));
+    }
+
+    #[test]
+    fn option_compose_table_is_unambiguous() {
+        for (index, (composed, _)) in OPTION_COMPOSED_LETTERS.iter().enumerate() {
+            assert!(
+                !composed.is_ascii(),
+                "{composed} would shadow a plain tour key"
+            );
+            assert!(
+                OPTION_COMPOSED_LETTERS
+                    .iter()
+                    .skip(index + 1)
+                    .all(|(other, _)| other != composed),
+                "{composed} is mapped twice"
+            );
+        }
+    }
+
     #[test]
     fn guided_tour_advances_with_the_live_watch_keys() {
         let mut app = TourApp::new(false);
@@ -2165,7 +2589,7 @@ mod tests {
         // watch action is being taught.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.current(), TourStep::Work);
-        assert!(app.blocked_hint);
+        assert!(app.blocked_hint());
 
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.current(), TourStep::Agents);
