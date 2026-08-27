@@ -62,7 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Codex's approval prompt answers. A prompt reading `[y] yes  [n] no` that
   swallows the keystroke invites the learner to do the one thing the tour has
   made impossible; pressing `y` now appends the tool output and fires the hook
-  a resuming agent fires, so the row in watch goes back to `working`.
+  a resuming agent fires, so the row in watch goes back to `working`. claude
+  answers the learner's question through the mailbox rather than only on its
+  own screen, straight away — a reply they can find with `muxa msg list` is
+  what a durable mailbox is for.
+
+  The steps say what their commands do: that `attend` goes to whichever agent
+  has been blocked longest and lands you in its pane, and that `Ctrl-b ;`
+  returns to the pane you were in before. The placeholder session is removed as
+  soon as the learner has one of their own, so the `tmux ls` that step 3 asks
+  for shows their session and not the tour's plumbing. And the step is part of
+  the shell prompt while they are detached, instead of printed underneath a
+  prompt bash had already drawn — which read as the shell having gone away.
 
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
