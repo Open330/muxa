@@ -7,8 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
+  one.** The isolation the demo recordings had grown privately is now a
+  supported command: `up` / `daemon` / `env` / `status` / `down` over a private
+  `MUXA_SOCKET`, `MUXA_CONFIG` and `XDG_DATA_HOME`, an isolated tmux server
+  pinned through `MUXA_TMUX_SOCKET`, and a `tmux` PATH shim so child processes
+  land on that server too. `up` refuses to nest inside an existing tmux session
+  unless told otherwise, checks that `muxa` and `muxad` are the same build, and
+  tears down anything a previous run left behind before building. `status`
+  distinguishes healthy from partial and names every artifact it found; `down`
+  reaps daemons the pidfile lost track of, waits for them to actually exit, then
+  verifies and reports what survived. Every artifact lives below a mode-0700
+  root carrying an ownership marker, so a same-named `/tmp` path is refused
+  rather than deleted, and tmux uses an explicit socket path that stays stable
+  across `TMUX_TMPDIR` changes. A pidfile is only trusted after its process is
+  confirmed against this sandbox's exact config, while custom-named `muxad`
+  binaries remain discoverable; starting the daemon again reuses the healthy
+  process rather than creating a socket race.
+  `scripts/sandbox-smoke.sh` holds it to that, asserting teardown is total from
+  each state a crash can leave.
+  `docs/demo-setup.sh` is the first consumer and now carries only the fixture.
+
+### Changed
+
+- **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
+  release binary for the host into a temporary directory, verifies its
+  published SHA-256, runs the onboarding, and deletes it — a download, not an
+  install: no daemon, no config, no PATH entry. The embedded shell simulation
+  remains the fallback for `--no-download`, an unsupported platform, a missing
+  checksum tool, or no network, so the pipe-to-`sh` entry point keeps working
+  offline. The fallback was realigned to the real tour's step decomposition and
+  keys — the splits are one step, detach and reattach are two, pane movement
+  takes `→`, and the attention sort takes `Alt-T` (the macOS compose glyphs
+  `†`/`ˇ` included) rather than a stand-in `t`. `muxa onboard --emit
+  step-table` publishes the key each step waits for, derived by walking the
+  real gates, and `scripts/onboarding-parity.py` presses exactly those keys at
+  the fallback in CI so the two cannot drift apart again.
+
 ### Fixed
 
+- **The demo fixture could not be rebuilt.** `docs/demo-setup.sh` wrote
+  `[watch] view = 'work'`, a value that stopped existing when the watch view
+  enum became `session` / `window` / `pane`, so `muxad` refused the config and
+  every GIF regeneration failed at daemon start.
+- **An arrow torn across two reads still counts.** The handler added here to
+  drop the phantom `Esc` of a split escape sequence swallowed the CSI tail and
+  returned nothing, which drops the arrow along with the `Esc` — on the one
+  step whose contract accepts an arrow and no letter. A terminal that ships
+  `\x1b` and `[C` in separate writes therefore hit the same dead end this
+  change exists to remove. The final byte now says which key it was.
+  `scripts/split-arrow-check.py` drives the real tour with the sequence torn at
+  1, 20 and 45 ms and is wired into CI.
+- **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
+  it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
+  so a terminal that composes Option instead of sending Meta — the macOS
+  default — could never satisfy it. The gate now also accepts the compose
+  glyph (`†`, `ˇ`), and two missed attempts surface the terminal
+  setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
+  `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
+  relayed through tmux or a slow pty could tear the tour down mid-step; both
+  the tour and the tmux track now confirm an `Esc` before quitting, reassemble
+  the split sequence, and deliver the represented arrow instead of swallowing
+  it. `scripts/onboard.sh` read one byte per key and so quit on *every* arrow
+  key; it now classifies the escape tail the same way and accepts the real
+  `Alt-T`. The download path also capability-checks the release before running
+  it, so a release still predating these fixes falls back to the corrected
+  embedded tour.
 - **Pasting into an attached muxa-owned PTY is safe and complete.** The attach
   relay now enables bracketed paste, forwards the restored framing to the child
   PTY so multiline input is not executed line by line, ignores leaked platform

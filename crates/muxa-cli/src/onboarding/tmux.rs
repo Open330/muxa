@@ -10,7 +10,7 @@ use super::{
     action_line, action_style, centered_rect, dialog_block, highlighted_actions, tr, UiLanguage,
 };
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use muxa::AgentState;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -184,7 +184,7 @@ pub(super) fn interactive_guide(
                 }
             }
         }
-        if let Event::Key(key) = event::read().context("reading tmux onboarding input")? {
+        if let Some(key) = super::read_key_event()? {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
                 return Ok(None);
             }
@@ -1732,6 +1732,65 @@ fn muxa_lines(app: &TmuxApp) -> Vec<Line<'static>> {
         },
     ]);
     lines
+}
+
+/// The tokens this track expects, one list per step, in stage order.
+///
+/// The table is *walked*, not written down: each stage publishes its key
+/// through `expected_key`, the walk presses exactly that, and the step only
+/// closes when the real gate lets it. A gate and its published key therefore
+/// cannot drift apart, which is what `scripts/onboarding-parity.sh` compares
+/// the shell fallback against.
+pub(super) fn step_table() -> Vec<Vec<String>> {
+    let prefix = DetectedPrefix {
+        display: "prefix".to_string(),
+        tmux_key: "C-b".to_string(),
+    };
+    let mut app = TmuxApp::new(false, UiLanguage::En, prefix, PrefixCapture::Direct);
+    let mut table: Vec<Vec<String>> = vec![Vec::new(); Step::ALL.len()];
+    while !app.done {
+        let index = app.step;
+        // A runaway gate would otherwise spin here; the parity test asserts no
+        // step needs anywhere near this many stages.
+        while app.step == index && !app.done && table[index].len() < 8 {
+            let token = table_token(&app);
+            table[index].push(token.clone());
+            feed_token(&mut app, &token);
+        }
+        if app.step == index && !app.done {
+            break;
+        }
+    }
+    table
+}
+
+/// `expected_key` renders the prefix and the shell commands for a human. The
+/// table needs stable, environment-independent tokens instead.
+fn table_token(app: &TmuxApp) -> String {
+    match app.current() {
+        Step::Prefix => "prefix".to_string(),
+        Step::Shell => format!("type:{NEW_SESSION_COMMAND}"),
+        Step::Reattach => format!("type:{ATTACH_COMMAND}"),
+        _ => expected_key(app),
+    }
+}
+
+fn feed_token(app: &mut TmuxApp, token: &str) {
+    if let Some(command) = token.strip_prefix("type:") {
+        for ch in command.chars() {
+            handle_key(app, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        return;
+    }
+    if token == "prefix" {
+        handle_key(
+            app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        );
+        return;
+    }
+    handle_key(app, super::key_for_token(token));
 }
 
 fn expected_key(app: &TmuxApp) -> String {
