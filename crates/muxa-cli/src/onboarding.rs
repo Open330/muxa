@@ -627,7 +627,7 @@ fn is_alt_chord(key: KeyEvent, letter: char) -> bool {
 /// nothing else in the same syscall, so an escape sequence split across reads —
 /// an arrow key relayed through tmux, or a slow pty — surfaces as a phantom
 /// quit. Wait this long before trusting `Esc`.
-const ESC_SEQUENCE_GRACE: Duration = Duration::from_millis(50);
+const ESC_SEQUENCE_GRACE: Duration = Duration::from_millis(100);
 
 /// Read one key, dropping the phantom `Esc` of a split escape sequence.
 pub(super) fn read_key_event() -> Result<Option<KeyEvent>> {
