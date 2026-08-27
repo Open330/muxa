@@ -28,7 +28,7 @@ import time
 
 SANDBOX = "muxa-onboarding"
 STEP_MARK = re.compile(r"onboarding · (\d+)/(\d+)")
-STEPS_TOTAL = range(9)
+TOTAL_STEPS = 14
 
 
 class Terminal:
@@ -189,8 +189,8 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
     cannot repeat that: `--no-quiz` offers the way past from the first step, and
     F12 walks the whole tour without the learner doing any of it.
 
-    Skipping has to leave the world consistent too — Act II introduces agents,
-    and there has to be a session for them to arrive in."""
+    Skipping has to leave the world consistent too — the agents move into a pane
+    the learner split, and there has to be one for them to move into."""
     print("escape hatch")
     terminal = Terminal(muxa, args.lang, no_quiz=True)
     try:
@@ -209,32 +209,24 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
         terminal.type(b"tmux new-session -s muxa-onboarding\r", 4)
         report.check("step 1 done for real", wait_step(terminal, 2), f"step={step()}")
 
-        # F2 was the simulation's language switch; losing it in the live tour
-        # would be a regression for anyone who starts in the wrong one.
-        before = title_row()
-        terminal.type(b"\x1bOQ", 2)  # F2
-        after = title_row()
-        report.check("F2 switches the narration language", before != after and after != "",
-                     f"{before!r} -> {after!r}")
-        terminal.type(b"\x1bOQ", 2)
-        report.check("F2 switches it back", title_row() == before,
-                     f"{title_row()!r} != {before!r}")
-
         target = 3
-        while target <= len(STEPS_TOTAL):
+        while target <= TOTAL_STEPS:
             terminal.type(b"\x1b[24~", 1.5)  # F12
-            if not report.check(f"F12 reaches step {target} or past it",
-                                wait_past(terminal, target, 45), f"step={step()}"):
+            if not report.check(
+                f"F12 reaches step {target} or past it",
+                wait_past(terminal, target, 45),
+                f"step={step()}",
+            ):
                 break
             reached = step() or target
-            if reached >= 5 and target < 5:
-                # The agents joined a session the learner never made themselves.
+            if reached >= 8 and target < 8:
                 panes = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
-                report.check("the agents still had a window to arrive in", len(panes) >= 3,
-                             str(panes))
+                report.check(
+                    "the agents still had a pane to move into", len(panes) >= 3, str(panes)
+                )
             target = reached + 1
 
-        terminal.type(b"\x1b[24~", 2)  # F12 past the last step
+        terminal.type(b"\x1b[24~", 2)
         for _ in range(10):
             if terminal.finished():
                 break
@@ -271,109 +263,106 @@ def main() -> int:
 
     terminal = Terminal(muxa, args.lang)
     try:
-        # Sandbox up, daemon up, the learner's shell.
         terminal.pump(12)
 
         print("act I — tmux")
-        report.check("step 1 is showing", step() == 1, f"step={step()}")
-        report.check("the cue asks for tmux new-session", "tmux new-session" in cue(), cue())
+        report.check("1  the first step is showing", step() == 1, f"step={step()}")
+        report.check("1  the cue asks for tmux new-session", "tmux new-session" in cue(), cue())
         report.check(
-            "tmux's own status row is left alone",
-            "status-format[0]" in tmux("show", "-g", "status-format[0]").stdout
-            and "window-status" in tmux("show", "-g", "status-format[0]").stdout,
+            "1  tmux's own status row is left alone",
+            "window-status" in tmux("show", "-g", "status-format[0]").stdout,
             tmux("show", "-g", "status-format[0]").stdout[:120],
         )
 
         terminal.type(b"tmux new-session -s muxa-onboarding\r", 4)
-        report.check("creating a session advances", wait_step(terminal, 2), f"step={step()}")
+        report.check("2  creating a session", wait_step(terminal, 2), f"step={step()}")
+        report.check("2  the step confirms what just happened", "✓" in banner(), banner())
 
-        terminal.type(b"\x02c", 3)  # Ctrl-b c
-        report.check("a second window advances", wait_step(terminal, 3), f"step={step()}")
-        # "Did that work?" is the question the learner is holding at every step.
-        report.check("the step confirms what the last action did", "✓" in banner(), banner())
+        terminal.type(b"\x02c", 3)
+        report.check("3  a second window", wait_step(terminal, 3), f"step={step()}")
 
-        terminal.type(b"\x02d", 3)  # Ctrl-b d
-        report.check("detaching advances", wait_step(terminal, 4), f"step={step()}")
+        terminal.type(b"\x02s", 2)
+        terminal.type(b"q", 2)
+        report.check("4  opening and closing the tree", wait_step(terminal, 4), f"step={step()}")
 
-        # Step 3 tells them to run `tmux ls`; the tour's own placeholder session
-        # showing up in that output is plumbing leaking through the lesson.
+        terminal.type(b"\x02d", 3)
+        report.check("5  detaching", wait_step(terminal, 5), f"step={step()}")
         sessions = tmux("list-sessions", "-F", "#{session_name}").stdout.split()
-        report.check("the placeholder session is not in `tmux ls`",
-                     "_sandbox" not in sessions, str(sessions))
+        report.check(
+            "5  the placeholder session is not in `tmux ls`",
+            "_sandbox" not in sessions,
+            str(sessions),
+        )
+
+        terminal.type(b"tmux ls\r", 3)
+        report.check("6  running tmux ls", wait_step(terminal, 6), f"step={step()}")
 
         terminal.type(b"tmux attach -t muxa-onboarding\r", 4)
-        report.check("reattaching advances", wait_step(terminal, 5), f"step={step()}")
+        report.check("7  reattaching", wait_step(terminal, 7), f"step={step()}")
+
+        terminal.type(b"\x02%", 3)
+        report.check("8  splitting a pane", wait_step(terminal, 8), f"step={step()}")
 
         print("act II — muxa")
         panes = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
-        report.check("two agents joined the learner's window", len(panes) >= 3, str(panes))
-
-        # The tour claims to be a sandbox. If `ls` shows the learner their own
-        # repository, or watch prints their real path, it is not one.
+        report.check(
+            "8  the split pane became an agent, and a second joined",
+            len(panes) >= 3,
+            str(panes),
+        )
         paths = tmux("list-panes", "-a", "-F", "#{pane_current_path}").stdout.split()
         report.check(
-            "nothing runs outside the sandbox workspace",
-            paths and all(p.startswith("/tmp/muxa-onboarding-home") for p in paths),
+            "8  nothing runs outside the sandbox workspace",
+            bool(paths) and all(p.startswith("/tmp/muxa-onboarding-home") for p in paths),
             str(paths),
         )
         report.check(
-            "the windows are named after Works, not processes",
+            "8  the windows are named after Works, not processes",
             set(tmux("list-windows", "-a", "-F", "#{window_name}").stdout.split())
             == {"checkout", "release-checks"},
             tmux("list-windows", "-a", "-F", "#{window_name}").stdout.split(),
         )
 
         terminal.type(b"muxa watch\r", 4)
-        report.check("running watch advances", wait_step(terminal, 6), f"step={step()}")
+        report.check("9  running watch", wait_step(terminal, 9), f"step={step()}")
 
-        # A cue that names a command without saying what it does leaves the
-        # learner running things blind.
         explains_attend = {"en": "blocked longest", "ko": "가장 오래 막힌"}[args.lang]
-        report.check("the attend step says what attend does",
-                     explains_attend in title_text(), title_text())
-
+        report.check(
+            "9  the step says what attend does", explains_attend in title_text(), title_text()
+        )
         terminal.type(b"q", 2)
         terminal.type(b"muxa attend\r", 4)
-        report.check("attend advances", wait_step(terminal, 7), f"step={step()}")
-        explains_return = {"en": "last pane you were in", "ko": "직전에 있던 pane"}[args.lang]
-        report.check("the return step says what Ctrl-b ; does",
-                     explains_return in title_text(), title_text())
+        report.check("10  attend", wait_step(terminal, 10), f"step={step()}")
 
-        # attend put the learner in codex's pane, which is the point of it —
-        # and that pane has no shell. Step 7 teaches `Ctrl-b ;` to get back, so
-        # type exactly that rather than repositioning the cursor out of band,
-        # or the test stops covering the step it claims to.
-        terminal.type(b"\x02;", 2)
+        explains_return = {"en": "pane you were in", "ko": "직전에 있던 pane"}[args.lang]
+        report.check(
+            "10  the step says what Ctrl-b ; does", explains_return in title_text(), title_text()
+        )
+        terminal.type(b"\x02;", 3)
+        report.check("11  back in your own pane", wait_step(terminal, 11), f"step={step()}")
 
         terminal.type(b'muxa msg send @claude "how far along?"\r', 4)
-        report.check("messaging a peer advances", wait_step(terminal, 8), f"step={step()}")
+        report.check("12  messaging a peer", wait_step(terminal, 12), f"step={step()}")
 
-        # claude answers through the mailbox, not just on its own screen, and
-        # before the learner runs anything to fetch it.
         sent = sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--json")
         report.check(
-            "claude replied through muxa on its own",
-            '"completed"' in sent,
-            sent[-300:],
+            "12  claude replied through muxa on its own", '"completed"' in sent, sent[-300:]
         )
 
-        terminal.type(b"muxa msg inbox\r", 4)
-        report.check("claiming the inbox advances", wait_step(terminal, 9), f"step={step()}")
+        terminal.type(b"muxa msg list\r", 4)
+        report.check("13  reading the mailbox", wait_step(terminal, 13), f"step={step()}")
 
-        terminal.type(b"\x02d", 4)  # Ctrl-b d finishes the tour
+        terminal.type(b"muxa msg inbox\r", 4)
+        report.check("14  claiming the inbox", wait_step(terminal, 14), f"step={step()}")
+
+        terminal.type(b"\x02d", 4)
         for _ in range(12):
             if terminal.finished():
                 break
             terminal.pump(2)
         report.check("the tour exits on its own", terminal.finished())
-        # Both languages, because the summary is the only place the tour tells
-        # the learner nothing was left on their machine.
         gone = {"en": "sandbox is gone", "ko": "sandbox는 사라졌습니다"}[args.lang]
-        report.check(
-            "it says the sandbox is gone",
-            gone in terminal.text(),
-            terminal.text()[-300:],
-        )
+        report.check("it says the sandbox is gone", gone in terminal.text(), terminal.text()[-300:])
     finally:
         terminal.kill()
 

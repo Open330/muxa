@@ -128,6 +128,14 @@ struct Sandbox {
     rcfile: PathBuf,
     /// What the shell prompt shows when nobody is attached to a status bar.
     cue: PathBuf,
+    /// Every command the learner runs, appended by their own shell.
+    ///
+    /// Without it a step whose action is a shell command — `tmux ls`,
+    /// `muxa msg list` — has nothing to detect, and the only way to teach one
+    /// was to bolt it onto the end of another step's cue. That is what put two
+    /// actions on one line and left the learner unsure which of them had
+    /// registered.
+    history: PathBuf,
     /// `HOME` for everything the learner runs, so `cd ~` lands here too.
     home: PathBuf,
     /// Where their shell starts, and what `ls` shows.
@@ -144,6 +152,7 @@ impl Sandbox {
         let config = dir.join("muxa-onboarding.src.toml");
         let rcfile = dir.join("muxa-onboarding.bashrc");
         let cue = dir.join("muxa-onboarding.cue");
+        let history = dir.join("muxa-onboarding.history");
         let home = dir.join("muxa-onboarding-home");
         let project = home.join("checkout-service");
         write_executable(&script, SANDBOX_SCRIPT).context("staging the sandbox script")?;
@@ -158,6 +167,7 @@ impl Sandbox {
             config,
             rcfile,
             cue,
+            history,
             home,
             project,
             tmux,
@@ -246,6 +256,11 @@ impl Sandbox {
         use std::fmt::Write as _;
 
         let mut body = String::from("unset PROMPT_COMMAND\n");
+        let _ = writeln!(
+            body,
+            "export PROMPT_COMMAND='history 1 | sed \"s/^ *[0-9]* *//\" >> {}'",
+            self.history.display()
+        );
         let _ = writeln!(
             body,
             "export PS1='$([ -z \"$TMUX\" ] && cat {} 2>/dev/null)muxa-onboarding $ '",
@@ -397,7 +412,13 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = self.script_command(&["down"]);
-        for path in [&self.script, &self.config, &self.rcfile, &self.cue] {
+        for path in [
+            &self.script,
+            &self.config,
+            &self.rcfile,
+            &self.cue,
+            &self.history,
+        ] {
             let _ = std::fs::remove_file(path);
         }
         // The agent transcripts are named deterministically, so they can be
@@ -487,6 +508,12 @@ impl Sandbox {
         }
         let _ = self.tmux_command(&["set", "-gu", option]);
         true
+    }
+
+    /// Has the learner run a command starting with this?
+    fn ran_command(&self, prefix: &str) -> bool {
+        std::fs::read_to_string(&self.history)
+            .is_ok_and(|log| log.lines().any(|line| line.trim().starts_with(prefix)))
     }
 
     fn skip_requested(&self) -> bool {
@@ -936,81 +963,119 @@ struct Fleet {
     codex_screen: Transcript,
 }
 
+/// The first screenful each agent shows, in the shape of the CLI it stands in
+/// for.
+fn write_opening_screens(claude: &Transcript, codex: &Transcript, language: UiLanguage) {
+    let claude_prompt = tr(
+        language,
+        "harden the checkout auth path",
+        "checkout 인증 경로를 강화해줘",
+    );
+    let codex_prompt = tr(
+        language,
+        "review the public-read boundary",
+        "public-read 경계를 검토해줘",
+    );
+
+    let mut opening = header(Cli::ClaudeCode, language);
+    opening.extend(prompt_line(claude_prompt));
+    opening.extend(turn(
+        Cli::ClaudeCode,
+        tr(
+            language,
+            "I'll start with the token handling in auth.rs.",
+            "auth.rs의 토큰 처리부터 보겠습니다.",
+        ),
+        "",
+    ));
+    opening.extend(turn(
+        Cli::ClaudeCode,
+        "Read(crates/checkout/src/auth.rs)",
+        tr(language, "Read 42 lines", "42줄 읽음"),
+    ));
+    opening.extend(turn(
+        Cli::ClaudeCode,
+        "Search(pattern: \"bearer\")",
+        tr(language, "Found 12 matches", "12건 일치"),
+    ));
+    opening.push(working(language));
+    opening.push(String::new());
+    opening.extend(composer(Cli::ClaudeCode, language));
+    claude.append(&opening);
+
+    let mut opening = header(Cli::Codex, language);
+    opening.extend(prompt_line(codex_prompt));
+    opening.extend(turn(
+        Cli::Codex,
+        "Read crates/api/src/public.rs",
+        tr(language, "3 routes listed", "route 3개 확인"),
+    ));
+    opening.push(working(language));
+    opening.push(String::new());
+    opening.extend(composer(Cli::Codex, language));
+    codex.append(&opening);
+}
+
 impl Sandbox {
     /// Two agents join whatever window the learner is sitting in.
     ///
     /// Joining *their* window rather than a prepared one is the point: the room
     /// they can address peers in is the window they are already in, and
     /// watching the panes arrive is what makes "a pane is an agent" land.
-    fn add_agents(&self, session: &str, language: UiLanguage) -> Result<Fleet> {
+    fn add_agents(
+        &self,
+        session: &str,
+        before_split: &[String],
+        language: UiLanguage,
+    ) -> Result<Fleet> {
         // Resolved through the session rather than the attached client: a
         // learner who skipped their way here may not be attached to anything,
         // and the agents still have to land in a real window.
         let target = format!("{session}:");
-        let learner = self.tmux_command(&["display-message", "-p", "-t", &target, "#{pane_id}"])?;
         let window =
             self.tmux_command(&["display-message", "-p", "-t", &target, "#{window_id}"])?;
-        if learner.is_empty() || window.is_empty() {
+        if window.is_empty() {
             bail!("could not find a window to put the agents in");
+        }
+
+        // The pane the learner just split off becomes claude, and the one they
+        // were sitting in stays theirs. Watching an agent move into the pane
+        // *they* made is what turns "a pane is an agent" from a sentence into
+        // something they did.
+        let panes: Vec<String> = self
+            .tmux_command(&["list-panes", "-t", &window, "-F", "#{pane_id}"])?
+            .lines()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect();
+        let fresh = panes
+            .iter()
+            .find(|id| !before_split.contains(id))
+            .cloned()
+            .unwrap_or_default();
+        let learner = panes
+            .iter()
+            .find(|id| **id != fresh)
+            .cloned()
+            .unwrap_or_default();
+        if learner.is_empty() {
+            bail!("could not tell your pane from the one you split off");
         }
 
         let dir = std::env::temp_dir();
         let claude_screen = Transcript::new(&dir, "claude")?;
         let codex_screen = Transcript::new(&dir, "codex")?;
+        write_opening_screens(&claude_screen, &codex_screen, language);
 
-        let claude_prompt = tr(
-            language,
-            "harden the checkout auth path",
-            "checkout 인증 경로를 강화해줘",
-        );
-        let codex_prompt = tr(
-            language,
-            "review the public-read boundary",
-            "public-read 경계를 검토해줘",
-        );
-
-        let mut opening = header(Cli::ClaudeCode, language);
-        opening.extend(prompt_line(claude_prompt));
-        opening.extend(turn(
-            Cli::ClaudeCode,
-            tr(
-                language,
-                "I'll start with the token handling in auth.rs.",
-                "auth.rs의 토큰 처리부터 보겠습니다.",
-            ),
-            "",
-        ));
-        opening.extend(turn(
-            Cli::ClaudeCode,
-            "Read(crates/checkout/src/auth.rs)",
-            tr(language, "Read 42 lines", "42줄 읽음"),
-        ));
-        opening.extend(turn(
-            Cli::ClaudeCode,
-            "Search(pattern: \"bearer\")",
-            tr(language, "Found 12 matches", "12건 일치"),
-        ));
-        opening.push(working(language));
-        opening.push(String::new());
-        opening.extend(composer(Cli::ClaudeCode, language));
-        claude_screen.append(&opening);
-
-        let mut opening = header(Cli::Codex, language);
-        opening.extend(prompt_line(codex_prompt));
-        opening.extend(turn(
-            Cli::Codex,
-            "Read crates/api/src/public.rs",
-            tr(language, "3 routes listed", "route 3개 확인"),
-        ));
-        opening.push(working(language));
-        opening.push(String::new());
-        opening.extend(composer(Cli::Codex, language));
-        codex_screen.append(&opening);
+        let approved = dir.join("muxa-onboarding-approved.txt");
+        let declined = dir.join("muxa-onboarding-declined.txt");
+        std::fs::write(&approved, approved_block(language).join("\n") + "\n")?;
+        std::fs::write(&declined, declined_block(language).join("\n") + "\n")?;
 
         // A window is a Work, and in a real fleet it is named after one.
         self.tmux_command(&["rename-window", "-t", &window, "checkout"])?;
-        // Whatever they made at step 2 is a Work too — an unstaffed one.
-        // Left called `bash` the fleet looks half-built rather than like a
+        // Whatever they made at step 2 is a Work too — an unstaffed one. Left
+        // called `bash`, the fleet looks half-built rather than like a
         // workspace with a job nobody has picked up yet.
         for other in self
             .tmux_quiet(&["list-windows", "-a", "-F", "#{window_id}"])
@@ -1022,12 +1087,22 @@ impl Sandbox {
             let _ = self.tmux_command(&["rename-window", "-t", &other, "release-checks"]);
         }
 
-        let approved = dir.join("muxa-onboarding-approved.txt");
-        let declined = dir.join("muxa-onboarding-declined.txt");
-        std::fs::write(&approved, approved_block(language).join("\n") + "\n")?;
-        std::fs::write(&declined, declined_block(language).join("\n") + "\n")?;
-
-        let claude = self.split(&window, &claude_screen.pane_command())?;
+        // `respawn-pane` keeps the pane id, so the hook that registers claude
+        // still lands on the pane the learner is looking at.
+        let claude = if fresh.is_empty() {
+            self.split(&window, &claude_screen.pane_command())?
+        } else {
+            self.tmux_command(&[
+                "respawn-pane",
+                "-k",
+                "-c",
+                &self.project.to_string_lossy(),
+                "-t",
+                &fresh,
+                &claude_screen.pane_command(),
+            ])?;
+            fresh
+        };
         let codex = self.split(
             &window,
             &codex_screen.answerable_pane_command(&dir, &approved, &declined)?,
@@ -1145,14 +1220,22 @@ enum Detect {
     SessionCreated,
     /// That session has more than the window it started with.
     SecondWindow,
+    /// They opened the session tree and closed it again — one gesture.
+    TreeModeClosed,
     /// Nobody is attached — they detached, and the work kept running.
     NoClient,
+    /// They ran a command starting with this.
+    TypedCommand(&'static str),
     /// Somebody is attached again.
     ClientAttached,
+    /// Their window has more than the pane it started with.
+    PaneSplit,
     /// Some pane on the sandbox server is running this command.
     PaneRunning(&'static str),
     /// The active pane is the one `muxa attend` should have jumped to.
     ActivePaneIsCodex,
+    /// They came back to their own pane.
+    ActivePaneIsLearner,
     /// The learner sent a request.
     SentMessage,
     /// The learner claimed what was waiting for them.
@@ -1177,8 +1260,14 @@ struct Step {
 /// terminal attached to it. Zoom, copy mode and pane-navigation drills are
 /// deliberately absent: they are tmux trivia, and the pane concept lands in Act
 /// II when the agents themselves arrive as panes.
+/// Fourteen steps in two acts, one action each.
+///
+/// An earlier pass fit this into nine by putting two actions on some cues —
+/// "see both: Ctrl-b s · then leave: Ctrl-b d". That reads as one instruction
+/// and leaves the learner unsure which half registered, which is the opposite
+/// of what a confirmation line is for. Fewer steps is not the goal; knowing
+/// where you are is.
 const STEPS: &[Step] = &[
-    // ---- Act I: tmux ------------------------------------------------------
     Step {
         achieved_en: "ready — you are at a plain shell, outside tmux",
         achieved_ko: "준비 완료 — 지금은 tmux 밖의 평범한 셸입니다",
@@ -1189,7 +1278,7 @@ const STEPS: &[Step] = &[
         detect: Detect::SessionCreated,
     },
     Step {
-        achieved_en: "✓ session created, and you are inside it — this bar is tmux's",
+        achieved_en: "✓ session created, and you are inside it — these rows are tmux's",
         achieved_ko: "✓ session을 만들고 들어왔습니다 — 이 줄들이 tmux입니다",
         title_en: "One window is one Work. Make a second one.",
         title_ko: "window 하나가 Work 하나입니다. 두 번째를 만들어 보세요.",
@@ -1198,62 +1287,102 @@ const STEPS: &[Step] = &[
         detect: Detect::SecondWindow,
     },
     Step {
-        achieved_en: "✓ second window created — see both in the top row",
+        achieved_en: "✓ second window created — the top row lists both",
         achieved_ko: "✓ 두 번째 window가 생겼습니다 — 맨 윗줄에 둘 다 보입니다",
+        title_en: "The tree is the readable view of that: sessions, and the windows in them.",
+        title_ko: "그걸 제대로 보는 화면이 tree입니다: session과 그 안의 window들.",
+        cue_en: "press   Ctrl-b   then   s      ·   q closes it",
+        cue_ko: "Ctrl-b 를 눌렀다 떼고   s      ·   q 로 닫습니다",
+        detect: Detect::TreeModeClosed,
+    },
+    Step {
+        achieved_en: "✓ you saw both windows in the tree",
+        achieved_ko: "✓ tree에서 window 두 개를 확인했습니다",
         title_en: "Now leave. Detaching removes you, not the work.",
         title_ko: "이제 나가 보세요. detach는 당신만 빠지고 작업은 그대로입니다.",
-        cue_en: "see both:   Ctrl-b s      ·   then leave:   Ctrl-b d",
-        cue_ko: "둘 다 보기:   Ctrl-b s      ·   그다음 나가기:   Ctrl-b d",
+        cue_en: "press   Ctrl-b   then   d",
+        cue_ko: "Ctrl-b 를 눌렀다 떼고   d",
         detect: Detect::NoClient,
     },
     Step {
-        achieved_en: "✓ detached — you are back at your shell, and the session kept running",
-        achieved_ko: "✓ detach했습니다 — 셸로 돌아왔고, session은 계속 돌고 있습니다",
-        title_en: "Still listed, still running. That is the whole reason muxa lives in tmux.",
-        title_ko: "여전히 목록에 있고 여전히 돌고 있습니다. muxa가 tmux에 사는 이유입니다.",
-        cue_en: "check:   tmux ls      ·   then:   tmux attach -t muxa-onboarding",
-        cue_ko: "확인:   tmux ls      ·   그다음:   tmux attach -t muxa-onboarding",
+        achieved_en: "✓ detached — you are back at your own shell",
+        achieved_ko: "✓ detach했습니다 — 당신의 셸로 돌아왔습니다",
+        title_en: "The session is still there. Ask tmux yourself.",
+        title_ko: "session은 여전히 있습니다. tmux에게 직접 물어보세요.",
+        cue_en: "type:   tmux ls",
+        cue_ko: "입력:   tmux ls",
+        detect: Detect::TypedCommand("tmux ls"),
+    },
+    Step {
+        achieved_en: "✓ still listed, still running — that is the whole reason muxa lives in tmux",
+        achieved_ko: "✓ 여전히 목록에 있고 여전히 돌고 있습니다 — muxa가 tmux에 사는 이유입니다",
+        title_en: "So going back is just attaching to it again.",
+        title_ko: "그러니 돌아가는 건 다시 붙기만 하면 됩니다.",
+        cue_en: "type:   tmux attach -t muxa-onboarding",
+        cue_ko: "입력:   tmux attach -t muxa-onboarding",
         detect: Detect::ClientAttached,
     },
-    // ---- Act II: muxa -----------------------------------------------------
     Step {
-        achieved_en: "✓ attached again — every window and pane exactly as you left it",
+        achieved_en: "✓ back in, with every window and pane as you left it",
         achieved_ko: "✓ 다시 들어왔습니다 — window도 pane도 떠날 때 그대로입니다",
-        title_en: "This window is the `checkout` Work now, with two agents in it. A pane is an agent.",
-        title_ko:
-            "이 window가 이제 `checkout` Work이고, 안에 agent가 둘 있습니다. pane 하나가 agent 하나입니다.",
-        cue_en: "run:   muxa watch             ·   q leaves it",
-        cue_ko: "입력:   muxa watch             ·   q로 나갑니다",
+        title_en: "A pane is an agent. Split this window and one will move in.",
+        title_ko: "pane 하나가 agent 하나입니다. 이 window를 나누면 거기에 agent가 들어옵니다.",
+        cue_en: "press   Ctrl-b   then   %      ·   \" splits top and bottom instead",
+        cue_ko: "Ctrl-b 를 눌렀다 떼고   %      ·   \" 는 상하로 나눕니다",
+        detect: Detect::PaneSplit,
+    },
+    Step {
+        achieved_en: "✓ the pane you just made is claude, and codex joined beside it",
+        achieved_ko: "✓ 방금 만든 pane이 claude가 됐고, 옆에 codex도 합류했습니다",
+        title_en: "This window is the `checkout` Work now. See all of it at once.",
+        title_ko: "이 window가 이제 `checkout` Work입니다. 전체를 한 번에 보세요.",
+        cue_en: "run:   muxa watch            ·   q leaves it",
+        cue_ko: "입력:   muxa watch            ·   q 로 나갑니다",
         detect: Detect::PaneRunning("muxa"),
     },
     Step {
-        achieved_en: "✓ watch showed the whole window at once — and codex just stopped",
-        achieved_ko: "✓ watch가 window 전체를 한 번에 보여줬습니다 — 그리고 codex가 방금 멈췄습니다",
-        title_en: "codex stopped and needs you. `attend` jumps to whichever agent has been blocked longest — you land in codex's pane.",
-        title_ko: "codex가 멈춰서 당신이 필요합니다. `attend`는 가장 오래 막힌 agent로 이동합니다 — codex의 pane에 도착합니다.",
-        cue_en: "leave watch with q, then run:   muxa attend",
-        cue_ko: "q로 watch를 나간 뒤 입력:   muxa attend",
+        achieved_en: "✓ watch showed the whole Work — and codex just stopped, waiting on you",
+        achieved_ko: "✓ watch가 Work 전체를 보여줬습니다 — 그리고 codex가 멈춰서 당신을 기다립니다",
+        title_en: "`attend` goes to whichever agent has been blocked longest — codex, here.",
+        title_ko: "`attend`는 가장 오래 막힌 agent로 갑니다 — 여기서는 codex입니다.",
+        cue_en: "run:   muxa attend",
+        cue_ko: "입력:   muxa attend",
         detect: Detect::ActivePaneIsCodex,
     },
     Step {
-        // attend left them sitting in codex's pane, which has no shell to
-        // type into. Getting back is a real tmux key, so the step teaches it
-        // rather than having the tour move the cursor on their behalf.
-        achieved_en: "✓ attend moved you to codex, the agent blocked longest",
-        achieved_ko: "✓ attend가 가장 오래 막힌 agent인 codex로 데려왔습니다",
-        title_en: "You are in codex's pane — press y to approve it if you like. `Ctrl-b ;` returns to the last pane you were in, which is your own shell.",
-        title_ko: "지금 codex의 pane입니다 — 원하면 y로 승인해 보세요. `Ctrl-b ;`는 직전에 있던 pane, 즉 당신의 셸로 돌아갑니다.",
-        cue_en: "back:   Ctrl-b ;   (or Ctrl-b o to cycle)   ·   then:   muxa msg send @claude \"how far along?\"",
-        cue_ko: "돌아가기:   Ctrl-b ;   (Ctrl-b o 로 순환)   ·   그다음:   muxa msg send @claude \"어디까지 됐나요?\"",
+        achieved_en: "✓ attend moved you into codex's pane — press y to approve it if you like",
+        achieved_ko: "✓ attend가 codex의 pane으로 데려왔습니다 — 원하면 y로 승인해 보세요",
+        title_en: "This pane has no shell of yours. `Ctrl-b ;` returns to the pane you were in.",
+        title_ko: "이 pane에는 당신의 셸이 없습니다. `Ctrl-b ;`는 직전에 있던 pane으로 돌아갑니다.",
+        cue_en: "press   Ctrl-b   then   ;      ·   Ctrl-b o cycles instead",
+        cue_ko: "Ctrl-b 를 눌렀다 떼고   ;      ·   Ctrl-b o 는 순서대로 순환합니다",
+        detect: Detect::ActivePaneIsLearner,
+    },
+    Step {
+        achieved_en: "✓ back in your own pane",
+        achieved_ko: "✓ 당신의 pane으로 돌아왔습니다",
+        title_en: "You can ask an agent something without attaching to it.",
+        title_ko: "attach하지 않고도 agent에게 물어볼 수 있습니다.",
+        cue_en: "run:   muxa msg send @claude \"how far along?\"",
+        cue_ko: "입력:   muxa msg send @claude \"어디까지 됐나요?\"",
         detect: Detect::SentMessage,
     },
     Step {
-        achieved_en: "✓ your question reached claude and it answered — and codex asked you something",
-        achieved_ko: "✓ 질문이 claude에게 닿았고 답이 왔습니다 — 그리고 codex가 당신에게 물어왔습니다",
-        title_en: "claude answered into your mailbox. `list` shows what you sent; `inbox` claims what was sent to you — codex just asked you something.",
-        title_ko: "claude가 mailbox로 답했습니다. `list`는 보낸 것, `inbox`는 받은 것을 가져옵니다 — codex가 방금 물어왔습니다.",
-        cue_en: "claude's answer:   muxa msg list      ·   codex's request:   muxa msg inbox",
-        cue_ko: "claude의 답장:   muxa msg list      ·   codex의 요청:   muxa msg inbox",
+        achieved_en: "✓ the message reached claude, and it answered into your mailbox",
+        achieved_ko: "✓ 메시지가 claude에게 닿았고, mailbox로 답이 왔습니다",
+        title_en: "`list` shows what you sent, and what came back.",
+        title_ko: "`list`는 보낸 것과 돌아온 답을 보여줍니다.",
+        cue_en: "run:   muxa msg list",
+        cue_ko: "입력:   muxa msg list",
+        detect: Detect::TypedCommand("muxa msg list"),
+    },
+    Step {
+        achieved_en: "✓ you read claude's reply — and codex has asked you something of its own",
+        achieved_ko: "✓ claude의 답장을 봤습니다 — 그리고 codex가 당신에게 물어왔습니다",
+        title_en: "`inbox` claims what was sent *to* you. Agents use muxa too.",
+        title_ko: "`inbox`는 당신에게 **온** 요청을 가져옵니다. agent도 muxa를 씁니다.",
+        cue_en: "run:   muxa msg inbox",
+        cue_ko: "입력:   muxa msg inbox",
         detect: Detect::ClaimedInbox,
     },
     Step {
@@ -1261,14 +1390,14 @@ const STEPS: &[Step] = &[
         achieved_ko: "✓ codex의 요청을 확인했습니다 — mailbox는 당신이 처리하는 곳입니다",
         title_en: "session is a workspace · window is a work · pane is an agent",
         title_ko: "session은 workspace · window는 work · pane은 agent",
-        cue_en: "press   Ctrl-b   then   d       ·   finishes and deletes the sandbox",
-        cue_ko: "Ctrl-b 를 눌렀다 떼고   d       ·   마치고 sandbox를 지웁니다",
+        cue_en: "press   Ctrl-b   then   d      ·   finishes and deletes the sandbox",
+        cue_ko: "Ctrl-b 를 눌렀다 떼고   d      ·   마치고 sandbox를 지웁니다",
         detect: Detect::NoClient,
     },
 ];
-
-/// The step Act II begins at, and so the point the agents arrive.
-const ACT_TWO_START: usize = 4;
+/// The step whose completion brings the agents in: the learner has just
+/// split a pane, and that pane becomes claude.
+const AGENTS_ARRIVE: usize = 7;
 
 // ---------------------------------------------------------------------------
 // Run
@@ -1279,6 +1408,10 @@ struct Tour<'a> {
     /// Mutable: `F2` switches it mid-tour, the way the simulation's footer did.
     language: UiLanguage,
     fleet: Option<Fleet>,
+    /// The tree opens and closes; the step is the whole gesture.
+    saw_tree: bool,
+    /// Panes present before the learner split, so the new one is identifiable.
+    before_split: Vec<String>,
     /// `--no-quiz` does not remove the steps — there is nothing to remove, the
     /// tour is the real thing — so it offers the way past from the start
     /// instead of after a wait.
@@ -1303,7 +1436,7 @@ impl Tour<'_> {
             .collect()
     }
 
-    fn satisfied(&self, detect: &Detect) -> bool {
+    fn satisfied(&mut self, detect: &Detect) -> bool {
         match detect {
             Detect::SessionCreated => !self.own_sessions().is_empty(),
             Detect::SecondWindow => {
@@ -1315,8 +1448,33 @@ impl Tour<'_> {
                     .count()
                     >= 2
             }
+            // Opened *and* closed: one gesture, so one step.
+            Detect::TreeModeClosed => {
+                // Across every pane, not `display-message` on "the current"
+                // one: run from outside a client that resolves to whichever
+                // pane tmux feels like, which is rarely the one the learner is
+                // looking at.
+                let in_tree = self
+                    .sandbox
+                    .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_mode}"])
+                    .contains("tree");
+                if in_tree {
+                    self.saw_tree = true;
+                    return false;
+                }
+                self.saw_tree
+            }
             Detect::NoClient => self.clients().is_empty(),
+            Detect::TypedCommand(prefix) => self.sandbox.ran_command(prefix),
             Detect::ClientAttached => !self.clients().is_empty(),
+            Detect::PaneSplit => {
+                self.sandbox
+                    .tmux_quiet(&["list-panes", "-F", "#{pane_id}"])
+                    .lines()
+                    .filter(|id| !id.is_empty())
+                    .count()
+                    >= 2
+            }
             Detect::PaneRunning(command) => self
                 .sandbox
                 .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
@@ -1326,6 +1484,11 @@ impl Tour<'_> {
                 self.sandbox
                     .tmux_quiet(&["display-message", "-p", "#{pane_id}"])
                     == fleet.codex
+            }),
+            Detect::ActivePaneIsLearner => self.fleet.as_ref().is_some_and(|fleet| {
+                self.sandbox
+                    .tmux_quiet(&["display-message", "-p", "#{pane_id}"])
+                    == fleet.learner
             }),
             Detect::SentMessage => self.fleet.as_ref().is_some_and(|fleet| {
                 self.sandbox
@@ -1350,9 +1513,8 @@ impl Tour<'_> {
 
     /// What a skipped step would have done to the world.
     ///
-    /// Skipping has to leave the tour consistent, not just further along: Act II
-    /// cannot introduce agents into a session that was never created. Anything
-    /// the learner would have done that the tour can do for them, it does.
+    /// Skipping has to leave the tour consistent, not just further along: the
+    /// agents cannot move into a pane that was never split.
     fn perform(&self, index: usize) {
         match index {
             0 => {
@@ -1377,8 +1539,15 @@ impl Tour<'_> {
                     ]);
                 }
             }
-            // The rest are either about where the learner is looking, which the
-            // tour will not fake, or about state it has already produced.
+            6 => {
+                if let Some(session) = self.own_sessions().first() {
+                    let _ =
+                        self.sandbox
+                            .tmux_command(&["split-window", "-t", &format!("{session}:")]);
+                }
+            }
+            // The rest are about where the learner is looking, which the tour
+            // will not fake, or about state it has already produced.
             _ => {}
         }
     }
@@ -1387,7 +1556,7 @@ impl Tour<'_> {
     /// response to the learner.
     fn on_enter(&mut self, index: usize) -> Result<()> {
         // The placeholder only had to keep the server alive until the learner
-        // made a session of their own. Step 3 asks them to run `tmux ls`, and a
+        // made a session of their own. Step 5 asks them to run `tmux ls`, and a
         // mysterious `_sandbox` in that output is the tour's own plumbing
         // showing through the lesson.
         if index == 1 {
@@ -1396,20 +1565,34 @@ impl Tour<'_> {
                 let _ = self.sandbox.tmux_command(&["kill-session", "-t", &holder]);
             }
         }
-        if index == ACT_TWO_START {
+        // Their pane, recorded before the split so the new one can be told
+        // apart from it afterwards.
+        if index == AGENTS_ARRIVE - 1 {
+            self.before_split = self
+                .sandbox
+                .tmux_quiet(&["list-panes", "-F", "#{pane_id}"])
+                .lines()
+                .map(str::to_string)
+                .collect();
+        }
+        if index == AGENTS_ARRIVE {
             let session = self
                 .own_sessions()
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "muxa-onboarding".to_string());
-            self.fleet = Some(self.sandbox.add_agents(&session, self.language)?);
+            self.fleet = Some(self.sandbox.add_agents(
+                &session,
+                &self.before_split,
+                self.language,
+            )?);
             return Ok(());
         }
         let Some(fleet) = self.fleet.as_ref() else {
             return Ok(());
         };
         match index {
-            5 => {
+            8 => {
                 // The row in watch flips to `waiting` because of the hook; the
                 // pane has to show *why*, or the state is a claim rather than
                 // something the learner can see for themselves.
@@ -1421,26 +1604,26 @@ impl Tour<'_> {
                     r#"{"session_id":"onboarding-codex","tool_name":"shell"}"#,
                 )
             }
-            7 => {
-                let body = tr(
-                    self.language,
-                    "the public-read boundary needs a decision before I continue",
-                    "public-read 경계는 계속하기 전에 결정이 필요합니다",
-                );
-                // Both beats land here, on the step *after* the one that asks
-                // for the message: claude answering before being asked read as
-                // the tour talking to itself.
+            11 => {
                 fleet
                     .claude_screen
                     .append(&incoming_question(self.language));
                 // And claude answers through muxa, not only on its own screen.
                 self.sandbox.reply_as_claude(fleet, self.language);
+                Ok(())
+            }
+            12 => {
+                let body = tr(
+                    self.language,
+                    "the public-read boundary needs a decision before I continue",
+                    "public-read 경계는 계속하기 전에 결정이 필요합니다",
+                );
                 fleet.codex_screen.append(&outgoing_request(self.language));
                 self.sandbox
                     .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
                     .map(|_| ())
             }
-            8 => {
+            13 => {
                 fleet.claude_screen.append(&finished(self.language));
                 Ok(())
             }
@@ -1596,6 +1779,8 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
             sandbox: &sandbox,
             language,
             fleet: None,
+            saw_tree: false,
+            before_split: Vec::new(),
             no_quiz,
         };
         tour.drive()?
