@@ -37,6 +37,7 @@ child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로
 | `Enter` | 선택한 pane에 바로 attach. |
 | `n` | workspace session과 work window를 생성/재사용하고 agent pane 추가. |
 | `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
+| `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
 | `m` / `M` | 선택한 agent에게 request 보내기 / incoming·sent mailbox 열기. |
@@ -239,6 +240,14 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s`가 관측과 협업의 기본 진입점입니다. `prefix+D`는 더 상세한 Dashboard를
 바로 여는 선택 단축키입니다.
 
+## 안정적인 tmux 이름
+
+`muxa init`은 `tmux-window-names` 컴포넌트를 기본으로 켭니다. tmux의 process 기반
+`automatic-rename`을 꺼서 Work window가 `node`나 `claude`로 덮어써지지 않게 하고,
+익숙한 `prefix + ,` prompt를 `muxa window rename`으로 연결합니다. window 이름의
+공백은 `-`로 정규화하며 같은 session 안의 중복 이름은 거부합니다. 특정 window만
+동적 이름으로 되돌리려면 `muxa window rename --auto`를 실행합니다.
+
 ## 한 workspace를 터미널 두 개로 보기
 
 tmux session은 current window를 하나만 가지며, attach된 모든 client가 그 window를
@@ -251,9 +260,12 @@ current window를 따로 가집니다.
 client에게 자기 view를 주는 훅 두 개를 겁니다.
 
 ```tmux
-set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
-set-hook -g client-session-changed "…같은 내용…"
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-session-changed[9000]' "…같은 내용…"
 ```
+
+전용 hook array slot을 쓰므로 config를 다시 source해도 중복되지 않고, 사용자가 같은
+이벤트에 설치한 다른 hook도 덮어쓰지 않습니다.
 
 **훅이 두 개여야 합니다.** `client-attached`는 `tmux attach`로 붙는 터미널을,
 `client-session-changed`는 `switch-client`를 덮습니다 — 후자가 watch의 `Enter`가

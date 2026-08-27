@@ -58,6 +58,7 @@ children keep their aggregate state markers.
 | `Enter` | Attach to the selected pane. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
 | `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
+| `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
 | `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
@@ -296,6 +297,15 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 `prefix+s` is the normal watch and collaboration entry point. `prefix+D` is an
 optional shortcut to the richer Dashboard.
 
+## Stable tmux Names
+
+`muxa init` enables the `tmux-window-names` component by default. It turns off
+tmux's process-based `automatic-rename`, so a Work window keeps its useful name
+instead of becoming `node` or `claude`, and routes the familiar `prefix + ,`
+prompt through `muxa window rename`. Window whitespace is normalized to `-`
+and duplicate names in one session are refused. Restore dynamic naming for one
+window with `muxa window rename --auto`.
+
 ## Two Terminals on One Workspace
 
 One tmux session has one current window, and every client attached to it shows
@@ -309,9 +319,12 @@ its own current window.
 sets two hooks that hand an arriving client its own view:
 
 ```tmux
-set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
-set-hook -g client-session-changed "…same…"
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-session-changed[9000]' "…same…"
 ```
+
+The dedicated hook-array slot keeps reloading idempotent and leaves unrelated
+user hooks in their own slots intact.
 
 **Both hooks are needed.** `client-attached` covers a terminal running `tmux
 attach`. `client-session-changed` covers `switch-client` — which is what

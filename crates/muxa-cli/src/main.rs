@@ -3075,7 +3075,7 @@ mod tests {
     }
 
     #[test]
-    fn window_rename_cli_supports_explicit_and_automatic_names() {
+    fn window_rename_cli_supports_explicit_automatic_and_buffered_names() {
         let args = Args::try_parse_from([
             "muxa",
             "window",
@@ -3093,6 +3093,7 @@ mod tests {
             panic!("expected window rename");
         };
         assert_eq!(rename.name.as_deref(), Some("CAL-7175 auth refactor"));
+        assert!(rename.buffer.is_none());
         assert_eq!(rename.window.as_deref(), Some("@42"));
         assert!(!rename.auto);
         assert!(rename.json);
@@ -3109,6 +3110,25 @@ mod tests {
             "muxa", "window", "rename", "name", "--window", "@42", "--auto"
         ])
         .is_err());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "window",
+            "rename",
+            "--window",
+            "@42",
+            "--buffer",
+            "muxa-window-name-123",
+        ])
+        .unwrap();
+        let Cmd::Window {
+            action: WindowCmd::Rename(rename),
+        } = args.cmd
+        else {
+            panic!("expected buffered window rename");
+        };
+        assert_eq!(rename.buffer.as_deref(), Some("muxa-window-name-123"));
+        assert!(rename.name.is_none());
     }
 
     #[test]

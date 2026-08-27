@@ -1692,7 +1692,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach via active window/pane or exact pane",
-        "  n / w / R      new pane / work up a pipeline / rename the row",
+        "  n / w / R      new window/pane / work up / rename the row",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -7214,9 +7214,16 @@ pub async fn run(
                     app.work_composer = Some(WorkComposer::default());
                 }
                 Action::SubmitRename => {
-                    if let Some(rename) = app.rename.take() {
-                        match apply_rename(&rename) {
-                            Ok(message) => app.set_hint(message, HintLevel::Ok),
+                    let result = app.rename.as_ref().map(apply_rename);
+                    if let Some(result) = result {
+                        match result {
+                            Ok(message) => {
+                                app.rename = None;
+                                app.set_hint(message, HintLevel::Ok);
+                            }
+                            // Keep the form and its input open so a duplicate,
+                            // invalid value, or transient tmux failure can be
+                            // corrected instead of making the user retype it.
                             Err(e) => app.set_hint(format!("rename failed: {e}"), HintLevel::Err),
                         }
                     }
@@ -9253,6 +9260,36 @@ fn window_name_taken(listing: &str, window_id: &str, name: &str) -> bool {
     })
 }
 
+/// Session names and pane titles are labels, not Work window ids. Preserve
+/// their internal whitespace; applying the window policy here would turn a
+/// pane title such as `Claude review` into `Claude-review` as a side effect of
+/// changing one character.
+fn rename_label(raw: &str, level: RenameLevel) -> std::result::Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("{} cannot be empty", level.label()));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "{} cannot contain control characters",
+            level.label()
+        ));
+    }
+    if value.len() > 64 {
+        return Err(format!("{} is too long (max 64 bytes)", level.label()));
+    }
+    if value.contains("#{") || value.contains("#(") {
+        return Err(format!(
+            "{} cannot contain tmux format expansions",
+            level.label()
+        ));
+    }
+    if level == RenameLevel::Session && value.chars().any(|ch| matches!(ch, '.' | ':')) {
+        return Err("session name cannot contain '.' or ':'".into());
+    }
+    Ok(value.to_string())
+}
+
 /// Apply a rename to tmux. Returns the message to show on success.
 ///
 /// Sessions and windows have real names; a pane does not, so `RenameLevel::Pane`
@@ -9260,7 +9297,12 @@ fn window_name_taken(listing: &str, window_id: &str, name: &str) -> bool {
 /// only per-pane label tmux persists.
 fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> {
     let socket = Some(rename.key.endpoint().socket.as_str());
-    let name = crate::tmux_work::normalize_window_name(&rename.input).map_err(|e| e.to_string())?;
+    let name = match rename.level {
+        RenameLevel::Window => {
+            crate::tmux_work::normalize_window_name(&rename.input).map_err(|e| e.to_string())?
+        }
+        RenameLevel::Session | RenameLevel::Pane => rename_label(&rename.input, rename.level)?,
+    };
     let run = |args: &[&str]| -> std::result::Result<(), String> {
         muxa::tmux::run_control_on(socket, args).map_err(|e| e.to_string())
     };
@@ -23541,6 +23583,26 @@ sort = ["state"]
     }
 
     #[test]
+    fn rename_rules_preserve_label_spaces_but_normalize_window_spaces() {
+        assert_eq!(
+            rename_label(" Claude review updated ", RenameLevel::Pane).unwrap(),
+            "Claude review updated"
+        );
+        assert_eq!(
+            rename_label("two terminals", RenameLevel::Session).unwrap(),
+            "two terminals"
+        );
+        assert_eq!(
+            crate::tmux_work::normalize_window_name("CAL-1 review").unwrap(),
+            "CAL-1-review"
+        );
+        assert!(rename_label("bad:name", RenameLevel::Session).is_err());
+        assert!(rename_label("bad\ntitle", RenameLevel::Pane).is_err());
+        assert!(rename_label("#{session_name}", RenameLevel::Pane).is_err());
+        assert!(rename_label(&"a".repeat(65), RenameLevel::Pane).is_err());
+    }
+
+    #[test]
     fn kill_action_disabled_for_paneless_row() {
         let mut app = app_with_paneless_and_pane();
         // Find the paneless row by walking the rows — sort may have
@@ -23811,7 +23873,7 @@ sort = ["state"]
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
-        assert!(body.contains("n / w / R      new pane / work up a pipeline / rename the row"));
+        assert!(body.contains("n / w / R      new window/pane / work up / rename the row"));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.

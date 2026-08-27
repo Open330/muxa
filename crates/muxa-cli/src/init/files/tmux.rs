@@ -86,14 +86,18 @@ bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
 /// tty path with no spaces, so it needs no quoting, and `muxa workspace view`
 /// resolves the session and the pid from the client itself.
 ///
+/// The fixed array index makes re-sourcing idempotent without replacing a
+/// user's existing hook at index 0. tmux hooks are arrays; an unindexed
+/// `set-hook -g client-attached ...` silently overwrites that first entry.
+///
 /// Per-session opt-out, for when two terminals *should* mirror each other
 /// (pairing, screen sharing): `tmux set-option -t <session> @no_auto_view 1`.
 pub const AUTO_VIEW_BODY: &str = r#"# Each terminal on a workspace gets its own current window, via a session
 # group. Both hooks are needed: attach covers `tmux attach`, session-changed
 # covers `switch-client` — which is what `muxa watch`'s Enter does.
 # Mirror two terminals instead: tmux set-option -t <session> @no_auto_view 1
-set-hook -g client-attached "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
-set-hook -g client-session-changed "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'""#;
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-session-changed[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'""#;
 
 /// The body that goes inside the `tmux-window-names` marker block.
 ///
@@ -107,10 +111,15 @@ set-hook -g client-session-changed "if -F '#{&&:#{>:#{session_attached},1},#{==:
 /// `prefix + ,` keeps tmux's muscle memory but routes through muxa: whitespace
 /// normalizes to `-`, and a name already used in that session is refused,
 /// because tmux matches `session:window` targets by prefix and a duplicate
-/// silently addresses the wrong window. `#{window_id}` is expanded by
-/// `run-shell`, and `%%` by `command-prompt`; `-I "#W"` prefills the name so
-/// the prompt is an edit rather than a retype. Measured end to end on tmux 3.4
-/// by driving a real client's tty.
+/// silently addresses the wrong window. `-I "#W"` prefills the name so the
+/// prompt is an edit rather than a retype. Its response is first stored in a
+/// per-client tmux buffer (`%%%` escapes quotes for tmux's parser); the fixed
+/// shell command carries only native ids and the buffer name, never the user
+/// text. The CLI consumes and deletes the buffer before renaming, while the
+/// fixed shell cleanup also removes it if muxa cannot start. `run-shell` stays
+/// synchronous so it cannot race the preceding `set-buffer`. Measured end to
+/// end on tmux 3.4 by driving a real client's tty, including shell syntax in
+/// the submitted name.
 ///
 /// One window can opt back into tmux's dynamic name with
 /// `muxa window rename --auto`.
@@ -118,7 +127,7 @@ pub const WINDOW_NAMES_BODY: &str = r##"# muxa owns window names: a window is a 
 # `muxa window rename --auto` opts one window back into tmux's dynamic name.
 set-window-option -g automatic-rename off
 # prefix + , renames through muxa: whitespace to `-`, duplicates refused.
-bind-key , command-prompt -I "#W" "run-shell \"muxa window rename --window '#{window_id}' -- '%%'\""##;
+bind-key , command-prompt -F -I "#W" "set-buffer -b 'muxa-window-name-#{client_pid}' -- \"%%%\" ; run-shell \"muxa window rename --window '#{window_id}' --buffer 'muxa-window-name-#{client_pid}'; tmux delete-buffer -b 'muxa-window-name-#{client_pid}' 2>/dev/null || true\"""##;
 
 /// The body that goes inside the `tmux-statusline` marker block.
 ///
@@ -255,6 +264,30 @@ mod tests {
         let (after3, o3) = remove(&after2, Component::TmuxPeek);
         assert_eq!(o3, Outcome::Removed);
         assert!(!after3.contains("muxa peek"));
+    }
+
+    #[test]
+    fn auto_view_uses_owned_hook_slots_without_clobbering_user_hooks() {
+        let (after, outcome) = upsert("", Component::TmuxAutoView);
+        assert_eq!(outcome, Outcome::Inserted);
+        assert!(after.contains("client-attached[9000]"));
+        assert!(after.contains("client-session-changed[9000]"));
+        assert!(!after.contains("set-hook -g client-attached \""));
+
+        let (after2, outcome2) = upsert(&after, Component::TmuxAutoView);
+        assert_eq!(outcome2, Outcome::Unchanged);
+        assert_eq!(after2, after);
+    }
+
+    #[test]
+    fn window_rename_prompt_keeps_user_text_out_of_the_shell() {
+        let (after, outcome) = upsert("", Component::TmuxWindowNames);
+        assert_eq!(outcome, Outcome::Inserted);
+        assert!(after.contains("set-buffer -b 'muxa-window-name-#{client_pid}' -- \\\"%%%\\\""));
+        assert!(after.contains("--buffer 'muxa-window-name-#{client_pid}'"));
+        assert!(after.contains("; tmux delete-buffer -b 'muxa-window-name-#{client_pid}'"));
+        assert!(!after.contains("run-shell -b"));
+        assert!(!after.contains("-- '%%"));
     }
 
     #[test]
