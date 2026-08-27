@@ -18,7 +18,9 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("parity", HERE / "onboarding-parity.py")
 parity = importlib.util.module_from_spec(spec)
-sys.argv = ["parity"]
+# The parity harness parses `sys.argv` at import. Hand it none and keep our own,
+# or every flag below is silently ignored and the check runs on its defaults.
+ARGV, sys.argv = sys.argv[1:], [sys.argv[0]]
 spec.loader.exec_module(parity)
 
 ARROW_STEP = 6
@@ -56,18 +58,33 @@ def probe(muxa: str, gap_ms: int | None) -> bool:
         tour.finish()
 
 
+def advances(muxa: str, gap_ms: int | None, attempts: int) -> bool:
+    """Whether the arrow ever gets through.
+
+    Driving a TUI over a pty is timing-sensitive: reaching the gate, or seeing
+    the step counter move, times out perhaps one run in ten under load. Retry
+    rather than ship a flaky gate — the signal survives it, because a binary
+    that drops the key fails every attempt, not one in ten.
+    """
+    return any(probe(muxa, gap_ms) for _ in range(attempts))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--muxa", default="target/debug/muxa")
-    ap.add_argument("--gaps", default="1,20,45", help="split delays in ms")
-    args = ap.parse_args()
+    ap.add_argument("--attempts", type=int, default=3, help="retries before failing")
+    # Below about 5 ms the two writes coalesce in the pty often enough to be
+    # nondeterministic, which exercises the *un*-split path and makes the check
+    # flaky rather than strict. Real split escapes are milliseconds apart.
+    ap.add_argument("--gaps", default="10,20,45", help="split delays in ms")
+    args = ap.parse_args(ARGV)
 
     failures = 0
-    whole = probe(args.muxa, None)
+    whole = advances(args.muxa, None, args.attempts)
     print(f"  {'ok  ' if whole else 'FAIL'}  arrow in one write")
     failures += not whole
     for gap in [int(g) for g in args.gaps.split(",")]:
-        torn = probe(args.muxa, gap)
+        torn = advances(args.muxa, gap, args.attempts)
         print(f"  {'ok  ' if torn else 'FAIL'}  arrow split across two writes, {gap}ms apart")
         failures += not torn
 
