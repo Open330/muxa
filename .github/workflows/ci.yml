@@ -64,7 +64,7 @@ jobs:
       - run: cargo build -p muxa-cli --bin muxa
       - run: shellcheck scripts/onboard.sh
       # The shell fallback in onboard.sh must teach the same keys as the real
-      # tour; `muxa onboard --emit-step-table` is the contract it is held to.
+      # tour; `muxa onboard --emit step-table` is the contract it is held to.
       - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa
       - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa --lang ko
 
