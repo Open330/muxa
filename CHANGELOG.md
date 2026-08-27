@@ -55,7 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Allocation runs under a per-room file lock, because the claim is a
   read-modify-write over a shared namespace and tmux user options have no
   compare-and-set — re-checking after the write cannot close that, since the
-  pane writing second can finish its check before the first write lands.
+  pane writing second can finish its check before the first write lands. The
+  claim itself goes through `set-option -o`, so a pipeline's explicit alias
+  wins whichever side of it the minting lands on.
 
 ### Changed
 

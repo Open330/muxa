@@ -888,8 +888,37 @@ pub fn ensure_default_alias(pane: &str, base: &str) -> Result<Option<String>> {
     let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
         return Ok(None);
     };
-    set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
-    Ok(Some(alias))
+    claim_alias(pane, &alias)
+}
+
+/// Write a minted handle onto `pane`, but only if nothing has named it.
+///
+/// The room lock keeps two *different* panes from claiming one name; it says
+/// nothing about this pane, because the other writer is not an allocator.
+/// `agent_launch::start` launches the agent — which fires its session-start
+/// hook immediately — and only then stamps the pipeline's explicit alias, so
+/// a hook that read "unnamed" before that stamp landed would overwrite a
+/// `review` with a `claude`.
+///
+/// `set-option -o` refuses an option that is already set, which resolves both
+/// orders in the pipeline's favour without either side coordinating: an
+/// explicit alias that lands first makes this claim a no-op, and one that
+/// lands second overwrites the claim with a plain set. `-q` keeps tmux's
+/// "already set" message off the agent's stderr; the refusal still stands, so
+/// the pane option itself is the answer, and re-reading it beats inspecting
+/// an exit code whose shape is tmux's business.
+fn claim_alias(pane: &str, alias: &str) -> Result<Option<String>> {
+    tmux_status(&[
+        "set-option",
+        "-p",
+        "-o",
+        "-q",
+        "-t",
+        pane,
+        AGENT_ALIAS_OPTION,
+        alias,
+    ])?;
+    Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.filter(|held| held == alias))
 }
 
 /// Exclusive hold on one room's handle namespace.
