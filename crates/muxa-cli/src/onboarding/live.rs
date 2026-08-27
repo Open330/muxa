@@ -25,6 +25,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +39,7 @@ use super::{tr, UiLanguage};
 /// `scripts/sandbox-smoke.sh`.
 const SANDBOX_SCRIPT: &str = include_str!("../../../../scripts/muxa-sandbox.sh");
 
-const SANDBOX_NAME: &str = "muxa-onboarding";
+const SANDBOX_NAME_PREFIX: &str = "muxa-onboarding";
 const POLL: Duration = Duration::from_millis(250);
 
 /// Long enough that nobody reading the screen feels rushed, short enough that
@@ -85,8 +86,9 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// handler keeps the workspace's `unsafe_code = "forbid"` intact; the teardown
 /// itself happens on the main thread once the poll loop sees the flag.
 ///
-/// SIGKILL cannot be caught. The next `up` clears whatever it leaves behind,
-/// and `muxa-sandbox.sh status --name muxa-onboarding` names it meanwhile.
+/// SIGKILL cannot be caught. Each run has a PID-scoped directory and sandbox,
+/// so even an unclean exit cannot make a later or concurrent tour adopt its
+/// daemon, tmux server, command history, or scripted-agent transcripts.
 fn trap_signals() {
     std::thread::spawn(|| {
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -123,6 +125,8 @@ fn trap_signals() {
 /// including on a panic, which is the path that would otherwise leave a daemon
 /// and a tmux server behind on someone's machine.
 struct Sandbox {
+    name: String,
+    dir: PathBuf,
     script: PathBuf,
     config: PathBuf,
     rcfile: PathBuf,
@@ -147,26 +151,20 @@ struct Sandbox {
 
 impl Sandbox {
     fn create() -> Result<Self> {
-        let dir = std::env::temp_dir();
-        let script = dir.join("muxa-onboarding-sandbox.sh");
-        let config = dir.join("muxa-onboarding.src.toml");
-        let rcfile = dir.join("muxa-onboarding.bashrc");
-        let cue = dir.join("muxa-onboarding.cue");
-        let history = dir.join("muxa-onboarding.history");
-        let home = dir.join("muxa-onboarding-home");
-        let project = home.join("checkout-service");
-        write_executable(&script, SANDBOX_SCRIPT).context("staging the sandbox script")?;
-        std::fs::write(&config, SANDBOX_CONFIG).context("staging the sandbox config")?;
-        // The shell appends to this. A run that died before its teardown — a
-        // crash, a SIGKILL — leaves commands behind that would satisfy this
-        // run's steps before the learner has typed anything.
-        std::fs::write(&history, "").context("clearing the command log")?;
-        write_workspace(&project).context("staging the practice workspace")?;
-
         let tmux = which("tmux").context("tmux is required for the live tour")?;
         let exe = std::env::current_exe().context("locating the running muxa binary")?;
+        let (name, dir) = allocate_tour_dir()?;
+        let script = dir.join("sandbox.sh");
+        let config = dir.join("config.src.toml");
+        let rcfile = dir.join("bashrc");
+        let cue = dir.join("cue");
+        let history = dir.join("history");
+        let home = dir.join("home");
+        let project = home.join("checkout-service");
 
         let mut sandbox = Self {
+            name,
+            dir,
             script,
             config,
             rcfile,
@@ -178,6 +176,16 @@ impl Sandbox {
             exe,
             env: BTreeMap::new(),
         };
+        // Construct the owner before staging anything: if a later write or
+        // command fails, normal local-drop cleanup removes this run's unique
+        // directory and sandbox instead of leaving a half-built fixture.
+        write_executable(&sandbox.script, SANDBOX_SCRIPT).context("staging the sandbox script")?;
+        std::fs::write(&sandbox.config, SANDBOX_CONFIG).context("staging the sandbox config")?;
+        // The shell appends to this. A run that died before its teardown — a
+        // crash, a SIGKILL — leaves commands behind that would satisfy this
+        // run's steps before the learner has typed anything.
+        std::fs::write(&sandbox.history, "").context("clearing the command log")?;
+        write_workspace(&sandbox.project).context("staging the practice workspace")?;
         sandbox.script_command(&["up"])?;
         sandbox.env = sandbox.read_env()?;
         sandbox.write_rcfile()?;
@@ -188,7 +196,7 @@ impl Sandbox {
     fn script_command(&self, args: &[&str]) -> Result<String> {
         let mut cmd = Command::new("bash");
         cmd.arg(&self.script).arg(args[0]);
-        cmd.args(["--name", SANDBOX_NAME]);
+        cmd.args(["--name", &self.name]);
         cmd.arg("--tmux").arg(&self.tmux);
         cmd.arg("--muxa").arg(&self.exe);
         if let Some(muxad) = muxad_beside(&self.exe) {
@@ -327,11 +335,20 @@ impl Sandbox {
     }
 
     fn tmux_command(&self, args: &[&str]) -> Result<String> {
+        let socket = self.env_value("MUXA_TMUX_SOCKET");
         let out = Command::new(&self.tmux)
-            .args(["-u", "-L", SANDBOX_NAME])
+            .args(["-u", "-S", &socket])
             .args(args)
             .output()
             .context("running tmux against the sandbox")?;
+        if !out.status.success() {
+            bail!(
+                "tmux {} failed ({}):\n{}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
         Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     }
 
@@ -354,43 +371,47 @@ impl Sandbox {
         cmd.env("TMUX", self.env_value("MUXA_SANDBOX_TMUX_ENV"));
         cmd.env("TMUX_PANE", pane);
         let out = cmd.output().context("running muxa against the sandbox")?;
+        if !out.status.success() {
+            bail!(
+                "muxa {} failed ({}):\n{}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Answer whatever the learner just asked claude.
+    ///
+    /// Their request is real and sits in claude's mailbox; leaving it there
+    /// would teach that messages go nowhere. A reply they can find with
+    /// `muxa msg list` is the point of a durable mailbox — a line in a
+    /// transcript is a drawing of one. Failure is fatal because the next step
+    /// explicitly asks the learner to read this reply.
+    fn reply_as_claude(&self, fleet: &Fleet, language: UiLanguage) -> Result<()> {
+        let raw = self.muxa_as(&fleet.claude, &["msg", "inbox", "--json"])?;
+        let requests = serde_json::from_str::<serde_json::Value>(&raw)
+            .context("reading claude's live-tour inbox")?;
+        let id = requests
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .context("claude's live-tour inbox had no request to answer")?;
+        let body = tr(
+            language,
+            "auth path is covered; writing the regression test now",
+            "인증 경로는 끝났고, 지금 회귀 테스트를 쓰는 중입니다",
+        );
+        self.muxa_as(&fleet.claude, &["msg", "reply", id, body])?;
+        Ok(())
     }
 
     /// Feed the daemon the payload a real agent CLI would send, so the states
     /// the tour teaches arrive through the real pipeline rather than being
     /// drawn. Only valid once the daemon is up — events sent before it starts
     /// are simply lost.
-    /// Answer whatever the learner just asked claude.
-    ///
-    /// Their request is real and sits in claude's mailbox; leaving it there
-    /// would teach that messages go nowhere. A reply they can find with
-    /// `muxa msg list` is the point of a durable mailbox — a line in a
-    /// transcript is a drawing of one. Best-effort: a flourish should not stop
-    /// the tour.
-    fn reply_as_claude(&self, fleet: &Fleet, language: UiLanguage) {
-        let Ok(raw) = self.muxa_as(&fleet.claude, &["msg", "inbox", "--json"]) else {
-            return;
-        };
-        let Ok(requests) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return;
-        };
-        let Some(id) = requests
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|item| item.get("id"))
-            .and_then(serde_json::Value::as_str)
-        else {
-            return;
-        };
-        let body = tr(
-            language,
-            "auth path is covered; writing the regression test now",
-            "인증 경로는 끝났고, 지금 회귀 테스트를 쓰는 중입니다",
-        );
-        let _ = self.muxa_as(&fleet.claude, &["msg", "reply", id, body]);
-    }
-
     fn hook(&self, pane: &str, kind: &str, event: &str, body: &str) -> Result<()> {
         let mut cmd = Command::new(&self.exe);
         cmd.args(["hook", kind, "--event", event]);
@@ -401,14 +422,21 @@ impl Sandbox {
         cmd.env("TMUX_PANE", pane);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().context("spawning a hook")?;
         child
             .stdin
             .as_mut()
             .context("hook stdin")?
             .write_all(body.as_bytes())?;
-        child.wait().context("waiting for a hook")?;
+        let output = child.wait_with_output().context("waiting for a hook")?;
+        if !output.status.success() {
+            bail!(
+                "muxa hook {kind} --event {event} failed ({}):\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 }
@@ -416,34 +444,34 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = self.script_command(&["down"]);
-        for path in [
-            &self.script,
-            &self.config,
-            &self.rcfile,
-            &self.cue,
-            &self.history,
-        ] {
-            let _ = std::fs::remove_file(path);
-        }
-        // The agent transcripts are named deterministically, so they can be
-        // cleaned from here without threading the `Fleet` back through.
-        let dir = std::env::temp_dir();
-        for name in ["claude", "codex"] {
-            let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}.log")));
-        }
-        for name in [
-            "codex-pane.sh",
-            "approved.txt",
-            "declined.txt",
-            "claude.pane",
-        ] {
-            let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}")));
-        }
-        // Only ever the tour's own home — never anything the learner owns.
-        if self.home.starts_with(&dir) {
-            let _ = std::fs::remove_dir_all(&self.home);
+        let temp = std::env::temp_dir();
+        // Exact equality to the directory this instance allocated, plus the
+        // validated prefix, keeps recursive cleanup away from every caller path.
+        if self.name.starts_with(SANDBOX_NAME_PREFIX) && self.dir == temp.join(&self.name) {
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+fn allocate_tour_dir() -> Result<(String, PathBuf)> {
+    let temp = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..100_u8 {
+        let name = if attempt == 0 {
+            format!("{SANDBOX_NAME_PREFIX}-{pid}")
+        } else {
+            format!("{SANDBOX_NAME_PREFIX}-{pid}-{attempt}")
+        };
+        let dir = temp.join(&name);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok((name, dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("creating the live-tour directory"),
+        }
+    }
+    bail!("could not allocate a unique live-tour directory")
 }
 
 fn write_workspace(project: &Path) -> Result<()> {
@@ -511,12 +539,12 @@ impl Sandbox {
     }
 
     /// Reads the flag and clears it, so one keypress is one request.
-    fn consume_flag(&self, option: &str) -> bool {
-        if self.tmux_quiet(&["show", "-gv", option]) != "1" {
-            return false;
+    fn consume_flag(&self, option: &str) -> Result<bool> {
+        if self.tmux_command(&["show", "-gvq", option])? != "1" {
+            return Ok(false);
         }
-        let _ = self.tmux_command(&["set", "-gu", option]);
-        true
+        self.tmux_command(&["set", "-gu", option])?;
+        Ok(true)
     }
 
     /// Has the learner run a command starting with this?
@@ -525,11 +553,11 @@ impl Sandbox {
             .is_ok_and(|log| log.lines().any(|line| line.trim().starts_with(prefix)))
     }
 
-    fn skip_requested(&self) -> bool {
+    fn skip_requested(&self) -> Result<bool> {
         self.consume_flag(SKIP_OPTION)
     }
 
-    fn language_toggled(&self) -> bool {
+    fn language_toggled(&self) -> Result<bool> {
         self.consume_flag(LANGUAGE_OPTION)
     }
 
@@ -543,7 +571,7 @@ impl Sandbox {
         cue: &str,
         escape: Option<&str>,
         other_language: &str,
-    ) {
+    ) -> Result<()> {
         // What just happened comes first. A tour that only ever says what to do
         // next leaves the learner typing commands and guessing whether any of
         // them landed.
@@ -559,9 +587,10 @@ impl Sandbox {
             None => format!("#[align=left fg=#d29922,bold]  {cue}"),
         };
         // Row 0 stays tmux's own window list.
-        let _ = self.tmux_command(&["set", "-g", "status-format[1]", &banner]);
-        let _ = self.tmux_command(&["set", "-g", "status-format[2]", &title]);
-        let _ = self.tmux_command(&["set", "-g", "status-format[3]", &cue]);
+        self.tmux_command(&["set", "-g", "status-format[1]", &banner])?;
+        self.tmux_command(&["set", "-g", "status-format[2]", &title])?;
+        self.tmux_command(&["set", "-g", "status-format[3]", &cue])?;
+        Ok(())
     }
 }
 
@@ -1065,24 +1094,21 @@ impl Sandbox {
     /// Stage the screens and put `claude` on the learner's `PATH`, so starting
     /// the agent is theirs to do rather than the tour's to perform.
     fn prepare_agents(&self, language: UiLanguage) -> Result<()> {
-        let dir = std::env::temp_dir();
-        let claude_screen = Transcript::new(&dir, "claude")?;
-        let codex_screen = Transcript::new(&dir, "codex")?;
+        let claude_screen = Transcript::new(&self.dir, "claude")?;
+        let codex_screen = Transcript::new(&self.dir, "codex")?;
         write_opening_screens(&claude_screen, &codex_screen, language);
-        // A marker left by an earlier tour would satisfy the step before the
-        // learner has typed anything.
-        let _ = std::fs::remove_file(dir.join("muxa-onboarding-claude.pane"));
+        let marker = self.dir.join("muxa-onboarding-claude.pane");
         claude_screen.launcher(
             Path::new(&self.env_value("MUXA_SANDBOX_SHIM")),
             "claude",
-            &dir.join("muxa-onboarding-claude.pane"),
+            &marker,
         )?;
         Ok(())
     }
 
     /// Where the learner started claude, once they have.
-    fn started_pane() -> Option<String> {
-        std::fs::read_to_string(std::env::temp_dir().join("muxa-onboarding-claude.pane"))
+    fn started_pane(&self) -> Option<String> {
+        std::fs::read_to_string(self.dir.join("muxa-onboarding-claude.pane"))
             .ok()
             .map(|pane| pane.trim().to_string())
             .filter(|pane| !pane.is_empty())
@@ -1106,7 +1132,7 @@ impl Sandbox {
             .unwrap_or_default()
             .to_string();
         if !first.is_empty() && first != learner {
-            let _ = self.tmux_command(&["swap-pane", "-s", &first, "-t", learner]);
+            self.tmux_command(&["swap-pane", "-s", &first, "-t", learner])?;
         }
         // A column count rather than `50%`, which older tmux rejects here.
         // Half each suits a wide terminal. On a narrow one, half would put the
@@ -1123,14 +1149,14 @@ impl Sandbox {
             .max(60)
             .min(width.saturating_sub(20))
             .max(20);
-        let _ = self.tmux_command(&[
+        self.tmux_command(&[
             "set-window-option",
             "-t",
             window,
             "main-pane-width",
             &main.to_string(),
-        ]);
-        let _ = self.tmux_command(&["select-layout", "-t", window, "main-vertical"]);
+        ])?;
+        self.tmux_command(&["select-layout", "-t", window, "main-vertical"])?;
         self.tmux_command(&["select-pane", "-t", learner])?;
         Ok(())
     }
@@ -1182,19 +1208,18 @@ impl Sandbox {
         }
         // If they started claude in the pane this guessed was theirs, theirs is
         // the other one.
-        let learner = match Self::started_pane() {
+        let learner = match self.started_pane() {
             Some(started) if started == learner => fresh.clone(),
             _ => learner,
         };
 
         // Already written by `prepare_agents`; opening them again would blank
         // the screen the learner is looking at.
-        let dir = std::env::temp_dir();
-        let claude_screen = Transcript::open(&dir, "claude");
-        let codex_screen = Transcript::open(&dir, "codex");
+        let claude_screen = Transcript::open(&self.dir, "claude");
+        let codex_screen = Transcript::open(&self.dir, "codex");
 
-        let approved = dir.join("muxa-onboarding-approved.txt");
-        let declined = dir.join("muxa-onboarding-declined.txt");
+        let approved = self.dir.join("muxa-onboarding-approved.txt");
+        let declined = self.dir.join("muxa-onboarding-declined.txt");
         std::fs::write(&approved, approved_block(language).join("\n") + "\n")?;
         std::fs::write(&declined, declined_block(language).join("\n") + "\n")?;
 
@@ -1210,7 +1235,7 @@ impl Sandbox {
             .map(str::to_string)
             .collect::<Vec<_>>()
         {
-            let _ = self.tmux_command(&["rename-window", "-t", &other, "release-checks"]);
+            self.tmux_command(&["rename-window", "-t", &other, "release-checks"])?;
         }
 
         // claude is wherever the learner ran it. The fallback covers a skipped
@@ -1219,7 +1244,7 @@ impl Sandbox {
         // split — or failing that their own — is respawned into claude
         // instead. `respawn-pane -k` keeps the pane id, so the hook still
         // lands on the pane the learner is looking at.
-        let claude = if let Some(pane) = Self::started_pane() {
+        let claude = if let Some(pane) = self.started_pane() {
             pane
         } else {
             let pane = if fresh.is_empty() {
@@ -1240,7 +1265,7 @@ impl Sandbox {
         };
         let codex = self.split(
             &window,
-            &codex_screen.answerable_pane_command(&dir, &approved, &declined)?,
+            &codex_screen.answerable_pane_command(&self.dir, &approved, &declined)?,
         )?;
 
         self.lay_out_fleet(&window, &learner)?;
@@ -1312,10 +1337,14 @@ impl Sandbox {
 
         // Aliases are what make `muxa msg send @claude` teachable; without them
         // the learner would have to name a peer by raw pane id.
+        // `session_start` classifies the learner pane through the Claude
+        // adapter, so automatic pane handles may provision `claude` there
+        // before the scripted peer arrives. Move the learner to `you` first;
+        // that releases the room-local namespace before assigning peer names.
         for (pane, alias) in [
+            (&fleet.learner, "you"),
             (&fleet.claude, "claude"),
             (&fleet.codex, "codex"),
-            (&fleet.learner, "you"),
         ] {
             self.muxa_as(pane, &["identity", "set", "--alias", alias])?;
         }
@@ -1642,7 +1671,7 @@ impl Tour<'_> {
                     .count()
                     >= 2
             }
-            Detect::StartedClaude => Sandbox::started_pane().is_some(),
+            Detect::StartedClaude => self.sandbox.started_pane().is_some(),
             Detect::PaneRunning(command) => self
                 .sandbox
                 .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
@@ -1683,10 +1712,10 @@ impl Tour<'_> {
     ///
     /// Skipping has to leave the tour consistent, not just further along: the
     /// agents cannot move into a pane that was never split.
-    fn perform(&self, index: usize) {
+    fn perform(&self, index: usize) -> Result<()> {
         match index {
             0 => {
-                let _ = self.sandbox.tmux_command(&[
+                self.sandbox.tmux_command(&[
                     "new-session",
                     "-d",
                     "-s",
@@ -1695,29 +1724,40 @@ impl Tour<'_> {
                     "200",
                     "-y",
                     "50",
-                ]);
+                ])?;
             }
             1 => {
                 if let Some(session) = self.own_sessions().first() {
-                    let _ = self.sandbox.tmux_command(&[
+                    self.sandbox.tmux_command(&[
                         "new-window",
                         "-d",
                         "-t",
                         &format!("{session}:"),
-                    ]);
+                    ])?;
                 }
             }
             SPLIT_STEP => {
                 if let Some(session) = self.own_sessions().first() {
-                    let _ =
-                        self.sandbox
-                            .tmux_command(&["split-window", "-t", &format!("{session}:")]);
+                    self.sandbox
+                        .tmux_command(&["split-window", "-t", &format!("{session}:")])?;
+                }
+            }
+            11 => {
+                // Entering the next step makes scripted claude answer the
+                // learner's request. A skipped send still needs to create that
+                // request, or the escape hatch exits on an empty inbox instead
+                // of leaving the later mailbox steps coherent.
+                if let Some(fleet) = self.fleet.as_ref() {
+                    let body = tr(self.language, "how far along?", "어디까지 됐나요?");
+                    self.sandbox
+                        .muxa_as(&fleet.learner, &["msg", "send", "@claude", body])?;
                 }
             }
             // The rest are about where the learner is looking, which the tour
             // will not fake, or about state it has already produced.
             _ => {}
         }
+        Ok(())
     }
 
     /// Fired as a step opens, so the world moves on its own rather than only in
@@ -1730,7 +1770,8 @@ impl Tour<'_> {
         if index == 1 {
             let holder = self.sandbox.env_value("MUXA_SANDBOX_HOLDER");
             if !holder.is_empty() {
-                let _ = self.sandbox.tmux_command(&["kill-session", "-t", &holder]);
+                self.sandbox
+                    .tmux_command(&["kill-session", "-t", &holder])?;
             }
         }
         // Their pane, recorded before the split so the new one can be told
@@ -1738,13 +1779,13 @@ impl Tour<'_> {
         if index == SPLIT_STEP {
             self.before_split = self
                 .sandbox
-                .tmux_quiet(&[
+                .tmux_command(&[
                     "list-panes",
                     "-t",
                     &self.session_target(),
                     "-F",
                     "#{pane_id}",
-                ])
+                ])?
                 .lines()
                 .map(str::to_string)
                 .collect();
@@ -1787,8 +1828,7 @@ impl Tour<'_> {
                     .claude_screen
                     .append(&incoming_question(self.language));
                 // And claude answers through muxa, not only on its own screen.
-                self.sandbox.reply_as_claude(fleet, self.language);
-                Ok(())
+                self.sandbox.reply_as_claude(fleet, self.language)
             }
             13 => {
                 let body = tr(
@@ -1809,7 +1849,7 @@ impl Tour<'_> {
         }
     }
 
-    fn narrate(&self, index: usize, escape: bool) {
+    fn narrate(&self, index: usize, escape: bool) -> Result<()> {
         let step = &STEPS[index];
         let achieved = tr(self.language, step.achieved_en, step.achieved_ko);
         let title = tr(self.language, step.title_en, step.title_ko);
@@ -1835,7 +1875,7 @@ impl Tour<'_> {
                 UiLanguage::En => "한국어",
                 UiLanguage::Ko => "English",
             },
-        );
+        )?;
 
         // The status bar only exists for someone attached to the server, and a
         // few steps are the ones where they are not.
@@ -1859,13 +1899,16 @@ impl Tour<'_> {
                 index + 1,
                 STEPS.len()
             );
-            let _ = std::io::stdout().flush();
+            std::io::stdout()
+                .flush()
+                .context("printing live-tour narration")?;
         }
+        Ok(())
     }
 
     fn drive(&mut self) -> Result<usize> {
         // Prints rather than paints: nobody is attached yet.
-        self.narrate(0, self.no_quiz);
+        self.narrate(0, self.no_quiz)?;
 
         // The learner's own shell, in their own terminal. They are not attached
         // to anything yet — Act I is where they attach themselves, which is the
@@ -1896,32 +1939,32 @@ impl Tour<'_> {
                 offered_escape = self.no_quiz;
                 if index < STEPS.len() {
                     self.on_enter(index)?;
-                    self.narrate(index, offered_escape);
+                    self.narrate(index, offered_escape)?;
                 }
                 continue;
             }
-            if self.sandbox.language_toggled() {
+            if self.sandbox.language_toggled()? {
                 self.language = match self.language {
                     UiLanguage::En => UiLanguage::Ko,
                     UiLanguage::Ko => UiLanguage::En,
                 };
-                self.narrate(index, offered_escape);
+                self.narrate(index, offered_escape)?;
                 continue;
             }
-            if self.sandbox.skip_requested() {
-                self.perform(index);
+            if self.sandbox.skip_requested()? {
+                self.perform(index)?;
                 index += 1;
                 entered = Instant::now();
                 offered_escape = self.no_quiz;
                 if index < STEPS.len() {
                     self.on_enter(index)?;
-                    self.narrate(index, offered_escape);
+                    self.narrate(index, offered_escape)?;
                 }
                 continue;
             }
             if !offered_escape && entered.elapsed() > SKIP_AFTER {
                 offered_escape = true;
-                self.narrate(index, true);
+                self.narrate(index, true)?;
             }
             std::thread::sleep(POLL);
         }

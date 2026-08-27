@@ -26,7 +26,8 @@ import sys
 import termios
 import time
 
-SANDBOX = "muxa-onboarding"
+SANDBOX_PREFIX = "muxa-onboarding"
+SANDBOX = ""
 STEP_MARK = re.compile(r"onboarding · (\d+)/(\d+)")
 TOTAL_STEPS = 15
 
@@ -35,6 +36,7 @@ class Terminal:
     """A pty with a `muxa onboard --tour live` running in it."""
 
     def __init__(self, muxa: str, lang: str, no_quiz: bool = False) -> None:
+        global SANDBOX
         self.buffer = b""
         self.exited = False
         self.pid, self.fd = pty.fork()
@@ -48,6 +50,10 @@ class Terminal:
                 argv.append("--no-quiz")
             os.execv(muxa, argv)
             os._exit(127)
+        # The live tour scopes every artifact to the muxa process PID. Keep the
+        # driver on that same namespace so parallel smoke jobs cannot observe
+        # or tear down one another's tmux server and daemon.
+        SANDBOX = f"{SANDBOX_PREFIX}-{self.pid}"
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
         os.set_blocking(self.fd, False)
 
@@ -102,8 +108,9 @@ class Terminal:
 
 
 def tmux(*args: str) -> subprocess.CompletedProcess:
+    socket = f"/tmp/{SANDBOX}-sandbox/tmux.sock"
     return subprocess.run(
-        ["tmux", "-L", SANDBOX, *args], capture_output=True, text=True, timeout=10
+        ["tmux", "-S", socket, *args], capture_output=True, text=True, timeout=10
     )
 
 
@@ -165,6 +172,8 @@ def wait_step(terminal: Terminal, target: int, timeout: float = 60) -> bool:
     while time.time() < end:
         if step() == target:
             return True
+        if terminal.finished():
+            return False
         terminal.pump(0.4)
     return False
 
@@ -178,6 +187,8 @@ def wait_past(terminal: Terminal, target: int, timeout: float = 60) -> bool:
         current = step()
         if current is not None and current >= target:
             return True
+        if terminal.finished():
+            return False
         terminal.pump(0.4)
     current = step()
     return current is not None and current >= target
@@ -229,7 +240,7 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
             if not report.check(
                 f"F12 reaches step {target} or past it",
                 wait_past(terminal, target, 45),
-                f"step={step()}",
+                f"step={step()}\n{terminal.text()[-800:]}",
             ):
                 break
             reached = step() or target
@@ -251,7 +262,9 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
 
     report.check("no tmux server survives", tmux("list-sessions").returncode != 0)
     strays = subprocess.run(
-        ["pgrep", "-f", f"{SANDBOX}-config"], capture_output=True, text=True
+        ["pgrep", "-f", f"/tmp/{SANDBOX}-sandbox/config[.]toml"],
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     report.check("no daemon survives", strays == "", strays)
     print(f"\n{report.passes} passed, {len(report.failures)} failed")
@@ -338,7 +351,11 @@ def main() -> int:
             which,
         )
         terminal.type(b"claude\r", 4)
-        report.check("9  starting claude", wait_step(terminal, 9), f"step={step()}")
+        report.check(
+            "9  starting claude",
+            wait_step(terminal, 9),
+            f"step={step()}\n{terminal.text()[-800:]}",
+        )
 
         panes = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
         report.check(
@@ -370,7 +387,7 @@ def main() -> int:
         paths = tmux("list-panes", "-a", "-F", "#{pane_current_path}").stdout.split()
         report.check(
             "9  nothing runs outside the sandbox workspace",
-            bool(paths) and all(p.startswith("/tmp/muxa-onboarding-home") for p in paths),
+            bool(paths) and all(p.startswith(f"/tmp/{SANDBOX}/home") for p in paths),
             str(paths),
         )
         report.check(
@@ -437,7 +454,9 @@ def main() -> int:
     print("nothing left behind")
     report.check("no tmux server survives", tmux("list-sessions").returncode != 0)
     strays = subprocess.run(
-        ["pgrep", "-f", f"{SANDBOX}-config"], capture_output=True, text=True
+        ["pgrep", "-f", f"/tmp/{SANDBOX}-sandbox/config[.]toml"],
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     report.check("no daemon survives", strays == "", strays)
 

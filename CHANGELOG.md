@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real commands instead of a quiz. `scripts/live-tour-smoke.py` types those
   commands in CI and checks the tour keeps up.
 
+  Each invocation now allocates its own private PID-scoped directory, daemon,
+  and tmux socket. Concurrent tours cannot erase or reuse one another's state,
+  and failed tmux, muxa, or hook commands stop with their actual error instead
+  of leaving the learner at a step that can never advance.
+
   The sandbox is torn down on every exit path, including `Ctrl-C`. The old
   simulation remains the default (`--tour simulated`) until the live tour has
   replaced it outright.
