@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pasting into an attached muxa-owned PTY is safe and complete.** The attach
+  relay now enables bracketed paste, forwards the restored framing to the child
+  PTY so multiline input is not executed line by line, ignores leaked platform
+  shortcut keys, and restores the parent terminal state on every exit path.
+
 ## [0.8.36] - 2026-08-27
 
 ### Added
