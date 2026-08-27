@@ -5,6 +5,7 @@
 //! fullscreen terminal to a stable `muxa watch` mock with location-aware
 //! dialogs. `--print` remains available for scripts and accessibility.
 
+mod live;
 mod tmux;
 
 use anyhow::{Context, Result};
@@ -36,6 +37,23 @@ pub struct Args {
     /// Display language: auto, en, or ko. / 표시 언어: auto, en, ko.
     #[arg(long, value_enum, default_value_t)]
     pub lang: Language,
+    /// Which tour to run: the built-in simulation, or a throwaway muxa.
+    #[arg(long, value_enum, default_value_t)]
+    pub tour: Tour,
+}
+
+/// Which onboarding to run.
+///
+/// A value rather than a `--live` flag because `Args` is already at clippy's
+/// bool ceiling, and because the default is the thing that moves once the live
+/// tour covers both acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Tour {
+    /// Draw the scenario; change nothing, need nothing.
+    #[default]
+    Simulated,
+    /// Run the real muxa against a sandbox on its own tmux server.
+    Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -277,6 +295,9 @@ const SECTIONS: &[Section] = &[
 
 pub fn run(args: Args) -> Result<()> {
     apply_icon_preference();
+    if args.tour == Tour::Live && !args.print {
+        return live::run(args.lang.resolve());
+    }
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();
     match mode {

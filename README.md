@@ -276,6 +276,7 @@ Korean is selected automatically for a Korean locale, can be requested with
 | `muxa work list/show/close [--workspace muxa]` | Inspect Work and its current Run binding, or explicitly close that Run window. |
 | `muxa agent start --host tmux --workspace muxa --work muxa-onboarding ...` | Add an allowlisted agent pane to one managed tmux Work window; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | Interrupt or explicitly terminate one managed tmux pane or muxa-owned PTY agent session. |
+| `muxa onboard --tour live` | Nine live steps on a throwaway muxa: real tmux, real watch, real mailbox. Refuses to nest inside an existing tmux session. |
 | `muxa onboard [--lang auto\|en\|ko]` | Unified shell → tmux → Muxa fullscreen walkthrough. `F2` switches language, `--no-quiz` skips gates, and `--print` emits the combined guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
