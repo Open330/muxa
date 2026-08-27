@@ -9,6 +9,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
+  release binary for the host into a temporary directory, verifies its
+  published SHA-256, runs the onboarding, and deletes it — a download, not an
+  install: no daemon, no config, no PATH entry. The embedded shell simulation
+  remains the fallback for `--no-download`, an unsupported platform, a missing
+  checksum tool, or no network, so the pipe-to-`sh` entry point keeps working
+  offline. The fallback was realigned to the real tour's step decomposition and
+  keys — the splits are one step, detach and reattach are two, pane movement
+  takes `→`, and the attention sort takes `Alt-T` (the macOS compose glyphs
+  `†`/`ˇ` included) rather than a stand-in `t`. `muxa onboard --emit
+  step-table` publishes the key each step waits for, derived by walking the
+  real gates, and `scripts/onboarding-parity.py` presses exactly those keys at
+  the fallback in CI so the two cannot drift apart again.
+
+### Fixed
+
+- **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
+  it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
+  so a terminal that composes Option instead of sending Meta — the macOS
+  default — could never satisfy it. The gate now also accepts the compose
+  glyph (`†`, `ˇ`), and two missed attempts surface the terminal
+  setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
+  `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
+  relayed through tmux or a slow pty could tear the tour down mid-step; both
+  the tour and the tmux track now confirm an `Esc` before quitting and
+  reassemble the split sequence. `scripts/onboard.sh` read one byte per key
+  and so quit on *every* arrow key; it now classifies the escape tail the same
+  way and accepts the real `Alt-T`.
+
+## [0.8.36] - 2026-08-27
+
+### Added
+
+- **Every terminal on a workspace gets its own current window.** New
+  `tmux-auto-view` init component, on by default: two tmux hooks hand an
+  arriving client its own session-group view, so two terminals on one workspace
+  stop following each other's window switches. Both hooks matter —
+  `client-attached` covers `tmux attach`, and `client-session-changed` covers
+  `switch-client`, which is what `muxa watch`'s Enter does and what a terminal
+  that was already open goes through. `muxa workspace view` does the work and
+  can be run by hand; it is a no-op for a session's sole client and reuses one
+  view per terminal, so nothing accumulates. Views are named
+  `<session>~view~<pid>` and vanish on detach. Opt one session out with
+  `tmux set-option -t <session> @no_auto_view 1`.
+- **`R` renames the session, window, or pane under the cursor in `muxa
+  watch`.** The form opens prefilled with the current name and cursor at the
+  end, since renaming is usually an edit; Enter on an untouched prefill is a
+  cancel rather than a write. Window renames go through muxa's naming policy —
+  whitespace normalized to `-`, and a name already used in that session refused,
+  because tmux matches `session:window` targets by prefix. A pane has no name in
+  tmux, so that level sets the pane title, which is the string watch displays.
+- **New `tmux-window-names` init component**, on by default: turns off tmux's
+  `automatic-rename` and binds `prefix + ,` to `muxa window rename`. A window
+  is a Work Run under muxa's model, so naming it after whatever process is
+  running in it overwrites the Work with `node` or `claude` the moment an agent
+  starts.
+- **Minimum supported Rust is now 1.89.** Nothing in the tree requires it
+  today; the floor moves so future work can reach for stabilized std APIs
+  without the design bending around an old one. Raised while the project is
+  young enough for the cost to be small.
+- **The daemon arbitrates a room's handle namespace.** A room-local handle
+  had three writers — the `@muxa_agent_alias` pane option, a launcher's
+  explicit alias, and a registered identity — each enforcing its own rule
+  against its own view, so every ordering between them produced a different
+  way for one room to answer to `@claude` twice. The daemon is the only
+  place that sees all three, so allocation now goes through it via
+  `collaboration_issue_handle` (local IPC protocol 6, capability
+  `handle_namespace_v1`), which also tracks handles promised to callers that
+  have not written them yet. Lifetimes are unchanged: a handle still lives
+  on the pane option and outlives the agent restarting in place, while a
+  registered identity still belongs to one agent session. Without a daemon
+  to referee, a pane stays unnamed rather than being named from a partial
+  view.
+- **Every agent pane gets a handle, so peers are addressable by name rather
+  than by `%1242`.** The first agent of a runtime in a room becomes
+  `@claude` / `@codex` / `@gemini` / `@agy` / `@opencode`, a second of the
+  same kind becomes `@claude2`, and so on. muxa mints it on the session's
+  first hook event — the one installed by `muxa init` — and immediately for
+  a pane `muxa agent start` opened, which also reports it in `--json`. The
+  name is stored on the pane as `@muxa_agent_alias` so the slot keeps it
+  across muxad, CLI, and agent restarts, and a pane that already carries a
+  pipeline or hand-set alias is never renamed. `resolve_target` has always
+  understood `@alias`; what was missing was anything that minted one.
+  Allocation runs under a per-room file lock, because the claim is a
+  read-modify-write over a shared namespace and tmux user options have no
+  compare-and-set — re-checking after the write cannot close that, since the
+  pane writing second can finish its check before the first write lands. The
+  claim itself goes through `set-option -o`, so a pipeline's explicit alias
+  wins whichever side of it the minting lands on.
+
+### Changed
+
+- **Operator messages now carry their body directly by default, without making
+  agent delegation equally permissive.** The new default `wake_payload =
+  "operator_full"` claims and injects requests sent by the resolved operator
+  console (watch/dashboard), while agent-originated MCP and CLI requests remain
+  body-free mailbox notices. Explicit `notice` and `full` retain their strict
+  all-notice and all-direct behavior. This is a delivery policy, not an
+  authorization signal: `work_mode = "execute"` cannot promote an agent request.
 - **Work pipelines now have daemon-owned, generation-aware Run state.** The
   selected pipeline, rendered desired aliases, dependency graph, Run
   generation, and each alias's `pending`/`running`/`blocked`/`done`/`failed`
@@ -44,42 +143,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `/` skills with in-watch add/remove, and mailbox claim/reply. Remote
   collaboration stays owned by the selected node and travels over the existing
   exact-pane SSH relay behind an explicit capability gate.
-
-### Changed
-
-- **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
-  release binary for the host into a temporary directory, verifies its
-  published SHA-256, runs the onboarding, and deletes it — a download, not an
-  install: no daemon, no config, no PATH entry. The embedded shell simulation
-  remains the fallback for `--no-download`, an unsupported platform, a missing
-  checksum tool, or no network, so the pipe-to-`sh` entry point keeps working
-  offline. The fallback was realigned to the real tour's step decomposition and
-  keys — the splits are one step, detach and reattach are two, pane movement
-  takes `→`, and the attention sort takes `Alt-T` (the macOS compose glyphs
-  `†`/`ˇ` included) rather than a stand-in `t`. `muxa onboard --emit
-  step-table` publishes the key each step waits for, derived by walking the
-  real gates, and `scripts/onboarding-parity.py` presses exactly those keys at
-  the fallback in CI so the two cannot drift apart again.
-
-### Fixed
-
-- **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
-  it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
-  so a terminal that composes Option instead of sending Meta — the macOS
-  default — could never satisfy it. The gate now also accepts the compose
-  glyph (`†`, `ˇ`), and two missed attempts surface the terminal
-  setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
-  `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
-  relayed through tmux or a slow pty could tear the tour down mid-step; both
-  the tour and the tmux track now confirm an `Esc` before quitting and
-  reassemble the split sequence. `scripts/onboard.sh` read one byte per key
-  and so quit on *every* arrow key; it now classifies the escape tail the same
-  way and accepts the real `Alt-T`.
+- **`muxa peek` names each pane by its handle and its tmux id.** The
+  `prefix + q` overlay now prints `@claude %1242` in every pane's header,
+  next to the jump digit — the digit addresses the pane inside peek, but
+  peer calls, `muxa send`, and raw tmux are addressed by the other two, and
+  peek is where you are already looking to work out which pane is which. A
+  narrow box gives up the pane id before the handle and the runtime name
+  before either, dropping each rather than clipping it: a truncated
+  `%1242` or `@claude2` is still a well-formed address for a different
+  pane.
 
 ## [0.8.35] - 2026-08-22
 
 ### Added
-
 - **Google Antigravity CLI (`agy`) is a first-class agent.** agy replaced the
   Gemini CLI upstream but shares none of its hook contract, so muxa's existing
   Gemini support was silently inert against it: agy reads
@@ -236,6 +312,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   room — the dashboard does not follow `[collaboration].scope = "host"`.
 
 ### Fixed
+
+- **A workspace open in two terminals is one tree again.** A tmux session group
+  shares one window list across several sessions — the supported way to put two
+  terminals on two Work windows of one workspace — and `list-panes -a` walks
+  sessions, so it reports every pane once per member. Topology showed the same
+  workspace two or three times over, with the agent attached to whichever copy
+  was scanned first and the rest rendered as bare panes. Grouped sessions now
+  fold onto the member the group is named after, deduplicated by pane; if that
+  session is gone the choice falls back to the lexically first id so it stays
+  put across ticks. `watch` sums `attached_clients` across the group, since the
+  members it no longer shows are still terminals on that workspace. `PaneInfo`
+  and `SessionInfo` carry `#{session_group}`, both `serde(default)` for peers
+  built before the field.
+
+- **A refused IPC request no longer reports "no active agents".** `snapshot`,
+  `by_pane`, and their timeout variants handed the response straight to a
+  lenient decoder that read the absent `agents` array as an empty registry, so
+  every daemon refusal became a confident, wrong, and perfectly stable answer
+  — and exited 0. The failure this hides in practice is a mixed install: a
+  `muxad` predating the protocol 5 bump answers `protocol mismatch: server=4
+  client=5` to every call, and `muxa status` reported no agents for a full day
+  on a host with 58 registered. Refusals now surface as `RuntimeError::Daemon`
+  carrying the daemon's own message, a protocol mismatch adds the restart it
+  needs, and a genuinely empty registry still reads as empty.
+
+- **Jumping from watch no longer drags a second terminal off its window.** The
+  jump addressed the target as a bare pane id, which names a pane but not a
+  session; tmux filled the gap from recent client activity. Under a session
+  group — `tmux new-session -t <session>`, the supported way to keep two
+  terminals on two Work windows of one workspace — the same window is linked
+  into several sessions, and the guess was routinely wrong: measured on tmux
+  3.4, jumping one client pulled it into the grouped sibling and dragged the
+  other terminal's view along, re-coupling the terminals the group exists to
+  separate. Jumps now address the window as `<session_id>:<window_id>`,
+  preferring the asking client's own session when the window is linked there
+  and otherwise the pane's recorded session, so a cross-session jump is
+  deterministic instead of activity-dependent. The bare-shell path carried the
+  same defect more visibly — its pre-attach `select-window` moved a grouped
+  bystander session and left the session it then attached to on the wrong
+  window — and it now targets the session it is about to attach. That attach
+  also addresses the session by id rather than by name, which matched by
+  prefix (`callabo` against `callabo-set`).
 
 - **`muxa upgrade` no longer strands an old daemon when no service manager is
   usable.** A capable muxad now drains and re-execs itself on the exact socket

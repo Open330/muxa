@@ -10,6 +10,9 @@ use clap::ValueEnum;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+use muxa::backend::HostKind;
+use muxa::ipc::Client;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentProgram {
@@ -76,6 +79,71 @@ impl AgentProgram {
             (Self::Opencode, None) => "opencode".into(),
         }
     }
+
+    fn native_launch(self, prompt: Option<&str>) -> NativeLaunch {
+        let mut args = match self {
+            Self::Claude | Self::Antigravity => {
+                vec!["--dangerously-skip-permissions".into()]
+            }
+            Self::Codex => vec!["--yolo".into()],
+            Self::Gemini => vec![
+                "--approval-mode".into(),
+                "yolo".into(),
+                "--skip-trust".into(),
+            ],
+            Self::Opencode => Vec::new(),
+        };
+        if let Some(prompt) = prompt {
+            match self {
+                Self::Claude | Self::Codex => args.push(prompt.into()),
+                Self::Gemini | Self::Antigravity => {
+                    args.push("-i".into());
+                    args.push(prompt.into());
+                }
+                Self::Opencode => {
+                    args.push("--prompt".into());
+                    args.push(prompt.into());
+                }
+            }
+        }
+        NativeLaunch {
+            command: self.label().into(),
+            args,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLaunch {
+    command: String,
+    args: Vec<String>,
+}
+
+/// Execution host selection for the user-facing agent launcher.
+///
+/// The first native slice deliberately exposes only hosts that can create a
+/// new surface today. Observation-only pane backends remain available to the
+/// daemon and will join this enum as their launch lifecycle lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchHost {
+    /// Use tmux when this shell is in a real tmux pane; otherwise use muxa's PTY.
+    #[default]
+    Auto,
+    /// Spawn a muxa-owned PTY session through muxad.
+    Native,
+    /// Use the existing managed tmux launcher.
+    Tmux,
+}
+
+impl LaunchHost {
+    fn resolve(self, detected: Option<HostKind>) -> Self {
+        match self {
+            Self::Auto if detected == Some(HostKind::Tmux) => Self::Tmux,
+            Self::Auto => Self::Native,
+            explicit => explicit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ValueEnum)]
@@ -129,6 +197,9 @@ pub struct StartArgs {
     /// Known agent CLI to launch. codex expands the local cx profile (codex --yolo).
     #[arg(long, value_enum)]
     pub agent: AgentProgram,
+    /// Execution host. Auto uses tmux inside tmux and a muxa-owned PTY elsewhere.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub host: LaunchHost,
     /// Create a split pane (default), window, or independent session.
     #[arg(long, value_enum, default_value = "pane")]
     pub placement: Placement,
@@ -242,6 +313,7 @@ impl From<&StartArgs> for StartRequest {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StartResult {
+    pub host: LaunchHost,
     pub pane: String,
     pub agent: AgentProgram,
     pub placement: Placement,
@@ -266,11 +338,72 @@ pub struct StartResult {
     pub prompt_supplied: bool,
 }
 
-pub fn run(args: StartArgs) -> Result<()> {
+/// Stable `muxa agent start --json` envelope across execution hosts.
+///
+/// Host-specific coordinates remain optional, but every key is serialized so
+/// consumers can parse one schema and branch only on `host`. `StartResult`
+/// remains the tmux lifecycle result used by managed Work/MCP internals.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct AgentStartOutput {
+    schema_version: u8,
+    host: LaunchHost,
+    agent: AgentProgram,
+    placement: Placement,
+    pane: Option<String>,
+    session: Option<String>,
+    window: Option<String>,
+    name: Option<String>,
+    workspace: Option<String>,
+    work: Option<String>,
+    created_workspace: bool,
+    created_work: bool,
+    role: Option<String>,
+    task: Option<String>,
+    alias: Option<String>,
+    cwd: PathBuf,
+    prompt_supplied: bool,
+}
+
+impl AgentStartOutput {
+    fn tmux(result: &StartResult) -> Self {
+        Self {
+            schema_version: 1,
+            host: result.host,
+            agent: result.agent,
+            placement: result.placement,
+            pane: Some(result.pane.clone()),
+            session: result.session.clone(),
+            window: result.window.clone(),
+            name: result.name.clone(),
+            workspace: result.workspace.clone(),
+            work: result.work.clone(),
+            created_workspace: result.created_workspace,
+            created_work: result.created_work,
+            role: result.role.clone(),
+            task: result.task.clone(),
+            alias: result.alias.clone(),
+            cwd: result.cwd.clone(),
+            prompt_supplied: result.prompt_supplied,
+        }
+    }
+}
+
+pub async fn run(args: StartArgs, client: &Client, socket_path: &Path) -> Result<()> {
+    match args.host.resolve(muxa::backend::detect_host_env()) {
+        LaunchHost::Native => run_native(args, client, socket_path).await,
+        LaunchHost::Tmux => run_tmux(args),
+        LaunchHost::Auto => unreachable!("auto launch host is resolved above"),
+    }
+}
+
+fn run_tmux(args: StartArgs) -> Result<()> {
     let json = args.json;
     let result = start(StartRequest::from(&args))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&AgentStartOutput::tmux(&result))?
+        );
     } else {
         println!(
             "started {} in {} {} (cwd {})",
@@ -282,6 +415,92 @@ pub fn run(args: StartArgs) -> Result<()> {
             },
             result.pane,
             result.cwd.display()
+        );
+    }
+    Ok(())
+}
+
+async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Result<()> {
+    if args.work.is_some() || args.workspace.is_some() {
+        bail!(
+            "managed --work/--workspace launch is not available on the native host yet; use --host tmux or `muxa run`"
+        );
+    }
+    if args.target.is_some() || args.placement != Placement::Pane {
+        bail!(
+            "--target and non-pane --placement require tmux; omit them for a native session or use --host tmux"
+        );
+    }
+    if args.direction != SplitDirection::Right {
+        bail!("--direction requires tmux; omit it for a native session or use --host tmux");
+    }
+    if args.role.is_some() || args.task.is_some() || args.alias.is_some() {
+        bail!(
+            "--role, --task, and --alias require a managed Work binding, which is not available on the native host yet"
+        );
+    }
+
+    let cwd_source = args.cwd.unwrap_or(std::env::current_dir()?);
+    let cwd = std::fs::canonicalize(&cwd_source)
+        .with_context(|| format!("resolve cwd {}", cwd_source.display()))?;
+    if !cwd.is_dir() {
+        bail!("cwd is not a directory: {}", cwd.display());
+    }
+    let prompt = args
+        .prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty());
+    let launch = args.agent.native_launch(prompt);
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let session = client
+        .spawn_session(muxa::SpawnSession {
+            command: launch.command,
+            args: launch.args,
+            env: crate::caller_env(socket_path),
+            cwd: Some(cwd.clone()),
+            name: args
+                .name
+                .clone()
+                .or_else(|| Some(args.agent.label().into())),
+            cols: Some(cols),
+            rows: Some(rows),
+        })
+        .await
+        .context("spawning native muxa agent session")?;
+    let result = AgentStartOutput {
+        schema_version: 1,
+        host: LaunchHost::Native,
+        agent: args.agent,
+        placement: Placement::Session,
+        pane: None,
+        session: Some(session.id),
+        window: None,
+        name: session.display_name,
+        workspace: None,
+        work: None,
+        created_workspace: false,
+        created_work: false,
+        role: None,
+        task: None,
+        alias: None,
+        cwd,
+        prompt_supplied: prompt.is_some(),
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "started {} in native session {} (cwd {})\nattach with: muxa attach {}",
+            result.agent.label(),
+            result
+                .session
+                .as_deref()
+                .expect("native result has a session"),
+            result.cwd.display(),
+            result
+                .session
+                .as_deref()
+                .expect("native result has a session"),
         );
     }
     Ok(())
@@ -416,8 +635,15 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         crate::tmux_work::cleanup_pane(&pane);
         return Err(error).context("record muxa tmux metadata");
     }
+    // Minting belongs to the agent's session-start hook, which reaches the
+    // room's arbiter. Doing it here too would allocate from a namespace this
+    // process cannot see all of — the bug the arbiter exists to close — so an
+    // unaliased launch reports no handle and the hook names the pane a moment
+    // later.
+    let alias = request.alias;
 
     Ok(StartResult {
+        host: LaunchHost::Tmux,
         pane,
         agent: request.agent,
         placement: request.placement,
@@ -430,7 +656,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         window,
         role: request.role,
         task: request.task,
-        alias: request.alias,
+        alias,
         cwd,
         prompt_supplied: prompt.is_some(),
     })
@@ -776,6 +1002,78 @@ mod tests {
         assert_eq!(
             AgentProgram::Codex.launch_command(Some("review June's changes; don't edit")),
             "codex --yolo 'review June'\\''s changes; don'\\''t edit'"
+        );
+    }
+
+    #[test]
+    fn native_launch_keeps_the_prompt_as_one_argv_value() {
+        let launch = AgentProgram::Codex.native_launch(Some("review June's changes; don't edit"));
+        assert_eq!(launch.command, "codex");
+        assert_eq!(launch.args, ["--yolo", "review June's changes; don't edit"]);
+
+        let gemini = AgentProgram::Gemini.native_launch(Some("review it"));
+        assert_eq!(gemini.command, "gemini");
+        assert_eq!(
+            gemini.args,
+            ["--approval-mode", "yolo", "--skip-trust", "-i", "review it"]
+        );
+    }
+
+    #[test]
+    fn agent_start_json_uses_one_schema_for_tmux_and_native() {
+        let tmux = AgentStartOutput {
+            schema_version: 1,
+            host: LaunchHost::Tmux,
+            agent: AgentProgram::Codex,
+            placement: Placement::Pane,
+            pane: Some("%7".into()),
+            session: Some("$1".into()),
+            window: Some("@2".into()),
+            name: Some("review".into()),
+            workspace: None,
+            work: None,
+            created_workspace: false,
+            created_work: false,
+            role: None,
+            task: None,
+            alias: None,
+            cwd: PathBuf::from("/repo"),
+            prompt_supplied: true,
+        };
+        let native = AgentStartOutput {
+            host: LaunchHost::Native,
+            placement: Placement::Session,
+            pane: None,
+            session: Some("pty-7".into()),
+            window: None,
+            ..tmux.clone()
+        };
+        let tmux = serde_json::to_value(tmux).unwrap();
+        let native = serde_json::to_value(native).unwrap();
+
+        let tmux_keys = tmux.as_object().unwrap().keys().collect::<Vec<_>>();
+        let native_keys = native.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(tmux_keys, native_keys);
+        assert_eq!(tmux["pane"], "%7");
+        assert!(native["pane"].is_null());
+        assert_eq!(native["session"], "pty-7");
+        assert_eq!(native["placement"], "session");
+    }
+
+    #[test]
+    fn auto_launch_uses_tmux_only_for_a_tmux_shell() {
+        assert_eq!(
+            LaunchHost::Auto.resolve(Some(HostKind::Tmux)),
+            LaunchHost::Tmux
+        );
+        assert_eq!(LaunchHost::Auto.resolve(None), LaunchHost::Native);
+        assert_eq!(
+            LaunchHost::Auto.resolve(Some(HostKind::Rmux)),
+            LaunchHost::Native
+        );
+        assert_eq!(
+            LaunchHost::Native.resolve(Some(HostKind::Tmux)),
+            LaunchHost::Native
         );
     }
 

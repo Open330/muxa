@@ -1692,7 +1692,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach via active window/pane or exact pane",
-        "  n / w          new window or agent pane / work up a pipeline",
+        "  n / w / R      new window/pane / work up / rename the row",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -1770,6 +1770,39 @@ struct AskComposer {
 /// wanting the same text box is not a reason to give them the same key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WorkComposer {
+    input: String,
+    cursor: usize,
+}
+
+/// Which level of the tree `R` is renaming, and what tmux calls the thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameLevel {
+    Session,
+    Window,
+    Pane,
+}
+
+impl RenameLevel {
+    fn label(self) -> &'static str {
+        match self {
+            RenameLevel::Session => "session",
+            RenameLevel::Window => "window",
+            // tmux has no pane *name*; the closest durable, displayable
+            // string is the pane title, which is what watch already shows.
+            RenameLevel::Pane => "pane title",
+        }
+    }
+}
+
+/// Rename form for the row under the cursor. Carries the node key rather than
+/// re-reading the selection on submit: a refresh can move the cursor while the
+/// form is open, and renaming whatever happens to be selected a second later
+/// is not what the user asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenameComposer {
+    key: TopologyNodeKey,
+    level: RenameLevel,
+    original: String,
     input: String,
     cursor: usize,
 }
@@ -2704,6 +2737,7 @@ pub(crate) struct App {
     /// `Some` while the `a` ask composer is open.
     ask_composer: Option<AskComposer>,
     work_composer: Option<WorkComposer>,
+    rename: Option<RenameComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
     /// Agent the next question goes to, as the daemon reports it.
@@ -2961,6 +2995,7 @@ impl App {
             spawn: None,
             ask_composer: None,
             work_composer: None,
+            rename: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
             ask_agent: "claude".into(),
@@ -3512,6 +3547,45 @@ impl App {
 
     fn selected_node_key(&self) -> Option<TopologyNodeKey> {
         self.selected_tree_target().map(|target| target.key)
+    }
+
+    /// Open the rename form on the row under the cursor, prefilled with the
+    /// name it has now.
+    ///
+    /// The cursor lands at the end of the prefill: renaming is usually an edit
+    /// of what is there (`cal-7306` → `cal-7306-review`), and a cursor at
+    /// column zero turns the first keystroke into a prefix splice.
+    fn open_rename(&mut self) {
+        let Some(node) = self.selected_node() else {
+            self.set_hint(
+                "rename needs a session, window, or pane row",
+                HintLevel::Warn,
+            );
+            return;
+        };
+        let (key, level, original) = match node {
+            TopologyNodeRef::Session(session) => (
+                session.node_key(),
+                RenameLevel::Session,
+                session.name.clone(),
+            ),
+            TopologyNodeRef::Window(window) => {
+                (window.node_key(), RenameLevel::Window, window.name.clone())
+            }
+            TopologyNodeRef::Pane(pane) => (pane.node_key(), RenameLevel::Pane, pane.title.clone()),
+        };
+        if key.endpoint().host != muxa::HostKind::Tmux {
+            self.set_hint("rename is tmux-only for now", HintLevel::Warn);
+            return;
+        }
+        let cursor = original.chars().count();
+        self.rename = Some(RenameComposer {
+            key,
+            level,
+            original: original.clone(),
+            input: original,
+            cursor,
+        });
     }
 
     fn selected_node(&self) -> Option<TopologyNodeRef<'_>> {
@@ -5021,11 +5095,29 @@ fn sort_agents(
 fn session_group_key(host: Option<muxa::HostKind>, session: &str) -> String {
     match host {
         Some(muxa::HostKind::Tmux) => format!("tmux:{session}"),
+        Some(muxa::HostKind::Cmux) => format!("cmux:{session}"),
         Some(muxa::HostKind::Rmux) => format!("rmux:{session}"),
         Some(muxa::HostKind::Herdr) => format!("herdr:{session}"),
         Some(muxa::HostKind::Zellij) => format!("zellij:{session}"),
         None => session.to_string(),
     }
+}
+
+/// Terminals attached to the workspace `info` names, counting the whole
+/// session group.
+///
+/// `attached_clients` is per session, and topology folds a session group into
+/// one node — so the members' counts belong on that node too. Without the sum
+/// a workspace open in two terminals reports one, which is the count for a row
+/// the user is deliberately no longer being shown.
+fn group_attached_clients(info: &SessionInfo, all: &[SessionInfo]) -> u32 {
+    let Some(group) = info.group.as_deref() else {
+        return info.attached_clients;
+    };
+    all.iter()
+        .filter(|member| member.group.as_deref() == Some(group))
+        .map(|member| member.attached_clients)
+        .sum()
 }
 
 fn build_watch_topology(
@@ -5080,7 +5172,12 @@ fn build_watch_topology(
         if let Some(info) = matches.next() {
             if matches.next().is_none() {
                 node.name.clone_from(&info.name);
-                node.attached_clients = Some(info.attached_clients);
+                // `attached_clients` is per session, and topology folded this
+                // node's session group into one row — so the count for the
+                // group's other members belongs here too. Without the sum a
+                // workspace open in two terminals reports one, which is the
+                // number for the row the user is no longer being shown.
+                node.attached_clients = Some(group_attached_clients(info, session_info));
             }
         }
     }
@@ -5439,6 +5536,7 @@ fn rows_multi_host(rows: &[WatchRow]) -> bool {
 fn host_badge_label(host: muxa::HostKind) -> &'static str {
     match host {
         muxa::HostKind::Tmux => "tmux",
+        muxa::HostKind::Cmux => "cmux",
         muxa::HostKind::Rmux => "rmux",
         muxa::HostKind::Zellij => "zellij",
         muxa::HostKind::Herdr => "herdr",
@@ -6542,6 +6640,7 @@ fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
             muxa::backend::herdr::herdr_list_workspaces(&socket)
                 .into_iter()
                 .map(|ws| SessionInfo {
+                    group: None,
                     session_id: ws.id,
                     name: ws.label,
                     // herdr's socket API exposes no client-attach state
@@ -6551,7 +6650,7 @@ fn sessions_for_host(host: muxa::HostKind) -> Vec<SessionInfo> {
                 })
                 .collect()
         }
-        muxa::HostKind::Rmux | muxa::HostKind::Zellij => Vec::new(),
+        muxa::HostKind::Cmux | muxa::HostKind::Rmux | muxa::HostKind::Zellij => Vec::new(),
     }
 }
 
@@ -6768,6 +6867,7 @@ fn current_backend_endpoint(host: muxa::HostKind, pane_id: &str) -> Option<Backe
                 .filter(|socket| !socket.trim().is_empty())
         }),
         muxa::HostKind::Rmux => muxa::backend::rmux::endpoint_from_env(),
+        muxa::HostKind::Cmux => Some(muxa::backend::cmux::endpoint_from_env()),
         muxa::HostKind::Zellij => Some("zellij".into()),
         muxa::HostKind::Herdr => Some("herdr".into()),
     }?;
@@ -7112,6 +7212,21 @@ pub async fn run(
                 }
                 Action::OpenWorkUp => {
                     app.work_composer = Some(WorkComposer::default());
+                }
+                Action::SubmitRename => {
+                    let result = app.rename.as_ref().map(apply_rename);
+                    if let Some(result) = result {
+                        match result {
+                            Ok(message) => {
+                                app.rename = None;
+                                app.set_hint(message, HintLevel::Ok);
+                            }
+                            // Keep the form and its input open so a duplicate,
+                            // invalid value, or transient tmux failure can be
+                            // corrected instead of making the user retype it.
+                            Err(e) => app.set_hint(format!("rename failed: {e}"), HintLevel::Err),
+                        }
+                    }
                 }
                 Action::SubmitWorkUp => {
                     if let Some(work) = app.work_composer.take() {
@@ -7587,6 +7702,7 @@ fn watch_collaboration_origin_from(
     let pane = initial_pane.filter(|pane| !pane.is_empty());
     let socket = pane.as_deref().and_then(|pane| {
         let endpoint = match muxa::backend::pane_id_host_kind(pane)? {
+            muxa::HostKind::Cmux => Some(muxa::backend::cmux::endpoint_from_env()),
             muxa::HostKind::Rmux => rmux,
             muxa::HostKind::Tmux => tmux,
             muxa::HostKind::Zellij | muxa::HostKind::Herdr => None,
@@ -8385,6 +8501,7 @@ pub(crate) enum Action {
     OpenWorkUp,
     /// Run `muxa work up` for whatever the composer holds.
     SubmitWorkUp,
+    SubmitRename,
     None,
     Quit,
     Refresh,
@@ -8580,6 +8697,10 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
             Action::InspectorSplitChanged
         }
         "b" | "mailbox" => Action::OpenCollaborationMailbox,
+        "rename" => {
+            app.open_rename();
+            Action::None
+        }
         "copy" | "yank" => quick_copy_action(app),
         "kill" => quick_kill_action(app),
         "abort" => quick_abort_action(app),
@@ -8721,6 +8842,9 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if app.work_composer.is_some() {
         return handle_work_composer_event(code, modifiers, app);
+    }
+    if app.rename.is_some() {
+        return handle_rename_event(code, modifiers, app);
     }
     if app.ask_composer.is_some() {
         return handle_ask_composer_event(code, modifiers, app);
@@ -8927,6 +9051,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         }
         KeyCode::Char('a') if app.browse_keys_active() => Action::OpenAsk,
         KeyCode::Char('w') if app.browse_keys_active() => Action::OpenWorkUp,
+        KeyCode::Char('R') if app.browse_keys_active() => {
+            app.open_rename();
+            Action::None
+        }
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_work_parent();
@@ -9118,6 +9246,149 @@ fn work_up_window_args(exe: &str, work: &str) -> Vec<String> {
 /// embedded `'`.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Whether `list-windows` output already gives `name` to a *different* window.
+///
+/// Equality on the id, not the name, is what lets a window keep the name it
+/// already has: re-submitting an unchanged prefill must be a no-op, not a
+/// collision with itself.
+fn window_name_taken(listing: &str, window_id: &str, name: &str) -> bool {
+    listing.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(id, current)| id.trim() != window_id && current.trim() == name)
+    })
+}
+
+/// Session names and pane titles are labels, not Work window ids. Preserve
+/// their internal whitespace; applying the window policy here would turn a
+/// pane title such as `Claude review` into `Claude-review` as a side effect of
+/// changing one character.
+fn rename_label(raw: &str, level: RenameLevel) -> std::result::Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("{} cannot be empty", level.label()));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "{} cannot contain control characters",
+            level.label()
+        ));
+    }
+    if value.len() > 64 {
+        return Err(format!("{} is too long (max 64 bytes)", level.label()));
+    }
+    if value.contains("#{") || value.contains("#(") {
+        return Err(format!(
+            "{} cannot contain tmux format expansions",
+            level.label()
+        ));
+    }
+    if level == RenameLevel::Session && value.chars().any(|ch| matches!(ch, '.' | ':')) {
+        return Err("session name cannot contain '.' or ':'".into());
+    }
+    Ok(value.to_string())
+}
+
+/// Apply a rename to tmux. Returns the message to show on success.
+///
+/// Sessions and windows have real names; a pane does not, so `RenameLevel::Pane`
+/// sets the pane *title* — the string watch already displays for a pane, and the
+/// only per-pane label tmux persists.
+fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> {
+    let socket = Some(rename.key.endpoint().socket.as_str());
+    let name = match rename.level {
+        RenameLevel::Window => {
+            crate::tmux_work::normalize_window_name(&rename.input).map_err(|e| e.to_string())?
+        }
+        RenameLevel::Session | RenameLevel::Pane => rename_label(&rename.input, rename.level)?,
+    };
+    let run = |args: &[&str]| -> std::result::Result<(), String> {
+        muxa::tmux::run_control_on(socket, args).map_err(|e| e.to_string())
+    };
+    match (&rename.key, rename.level) {
+        (TopologyNodeKey::Session(session), _) => {
+            run(&["rename-session", "-t", &session.session_id, &name])?;
+        }
+        (TopologyNodeKey::Window(window), _) => {
+            // Session-scoped uniqueness, for the reason tmux targets make it
+            // matter: `session:window` matches names by prefix, so a duplicate
+            // silently addresses the wrong window.
+            let listing = muxa::tmux::capture_control_on(
+                socket,
+                &[
+                    "list-windows",
+                    "-t",
+                    &window.session.session_id,
+                    "-F",
+                    "#{window_id}\t#{window_name}",
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            if window_name_taken(&listing, &window.window_id, &name) {
+                return Err(format!(
+                    "window name {name:?} is already used in this session"
+                ));
+            }
+            // Pin the mode rather than relying on `rename-window` turning
+            // automatic-rename off as a side effect.
+            run(&[
+                "set-window-option",
+                "-t",
+                &window.window_id,
+                "automatic-rename",
+                "off",
+            ])?;
+            run(&["rename-window", "-t", &window.window_id, &name])?;
+        }
+        (TopologyNodeKey::Pane(pane), _) => {
+            run(&["select-pane", "-t", &pane.pane_id, "-T", &name])?;
+        }
+    }
+    Ok(format!("renamed {} to {name:?}", rename.level.label()))
+}
+
+fn handle_rename_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    if code == KeyCode::Backspace
+        && app
+            .rename
+            .as_ref()
+            .is_some_and(|rename| rename.input.is_empty())
+    {
+        app.rename = None;
+        return Action::None;
+    }
+    let Some(rename) = app.rename.as_mut() else {
+        return Action::None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.rename = None;
+            Action::None
+        }
+        KeyCode::Enter => {
+            if rename.input.trim().is_empty() {
+                app.set_hint("a name is required", HintLevel::Warn);
+                Action::None
+            } else if rename.input == rename.original {
+                // Submitting the untouched prefill means "never mind".
+                app.rename = None;
+                Action::None
+            } else {
+                Action::SubmitRename
+            }
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(pasted) = system_clipboard_text() {
+                insert_str_at(&mut rename.input, &mut rename.cursor, &pasted);
+            }
+            Action::None
+        }
+        other => {
+            spawn_edit_text(other, modifiers, &mut rename.input, &mut rename.cursor);
+            Action::None
+        }
+    }
 }
 
 fn handle_work_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
@@ -10393,6 +10664,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         render_ask_panel(f, popup_area, app);
     }
     render_work_composer_overlay(f, chunks[1], app);
+    render_rename_overlay(f, chunks[1], app);
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
@@ -10664,6 +10936,56 @@ fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
 
 /// Draw the `w` composer over `area`, or nothing when it is closed. Folded
 /// into one call so `render` stays inside its line budget.
+fn render_rename_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if app.rename.is_none() {
+        return;
+    }
+    let popup_area = message_composer_rect(area, false);
+    f.render_widget(Clear, popup_area);
+    render_rename(f, popup_area, app);
+}
+
+fn render_rename(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some(rename) = app.rename.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            // The level is in the title because the same key opens the form on
+            // three different things, and "which one is this about" has to be
+            // answerable without looking back at the cursor behind the popup.
+            format!(" rename {} ", rename.level.label()),
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let view = truncate_prompt_input(&rename.input, usize::from(inner.width.saturating_sub(2)));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("> "),
+            Span::raw(view.text.clone()),
+        ]))
+        .block(block),
+        area,
+    );
+    let before: String = view
+        .text
+        .chars()
+        .take(rename.cursor.saturating_sub(view.skipped_chars))
+        .collect();
+    let x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(before.width()).unwrap_or(u16::MAX));
+    if x < inner.x + inner.width {
+        f.set_cursor_position((x, inner.y));
+    }
+}
+
 fn render_work_composer_overlay(f: &mut Frame, area: Rect, app: &App) {
     if app.work_composer.is_none() {
         return;
@@ -15559,6 +15881,7 @@ mod tests {
 
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
@@ -15589,6 +15912,7 @@ mod tests {
         pane_index: u32,
     ) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: Some(socket.into()),
@@ -16597,6 +16921,7 @@ mod tests {
             height: 20,
             active: true,
             command: "codex".into(),
+            alias: None,
         };
         let right = PaneGeometry {
             pane_id: "%2".into(),
@@ -16607,6 +16932,7 @@ mod tests {
             height: 20,
             active: false,
             command: "codex".into(),
+            alias: None,
         };
         let area = Rect::new(10, 4, 80, 12);
 
@@ -16643,6 +16969,7 @@ mod tests {
                         height: 20,
                         active: true,
                         command: "codex".into(),
+                        alias: None,
                     },
                     text: Some(Text::from("LEFT CAPTURE")),
                 },
@@ -16656,6 +16983,7 @@ mod tests {
                         height: 20,
                         active: false,
                         command: "codex".into(),
+                        alias: None,
                     },
                     text: Some(Text::from("RIGHT CAPTURE")),
                 },
@@ -16703,6 +17031,7 @@ mod tests {
                     height: 30,
                     active: true,
                     command: "codex".into(),
+                    alias: None,
                 },
                 text: Some(Text::from("SHOULD USE ROSTER WHEN TOO SHORT")),
             }],
@@ -18335,8 +18664,48 @@ mod tests {
         assert!(dump.contains("review the auth change"));
     }
 
+    fn grouped_session(id: &str, name: &str, attached: u32, group: &str) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            name: name.into(),
+            attached_clients: attached,
+            group: Some(group.into()),
+        }
+    }
+
+    #[test]
+    fn a_folded_workspace_counts_every_terminal_on_it() {
+        // Two terminals on one workspace via a session group: tmux reports one
+        // attached client per member, and topology shows the members as a
+        // single node. Reporting either member's own count would understate
+        // the workspace by exactly the terminals the group exists to allow.
+        let all = vec![
+            grouped_session("$0", "callabo", 1, "callabo"),
+            grouped_session("$1", "view~9~callabo", 1, "callabo"),
+            fake_session("$2", "unrelated", 3),
+        ];
+        assert_eq!(group_attached_clients(&all[0], &all), 2);
+        // Either member answers for the whole group — the caller does not have
+        // to know which one topology kept.
+        assert_eq!(group_attached_clients(&all[1], &all), 2);
+        // An ungrouped session is only ever itself.
+        assert_eq!(group_attached_clients(&all[2], &all), 3);
+    }
+
+    #[test]
+    fn a_detached_group_member_adds_nothing() {
+        // A view whose terminal has gone is still a session until tmux reaps
+        // it. It must not inflate the count while it lingers.
+        let all = vec![
+            grouped_session("$0", "callabo", 1, "callabo"),
+            grouped_session("$1", "view~9~callabo", 0, "callabo"),
+        ];
+        assert_eq!(group_attached_clients(&all[0], &all), 1);
+    }
+
     fn fake_session(id: &str, name: &str, attached_clients: u32) -> SessionInfo {
         SessionInfo {
+            group: None,
             session_id: id.into(),
             name: name.into(),
             attached_clients,
@@ -20010,6 +20379,7 @@ sort = ["state"]
     #[test]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
@@ -22269,6 +22639,9 @@ sort = ["state"]
             // The real handler shells out to tmux; the test harness stops at
             // the state change so nothing spawns a window.
             Action::SubmitWorkUp => app.work_composer = None,
+            // Same reasoning: the run loop applies the rename through tmux, so
+            // the harness only takes the composer the way the run loop does.
+            Action::SubmitRename => app.rename = None,
             Action::TogglePreviewMode => {
                 if let Some(p) = app.preview.as_mut() {
                     p.mode = match p.mode {
@@ -23114,6 +23487,126 @@ sort = ["state"]
         app
     }
 
+    fn rename_app(level: RenameLevel, original: &str) -> App {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.rename = Some(RenameComposer {
+            key: TopologyNodeKey::Window(muxa::WindowKey {
+                session: muxa::SessionKey {
+                    endpoint: muxa::BackendEndpoint {
+                        host: muxa::HostKind::Tmux,
+                        socket: "default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@4".into(),
+            }),
+            level,
+            original: original.into(),
+            input: original.into(),
+            cursor: original.chars().count(),
+        });
+        app
+    }
+
+    #[test]
+    fn rename_submitting_an_untouched_prefill_is_a_cancel() {
+        // The form opens prefilled, so Enter on an unchanged field is the most
+        // likely accident in it. Renaming a window to the name it already has
+        // would still pin `automatic-rename off` as a side effect, which is a
+        // real change nobody asked for.
+        let mut app = rename_app(RenameLevel::Window, "cal-7306");
+        let action = handle_rename_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(app.rename.is_none(), "the form closes");
+    }
+
+    #[test]
+    fn rename_submits_only_a_changed_name() {
+        let mut app = rename_app(RenameLevel::Window, "cal-7306");
+        {
+            let rename = app.rename.as_mut().expect("form is open");
+            spawn_edit_text(
+                KeyCode::Char('!'),
+                KeyModifiers::NONE,
+                &mut rename.input,
+                &mut rename.cursor,
+            );
+        }
+        let action = handle_rename_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::SubmitRename));
+        // The composer survives until the run loop takes it — the apply needs
+        // the key it captured when the form opened.
+        assert!(app.rename.is_some());
+    }
+
+    #[test]
+    fn rename_refuses_an_empty_name_without_closing() {
+        let mut app = rename_app(RenameLevel::Session, "callabo");
+        app.rename.as_mut().unwrap().input.clear();
+        app.rename.as_mut().unwrap().cursor = 0;
+        // Enter on an empty field warns rather than submitting; Backspace on
+        // an empty field is the deliberate way out.
+        let action = handle_rename_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(
+            app.rename.is_some(),
+            "an empty name must not close the form"
+        );
+        handle_rename_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app);
+        assert!(app.rename.is_none());
+    }
+
+    #[test]
+    fn rename_escape_abandons_the_edit() {
+        let mut app = rename_app(RenameLevel::Pane, "claude");
+        app.rename.as_mut().unwrap().input.push_str("-review");
+        handle_rename_event(KeyCode::Esc, KeyModifiers::NONE, &mut app);
+        assert!(app.rename.is_none());
+    }
+
+    #[test]
+    fn window_name_taken_excludes_the_window_being_renamed() {
+        let listing = "@1\tbuild\n@4\tcal-7306\n@9\treview\n";
+        // Keeping your own name is not a collision with yourself.
+        assert!(!window_name_taken(listing, "@4", "cal-7306"));
+        // Another window holding it is.
+        assert!(window_name_taken(listing, "@4", "review"));
+        // Free names are free.
+        assert!(!window_name_taken(listing, "@4", "cal-7307"));
+        // Whole-field equality, never a prefix: `build` must not match
+        // `build-2`, or a rename would be refused against a name nobody has.
+        assert!(!window_name_taken(listing, "@4", "build-2"));
+    }
+
+    #[test]
+    fn rename_level_names_what_tmux_actually_changes() {
+        // A pane has no name in tmux; the form says "pane title" so the label
+        // matches the thing that ends up different.
+        assert_eq!(RenameLevel::Session.label(), "session");
+        assert_eq!(RenameLevel::Window.label(), "window");
+        assert_eq!(RenameLevel::Pane.label(), "pane title");
+    }
+
+    #[test]
+    fn rename_rules_preserve_label_spaces_but_normalize_window_spaces() {
+        assert_eq!(
+            rename_label(" Claude review updated ", RenameLevel::Pane).unwrap(),
+            "Claude review updated"
+        );
+        assert_eq!(
+            rename_label("two terminals", RenameLevel::Session).unwrap(),
+            "two terminals"
+        );
+        assert_eq!(
+            crate::tmux_work::normalize_window_name("CAL-1 review").unwrap(),
+            "CAL-1-review"
+        );
+        assert!(rename_label("bad:name", RenameLevel::Session).is_err());
+        assert!(rename_label("bad\ntitle", RenameLevel::Pane).is_err());
+        assert!(rename_label("#{session_name}", RenameLevel::Pane).is_err());
+        assert!(rename_label(&"a".repeat(65), RenameLevel::Pane).is_err());
+    }
+
     #[test]
     fn kill_action_disabled_for_paneless_row() {
         let mut app = app_with_paneless_and_pane();
@@ -23385,7 +23878,7 @@ sort = ["state"]
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
-        assert!(body.contains("n / w          new window or agent pane / work up a pipeline"));
+        assert!(body.contains("n / w / R      new window/pane / work up / rename the row"));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.

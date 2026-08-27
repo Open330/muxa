@@ -492,13 +492,14 @@ fn sessions_for_backend(kind: HostKind) -> Vec<SessionInfo> {
             muxa::backend::herdr::herdr_list_workspaces(&socket)
                 .into_iter()
                 .map(|workspace| SessionInfo {
+                    group: None,
                     session_id: workspace.id,
                     name: workspace.label,
                     attached_clients: 0,
                 })
                 .collect()
         }
-        HostKind::Rmux | HostKind::Zellij => Vec::new(),
+        HostKind::Cmux | HostKind::Rmux | HostKind::Zellij => Vec::new(),
     }
 }
 

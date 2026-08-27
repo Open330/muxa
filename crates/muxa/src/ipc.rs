@@ -130,6 +130,12 @@ pub enum RuntimeError {
 
     #[error("ipc request timed out after {0:?}")]
     Timeout(Duration),
+
+    /// The daemon answered, and said no. Carries the server's own message so
+    /// a refusal reaches the user as a refusal instead of being flattened
+    /// into an empty result — see [`decode_agents`].
+    #[error("{0}")]
+    Daemon(String),
 }
 
 impl RuntimeError {
@@ -145,6 +151,15 @@ enum RequestBody {
         event: AgentEvent,
     },
     Snapshot,
+    /// Ask the room's namespace arbiter for a handle. The daemon is the only
+    /// place that sees pane options, registered identities, and handles
+    /// promised to callers that have not written them yet.
+    CollaborationIssueHandle {
+        pane: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<String>,
+        request: collaboration::HandleRequest,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     /// Create or update one desired Run and reconcile live pane evidence.
@@ -449,6 +464,7 @@ const CAPABILITIES: &[&str] = &[
     "fleet_v1",
     "fleet_subscribe",
     "pipeline_runs_v1",
+    "handle_namespace_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -508,6 +524,10 @@ pub struct Response {
     pub submitted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomContext>,
+    /// Handle issued by the room's namespace arbiter. Absent when the room
+    /// had no free name, or when the pane could not be placed in one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_requests: Option<Vec<CollaborationRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,6 +578,7 @@ impl Response {
             sent: None,
             submitted: None,
             room: None,
+            handle: None,
             collaboration_requests: None,
             collaboration_request: None,
             ask_entries: None,
@@ -657,6 +678,11 @@ impl Response {
         let mut r = Self::ok();
         r.sent = Some(sent);
         r.submitted = Some(submitted);
+        r
+    }
+    fn with_handle(handle: Option<String>) -> Self {
+        let mut r = Self::ok();
+        r.handle = handle;
         r
     }
     fn with_room(room: RoomContext) -> Self {
@@ -1393,6 +1419,24 @@ struct CollaborationTopology {
 }
 
 impl CollaborationTopology {
+    /// The room a pane belongs to, whether or not it hosts a tracked agent.
+    /// A handle is allocated at session start, which is exactly when the pane
+    /// may not be a participant yet.
+    fn room_of(&self, pane: &str, socket: Option<&str>) -> Option<collaboration::RoomId> {
+        self.panes
+            .iter()
+            .find(|info| info.pane_id == pane)
+            .map(|info| {
+                collaboration::room_of_pane(
+                    pane,
+                    info,
+                    socket
+                        .map(ToString::to_string)
+                        .or_else(|| info.socket.clone()),
+                )
+            })
+    }
+
     fn resolve_origin(
         &self,
         origin: &CollaborationOrigin,
@@ -1796,19 +1840,18 @@ async fn handle(
                 }
                 RequestBody::Ingest { event } => {
                     kind = "ingest";
-                    // Drop events from tmux servers outside the configured
-                    // `MUXA_TMUX_SOCKET` scope. muxa's agent hooks are
-                    // installed globally, so an agent another multiplexer
-                    // (e.g. cmux) launched on its own server would otherwise
-                    // register here with pane ids muxa can't correlate —
-                    // unmappable `%NN` ghost rows. Ack it either way so the
-                    // agent's hook never sees an error on its critical path.
+                    // Drop only tmux events from servers outside the configured
+                    // `MUXA_TMUX_SOCKET` scope. Namespaced non-tmux panes have
+                    // their own endpoint rules and must not be compared with a
+                    // tmux socket path (notably cmux, which also retains a full
+                    // Unix-socket endpoint). Ack it either way so the agent's
+                    // hook never sees an error on its critical path.
                     let pane_host = event
                         .id()
                         .pane
                         .as_deref()
                         .and_then(crate::backend::pane_id_host_kind);
-                    let in_scope = pane_host == Some(HostKind::Rmux)
+                    let in_scope = pane_host.is_some_and(|host| host != HostKind::Tmux)
                         || crate::tmux::scanner::event_tmux_socket_in_scope(
                             event.id().tmux_socket.as_deref(),
                         );
@@ -2184,6 +2227,28 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationIssueHandle {
+                    pane,
+                    socket,
+                    request,
+                } => {
+                    kind = "collaboration_issue_handle";
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    match topology.room_of(&pane, socket.as_deref()) {
+                        Some(room) => match collaboration
+                            .issue_handle(&room, &pane, &topology.participants, request)
+                            .await
+                        {
+                            Ok(handle) => Response::with_handle(handle),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        // A pane the scan cannot place has no room, so it has
+                        // no namespace to allocate from. The caller falls back
+                        // to leaving it unnamed rather than guessing.
+                        None => Response::with_handle(None),
+                    }
+                }
                 RequestBody::CollaborationSetIdentity {
                     origin,
                     alias,
@@ -2522,14 +2587,14 @@ async fn handle(
                             // Best-effort: a name collision with a real agent
                             // just skips the task row, the session still runs.
                             let _ = store
-                                .register_task(
+                                .register_surface_task(
                                     session
                                         .display_name
                                         .clone()
                                         .unwrap_or_else(|| session.id.clone()),
                                     session.pid,
                                     session.cwd.clone(),
-                                    None,
+                                    session.surface(),
                                     None,
                                 )
                                 .await;
@@ -2651,6 +2716,75 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 }
 
 /// After `UnixListener::bind`, chmod the path so only the owner can connect.
+/// One blocking request/response against the daemon, for callers that have no
+/// runtime to await on.
+///
+/// `agent_launch::start` and the `work up` pipeline stamp a pane's explicit
+/// alias from synchronous code that is reached from both async and blocking
+/// contexts, and threading a runtime through every one of them to register a
+/// name would be a large change in service of one small call. The wire is
+/// line-delimited JSON over a Unix socket, so a synchronous client is a
+/// connect, a write, and a read.
+///
+/// Every failure is `None`: the caller's job is to name a pane, and losing
+/// the daemon means it names it without the arbiter's blessing rather than
+/// not at all.
+pub fn blocking_call(
+    socket_path: &Path,
+    req: &serde_json::Value,
+    deadline: Duration,
+) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader as SyncBufReader, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
+    stream.set_read_timeout(Some(deadline)).ok()?;
+    stream.set_write_timeout(Some(deadline)).ok()?;
+    let mut bytes = serde_json::to_vec(req).ok()?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).ok()?;
+    stream.flush().ok()?;
+    let mut line = String::new();
+    let read = SyncBufReader::new(&stream).read_line(&mut line).ok()?;
+    if read == 0 {
+        return None;
+    }
+    serde_json::from_str(&line).ok()
+}
+
+/// Register an explicit alias with the room's namespace arbiter.
+///
+/// `Ok(())` means the room accepted it, `Err` that another pane already
+/// answers to that name. `Ok(())` is also what a missing or older daemon
+/// yields — an explicit alias comes from the user's own configuration, so a
+/// daemon that cannot referee is no reason to refuse to honour it.
+pub fn blocking_reserve_handle(
+    socket_path: &Path,
+    pane: &str,
+    handle: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    let req = serde_json::json!({
+        "protocol": PROTOCOL_VERSION,
+        "kind": "collaboration_issue_handle",
+        "pane": pane,
+        "request": { "reserve": { "handle": handle } },
+    });
+    let Some(resp) = blocking_call(socket_path, &req, deadline) else {
+        return Ok(());
+    };
+    if resp["ok"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    match resp["error"].as_str() {
+        Some(message) if message.contains("already used by a live peer") => {
+            Err(message.to_string())
+        }
+        // Anything else is the daemon failing to referee rather than
+        // refusing: an unknown request kind on an older build, a room it
+        // cannot resolve. Honour the caller's own configuration.
+        _ => Ok(()),
+    }
+}
+
 pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(socket_path, perms)
@@ -2729,12 +2863,44 @@ fn collaboration_wait_is_unsupported(error: &str) -> bool {
     error.contains("unknown variant") && error.contains("collaboration_wait")
 }
 
-fn decode_agents(resp: &serde_json::Value) -> Vec<Agent> {
-    resp["agents"]
-        .as_array()
-        .cloned()
-        .map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default())
-        .unwrap_or_default()
+/// Build the error for an `ok: false` response, from the daemon's own message.
+///
+/// A protocol mismatch gets a hint appended. It is the one refusal whose
+/// message names a cause the reader cannot act on — two version numbers say
+/// nothing about which half is stale or how to move it — and it is the
+/// refusal a mixed install produces every single call.
+fn response_error(resp: &serde_json::Value) -> RuntimeError {
+    let message = resp["error"].as_str().unwrap_or("request failed");
+    if message.starts_with("protocol mismatch") {
+        RuntimeError::Daemon(format!(
+            "{message} — the running daemon is older than this CLI. \
+             Restart it: `muxa upgrade` (add `--no-pull` to rebuild the current source)"
+        ))
+    } else {
+        RuntimeError::Daemon(message.to_string())
+    }
+}
+
+/// Decode the `agents` array out of a response, or surface the daemon's error.
+///
+/// The `ok` check is the point. A refusal and a genuinely empty registry are
+/// indistinguishable to a lenient decoder — neither carries an `agents` array
+/// — so returning `Vec::new()` for both turned every failure into "no active
+/// agents": a confident, wrong, and perfectly stable answer that looks like
+/// news about the user's agents rather than a broken connection.
+///
+/// Measured on a live host: a `muxad` built before the protocol 5 bump
+/// answered `protocol mismatch: server=4 client=5` to every request, and
+/// `muxa status` reported no agents for a full day while 58 were registered
+/// and the daemon was writing all 58 to its state snapshot every 30 seconds.
+fn decode_agents(resp: &serde_json::Value) -> Result<Vec<Agent>, RuntimeError> {
+    if !resp["ok"].as_bool().unwrap_or(false) {
+        return Err(response_error(resp));
+    }
+    let Some(agents) = resp["agents"].as_array().cloned() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(serde_json::Value::Array(agents)).map_err(RuntimeError::Json)
 }
 
 impl TransitionStream {
@@ -2834,7 +3000,7 @@ impl Client {
     pub async fn snapshot(&self) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     /// Read the central physical-host cache. This is a local Unix-socket
@@ -3048,6 +3214,39 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Ask the room's arbiter for a handle for `pane`.
+    ///
+    /// `Ok(None)` covers every "carry on without a name" case — no free name,
+    /// a pane the daemon cannot place, or a daemon too old to know the
+    /// request — so callers do not have to tell them apart. `Err` is reserved
+    /// for a `Reserve` the room refused, which the caller does need to see.
+    pub async fn collaboration_issue_handle(
+        &self,
+        pane: &str,
+        socket: Option<&str>,
+        request: &crate::collaboration::HandleRequest,
+        deadline: Duration,
+    ) -> Result<Option<String>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_issue_handle",
+            "pane": pane,
+            "socket": socket,
+            "request": request,
+        });
+        // A daemon that predates the arbiter cannot referee the namespace, and
+        // naming a pane without one is what this change exists to stop.
+        // Leaving it unnamed costs a `%1242`.
+        let Ok(resp) = self.call_with_timeout(&req, deadline).await else {
+            return Ok(None);
+        };
+        if resp["ok"].as_bool() != Some(true) {
+            let message = resp["error"].as_str().unwrap_or("issue handle failed");
+            return Err(RuntimeError::Daemon(message.to_string()));
+        }
+        Ok(resp["handle"].as_str().map(ToString::to_string))
     }
 
     pub async fn collaboration_set_identity(
@@ -3287,7 +3486,7 @@ impl Client {
     ) -> Result<Vec<Agent>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call_with_timeout(&req, deadline).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     pub async fn pipeline_runs(&self) -> Result<Vec<PipelineRun>, RuntimeError> {
@@ -3394,7 +3593,7 @@ impl Client {
             "pane": pane
         });
         let resp = self.call(&req).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     pub async fn by_pane_with_timeout(
@@ -3408,7 +3607,7 @@ impl Client {
             "pane": pane
         });
         let resp = self.call_with_timeout(&req, deadline).await?;
-        Ok(decode_agents(&resp))
+        decode_agents(&resp)
     }
 
     /// [`Self::recent_prompts`] under an explicit deadline, for callers on
@@ -3770,12 +3969,9 @@ impl Client {
         if resp["ok"].as_bool().unwrap_or(false) {
             Ok(resp)
         } else {
-            Err(RuntimeError::Json(serde::de::Error::custom(
-                resp["error"]
-                    .as_str()
-                    .unwrap_or("request failed")
-                    .to_string(),
-            )))
+            // One error shape for every refusal, so a protocol mismatch reads
+            // the same here as it does through `decode_agents`.
+            Err(response_error(&resp))
         }
     }
 }
@@ -3788,6 +3984,59 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
     use time::OffsetDateTime;
+
+    #[test]
+    fn decode_agents_surfaces_a_refusal_instead_of_an_empty_registry() {
+        // The regression this guards: an `ok:false` response carries no
+        // `agents` array, and the lenient decoder read that absence as "no
+        // agents". A refusal must not be able to impersonate an answer.
+        let resp = serde_json::json!({ "ok": false, "error": "store unavailable" });
+        let error = decode_agents(&resp).expect_err("a refusal must not decode as agents");
+        assert!(
+            matches!(&error, RuntimeError::Daemon(message) if message == "store unavailable"),
+            "expected the daemon's own message, got: {error}"
+        );
+    }
+
+    #[test]
+    fn decode_agents_explains_a_protocol_mismatch() {
+        // Two bare version numbers do not tell the reader which half is stale
+        // or what to do about it, and a mixed install answers this to every
+        // single call — so this is the one refusal that earns a hint.
+        let resp = serde_json::json!({
+            "ok": false,
+            "error": "protocol mismatch: server=4 client=5",
+        });
+        let error = decode_agents(&resp).expect_err("a mismatch must not decode as agents");
+        let message = error.to_string();
+        assert!(
+            message.contains("protocol mismatch: server=4 client=5"),
+            "{message}"
+        );
+        assert!(message.contains("older than this CLI"), "{message}");
+        assert!(message.contains("muxa upgrade"), "{message}");
+    }
+
+    #[test]
+    fn decode_agents_keeps_a_genuinely_empty_registry_empty() {
+        // The other half of the distinction: a successful response really can
+        // carry no agents, and that must still read as none rather than as an
+        // error. Both the explicit empty array and an absent field count.
+        assert!(
+            decode_agents(&serde_json::json!({ "ok": true, "agents": [] }))
+                .expect("an empty registry is a valid answer")
+                .is_empty()
+        );
+        assert!(decode_agents(&serde_json::json!({ "ok": true }))
+            .expect("an absent agents field is a valid answer")
+            .is_empty());
+    }
+
+    #[test]
+    fn response_error_falls_back_when_the_daemon_sends_no_message() {
+        let error = response_error(&serde_json::json!({ "ok": false }));
+        assert_eq!(error.to_string(), "request failed");
+    }
 
     struct CollaborationTestBackend {
         panes: Vec<PaneInfo>,
@@ -3832,6 +4081,7 @@ mod tests {
 
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             pane_id: pane_id.into(),
@@ -5075,6 +5325,7 @@ mod tests {
         assert!(backend.list_panes().is_empty());
 
         let pane = PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,

@@ -33,7 +33,7 @@ use super::{command_output_with_timeout, tmux_command, TMUX_COMMAND_TIMEOUT};
 
 /// `tmux -F` columns behind [`current_window_panes`]. Tab-separated,
 /// parsed by [`parse_pane_geometry_lines`].
-const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_current_command}";
+const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_current_command}\t#{@muxa_agent_alias}";
 
 /// `tmux -F` columns behind [`current_window_frame`].
 const FRAME_FMT: &str =
@@ -55,6 +55,16 @@ pub struct PaneGeometry {
     /// Foreground command (`zsh`, `claude`, …). The fallback label for a
     /// pane muxa has no agent row for.
     pub command: String,
+    /// The pane's room-local handle (`claude`, `reviewer`), read straight
+    /// off `@muxa_agent_alias`.
+    ///
+    /// This is the *slot's* name — what the launcher declared about the
+    /// pane, which is also what muxa mints when nobody else did. An agent
+    /// that later registers its own identity through the daemon overrides
+    /// it for routing purposes without rewriting the option, so treat this
+    /// as the durable label rather than as the last word on where a peer
+    /// call lands.
+    pub alias: Option<String>,
 }
 
 /// Client/window dimensions needed to place window-relative pane
@@ -128,6 +138,11 @@ pub fn parse_pane_geometry_lines(stdout: &str) -> (Vec<PaneGeometry>, bool) {
             height,
             active: is_flag_set(cols[6]),
             command: cols.get(8).map(|s| (*s).to_string()).unwrap_or_default(),
+            alias: cols
+                .get(9)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string),
         });
     }
     (panes, zoomed)

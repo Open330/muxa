@@ -380,9 +380,9 @@ enum MsgCmd {
 
 #[derive(Debug, Subcommand)]
 enum AgentCmd {
-    /// Start an allowlisted agent in a detached pane, window, or session.
+    /// Start an allowlisted agent in tmux or a muxa-owned PTY session.
     Start(agent_launch::StartArgs),
-    /// Interrupt or terminate one muxa-managed agent pane.
+    /// Interrupt or terminate one muxa-managed tmux pane or native PTY session.
     Control(tmux_work::AgentControlArgs),
 }
 
@@ -428,6 +428,9 @@ enum WorkspaceCmd {
     Show(tmux_work::WorkspaceShowArgs),
     /// Close a workspace session, including every work and agent.
     Close(tmux_work::WorkspaceCloseArgs),
+    /// Give this terminal its own view of a workspace, so two terminals on one
+    /// session stop following each other's window switches.
+    View(tmux_work::WorkspaceViewArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -552,10 +555,10 @@ impl WatchSortArg {
     }
 }
 
-fn run_agent_cmd(action: AgentCmd) -> Result<()> {
+async fn run_agent_cmd(action: AgentCmd, client: &Client, socket_path: &Path) -> Result<()> {
     match action {
-        AgentCmd::Start(args) => agent_launch::run(args),
-        AgentCmd::Control(args) => tmux_work::run_agent_control(args),
+        AgentCmd::Start(args) => agent_launch::run(args, client, socket_path).await,
+        AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
     }
 }
 
@@ -588,6 +591,7 @@ fn run_workspace_cmd(action: WorkspaceCmd) -> Result<()> {
         WorkspaceCmd::List(args) => tmux_work::run_workspace_list(args),
         WorkspaceCmd::Show(args) => tmux_work::run_workspace_show(args),
         WorkspaceCmd::Close(args) => tmux_work::run_workspace_close(args),
+        WorkspaceCmd::View(args) => tmux_work::run_workspace_view(args),
     }
 }
 
@@ -654,7 +658,7 @@ async fn main() -> Result<()> {
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
-        Cmd::Agent { action } => run_agent_cmd(action),
+        Cmd::Agent { action } => run_agent_cmd(action, &client, &socket).await,
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
@@ -1145,7 +1149,7 @@ async fn cmd_run(
     Ok(())
 }
 
-fn caller_env(socket_path: &Path) -> Vec<(String, String)> {
+pub(crate) fn caller_env(socket_path: &Path) -> Vec<(String, String)> {
     let mut env = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect::<Vec<_>>();
@@ -1312,7 +1316,7 @@ fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
 }
 
 /// Jump to (or list) the agent that needs you. `attend::run` picks the
-/// pane — reusing the same selection that drives `--list` — and we perform
+/// pane and endpoint — reusing the same selection that drives `--list` — and we perform
 /// the actual focus through `jump_to_pane`, the identical machinery the
 /// `muxa watch` Enter action uses, so a jump lands the same way from both.
 async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
@@ -1320,8 +1324,16 @@ async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
     // a human is jumpable from a tmux-primary shell (and vice versa). The
     // jump itself dispatches per-row in `jump_to_pane`.
     let panes = all_panes().await;
-    if let Some(pane) = attend::run(client, panes, args).await? {
-        jump_to_pane(&pane);
+    if let Some(target) = attend::run(client, panes, args).await? {
+        if muxa::backend::pane_id_host_kind(&target.pane) == Some(muxa::HostKind::Cmux) {
+            let backend = target.endpoint.map_or_else(
+                muxa::backend::cmux::CmuxBackend::new,
+                muxa::backend::cmux::CmuxBackend::with_endpoint,
+            );
+            jump_to_pane_cmux(&backend, &target.pane);
+        } else {
+            jump_to_pane(&target.pane);
+        }
     }
     Ok(())
 }
@@ -1637,6 +1649,10 @@ fn jump_to_pane(pane_id: &str) {
     match kind {
         // tmux jumps go straight through `tmux::` helpers and need no backend.
         muxa::HostKind::Tmux => jump_to_pane_tmux(pane_id),
+        muxa::HostKind::Cmux => {
+            let backend = backend_for_dispatch(kind, &fallback);
+            jump_to_pane_cmux(backend.as_ref(), pane_id);
+        }
         muxa::HostKind::Rmux => {
             let backend = backend_for_dispatch(kind, &fallback);
             jump_to_pane_rmux(backend.as_ref(), pane_id);
@@ -1655,10 +1671,103 @@ fn jump_to_pane(pane_id: &str) {
 fn jump_to_topology_pane(key: &muxa::PaneKey) {
     match key.window.session.endpoint.host {
         muxa::HostKind::Tmux => jump_to_pane_tmux_key(key),
+        muxa::HostKind::Cmux => {
+            let backend = muxa::backend::cmux::CmuxBackend::with_endpoint(
+                key.window.session.endpoint.socket.clone(),
+            );
+            jump_to_pane_cmux(&backend, &key.pane_id);
+        }
         muxa::HostKind::Rmux | muxa::HostKind::Zellij | muxa::HostKind::Herdr => {
             jump_to_pane(&key.pane_id);
         }
     }
+}
+
+/// Address for the *window* half of a jump.
+///
+/// `switch-client -t %pane` names a pane but not a session, and tmux fills the
+/// gap from recent client activity. That is unambiguous only while every
+/// window belongs to exactly one session. A **session group** — created by
+/// `tmux new-session -t <session>`, the supported way to keep two terminals on
+/// two different windows of one workspace — links the same window into every
+/// session in the group, and there the guess is routinely wrong. Measured on
+/// tmux 3.4 with two attached clients: jumping client A pulled it out of its
+/// own session into the grouped sibling and dragged client B's view along with
+/// it, re-coupling the two terminals the group exists to separate.
+///
+/// `<session_id>:<window_id>` closes the gap. Both are backend-native ids, so
+/// neither can prefix-match a neighbouring object the way session *names* do
+/// (`callabo` against `callabo-set`), and together they name exactly one
+/// window in exactly one session. Falls back to the bare pane id when no
+/// session id is known, which is the behaviour every jump had before.
+fn window_target(session_id: Option<&str>, window_id: &str, pane_id: &str) -> String {
+    match session_id {
+        Some(session) if !session.is_empty() && !window_id.is_empty() => {
+            format!("{session}:{window_id}")
+        }
+        _ => pane_id.to_string(),
+    }
+}
+
+/// Session target for `attach-session`: the stable `$N` id when the scan
+/// carried one, else the session name.
+///
+/// Ids are exact. Names match by prefix unless anchored with `=`, and real
+/// session sets collide — `callabo` also matches `callabo-set`, so a
+/// name-targeted attach can hand the terminal to the wrong workspace. The
+/// name stays as a fallback only because a row parsed from an older
+/// `PANE_FMT` has no session id to use.
+fn session_target<'a>(session_id: &'a str, session_name: &'a str) -> &'a str {
+    if session_id.is_empty() {
+        session_name
+    } else {
+        session_id
+    }
+}
+
+/// Choose which session a jump should address, given the asking client's
+/// current session and the session recorded for the target pane.
+///
+/// Prefers the client's own session whenever the target window is linked into
+/// it: inside a session group that makes the jump a pure window change, so no
+/// sibling session — and therefore no other terminal — moves. Otherwise this
+/// is a genuine cross-session jump, and `pane_session` names a definite
+/// destination where tmux would otherwise pick one from client activity.
+///
+/// `window_linked` is the membership probe, taken as a closure so the decision
+/// is testable without a tmux server, and called *only* when it can change the
+/// answer. Identical session ids already imply membership — the ordinary
+/// same-session jump — so that case is answered without a round trip.
+///
+/// `None` only when neither session is known, leaving [`window_target`] to
+/// fall back to the bare pane id.
+fn resolve_jump_session(
+    client_session: Option<String>,
+    pane_session: &str,
+    window_linked: impl FnOnce(&str) -> bool,
+) -> Option<String> {
+    let fallback = || (!pane_session.is_empty()).then(|| pane_session.to_string());
+    let Some(client_session) = client_session.filter(|session| !session.is_empty()) else {
+        return fallback();
+    };
+    if client_session == pane_session || window_linked(&client_session) {
+        return Some(client_session);
+    }
+    fallback()
+}
+
+/// [`resolve_jump_session`] wired to tmux on the server named by `socket`.
+fn jump_session_id(
+    socket: Option<&str>,
+    client: Option<&str>,
+    window_id: &str,
+    pane_session: &str,
+) -> Option<String> {
+    resolve_jump_session(
+        client.and_then(|client| muxa::tmux::client_session_id_on(socket, client)),
+        pane_session,
+        |session| muxa::tmux::window_in_session_on(socket, session, window_id),
+    )
 }
 
 fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
@@ -1671,17 +1780,35 @@ fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
     };
     if tmux::inside_tmux() {
         let pinned = CALLER_CLIENT.get().cloned().or_else(tmux::current_client);
+        // Address the window by session, not just by pane — see `window_target`.
+        let session = jump_session_id(
+            socket,
+            pinned.as_deref(),
+            &key.window.window_id,
+            &key.window.session.session_id,
+        );
+        let target = window_target(session.as_deref(), &key.window.window_id, pane);
         if let Some(client) = pinned.as_deref() {
-            run(&["switch-client", "-c", client, "-t", pane]);
+            run(&["switch-client", "-c", client, "-t", &target]);
         } else {
-            run(&["switch-client", "-t", pane]);
+            run(&["switch-client", "-t", &target]);
         }
-        run(&["select-window", "-t", pane]);
+        run(&["select-window", "-t", &target]);
         run(&["select-pane", "-t", pane]);
         return;
     }
 
-    run(&["select-window", "-t", pane]);
+    // Pre-position the session we are about to attach to. Its id is already
+    // in the key, so qualify the window with it rather than letting a bare
+    // pane id send `select-window` at a grouped sibling — that would move a
+    // window in a session some *other* terminal is looking at, before this
+    // terminal has even attached.
+    let target = window_target(
+        Some(key.window.session.session_id.as_str()),
+        &key.window.window_id,
+        pane,
+    );
+    run(&["select-window", "-t", &target]);
     run(&["select-pane", "-t", pane]);
     match muxa::tmux::tmux_command_on(socket)
         .args([
@@ -1729,6 +1856,7 @@ fn backend_for_dispatch(
 pub(crate) fn backend_for_kind(kind: muxa::HostKind) -> muxa::SharedBackend {
     match kind {
         muxa::HostKind::Tmux => std::sync::Arc::new(muxa::TmuxBackend::new()),
+        muxa::HostKind::Cmux => std::sync::Arc::new(muxa::backend::cmux::CmuxBackend::new()),
         muxa::HostKind::Rmux => std::sync::Arc::new(muxa::RmuxBackend::new()),
         muxa::HostKind::Zellij => std::sync::Arc::new(muxa::ZellijBackend::new()),
         muxa::HostKind::Herdr => std::sync::Arc::new(muxa::backend::herdr::HerdrBackend::new()),
@@ -1787,10 +1915,11 @@ fn jump_to_pane_tmux(pane_id: &str) {
         return;
     };
     if tmux::inside_tmux() {
-        // One command, addressed by pane id, pinned to the asking client.
+        // Switch after pre-positioning, addressed by stable ids, pinned to
+        // the asking client.
         //
-        // Each of those three matters, and the previous version had none
-        // of them. It pre-positioned with `select-window -t "<name>:<idx>"`
+        // Each of those three matters, and the version before them had
+        // none. It pre-positioned with `select-window -t "<name>:<idx>"`
         // *before* switching anyone: that mutates the target session's
         // current window immediately, so any other terminal already
         // attached to that session jumped on the spot — a window the user
@@ -1802,38 +1931,53 @@ fn jump_to_pane_tmux(pane_id: &str) {
         // activity, which with two terminals attached is routinely the
         // other one.
         //
-        // `switch-client -t <pane-id>` resolves session, window and pane
-        // together from an identifier that cannot be ambiguous, and only
-        // for the client we name.
+        // A pane id alone is *not* the unambiguous identifier it looks
+        // like. It names one pane, but `switch-client` needs a session,
+        // and a window can be linked into more than one — that is exactly
+        // what a session group is. `window_target` explains what tmux does
+        // with the ambiguity and why the answer is wrong often enough to
+        // matter. Address the window by `<session_id>:<window_id>` instead.
         // Prefer the binding-expanded client: it names who pressed the key.
         // `current_client()` is an activity-based guess and only acceptable
         // when nothing better exists (an old binding without the flag);
         // unpinned is last, safe only when a single client is attached.
         let pinned = CALLER_CLIENT.get().cloned().or_else(tmux::current_client);
+        let session = jump_session_id(None, pinned.as_deref(), &info.window_id, &info.session_id);
+        let target = window_target(session.as_deref(), &info.window_id, pane_id);
         if let Some(client) = pinned {
-            run_tmux(&["switch-client", "-c", &client, "-t", pane_id]);
+            run_tmux(&["switch-client", "-c", &client, "-t", &target]);
         } else {
-            run_tmux(&["switch-client", "-t", pane_id]);
+            run_tmux(&["switch-client", "-t", &target]);
         }
-        // `switch-client -t <pane>` resolves only the *session*: the client
-        // lands on whatever window that session had current, which in a
-        // multi-window session is not the pane's window. Selecting the
-        // window *after* the switch confines the shared-state mutation to
-        // the session we are entering — clients attached to it follow, which
-        // is tmux's model for a session's current window, but no bystander
-        // session is touched the way the old pre-switch select-window did.
-        run_tmux(&["select-window", "-t", pane_id]);
+        // Selecting the window *after* the switch confines the shared-state
+        // mutation to the session we are entering — clients attached to *it*
+        // follow, which is tmux's model for a session's current window, but
+        // no bystander session is touched the way the old pre-switch
+        // select-window did. With the session-qualified target above, a
+        // grouped sibling is a bystander too: it keeps its own current
+        // window, so the other terminal stays where the user left it.
+        run_tmux(&["select-window", "-t", &target]);
         run_tmux(&["select-pane", "-t", pane_id]);
     } else {
         // Pre-position for the fresh attach below; there is no client of
-        // ours yet to pin, and the session is about to become ours.
-        run_tmux(&["select-window", "-t", pane_id]);
+        // ours yet to pin, and the session is about to become ours. Qualify
+        // the window with that session all the same: a bare pane id lets
+        // `select-window` land on a grouped sibling and move a window some
+        // other terminal is looking at, before we have attached anywhere.
+        let target = window_target(Some(&info.session_id), &info.window_id, pane_id);
+        run_tmux(&["select-window", "-t", &target]);
         run_tmux(&["select-pane", "-t", pane_id]);
         // Bare shell — hand our terminal to a fresh tmux attach-session.
+        // Target the session by id: names match by prefix unless anchored,
+        // and real session sets collide (`callabo` against `callabo-set`).
         // `.status()` waits for tmux to exit; on detach the user is back at
         // this shell prompt, which is the least-surprising behaviour.
         match muxa::tmux::tmux_command()
-            .args(["attach-session", "-t", &info.session])
+            .args([
+                "attach-session",
+                "-t",
+                session_target(&info.session_id, &info.session),
+            ])
             .status()
         {
             Ok(s) if s.success() => {}
@@ -1856,6 +2000,14 @@ fn jump_to_pane_tmux(pane_id: &str) {
 fn jump_to_pane_zellij(backend: &dyn muxa::PaneBackend, pane_id: &str) {
     if !backend.focus_pane(pane_id) {
         eprintln!("muxa: zellij focus-pane-with-id {pane_id} failed — pane may have closed");
+    }
+}
+
+fn jump_to_pane_cmux(backend: &dyn muxa::PaneBackend, pane_id: &str) {
+    if !backend.focus_pane(pane_id) {
+        eprintln!(
+            "muxa: cmux surface.focus {pane_id} failed — surface may have closed or socket access may be disabled"
+        );
     }
 }
 
@@ -1898,6 +2050,73 @@ async fn best_effort_ingest(client: &Client, ev: &muxa::event::AgentEvent) {
     if let Err(e) = client.ingest(ev).await {
         tracing::debug!(error = %e, "muxa ingest failed (daemon down?)");
     }
+}
+
+/// Name the agent's pane the first time a session starts in it, so it is
+/// addressable as `@claude` rather than only as `%1242`.
+///
+/// Gated on `Started` — the one hook event that fires once per session —
+/// because everything else on this path fires per tool call, and a tmux
+/// round-trip per tool call is a tax on the agent's critical path for a
+/// fact that cannot have changed.
+///
+/// Best-effort like the ingest above, and for a stronger reason: this runs
+/// inside the agent's own hook, where a non-zero exit is the agent's
+/// problem. A pane stuck with `%1242` as its only handle is a worse
+/// interface, not a broken agent.
+async fn best_effort_default_alias(client: &Client, ev: &muxa::event::AgentEvent) {
+    let Some((pane, base)) = alias_target(ev) else {
+        return;
+    };
+    // The answer for every session start after the first, and one tmux call
+    // rather than an IPC round-trip on the agent's critical path.
+    if tmux_work::pane_is_named(&pane).unwrap_or(true) {
+        return;
+    }
+    let request = muxa::collaboration::HandleRequest::Mint {
+        base: base.to_string(),
+    };
+    let issued = client
+        .collaboration_issue_handle(&pane, None, &request, HANDLE_IPC_TIMEOUT)
+        .await;
+    match issued {
+        Ok(Some(handle)) => match tmux_work::claim_alias(&pane, &handle) {
+            Ok(Some(alias)) => tracing::debug!(pane, alias, "named pane"),
+            Ok(None) => tracing::debug!(pane, handle, "pane was named first"),
+            Err(e) => tracing::debug!(error = %e, pane, "could not name pane"),
+        },
+        // No free name, no room for the pane, or no daemon to referee. Naming
+        // a pane without the arbiter is exactly what this path stopped doing,
+        // so the pane keeps `%1242` until its next session start.
+        Ok(None) => {}
+        Err(e) => tracing::debug!(error = %e, pane, "handle refused"),
+    }
+}
+
+/// Budget for the one namespace round-trip. This runs inside an agent's
+/// session-start hook, so a wedged daemon must cost the pane its name rather
+/// than the agent its startup.
+const HANDLE_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The pane this event should name and the runtime to name it after, or
+/// `None` when the event names nothing.
+fn alias_target(ev: &muxa::event::AgentEvent) -> Option<(String, &'static str)> {
+    let muxa::event::AgentEvent::Started { id, .. } = ev else {
+        return None;
+    };
+    // `Task` rows are pid-tracked subagents rather than panes, and an
+    // unrecognised runtime has no name worth minting from.
+    if matches!(id.kind, AgentKind::Task | AgentKind::Unknown) {
+        return None;
+    }
+    // No second-guessing the hook layer's pane resolution. `run_hook` has
+    // already tried the host env vars and walked the parent-pid chain, and
+    // it deliberately reports `None` for a muxa-owned PTY surface: that
+    // agent's shell inherits `$TMUX_PANE` from the terminal that *requested*
+    // the PTY, which owns nothing. Reading the environment again here would
+    // name that outer pane after the runtime running inside the PTY.
+    let pane = id.pane.clone()?;
+    Some((pane, watch::agent_kind_short(id.kind)))
 }
 
 /// Spawn `cmd` via `/bin/sh -c`, feed it `stdin_bytes`, stream its stdout to
@@ -1948,6 +2167,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(client, &ev).await;
         }
         HookCmd::ClaudeStatusline { forward } => {
             if let Some(cmd) = forward {
@@ -1997,10 +2217,12 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         HookCmd::Codex { event } => {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(client, &ev).await;
         }
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(client, &ev).await;
         }
         HookCmd::Agy { event } => {
             // FAIL-OPEN, and deliberately unlike the other hook arms.
@@ -2012,13 +2234,17 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             // change in a future agy, a truncated stdin — is logged and
             // swallowed rather than propagated to a non-zero exit.
             match run_hook::<AntigravityAdapter, _>(&event, &mut std::io::stdin()) {
-                Ok(ev) => best_effort_ingest(client, &ev).await,
+                Ok(ev) => {
+                    best_effort_ingest(client, &ev).await;
+                    best_effort_default_alias(client, &ev).await;
+                }
                 Err(e) => tracing::debug!(error = %e, event, "agy hook payload ignored"),
             }
         }
         HookCmd::Opencode { event } => {
             let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(client, &ev).await;
         }
     }
     Ok(())
@@ -2259,6 +2485,9 @@ fn cmd_panes() -> Result<()> {
 fn empty_pane_hint(backend: &dyn muxa::PaneBackend) -> &'static str {
     match backend.kind() {
         muxa::HostKind::Tmux => "(no tmux panes — server may be down)",
+        muxa::HostKind::Cmux => {
+            "(cmux first slice: only the current env surface is visible; full inventory is pending)"
+        }
         muxa::HostKind::Rmux => "(no rmux panes — server may be down or endpoint unreachable)",
         muxa::HostKind::Zellij if !backend.caps().current_command => {
             "(zellij CLI baseline: pane inventory is plugin-only — install the muxa zellij plugin to populate)"
@@ -2601,6 +2830,60 @@ mod tests {
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
 
+    fn started(kind: AgentKind, pane: Option<&str>) -> muxa::event::AgentEvent {
+        muxa::event::AgentEvent::Started {
+            id: muxa::event::AgentId {
+                kind,
+                session_id: "s".into(),
+                surface: None,
+                pane: pane.map(ToString::to_string),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[test]
+    fn a_paneless_start_names_nothing() {
+        // `run_hook` reports `pane: None` for a muxa-owned PTY surface on
+        // purpose: that agent's shell inherited `$TMUX_PANE` from whatever
+        // terminal asked for the PTY, and that pane owns nothing. Reaching
+        // for the environment here would name the outer pane after the
+        // runtime running inside the PTY.
+        assert_eq!(alias_target(&started(AgentKind::ClaudeCode, None)), None);
+    }
+
+    #[test]
+    fn only_a_session_start_names_a_pane() {
+        assert_eq!(
+            alias_target(&started(AgentKind::ClaudeCode, Some("%7"))),
+            Some(("%7".to_string(), "claude")),
+        );
+        // Everything else on the hook path fires per tool call.
+        let tool = muxa::event::AgentEvent::ToolStarted {
+            id: muxa::event::AgentId {
+                kind: AgentKind::ClaudeCode,
+                session_id: "s".into(),
+                surface: None,
+                pane: Some("%7".into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            tool: "Bash".into(),
+            subagent: None,
+            at: time::OffsetDateTime::now_utc(),
+        };
+        assert_eq!(alias_target(&tool), None);
+    }
+
+    #[test]
+    fn pid_tracked_and_unknown_rows_name_nothing() {
+        // A `Task` row is a subagent under a pane, not a pane of its own.
+        assert_eq!(alias_target(&started(AgentKind::Task, Some("%7"))), None);
+        assert_eq!(alias_target(&started(AgentKind::Unknown, Some("%7"))), None);
+    }
+
     #[test]
     fn dispatch_kind_prefers_pane_namespace_over_fallback() {
         use muxa::HostKind;
@@ -2614,6 +2897,80 @@ mod tests {
         // Unrecognized ids fall back to the process-global host.
         assert_eq!(dispatch_kind("legacy-id", HostKind::Tmux), HostKind::Tmux);
         assert_eq!(dispatch_kind("legacy-id", HostKind::Herdr), HostKind::Herdr);
+    }
+
+    #[test]
+    fn window_target_qualifies_the_window_with_its_session() {
+        // The whole point: a window addressed together with its session
+        // cannot be resolved into a *different* session of the same group.
+        assert_eq!(window_target(Some("$1"), "@4", "%9"), "$1:@4");
+    }
+
+    #[test]
+    fn window_target_falls_back_to_the_pane_id() {
+        // No session, no window, or an empty id from an older PANE_FMT: the
+        // pane id is what every jump used before, so degrade to it rather
+        // than emit a malformed target like `:@4` that tmux would reject.
+        assert_eq!(window_target(None, "@4", "%9"), "%9");
+        assert_eq!(window_target(Some("$1"), "", "%9"), "%9");
+        assert_eq!(window_target(Some(""), "@4", "%9"), "%9");
+    }
+
+    #[test]
+    fn jump_stays_in_the_asking_client_session_without_probing() {
+        // The ordinary same-session jump: the ids already match, so the
+        // membership probe — a tmux round trip on a keypress path — must not
+        // run at all.
+        let answer = resolve_jump_session(Some("$0".into()), "$0", |_| {
+            panic!("probed tmux for a session we already know matches")
+        });
+        assert_eq!(answer.as_deref(), Some("$0"));
+    }
+
+    #[test]
+    fn jump_stays_in_the_asking_client_session_when_the_window_is_linked() {
+        // The session-group case, and the whole point of the change: the pane
+        // is recorded under `$0`, but the asking client sits in the grouped
+        // sibling `$1` where that window is linked too. Answering `$1` keeps
+        // this terminal in its own session, so `$0` — and whoever is looking
+        // at it — never moves.
+        let answer = resolve_jump_session(Some("$1".into()), "$0", |session| {
+            assert_eq!(session, "$1");
+            true
+        });
+        assert_eq!(answer.as_deref(), Some("$1"));
+    }
+
+    #[test]
+    fn jump_crosses_to_the_pane_session_when_the_window_is_not_linked() {
+        // A genuine cross-session jump. The pane's own session is a definite
+        // destination; tmux would otherwise choose one from client activity.
+        let answer = resolve_jump_session(Some("$1".into()), "$0", |_| false);
+        assert_eq!(answer.as_deref(), Some("$0"));
+    }
+
+    #[test]
+    fn jump_falls_back_when_the_client_session_is_unknown() {
+        // No caller client, or a client that detached mid-call: the pane's
+        // session still beats letting tmux guess.
+        assert_eq!(
+            resolve_jump_session(None, "$0", |_| unreachable!()).as_deref(),
+            Some("$0")
+        );
+        assert_eq!(
+            resolve_jump_session(Some(String::new()), "$0", |_| unreachable!()).as_deref(),
+            Some("$0")
+        );
+        // Neither known — `window_target` degrades to the bare pane id.
+        assert_eq!(resolve_jump_session(None, "", |_| unreachable!()), None);
+    }
+
+    #[test]
+    fn session_target_prefers_the_stable_id_over_the_name() {
+        // `callabo` matches `callabo-set` by prefix; `$3` matches nothing else.
+        assert_eq!(session_target("$3", "callabo"), "$3");
+        // Only a row with no id at all falls back to the ambiguous name.
+        assert_eq!(session_target("", "callabo"), "callabo");
     }
 
     fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {
@@ -2652,6 +3009,7 @@ mod tests {
 
     fn pane(id: &str, session: &str) -> muxa::tmux::PaneInfo {
         muxa::tmux::PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
@@ -2744,6 +3102,7 @@ mod tests {
             panic!("expected agent start");
         };
         assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
+        assert_eq!(start.host, agent_launch::LaunchHost::Auto);
         assert_eq!(start.placement, agent_launch::Placement::Pane);
         assert_eq!(start.target.as_deref(), Some("%42"));
         assert_eq!(start.direction, agent_launch::SplitDirection::Down);
@@ -2844,7 +3203,7 @@ mod tests {
     }
 
     #[test]
-    fn window_rename_cli_supports_explicit_and_automatic_names() {
+    fn window_rename_cli_supports_explicit_automatic_and_buffered_names() {
         let args = Args::try_parse_from([
             "muxa",
             "window",
@@ -2862,6 +3221,7 @@ mod tests {
             panic!("expected window rename");
         };
         assert_eq!(rename.name.as_deref(), Some("CAL-7175 auth refactor"));
+        assert!(rename.buffer.is_none());
         assert_eq!(rename.window.as_deref(), Some("@42"));
         assert!(!rename.auto);
         assert!(rename.json);
@@ -2878,6 +3238,25 @@ mod tests {
             "muxa", "window", "rename", "name", "--window", "@42", "--auto"
         ])
         .is_err());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "window",
+            "rename",
+            "--window",
+            "@42",
+            "--buffer",
+            "muxa-window-name-123",
+        ])
+        .unwrap();
+        let Cmd::Window {
+            action: WindowCmd::Rename(rename),
+        } = args.cmd
+        else {
+            panic!("expected buffered window rename");
+        };
+        assert_eq!(rename.buffer.as_deref(), Some("muxa-window-name-123"));
+        assert!(rename.name.is_none());
     }
 
     #[test]
@@ -2905,12 +3284,47 @@ mod tests {
             "interrupt",
         ])
         .unwrap();
-        assert!(matches!(
-            args.cmd,
-            Cmd::Agent {
-                action: AgentCmd::Control(_)
-            }
-        ));
+        let Cmd::Agent {
+            action: AgentCmd::Control(control),
+        } = args.cmd
+        else {
+            panic!("expected agent control");
+        };
+        assert_eq!(control.pane.as_deref(), Some("%42"));
+        assert!(control.session.is_none());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "agent",
+            "control",
+            "--session",
+            "pty-7",
+            "--action",
+            "terminate",
+            "--yes",
+        ])
+        .unwrap();
+        let Cmd::Agent {
+            action: AgentCmd::Control(control),
+        } = args.cmd
+        else {
+            panic!("expected native agent control");
+        };
+        assert_eq!(control.session.as_deref(), Some("pty-7"));
+        assert!(control.pane.is_none());
+
+        assert!(Args::try_parse_from([
+            "muxa",
+            "agent",
+            "control",
+            "--pane",
+            "%42",
+            "--session",
+            "pty-7",
+            "--action",
+            "interrupt",
+        ])
+        .is_err());
 
         let args = Args::try_parse_from(["muxa", "onboard", "--print", "--no-quiz"]).unwrap();
         let Cmd::Onboard(onboard) = args.cmd else {

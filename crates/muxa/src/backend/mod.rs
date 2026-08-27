@@ -52,6 +52,7 @@
 //! when zellij CLI cannot populate `pane_pid_map`), call sites consult
 //! [`BackendCaps`] returned by [`PaneBackend::caps`] before degrading.
 
+pub mod cmux;
 pub mod herdr;
 pub mod rmux;
 pub mod tmux;
@@ -72,13 +73,16 @@ pub const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(120);
 
 /// Whether a pane observation is authoritative enough for destructive use.
 ///
-/// A snapshot can still carry useful panes when it is [`Incomplete`](Self::Incomplete)
-/// (for example, one tmux server answered while another timed out). Callers
-/// may use those rows for best-effort enrichment, but absence from that
-/// snapshot is not evidence that a pane died.
+/// A snapshot can still carry useful panes when it is partial or incomplete.
+/// `Partial` is a backend's stable contract (for example, cmux deliberately
+/// exposes only the invoking surface) and must never age out rows outside that
+/// subset. `Incomplete` means a normally-authoritative scan failed or timed
+/// out; absence is not immediate death evidence, but chronically unreachable
+/// hosts may still be aged out after the configured stale window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationCompleteness {
     Complete,
+    Partial,
     Incomplete,
 }
 
@@ -105,8 +109,24 @@ impl PaneObservation {
         }
     }
 
+    /// Construct an intentionally partial observation. Unlike a transient
+    /// [`Self::incomplete`] result, this backend is not expected to enumerate
+    /// its whole namespace, so cross-host stale aging must keep its hook rows.
+    pub fn partial(panes: Vec<PaneInfo>) -> Self {
+        Self {
+            panes,
+            completeness: ObservationCompleteness::Partial,
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         self.completeness == ObservationCompleteness::Complete
+    }
+
+    /// Whether this observation proves the backend is intentionally present
+    /// and therefore protects its namespace from cross-host age-out.
+    pub fn protects_stale_rows(&self) -> bool {
+        self.completeness != ObservationCompleteness::Incomplete
     }
 }
 
@@ -137,6 +157,7 @@ pub type SharedBackend = Arc<dyn PaneBackend>;
 /// this fallback if that assumption stops holding.
 pub fn default_backend() -> SharedBackend {
     match detect_host_env() {
+        Some(HostKind::Cmux) => Arc::new(cmux::CmuxBackend::new()),
         Some(HostKind::Rmux) => Arc::new(rmux::RmuxBackend::new()),
         Some(HostKind::Zellij) => Arc::new(zellij::ZellijBackend::new()),
         Some(HostKind::Herdr) => Arc::new(herdr::HerdrBackend::new()),
@@ -147,6 +168,7 @@ pub fn default_backend() -> SharedBackend {
 /// Build one backend of the given kind.
 fn backend_of(kind: HostKind) -> SharedBackend {
     match kind {
+        HostKind::Cmux => Arc::new(cmux::CmuxBackend::new()),
         HostKind::Tmux => Arc::new(tmux::TmuxBackend::new()),
         HostKind::Rmux => Arc::new(rmux::RmuxBackend::new()),
         HostKind::Zellij => Arc::new(zellij::ZellijBackend::new()),
@@ -168,8 +190,10 @@ fn backend_of(kind: HostKind) -> SharedBackend {
 ///    — consumers treat the first backend as "primary" (dashboard, watch
 ///    initial cursor). tmux is always in the set (its methods degrade to
 ///    empty when no server is running, and it remains muxa's default
-///    market); rmux joins when its native env is present or its CLI is
-///    installed, so a server started after the daemon is still discovered;
+///    market); cmux is always kept ready as a partial observer so a GUI
+///    started after muxad can still route hook control; rmux joins when its
+///    native env is present or its CLI is installed, so a server started after
+///    the daemon is still discovered;
 ///    herdr joins when a herdr server actually **answers** on its
 ///    socket (a live connect, not a stale socket file — see
 ///    [`herdr::server_reachable`]) or its pane env is present; zellij only
@@ -194,7 +218,7 @@ pub fn active_backends() -> Vec<SharedBackend> {
             HostKind::Rmux => rmux::binary_available(),
             // tmux/zellij reachability is not probed here; see the
             // resolution rules above.
-            HostKind::Tmux | HostKind::Zellij => false,
+            HostKind::Cmux | HostKind::Tmux | HostKind::Zellij => false,
         },
     )
 }
@@ -226,6 +250,7 @@ fn active_kinds_from(
         for name in raw.split(',') {
             let kind = match name.trim().to_ascii_lowercase().as_str() {
                 "tmux" => Some(HostKind::Tmux),
+                "cmux" => Some(HostKind::Cmux),
                 "rmux" => Some(HostKind::Rmux),
                 "zellij" => Some(HostKind::Zellij),
                 "herdr" => Some(HostKind::Herdr),
@@ -250,7 +275,7 @@ fn active_kinds_from(
     }
 
     // 3. Auto-detect. The env-preferred host — whatever `detect_from`
-    // resolves the current shell to (rmux > zellij > herdr > tmux on a nested-env
+    // resolves the current shell to (rmux > zellij > herdr > cmux > tmux on a nested-env
     // tie) — leads the set so `backends[0]` is the host the shell actually
     // lives in; consumers (dashboard, watch initial cursor) treat the first
     // backend as primary. The remaining detected hosts follow in a stable
@@ -266,6 +291,10 @@ fn active_kinds_from(
         add(&mut kinds, env_host);
     }
     add(&mut kinds, HostKind::Tmux);
+    // Keep a capability-honest cmux backend ready even when muxad was
+    // launched before cmux and inherited none of its environment. Its first
+    // slice reports partial observations, so it cannot reap other rows.
+    add(&mut kinds, HostKind::Cmux);
     if read("RMUX").is_some() || read("RMUX_PANE").is_some() || probe(HostKind::Rmux) {
         add(&mut kinds, HostKind::Rmux);
     }
@@ -285,6 +314,7 @@ fn detect_from_override(read: &impl Fn(&str) -> Option<String>) -> Option<HostKi
     let raw = read("MUXA_HOST")?;
     match raw.trim().to_ascii_lowercase().as_str() {
         "tmux" => Some(HostKind::Tmux),
+        "cmux" => Some(HostKind::Cmux),
         "rmux" => Some(HostKind::Rmux),
         "zellij" => Some(HostKind::Zellij),
         "herdr" => Some(HostKind::Herdr),
@@ -312,6 +342,7 @@ fn detect_from_override(read: &impl Fn(&str) -> Option<String>) -> Option<HostKi
 #[strum(serialize_all = "lowercase")]
 pub enum HostKind {
     Tmux,
+    Cmux,
     Rmux,
     Zellij,
     Herdr,
@@ -571,7 +602,7 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
 ///
 /// Resolution order:
 ///
-/// 1. **`MUXA_HOST`** — if set to `"tmux"`, `"rmux"`, `"zellij"`, or `"herdr"`
+/// 1. **`MUXA_HOST`** — if set to `"tmux"`, `"cmux"`, `"rmux"`, `"zellij"`, or `"herdr"`
 ///    (case-insensitive), that wins regardless of what `TMUX` / `ZELLIJ` /
 ///    `HERDR_*` look like. Provides an unambiguous override for
 ///    nested-multiplexer setups (zellij inside tmux, `tmux new-session` from
@@ -581,7 +612,8 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
 /// 2. **`RMUX` / `RMUX_PANE`** set → [`HostKind::Rmux`].
 /// 3. **`ZELLIJ`** set → [`HostKind::Zellij`].
 /// 4. **`HERDR_PANE_ID` / `HERDR_ENV`** set → [`HostKind::Herdr`].
-/// 5. **`TMUX`** set → [`HostKind::Tmux`].
+/// 5. **`CMUX_SURFACE_ID` / `CMUX_WORKSPACE_ID`** set → [`HostKind::Cmux`].
+/// 6. **`TMUX`** set → [`HostKind::Tmux`].
 ///
 /// The tie-break for nested hosts (all ancestors' vars are inherited) is
 /// **native rmux first**, then zellij, herdr, and tmux. rmux must precede tmux
@@ -608,6 +640,7 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
     if let Some(raw) = read("MUXA_HOST") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "tmux" => return Some(HostKind::Tmux),
+            "cmux" => return Some(HostKind::Cmux),
             "rmux" => return Some(HostKind::Rmux),
             "zellij" => return Some(HostKind::Zellij),
             "herdr" => return Some(HostKind::Herdr),
@@ -637,6 +670,9 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
     if read("HERDR_PANE_ID").is_some() || read("HERDR_ENV").is_some() {
         return Some(HostKind::Herdr);
     }
+    if read("CMUX_SURFACE_ID").is_some() || read("CMUX_WORKSPACE_ID").is_some() {
+        return Some(HostKind::Cmux);
+    }
     if read("TMUX").is_some() {
         return Some(HostKind::Tmux);
     }
@@ -645,8 +681,9 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
 
 /// Classify a namespaced pane id back to the host that governs it.
 ///
-/// muxa namespaces every non-tmux pane id — `rmux:%N` for rmux, `zellij:<id>` for zellij,
-/// `herdr:<id>` (see [`herdr::PANE_ID_PREFIX`]) for herdr — and leaves
+/// muxa namespaces every non-tmux pane id — `cmux:<id>` for cmux, `rmux:%N`
+/// for rmux, `zellij:<id>` for zellij, `herdr:<id>` (see
+/// [`herdr::PANE_ID_PREFIX`]) for herdr — and leaves
 /// tmux's native `%N` ids as-is. The reconciler's cross-host reaping guard
 /// uses this to tell whether a registry row belongs to the *observing*
 /// backend: a `%`-id is tmux's, a `herdr:`-id is herdr's, a `zellij:`-id is
@@ -660,6 +697,8 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
 pub fn pane_id_host_kind(pane_id: &str) -> Option<HostKind> {
     if pane_id.starts_with(rmux::PANE_ID_PREFIX) {
         Some(HostKind::Rmux)
+    } else if pane_id.starts_with(cmux::PANE_ID_PREFIX) {
+        Some(HostKind::Cmux)
     } else if pane_id.starts_with('%') {
         Some(HostKind::Tmux)
     } else if pane_id.starts_with("zellij:") {
@@ -677,12 +716,15 @@ pub fn pane_id_host_kind(pane_id: &str) -> Option<HostKind> {
 /// Canonical endpoint identity for a pane host.
 ///
 /// tmux pane scans store a short socket name while hooks inherit a full path,
-/// so tmux keeps its historical basename normalization. rmux uses the native
-/// full socket path for `rmux -S`; shortening it would make control operations
+/// so tmux keeps its historical basename normalization. rmux and cmux use
+/// native full socket paths; shortening them would make control operations
 /// unable to target the recorded server and could collide across directories.
 #[must_use]
 pub fn pane_endpoint_identity(pane_id: Option<&str>, endpoint: &str) -> String {
-    if pane_id.and_then(pane_id_host_kind) == Some(HostKind::Rmux) {
+    if matches!(
+        pane_id.and_then(pane_id_host_kind),
+        Some(HostKind::Rmux | HostKind::Cmux)
+    ) {
         endpoint.to_string()
     } else {
         crate::tmux::socket_short_name(endpoint)
@@ -736,6 +778,17 @@ mod tests {
         assert_eq!(
             detect_from(env_reader(&[("RMUX", "/tmp/rmux.sock,42,$1")])),
             Some(HostKind::Rmux),
+        );
+        assert_eq!(
+            detect_from(env_reader(&[("CMUX_SURFACE_ID", "surface-7")])),
+            Some(HostKind::Cmux),
+        );
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("CMUX_SURFACE_ID", "surface-7"),
+                ("TMUX", "/tmp/outer,1,0"),
+            ])),
+            Some(HostKind::Cmux),
         );
     }
 
@@ -854,6 +907,7 @@ mod tests {
     #[test]
     fn host_kind_display_is_lowercase_stable() {
         assert_eq!(HostKind::Tmux.to_string(), "tmux");
+        assert_eq!(HostKind::Cmux.to_string(), "cmux");
         assert_eq!(HostKind::Rmux.to_string(), "rmux");
         assert_eq!(HostKind::Zellij.to_string(), "zellij");
     }
@@ -868,6 +922,7 @@ mod tests {
         assert_eq!(pane_id_host_kind("%3"), Some(HostKind::Tmux));
         assert_eq!(pane_id_host_kind("%0"), Some(HostKind::Tmux));
         assert_eq!(pane_id_host_kind("rmux:%3"), Some(HostKind::Rmux));
+        assert_eq!(pane_id_host_kind("cmux:surface-7"), Some(HostKind::Cmux));
         assert_eq!(pane_id_host_kind("zellij:7"), Some(HostKind::Zellij));
         assert_eq!(
             pane_id_host_kind("zellij:terminal:7"),
@@ -891,6 +946,10 @@ mod tests {
         assert_eq!(
             pane_endpoint_identity(Some("rmux:%3"), "/tmp/rmux-501/default"),
             "/tmp/rmux-501/default",
+        );
+        assert_eq!(
+            pane_endpoint_identity(Some("cmux:surface-7"), "/tmp/cmux-debug.sock"),
+            "/tmp/cmux-debug.sock",
         );
         assert_eq!(
             pane_endpoint_identity(Some("%3"), "/tmp/tmux-501/default"),
@@ -963,6 +1022,7 @@ mod tests {
 
     fn fake_pane(id: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
@@ -1069,10 +1129,13 @@ mod tests {
         assert_eq!(kinds, vec![HostKind::Herdr, HostKind::Tmux]);
 
         let fallthrough = active_kinds_from(&env_reader(&[("MUXA_HOSTS", "bogus,")]), &|_| false);
-        assert_eq!(fallthrough, vec![HostKind::Tmux]);
+        assert_eq!(fallthrough, vec![HostKind::Tmux, HostKind::Cmux]);
 
         let rmux = active_kinds_from(&env_reader(&[("MUXA_HOSTS", "rmux,tmux")]), &|_| false);
         assert_eq!(rmux, vec![HostKind::Rmux, HostKind::Tmux]);
+
+        let cmux = active_kinds_from(&env_reader(&[("MUXA_HOSTS", "cmux,tmux")]), &|_| false);
+        assert_eq!(cmux, vec![HostKind::Cmux, HostKind::Tmux]);
     }
 
     /// `MUXA_HOST` (singular) keeps meaning "exactly this one" even in
@@ -1095,15 +1158,15 @@ mod tests {
     fn active_kinds_auto_detect() {
         assert_eq!(
             active_kinds_from(&env_reader(&[]), &|_| false),
-            vec![HostKind::Tmux],
+            vec![HostKind::Tmux, HostKind::Cmux],
         );
         assert_eq!(
             active_kinds_from(&env_reader(&[]), &|k| k == HostKind::Herdr),
-            vec![HostKind::Tmux, HostKind::Herdr],
+            vec![HostKind::Tmux, HostKind::Cmux, HostKind::Herdr],
         );
         assert_eq!(
             active_kinds_from(&env_reader(&[]), &|k| k == HostKind::Rmux),
-            vec![HostKind::Tmux, HostKind::Rmux],
+            vec![HostKind::Tmux, HostKind::Cmux, HostKind::Rmux],
         );
         // Both HERDR and ZELLIJ env present: zellij is the env-preferred host
         // (nested-env tie-break), so it leads; tmux is auto-added; herdr trails
@@ -1112,7 +1175,12 @@ mod tests {
             active_kinds_from(&env_reader(&[("HERDR_ENV", "1"), ("ZELLIJ", "1")]), &|_| {
                 false
             },),
-            vec![HostKind::Zellij, HostKind::Tmux, HostKind::Herdr],
+            vec![
+                HostKind::Zellij,
+                HostKind::Tmux,
+                HostKind::Cmux,
+                HostKind::Herdr
+            ],
         );
     }
 
@@ -1126,20 +1194,20 @@ mod tests {
     fn active_kinds_env_preferred_host_leads() {
         assert_eq!(
             active_kinds_from(&env_reader(&[("HERDR_ENV", "1")]), &|_| false),
-            vec![HostKind::Herdr, HostKind::Tmux],
+            vec![HostKind::Herdr, HostKind::Tmux, HostKind::Cmux],
         );
         // A herdr pane env plus a reachable-socket probe must not double-add
         // herdr; it still leads, tmux trails.
         assert_eq!(
             active_kinds_from(&env_reader(&[("HERDR_PANE_ID", "9")]), &|k| k
                 == HostKind::Herdr),
-            vec![HostKind::Herdr, HostKind::Tmux],
+            vec![HostKind::Herdr, HostKind::Tmux, HostKind::Cmux],
         );
         // A plain tmux shell (only `TMUX`) is already tmux-first; the env
         // preference and the unconditional tmux add resolve to a single entry.
         assert_eq!(
             active_kinds_from(&env_reader(&[("TMUX", "/tmp/t,1,0")]), &|_| false),
-            vec![HostKind::Tmux],
+            vec![HostKind::Tmux, HostKind::Cmux],
         );
         // rmux exports TMUX too; native rmux remains primary while tmux stays
         // in the observed set for any real tmux server also running.
@@ -1151,7 +1219,7 @@ mod tests {
                 ]),
                 &|_| false,
             ),
-            vec![HostKind::Rmux, HostKind::Tmux],
+            vec![HostKind::Rmux, HostKind::Tmux, HostKind::Cmux],
         );
     }
 }

@@ -547,6 +547,37 @@ impl Store {
         pane: Option<String>,
         command: Option<String>,
     ) -> Result<String, String> {
+        self.register_task_inner(name, pid, cwd, pane, None, command)
+            .await
+    }
+
+    /// Register a pid-tracked placeholder for a muxa-owned terminal surface.
+    ///
+    /// The generic `spawn_session` path needs a row immediately, before an
+    /// allowlisted agent has emitted its first hook. Once a real hook arrives
+    /// with the same surface, [`Self::apply`] atomically removes this Task row
+    /// and installs the runtime-owned Agent row instead of displaying both.
+    pub async fn register_surface_task(
+        &self,
+        name: String,
+        pid: Option<u32>,
+        cwd: Option<String>,
+        surface: SurfaceRef,
+        command: Option<String>,
+    ) -> Result<String, String> {
+        self.register_task_inner(name, pid, cwd, None, Some(surface), command)
+            .await
+    }
+
+    async fn register_task_inner(
+        &self,
+        name: String,
+        pid: Option<u32>,
+        cwd: Option<String>,
+        pane: Option<String>,
+        surface: Option<SurfaceRef>,
+        command: Option<String>,
+    ) -> Result<String, String> {
         let now = OffsetDateTime::now_utc();
         let base = if name.trim().is_empty() {
             format!("task-{}", pid.unwrap_or(0))
@@ -580,7 +611,7 @@ impl Store {
             }
             None => base.clone(),
         };
-        let mut agent = Agent::new(AgentKind::Task, key.clone(), None, pane, cwd, now);
+        let mut agent = Agent::new(AgentKind::Task, key.clone(), surface, pane, cwd, now);
         agent.state = AgentState::Working;
         agent.pid = pid;
         agent.last_prompt = command;
@@ -1047,6 +1078,20 @@ fn reconcile_pane_for_started(
     true
 }
 
+/// Replace the pid-tracked placeholder created for a muxa-owned PTY once the
+/// real agent runtime claims that same execution surface.
+fn remove_surface_task_placeholder(agents: &mut HashMap<String, Agent>, id: &AgentId) {
+    if id.kind == AgentKind::Task {
+        return;
+    }
+    let Some(surface) = id.surface.as_ref() else {
+        return;
+    };
+    agents.retain(|_, agent| {
+        !(agent.kind == AgentKind::Task && agent.surface.as_ref() == Some(surface))
+    });
+}
+
 impl Store {
     pub fn shared() -> SharedStore {
         Arc::new(Self::default())
@@ -1102,6 +1147,14 @@ impl Store {
         };
         tracing::Span::current().record("event_type", event_type);
 
+        // A muxa-owned PTY is surfaced immediately as a pid-tracked Task so
+        // users can attach/control it before an agent's first hook. The hook's
+        // runtime session id is deliberately different from the PTY id, so a
+        // plain session-id upsert would leave duplicate Task + Agent rows.
+        // Surface identity is the shared execution binding: once a real agent
+        // claims it, remove only the temporary Task placeholder.
+        remove_surface_task_placeholder(&mut agents, id);
+
         if let Some(pane) = id.pane.as_deref() {
             if matches!(ev, AgentEvent::Started { .. }) {
                 if !reconcile_pane_for_started(
@@ -1152,6 +1205,13 @@ impl Store {
         }
         if agent.surface.is_none() {
             agent.surface.clone_from(&id.surface);
+        } else if let (Some(existing), Some(incoming)) = (&mut agent.surface, &id.surface) {
+            if existing.kind == incoming.kind
+                && existing.id == incoming.id
+                && existing.workspace.is_none()
+            {
+                existing.workspace.clone_from(&incoming.workspace);
+            }
         }
         if agent.cwd.is_none() {
             agent.cwd.clone_from(&id.cwd);
@@ -2040,7 +2100,7 @@ enum RemovalReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AgentEvent, AgentId, AgentKind, NotificationLevel};
+    use crate::event::{AgentEvent, AgentId, AgentKind, NotificationLevel, SurfaceKind};
     use time::macros::datetime;
 
     fn id(session: &str) -> AgentId {
@@ -2113,6 +2173,47 @@ mod tests {
         assert_eq!(agent.state, AgentState::Working);
         assert_eq!(agent.pid, Some(4242));
         assert_eq!(agent.last_prompt.as_deref(), Some("./play.sh"));
+    }
+
+    #[tokio::test]
+    async fn real_hook_replaces_surface_bound_task_placeholder() {
+        let store = Store::shared();
+        let surface = SurfaceRef {
+            kind: SurfaceKind::Pty,
+            id: "pty-7".into(),
+            workspace: None,
+        };
+        store
+            .register_surface_task(
+                "codex".into(),
+                Some(std::process::id()),
+                Some("/repo".into()),
+                surface.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::Codex,
+                    session_id: "codex-runtime-session".into(),
+                    surface: Some(surface.clone()),
+                    pane: None,
+                    cwd: Some("/repo".into()),
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].kind, AgentKind::Codex);
+        assert_eq!(snapshot[0].session_id, "codex-runtime-session");
+        assert_eq!(snapshot[0].surface.as_ref(), Some(&surface));
+        assert!(snapshot[0].pid.is_none());
     }
 
     #[tokio::test]
@@ -2237,6 +2338,7 @@ mod tests {
                 Some(SurfaceRef {
                     kind: SurfaceKind::Pty,
                     id: "s1".into(),
+                    workspace: None,
                 }),
                 old,
             ))
@@ -2559,6 +2661,7 @@ mod tests {
             .await
             .unwrap();
         let pane = PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,
@@ -4351,6 +4454,7 @@ mod tests {
 
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,

@@ -69,8 +69,8 @@ collaboration --uninstall` removes it). Hand-editing works just as well:
 [collaboration]
 enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
-# Optional: "notice" (default) or "full" for direct request delivery.
-wake_payload = "notice"
+# Optional: "operator_full" (default), "notice", or "full".
+wake_payload = "operator_full"
 ```
 
 An existing `wake` is never overwritten — a deliberate `never` means "give me
@@ -113,13 +113,31 @@ sender pane.
 ## Addressing and CLI
 
 Agents sharing `(tmux socket, stable window id)` are peers. `peer` selects the
-only other agent; with three or more participants use `%N` or `pane:%N`.
+only other agent; with three or more participants use a handle — `@claude`,
+`@codex` — or, failing that, `%N` / `pane:%N`.
+
+Every agent pane gets a handle without anyone asking for one. The first agent
+of a runtime in a room becomes `@claude`, `@codex`, `@gemini`, `@agy`, or
+`@opencode`; a second of the same kind becomes `@claude2`, and so on. muxa
+mints it on the agent's first hook event of a session and stores it on the pane
+as `@muxa_agent_alias`, so it outlives muxad, the CLI, and the agent restarting
+in place. It is not minted over a name that already exists, so a pipeline alias
+or a hand-set one wins. `muxa peek` prints the handle in each pane's header
+next to its pane id.
+
+The daemon issues every handle. It is the only place that sees a room whole —
+pane options, registered identities, and names promised to callers that have
+not written them yet — and a handle allocated from anything less is how a room
+ends up answering to `@claude` twice. Explicit aliases register with it too,
+before they are stamped. With no daemon reachable a pane simply stays unnamed
+and keeps `%1242`.
 `scope = "window"` refuses cross-window targets; `scope = "host"` widens an
 explicit `pane:%N` target to other windows and sessions. Requests are also
 pinned to the target's current agent session, so a new process reusing that
 pane cannot inherit old work.
 
-An exact agent session can register a room-local alias and advisory roles:
+An exact agent session can also register its own room-local alias and
+advisory roles, which override the minted one for routing:
 
 ```bash
 muxa identity set --alias reviewer --role review --role rust
@@ -273,20 +291,28 @@ hook-authoritative participant is `Idle`. It never injects into `Working`,
 agents have no stable session identity, so they are not room participants or
 auto-wake targets.
 
-`wake_payload = "notice"` is the default. It injects a short mailbox prompt;
-the recipient calls `muxa_inbox`, which atomically claims and returns the body.
-`wake_payload = "full"` instead claims one queued request before any terminal
-side effect, then injects a structured envelope containing request id, source,
-kind, work mode, paths, AIR references, and the original body. The recipient
-must not call inbox for that request, so one tool round and its JSON envelope
-are removed. Only one direct request is submitted per idle agent generation;
-the next waits for a real Idle transition. Terminal reply bodies always remain
-in the mailbox in both modes.
+`wake_payload = "operator_full"` is the default. Requests whose resolved sender
+is the operator console — currently watch and dashboard messages — are claimed
+and delivered directly, while agent-originated MCP and CLI requests inject only
+a mailbox notice. `notice` keeps every request body in the mailbox. `full`
+directly delivers every request. Direct delivery injects a structured envelope
+containing request id, source, kind, work mode, paths, AIR references, and the
+original body, removing one inbox tool round and its JSON envelope. Only one
+direct request is submitted per idle agent generation; the next waits for a
+real Idle transition. Terminal reply bodies always remain in the mailbox.
+
+`operator_full` is a delivery policy, not proof of human authorization. It
+uses the sender identity muxad resolved for the request; `work_mode =
+"execute"` never changes the payload policy or upgrades an agent-originated
+request into an operator request. The source line in the delivered envelope
+still records the operator surface and caller provenance for the recipient.
 
 Direct delivery deliberately makes the request body part of terminal and
 agent prompt history. Use `notice` for secrets that should remain only in the
-private mailbox. A body containing terminal control characters automatically
-falls back to `notice` rather than being transformed or pasted unsafely.
+private mailbox; `operator_full` keeps agent-originated bodies private but not
+operator-originated ones. A body containing terminal control characters
+automatically falls back to `notice` rather than being transformed or pasted
+unsafely.
 Direct delivery records whether prompt text was written
 before the separate Enter keystroke. After interruption, muxad retries only
 Enter when text is known to be buffered; if writing was uncertain, it falls

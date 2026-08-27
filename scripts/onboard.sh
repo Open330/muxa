@@ -16,7 +16,7 @@
 # `--no-download` — or an unsupported platform, a missing checksum tool, or no
 # network — falls back to the simulation embedded below, which draws the same
 # shell → tmux → Muxa scenario with plain ANSI controls. The fallback tracks the
-# real tour step for step; `scripts/onboarding-parity.sh` is what keeps it
+# real tour step for step; `scripts/onboarding-parity.py` is what keeps it
 # honest.
 
 set -eu

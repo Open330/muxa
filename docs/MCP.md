@@ -34,7 +34,7 @@ args = ["mcp"]
 env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 ```
 
-This preserves the exact pane, tmux/rmux endpoint, and non-default muxa socket.
+This preserves the exact pane, tmux/cmux/rmux endpoint, and non-default muxa socket.
 For existing Codex registrations, muxa can recover a default-endpoint pane by
 walking the MCP process ancestry across active backends back to the pane shell.
 Explicit forwarding remains the reliable configuration for custom or multiple
@@ -85,7 +85,7 @@ Hand-rolled JSON-RPC 2.0 over stdio — a **tools-only** server implementing
 `initialize`, `tools/list`, `tools/call`, `ping`, and the `initialized`
 notification. That subset is small and stable, so muxa implements it directly
 on its existing `serde_json`/`tokio` deps rather than pulling the `rmcp` SDK's
-dependency tree (which would have to clear MSRV 1.88 and the workspace's
+dependency tree (which would have to clear MSRV 1.89 and the workspace's
 cargo-deny policy). No new dependencies. Protocol revision: `2024-11-05`.
 
 ### Concurrency and framing
@@ -138,7 +138,7 @@ it:
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
-only reaches the focused pane. tmux, rmux, and herdr support it.
+only reaches the focused pane. tmux, cmux, rmux, and herdr support targeted input.
 
 Pane ids carry their host namespace: tmux `%12`, rmux `rmux:%12`, herdr
 `herdr:p1`. Use the `pane` field from `muxa_status` verbatim.
@@ -295,11 +295,12 @@ aliases.
 The collaboration tools are higher-level than `muxa_send_prompt`: muxad pins
 each request to the target's current agent session, persists it before wake-up,
 and restricts routing to the caller's stable tmux window. Request and reply
-wake prompts are sent only to idle agents. Request bodies stay out of the
-terminal by default; opt-in `wake_payload = "full"` atomically claims and
-delivers one structured request body per idle generation. Reply wakes remain
-body-free. Enable the tools with `[collaboration] enabled = true`; see
-`docs/COLLABORATION.ko.md`.
+wake prompts are sent only to idle agents. The default `wake_payload =
+"operator_full"` delivers operator-console bodies directly while these
+agent-originated MCP requests remain body-free mailbox notices. `notice` keeps
+every body in the mailbox; `full` directly delivers every safe request body.
+Reply wakes remain body-free. Enable the tools with `[collaboration] enabled =
+true`; see `docs/COLLABORATION.ko.md`.
 
 For rooms with several agents, call `muxa_set_identity` once per agent and
 route with `@alias` or `role:<name>`. Aliases must be unique among live peers;

@@ -8,7 +8,7 @@
 실시간 TUI, 데스크톱 알림, 로컬 리포트에서 확인합니다.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
-![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
+![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
 
@@ -79,7 +79,7 @@ Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 �
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
+| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
@@ -103,7 +103,7 @@ brew install open330/tap/muxa
 muxa init
 ```
 
-또는 원샷 설치 스크립트(소스 빌드, Rust 1.88+ 필요):
+또는 원샷 설치 스크립트(소스 빌드, Rust 1.89+ 필요):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
@@ -130,7 +130,8 @@ muxa watch
 ### `muxa watch`에서 바로 협업합니다
 
 기억할 규칙은 하나입니다. **tmux window 하나가 협업 room 하나**입니다.
-`muxa watch`를 열 때 선택되어 있던 agent가 발신자가 됩니다.
+watch/dashboard에서 사람이 보낸 메시지는 operator console이 발신자가 되고, 선택한
+agent가 수신자가 됩니다. agent가 MCP나 CLI로 보낸 요청은 해당 agent가 발신자입니다.
 
 최초 한 번만 `~/.config/muxa/config.toml`에 다음 설정을 넣고 `muxad`를 재시작한
 뒤 `muxa init`으로 `prefix+s` watch popup을 설치합니다.
@@ -139,6 +140,8 @@ muxa watch
 [collaboration]
 enabled = true
 wake = "idle_only"
+# 기본값: operator 본문은 직접 전달하고 agent 발신 본문은 mailbox에 둡니다.
+wake_payload = "operator_full"
 ```
 
 두 agent가 메시지를 직접 읽고 답할 수 있도록 MCP도 한 번 등록한 뒤 실행 중인
@@ -232,11 +235,12 @@ footer에서 굵은 노란색으로 강조합니다. `j`, `l`, `Alt-T`, `o`, `?`
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa sync` | tmux pane scan으로 registry backfill. |
+| `muxa agent start --agent codex [--host auto\|native\|tmux]` | allowlist agent 실행. `auto`는 실제 tmux 셸에서는 tmux를, 일반 터미널에서는 muxa-owned PTY를 사용. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | workspace session과 work window를 만들거나 재사용하고 agent pane을 추가. |
 | `muxa workspace list/show/close` | workspace/project session을 조회하거나 명시적으로 종료. |
 | `muxa work list/show/close [--workspace muxa]` | Work와 현재 Run binding을 조회하거나 Run window를 명시적으로 종료. |
-| `muxa agent start --workspace muxa --work muxa-onboarding ...` | allowlist agent pane을 work window에 추가. MCP에서는 `muxa_start_agent`로 제공. |
-| `muxa agent control --pane %N --action interrupt` | managed agent pane 하나를 중단하거나 명시적으로 종료. |
+| `muxa agent start --host tmux --workspace muxa --work muxa-onboarding ...` | allowlist agent pane을 managed tmux Work window에 추가. MCP에서는 `muxa_start_agent`로 제공. |
+| `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | managed tmux pane 또는 muxa-owned PTY agent session 하나를 중단하거나 명시적으로 종료. |
 | `muxa onboard [--lang auto\|en\|ko]` | shell → tmux → Muxa 통합 fullscreen walkthrough. `F2` 언어 전환, `--no-quiz` gate 생략, `--print` 통합 guide 출력 지원. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa init` | install/uninstall wizard. |

@@ -97,6 +97,11 @@ struct Candidate<'a> {
     key: SpatialKey,
 }
 
+pub struct Target {
+    pub pane: String,
+    pub endpoint: Option<String>,
+}
+
 /// Filter the snapshot down to attention-needing agents that have a pane,
 /// sorted into spatial order. Agents with no pane are dropped: there's
 /// nothing to focus, and `muxa watch` already surfaces paneless agents.
@@ -148,9 +153,10 @@ fn next_after<'c>(
 }
 
 /// Choose a pane to attend to, or print the queue / a "nothing to do"
-/// line. Returns the pane id the caller should jump to, or `None` when
-/// there's nothing to jump to (`--list`, or no agent needs attention).
-pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Option<String>> {
+/// line. Returns the pane plus its recorded endpoint so multi-instance hosts
+/// such as cmux can focus the exact server. Returns `None` for `--list` or
+/// when no agent needs attention.
+pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Option<Target>> {
     let agents = client.snapshot().await?;
     // Panes are enumerated by the caller across every active host (spatial
     // ordering + `pane_display` both read them); empty is harmless on
@@ -198,7 +204,10 @@ pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Op
         longest_waiting(&cands)
     };
 
-    Ok(chosen.map(|c| c.pane.to_string()))
+    Ok(chosen.map(|candidate| Target {
+        pane: candidate.pane.to_string(),
+        endpoint: candidate.agent.tmux_socket.clone(),
+    }))
 }
 
 /// Render the attention queue, longest-waiting first. Each row is the
@@ -385,6 +394,7 @@ mod tests {
 
     fn pane(id: &str, session: &str, window: u32, idx: u32) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,

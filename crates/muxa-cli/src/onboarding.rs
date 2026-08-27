@@ -216,7 +216,7 @@ terminate_agent, close_work, and close_workspace require confirm=true.";
 
 const SAFETY: &str = "\
 Muxa deliberately does not expose arbitrary shell or generic tmux commands.\n\
-Use exact pane ids for agent control. Destructive actions require confirmation.\n\
+Use exact pane ids or native PTY session ids for agent control. Destructive actions require confirmation.\n\
 Use collaboration review + read_only by default; grant execute only with narrow paths.";
 
 const POLICY_KO: &str = "\
@@ -256,7 +256,7 @@ terminate_agent, close_work, close_workspace는 confirm=true가 필요합니다.
 
 const SAFETY_KO: &str = "\
 Muxa는 임의 shell 실행이나 범용 tmux 명령을 노출하지 않습니다.\n\
-Agent 제어에는 정확한 pane id를 사용하고 파괴적 동작은 확인을 요구합니다.\n\
+Agent 제어에는 정확한 pane id 또는 native PTY session id를 사용하고 파괴적 동작은 확인을 요구합니다.\n\
 협업은 review + read_only를 기본으로 하고 execute는 좁은 경로에만 허용합니다.";
 
 const SECTIONS: &[Section] = &[
@@ -2281,7 +2281,7 @@ mod tests {
         assert!(shortcuts.contains("m / M"));
         assert!(shortcuts.contains("a / A"));
         assert!(shortcuts.contains("Alt-K"));
-        assert!(shortcuts.contains("n / w          new window or agent pane / work up a pipeline"));
+        assert!(shortcuts.contains("n / w / R      new window/pane / work up / rename the row"));
     }
 
     #[test]

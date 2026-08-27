@@ -423,6 +423,18 @@ other agent occupies the same stable tmux window.
   "origin": { "pane": "%18", "socket": "default" },
   "alias": "reviewer", "roles": ["review", "rust"] }
 
+// Ask the room's namespace arbiter for a handle. `mint` takes the first free
+// name in a family (`claude`, `claude2`, …); `reserve` claims an exact one and
+// is refused if the room already answers to it. Replies carry `handle`, absent
+// when no name was free or the pane belongs to no room the daemon can see.
+{ "protocol": 6, "kind": "collaboration_issue_handle",
+  "pane": "%18", "socket": "default",
+  "request": { "mint": { "base": "claude" } } }
+
+{ "protocol": 6, "kind": "collaboration_issue_handle",
+  "pane": "%18", "socket": "default",
+  "request": { "reserve": { "handle": "reviewer" } } }
+
 { "protocol": 3, "kind": "collaboration_send",
   "origin": { "pane": "%12", "socket": "default" },
   "target": "peer",
@@ -722,3 +734,14 @@ is gone.
 
 - Added generation-aware durable pipeline Run request variants and the
   `pipeline_runs_v1` capability.
+
+### v5 → v6 (2026-08-27)
+
+- Added `collaboration_issue_handle` and the `handle_namespace_v1`
+  capability. The daemon becomes the single arbiter of a room's handle
+  namespace, because it is the only place that sees all three of its
+  writers at once: the `@muxa_agent_alias` pane option, registered
+  identities, and handles promised to callers that have not written them
+  yet. Allocating anywhere else means allocating from a partial view, which
+  is how one room came to answer to `@claude` twice.
+- Responses gain an optional `handle` field.

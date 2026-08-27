@@ -294,6 +294,29 @@ pub fn run_control_on(socket: Option<&str>, args: &[&str]) -> Result<(), TmuxErr
     }
 }
 
+/// Run one tmux control command against an explicitly identified server and
+/// return its stdout.
+///
+/// The reading counterpart to [`run_control_on`], for the control ops that
+/// need an answer rather than an exit status — checking whether a name is
+/// already taken in a session before renaming into it, say. Same server
+/// pinning and the same bounded error shape.
+pub fn capture_control_on(socket: Option<&str>, args: &[&str]) -> Result<String, TmuxError> {
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(args);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux {}", args.join(" ")),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
 /// The `send-keys` argv (after any server-scope flags) for a literal text
 /// injection. Split out from [`send_text_on`] so the argument construction is
 /// unit-testable without a running tmux server.
@@ -465,6 +488,20 @@ pub struct PaneInfo {
     #[serde(default)]
     pub session_id: String,
     pub session: String,
+    /// tmux `#{session_group}` — the name of the session group this session
+    /// belongs to, or `None` when it belongs to none.
+    ///
+    /// A session group shares one window list across several sessions, each
+    /// keeping its own current window. That is the supported way to put two
+    /// terminals on two windows of one workspace, and it means the same window
+    /// is reported once per member. Topology folds on this so one window set
+    /// is one tree.
+    ///
+    /// `serde(default)`, like every additive field here: pane snapshots cross
+    /// the wire (CLI → daemon over IPC, host → host over the fleet relay), so
+    /// a peer built before this field existed must not fail to deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_group: Option<String>,
     /// tmux's stable window id (for example `@7`). Collaboration rooms use
     /// `(socket, window_id)` rather than the mutable name/index.
     #[serde(default)]
@@ -530,7 +567,15 @@ pub struct SessionInfo {
     pub name: String,
     /// Number of attached clients. A session is "active" for muxa's
     /// cumulative timer when this is greater than zero.
+    ///
+    /// Per *session*, not per group: a workspace viewed by two terminals
+    /// through a session group reports 1 here on each member, so a caller
+    /// describing the workspace has to sum across [`Self::group`].
     pub attached_clients: u32,
+    /// tmux `#{session_group}`, or `None` when this session is in no group.
+    /// Additive, hence `serde(default)` — this type crosses the fleet wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -568,9 +613,10 @@ pub struct ClientInfo {
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}\t#{session_group}";
 
-pub(crate) const SESSION_FMT: &str = "#{session_id}\t#{session_name}\t#{session_attached}";
+pub(crate) const SESSION_FMT: &str =
+    "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_group}";
 pub(crate) const CLIENT_FMT: &str =
     "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}\t#{client_created}\t#{pane_in_mode}";
 
@@ -618,6 +664,7 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             socket: socket.map(Into::into),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
+            session_group: non_empty(cols.get(32)),
         });
     }
     panes
@@ -652,6 +699,7 @@ pub(crate) fn parse_session_lines(stdout: &str) -> Vec<SessionInfo> {
             session_id: cols[0].into(),
             name: cols[1].into(),
             attached_clients,
+            group: non_empty(cols.get(3)),
         });
     }
     sessions
@@ -933,6 +981,79 @@ pub fn current_client() -> Option<String> {
     (!client.is_empty()).then(|| client.to_string())
 }
 
+/// The stable session id (`$N`) the named client is currently attached to,
+/// on the server identified by `socket` (`None` ⇒ env-scoped default).
+///
+/// Pinned with `-t <client>` so the answer describes *that* terminal.
+/// An unpinned `display-message` resolves against whichever client tmux
+/// last saw activity on, which with two terminals attached is routinely
+/// the other one — the same hazard [`current_client`] documents.
+///
+/// `None` when tmux is unavailable, the client has detached mid-call, or
+/// the field comes back empty; callers treat that as "session unknown".
+pub fn client_session_id_on(socket: Option<&str>, client: &str) -> Option<String> {
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(["display-message", "-p", "-t", client, "#{session_id}"]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux display-message -t {client}"),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let session = stdout.lines().next().unwrap_or("").trim();
+    (!session.is_empty()).then(|| session.to_string())
+}
+
+/// Whether `window_id` (`@N`) is linked into the session `session_id` (`$N`)
+/// on `socket`.
+///
+/// One window belongs to exactly one session in an ordinary tmux server, so
+/// this is normally just "is that the pane's session". It stops being a
+/// tautology under a *session group* (`tmux new-session -t <session>`), where
+/// one window is linked into every session in the group — which is what the
+/// jump path needs to know before it can address a window without guessing.
+///
+/// `false` on any failure: the caller's fallback is the un-qualified target
+/// it used before, so a failed probe degrades to the old behaviour rather
+/// than to a broken one.
+pub fn window_in_session_on(socket: Option<&str>, session_id: &str, window_id: &str) -> bool {
+    if session_id.is_empty() || window_id.is_empty() {
+        return false;
+    }
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(["list-windows", "-t", session_id, "-F", "#{window_id}"]);
+    let Ok(out) = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux list-windows -t {session_id}"),
+    ) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(out.stdout) else {
+        return false;
+    };
+    window_listed(&stdout, window_id)
+}
+
+/// Whether `list-windows -F '#{window_id}'` output contains exactly
+/// `window_id`.
+///
+/// Split out from [`window_in_session_on`] so the match rule is testable
+/// without a tmux server. Equality, never a prefix or substring: tmux window
+/// ids are `@` plus a decimal counter, so `@1` is a prefix of `@10` and a
+/// looser rule would report a window as linked into a session that has a
+/// different, higher-numbered one.
+fn window_listed(stdout: &str, window_id: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == window_id)
+}
+
 pub fn current_pane() -> Option<String> {
     if let Some(p) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) {
         return Some(p);
@@ -1031,6 +1152,65 @@ pub(crate) fn parse_pane_pid_map(stdout: &str) -> std::collections::HashMap<u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_and_session_parsers_read_the_session_group_column() {
+        // `session_group` is the last column of each format, which makes it the
+        // one an off-by-one silently empties — and an empty group reads as "not
+        // grouped", so the tree would quietly stop folding rather than fail.
+        let cols: Vec<String> = PANE_FMT
+            .split('\t')
+            .enumerate()
+            .map(|(index, field)| match field {
+                "#{pane_id}" => "%7".to_string(),
+                "#{session_name}" => "base".to_string(),
+                "#{session_group}" => "grp".to_string(),
+                _ => format!("c{index}"),
+            })
+            .collect();
+        let panes = parse_pane_lines(&cols.join("\t"));
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "%7");
+        assert_eq!(panes[0].session, "base");
+        assert_eq!(panes[0].session_group.as_deref(), Some("grp"));
+
+        let sessions = parse_session_lines("$3\tbase\t2\tgrp\n");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "$3");
+        assert_eq!(sessions[0].attached_clients, 2);
+        assert_eq!(sessions[0].group.as_deref(), Some("grp"));
+    }
+
+    #[test]
+    fn an_ungrouped_session_reports_no_group() {
+        // tmux emits an empty field, not a missing one, for a session in no
+        // group — and a row from an older `PANE_FMT` has no field at all.
+        // Both mean "not grouped", never `Some("")`.
+        let sessions = parse_session_lines("$3\tbase\t1\t\n");
+        assert_eq!(sessions[0].group, None);
+        let short = parse_session_lines("$3\tbase\t1\n");
+        assert_eq!(short[0].group, None);
+    }
+
+    #[test]
+    fn window_listed_matches_whole_ids_only() {
+        let listing = "@0\n@1\n@12\n";
+        assert!(window_listed(listing, "@1"));
+        assert!(window_listed(listing, "@12"));
+        // `@1` is a prefix of `@12`, and `@2` a suffix — neither is a match.
+        assert!(!window_listed(listing, "@2"));
+        assert!(!window_listed(listing, "@120"));
+        // `lines()` yields no entry for the trailing newline, so an empty
+        // needle finds nothing here either; `window_in_session_on` rejects
+        // an empty id up front regardless.
+        assert!(!window_listed(listing, ""));
+    }
+
+    #[test]
+    fn window_listed_tolerates_padding_and_empty_output() {
+        assert!(window_listed("  @7  \n", "@7"));
+        assert!(!window_listed("", "@7"));
+    }
 
     /// Locks the `send-keys` argv shape: literal (`-l`) injection targeting
     /// the pane id, with `--` terminating options and the text passed verbatim
@@ -1243,6 +1423,7 @@ mod tests {
     #[test]
     fn an_unaliased_pane_serializes_without_the_new_keys() {
         let pane = PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             pane_id: "%1".into(),

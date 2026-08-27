@@ -30,7 +30,7 @@ use muxa::collaboration::{
     RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use muxa::event::{AgentKind, AgentState};
-use muxa::ipc::{Client, TransitionStream};
+use muxa::ipc::{Client, SendPromptOutcome, TransitionStream};
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -943,16 +943,18 @@ async fn call_tool(
             };
             // Submit defaults to true — the common case is "prompt and run".
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
-            Ok(match client.send_prompt(pane, text, submit).await {
-                // The daemon distinguishes "text injected" (`sent`) from
-                // "Enter delivered" (`submitted`); surface the latter so a
-                // caller whose submit was requested but not delivered learns
-                // the text already landed and must not blindly resend it.
-                Ok(outcome) => {
-                    render_send_result(text.len(), pane, submit, Some(outcome.submitted))
-                }
-                Err(e) => error_result(&format!("send_prompt failed: {e}")),
-            })
+            Ok(
+                match send_prompt_with_local_cmux(client, pane, text, submit).await {
+                    // The daemon distinguishes "text injected" (`sent`) from
+                    // "Enter delivered" (`submitted`); surface the latter so a
+                    // caller whose submit was requested but not delivered learns
+                    // the text already landed and must not blindly resend it.
+                    Ok(outcome) => {
+                        render_send_result(text.len(), pane, submit, Some(outcome.submitted))
+                    }
+                    Err(e) => error_result(&format!("send_prompt failed: {e}")),
+                },
+            )
         }
         "muxa_capture_pane" => {
             let Some(pane) = args.get("pane").and_then(Value::as_str) else {
@@ -1971,6 +1973,7 @@ fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, St
                 .to_string()
         })?;
     let endpoint = match muxa::backend::pane_id_host_kind(&pane) {
+        Some(muxa::HostKind::Cmux) => Some(muxa::backend::cmux::endpoint_from_env()),
         Some(muxa::HostKind::Rmux) => std::env::var("RMUX").ok(),
         Some(muxa::HostKind::Tmux) => std::env::var("TMUX").ok(),
         Some(muxa::HostKind::Zellij | muxa::HostKind::Herdr) | None => None,
@@ -2135,6 +2138,72 @@ fn render_send_result(text_len: usize, pane: &str, submit: bool, submitted: Opti
             ))
         }
     }
+}
+
+/// Prefer a direct cmux socket call from the MCP process when it is itself
+/// running inside cmux. cmux's default socket policy accepts descendants of a
+/// cmux terminal but rejects a separately launched login daemon, so proxying
+/// every request through muxad would make the default secure mode unusable.
+/// A failed first text injection is safe to retry through the daemon; once text
+/// lands, submit is reported separately and the text is never resent.
+async fn send_prompt_with_local_cmux(
+    client: &Client,
+    pane: &str,
+    prompt: &str,
+    submit: bool,
+) -> std::result::Result<SendPromptOutcome, String> {
+    let inside_cmux = std::env::var("CMUX_SURFACE_ID").is_ok_and(|id| !id.trim().is_empty());
+    if muxa::backend::pane_id_host_kind(pane) == Some(muxa::HostKind::Cmux) && inside_cmux {
+        let env_endpoint = muxa::backend::cmux::endpoint_from_env();
+        let mut endpoints = client
+            .snapshot()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|agent| agent.pane.as_deref() == Some(pane))
+            .filter_map(|agent| agent.tmux_socket)
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        endpoints.dedup();
+        let endpoint = if endpoints.is_empty() || endpoints.contains(&env_endpoint) {
+            env_endpoint
+        } else if endpoints.len() == 1 {
+            endpoints.remove(0)
+        } else {
+            return Err(format!(
+                "cmux pane {pane} exists on multiple socket endpoints; run muxa mcp inside the target cmux instance"
+            ));
+        };
+        let target_pane = pane.to_string();
+        let target_prompt = prompt.to_string();
+        if let Ok(Some(outcome)) = tokio::task::spawn_blocking(move || {
+            let backend = muxa::backend::cmux::CmuxBackend::with_endpoint(endpoint);
+            if !muxa::PaneBackend::send_text(&backend, &target_pane, &target_prompt) {
+                return None;
+            }
+            let submitted = if submit {
+                if !target_prompt.is_empty() {
+                    std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+                }
+                muxa::PaneBackend::send_text(&backend, &target_pane, "\r")
+            } else {
+                false
+            };
+            Some(SendPromptOutcome {
+                sent: true,
+                submitted,
+            })
+        })
+        .await
+        {
+            return Ok(outcome);
+        }
+    }
+
+    client
+        .send_prompt(pane, prompt, submit)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Terminal outcome of a `muxa_wait_for_change` race, before it's rendered
@@ -2641,6 +2710,7 @@ mod tests {
 
     fn registration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             pane_id: pane_id.into(),

@@ -91,7 +91,7 @@ wall-clock safety limit, not an inactivity detector.
 [collaboration]
 enabled = true
 wake = "idle_only" # idle_only | never
-wake_payload = "notice" # notice | full
+wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
 ```
@@ -100,10 +100,11 @@ Opt-in durable request/reply between agents in the same stable tmux window.
 The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json` and
 stores both mailbox state and exact-session aliases/roles.
 `idle_only` injects only at a hook-authoritative top-level Idle prompt.
-`wake_payload = "notice"` (the default) keeps request bodies in the mailbox;
-`full` atomically claims one request per idle generation and injects its
-structured metadata and body, avoiding a separate inbox tool round. Reply
-wakes remain body-free notifications in both modes.
+The default `wake_payload = "operator_full"` directly delivers requests sent
+from operator surfaces such as watch and dashboard, while agent-originated MCP
+and CLI requests remain mailbox notices. `notice` keeps every body in the
+mailbox; `full` atomically claims and directly delivers every request. Reply
+wakes remain body-free notifications in every mode.
 `scope = "host"` lets watch address the selected tracked agent in another
 tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).
@@ -302,8 +303,8 @@ prompts to oh-my-prompt. See [SINKS.md](SINKS.md).
 
 ## Pane host selection
 
-`MUXA_HOST=tmux|rmux|herdr|zellij` pins a single host. `MUXA_HOSTS` accepts an
+`MUXA_HOST=tmux|cmux|rmux|herdr|zellij` pins a single host. `MUXA_HOSTS` accepts an
 ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
 `RMUX` variables take precedence over the `TMUX` compatibility variables it
-also exports. See [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
+also exports. See [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
 [ZELLIJ.md](ZELLIJ.md).

@@ -67,6 +67,7 @@ impl SessionRef {
         SurfaceRef {
             kind: self.backend.into(),
             id: self.id.clone(),
+            workspace: None,
         }
     }
 }

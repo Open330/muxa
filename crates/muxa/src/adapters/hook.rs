@@ -42,8 +42,9 @@ pub trait HookAdapter {
 /// 2. `$RMUX_PANE`, namespaced to `rmux:%N`.
 /// 3. `$ZELLIJ_PANE_ID` (zellij's "this pane" var).
 /// 4. `$HERDR_PANE_ID` (herdr's analog), namespaced to `herdr:<id>`.
-/// 5. `$TMUX_PANE` (tmux and rmux compatibility set this).
-/// 6. Walk the parent-pid chain and match against the active backend's
+/// 5. `$CMUX_SURFACE_ID`, namespaced to `cmux:<id>`.
+/// 6. `$TMUX_PANE` (tmux and rmux compatibility set this).
+/// 7. Walk the parent-pid chain and match against the active backend's
 ///    `pane_pid_map()`. Linux reads `/proc`; macOS/BSD take one `ps` process
 ///    snapshot and walk it in memory. Useful when an agent hook subprocess
 ///    didn't inherit the host env var. Skipped when the backend's
@@ -73,8 +74,19 @@ where
     let mut ev = A::normalize(event, input, pane);
     if let Some(surface) = surface {
         ev.id_mut().surface = Some(surface);
+    } else if ev
+        .id()
+        .pane
+        .as_deref()
+        .and_then(crate::backend::pane_id_host_kind)
+        == Some(crate::backend::HostKind::Cmux)
+    {
+        ev.id_mut().surface = cmux_surface_env();
     }
-    if ev.id_mut().tmux_socket.is_none() {
+    // Endpoint metadata belongs to an external pane binding. A muxa-owned PTY
+    // may inherit CMUX/TMUX variables from the terminal that requested it, but
+    // that outer socket does not own the daemon-created PTY surface.
+    if ev.id().pane.is_some() && ev.id().tmux_socket.is_none() {
         ev.id_mut().tmux_socket = host_endpoint_env();
     }
     Ok(ev)
@@ -93,11 +105,12 @@ fn tmux_socket_env() -> Option<String> {
 }
 
 /// Control endpoint for the detected pane host. The persisted field retains
-/// its historical `tmux_socket` name for protocol compatibility, but rmux
-/// rows carry rmux's native socket path from `$RMUX` here.
+/// its historical `tmux_socket` name for protocol compatibility, but rmux and
+/// cmux rows carry their native socket paths here.
 fn host_endpoint_env() -> Option<String> {
     match crate::backend::detect_host_env() {
         Some(crate::backend::HostKind::Rmux) => crate::backend::rmux::endpoint_from_env(),
+        Some(crate::backend::HostKind::Cmux) => Some(crate::backend::cmux::endpoint_from_env()),
         _ => tmux_socket_env(),
     }
 }
@@ -112,19 +125,39 @@ fn muxa_session_env() -> Option<SurfaceRef> {
         "zellij" => SurfaceKind::Zellij,
         _ => SurfaceKind::Pty,
     };
-    Some(SurfaceRef { kind, id })
+    Some(SurfaceRef {
+        kind,
+        id,
+        workspace: None,
+    })
+}
+
+fn cmux_surface_env() -> Option<SurfaceRef> {
+    cmux_surface_env_from(|name| std::env::var(name).ok())
+}
+
+fn cmux_surface_env_from(read: impl Fn(&str) -> Option<String>) -> Option<SurfaceRef> {
+    let id = read("CMUX_SURFACE_ID").filter(|id| !id.trim().is_empty())?;
+    let workspace = read("CMUX_WORKSPACE_ID").filter(|id| !id.trim().is_empty());
+    Some(SurfaceRef {
+        kind: SurfaceKind::Cmux,
+        id,
+        workspace,
+    })
 }
 
 /// Read whichever host-set "this pane" env var identifies the *innermost*
-/// host, in `MUXA_HOST` override → `RMUX_PANE` → `ZELLIJ_PANE_ID` → `HERDR_PANE_ID` →
-/// `TMUX_PANE` order. Empty string is treated as unset. This mirrors
+/// host, in `MUXA_HOST` override → `RMUX_PANE` → `ZELLIJ_PANE_ID` →
+/// `HERDR_PANE_ID` → `CMUX_SURFACE_ID` → `TMUX_PANE` order. Empty string is
+/// treated as unset. This mirrors
 /// `crate::backend::detect_from`'s host-selection precedence exactly, so the
 /// pane a hook is stamped onto and the backend that observes it always agree.
 ///
 /// tmux/zellij ids are returned verbatim (`%N`, `zellij:<id>` — the latter
-/// already carries its namespace). herdr's raw pane id is *not* namespaced
-/// by herdr, so we stamp `crate::backend::herdr::PANE_ID_PREFIX` (`herdr:`)
-/// here to match the `herdr:<id>` shape muxa uses everywhere internally
+/// already carries its namespace). cmux and herdr raw ids are namespaced
+/// with their respective prefixes; herdr uses
+/// `crate::backend::herdr::PANE_ID_PREFIX` (`herdr:`) to match the
+/// `herdr:<id>` shape muxa uses everywhere internally
 /// (registry rows, `by_pane`, and the cross-host reaping guard's
 /// `pane_id_host_kind`); the prefix is stripped again before the id goes
 /// back over the herdr socket.
@@ -156,6 +189,7 @@ fn host_pane_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
     if let Some(raw) = read("MUXA_HOST") {
         let forced = match raw.trim().to_ascii_lowercase().as_str() {
             "tmux" => Some(HostKind::Tmux),
+            "cmux" => Some(HostKind::Cmux),
             "rmux" => Some(HostKind::Rmux),
             "zellij" => Some(HostKind::Zellij),
             "herdr" => Some(HostKind::Herdr),
@@ -169,17 +203,18 @@ fn host_pane_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
     }
 
     // Auto-detect: native rmux first (it also sets TMUX_PANE), then zellij,
-    // herdr, and finally tmux. Byte-for-byte the same order as
+    // herdr, cmux, and finally tmux. Byte-for-byte the same order as
     // `detect_from`, so hook stamping and backend observation never disagree.
     pane_env_for(HostKind::Rmux, &read)
         .or_else(|| pane_env_for(HostKind::Zellij, &read))
         .or_else(|| pane_env_for(HostKind::Herdr, &read))
+        .or_else(|| pane_env_for(HostKind::Cmux, &read))
         .or_else(|| pane_env_for(HostKind::Tmux, &read))
 }
 
 /// The muxa pane id for one host from its "this pane" env var, or `None` when
-/// that var is unset/empty. tmux/zellij ids pass through verbatim; herdr's raw
-/// id is stamped with the `herdr:` namespace prefix.
+/// that var is unset/empty. tmux/zellij ids pass through verbatim; cmux and
+/// herdr raw ids receive their host namespace prefixes.
 fn pane_env_for(
     host: crate::backend::HostKind,
     read: &impl Fn(&str) -> Option<String>,
@@ -187,6 +222,9 @@ fn pane_env_for(
     use crate::backend::HostKind;
     match host {
         HostKind::Tmux => read("TMUX_PANE").filter(|v| !v.is_empty()),
+        HostKind::Cmux => read("CMUX_SURFACE_ID")
+            .filter(|v| !v.is_empty())
+            .map(|v| crate::backend::cmux::namespace_pane_id(&v)),
         HostKind::Rmux => read("RMUX_PANE")
             .filter(|v| !v.is_empty())
             .map(|v| format!("{}{v}", crate::backend::rmux::PANE_ID_PREFIX)),
@@ -281,6 +319,37 @@ mod tests {
         assert_eq!(
             host_pane_env_from(env_reader(&[("HERDR_PANE_ID", "42")])),
             Some(format!("{}42", crate::backend::herdr::PANE_ID_PREFIX)),
+        );
+    }
+
+    #[test]
+    fn host_pane_env_prefixes_cmux_surface_id() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[("CMUX_SURFACE_ID", "surface-7")])),
+            Some("cmux:surface-7".to_string()),
+        );
+        assert_eq!(
+            host_pane_env_from(env_reader(&[
+                ("MUXA_HOST", "cmux"),
+                ("CMUX_SURFACE_ID", "surface-8"),
+                ("TMUX_PANE", "%3"),
+            ])),
+            Some("cmux:surface-8".to_string()),
+        );
+    }
+
+    #[test]
+    fn cmux_surface_metadata_retains_workspace_identity() {
+        assert_eq!(
+            cmux_surface_env_from(env_reader(&[
+                ("CMUX_SURFACE_ID", "surface-7"),
+                ("CMUX_WORKSPACE_ID", "workspace-2"),
+            ])),
+            Some(SurfaceRef {
+                kind: SurfaceKind::Cmux,
+                id: "surface-7".into(),
+                workspace: Some("workspace-2".into()),
+            }),
         );
     }
 
