@@ -405,6 +405,7 @@ mod tests {
 
     fn pane(id: &str, cmd: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,

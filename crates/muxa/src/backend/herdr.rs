@@ -502,6 +502,7 @@ fn to_pane_info(pane: &HerdrPaneInfo, process: Option<&HerdrProcessInfo>) -> Pan
         None => (String::new(), 0, String::new()),
     };
     PaneInfo {
+        session_group: None,
         agent_role: None,
         agent_alias: None,
         pane_id: format!("{PANE_ID_PREFIX}{}", pane.pane_id),

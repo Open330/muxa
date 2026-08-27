@@ -5177,6 +5177,7 @@ mod tests {
 
     fn fake_pane(pane_id: &str, session: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             socket: None,

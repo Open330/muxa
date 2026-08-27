@@ -1643,6 +1643,7 @@ mod tests {
 
     fn pane_info(pane_id: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             pane_id: pane_id.into(),
