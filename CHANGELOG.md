@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Operator messages now carry their body directly by default, without making
+  agent delegation equally permissive.** The new default `wake_payload =
+  "operator_full"` claims and injects requests sent by the resolved operator
+  console (watch/dashboard), while agent-originated MCP and CLI requests remain
+  body-free mailbox notices. Explicit `notice` and `full` retain their strict
+  all-notice and all-direct behavior. This is a delivery policy, not an
+  authorization signal: `work_mode = "execute"` cannot promote an agent request.
 - **Work pipelines now have daemon-owned, generation-aware Run state.** The
   selected pipeline, rendered desired aliases, dependency graph, Run
   generation, and each alias's `pending`/`running`/`blocked`/`done`/`failed`
