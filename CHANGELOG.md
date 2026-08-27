@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relay now enables bracketed paste, forwards the restored framing to the child
   PTY so multiline input is not executed line by line, ignores leaked platform
   shortcut keys, and restores the parent terminal state on every exit path.
+  Embedded bracket markers are removed before forwarding so clipboard control
+  bytes cannot close the paste early and execute the remainder as keystrokes.
 
 ## [0.8.36] - 2026-08-27
 

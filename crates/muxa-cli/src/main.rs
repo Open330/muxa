@@ -1300,8 +1300,24 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
 /// shell. The parent terminal reports line feeds; PTY input expects carriage
 /// returns, with CRLF normalized first so it does not become a doubled CR.
 fn bracketed_paste_input(text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
-    format!("\x1b[200~{normalized}\x1b[201~")
+    const START: &str = "\x1b[200~";
+    const END: &str = "\x1b[201~";
+
+    // Clipboard text can contain terminal controls. If an end marker reaches
+    // the child unchanged, readline leaves paste mode early and processes the
+    // remainder as ordinary keystrokes, including carriage returns that execute
+    // commands. Remove markers while streaming so overlapping inputs cannot
+    // reveal a fresh marker after an earlier one is deleted.
+    let mut defanged = Vec::with_capacity(text.len());
+    for byte in text.bytes() {
+        defanged.push(byte);
+        if defanged.ends_with(START.as_bytes()) || defanged.ends_with(END.as_bytes()) {
+            defanged.truncate(defanged.len() - START.len());
+        }
+    }
+    let defanged = String::from_utf8(defanged).expect("removing ASCII preserves UTF-8");
+    let normalized = defanged.replace("\r\n", "\n").replace('\n', "\r");
+    format!("{START}{normalized}{END}")
 }
 
 fn is_detach_prefix(key: crossterm::event::KeyEvent) -> bool {
@@ -2879,6 +2895,17 @@ mod tests {
             bracketed_paste_input("first\nsecond\r\nthird"),
             "\x1b[200~first\rsecond\rthird\x1b[201~"
         );
+    }
+
+    #[test]
+    fn attached_session_paste_cannot_close_its_own_brackets() {
+        let framed =
+            bracketed_paste_input("safe\x1b[201~\r\nnext\x1b[200~\x1b\x1b[201~[201~\r\ncommand");
+        assert!(framed.starts_with("\x1b[200~"));
+        assert!(framed.ends_with("\x1b[201~"));
+        assert_eq!(framed.matches("\x1b[200~").count(), 1);
+        assert_eq!(framed.matches("\x1b[201~").count(), 1);
+        assert_eq!(&framed[6..framed.len() - 6], "safe\rnext\rcommand");
     }
 
     #[test]
