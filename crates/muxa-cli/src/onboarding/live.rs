@@ -461,7 +461,11 @@ fn muxad_beside(exe: &Path) -> Option<PathBuf> {
 
 impl Sandbox {
     fn prepare_status(&self) -> Result<()> {
-        self.tmux_command(&["set", "-g", "status", "3"])?;
+        // Four rows, and row 0 is left as tmux's own window list.
+        // Overwriting it meant a learner who pressed `Ctrl-b c` had no way
+        // to see the window they had just made — the tour was hiding its
+        // own evidence.
+        self.tmux_command(&["set", "-g", "status", "4"])?;
         self.tmux_command(&["set", "-g", "status-position", "top"])?;
         self.tmux_command(&["set", "-g", "status-style", "bg=#0b1220,fg=#c9d1d9"])?;
         self.tmux_command(&["set", "-g", "status-interval", "2"])?;
@@ -493,18 +497,23 @@ impl Sandbox {
         self.consume_flag(LANGUAGE_OPTION)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn narrate(
         &self,
         index: usize,
         total: usize,
+        achieved: &str,
         title: &str,
         cue: &str,
         escape: Option<&str>,
         other_language: &str,
     ) {
+        // What just happened comes first. A tour that only ever says what to do
+        // next leaves the learner typing commands and guessing whether any of
+        // them landed.
         let banner = format!(
             "#[align=centre bg=#1f6feb,fg=#0b1220,bold] muxa onboarding · {index}/{total} \
-             #[default]#[fg=#8b949e]  F2 {other_language}"
+             #[default]  #[fg=#3fb950]{achieved}#[default]#[fg=#8b949e]    F2 {other_language}"
         );
         let title = format!("#[align=centre]{title}");
         let cue = match escape {
@@ -513,9 +522,10 @@ impl Sandbox {
             }
             None => format!("#[align=centre fg=#d29922,bold]{cue}"),
         };
-        let _ = self.tmux_command(&["set", "-g", "status-format[0]", &banner]);
-        let _ = self.tmux_command(&["set", "-g", "status-format[1]", &title]);
-        let _ = self.tmux_command(&["set", "-g", "status-format[2]", &cue]);
+        // Row 0 stays tmux's own window list.
+        let _ = self.tmux_command(&["set", "-g", "status-format[1]", &banner]);
+        let _ = self.tmux_command(&["set", "-g", "status-format[2]", &title]);
+        let _ = self.tmux_command(&["set", "-g", "status-format[3]", &cue]);
     }
 }
 
@@ -1033,6 +1043,10 @@ enum Detect {
 }
 
 struct Step {
+    /// What the learner's last action actually did. Shown as this step opens,
+    /// because "did that work?" is the question they are holding.
+    achieved_en: &'static str,
+    achieved_ko: &'static str,
     title_en: &'static str,
     title_ko: &'static str,
     cue_en: &'static str,
@@ -1049,6 +1063,8 @@ struct Step {
 const STEPS: &[Step] = &[
     // ---- Act I: tmux ------------------------------------------------------
     Step {
+        achieved_en: "ready — you are at a plain shell, outside tmux",
+        achieved_ko: "준비 완료 — 지금은 tmux 밖의 평범한 셸입니다",
         title_en: "A tmux session is a workspace that keeps running without you.",
         title_ko: "tmux session은 당신 없이도 계속 도는 작업 공간입니다.",
         cue_en: "type:   tmux new-session -s muxa-onboarding",
@@ -1056,6 +1072,8 @@ const STEPS: &[Step] = &[
         detect: Detect::SessionCreated,
     },
     Step {
+        achieved_en: "✓ session created, and you are inside it — this bar is tmux's",
+        achieved_ko: "✓ session을 만들고 들어왔습니다 — 이 줄들이 tmux입니다",
         title_en: "One window is one Work. Make a second one.",
         title_ko: "window 하나가 Work 하나입니다. 두 번째를 만들어 보세요.",
         cue_en: "press   Ctrl-b   then   c",
@@ -1063,6 +1081,8 @@ const STEPS: &[Step] = &[
         detect: Detect::SecondWindow,
     },
     Step {
+        achieved_en: "✓ second window created — see both in the top row",
+        achieved_ko: "✓ 두 번째 window가 생겼습니다 — 맨 윗줄에 둘 다 보입니다",
         title_en: "Now leave. Detaching removes you, not the work.",
         title_ko: "이제 나가 보세요. detach는 당신만 빠지고 작업은 그대로입니다.",
         cue_en: "press   Ctrl-b   then   d       ·   then try:   tmux ls",
@@ -1070,6 +1090,8 @@ const STEPS: &[Step] = &[
         detect: Detect::NoClient,
     },
     Step {
+        achieved_en: "✓ detached — you are back at your shell, and the session kept running",
+        achieved_ko: "✓ detach했습니다 — 셸로 돌아왔고, session은 계속 돌고 있습니다",
         title_en: "Still listed, still running. That is the whole reason muxa lives in tmux.",
         title_ko: "여전히 목록에 있고 여전히 돌고 있습니다. muxa가 tmux에 사는 이유입니다.",
         cue_en: "type:   tmux attach -t muxa-onboarding",
@@ -1078,6 +1100,8 @@ const STEPS: &[Step] = &[
     },
     // ---- Act II: muxa -----------------------------------------------------
     Step {
+        achieved_en: "✓ attached again — every window and pane exactly as you left it",
+        achieved_ko: "✓ 다시 들어왔습니다 — window도 pane도 떠날 때 그대로입니다",
         title_en: "This window is the `checkout` Work now, with two agents in it. A pane is an agent.",
         title_ko:
             "이 window가 이제 `checkout` Work이고, 안에 agent가 둘 있습니다. pane 하나가 agent 하나입니다.",
@@ -1086,6 +1110,8 @@ const STEPS: &[Step] = &[
         detect: Detect::PaneRunning("muxa"),
     },
     Step {
+        achieved_en: "✓ watch showed the whole window at once — and codex just stopped",
+        achieved_ko: "✓ watch가 window 전체를 한 번에 보여줬습니다 — 그리고 codex가 방금 멈췄습니다",
         title_en: "codex stopped and needs you. `attend` jumps to whichever agent has been blocked longest — you land in codex's pane.",
         title_ko: "codex가 멈춰서 당신이 필요합니다. `attend`는 가장 오래 막힌 agent로 이동합니다 — codex의 pane에 도착합니다.",
         cue_en: "leave watch with q, then run:   muxa attend",
@@ -1096,6 +1122,8 @@ const STEPS: &[Step] = &[
         // attend left them sitting in codex's pane, which has no shell to
         // type into. Getting back is a real tmux key, so the step teaches it
         // rather than having the tour move the cursor on their behalf.
+        achieved_en: "✓ attend moved you to codex, the agent blocked longest",
+        achieved_ko: "✓ attend가 가장 오래 막힌 agent인 codex로 데려왔습니다",
         title_en: "You are in codex's pane — press y to approve it if you like. `Ctrl-b ;` returns to the last pane you were in, which is your own shell.",
         title_ko: "지금 codex의 pane입니다 — 원하면 y로 승인해 보세요. `Ctrl-b ;`는 직전에 있던 pane, 즉 당신의 셸로 돌아갑니다.",
         cue_en: "back with   Ctrl-b ;   then run:   muxa msg send @claude \"how far along?\"",
@@ -1103,6 +1131,8 @@ const STEPS: &[Step] = &[
         detect: Detect::SentMessage,
     },
     Step {
+        achieved_en: "✓ your question reached claude and it answered — and codex asked you something",
+        achieved_ko: "✓ 질문이 claude에게 닿았고 답이 왔습니다 — 그리고 codex가 당신에게 물어왔습니다",
         title_en: "Agents use muxa too — codex just sent you a request of its own.",
         title_ko: "agent도 muxa를 씁니다 — codex가 방금 당신에게 요청을 보냈습니다.",
         cue_en: "run:   muxa msg inbox",
@@ -1110,6 +1140,8 @@ const STEPS: &[Step] = &[
         detect: Detect::ClaimedInbox,
     },
     Step {
+        achieved_en: "✓ you claimed codex's request — the mailbox is yours to work through",
+        achieved_ko: "✓ codex의 요청을 확인했습니다 — mailbox는 당신이 처리하는 곳입니다",
         title_en: "session is a workspace · window is a work · pane is an agent",
         title_ko: "session은 workspace · window는 work · pane은 agent",
         cue_en: "press   Ctrl-b   then   d       ·   finishes and deletes the sandbox",
@@ -1301,6 +1333,7 @@ impl Tour<'_> {
 
     fn narrate(&self, index: usize, escape: bool) {
         let step = &STEPS[index];
+        let achieved = tr(self.language, step.achieved_en, step.achieved_ko);
         let title = tr(self.language, step.title_en, step.title_ko);
         let cue = tr(self.language, step.cue_en, step.cue_ko);
         let hint = escape.then(|| {
@@ -1314,6 +1347,7 @@ impl Tour<'_> {
         self.sandbox.narrate(
             index + 1,
             STEPS.len(),
+            achieved,
             title,
             cue,
             hint,
@@ -1333,7 +1367,7 @@ impl Tour<'_> {
         let _ = std::fs::write(
             &self.sandbox.cue,
             format!(
-                "\n  muxa onboarding · {}/{}\n  {title}\n  {cue}\n\n",
+                "\n  muxa onboarding · {}/{}   {achieved}\n  {title}\n  {cue}\n\n",
                 index + 1,
                 STEPS.len()
             ),

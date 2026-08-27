@@ -75,6 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shell prompt while they are detached, instead of printed underneath a
   prompt bash had already drawn — which read as the shell having gone away.
 
+  Every step opens by saying what the last action did — `✓ second window
+  created, see both in the top row` — because a tour that only ever says what
+  to do next leaves the learner typing commands and guessing whether any of
+  them landed. tmux's own status row is left alone for the same reason: the
+  narration had been painted over the window list, so pressing `Ctrl-b c`
+  produced no visible result anywhere on screen.
+
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
   supported command: `up` / `daemon` / `env` / `status` / `down` over a private
