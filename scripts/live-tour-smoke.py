@@ -268,6 +268,21 @@ def main() -> int:
         panes = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
         report.check("two agents joined the learner's window", len(panes) >= 3, str(panes))
 
+        # The tour claims to be a sandbox. If `ls` shows the learner their own
+        # repository, or watch prints their real path, it is not one.
+        paths = tmux("list-panes", "-a", "-F", "#{pane_current_path}").stdout.split()
+        report.check(
+            "nothing runs outside the sandbox workspace",
+            paths and all(p.startswith("/tmp/muxa-onboarding-home") for p in paths),
+            str(paths),
+        )
+        report.check(
+            "the windows are named after Works, not processes",
+            set(tmux("list-windows", "-a", "-F", "#{window_name}").stdout.split())
+            == {"checkout", "release-checks"},
+            tmux("list-windows", "-a", "-F", "#{window_name}").stdout.split(),
+        )
+
         terminal.type(b"muxa watch\r", 4)
         report.check("running watch advances", wait_step(terminal, 6), f"step={step()}")
 

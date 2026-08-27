@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `checkout · 3 agents` instead of `muxa` and `bash`. None of it shells out to
   an agent CLI, and each transcript says so on its first line.
 
+  The tour runs in a workspace of its own. It has its own `HOME` and a
+  `checkout-service` tree — the files the scripted agents say they are reading,
+  so `cat crates/checkout/src/auth.rs` answers — and every pane starts there,
+  so `ls` shows the practice project and `muxa watch` stops printing the
+  learner's real path as an agent's cwd. This is a convincing workspace rather
+  than a jail: `cd /` still works, because a real filesystem confinement needs
+  bubblewrap or a mount namespace and neither is available unprivileged on
+  every platform muxa runs on.
+
+  Codex's approval prompt answers. A prompt reading `[y] yes  [n] no` that
+  swallows the keystroke invites the learner to do the one thing the tour has
+  made impossible; pressing `y` now appends the tool output and fires the hook
+  a resuming agent fires, so the row in watch goes back to `working`.
+
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
   supported command: `up` / `daemon` / `env` / `status` / `down` over a private

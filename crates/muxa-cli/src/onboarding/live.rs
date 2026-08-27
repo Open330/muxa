@@ -126,6 +126,10 @@ struct Sandbox {
     script: PathBuf,
     config: PathBuf,
     rcfile: PathBuf,
+    /// `HOME` for everything the learner runs, so `cd ~` lands here too.
+    home: PathBuf,
+    /// Where their shell starts, and what `ls` shows.
+    project: PathBuf,
     tmux: PathBuf,
     exe: PathBuf,
     env: BTreeMap<String, String>,
@@ -137,8 +141,11 @@ impl Sandbox {
         let script = dir.join("muxa-onboarding-sandbox.sh");
         let config = dir.join("muxa-onboarding.src.toml");
         let rcfile = dir.join("muxa-onboarding.bashrc");
+        let home = dir.join("muxa-onboarding-home");
+        let project = home.join("checkout-service");
         write_executable(&script, SANDBOX_SCRIPT).context("staging the sandbox script")?;
         std::fs::write(&config, SANDBOX_CONFIG).context("staging the sandbox config")?;
+        write_workspace(&project).context("staging the practice workspace")?;
 
         let tmux = which("tmux").context("tmux is required for the live tour")?;
         let exe = std::env::current_exe().context("locating the running muxa binary")?;
@@ -147,6 +154,8 @@ impl Sandbox {
             script,
             config,
             rcfile,
+            home,
+            project,
             tmux,
             exe,
             env: BTreeMap::new(),
@@ -226,6 +235,10 @@ impl Sandbox {
         use std::fmt::Write as _;
 
         let mut body = String::from("unset PROMPT_COMMAND\nexport PS1='muxa-onboarding $ '\n");
+        // Every pane, not just the first: a window the learner opens at step 2
+        // would otherwise land back in their own home directory.
+        let _ = writeln!(body, "export HOME='{}'", self.home.display());
+        let _ = writeln!(body, "cd '{}' 2>/dev/null || true", self.project.display());
         for key in [
             "MUXA_SOCKET",
             "MUXA_CONFIG",
@@ -347,7 +360,25 @@ impl Drop for Sandbox {
         for name in ["claude", "codex"] {
             let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}.log")));
         }
+        for name in ["codex-pane.sh", "approved.txt", "declined.txt"] {
+            let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}")));
+        }
+        // Only ever the tour's own home — never anything the learner owns.
+        if self.home.starts_with(&dir) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
     }
+}
+
+fn write_workspace(project: &Path) -> Result<()> {
+    for (relative, body) in WORKSPACE_FILES {
+        let path = project.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, body)?;
+    }
+    Ok(())
 }
 
 fn write_executable(path: &Path, body: &str) -> Result<()> {
@@ -443,6 +474,77 @@ impl Sandbox {
 }
 
 // ---------------------------------------------------------------------------
+// The learner's workspace
+// ---------------------------------------------------------------------------
+
+/// A checkout service that does not exist, laid out where the tour can point
+/// at it.
+///
+/// Without this the learner's shell sits in whatever directory they launched
+/// from, so `ls` shows their own repository and `muxa watch` prints their real
+/// path in the inspector — the tour claiming to be a sandbox while showing
+/// them their own machine. The files are the ones the scripted agents say they
+/// are reading, so `cat crates/checkout/src/auth.rs` answers.
+///
+/// This is a convincing workspace, not a jail. `cd /` still works: a real
+/// filesystem confinement needs bubblewrap or a mount namespace, neither of
+/// which is available unprivileged on every platform muxa runs on.
+const WORKSPACE_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/api\", \"crates/checkout\"]\n",
+    ),
+    (
+        "README.md",
+        "# checkout-service\n\nPayments and the public read API.\n\n\
+         - `crates/checkout` — auth, capture, refunds\n\
+         - `crates/api` — the public-read boundary\n",
+    ),
+    (
+        "crates/checkout/src/auth.rs",
+        "use crate::Session;\n\n\
+         /// Extracts the bearer token from an Authorization header.\n\
+         pub fn bearer_token(header: &str) -> Option<&str> {\n\
+         \x20   header.strip_prefix(\"Bearer \")\n\
+         }\n\n\
+         /// TODO: this stores the raw bearer token on the session.\n\
+         pub fn attach(session: &mut Session, bearer: &str) {\n\
+         \x20   session.bearer = bearer.to_string();\n\
+         }\n\n\
+         pub fn is_bearer(scheme: &str) -> bool {\n\
+         \x20   scheme.eq_ignore_ascii_case(\"bearer\")\n\
+         }\n",
+    ),
+    (
+        "crates/checkout/src/lib.rs",
+        "pub mod auth;\n\n\
+         pub struct Session {\n\
+         \x20   pub bearer: String,\n\
+         }\n",
+    ),
+    (
+        "crates/api/src/public.rs",
+        "/// Everything reachable without a session.\n\
+         ///\n\
+         /// Anything added here is public forever, so the boundary is reviewed\n\
+         /// before it moves.\n\
+         pub const PUBLIC_READ: &[&str] = &[\n\
+         \x20   \"/health\",\n\
+         \x20   \"/v1/catalog\",\n\
+         \x20   \"/v1/prices\",\n\
+         ];\n",
+    ),
+    ("crates/api/src/lib.rs", "pub mod public;\n"),
+    (
+        "tests/auth.rs",
+        "#[test]\n\
+         fn rejects_raw_bearer() {\n\
+         \x20   // pending: the regression test claude is writing\n\
+         }\n",
+    ),
+];
+
+// ---------------------------------------------------------------------------
 // Agent transcripts
 // ---------------------------------------------------------------------------
 
@@ -483,6 +585,50 @@ impl Transcript {
     /// and shows whatever arrives next.
     fn pane_command(&self) -> String {
         format!("exec tail -n +1 -f {}", self.path.display())
+    }
+    /// A pane that shows the transcript *and* answers its own approval prompt.
+    ///
+    /// A prompt reading `[y] yes  [n] no` that swallows the keystroke is worse
+    /// than no prompt: it invites the learner to do the one thing the tour has
+    /// made impossible. Pressing `y` here appends the tool output and fires the
+    /// hook a resuming agent fires, so the row in `muxa watch` goes back to
+    /// `working` — the real attend-and-clear loop rather than a picture of it.
+    fn answerable_pane_command(
+        &self,
+        dir: &Path,
+        approved: &Path,
+        declined: &Path,
+    ) -> Result<String> {
+        let runner = dir.join("muxa-onboarding-codex-pane.sh");
+        let body = format!(
+            r#"#!/usr/bin/env bash
+# codex's screen, plus the keypress that answers its approval prompt.
+# Written by `muxa onboard`; removed with the sandbox.
+log={log}
+tail -n +1 -f "$log" &
+while IFS= read -rsn1 key; do
+  case "$key" in
+    y|Y|a|A)
+      cat {approved} >> "$log"
+      # `pre_tool_use` is what a resuming agent sends, and what takes the row
+      # back out of `waiting` in watch.
+      muxa hook codex --event pre_tool_use \
+        <<< '{{"session_id":"onboarding-codex","tool_name":"shell"}}' \
+        >/dev/null 2>&1
+      break ;;
+    n|N)
+      cat {declined} >> "$log"
+      break ;;
+  esac
+done
+wait
+"#,
+            log = self.path.display(),
+            approved = approved.display(),
+            declined = declined.display(),
+        );
+        write_executable(&runner, &body)?;
+        Ok(format!("exec bash {}", runner.display()))
     }
 }
 
@@ -537,6 +683,29 @@ fn approval_block(language: UiLanguage) -> Vec<String> {
             tr(language, "yes", "예"),
             tr(language, "no", "아니오"),
             tr(language, "yes, and don't ask again", "예, 다시 묻지 않기"),
+        ),
+    ]
+}
+
+fn approved_block(language: UiLanguage) -> Vec<String> {
+    vec![
+        String::new(),
+        tool_line("ran      rg -n \"public_read\" --type rust   ·   3 matches"),
+        String::new(),
+        working(language),
+    ]
+}
+
+fn declined_block(language: UiLanguage) -> Vec<String> {
+    vec![
+        String::new(),
+        format!(
+            "  {DIM}✗ {}{RESET}",
+            tr(
+                language,
+                "declined — leaving it alone",
+                "거절됨 — 그대로 둡니다"
+            )
         ),
     ]
 }
@@ -680,8 +849,16 @@ impl Sandbox {
             let _ = self.tmux_command(&["rename-window", "-t", &other, "release-checks"]);
         }
 
+        let approved = dir.join("muxa-onboarding-approved.txt");
+        let declined = dir.join("muxa-onboarding-declined.txt");
+        std::fs::write(&approved, approved_block(language).join("\n") + "\n")?;
+        std::fs::write(&declined, declined_block(language).join("\n") + "\n")?;
+
         let claude = self.split(&window, &claude_screen.pane_command())?;
-        let codex = self.split(&window, &codex_screen.pane_command())?;
+        let codex = self.split(
+            &window,
+            &codex_screen.answerable_pane_command(&dir, &approved, &declined)?,
+        )?;
 
         // Zoomed so `muxa watch` gets the whole screen. The agent panes stay in
         // the window, and `muxa attend` unzooms to reach one — which
@@ -701,12 +878,19 @@ impl Sandbox {
     }
 
     fn split(&self, window: &str, command: &str) -> Result<String> {
+        // `-c` is not optional here. Invoked from outside any client,
+        // `split-window` takes this process's working directory — the repo the
+        // learner launched from — and `muxa watch` then prints that real path
+        // as the agent's cwd, in a tour that just told them nothing outside the
+        // sandbox is involved.
         let id = self.tmux_command(&[
             "split-window",
             "-d",
             "-P",
             "-F",
             "#{pane_id}",
+            "-c",
+            &self.project.to_string_lossy(),
             "-t",
             window,
             command,
@@ -1038,20 +1222,18 @@ impl Tour<'_> {
                     r#"{"session_id":"onboarding-codex","tool_name":"shell"}"#,
                 )
             }
-            6 => {
-                // The learner's question lands in claude's session, so claude's
-                // screen shows it arriving and being answered.
-                fleet
-                    .claude_screen
-                    .append(&incoming_question(self.language));
-                Ok(())
-            }
             7 => {
                 let body = tr(
                     self.language,
                     "the public-read boundary needs a decision before I continue",
                     "public-read 경계는 계속하기 전에 결정이 필요합니다",
                 );
+                // Both beats land here, on the step *after* the one that asks
+                // for the message: claude answering before being asked read as
+                // the tour talking to itself.
+                fleet
+                    .claude_screen
+                    .append(&incoming_question(self.language));
                 fleet.codex_screen.append(&outgoing_request(self.language));
                 self.sandbox
                     .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
