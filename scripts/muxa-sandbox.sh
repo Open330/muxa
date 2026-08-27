@@ -155,7 +155,7 @@ daemon_belongs_to_sandbox() {
   local pid=$1 process_command
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  process_command=$(ps -o command= -p "$pid" 2>/dev/null) || return 1
+  process_command=$(ps -ww -o command= -p "$pid" 2>/dev/null) || return 1
   case " $process_command " in
     *" --config $SB_CONFIG "* | *" --config=$SB_CONFIG "*) return 0 ;;
     *) return 1 ;;
@@ -397,7 +397,7 @@ cmd_up() {
 #!/bin/sh
 # Sandbox shim: every tmux call, including ones muxa's children make, lands on
 # the sandbox server rather than the caller's.
-exec $TMUX_BIN -u -S $SB_TMUX_SOCKET "\$@"
+exec "$TMUX_BIN" -u -S "$SB_TMUX_SOCKET" "\$@"
 EOF
   chmod +x "$SB_SHIM/tmux"
 

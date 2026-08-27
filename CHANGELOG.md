@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tears down anything a previous run left behind before building. `status`
   distinguishes healthy from partial and names every artifact it found; `down`
   reaps daemons the pidfile lost track of, waits for them to actually exit, then
-  verifies and reports what survived. A pidfile is only trusted after its
-  process is confirmed as this sandbox's `muxad`, and starting the daemon again
-  reuses the healthy process rather than creating a socket race.
+  verifies and reports what survived. Every artifact lives below a mode-0700
+  root carrying an ownership marker, so a same-named `/tmp` path is refused
+  rather than deleted, and tmux uses an explicit socket path that stays stable
+  across `TMUX_TMPDIR` changes. A pidfile is only trusted after its process is
+  confirmed against this sandbox's exact config, while custom-named `muxad`
+  binaries remain discoverable; starting the daemon again reuses the healthy
+  process rather than creating a socket race.
   `scripts/sandbox-smoke.sh` holds it to that, asserting teardown is total from
   each state a crash can leave.
   `docs/demo-setup.sh` is the first consumer and now carries only the fixture.
