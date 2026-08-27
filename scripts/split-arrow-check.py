@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import pathlib
 import sys
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("parity", HERE / "onboarding-parity.py")
@@ -51,7 +52,11 @@ def probe(muxa: str, gap_ms: int | None) -> bool:
             tour.send(b"\x1b[C")
         else:
             tour.send(b"\x1b")
-            tour.pump(gap_ms / 1000)
+            # `Tour.pump` waits in 50 ms select calls, so using it here made a
+            # claimed 20 ms gap exceed the product's old 50 ms grace period.
+            # Sleep directly: output between the two halves is irrelevant, and
+            # the duration printed below now describes the input we sent.
+            time.sleep(gap_ms / 1000)
             tour.send(b"[C")
         return tour.wait_for_step(ARROW_STEP + 1)
     finally:
@@ -59,20 +64,18 @@ def probe(muxa: str, gap_ms: int | None) -> bool:
 
 
 def advances(muxa: str, gap_ms: int | None, attempts: int) -> bool:
-    """Whether the arrow ever gets through.
+    """Whether the arrow gets through on every attempt.
 
-    Driving a TUI over a pty is timing-sensitive: reaching the gate, or seeing
-    the step counter move, times out perhaps one run in ten under load. Retry
-    rather than ship a flaky gate — the signal survives it, because a binary
-    that drops the key fails every attempt, not one in ten.
+    Requiring every probe to pass prevents an unsplit/coalesced write in one
+    attempt from concealing a handler that still drops genuinely torn input.
     """
-    return any(probe(muxa, gap_ms) for _ in range(attempts))
+    return all(probe(muxa, gap_ms) for _ in range(attempts))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--muxa", default="target/debug/muxa")
-    ap.add_argument("--attempts", type=int, default=3, help="retries before failing")
+    ap.add_argument("--attempts", type=int, default=2, help="successful probes required")
     # Below about 5 ms the two writes coalesce in the pty often enough to be
     # nondeterministic, which exercises the *un*-split path and makes the check
     # flaky rather than strict. Real split escapes are milliseconds apart.
