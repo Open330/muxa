@@ -492,9 +492,10 @@ pub struct CollaborationConfig {
     /// `never` keeps delivery pull-only; `idle_only` wakes hook-authoritative
     /// agents only at their top-level idle prompt.
     pub wake: CollaborationWake,
-    /// `notice` injects only a mailbox notification. `full` atomically claims
-    /// each request and injects its metadata and body into the recipient's
-    /// prompt, avoiding a separate inbox tool round.
+    /// `notice` injects only a mailbox notification. `operator_full` (the
+    /// default) directly delivers requests sent by an operator console while
+    /// keeping agent-originated requests in the mailbox. `full` directly
+    /// delivers every request.
     pub wake_payload: CollaborationWakePayload,
     /// How far an explicit `pane:%N` target may reach. `window` (default)
     /// keeps requests inside the sender's tmux window — co-locating agents
@@ -514,7 +515,7 @@ impl Default for CollaborationConfig {
             enabled: false,
             path: None,
             wake: CollaborationWake::IdleOnly,
-            wake_payload: CollaborationWakePayload::Notice,
+            wake_payload: CollaborationWakePayload::OperatorFull,
             scope: CollaborationScope::default(),
             max_message_bytes: default_collaboration_max_message_bytes(),
         }
@@ -540,8 +541,9 @@ pub enum CollaborationWake {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationWakePayload {
-    #[default]
     Notice,
+    #[default]
+    OperatorFull,
     Full,
 }
 
@@ -2007,7 +2009,14 @@ agent-review = "create a codex pane and pass our changes for review"
         let defaults: Config = toml::from_str("[collaboration]\nenabled = true\n").unwrap();
         assert_eq!(
             defaults.collaboration.wake_payload,
-            CollaborationWakePayload::Notice
+            CollaborationWakePayload::OperatorFull
+        );
+
+        let operator: Config =
+            toml::from_str("[collaboration]\nwake_payload = \"operator_full\"\n").unwrap();
+        assert_eq!(
+            operator.collaboration.wake_payload,
+            CollaborationWakePayload::OperatorFull
         );
     }
 

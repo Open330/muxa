@@ -4,7 +4,7 @@ This page keeps the detailed install and wiring notes out of the README.
 
 ## Requirements
 
-- Rust 1.88+
+- Rust 1.89+
 - tmux 3.x
 - Unix-like OS
 - One supported agent CLI: Claude Code, OpenAI Codex, Google Gemini CLI, or the

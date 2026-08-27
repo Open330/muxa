@@ -30,8 +30,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum became `session` / `window` / `pane`, so `muxad` refused the config and
   every GIF regeneration failed at daemon start.
 
+## [0.8.36] - 2026-08-27
+
+### Added
+
+- **Every terminal on a workspace gets its own current window.** New
+  `tmux-auto-view` init component, on by default: two tmux hooks hand an
+  arriving client its own session-group view, so two terminals on one workspace
+  stop following each other's window switches. Both hooks matter —
+  `client-attached` covers `tmux attach`, and `client-session-changed` covers
+  `switch-client`, which is what `muxa watch`'s Enter does and what a terminal
+  that was already open goes through. `muxa workspace view` does the work and
+  can be run by hand; it is a no-op for a session's sole client and reuses one
+  view per terminal, so nothing accumulates. Views are named
+  `<session>~view~<pid>` and vanish on detach. Opt one session out with
+  `tmux set-option -t <session> @no_auto_view 1`.
+- **`R` renames the session, window, or pane under the cursor in `muxa
+  watch`.** The form opens prefilled with the current name and cursor at the
+  end, since renaming is usually an edit; Enter on an untouched prefill is a
+  cancel rather than a write. Window renames go through muxa's naming policy —
+  whitespace normalized to `-`, and a name already used in that session refused,
+  because tmux matches `session:window` targets by prefix. A pane has no name in
+  tmux, so that level sets the pane title, which is the string watch displays.
+- **New `tmux-window-names` init component**, on by default: turns off tmux's
+  `automatic-rename` and binds `prefix + ,` to `muxa window rename`. A window
+  is a Work Run under muxa's model, so naming it after whatever process is
+  running in it overwrites the Work with `node` or `claude` the moment an agent
+  starts.
+- **Minimum supported Rust is now 1.89.** Nothing in the tree requires it
+  today; the floor moves so future work can reach for stabilized std APIs
+  without the design bending around an old one. Raised while the project is
+  young enough for the cost to be small.
+- **The daemon arbitrates a room's handle namespace.** A room-local handle
+  had three writers — the `@muxa_agent_alias` pane option, a launcher's
+  explicit alias, and a registered identity — each enforcing its own rule
+  against its own view, so every ordering between them produced a different
+  way for one room to answer to `@claude` twice. The daemon is the only
+  place that sees all three, so allocation now goes through it via
+  `collaboration_issue_handle` (local IPC protocol 6, capability
+  `handle_namespace_v1`), which also tracks handles promised to callers that
+  have not written them yet. Lifetimes are unchanged: a handle still lives
+  on the pane option and outlives the agent restarting in place, while a
+  registered identity still belongs to one agent session. Without a daemon
+  to referee, a pane stays unnamed rather than being named from a partial
+  view.
+- **Every agent pane gets a handle, so peers are addressable by name rather
+  than by `%1242`.** The first agent of a runtime in a room becomes
+  `@claude` / `@codex` / `@gemini` / `@agy` / `@opencode`, a second of the
+  same kind becomes `@claude2`, and so on. muxa mints it on the session's
+  first hook event — the one installed by `muxa init` — and immediately for
+  a pane `muxa agent start` opened, which also reports it in `--json`. The
+  name is stored on the pane as `@muxa_agent_alias` so the slot keeps it
+  across muxad, CLI, and agent restarts, and a pane that already carries a
+  pipeline or hand-set alias is never renamed. `resolve_target` has always
+  understood `@alias`; what was missing was anything that minted one.
+  Allocation runs under a per-room file lock, because the claim is a
+  read-modify-write over a shared namespace and tmux user options have no
+  compare-and-set — re-checking after the write cannot close that, since the
+  pane writing second can finish its check before the first write lands. The
+  claim itself goes through `set-option -o`, so a pipeline's explicit alias
+  wins whichever side of it the minting lands on.
+
 ### Changed
 
+- **Operator messages now carry their body directly by default, without making
+  agent delegation equally permissive.** The new default `wake_payload =
+  "operator_full"` claims and injects requests sent by the resolved operator
+  console (watch/dashboard), while agent-originated MCP and CLI requests remain
+  body-free mailbox notices. Explicit `notice` and `full` retain their strict
+  all-notice and all-direct behavior. This is a delivery policy, not an
+  authorization signal: `work_mode = "execute"` cannot promote an agent request.
 - **Work pipelines now have daemon-owned, generation-aware Run state.** The
   selected pipeline, rendered desired aliases, dependency graph, Run
   generation, and each alias's `pending`/`running`/`blocked`/`done`/`failed`
@@ -67,11 +135,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `/` skills with in-watch add/remove, and mailbox claim/reply. Remote
   collaboration stays owned by the selected node and travels over the existing
   exact-pane SSH relay behind an explicit capability gate.
+- **`muxa peek` names each pane by its handle and its tmux id.** The
+  `prefix + q` overlay now prints `@claude %1242` in every pane's header,
+  next to the jump digit — the digit addresses the pane inside peek, but
+  peer calls, `muxa send`, and raw tmux are addressed by the other two, and
+  peek is where you are already looking to work out which pane is which. A
+  narrow box gives up the pane id before the handle and the runtime name
+  before either, dropping each rather than clipping it: a truncated
+  `%1242` or `@claude2` is still a well-formed address for a different
+  pane.
 
 ## [0.8.35] - 2026-08-22
 
 ### Added
-
 - **Google Antigravity CLI (`agy`) is a first-class agent.** agy replaced the
   Gemini CLI upstream but shares none of its hook contract, so muxa's existing
   Gemini support was silently inert against it: agy reads
@@ -228,6 +304,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   room — the dashboard does not follow `[collaboration].scope = "host"`.
 
 ### Fixed
+
+- **A workspace open in two terminals is one tree again.** A tmux session group
+  shares one window list across several sessions — the supported way to put two
+  terminals on two Work windows of one workspace — and `list-panes -a` walks
+  sessions, so it reports every pane once per member. Topology showed the same
+  workspace two or three times over, with the agent attached to whichever copy
+  was scanned first and the rest rendered as bare panes. Grouped sessions now
+  fold onto the member the group is named after, deduplicated by pane; if that
+  session is gone the choice falls back to the lexically first id so it stays
+  put across ticks. `watch` sums `attached_clients` across the group, since the
+  members it no longer shows are still terminals on that workspace. `PaneInfo`
+  and `SessionInfo` carry `#{session_group}`, both `serde(default)` for peers
+  built before the field.
 
 - **A refused IPC request no longer reports "no active agents".** `snapshot`,
   `by_pane`, and their timeout variants handed the response straight to a

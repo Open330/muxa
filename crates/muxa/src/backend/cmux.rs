@@ -192,6 +192,7 @@ fn current_pane_info_from(
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| "cmux".into());
     Some(PaneInfo {
+        session_group: None,
         agent_role: None,
         agent_alias: None,
         socket: endpoint,

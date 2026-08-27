@@ -15,6 +15,12 @@ pub enum Component {
     TmuxStatusLine,
     /// `prefix + Q` → `display-popup -B muxa peek`
     TmuxPeek,
+    /// muxa owns window names: `automatic-rename off` + `prefix+,` renames
+    /// through `muxa window rename`
+    TmuxWindowNames,
+    /// Every terminal on a workspace gets its own current window, via a
+    /// session group created on attach and on jump
+    TmuxAutoView,
     /// Claude Code shell hooks + statusLine
     ClaudeHooks,
     /// Codex shell hooks
@@ -46,6 +52,8 @@ impl Component {
         Component::TmuxPopup,
         Component::TmuxStatusLine,
         Component::TmuxPeek,
+        Component::TmuxWindowNames,
+        Component::TmuxAutoView,
         Component::ClaudeHooks,
         Component::CodexHooks,
         Component::GeminiHooks,
@@ -65,6 +73,8 @@ impl Component {
             Component::TmuxPopup => "tmux-popup",
             Component::TmuxStatusLine => "tmux-statusline",
             Component::TmuxPeek => "tmux-peek",
+            Component::TmuxWindowNames => "tmux-window-names",
+            Component::TmuxAutoView => "tmux-auto-view",
             Component::ClaudeHooks => "claude-hooks",
             Component::CodexHooks => "codex-hooks",
             Component::GeminiHooks => "gemini-hooks",
@@ -89,6 +99,8 @@ impl Component {
             Component::TmuxPopup => "tmux: prefix+s watch + prefix+S Fleet + prefix+D dashboard",
             Component::TmuxStatusLine => "tmux: per-pane agent glyphs in status-right",
             Component::TmuxPeek => "tmux: prefix+Q overlays each pane with its agent",
+            Component::TmuxWindowNames => "tmux: muxa owns window names (prefix+, renames)",
+            Component::TmuxAutoView => "tmux: each terminal gets its own window view",
             Component::ClaudeHooks => "Claude Code: shell hooks + statusLine",
             Component::CodexHooks => "OpenAI Codex: shell hooks",
             Component::GeminiHooks => "Gemini CLI: shell hooks",
@@ -109,6 +121,10 @@ impl Component {
             Component::TmuxPopup => "open muxa without replacing the current agent pane",
             Component::TmuxStatusLine => "● / ○ / ▶ per pane, refreshed every 2s",
             Component::TmuxPeek => "display-panes with summary + prompt; digit jumps",
+            Component::TmuxWindowNames => {
+                "stops `automatic-rename` overwriting a Work name with `node`"
+            }
+            Component::TmuxAutoView => "two terminals on one workspace stop following each other",
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
             Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",
@@ -156,11 +172,15 @@ impl Component {
                 Component::TmuxPopup,
                 Component::TmuxStatusLine,
                 Component::TmuxPeek,
+                Component::TmuxWindowNames,
+                Component::TmuxAutoView,
             ],
             Preset::Standard => vec![
                 Component::TmuxPopup,
                 Component::TmuxStatusLine,
                 Component::TmuxPeek,
+                Component::TmuxWindowNames,
+                Component::TmuxAutoView,
                 Component::ClaudeHooks,
                 Component::CodexHooks,
                 Component::GeminiHooks,

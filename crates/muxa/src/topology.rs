@@ -95,6 +95,22 @@ pub enum TopologyNodeKey {
     Pane(PaneKey),
 }
 
+impl TopologyNodeKey {
+    /// The backend endpoint this node lives on, whatever level it is.
+    ///
+    /// Every level carries the same endpoint through its ancestry, so callers
+    /// that only need "which server, which multiplexer" — a rename, a control
+    /// command — do not have to match the variant to find out.
+    #[must_use]
+    pub fn endpoint(&self) -> &BackendEndpoint {
+        match self {
+            TopologyNodeKey::Session(session) => &session.endpoint,
+            TopologyNodeKey::Window(window) => &window.session.endpoint,
+            TopologyNodeKey::Pane(pane) => &pane.window.session.endpoint,
+        }
+    }
+}
+
 /// Whether a hierarchy level is native, mapped without inventing nodes, or
 /// unavailable from a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +384,81 @@ pub struct TopologySnapshot {
     pub unassigned_agents: Vec<Agent>,
 }
 
+/// Collapse tmux session groups so one window set produces one tree.
+///
+/// A session group (`tmux new-session -t <session>`) shares one window list
+/// across several sessions, each keeping its own current window. That is what
+/// lets two terminals sit on two windows of one workspace — and it means
+/// `list-panes -a`, which walks sessions, reports every pane once per member.
+/// Left alone the topology shows the same workspace two or three times over,
+/// with the agents attached to whichever copy happened to be scanned first.
+///
+/// The oldest live member (the lowest numeric `$N` session id) survives. tmux
+/// creates every grouped sibling after the session it was created from, so the
+/// original workspace is the oldest member even after it is renamed. The
+/// group name cannot identify it: `rename-session` does not update
+/// `#{session_group}`. If the original is gone, the oldest remaining view is a
+/// stable fallback instead of whichever row the scan happened to return first.
+///
+/// Rows for the other members are rewritten onto the survivor's identity and
+/// then deduplicated by pane, which is what actually merges the trees: the
+/// duplicates were only ever distinguished by the session half of their key.
+fn fold_session_groups(rows: Vec<(HostKind, PaneInfo)>) -> Vec<(HostKind, PaneInfo)> {
+    // Nothing is grouped in the overwhelmingly common case; skip the work
+    // rather than pay two passes and a map on every tick.
+    if rows.iter().all(|(_, pane)| pane.session_group.is_none()) {
+        return rows;
+    }
+    let mut survivors: HashMap<(HostKind, Option<String>, String), (String, String)> =
+        HashMap::new();
+    for (host, pane) in &rows {
+        let Some(group) = pane.session_group.clone() else {
+            continue;
+        };
+        let key = (*host, pane.socket.clone(), group.clone());
+        let candidate = (pane.session_id.clone(), pane.session.clone());
+        match survivors.get(&key) {
+            Some((id, _)) if !tmux_session_id_is_earlier(&candidate.0, id) => {}
+            _ => {
+                survivors.insert(key, candidate);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut folded = Vec::with_capacity(rows.len());
+    for (host, mut pane) in rows {
+        if let Some(group) = pane.session_group.clone() {
+            if let Some((id, name)) = survivors.get(&(host, pane.socket.clone(), group)) {
+                pane.session_id.clone_from(id);
+                pane.session.clone_from(name);
+            }
+        }
+        if seen.insert((
+            host,
+            pane.socket.clone(),
+            pane.session_id.clone(),
+            pane.window_id.clone(),
+            pane.pane_id.clone(),
+        )) {
+            folded.push((host, pane));
+        }
+    }
+    folded
+}
+
+/// tmux session ids are monotonically allocated decimal numbers prefixed by
+/// `$`. Compare that numeric payload rather than the rendered string: `$107`
+/// is newer than `$99`, despite sorting before it lexically.
+fn tmux_session_id_is_earlier(candidate: &str, current: &str) -> bool {
+    let sequence = |id: &str| id.strip_prefix('$').and_then(|raw| raw.parse::<u64>().ok());
+    match (sequence(candidate), sequence(current)) {
+        (Some(candidate), Some(current)) => candidate < current,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate < current,
+    }
+}
+
 impl TopologySnapshot {
     /// Build a nested snapshot and join agents by the complete
     /// `(host, socket, pane_id)` identity. An agent without endpoint metadata
@@ -407,6 +498,7 @@ impl TopologySnapshot {
             }
         }
         append_cmux_hook_panes(&mut pane_rows, &agents, &mut capabilities);
+        let pane_rows = fold_session_groups(pane_rows);
         capabilities.sort_by_key(|caps| caps.host);
 
         let candidate_counts = pane_candidate_counts(&pane_rows);
@@ -680,6 +772,7 @@ fn append_cmux_hook_panes(
         panes.push((
             HostKind::Cmux,
             PaneInfo {
+                session_group: None,
                 agent_role: None,
                 agent_alias: None,
                 socket: agent.tmux_socket.clone(),
@@ -749,6 +842,7 @@ mod tests {
 
     fn pane(socket: &str, session_name: &str, window_name: &str) -> PaneInfo {
         PaneInfo {
+            session_group: None,
             agent_role: None,
             agent_alias: None,
             pane_id: "%1".into(),
@@ -800,6 +894,104 @@ mod tests {
             last_activity_at: now,
             state_entered_at: now,
         }
+    }
+
+    /// One pane of a session group, as it is reported for `member`.
+    fn grouped(session_id: &str, session: &str, group: &str) -> (HostKind, PaneInfo) {
+        let mut pane = pane("default", session, "w0");
+        pane.session_id = session_id.into();
+        pane.session_group = Some(group.into());
+        (HostKind::Tmux, pane)
+    }
+
+    #[test]
+    fn folding_keeps_the_original_session_after_it_is_renamed() {
+        // tmux leaves `session_group` as `base` after the original session is
+        // renamed. The original still survives because it has the older
+        // numeric id; relying on the stale group name would select no member.
+        for rows in [
+            vec![
+                grouped("$99", "renamed", "base"),
+                grouped("$107", "base~view~9", "base"),
+            ],
+            vec![
+                grouped("$107", "base~view~9", "base"),
+                grouped("$99", "renamed", "base"),
+            ],
+        ] {
+            let folded = fold_session_groups(rows);
+            assert_eq!(folded.len(), 1, "the duplicate row must be dropped");
+            assert_eq!(folded[0].1.session, "renamed");
+            assert_eq!(folded[0].1.session_id, "$99");
+        }
+    }
+
+    #[test]
+    fn folding_is_stable_when_the_namesake_session_is_gone() {
+        // A view can outlive the session it was opened from. There is then no
+        // right answer, only a stable one: the same member every tick, not
+        // whichever the scan reached first.
+        let a = grouped("$9", "view~9~base", "base");
+        let b = grouped("$107", "view~8~base", "base");
+        let forward = fold_session_groups(vec![a.clone(), b.clone()]);
+        let reverse = fold_session_groups(vec![b, a]);
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].1.session_id, "$9");
+        assert_eq!(reverse[0].1.session_id, forward[0].1.session_id);
+    }
+
+    #[test]
+    fn folding_leaves_ungrouped_sessions_alone() {
+        // Two ordinary sessions are two workspaces, however similar they look.
+        let mut one = pane("default", "main", "w0");
+        one.session_id = "$0".into();
+        let mut two = pane("default", "other", "w0");
+        two.session_id = "$1".into();
+        let folded = fold_session_groups(vec![(HostKind::Tmux, one), (HostKind::Tmux, two)]);
+        assert_eq!(folded.len(), 2);
+    }
+
+    #[test]
+    fn folding_does_not_reach_across_servers() {
+        // Session ids and group names are only unique per tmux server, so a
+        // group named `base` on one socket says nothing about `base` on
+        // another. Folding them together would merge two real workspaces.
+        let (_, mut other) = grouped("$0", "base", "base");
+        other.socket = Some("amux".into());
+        let folded =
+            fold_session_groups(vec![grouped("$0", "base", "base"), (HostKind::Tmux, other)]);
+        assert_eq!(folded.len(), 2);
+    }
+
+    #[test]
+    fn a_grouped_workspace_is_one_tree_with_its_agent_attached() {
+        // The user-visible point. Before folding, `list-panes -a` reported this
+        // pane once per member, the topology showed the workspace twice, and
+        // `matching_agent` claimed the agent for whichever copy was scanned
+        // first — leaving the other tree a bare pane.
+        let snapshot = TopologySnapshot::build(
+            OffsetDateTime::UNIX_EPOCH,
+            vec![TopologyInput {
+                host: HostKind::Tmux,
+                capabilities: BackendTopologyCapabilities::for_host(HostKind::Tmux),
+                panes: vec![
+                    grouped("$0", "base", "base").1,
+                    grouped("$1", "view~9~base", "base").1,
+                ],
+                sessions: Vec::new(),
+            }],
+            vec![agent("agent-base", Some("default"))],
+        );
+
+        assert_eq!(snapshot.sessions.len(), 1, "one workspace, one tree");
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.name, "base");
+        assert_eq!(session.windows.len(), 1);
+        assert_eq!(session.windows[0].panes.len(), 1);
+        assert!(
+            session.windows[0].panes[0].agent.is_some(),
+            "the surviving tree keeps the agent"
+        );
     }
 
     #[test]

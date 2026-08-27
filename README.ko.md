@@ -8,7 +8,7 @@
 실시간 TUI, 데스크톱 알림, 로컬 리포트에서 확인합니다.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
-![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
+![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
 
@@ -76,7 +76,7 @@ Muxa prefix binding, watch workflow까지 하나의 시나리오로 익힐 수 �
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
+| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
@@ -100,7 +100,7 @@ brew install open330/tap/muxa
 muxa init
 ```
 
-또는 원샷 설치 스크립트(소스 빌드, Rust 1.88+ 필요):
+또는 원샷 설치 스크립트(소스 빌드, Rust 1.89+ 필요):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
@@ -127,7 +127,8 @@ muxa watch
 ### `muxa watch`에서 바로 협업합니다
 
 기억할 규칙은 하나입니다. **tmux window 하나가 협업 room 하나**입니다.
-`muxa watch`를 열 때 선택되어 있던 agent가 발신자가 됩니다.
+watch/dashboard에서 사람이 보낸 메시지는 operator console이 발신자가 되고, 선택한
+agent가 수신자가 됩니다. agent가 MCP나 CLI로 보낸 요청은 해당 agent가 발신자입니다.
 
 최초 한 번만 `~/.config/muxa/config.toml`에 다음 설정을 넣고 `muxad`를 재시작한
 뒤 `muxa init`으로 `prefix+s` watch popup을 설치합니다.
@@ -136,6 +137,8 @@ muxa watch
 [collaboration]
 enabled = true
 wake = "idle_only"
+# 기본값: operator 본문은 직접 전달하고 agent 발신 본문은 mailbox에 둡니다.
+wake_payload = "operator_full"
 ```
 
 두 agent가 메시지를 직접 읽고 답할 수 있도록 MCP도 한 번 등록한 뒤 실행 중인

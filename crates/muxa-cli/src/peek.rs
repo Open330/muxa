@@ -2,8 +2,9 @@
 //!
 //! `display-panes` answers "which pane is which number". This answers
 //! "which pane is doing what": over each pane's own screen sits a box with
-//! its agent's state glyph, session summary, latest prompt, and latest
-//! response. Typing the pane's digit jumps there, so it takes over
+//! its tmux pane id, its agent's state glyph, session summary, latest
+//! prompt, and latest response. Typing the pane's digit jumps there, so it
+//! takes over
 //! `prefix + q` outright rather than asking for a modifier to reach the
 //! better version of a reflex you already have.
 //!
@@ -567,21 +568,30 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect, is_latest_prompt: boo
     // keep the context that tells you which pane you're looking at.
     render_backdrop(f, cell, rect);
 
-    let header = header_spans(cell);
     let one_line = Rect { height: 1, ..rect };
+    // A bare badge owns the whole row; a title has to fit between the
+    // border's two corners. `header_spans` drops the pane id rather than
+    // overrun either, so it needs the difference.
     if rect.height < MIN_BORDERED_HEIGHT || rect.width < 4 {
         // Too small to frame — spend every cell on the label itself.
         f.render_widget(Clear, one_line);
-        f.render_widget(Paragraph::new(Line::from(header)), one_line);
+        f.render_widget(
+            Paragraph::new(Line::from(header_spans(cell, rect.width))),
+            one_line,
+        );
         return;
     }
     if cell.agent.is_none() {
         // No agent, nothing to narrate. A bare badge keeps the pane
         // jumpable without framing an empty box over its output.
         f.render_widget(Clear, one_line);
-        f.render_widget(Paragraph::new(Line::from(header)), one_line);
+        f.render_widget(
+            Paragraph::new(Line::from(header_spans(cell, rect.width))),
+            one_line,
+        );
         return;
     }
+    let header = header_spans(cell, rect.width.saturating_sub(2));
     // The box covers only what it needs, so the pane's content stays
     // readable below it.
     let rect = Rect {
@@ -720,12 +730,67 @@ pub(crate) fn box_height(cell: &PeekCell, rect: Rect) -> u16 {
 /// ratatui will happily overlap them; the two corners plus a gap between
 /// is the floor.
 fn fits_alongside_header(header: &[Span<'static>], stamp: &str, width: u16) -> bool {
-    let header_width: usize = header.iter().map(|s| display_width(&s.content)).sum();
-    header_width + display_width(stamp) + 3 <= width as usize
+    spans_width(header) + display_width(stamp) + 3 <= width as usize
 }
 
-/// `1 ● claude +2` — the box title, and the whole box when it's one row.
-fn header_spans(cell: &PeekCell) -> Vec<Span<'static>> {
+/// Display columns a run of spans will occupy.
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|s| display_width(&s.content)).sum()
+}
+
+/// `1 ● @claude %1242 +2` — the box title, and the whole box when it's
+/// one row.
+///
+/// Three facts compete for one border row, and they are not equally
+/// droppable:
+///
+/// - the **digit** is how you jump inside peek, and is never dropped;
+/// - the **handle** (`@claude`, `@reviewer`) is how you address the pane
+///   from anywhere else — a peer call, `muxa send` — which is the reason
+///   most people open this overlay at all;
+/// - the **pane id** is the same address spelled the way tmux spells it:
+///   always correct, never memorable.
+///
+/// So a narrow box gives up the pane id before the handle, and the kind
+/// name before either. Everything except the bare kind is width-gated
+/// rather than left to ratatui's title clipping, because a clipped
+/// `%1242` or `@claude2` is still a well-formed address — it just points
+/// somewhere else, and would be copied without a second thought. Clipping
+/// `claude` down to `clau` misleads nobody.
+fn header_spans(cell: &PeekCell, width: u16) -> Vec<Span<'static>> {
+    let extra = (cell.extra > 0).then(|| {
+        Span::styled(
+            format!(" +{}", cell.extra),
+            Style::default().fg(Color::DarkGray),
+        )
+    });
+    let pane_id = Span::styled(
+        format!(" {}", cell.geo.pane_id),
+        Style::default().fg(Color::DarkGray),
+    );
+
+    let mut narrowest = Vec::new();
+    for identity in identity_spans(cell) {
+        for with_pane_id in [true, false] {
+            let mut spans = badge_spans(cell);
+            spans.extend(identity.iter().cloned());
+            if with_pane_id {
+                spans.push(pane_id.clone());
+            }
+            spans.extend(extra.iter().cloned());
+            spans.push(Span::raw(" "));
+            if spans_width(&spans) <= width as usize {
+                return spans;
+            }
+            narrowest = spans;
+        }
+    }
+    narrowest
+}
+
+/// The part of the header that is never negotiable: the jump digit, and
+/// the state glyph when there's an agent to have one.
+fn badge_spans(cell: &PeekCell) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
             format!(" {} ", cell.geo.pane_index),
@@ -746,11 +811,14 @@ fn header_spans(cell: &PeekCell) -> Vec<Span<'static>> {
             state_style(a.state),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            agent_kind_short(a.kind),
-            Style::default().fg(Color::White),
-        ));
-    } else {
+    }
+    spans
+}
+
+/// How the pane names itself, richest first. Later entries give up a fact
+/// so the header can fit a narrower box.
+fn identity_spans(cell: &PeekCell) -> Vec<Vec<Span<'static>>> {
+    let Some(a) = &cell.agent else {
         // No agent: name the process so the box still identifies the pane
         // rather than reading as an empty slot.
         let label = if cell.geo.command.is_empty() {
@@ -758,21 +826,34 @@ fn header_spans(cell: &PeekCell) -> Vec<Span<'static>> {
         } else {
             cell.geo.command.clone()
         };
-        spans.push(Span::styled(
+        return vec![vec![Span::styled(
             label,
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
-        ));
+        )]];
+    };
+    let kind = agent_kind_short(a.kind);
+    let kind_span = Span::styled(kind, Style::default().fg(Color::White));
+    let Some(alias) = cell.geo.alias.as_deref() else {
+        return vec![vec![kind_span]];
+    };
+    let handle = Span::styled(format!("@{alias}"), Style::default().fg(Color::Cyan));
+    // A handle muxa minted from the kind (`claude`, `claude2`) already says
+    // which runtime this is, so printing `claude @claude` spends a third of
+    // the header restating it. A handle that names something else — a
+    // pipeline role, an alias the agent chose — does not, and keeps both
+    // until the box gets too narrow to afford it.
+    if alias.to_ascii_lowercase().starts_with(kind) {
+        return vec![vec![handle], vec![kind_span]];
     }
-    if cell.extra > 0 {
-        spans.push(Span::styled(
-            format!(" +{}", cell.extra),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    spans.push(Span::raw(" "));
-    spans
+    vec![
+        vec![kind_span.clone(), Span::raw(" "), handle.clone()],
+        // The kind goes before the handle does: `@reviewer` still addresses
+        // the pane, `codex` addresses nothing.
+        vec![handle],
+        vec![kind_span],
+    ]
 }
 
 /// Body text, allocated by priority into whatever rows the pane has.
@@ -1003,10 +1084,17 @@ pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
     cells
         .iter()
         .map(|cell| {
-            let (glyph, label) = match &cell.agent {
+            let (glyph, kind) = match &cell.agent {
                 Some(a) => (crate::state_icon(a.state), agent_kind_short(a.kind)),
                 None => ("·", "-"),
             };
+            // The handle over the kind: `--plain` exists to be read from a
+            // shell, where the next thing you type is the address.
+            let label = cell
+                .geo
+                .alias
+                .as_deref()
+                .map_or_else(|| kind.to_string(), |alias| format!("@{alias}"));
             let summary = cell
                 .agent
                 .as_ref()
@@ -1024,7 +1112,7 @@ pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
                 },
             );
             format!(
-                "{} {} {} {:<8} {:>15}  {}",
+                "{} {} {} {:<12} {:>15}  {}",
                 cell.geo.pane_index, cell.geo.pane_id, glyph, label, age, summary
             )
         })
@@ -1237,6 +1325,23 @@ mod tests {
             height,
             active,
             command: "zsh".into(),
+            alias: None,
+        }
+    }
+
+    /// A pane whose tmux id is unrelated to its window index — which is
+    /// the realistic case, and the whole reason the id is worth printing.
+    fn pane(index: &str, pane_id: &str, width: u16, height: u16) -> PaneGeometry {
+        PaneGeometry {
+            pane_id: pane_id.into(),
+            ..geo(index, 0, 0, width, height, true)
+        }
+    }
+
+    fn named(index: &str, pane_id: &str, alias: &str, width: u16, height: u16) -> PaneGeometry {
+        PaneGeometry {
+            alias: Some(alias.into()),
+            ..pane(index, pane_id, width, height)
         }
     }
 
@@ -1877,7 +1982,7 @@ mod tests {
         let mut cells = build_cells(vec![geo("0", 0, 0, 16, 8, true)], &[a]);
         cells[0].last_prompt_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(5));
 
-        let header = header_spans(&cells[0]);
+        let header = header_spans(&cells[0], 16);
         let stamp = age_stamp(&cells[0], true).unwrap();
         assert!(!fits_alongside_header(&header, &stamp, 16));
         assert!(fits_alongside_header(&header, &stamp, 40));
@@ -1889,6 +1994,85 @@ mod tests {
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
         assert!(!rows[0].contains("ago"), "{rows:#?}");
         assert!(rows[0].contains(" 0 "), "the digit survives: {rows:#?}");
+    }
+
+    #[test]
+    fn box_header_carries_the_tmux_pane_id() {
+        // The digit jumps within peek; the pane id is what every other
+        // surface — peer calls, `muxa send`, raw tmux — is addressed by.
+        let mut a = agent("%1242", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        let cells = build_cells(vec![pane("3", "%1242", 40, 10)], &[a]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("%1242"), "{rendered}");
+    }
+
+    #[test]
+    fn shell_pane_badge_carries_the_pane_id_too() {
+        // A pane running no agent still gets addressed — you send it a
+        // prompt to start one — so its bare badge names it as well.
+        let cells = build_cells(vec![pane("2", "%77", 40, 10)], &[]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("%77"), "{rendered}");
+    }
+
+    #[test]
+    fn minted_handle_replaces_the_kind_it_was_minted_from() {
+        // `claude @claude` spends a third of the header restating itself.
+        let cell = &build_cells(
+            vec![named("0", "%1242", "claude", 40, 10)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let header = line_text(&Line::from(header_spans(cell, 40)));
+        assert!(header.contains("@claude"), "{header:?}");
+        assert_eq!(header.matches("claude").count(), 1, "{header:?}");
+    }
+
+    #[test]
+    fn a_handle_naming_something_else_keeps_the_kind() {
+        // `@reviewer` says what the pane is for but not what runs in it.
+        let cell = &build_cells(
+            vec![named("0", "%1242", "reviewer", 40, 10)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let header = line_text(&Line::from(header_spans(cell, 40)));
+        assert!(header.contains("claude"), "{header:?}");
+        assert!(header.contains("@reviewer"), "{header:?}");
+    }
+
+    #[test]
+    fn a_narrow_header_gives_up_the_pane_id_before_the_handle() {
+        // Both address the pane; only one of them is memorable.
+        let cell = &build_cells(
+            vec![named("0", "%1242", "reviewer", 20, 10)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let header = line_text(&Line::from(header_spans(cell, 20)));
+        assert!(header.contains("@reviewer"), "{header:?}");
+        assert!(!header.contains('%'), "{header:?}");
+    }
+
+    #[test]
+    fn narrow_header_drops_the_pane_id_rather_than_clipping_it() {
+        // A clipped `%1242` is still a syntactically valid pane id, so it
+        // would be copied as one — pointing at somebody else's pane.
+        let cell = &build_cells(
+            vec![pane("3", "%1242", 14, 8)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let wide = line_text(&Line::from(header_spans(cell, 40)));
+        let narrow = line_text(&Line::from(header_spans(cell, 12)));
+        assert!(wide.contains("%1242"), "{wide:?}");
+        assert!(!narrow.contains('%'), "no partial id survives: {narrow:?}");
+        assert!(narrow.contains(" 3 "), "the digit survives: {narrow:?}");
     }
 
     #[test]

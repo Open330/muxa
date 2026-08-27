@@ -58,6 +58,17 @@ impl Detection {
             out.push(Component::TmuxPopup);
             out.push(Component::TmuxStatusLine);
             out.push(Component::TmuxPeek);
+            // Pre-checked because the default it replaces is actively wrong
+            // for muxa's model: `automatic-rename` renames a Work window
+            // after whatever process is running in it, so every window ends
+            // up called `node` or `claude` and the Work it stands for is
+            // invisible in tmux's own status line and window list.
+            out.push(Component::TmuxWindowNames);
+            // Pre-checked for the same reason: the tmux default is wrong for
+            // how muxa is used. One session has one current window, so a
+            // second terminal on a workspace cannot sit on a second Work —
+            // and there is no way to discover that the fix is a session group.
+            out.push(Component::TmuxAutoView);
             // A collaboration room *is* a tmux window, so tmux is the only
             // prerequisite. Pre-checked rather than opt-in: leaving it dark
             // is what made `m`/`b` answer "collaboration is disabled" on
