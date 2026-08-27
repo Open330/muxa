@@ -145,6 +145,10 @@ muxa msg list --mailbox sent
 muxa msg cancel req_... # queued requests only
 ```
 
+`send`, `reply`, and `cancel` print a one-line receipt; `list` and `inbox`
+print each request followed by its reply, when one has come back. Add `--json`
+to any of them for the stored record instead.
+
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
 selected room peer, `b` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. `muxa dashboard` provides the richer workspace-card form
