@@ -295,11 +295,12 @@ aliases.
 The collaboration tools are higher-level than `muxa_send_prompt`: muxad pins
 each request to the target's current agent session, persists it before wake-up,
 and restricts routing to the caller's stable tmux window. Request and reply
-wake prompts are sent only to idle agents. Request bodies stay out of the
-terminal by default; opt-in `wake_payload = "full"` atomically claims and
-delivers one structured request body per idle generation. Reply wakes remain
-body-free. Enable the tools with `[collaboration] enabled = true`; see
-`docs/COLLABORATION.ko.md`.
+wake prompts are sent only to idle agents. The default `wake_payload =
+"operator_full"` delivers operator-console bodies directly while these
+agent-originated MCP requests remain body-free mailbox notices. `notice` keeps
+every body in the mailbox; `full` directly delivers every safe request body.
+Reply wakes remain body-free. Enable the tools with `[collaboration] enabled =
+true`; see `docs/COLLABORATION.ko.md`.
 
 For rooms with several agents, call `muxa_set_identity` once per agent and
 route with `@alias` or `role:<name>`. Aliases must be unique among live peers;

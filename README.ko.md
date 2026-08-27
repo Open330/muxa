@@ -127,7 +127,8 @@ muxa watch
 ### `muxa watch`에서 바로 협업합니다
 
 기억할 규칙은 하나입니다. **tmux window 하나가 협업 room 하나**입니다.
-`muxa watch`를 열 때 선택되어 있던 agent가 발신자가 됩니다.
+watch/dashboard에서 사람이 보낸 메시지는 operator console이 발신자가 되고, 선택한
+agent가 수신자가 됩니다. agent가 MCP나 CLI로 보낸 요청은 해당 agent가 발신자입니다.
 
 최초 한 번만 `~/.config/muxa/config.toml`에 다음 설정을 넣고 `muxad`를 재시작한
 뒤 `muxa init`으로 `prefix+s` watch popup을 설치합니다.
@@ -136,6 +137,8 @@ muxa watch
 [collaboration]
 enabled = true
 wake = "idle_only"
+# 기본값: operator 본문은 직접 전달하고 agent 발신 본문은 mailbox에 둡니다.
+wake_payload = "operator_full"
 ```
 
 두 agent가 메시지를 직접 읽고 답할 수 있도록 MCP도 한 번 등록한 뒤 실행 중인
