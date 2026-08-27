@@ -8,7 +8,7 @@
 실시간 TUI, 데스크톱 알림, 로컬 리포트에서 확인합니다.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
-![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)
+![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
 
@@ -100,7 +100,7 @@ brew install open330/tap/muxa
 muxa init
 ```
 
-또는 원샷 설치 스크립트(소스 빌드, Rust 1.88+ 필요):
+또는 원샷 설치 스크립트(소스 빌드, Rust 1.89+ 필요):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh

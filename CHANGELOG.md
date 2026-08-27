@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a Work Run under muxa's model, so naming it after whatever process is
   running in it overwrites the Work with `node` or `claude` the moment an agent
   starts.
+- **Minimum supported Rust is now 1.89**, for `std::fs::File::lock` — the
+  cross-process exclusion behind handle allocation. It needs no dependency
+  and the kernel releases it when the holding process dies, which a lock
+  file whose staleness had to be guessed from an mtime would not.
+- **Registering an identity can no longer squat a handle a live peer already
+  answers to.** `set_identity`'s uniqueness check consulted only aliases
+  registered through it, missing the ones participants are seeded with from
+  `@muxa_agent_alias`. That was a hole only pipeline panes could fall into
+  before; with every pane carrying a minted handle it is one any room can,
+  so the check now covers both.
 - **Every agent pane gets a handle, so peers are addressable by name rather
   than by `%1242`.** The first agent of a runtime in a room becomes
   `@claude` / `@codex` / `@gemini` / `@agy` / `@opencode`, a second of the
@@ -42,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across muxad, CLI, and agent restarts, and a pane that already carries a
   pipeline or hand-set alias is never renamed. `resolve_target` has always
   understood `@alias`; what was missing was anything that minted one.
+  Allocation runs under a per-room file lock, because the claim is a
+  read-modify-write over a shared namespace and tmux user options have no
+  compare-and-set — re-checking after the write cannot close that, since the
+  pane writing second can finish its check before the first write lands.
 
 ### Changed
 

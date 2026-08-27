@@ -670,15 +670,41 @@ impl CollaborationStore {
         {
             let mut identities = self.identities.write().await;
             if let Some(alias) = alias.as_deref() {
-                let in_use = identities.iter().any(|identity| {
+                // A name is taken if *anything* in the room answers to it,
+                // which is two sources, not one.
+                //
+                // Identities registered through here are the obvious half.
+                // The other half is what a participant was seeded with:
+                // `@muxa_agent_alias`, the name a launcher stamped on the
+                // pane or that muxa minted for it. Checking only the store
+                // let an agent register a name a live peer already answers
+                // to, leaving `@claude` ambiguous for both — a hole only
+                // pipeline panes could fall into before, and one any room
+                // can now that every pane carries a minted handle.
+                //
+                // Both, rather than the seeded alias alone, because a caller
+                // is not required to hand us enriched participants; the
+                // store is always current.
+                let registered = identities.iter().any(|identity| {
                     identity.room == caller.room
-                        && identity.alias.as_deref() == Some(alias)
+                        && identity
+                            .alias
+                            .as_deref()
+                            .is_some_and(|held| held.eq_ignore_ascii_case(alias))
                         && !identity.matches(caller)
                         && live_participants
                             .iter()
                             .any(|participant| identity.matches(participant))
                 });
-                if in_use {
+                let answered_to = live_participants.iter().any(|participant| {
+                    participant.room == caller.room
+                        && participant
+                            .alias
+                            .as_deref()
+                            .is_some_and(|held| held.eq_ignore_ascii_case(alias))
+                        && !participant.same_endpoint(caller)
+                });
+                if registered || answered_to {
                     return Err(CollaborationError::AliasInUse(alias.to_string()));
                 }
             }
@@ -2687,6 +2713,48 @@ mod tests {
                 .await,
             Err(CollaborationError::ConsoleIdentity)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_minted_handle_cannot_be_squatted_by_a_registered_identity() {
+        // The seeded half of "taken". `%2` answers to `claude` because muxa
+        // minted it onto the pane, not because anybody registered it — and
+        // an agent registering the same name would leave `@claude`
+        // ambiguous for both of them.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let minted = Participant {
+            alias: Some("claude".into()),
+            ..participant("%2", "minted-session")
+        };
+        let other = participant("%3", "other-session");
+        let live = vec![minted, other.clone()];
+
+        assert!(matches!(
+            mailbox
+                .set_identity(&other, &live, Some("CLAUDE".into()), Vec::new())
+                .await,
+            Err(CollaborationError::AliasInUse(_)),
+        ));
+        // A free name still goes through.
+        mailbox
+            .set_identity(&other, &live, Some("verifier".into()), Vec::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_may_re_register_the_handle_it_already_answers_to() {
+        // Its own seeded name is not somebody else's claim on it.
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mine = Participant {
+            alias: Some("claude".into()),
+            ..participant("%2", "my-session")
+        };
+        let live = vec![mine.clone()];
+        mailbox
+            .set_identity(&mine, &live, Some("claude".into()), vec!["review".into()])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

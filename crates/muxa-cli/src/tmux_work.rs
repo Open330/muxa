@@ -834,10 +834,6 @@ const DEFAULT_ALIAS_BASE_MAX: usize = 28;
 /// How many `claude`, `claude2`, `claude3`… candidates to try. A room with
 /// 64 agents of one kind is not a room; this is a loop bound, not a policy.
 const DEFAULT_ALIAS_TRIES: usize = 64;
-/// How many claim/verify rounds to spend settling a naming race. One round
-/// per racer is enough to converge, so this bounds how many agents may start
-/// in one window in the same instant before muxa stops trying.
-const DEFAULT_ALIAS_ROUNDS: usize = 16;
 
 /// Give `pane` a room-local handle if nothing has named it yet. Returns the
 /// alias the pane now answers to, or `None` when it already had one or the
@@ -859,41 +855,131 @@ const DEFAULT_ALIAS_ROUNDS: usize = 16;
 /// a handle is worth keeping only while the thing it addresses exists.
 pub fn ensure_default_alias(pane: &str, base: &str) -> Result<Option<String>> {
     validate_pane_id(pane)?;
-    // The overwhelmingly common case: a pane that was named the first time
-    // its agent started, on every session start since. One tmux call, out.
+    // The overwhelmingly common case: a pane named the first time its agent
+    // started, on every session start since. One tmux call, out — and no
+    // lock, because there is nothing to allocate.
     if pane_option(pane, AGENT_ALIAS_OPTION)?.is_some() {
         return Ok(None);
     }
     let window = window_id_for_pane(pane)?;
 
-    // Agents starting in one window at the same moment all read an empty
-    // room and all pick `claude`. tmux user options have no compare-and-set,
-    // so the race is settled after the fact: claim, re-read, and yield to
-    // any lower-numbered pane holding the same name.
+    // Everything past here is a read-modify-write over a namespace the whole
+    // room shares, so it runs under the room's lock.
     //
-    // It has to be a loop rather than one retry. With three racers, the two
-    // that yield both re-pick from a read taken before either wrote, so they
-    // land on the same `claude2` and — with nothing checking a second time —
-    // keep it. Each round does settle the lowest unsettled racer, though,
-    // and a pane that settles never moves again, so N racers converge in at
-    // most N rounds.
-    for _ in 0..DEFAULT_ALIAS_ROUNDS {
-        let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
+    // Verifying after the write is not a substitute, which is what an earlier
+    // version of this got wrong: two panes both read a free `claude`, the
+    // higher-numbered one writes and re-reads *before* the lower one's write
+    // lands, sees nobody above it and settles — then the lower one writes,
+    // sees only a higher holder, and settles too. Neither yields, and no
+    // number of extra rounds changes that, because the flaw is the missing
+    // exclusion rather than too few checks.
+    let Some(_guard) = RoomLock::acquire(&window)? else {
+        // Somebody else is allocating and did not finish inside the budget.
+        // This runs on the agent's critical path at session start, so the
+        // answer is to leave the pane unnamed — addressable as `%1242`, and
+        // named by its next session start — never to block the agent.
+        return Ok(None);
+    };
+    // Re-read inside the lock: the holder we waited on may have been naming
+    // this very pane.
+    if pane_option(pane, AGENT_ALIAS_OPTION)?.is_some() {
+        return Ok(None);
+    }
+    let Some(alias) = pick_default_alias(base, &aliases_besides(&window, pane)?) else {
+        return Ok(None);
+    };
+    set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
+    Ok(Some(alias))
+}
+
+/// Exclusive hold on one room's handle namespace.
+///
+/// `File::lock_shared`'s exclusive sibling, so the kernel releases it when
+/// the descriptor closes — including when the process is killed mid-hold.
+/// That is the whole reason it is a kernel lock rather than a lock *file*
+/// whose staleness we would have to guess at from an mtime: a hook that dies
+/// between claim and release must not wedge the next agent's start.
+struct RoomLock(std::fs::File);
+
+/// How long to wait for another process's allocation. Holding the lock costs
+/// two or three tmux round-trips, so anything past this is a wedged host
+/// rather than contention, and the agent's session start should not wait on
+/// it.
+const ROOM_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+const ROOM_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+impl RoomLock {
+    /// `None` when the budget ran out, or when there is no data directory to
+    /// put a lock in — both "skip naming this time", never an error.
+    fn acquire(window: &str) -> Result<Option<Self>> {
+        let Some(path) = muxa::paths::alias_lock_file(&room_lock_key(window)) else {
             return Ok(None);
         };
-        set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
-        if !yields_to_lower(&alias, pane, &aliases_besides(&window, pane)?) {
-            return Ok(Some(alias));
-        }
+        Self::at(&path, ROOM_LOCK_BUDGET)
     }
 
-    // Out of rounds with a name somebody lower still holds. Give it up
-    // rather than leave the duplicate standing: a contested `@claude2` is
-    // refused as ambiguous for *both* panes, so keeping ours would take down
-    // the pane that legitimately owns it too. Unset, this pane simply falls
-    // back to being addressed as `%1242`.
-    unset_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION)?;
-    Ok(None)
+    fn at(path: &Path, budget: std::time::Duration) -> Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create lock directory {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open lock file {}", path.display()))?;
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self(file))),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(ROOM_LOCK_POLL);
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+}
+
+impl Drop for RoomLock {
+    fn drop(&mut self) {
+        // Closing the descriptor would release it anyway; unlocking first
+        // keeps the release explicit rather than incidental.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Filename for a room's lock: the tmux server this window lives on, plus
+/// the window id. Window ids are only unique per server, so a socket-less key
+/// would make two servers' `@30` share one lock — correct, but needlessly
+/// serializing unrelated rooms.
+///
+/// Sanitized to one path segment, since both halves come from the
+/// environment.
+fn room_lock_key(window: &str) -> String {
+    let socket = std::env::var("MUXA_TMUX_SOCKET")
+        .ok()
+        .or_else(|| {
+            std::env::var("TMUX")
+                .ok()
+                .and_then(|value| value.split(',').next().map(str::to_string))
+        })
+        .unwrap_or_default();
+    let socket = muxa::tmux::socket_short_name(socket.trim());
+    sanitize_lock_segment(&format!("alias-{socket}-{window}"))
+}
+
+fn sanitize_lock_segment(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// `(pane id, alias)` for every *other* pane in `window` that carries one.
@@ -951,24 +1037,6 @@ fn sanitize_alias_base(base: &str) -> Option<String> {
         .collect();
     cleaned.truncate(DEFAULT_ALIAS_BASE_MAX);
     (!cleaned.is_empty()).then_some(cleaned)
-}
-
-/// Whether `pane` has to give up `alias` because a pane tmux numbered
-/// earlier is holding the same name. The tie-break has to be total and
-/// stable, or two racers each decide the *other* one yields.
-fn yields_to_lower(alias: &str, pane: &str, others: &[(String, String)]) -> bool {
-    others.iter().any(|(other, name)| {
-        name.eq_ignore_ascii_case(alias) && pane_ordinal(other) < pane_ordinal(pane)
-    })
-}
-
-/// tmux hands out pane ids monotonically, so the numeric part orders two
-/// panes by which existed first. Unparseable ids sort last, which keeps an
-/// unexpected id shape from winning a contest it should lose.
-fn pane_ordinal(pane: &str) -> u64 {
-    pane.strip_prefix('%')
-        .and_then(|digits| digits.parse().ok())
-        .unwrap_or(u64::MAX)
 }
 
 fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
@@ -2332,17 +2400,6 @@ fn set_option(scope: OptionScope, target: &str, key: &str, value: &str) -> Resul
     tmux_status(&args)
 }
 
-fn unset_option(scope: OptionScope, target: &str, key: &str) -> Result<()> {
-    let mut args = vec!["set-option", "-u"];
-    match scope {
-        OptionScope::Session => {}
-        OptionScope::Window => args.push("-w"),
-        OptionScope::Pane => args.push("-p"),
-    }
-    args.extend(["-t", target, key]);
-    tmux_status(&args)
-}
-
 fn tmux_status(args: &[&str]) -> Result<()> {
     let output = muxa::tmux::tmux_command_scoped()
         .args(args)
@@ -2828,113 +2885,61 @@ mod tests {
         );
     }
 
-    /// One round of the settle loop under the worst schedule: every racer
-    /// reads the room as it stood before any of them wrote, then all the
-    /// writes land, then each verifies against the result. Returns the room
-    /// and who settled — composing the same two decisions
-    /// (`pick_default_alias`, `yields_to_lower`) the real loop runs.
-    fn settle_round(
-        racers: &[String],
-        room: &mut Vec<(String, String)>,
-        settled: &mut Vec<String>,
-    ) {
-        let snapshot = room.clone();
-        let writes: Vec<(String, String)> = racers
-            .iter()
-            .filter(|pane| !settled.contains(pane))
-            .map(|pane| {
-                let others: Vec<_> = snapshot
-                    .iter()
-                    .filter(|(other, _)| other != pane)
-                    .cloned()
-                    .collect();
-                let alias = pick_default_alias("claude", &others).expect("a free name");
-                (pane.clone(), alias)
-            })
-            .collect();
-        for (pane, alias) in &writes {
-            room.retain(|(held, _)| held != pane);
-            room.push((pane.clone(), alias.clone()));
-        }
-        for (pane, alias) in &writes {
-            let others: Vec<_> = room
-                .iter()
-                .filter(|(other, _)| other != pane)
-                .cloned()
-                .collect();
-            if !yields_to_lower(alias, pane, &others) {
-                settled.push(pane.clone());
-            }
-        }
-    }
-
-    fn racers(n: usize) -> Vec<String> {
-        (1..=n).map(|i| format!("%{i}")).collect()
+    fn scratch_lock(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("muxa-test-{}-{name}", std::process::id()))
     }
 
     #[test]
-    fn a_single_retry_leaves_the_losers_colliding() {
-        // Why the settle is a loop and not the one retry this started as.
-        // Round one: everyone claims `claude`, and only the lowest-numbered
-        // racer survives the check. Round two: the three that yielded each
-        // re-pick from a read taken before any of them wrote, so all three
-        // choose `claude2` — and the old code returned right there, with no
-        // second check. This is the shape the live 7-pane barrier test
-        // produced before the fix.
-        let panes = racers(4);
-        let (mut room, mut settled) = (Vec::new(), Vec::new());
-        settle_round(&panes, &mut room, &mut settled);
-        assert_eq!(settled, vec!["%1"], "only the lowest ordinal settles");
-        settle_round(&panes, &mut room, &mut settled);
-        let losers: Vec<&str> = room
-            .iter()
-            .filter(|(pane, _)| pane != "%1")
-            .map(|(_, alias)| alias.as_str())
-            .collect();
-        assert_eq!(losers, ["claude2", "claude2", "claude2"], "{room:?}");
-    }
-
-    #[test]
-    fn repeated_rounds_settle_every_racer_on_its_own_name() {
-        // A settled pane never moves again, so each round frees the next
-        // racer: N racers converge in at most N rounds, well inside the
-        // bound.
-        let panes = racers(7);
-        let (mut room, mut settled) = (Vec::new(), Vec::new());
-        let mut rounds = 0;
-        while settled.len() < panes.len() && rounds < DEFAULT_ALIAS_ROUNDS {
-            settle_round(&panes, &mut room, &mut settled);
-            rounds += 1;
-        }
-        assert_eq!(settled.len(), panes.len(), "did not converge: {room:?}");
+    fn one_room_allocates_at_a_time() {
+        // The property the whole naming scheme rests on. Two panes claiming
+        // at once must not both see a free `claude`, and checking again
+        // after writing cannot give us that — only exclusion can.
+        let path = scratch_lock("exclusive");
+        let short = std::time::Duration::from_millis(50);
+        let held = RoomLock::at(&path, short).unwrap().expect("first claim");
         assert!(
-            rounds <= panes.len(),
-            "{rounds} rounds for {} racers",
-            panes.len()
+            RoomLock::at(&path, short).unwrap().is_none(),
+            "a second allocator must not get in while the first holds it",
         );
-        let mut names: Vec<&str> = room.iter().map(|(_, alias)| alias.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
+        drop(held);
+        assert!(
+            RoomLock::at(&path, short).unwrap().is_some(),
+            "the room reopens once the holder is done",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_wedged_room_gives_up_instead_of_blocking_the_agent() {
+        // This runs inside an agent's session-start hook. Waiting forever on
+        // somebody else's lock would hang the agent's startup; an unnamed
+        // pane is merely addressed as `%1242` until its next start.
+        let path = scratch_lock("budget");
+        let short = std::time::Duration::from_millis(50);
+        let _held = RoomLock::at(&path, short).unwrap().expect("first claim");
+        let began = std::time::Instant::now();
+        assert!(RoomLock::at(&path, short).unwrap().is_none());
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(1),
+            "gave up after {:?}, which is not giving up",
+            began.elapsed(),
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_room_key_is_one_path_segment() {
+        // Both halves come from the environment — `$TMUX`'s socket path
+        // carries separators, and `MUXA_TMUX_SOCKET` is whatever the user
+        // exported — so neither may escape the lock directory.
         assert_eq!(
-            names.len(),
-            panes.len(),
-            "duplicate names survived: {room:?}"
+            sanitize_lock_segment("alias-/tmp/tmux-1044/default-@30"),
+            "alias-_tmp_tmux-1044_default-_30",
         );
-    }
-
-    #[test]
-    fn the_tie_break_never_makes_both_racers_yield() {
-        // If two panes each decided the other one wins, the loop would swap
-        // names forever instead of converging.
-        let room = vec![("%1".to_string(), "claude".to_string())];
-        assert!(yields_to_lower("claude", "%2", &room));
-        let room = vec![("%2".to_string(), "claude".to_string())];
-        assert!(!yields_to_lower("claude", "%1", &room));
-    }
-
-    #[test]
-    fn pane_ordinal_orders_by_age_and_sorts_junk_last() {
-        assert!(pane_ordinal("%9") < pane_ordinal("%10"));
-        assert!(pane_ordinal("%10") < pane_ordinal("nonsense"));
+        assert_eq!(
+            sanitize_lock_segment("alias-../../etc-@1"),
+            "alias-.._.._etc-_1",
+            "a relative path cannot climb out of the lock directory",
+        );
     }
 }
