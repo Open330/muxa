@@ -341,6 +341,12 @@ impl Drop for Sandbox {
         for path in [&self.script, &self.config, &self.rcfile] {
             let _ = std::fs::remove_file(path);
         }
+        // The agent transcripts are named deterministically, so they can be
+        // cleaned from here without threading the `Fleet` back through.
+        let dir = std::env::temp_dir();
+        for name in ["claude", "codex"] {
+            let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}.log")));
+        }
     }
 }
 
@@ -382,6 +388,11 @@ impl Sandbox {
         self.tmux_command(&["set", "-g", "status-position", "top"])?;
         self.tmux_command(&["set", "-g", "status-style", "bg=#0b1220,fg=#c9d1d9"])?;
         self.tmux_command(&["set", "-g", "status-interval", "2"])?;
+        // tmux renames a window after whatever is running in it, which turns
+        // the topology into a list of processes — `bash`, and then `muxa` the
+        // moment they start watch. A window is a Work, and a Work keeps its
+        // name.
+        self.tmux_command(&["set", "-g", "automatic-rename", "off"])?;
         // Root table, so they need no prefix and cannot be confused with typing.
         self.tmux_command(&["bind-key", "-n", "F12", "set", "-g", SKIP_OPTION, "1"])?;
         self.tmux_command(&["bind-key", "-n", "F2", "set", "-g", LANGUAGE_OPTION, "1"])?;
@@ -432,6 +443,163 @@ impl Sandbox {
 }
 
 // ---------------------------------------------------------------------------
+// Agent transcripts
+// ---------------------------------------------------------------------------
+
+/// One scripted agent's screen.
+///
+/// The pane runs `tail -f` over this file and the tour appends to it, so the
+/// session *grows* the way a real one does. A painted frame would have been
+/// less code, but `muxa watch`'s inspector and preview both render the selected
+/// pane's live screen — a fleet parked on a single static line makes those
+/// features look broken, and makes the tour's claim that this is what the work
+/// looks like ring hollow.
+///
+/// Nothing here shells out to an agent CLI. The transcript is a fiction; what
+/// muxa does around it is not, and the tour says so rather than letting anyone
+/// believe they watched Claude answer.
+struct Transcript {
+    path: PathBuf,
+}
+
+impl Transcript {
+    fn new(dir: &Path, name: &str) -> Result<Self> {
+        let path = dir.join(format!("muxa-onboarding-{name}.log"));
+        std::fs::write(&path, "").with_context(|| format!("staging {name}'s transcript"))?;
+        Ok(Self { path })
+    }
+
+    fn append(&self, lines: &[String]) {
+        use std::io::Write as _;
+        let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&self.path) else {
+            return;
+        };
+        for line in lines {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    /// `tail` rather than `cat`: it never reaches EOF, so the pane stays open
+    /// and shows whatever arrives next.
+    fn pane_command(&self) -> String {
+        format!("exec tail -n +1 -f {}", self.path.display())
+    }
+}
+
+const DIM: &str = "\u{1b}[2m";
+const BOLD: &str = "\u{1b}[1m";
+const RESET: &str = "\u{1b}[0m";
+const GREEN: &str = "\u{1b}[1;32m";
+const YELLOW: &str = "\u{1b}[1;33m";
+const BLUE: &str = "\u{1b}[1;34m";
+const MAGENTA: &str = "\u{1b}[1;35m";
+const CYAN: &str = "\u{1b}[1;36m";
+
+/// Matches `docs/demo-paint.sh` so the tour and the recordings show the same
+/// agent, rather than two different ideas of one.
+fn header(colour: &str, name: &str, language: UiLanguage) -> Vec<String> {
+    vec![
+        format!(
+            "{DIM}⟨{}⟩{RESET}",
+            tr(
+                language,
+                "simulated session — no agent CLI is running",
+                "시뮬레이션 세션 — 실제 agent CLI는 실행되지 않습니다",
+            )
+        ),
+        String::new(),
+        format!("{colour}●{RESET} {BOLD}{name}{RESET}"),
+        String::new(),
+    ]
+}
+
+fn prompt_line(text: &str) -> Vec<String> {
+    vec![format!("{GREEN}›{RESET} {text}"), String::new()]
+}
+
+fn tool_line(text: &str) -> String {
+    format!("  {DIM}⚙{RESET} {text}")
+}
+
+/// What codex's pane shows once it is blocked. Mirrors the `approval` frame in
+/// `docs/demo-paint.sh`.
+fn approval_block(language: UiLanguage) -> Vec<String> {
+    vec![
+        String::new(),
+        format!(
+            "  {YELLOW}⏸  {}{RESET}",
+            tr(language, "Approval required", "승인이 필요합니다")
+        ),
+        format!("     {BOLD}$ rg -n \"public_read\" --type rust{RESET}"),
+        String::new(),
+        format!(
+            "     {GREEN}[y]{RESET} {}   {YELLOW}[n]{RESET} {}   {DIM}[a]{RESET} {}",
+            tr(language, "yes", "예"),
+            tr(language, "no", "아니오"),
+            tr(language, "yes, and don't ask again", "예, 다시 묻지 않기"),
+        ),
+    ]
+}
+
+fn incoming_question(language: UiLanguage) -> Vec<String> {
+    vec![
+        String::new(),
+        format!(
+            "  {DIM}✉ {}{RESET}",
+            tr(language, "question from you", "당신이 보낸 질문")
+        ),
+        format!(
+            "     {}",
+            tr(language, "how far along?", "어디까지 됐나요?")
+        ),
+        String::new(),
+        format!(
+            "  {GREEN}›{RESET} {}",
+            tr(
+                language,
+                "auth path is covered; writing the regression test now",
+                "인증 경로는 끝났고, 지금 회귀 테스트를 쓰는 중입니다",
+            )
+        ),
+    ]
+}
+
+fn outgoing_request(language: UiLanguage) -> Vec<String> {
+    vec![
+        String::new(),
+        format!(
+            "  {DIM}✉ {}{RESET}",
+            tr(
+                language,
+                "asked you for a decision",
+                "당신에게 결정을 요청했습니다"
+            )
+        ),
+        format!(
+            "     {}",
+            tr(
+                language,
+                "the public-read boundary needs a decision before I continue",
+                "public-read 경계는 계속하기 전에 결정이 필요합니다",
+            )
+        ),
+    ]
+}
+
+fn finished(language: UiLanguage) -> Vec<String> {
+    vec![
+        String::new(),
+        format!("  {DIM}⚙{RESET} test     checkout::auth::rejects_raw_bearer  ok"),
+        String::new(),
+        format!("  {GREEN}✓ {}{RESET}", tr(language, "done", "완료")),
+    ]
+}
+
+fn working(language: UiLanguage) -> String {
+    format!("  {BLUE}▶ {}{RESET}", tr(language, "working…", "작업 중…"))
+}
+
+// ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
@@ -445,6 +613,8 @@ struct Fleet {
     learner: String,
     claude: String,
     codex: String,
+    claude_screen: Transcript,
+    codex_screen: Transcript,
 }
 
 impl Sandbox {
@@ -454,12 +624,6 @@ impl Sandbox {
     /// they can address peers in is the window they are already in, and
     /// watching the panes arrive is what makes "a pane is an agent" land.
     fn add_agents(&self, session: &str, language: UiLanguage) -> Result<Fleet> {
-        let note = tr(
-            language,
-            "scripted agent — everything muxa does with it is real",
-            "스크립트 agent — muxa가 하는 동작은 전부 진짜입니다",
-        );
-
         // Resolved through the session rather than the attached client: a
         // learner who skipped their way here may not be attached to anything,
         // and the agents still have to land in a real window.
@@ -471,18 +635,53 @@ impl Sandbox {
             bail!("could not find a window to put the agents in");
         }
 
-        let claude = self.split(
-            &window,
-            &format!(
-                "printf '\\033[1;36m▸ claude\\033[0m  {note}\\n\\n  harden the checkout auth path\\n'; exec cat"
-            ),
-        )?;
-        let codex = self.split(
-            &window,
-            &format!(
-                "printf '\\033[1;35m▸ codex\\033[0m  {note}\\n\\n  review the public-read boundary\\n'; exec cat"
-            ),
-        )?;
+        let dir = std::env::temp_dir();
+        let claude_screen = Transcript::new(&dir, "claude")?;
+        let codex_screen = Transcript::new(&dir, "codex")?;
+
+        let claude_prompt = tr(
+            language,
+            "harden the checkout auth path",
+            "checkout 인증 경로를 강화해줘",
+        );
+        let codex_prompt = tr(
+            language,
+            "review the public-read boundary",
+            "public-read 경계를 검토해줘",
+        );
+
+        let mut opening = header(MAGENTA, "claude", language);
+        opening.extend(prompt_line(claude_prompt));
+        opening.push(tool_line("read     crates/checkout/src/auth.rs"));
+        opening.push(tool_line("grep     \"bearer\"  ·  12 matches"));
+        opening.push(String::new());
+        opening.push(working(language));
+        claude_screen.append(&opening);
+
+        let mut opening = header(CYAN, "codex", language);
+        opening.extend(prompt_line(codex_prompt));
+        opening.push(tool_line("read     crates/api/src/public.rs"));
+        opening.push(String::new());
+        opening.push(working(language));
+        codex_screen.append(&opening);
+
+        // A window is a Work, and in a real fleet it is named after one.
+        self.tmux_command(&["rename-window", "-t", &window, "checkout"])?;
+        // Whatever they made at step 2 is a Work too — an unstaffed one.
+        // Left called `bash` the fleet looks half-built rather than like a
+        // workspace with a job nobody has picked up yet.
+        for other in self
+            .tmux_quiet(&["list-windows", "-a", "-F", "#{window_id}"])
+            .lines()
+            .filter(|id| !id.is_empty() && *id != window)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        {
+            let _ = self.tmux_command(&["rename-window", "-t", &other, "release-checks"]);
+        }
+
+        let claude = self.split(&window, &claude_screen.pane_command())?;
+        let codex = self.split(&window, &codex_screen.pane_command())?;
 
         // Zoomed so `muxa watch` gets the whole screen. The agent panes stay in
         // the window, and `muxa attend` unzooms to reach one — which
@@ -494,6 +693,8 @@ impl Sandbox {
             learner,
             claude,
             codex,
+            claude_screen,
+            codex_screen,
         };
         self.seed_fleet(&fleet)?;
         Ok(fleet)
@@ -647,9 +848,9 @@ const STEPS: &[Step] = &[
     },
     // ---- Act II: muxa -----------------------------------------------------
     Step {
-        title_en: "Two agents just joined this window. A pane is an agent. See them all at once.",
+        title_en: "This window is the `checkout` Work now, with two agents in it. A pane is an agent.",
         title_ko:
-            "이 window에 agent 둘이 합류했습니다. pane 하나가 agent 하나입니다. 한눈에 보세요.",
+            "이 window가 이제 `checkout` Work이고, 안에 agent가 둘 있습니다. pane 하나가 agent 하나입니다.",
         cue_en: "run:   muxa watch             ·   q leaves it",
         cue_ko: "입력:   muxa watch             ·   q로 나갑니다",
         detect: Detect::PaneRunning("muxa"),
@@ -825,21 +1026,40 @@ impl Tour<'_> {
             return Ok(());
         };
         match index {
-            5 => self.sandbox.hook(
-                &fleet.codex,
-                "codex",
-                "permission_request",
-                r#"{"session_id":"onboarding-codex","tool_name":"shell"}"#,
-            ),
+            5 => {
+                // The row in watch flips to `waiting` because of the hook; the
+                // pane has to show *why*, or the state is a claim rather than
+                // something the learner can see for themselves.
+                fleet.codex_screen.append(&approval_block(self.language));
+                self.sandbox.hook(
+                    &fleet.codex,
+                    "codex",
+                    "permission_request",
+                    r#"{"session_id":"onboarding-codex","tool_name":"shell"}"#,
+                )
+            }
+            6 => {
+                // The learner's question lands in claude's session, so claude's
+                // screen shows it arriving and being answered.
+                fleet
+                    .claude_screen
+                    .append(&incoming_question(self.language));
+                Ok(())
+            }
             7 => {
                 let body = tr(
                     self.language,
                     "the public-read boundary needs a decision before I continue",
                     "public-read 경계는 계속하기 전에 결정이 필요합니다",
                 );
+                fleet.codex_screen.append(&outgoing_request(self.language));
                 self.sandbox
                     .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
                     .map(|_| ())
+            }
+            8 => {
+                fleet.claude_screen.append(&finished(self.language));
+                Ok(())
             }
             _ => Ok(()),
         }
