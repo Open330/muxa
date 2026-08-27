@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a Work Run under muxa's model, so naming it after whatever process is
   running in it overwrites the Work with `node` or `claude` the moment an agent
   starts.
+- **Minimum supported Rust is now 1.89.** Nothing in the tree requires it
+  today; the floor moves so future work can reach for stabilized std APIs
+  without the design bending around an old one. Raised while the project is
+  young enough for the cost to be small.
 - **The daemon arbitrates a room's handle namespace.** A room-local handle
   had three writers — the `@muxa_agent_alias` pane option, a launcher's
   explicit alias, and a registered identity — each enforcing its own rule
