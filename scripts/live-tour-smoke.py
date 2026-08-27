@@ -346,6 +346,27 @@ def main() -> int:
             len(panes) >= 3,
             str(panes),
         )
+        # The step says the agents arrived and the next one says to look at the
+        # whole Work. Zooming the learner's pane hid both and left that claim
+        # sitting above a blank screen.
+        report.check(
+            "9  the fleet is visible, not hidden behind a zoom",
+            tmux("display-message", "-p", "#{window_zoomed_flag}").stdout.strip() == "0",
+            tmux("display-message", "-p", "#{window_zoomed_flag}").stdout,
+        )
+        # The learner's pane has to fit `muxa watch` and the agents' have to fit
+        # their own frames; on a 200-column window both sides clear that easily,
+        # and the point of the check is that neither was starved to zero.
+        visible = [
+            int(w) for w in tmux(
+                "list-panes", "-t", "muxa-onboarding:", "-F", "#{pane_width}"
+            ).stdout.split()
+        ]
+        report.check(
+            "9  and every pane has room to render",
+            len(visible) >= 3 and min(visible) >= 60,
+            str(visible),
+        )
         paths = tmux("list-panes", "-a", "-F", "#{pane_current_path}").stdout.split()
         report.check(
             "9  nothing runs outside the sandbox workspace",

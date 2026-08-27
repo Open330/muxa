@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the learner's shell reports what it ran, so a step whose action is a command
   can be detected rather than bolted onto the end of another cue.
 
+  The fleet stays on screen. The learner's pane was zoomed so `muxa watch`
+  could have the whole screen, which hid the two agents that had just arrived —
+  the step confirmed an arrival the learner could not see, above an instruction
+  to look at the whole Work, over a blank pane. `main-vertical` gives them at
+  least 80 columns on the left and stacks claude and codex on the right, which
+  is both what watch needs and what the next four steps are about.
+
   The learner starts the agent themselves. Splitting a pane is one step and
   typing `claude` in it is the next, because a pane that turns into an agent on
   its own teaches that panes become agents by magic. `claude` resolves to a

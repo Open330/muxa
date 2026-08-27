@@ -865,8 +865,14 @@ fn display_width(text: &str) -> usize {
         .sum()
 }
 
+/// How wide an agent's pane has to be for its own frames to render.
+///
+/// The layout reads this, so narrowing the mock screens widens the learner's
+/// pane rather than leaving a box clipped down the middle.
+const AGENT_FRAME_COLUMNS: usize = 60;
+
 fn composer(cli: Cli, language: UiLanguage) -> Vec<String> {
-    let width: usize = 58;
+    let width: usize = AGENT_FRAME_COLUMNS - 2;
     // Each CLI's own idle hint. Inviting the learner to type here would be a
     // lie — they talk to these agents through `muxa msg`, not this box.
     let hint = match cli {
@@ -1082,6 +1088,53 @@ impl Sandbox {
             .filter(|pane| !pane.is_empty())
     }
 
+    /// Learner on the left, agents stacked on the right.
+    ///
+    /// Laid out rather than zoomed. Zooming the learner's pane gave
+    /// `muxa watch` the whole screen and hid the two agents that had just
+    /// arrived — so the step confirmed an arrival the learner could not see,
+    /// above an instruction to look at the whole Work, over a blank screen.
+    /// Half the width is still plenty for watch, and the fleet is what the
+    /// next four steps are about.
+    fn lay_out_fleet(&self, window: &str, learner: &str) -> Result<()> {
+        // `main-vertical` makes the first pane the wide one, and the learner's
+        // is first only because it predates the split. Not worth assuming.
+        let first = self
+            .tmux_command(&["list-panes", "-t", window, "-F", "#{pane_id}"])?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !first.is_empty() && first != learner {
+            let _ = self.tmux_command(&["swap-pane", "-s", &first, "-t", learner]);
+        }
+        // A column count rather than `50%`, which older tmux rejects here.
+        // Half each suits a wide terminal. On a narrow one, half would put the
+        // agents below the width their own frames need, so they keep that and
+        // the learner takes what is left — down to a floor, because a pane too
+        // narrow for `muxa watch` is its own kind of broken.
+        let width = self
+            .tmux_command(&["display-message", "-p", "-t", window, "#{window_width}"])?
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(160);
+        let main = (width / 2)
+            .min(width.saturating_sub(AGENT_FRAME_COLUMNS + 1))
+            .max(60)
+            .min(width.saturating_sub(20))
+            .max(20);
+        let _ = self.tmux_command(&[
+            "set-window-option",
+            "-t",
+            window,
+            "main-pane-width",
+            &main.to_string(),
+        ]);
+        let _ = self.tmux_command(&["select-layout", "-t", window, "main-vertical"]);
+        self.tmux_command(&["select-pane", "-t", learner])?;
+        Ok(())
+    }
+
     /// codex joins whatever window the learner started claude in.
     ///
     /// Joining *their* window rather than a prepared one is the point: the room
@@ -1190,11 +1243,7 @@ impl Sandbox {
             &codex_screen.answerable_pane_command(&dir, &approved, &declined)?,
         )?;
 
-        // Zoomed so `muxa watch` gets the whole screen. The agent panes stay in
-        // the window, and `muxa attend` unzooms to reach one — which
-        // demonstrates attend better than any description of it.
-        self.tmux_command(&["select-pane", "-t", &learner])?;
-        self.tmux_command(&["resize-pane", "-Z", "-t", &learner])?;
+        self.lay_out_fleet(&window, &learner)?;
 
         let fleet = Fleet {
             learner,
@@ -1425,8 +1474,8 @@ const STEPS: &[Step] = &[
         detect: Detect::StartedClaude,
     },
     Step {
-        achieved_en: "✓ claude took that pane, codex joined it, you are back in yours",
-        achieved_ko: "✓ claude가 그 pane을 차지하고 codex도 합류했습니다 — 당신은 자기 pane입니다",
+        achieved_en: "✓ that pane is claude now, codex joined it, and your cursor is back in yours",
+        achieved_ko: "✓ 그 pane이 claude가 됐고 codex도 합류했습니다 — 커서는 당신 pane에 있습니다",
         title_en: "This window is the `checkout` Work now. See all of it at once.",
         title_ko: "이 window가 이제 `checkout` Work입니다. 전체를 한 번에 보세요.",
         cue_en: "run:   muxa watch            ·   q leaves it",
@@ -1472,8 +1521,8 @@ const STEPS: &[Step] = &[
     Step {
         achieved_en: "✓ you read claude's reply — and codex has asked you something of its own",
         achieved_ko: "✓ claude의 답장을 봤습니다 — 그리고 codex가 당신에게 물어왔습니다",
-        title_en: "`inbox` claims what was sent *to* you. Agents use muxa too.",
-        title_ko: "`inbox`는 당신에게 **온** 요청을 가져옵니다. agent도 muxa를 씁니다.",
+        title_en: "`inbox` claims the requests addressed to you. Agents use muxa too.",
+        title_ko: "`inbox`는 당신 앞으로 온 요청을 가져옵니다. agent도 muxa를 씁니다.",
         cue_en: "run:   muxa msg inbox",
         cue_ko: "입력:   muxa msg inbox",
         detect: Detect::ClaimedInbox,
