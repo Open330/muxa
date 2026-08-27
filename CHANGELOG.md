@@ -68,10 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
   `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
   relayed through tmux or a slow pty could tear the tour down mid-step; both
-  the tour and the tmux track now confirm an `Esc` before quitting and
-  reassemble the split sequence. `scripts/onboard.sh` read one byte per key
-  and so quit on *every* arrow key; it now classifies the escape tail the same
-  way and accepts the real `Alt-T`.
+  the tour and the tmux track now confirm an `Esc` before quitting, reassemble
+  the split sequence, and deliver the represented arrow instead of swallowing
+  it. `scripts/onboard.sh` read one byte per key and so quit on *every* arrow
+  key; it now classifies the escape tail the same way and accepts the real
+  `Alt-T`. The download path also capability-checks the release before running
+  it, so a release still predating these fixes falls back to the corrected
+  embedded tour.
 
 ## [0.8.36] - 2026-08-27
 

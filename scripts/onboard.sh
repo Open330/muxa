@@ -230,6 +230,19 @@ run_release_onboarding() {
   [ -n "$muxa_bin" ] && [ -f "$muxa_bin" ] || return 1
   chmod +x "$muxa_bin" 2>/dev/null || :
 
+  # `main` can move ahead of the latest published release. Do not route users
+  # back into the exact pre-fix tour this script replaces while a new release is
+  # still being cut; the hidden contract was introduced with the Alt-T and
+  # split-Esc fixes, so it is also a precise capability probe.
+  step_table=$download_dir/step-table
+  tab=$(printf '\t')
+  if ! "$muxa_bin" onboard --emit step-table > "$step_table" 2>/dev/null \
+    || ! grep -Fqx "14${tab}Alt-T" "$step_table"; then
+    printf 'muxa-onboard: release %s predates the current tour fixes; using the embedded fallback\n' \
+      "$version" >&2
+    return 1
+  fi
+
   set -- onboard --lang "$language"
   [ "$print_only" -eq 1 ] && set -- "$@" --print
   [ "$no_quiz" -eq 1 ] && set -- "$@" --no-quiz

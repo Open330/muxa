@@ -2270,6 +2270,17 @@ mod tests {
     }
 
     #[test]
+    fn split_csi_sequences_preserve_the_key_the_tour_is_waiting_for() {
+        assert_eq!(csi_key('A'), Some(KeyCode::Up));
+        assert_eq!(csi_key('B'), Some(KeyCode::Down));
+        assert_eq!(csi_key('C'), Some(KeyCode::Right));
+        assert_eq!(csi_key('D'), Some(KeyCode::Left));
+        assert_eq!(csi_key('H'), Some(KeyCode::Home));
+        assert_eq!(csi_key('F'), Some(KeyCode::End));
+        assert_eq!(csi_key('~'), None);
+    }
+
+    #[test]
     fn interactive_input_tokens_use_the_shared_action_color() {
         let line = highlighted_actions("Press q, not quiet.", &["q"]);
         assert_eq!(line.spans.len(), 3);
