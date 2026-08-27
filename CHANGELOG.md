@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa onboard --tour live` — the onboarding stops simulating muxa and
+  becomes it.** Nine steps in two acts, against a sandbox on its own tmux
+  server: Act I is real `tmux new-session`, a real second window, a real detach
+  proving the work kept running, and a real reattach; Act II adds two scripted
+  agents to the learner's own window and walks them through real `muxa watch`,
+  `muxa attend`, `muxa msg send @claude` and `muxa msg inbox` over a real
+  mailbox. The states are produced by feeding `muxad` the same hook payloads
+  the agent CLIs send, so nothing on screen is drawn.
+
+  Narration goes through tmux's own status rows rather than a pane or a popup:
+  a narration pane would be split and zoomed by the very exercises Act I
+  teaches, and `display-popup` is modal and does not expand `#{}` formats.
+  Because the narration never owns the keyboard, no step can wait on a
+  keypress — each one polls real tmux and real muxa state and advances when the
+  learner has actually done the thing, which is why the tour is driven with
+  real commands instead of a quiz. `scripts/live-tour-smoke.py` types those
+  commands in CI and checks the tour keeps up.
+
+  The sandbox is torn down on every exit path, including `Ctrl-C`. The old
+  simulation remains the default (`--tour simulated`) until the live tour has
+  replaced it outright.
+
+  No step is a dead end. The sandbox server starts with `-f /dev/null`, so a
+  learner who rebound their prefix is not told to press `Ctrl-b` and left
+  stranded; any step offers `F12` to move past it after 45 seconds, and
+  `--no-quiz` offers that from the first step; and skipping performs whatever
+  the learner would have done, so Act II still has a session to put its agents
+  in. The first step prints its instruction rather than painting it, because
+  nobody is attached to a status bar yet. `F2` switches the narration language
+  mid-tour, as the simulation's footer did.
+
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
   supported command: `up` / `daemon` / `env` / `status` / `down` over a private
