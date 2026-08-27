@@ -62,14 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `checkout · 3 agents` instead of `muxa` and `bash`. None of it shells out to
   an agent CLI, and each transcript says so on its first line.
 
-  Fourteen steps, not nine, and one action each. Compressing them put two
+  Fifteen steps, not nine, and one action each. Compressing them put two
   instructions on a line — "see both: Ctrl-b s · then leave: Ctrl-b d" — which
   reads as one and leaves the learner unsure which half registered. `Ctrl-b s`,
   `tmux ls`, `Ctrl-b ;` and `muxa msg list` are steps in their own right now;
   the learner's shell reports what it ran, so a step whose action is a command
-  can be detected rather than bolted onto the end of another cue. Splitting a
-  pane is one of them: the pane they split becomes claude, which is what turns
-  "a pane is an agent" from a sentence into something they did.
+  can be detected rather than bolted onto the end of another cue.
+
+  The learner starts the agent themselves. Splitting a pane is one step and
+  typing `claude` in it is the next, because a pane that turns into an agent on
+  its own teaches that panes become agents by magic. `claude` resolves to a
+  shim on the sandbox `PATH`, so what comes up is the tour's screen and the
+  real CLI is never invoked — and the pane the learner ran it in is the pane
+  the hook registers, which is what turns "a pane is an agent" from a sentence
+  into something they did.
 
   The tour runs in a workspace of its own. It has its own `HOME` and a
   `checkout-service` tree — the files the scripted agents say they are reading,

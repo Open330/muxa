@@ -157,6 +157,10 @@ impl Sandbox {
         let project = home.join("checkout-service");
         write_executable(&script, SANDBOX_SCRIPT).context("staging the sandbox script")?;
         std::fs::write(&config, SANDBOX_CONFIG).context("staging the sandbox config")?;
+        // The shell appends to this. A run that died before its teardown — a
+        // crash, a SIGKILL — leaves commands behind that would satisfy this
+        // run's steps before the learner has typed anything.
+        std::fs::write(&history, "").context("clearing the command log")?;
         write_workspace(&project).context("staging the practice workspace")?;
 
         let tmux = which("tmux").context("tmux is required for the live tour")?;
@@ -427,7 +431,12 @@ impl Drop for Sandbox {
         for name in ["claude", "codex"] {
             let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}.log")));
         }
-        for name in ["codex-pane.sh", "approved.txt", "declined.txt"] {
+        for name in [
+            "codex-pane.sh",
+            "approved.txt",
+            "declined.txt",
+            "claude.pane",
+        ] {
             let _ = std::fs::remove_file(dir.join(format!("muxa-onboarding-{name}")));
         }
         // Only ever the tour's own home — never anything the learner owns.
@@ -648,6 +657,13 @@ struct Transcript {
 }
 
 impl Transcript {
+    /// An existing transcript, left as it is.
+    fn open(dir: &Path, name: &str) -> Self {
+        Self {
+            path: dir.join(format!("muxa-onboarding-{name}.log")),
+        }
+    }
+
     fn new(dir: &Path, name: &str) -> Result<Self> {
         let path = dir.join(format!("muxa-onboarding-{name}.log"));
         std::fs::write(&path, "").with_context(|| format!("staging {name}'s transcript"))?;
@@ -669,6 +685,29 @@ impl Transcript {
     fn pane_command(&self) -> String {
         format!("exec tail -n +1 -f {}", self.path.display())
     }
+
+    /// A `claude` / `codex` the learner can start themselves.
+    ///
+    /// Having the agents appear on their own left the tour doing the one thing
+    /// it keeps telling them muxa does *for* them. Typing `claude` is what
+    /// starting an agent actually looks like, and the shim on the sandbox PATH
+    /// means the real CLI is never reached — the name resolves to this screen.
+    /// It records its pane so the tour knows where the agent landed.
+    fn launcher(&self, shim: &Path, name: &str, marker: &Path) -> Result<()> {
+        let body = format!(
+            r#"#!/usr/bin/env bash
+# Stands in for the {name} CLI inside `muxa onboard`. Never reaches the real
+# one: the sandbox PATH resolves the name here. Removed with the sandbox.
+printf '%s' "$TMUX_PANE" > {marker}
+exec tail -n +1 -f {log}
+"#,
+            name = name,
+            marker = marker.display(),
+            log = self.path.display(),
+        );
+        write_executable(&shim.join(name), &body)
+    }
+
     /// A pane that shows the transcript *and* answers its own approval prompt.
     ///
     /// A prompt reading `[y] yes  [n] no` that swallows the keystroke is worse
@@ -1017,11 +1056,38 @@ fn write_opening_screens(claude: &Transcript, codex: &Transcript, language: UiLa
 }
 
 impl Sandbox {
-    /// Two agents join whatever window the learner is sitting in.
+    /// Stage the screens and put `claude` on the learner's `PATH`, so starting
+    /// the agent is theirs to do rather than the tour's to perform.
+    fn prepare_agents(&self, language: UiLanguage) -> Result<()> {
+        let dir = std::env::temp_dir();
+        let claude_screen = Transcript::new(&dir, "claude")?;
+        let codex_screen = Transcript::new(&dir, "codex")?;
+        write_opening_screens(&claude_screen, &codex_screen, language);
+        // A marker left by an earlier tour would satisfy the step before the
+        // learner has typed anything.
+        let _ = std::fs::remove_file(dir.join("muxa-onboarding-claude.pane"));
+        claude_screen.launcher(
+            Path::new(&self.env_value("MUXA_SANDBOX_SHIM")),
+            "claude",
+            &dir.join("muxa-onboarding-claude.pane"),
+        )?;
+        Ok(())
+    }
+
+    /// Where the learner started claude, once they have.
+    fn started_pane() -> Option<String> {
+        std::fs::read_to_string(std::env::temp_dir().join("muxa-onboarding-claude.pane"))
+            .ok()
+            .map(|pane| pane.trim().to_string())
+            .filter(|pane| !pane.is_empty())
+    }
+
+    /// codex joins whatever window the learner started claude in.
     ///
     /// Joining *their* window rather than a prepared one is the point: the room
     /// they can address peers in is the window they are already in, and
-    /// watching the panes arrive is what makes "a pane is an agent" land.
+    /// watching a pane arrive beside their own is what makes "a pane is an
+    /// agent" land.
     fn add_agents(
         &self,
         session: &str,
@@ -1061,11 +1127,18 @@ impl Sandbox {
         if learner.is_empty() {
             bail!("could not tell your pane from the one you split off");
         }
+        // If they started claude in the pane this guessed was theirs, theirs is
+        // the other one.
+        let learner = match Self::started_pane() {
+            Some(started) if started == learner => fresh.clone(),
+            _ => learner,
+        };
 
+        // Already written by `prepare_agents`; opening them again would blank
+        // the screen the learner is looking at.
         let dir = std::env::temp_dir();
-        let claude_screen = Transcript::new(&dir, "claude")?;
-        let codex_screen = Transcript::new(&dir, "codex")?;
-        write_opening_screens(&claude_screen, &codex_screen, language);
+        let claude_screen = Transcript::open(&dir, "claude");
+        let codex_screen = Transcript::open(&dir, "codex");
 
         let approved = dir.join("muxa-onboarding-approved.txt");
         let declined = dir.join("muxa-onboarding-declined.txt");
@@ -1087,21 +1160,30 @@ impl Sandbox {
             let _ = self.tmux_command(&["rename-window", "-t", &other, "release-checks"]);
         }
 
-        // `respawn-pane` keeps the pane id, so the hook that registers claude
-        // still lands on the pane the learner is looking at.
-        let claude = if fresh.is_empty() {
-            self.split(&window, &claude_screen.pane_command())?
+        // claude is wherever the learner ran it. The fallback covers a skipped
+        // step, where nobody ran anything.
+        // Skipping past that step means nobody ran anything, so the pane they
+        // split — or failing that their own — is respawned into claude
+        // instead. `respawn-pane -k` keeps the pane id, so the hook still
+        // lands on the pane the learner is looking at.
+        let claude = if let Some(pane) = Self::started_pane() {
+            pane
         } else {
+            let pane = if fresh.is_empty() {
+                learner.clone()
+            } else {
+                fresh.clone()
+            };
             self.tmux_command(&[
                 "respawn-pane",
                 "-k",
                 "-c",
                 &self.project.to_string_lossy(),
                 "-t",
-                &fresh,
+                &pane,
                 &claude_screen.pane_command(),
             ])?;
-            fresh
+            pane
         };
         let codex = self.split(
             &window,
@@ -1230,6 +1312,8 @@ enum Detect {
     ClientAttached,
     /// Their window has more than the pane it started with.
     PaneSplit,
+    /// The learner started claude, in whichever pane they chose.
+    StartedClaude,
     /// Some pane on the sandbox server is running this command.
     PaneRunning(&'static str),
     /// The active pane is the one `muxa attend` should have jumped to.
@@ -1332,8 +1416,17 @@ const STEPS: &[Step] = &[
         detect: Detect::PaneSplit,
     },
     Step {
-        achieved_en: "✓ the pane you just made is claude, and codex joined beside it",
-        achieved_ko: "✓ 방금 만든 pane이 claude가 됐고, 옆에 codex도 합류했습니다",
+        achieved_en: "✓ split — you are in the new pane, at its own shell",
+        achieved_ko: "✓ 나눴습니다 — 지금 새 pane의 셸에 있습니다",
+        title_en: "Nothing makes a pane an agent except starting one in it.",
+        title_ko: "pane을 agent로 만드는 건 거기서 agent를 띄우는 것뿐입니다.",
+        cue_en: "type:   claude                 ·   the sandbox stands in for the real CLI",
+        cue_ko: "입력:   claude                 ·   sandbox가 실제 CLI를 대신합니다",
+        detect: Detect::StartedClaude,
+    },
+    Step {
+        achieved_en: "✓ claude took that pane, codex joined it, you are back in yours",
+        achieved_ko: "✓ claude가 그 pane을 차지하고 codex도 합류했습니다 — 당신은 자기 pane입니다",
         title_en: "This window is the `checkout` Work now. See all of it at once.",
         title_ko: "이 window가 이제 `checkout` Work입니다. 전체를 한 번에 보세요.",
         cue_en: "run:   muxa watch            ·   q leaves it",
@@ -1395,9 +1488,13 @@ const STEPS: &[Step] = &[
         detect: Detect::NoClient,
     },
 ];
-/// The step whose completion brings the agents in: the learner has just
-/// split a pane, and that pane becomes claude.
-const AGENTS_ARRIVE: usize = 7;
+/// The step that opens once the learner has started claude: the pane they ran
+/// it in becomes claude's, and codex lands beside it.
+const AGENTS_ARRIVE: usize = 8;
+
+/// The step that asks them to split — one before the one that asks for
+/// `claude`, which is one before the agents land.
+const SPLIT_STEP: usize = AGENTS_ARRIVE - 2;
 
 // ---------------------------------------------------------------------------
 // Run
@@ -1436,6 +1533,21 @@ impl Tour<'_> {
             .collect()
     }
 
+    /// The learner's current window, named explicitly.
+    ///
+    /// `list-panes` with no target picks whichever window tmux considers
+    /// current, and the tour runs outside any client — so after step 2 leaves a
+    /// second window behind, a bare `list-panes` can report the window the
+    /// learner is *not* in. That is a split that never registers.
+    fn session_target(&self) -> String {
+        let session = self
+            .own_sessions()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "muxa-onboarding".to_string());
+        format!("{session}:")
+    }
+
     fn satisfied(&mut self, detect: &Detect) -> bool {
         match detect {
             Detect::SessionCreated => !self.own_sessions().is_empty(),
@@ -1469,12 +1581,19 @@ impl Tour<'_> {
             Detect::ClientAttached => !self.clients().is_empty(),
             Detect::PaneSplit => {
                 self.sandbox
-                    .tmux_quiet(&["list-panes", "-F", "#{pane_id}"])
+                    .tmux_quiet(&[
+                        "list-panes",
+                        "-t",
+                        &self.session_target(),
+                        "-F",
+                        "#{pane_id}",
+                    ])
                     .lines()
                     .filter(|id| !id.is_empty())
                     .count()
                     >= 2
             }
+            Detect::StartedClaude => Sandbox::started_pane().is_some(),
             Detect::PaneRunning(command) => self
                 .sandbox
                 .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
@@ -1539,7 +1658,7 @@ impl Tour<'_> {
                     ]);
                 }
             }
-            6 => {
+            SPLIT_STEP => {
                 if let Some(session) = self.own_sessions().first() {
                     let _ =
                         self.sandbox
@@ -1567,13 +1686,23 @@ impl Tour<'_> {
         }
         // Their pane, recorded before the split so the new one can be told
         // apart from it afterwards.
-        if index == AGENTS_ARRIVE - 1 {
+        if index == SPLIT_STEP {
             self.before_split = self
                 .sandbox
-                .tmux_quiet(&["list-panes", "-F", "#{pane_id}"])
+                .tmux_quiet(&[
+                    "list-panes",
+                    "-t",
+                    &self.session_target(),
+                    "-F",
+                    "#{pane_id}",
+                ])
                 .lines()
                 .map(str::to_string)
                 .collect();
+        }
+        // `claude` has to be on their PATH before the step that asks for it.
+        if index == AGENTS_ARRIVE - 1 {
+            return self.sandbox.prepare_agents(self.language);
         }
         if index == AGENTS_ARRIVE {
             let session = self
@@ -1592,7 +1721,7 @@ impl Tour<'_> {
             return Ok(());
         };
         match index {
-            8 => {
+            9 => {
                 // The row in watch flips to `waiting` because of the hook; the
                 // pane has to show *why*, or the state is a claim rather than
                 // something the learner can see for themselves.
@@ -1604,7 +1733,7 @@ impl Tour<'_> {
                     r#"{"session_id":"onboarding-codex","tool_name":"shell"}"#,
                 )
             }
-            11 => {
+            12 => {
                 fleet
                     .claude_screen
                     .append(&incoming_question(self.language));
@@ -1612,7 +1741,7 @@ impl Tour<'_> {
                 self.sandbox.reply_as_claude(fleet, self.language);
                 Ok(())
             }
-            12 => {
+            13 => {
                 let body = tr(
                     self.language,
                     "the public-read boundary needs a decision before I continue",
@@ -1623,7 +1752,7 @@ impl Tour<'_> {
                     .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
                     .map(|_| ())
             }
-            13 => {
+            14 => {
                 fleet.claude_screen.append(&finished(self.language));
                 Ok(())
             }
@@ -1659,31 +1788,30 @@ impl Tour<'_> {
             },
         );
 
-        // The status bar only exists for someone attached to the server, and
-        // the first step is the one where they are not — they are at a bare
-        // shell being asked to create the session. Narrating only through tmux
-        // would leave that instruction invisible, which is the same dead end as
-        // a gate with no way past it, just earlier.
-        // Trailing newlines are stripped by the `$(...)` the prompt reads this
-        // through, which ran the instruction and the prompt together on one
-        // line. A trailing *space* survives, so the prompt starts its own line.
+        // The status bar only exists for someone attached to the server, and a
+        // few steps are the ones where they are not.
         //
-        // Coloured and ruled, because a plain paragraph above a shell prompt
-        // reads as output from the last command rather than as the thing to do
-        // next.
-        let rule = "─".repeat(64);
-        let _ = std::fs::write(
-            &self.sandbox.cue,
-            format!(
+        // Printed rather than left for the prompt to render: bash will not
+        // re-draw a prompt it has already put on screen — SIGWINCH redraws the
+        // *saved* prompt string rather than re-evaluating `PS1` — so a step
+        // change reached the learner only once they pressed a key. Ruled and
+        // coloured, because a plain paragraph above a shell prompt reads as the
+        // last command's output rather than as the thing to do next; and it
+        // ends with the prompt, so whatever they type next has one in front of
+        // it.
+        if self.clients().is_empty() {
+            let rule = "─".repeat(64);
+            print!(
                 "\n{DIM}{rule}{RESET}\n\
                  {BOLD}muxa onboarding · {}/{}{RESET}   {GREEN}{achieved}{RESET}\n\
                  {title}\n\
                  {YELLOW}{BOLD}{cue}{RESET}\n\
-                 {DIM}{rule}{RESET}\n ",
+                 {DIM}{rule}{RESET}\n muxa-onboarding $ ",
                 index + 1,
                 STEPS.len()
-            ),
-        );
+            );
+            let _ = std::io::stdout().flush();
+        }
     }
 
     fn drive(&mut self) -> Result<usize> {
