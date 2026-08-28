@@ -38,11 +38,12 @@ use crossterm::terminal::{
 };
 use muxa::collaboration::{
     AirArtifactProfile, AirArtifactReference, CollaborationOrigin, CollaborationRequest,
-    NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
+    MailboxScope, NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, RoomContext,
+    WorkMode,
 };
 use muxa::config::{
-    IconSet, WatchCollaborationMode, WatchConfig, WatchLayout, WatchSortKey, WatchSummary,
-    WatchTheme, WatchTreeExpansion, WatchView, WidthSpec,
+    IconSet, WatchCollaborationMode, WatchConfig, WatchLayout, WatchScreen, WatchSortKey,
+    WatchSummary, WatchTheme, WatchTreeExpansion, WatchView, WidthSpec,
 };
 use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError};
@@ -63,6 +64,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -70,6 +72,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
+use crate::collab_screen::{self, CollabRow, CollabScreen};
 use crate::message_skill::{
     insert_prompt as insert_message_skill_prompt, matching_skills, remove as remove_message_skill,
     upsert as upsert_message_skill, validate_name as validate_message_skill_name,
@@ -1704,8 +1707,8 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M          message selected agent / mailbox (b alias)",
+        "  Alt-1 / Alt-2  screen: topology / collaboration across all rooms",
         "  i / e          (in mailbox) claim inbox / reply",
-        "",
         "Sorting",
         "  Alt-S/L/D/T    sibling name / latest / duration / state",
         "State markers",
@@ -2723,6 +2726,10 @@ pub(crate) struct App {
     /// glance preference, not configuration.
     inspector_split: InspectorSplit,
     collaboration_mailbox: CollaborationMailboxState,
+    /// Fleet-wide collaboration listing, populated only while its screen is
+    /// the one on show — an operator surface has no business polling every
+    /// room in the daemon to render a topology tree.
+    pub(crate) collab: CollabScreen,
     collaboration_composer: Option<CollaborationComposer>,
     /// Reusable templates loaded once from `[message.skills]`; palette
     /// filtering never touches disk or the daemon.
@@ -2988,6 +2995,7 @@ impl App {
             collaboration_scope: muxa::config::CollaborationScope::default(),
             inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
+            collab: CollabScreen::default(),
             collaboration_composer: None,
             message_skills: BTreeMap::new(),
             message_skill_editor: None,
@@ -3289,6 +3297,39 @@ impl App {
         if let Some(selected) = selected {
             self.restore_selection(Some(selected));
         }
+    }
+
+    /// Switch which list watch is showing.
+    ///
+    /// Nothing about the topology changes, so the tree keeps its cursor,
+    /// expansion and filter for when the operator comes back to it.
+    pub(crate) fn apply_screen(&mut self, screen: WatchScreen) {
+        self.watch_cfg.screen = screen;
+        if matches!(screen, WatchScreen::Collab) {
+            // The cursor belongs to whatever the listing turns out to hold,
+            // and the previous visit's row is not it.
+            self.collab.select_first();
+        }
+    }
+
+    /// The topology key for a pane a collaboration request named, when that
+    /// pane is still on screen. Requests outlive the panes that sent them, so
+    /// this is genuinely optional rather than an invariant.
+    pub(crate) fn pane_key_for(&self, pane_id: &str, socket: Option<&str>) -> Option<PaneKey> {
+        self.topology
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .flat_map(|window| window.panes.iter())
+            .find(|pane| {
+                pane.key.pane_id == pane_id
+                    // A pane id is only unique within one server, so a socket
+                    // the request carried has to match as well.
+                    && socket.is_none_or(|socket| {
+                        pane.key.window.session.endpoint.socket == socket
+                    })
+            })
+            .map(|pane| pane.key.clone())
     }
 
     pub(crate) fn apply_layout(&mut self, layout: WatchLayout) {
@@ -7095,6 +7136,7 @@ pub async fn run(
                 Action::Refresh => {
                     request_refresh(&mut app, &wake_tx);
                     refresh_watch_collaboration(client, &mut app).await;
+                    refresh_fleet_collaboration(client, &mut app).await;
                 }
                 Action::OpenPreview => {
                     let pane_key = if app.uses_tree() {
@@ -7204,6 +7246,17 @@ pub async fn run(
                         WatchView::Pane => "pane",
                     };
                     app.set_hint(format!("view: {label}"), HintLevel::Ok);
+                }
+                Action::SetScreen(screen) => {
+                    app.apply_screen(screen);
+                    let label = match screen {
+                        WatchScreen::Topology => "topology",
+                        WatchScreen::Collab => "collab",
+                    };
+                    app.set_hint(format!("screen: {label}"), HintLevel::Ok);
+                    // Arriving at an empty list and waiting out a poll tick
+                    // would read as "nothing is happening" on a busy fleet.
+                    refresh_fleet_collaboration(client, &mut app).await;
                 }
                 Action::SetLayout(layout) => {
                     app.apply_layout(layout);
@@ -7729,6 +7782,35 @@ fn friendly_watch_collaboration_error(error: &str) -> String {
             .into();
     }
     error.into()
+}
+
+/// Load every room's traffic for the collaboration screen.
+///
+/// Console-scoped by construction: the daemon refuses a widened listing to a
+/// pane agent, and the operator sitting in front of `muxa watch` is exactly
+/// the caller that is entitled to it. Skipped whenever the screen is not on
+/// show, so a topology-only session never pays for it.
+async fn refresh_fleet_collaboration(client: &Client, app: &mut App) {
+    if !matches!(app.watch_cfg.screen, WatchScreen::Collab) {
+        return;
+    }
+    let Some(origin) = app.collaboration.origin.clone() else {
+        app.collab.fail(collaboration_open_hint().into());
+        return;
+    };
+    let origin = CollaborationOrigin {
+        console: true,
+        ..origin
+    };
+    match client
+        .collaboration_list_scoped(&origin, RequestMailbox::All, MailboxScope::All)
+        .await
+    {
+        Ok(requests) => app.collab.set_requests(requests),
+        Err(error) => app
+            .collab
+            .fail(friendly_watch_collaboration_error(&error.to_string())),
+    }
 }
 
 async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
@@ -8518,6 +8600,7 @@ pub(crate) enum Action {
     SetView(WatchView),
     /// Change presentation without changing topology granularity.
     SetLayout(WatchLayout),
+    SetScreen(WatchScreen),
     /// Resolve the selected row as a same-window collaboration peer and open
     /// the durable request composer.
     OpenCollaborationMessage,
@@ -8651,6 +8734,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "show swarm clusters",
     },
     CommandSpec {
+        command: "screen topology",
+        description: "show sessions, windows and panes",
+    },
+    CommandSpec {
+        command: "screen collab",
+        description: "show collaboration across every room",
+    },
+    CommandSpec {
         command: "kill",
         description: "close selected session/window/pane (confirm)",
     },
@@ -8726,6 +8817,8 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "view session" | "view sessions" => Action::SetView(WatchView::Session),
         "view window" | "view windows" => Action::SetView(WatchView::Window),
         "view pane" | "view panes" => Action::SetView(WatchView::Pane),
+        "screen topology" | "topology" => Action::SetScreen(WatchScreen::Topology),
+        "screen collab" | "collab" => Action::SetScreen(WatchScreen::Collab),
         "layout tree" => Action::SetLayout(WatchLayout::Tree),
         "layout swarm" => Action::SetLayout(WatchLayout::Swarm),
         "" => {
@@ -8920,9 +9013,23 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 app.toggle_event_inbox();
                 Action::None
             }
+            // Digits, not letters: plain typing is the filter here, so the
+            // screen axis has to live on a modifier, and every letter worth
+            // having is already spoken for.
+            KeyCode::Char('1') => Action::SetScreen(WatchScreen::Topology),
+            KeyCode::Char('2') => Action::SetScreen(WatchScreen::Collab),
             KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
             _ => Action::None,
         };
+    }
+
+    // The collab screen lists requests rather than nodes, so movement has
+    // nothing to move through in the tree. Everything it does not claim —
+    // filter typing, `:`, `/`, `r`, `?`, `q` — falls through unchanged.
+    if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
+        if let Some(action) = handle_collab_screen_key(code, modifiers, app) {
+            return action;
+        }
     }
 
     if app.pending_g && !matches!(code, KeyCode::Char('g') | KeyCode::Esc) {
@@ -9371,6 +9478,87 @@ fn finish_rename(
         // retype it. Nothing changed, so nothing needs refreshing.
         Err(e) => app.set_hint(format!("rename failed: {e}"), HintLevel::Err),
     }
+}
+
+/// Keys the collaboration screen claims. `None` lets the key fall through to
+/// the ordinary table handling.
+///
+/// Letters are only claimed while no filter is being typed, exactly as the
+/// tree does it — otherwise `j` in a search would jump the cursor instead of
+/// narrowing the list.
+fn handle_collab_screen_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    app: &mut App,
+) -> Option<Action> {
+    let filter = app.search_query.clone();
+    let page = isize::try_from(app.table_page_rows.max(1)).unwrap_or(isize::MAX);
+    let browsing = app.browse_keys_active();
+    match code {
+        KeyCode::Down => app.collab.move_selection(1, &filter),
+        KeyCode::Up => app.collab.move_selection(-1, &filter),
+        KeyCode::Char('j') if browsing => app.collab.move_selection(1, &filter),
+        KeyCode::Char('k') if browsing => app.collab.move_selection(-1, &filter),
+        KeyCode::PageDown => app.collab.move_selection(page, &filter),
+        KeyCode::PageUp => app.collab.move_selection(-page, &filter),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.collab.move_selection(page / 2, &filter);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.collab.move_selection(-(page / 2), &filter);
+        }
+        KeyCode::Home => app.collab.select_first(),
+        KeyCode::End => app.collab.select_last(&filter),
+        KeyCode::Char('G') if browsing => app.collab.select_last(&filter),
+        KeyCode::Char('g') if browsing => {
+            if app.pending_g {
+                app.pending_g = false;
+                app.collab.select_first();
+            } else {
+                app.pending_g = true;
+            }
+        }
+        // Enter goes where the request went. The peer's pane is the useful
+        // end: the console dispatches from nowhere in particular, and a
+        // request whose peer is the console is a reply the operator already
+        // has on screen.
+        KeyCode::Enter => return Some(collab_attach_action(app, &filter)),
+        _ => return None,
+    }
+    Some(Action::None)
+}
+
+/// Resolve `Enter` on the collaboration screen to a pane to attach to.
+fn collab_attach_action(app: &mut App, filter: &str) -> Action {
+    // Enter goes where the request went, so the peer's pane is the useful
+    // end. Clone what is needed before hinting: the lookup borrows `app`.
+    let peer = app.collab.selected_request(filter).map(|request| {
+        let peer = if request.to.console {
+            &request.from
+        } else {
+            &request.to
+        };
+        (
+            peer.pane.clone(),
+            peer.socket.clone(),
+            peer.label(),
+            peer.console,
+        )
+    });
+    let Some((pane, socket, label, console)) = peer else {
+        return Action::None;
+    };
+    if console {
+        app.set_hint("that request never left the console", HintLevel::Warn);
+        return Action::None;
+    }
+    if let Some(key) = app.pane_key_for(&pane, socket.as_deref()) {
+        return Action::AttachTopologyPane(key);
+    }
+    // Requests outlive their panes, so this is ordinary rather than an error:
+    // say which pane is gone instead of leaving Enter silent.
+    app.set_hint(format!("{label} is no longer on any pane"), HintLevel::Warn);
+    Action::None
 }
 
 fn handle_rename_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
@@ -12177,6 +12365,93 @@ fn help_popup_rect(r: Rect) -> Rect {
 ///
 /// Looks up the row by `pane_id` every frame so background refreshes that
 /// re-sort the table can't bump us onto a different agent's content.
+/// The fleet-wide collaboration listing.
+///
+/// Deliberately its own table rather than the topology one: the columns
+/// identify a request and both of its endpoints, and none of the node columns
+/// (state, duration, prompt) mean anything for a message.
+fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let filter = app.search_query.clone();
+    let entries = app.collab.rows(app.watch_cfg.view, &filter);
+    let visible = app.collab.visible(&filter).len();
+    let selected = app.collab.selected_index();
+    let title = format!(" Collab · fleet ({visible}) ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(title);
+
+    if let Some(reason) = app.collab.unavailable.clone() {
+        f.render_widget(
+            Paragraph::new(reason)
+                .style(theme.dim_style())
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+    if entries.is_empty() {
+        // "Loading" and "the fleet said nothing" look identical on an empty
+        // grid, and one of them is a reason to keep waiting.
+        let hint = if !app.collab.loaded {
+            "loading the fleet's collaboration…"
+        } else if app.collab.is_empty() {
+            "no collaboration requests in any room yet — `m` sends the first one"
+        } else {
+            "no request matches this filter"
+        };
+        f.render_widget(
+            Paragraph::new(hint)
+                .style(theme.dim_style())
+                .block(block)
+                .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
+    let now = OffsetDateTime::now_utc();
+    // The cursor counts requests, not rows: group headers are not selectable,
+    // so the nth request is the nth *selectable* line.
+    let mut request_index = 0usize;
+    let mut selected_row = None;
+    let rows: Vec<Row> = entries
+        .iter()
+        .enumerate()
+        .map(|(row_index, entry)| {
+            let is_selected = match entry {
+                CollabRow::Group(_) => false,
+                CollabRow::Request(_) => {
+                    let hit = request_index == selected;
+                    if hit {
+                        selected_row = Some(row_index);
+                    }
+                    request_index += 1;
+                    hit
+                }
+            };
+            collab_screen::row(entry, now, theme, is_selected)
+        })
+        .collect();
+    let header = Row::new(
+        collab_screen::HEADERS
+            .iter()
+            .map(|header| Cell::from(*header).style(theme.table_header_style())),
+    )
+    .height(1);
+    let table = Table::new(rows, collab_screen::COLUMNS)
+        .header(header)
+        .block(block)
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
+    let mut state = TableState::default();
+    state.select(selected_row);
+    f.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_preview(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let preview = app
@@ -12614,6 +12889,10 @@ fn render_header(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
 /// separate [`WatchView`] concern.
 fn render_body(f: &mut Frame, area: Rect, app: &mut App, tree_targets: Option<&[TreeTarget]>) {
     let split_inspector = app.inspector_enabled
+        // The inspector describes the selected *pane*, and the collab screen's
+        // cursor is on a request. Halving the table to show an unrelated pane
+        // costs the two columns that identify both ends of a message.
+        && !matches!(app.watch_cfg.screen, WatchScreen::Collab)
         && area.width >= 120
         && if app.uses_tree() {
             selected_tree_target_from(app, tree_targets.unwrap_or_default()).is_some()
@@ -12671,6 +12950,10 @@ fn render_primary_body(
     tree_targets: Option<&[TreeTarget]>,
 ) {
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
+    if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
+        render_collab_screen(f, area, app);
+        return;
+    }
     if app.legacy_flat_table {
         render_table(f, area, app);
     } else if app.watch_cfg.layout == WatchLayout::Swarm {
@@ -22696,6 +22979,11 @@ sort = ["state"]
             Action::SetLayout(layout) => {
                 app.apply_layout(layout);
             }
+            // The run loop also reloads the fleet listing here; the harness
+            // stops at the state change so no test needs a daemon.
+            Action::SetScreen(screen) => {
+                app.apply_screen(screen);
+            }
             // Quick-action paths aren't exercised through `press` —
             // tests that need them call `handle_event` directly so
             // they can inspect the `Action` variant. Anything we
@@ -23510,6 +23798,162 @@ sort = ["state"]
             vec![fake_pane("%42", "main", 2, 0, "claude")],
         );
         app
+    }
+
+    fn collab_participant(pane: &str, session: &str, window: &str) -> Participant {
+        Participant {
+            agent_kind: AgentKind::ClaudeCode,
+            agent_session_id: format!("agent-{pane}"),
+            pane: pane.into(),
+            socket: Some("default".into()),
+            room: muxa::collaboration::RoomId {
+                host: "tmux".into(),
+                socket: Some("default".into()),
+                window_id: "@4".into(),
+            },
+            tmux_session_id: Some("$1".into()),
+            tmux_session_name: Some(session.into()),
+            window_name: Some(window.into()),
+            state: AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    fn collab_request(to_pane: &str) -> CollaborationRequest {
+        CollaborationRequest {
+            id: "req_1".into(),
+            from: collab_participant("%1", "callabo", "CAL-7330"),
+            to: collab_participant(to_pane, "callabo", "CAL-7330"),
+            provenance: None,
+            kind: RequestKind::Review,
+            body: "check the upload chunking".into(),
+            expects_reply: true,
+            work_mode: WorkMode::ReadOnly,
+            paths: Vec::new(),
+            air_artifacts: Vec::new(),
+            status: RequestStatus::Queued,
+            created_at: OffsetDateTime::now_utc(),
+            claimed_at: None,
+            wake_delivery: None,
+            notified_at: None,
+            reply_notified_at: None,
+            reply_read_at: None,
+            reply: None,
+        }
+    }
+
+    /// A watch sitting on the collab screen, with one request whose peer pane
+    /// is `to_pane` and a topology that really holds `%2`.
+    fn collab_app(to_pane: &str) -> App {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            vec![fake_topology_pane(
+                "default", "$1", "callabo", "@4", "CAL-7330", 4, "%2", 0,
+            )],
+        );
+        app.collab.set_requests(vec![collab_request(to_pane)]);
+        app.apply_screen(WatchScreen::Collab);
+        app
+    }
+
+    #[test]
+    fn alt_digits_pick_the_screen() {
+        // Plain letters are the filter, so the axis lives on a modifier.
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        assert!(matches!(
+            alt_key_action(&mut app, '2'),
+            Action::SetScreen(WatchScreen::Collab)
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, '1'),
+            Action::SetScreen(WatchScreen::Topology)
+        ));
+    }
+
+    #[test]
+    fn the_palette_reaches_both_screens() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        assert!(matches!(
+            execute_palette_command(&mut app, "screen collab"),
+            Action::SetScreen(WatchScreen::Collab)
+        ));
+        assert!(matches!(
+            execute_palette_command(&mut app, "topology"),
+            Action::SetScreen(WatchScreen::Topology)
+        ));
+    }
+
+    #[test]
+    fn enter_on_a_collab_row_goes_to_the_peer_pane() {
+        // The peer is the end that has the work; the sender is often the
+        // console, which is nowhere to attach to.
+        let mut app = collab_app("%2");
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        match action {
+            Action::AttachTopologyPane(key) => {
+                assert_eq!(key.pane_id, "%2");
+                assert_eq!(key.window.session.endpoint.socket, "default");
+            }
+            other => panic!("expected an attach to the peer pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_says_which_pane_is_gone_instead_of_doing_nothing() {
+        // Requests outlive their panes. Silence here reads as a broken key.
+        let mut app = collab_app("%99");
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        let hint = app.footer_hint.as_ref().expect("a hint explains the no-op");
+        assert!(
+            hint.message.contains("%99") && hint.message.contains("no longer"),
+            "unexpected hint: {}",
+            hint.message
+        );
+    }
+
+    #[test]
+    fn the_collab_screen_still_leaves_typing_to_the_filter() {
+        // `j` is a movement key only while nothing is being searched for —
+        // the same rule the tree follows.
+        let mut app = collab_app("%2");
+        app.arm_explicit_search();
+        let _ = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert_eq!(app.search_query, "j", "the keystroke went to the filter");
+        assert_eq!(app.collab.selected_index(), 0);
+    }
+
+    #[test]
+    fn the_collab_screen_paints_where_each_request_happened() {
+        let mut app = collab_app("%2");
+        let backend = ratatui::backend::TestBackend::new(160, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // Both ends, the room each sits in, and the message itself: without
+        // the location a fleet-wide list cannot say where the work happened.
+        assert!(painted.contains("callabo:CAL-7330"), "{painted}");
+        assert!(painted.contains("Collab"), "{painted}");
+        assert!(painted.contains("check the upload chunking"), "{painted}");
     }
 
     fn rename_app(level: RenameLevel, original: &str) -> App {

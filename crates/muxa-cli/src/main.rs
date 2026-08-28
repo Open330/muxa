@@ -3,6 +3,7 @@
 mod activity_query;
 mod agent_launch;
 mod attend;
+mod collab_screen;
 mod daemon;
 mod dashboard_tui;
 mod doctor;
@@ -203,6 +204,10 @@ enum Cmd {
         /// Presentation of the same topology: nested tree (default) or swarm.
         #[arg(long, value_enum)]
         layout: Option<WatchLayoutArg>,
+        /// Which list to open on: the topology (default), or collaboration
+        /// across every room the daemon holds.
+        #[arg(long, value_enum)]
+        screen: Option<WatchScreenArg>,
         /// One-shot sibling sort: name, latest/activity/act, duration/dur, st/state, pane, or pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
@@ -541,6 +546,21 @@ pub(crate) enum WatchLayoutArg {
     Swarm,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum WatchScreenArg {
+    Topology,
+    Collab,
+}
+
+impl From<WatchScreenArg> for muxa::config::WatchScreen {
+    fn from(value: WatchScreenArg) -> Self {
+        match value {
+            WatchScreenArg::Topology => Self::Topology,
+            WatchScreenArg::Collab => Self::Collab,
+        }
+    }
+}
+
 impl From<WatchLayoutArg> for muxa::config::WatchLayout {
     fn from(value: WatchLayoutArg) -> Self {
         match value {
@@ -699,6 +719,7 @@ async fn main() -> Result<()> {
             include_paneless,
             view,
             layout,
+            screen,
             sort,
             theme,
             caller_client,
@@ -719,6 +740,7 @@ async fn main() -> Result<()> {
                         include_paneless,
                         view,
                         layout,
+                        screen,
                         sort,
                         theme,
                         caller_pane: caller_pane.filter(|p| p.starts_with('%')),
@@ -734,6 +756,7 @@ async fn main() -> Result<()> {
                     include_paneless,
                     view,
                     layout,
+                    screen,
                     sort,
                     theme,
                     // Same unexpanded-format guard as the client: a literal
@@ -1595,6 +1618,7 @@ pub(crate) struct WatchInvocation {
     pub(crate) include_paneless: bool,
     pub(crate) view: Option<WatchViewArg>,
     pub(crate) layout: Option<WatchLayoutArg>,
+    pub(crate) screen: Option<WatchScreenArg>,
     pub(crate) sort: Option<WatchSortArg>,
     pub(crate) theme: Option<ThemeArg>,
     pub(crate) caller_pane: Option<String>,
@@ -1645,6 +1669,7 @@ pub(crate) async fn cmd_watch(
         include_paneless,
         view,
         layout,
+        screen,
         sort,
         theme,
         caller_pane,
@@ -1662,6 +1687,9 @@ pub(crate) async fn cmd_watch(
     };
     if let Some(view) = view {
         watch_cfg.view = view.into();
+    }
+    if let Some(screen) = screen {
+        watch_cfg.screen = screen.into();
     }
     if let Some(layout) = layout {
         watch_cfg.layout = layout.into();

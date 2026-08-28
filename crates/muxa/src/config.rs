@@ -1509,6 +1509,9 @@ pub struct WatchConfig {
     /// Presentation of the same canonical topology. Defaults to `tree`.
     #[serde(default)]
     pub layout: WatchLayout,
+    /// Which list `muxa watch` opens on. Defaults to `topology`.
+    #[serde(default)]
+    pub screen: WatchScreen,
     /// How tree children are revealed. `focus` keeps only the selected path
     /// open, `always` expands every node through the configured `view`, and
     /// `manual` changes expansion only through the tree navigation keys.
@@ -1613,6 +1616,23 @@ pub enum WatchLayout {
     /// Dense animated collaboration-room clusters. Node identities and the
     /// requested topology depth remain unchanged.
     Swarm,
+}
+
+/// What `muxa watch` is a list *of*.
+///
+/// Orthogonal to [`WatchView`] (how coarsely to group) and [`WatchLayout`]
+/// (how to draw it): those two are presentations of the same canonical node
+/// set, while a screen chooses the data plane. Collaboration rows are
+/// requests, not topology nodes, which is why it is a screen rather than a
+/// fourth layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchScreen {
+    /// Sessions, windows and panes — everything `layout` and `view` describe.
+    #[default]
+    Topology,
+    /// Collaboration requests across every room the daemon holds.
+    Collab,
 }
 
 /// Expansion policy for the selectable watch topology tree.
@@ -1751,6 +1771,7 @@ impl Default for WatchConfig {
             widths,
             view: WatchView::Window,
             layout: WatchLayout::Tree,
+            screen: WatchScreen::Topology,
             tree_expansion: WatchTreeExpansion::Focus,
             summary: WatchSummary::default(),
             detail: DetailConfig::default(),
