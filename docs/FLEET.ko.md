@@ -193,7 +193,7 @@ multi-node Fleet TUI 동작:
   표시하며, durable 원본은 계속 해당 node가 소유합니다.
 - Enter는 `local`이면 직접 이동하고 remote이면 SSH attach하며, `?`는 help입니다.
   `muxa init`은 `prefix+s`를 local watch, `prefix+S`를 Fleet watch에 연결합니다.
-- `--view`, `--layout tree|swarm`, `--sort`, `--theme`은 native watch와 같은 값을
+- `--view`, `--layout tree|swarm|work`, `--sort`, `--theme`은 native watch와 같은 값을
   사용합니다. `focus` 확장은 선택한 view 깊이를 지키고, `manual`은 구조 키로만
   바뀌며, 전역 `J`/`K` 이동은 대상의 ancestor만 엽니다.
 - 기본 설정이 숨기는 pane 없는 agent는 `--include-paneless`로 표시할 수 있습니다.

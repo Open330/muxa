@@ -128,11 +128,25 @@ inbox를 열면 확인 처리됩니다.
 탐색 중 `:`를 누르면 명령 팔레트가 열립니다. 명령을 입력하고 `Enter`로 실행하며,
 `Tab`은 첫 번째 일치 항목을 완성하고 `Esc`는 취소합니다. `refresh`, `preview`,
 `copy`, `attention`, `events`, `inspector`, `sort latest|duration|session|state`,
-`view pane|session|swarm`, `screen topology|collab`, `help`, `quit`를
-지원합니다. `kill`과 `abort`는 기존과
+`view pane|session|swarm`, `layout tree|swarm|work`, `screen topology|collab`,
+`help`, `quit`를 지원합니다. `kill`과 `abort`는 기존과
 동일하게 확인 popup을 거칩니다. `view` 변경은 cached snapshot에 즉시 반영되며
 현재 watch process의 이후 refresh에도 유지됩니다.
 
+
+## work 레이아웃
+
+`W`를 누르면 트리 대신 Work를 한 줄씩 보여주는 평면 테이블로 바뀝니다.
+`muxa work list`와 컬럼이 그대로 일치하고(WORK, WORKSPACE, GEN, ALIASES, DONE,
+CWD), CLI 테이블이 보여줄 수 없는 실시간 state 게이지가 앞에 붙습니다. `W`를 다시
+누르면 직전 레이아웃으로 돌아가므로 쓰던 swarm이 조용히 버려지지 않습니다.
+팔레트의 `layout work`, `--layout work`, `[watch] layout = "work"`로도 갑니다.
+
+행은 실제로 window 노드입니다. 그래서 attach·preview·composer·kill이 트리에서와
+똑같이 Work를 대상으로 동작하고, 레이아웃을 바꿔도 커서가 그대로 이어집니다.
+접히는 것은 session과 pane 층뿐입니다 — workspace는 여기서 컬럼이고, Work의
+pane들은 alias 상태로 요약되기 때문입니다. 이동은 트리의 형제 그룹이 아니라 목록
+전체를 훑습니다. 평면 테이블에는 이동할 조상 구조가 없기 때문입니다.
 
 ## 화면(Screen)
 
