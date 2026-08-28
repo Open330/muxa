@@ -35,7 +35,13 @@ CONFIG_SRC=
 MUXAD_BIN=
 MUXA_BIN=
 TMUX_BIN=
-TMUX_CONFIG=
+# `/dev/null` unless the caller supplies one. A sandbox that reads the caller's
+# `~/.tmux.conf` is not a sandbox: their bindings, their options, and — the one
+# that actually bit — their hooks all run inside it. A `client-attached` hook
+# that hands an arriving client its own session-group view (muxa's own
+# `tmux-auto-view`, on by default since v0.8.36) fires the moment the learner
+# attaches and moves them straight back out again.
+TMUX_CONFIG=/dev/null
 ALLOW_INSIDE_TMUX=0
 EXTRA_PATHS=()
 
@@ -146,11 +152,7 @@ resolve_bins() {
 # `-f` affects server creation; the explicit socket keeps every later command
 # on that same server even if TMUX_TMPDIR changes.
 tm() {
-  if [ -n "$TMUX_CONFIG" ]; then
-    "$TMUX_BIN" -u -f "$TMUX_CONFIG" -S "$SB_TMUX_SOCKET" "$@"
-  else
-    "$TMUX_BIN" -u -S "$SB_TMUX_SOCKET" "$@"
-  fi
+  "$TMUX_BIN" -u -f "$TMUX_CONFIG" -S "$SB_TMUX_SOCKET" "$@"
 }
 
 # --------------------------------------------------------------------------
@@ -408,8 +410,9 @@ cmd_up() {
   cat > "$SB_SHIM/tmux" <<EOF
 #!/bin/sh
 # Sandbox shim: every tmux call, including ones muxa's children make, lands on
-# the sandbox server rather than the caller's.
-exec "$TMUX_BIN" -u -S "$SB_TMUX_SOCKET" "\$@"
+# the sandbox server rather than the caller's, and none of them can revive the
+# caller's config on a server this one started.
+exec "$TMUX_BIN" -u -f "$TMUX_CONFIG" -S "$SB_TMUX_SOCKET" "\$@"
 EOF
   chmod +x "$SB_SHIM/tmux"
 

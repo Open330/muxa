@@ -14,140 +14,67 @@ session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존�
 
 ## 온보딩 실행
 
-아직 Muxa를 설치하지 않았다면 shell preview를 바로 실행할 수 있습니다. 가져온
-script 자체가 전체 preview이므로 Muxa binary를 내려받지 않으며 Rust, Git, tmux,
-muxad가 필요하지 않습니다. config나 실제 tmux session도 변경하지 않습니다.
-
-    curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
-
-shell tour도 alternate screen 안에서 가상 shell과 tmux session/window/pane layout,
-status line, Muxa watch의 attention과 협업 흐름을 전체 20단계로 재현합니다. 이미
-설치했다면 다음 명령으로 같은 실습의 native Ratatui 버전을 실행합니다.
-
-하나의 전체 화면 시나리오가 가상 기본 shell에서 시작해 tmux session/window/
-pane 조작을 가르친 뒤, 화면을 닫지 않고 실제 `muxa watch`와 닮은 화면으로
-이어집니다. 모든 장면은 설명용이므로 실제 tmux session을 변경하지
-않습니다.
-
-mock은 실제 work view처럼 `WORKSPACE › WORK · DUR · ACT · SUMMARY` 열을 사용하고,
-상태를 별도 오른쪽 열에 두지 않습니다. 각 session 이름 왼쪽의 고정 gutter에
-상태를 모아 표시합니다. 기본 Unicode 설정에서는 `●` working, `▶`
-waiting-input, `◆` choice, `○` idle, `■` error이며 `[ui] icons = "ascii"`
-환경에서는 대응하는 ASCII marker가 사용됩니다. 120열 이상에서는 실제
-watch처럼 Works와 Inspector를 50/50으로 나눕니다.
+`muxa onboard`의 기본 동작은 실제 tmux와 Muxa를 사용하는 16단계 live tour입니다.
+개인 환경과 격리된 전용 tmux server, `muxad`, config, data directory, mailbox를
+만들고 모든 종료 경로에서 sandbox를 삭제합니다. 기존 tmux 안에서 실행하면 prefix가
+모호해지므로 거부합니다. detach한 terminal이나 tmux 밖 terminal에서 실행하세요.
 
     muxa onboard
 
-shell tour의 마지막 화면에서 `q`를 누르면 원래 terminal로 돌아와 권장 설치 명령과
-직접 다운로드·설치 문서 링크를 표시합니다.
-
-한국어 locale(`LANG`, `LC_MESSAGES`, `LC_ALL`의 `ko*`)에서는 한글 안내가
-자동으로 선택됩니다. 명시적으로 선택하거나 영어로 실행할 수도 있습니다.
+한국어 locale(`LANG`, `LC_MESSAGES`, `LC_ALL`의 `ko*`)에서는 한글 안내를 자동으로
+선택합니다. 명시적으로 선택하거나 영어로 실행할 수도 있습니다. tour 중 `F2`를 누르면
+언어가 바뀝니다.
 
     muxa onboard --lang ko
     muxa onboard --lang en
 
-온보딩 도중에는 어느 단계에서든 `F2`로 한글과 영어를 즉시 전환할 수 있습니다.
-실제 watch를 재현하는 `WORKSPACE › WORK`, `DUR`, `ACT`, `SUMMARY` label은
-그대로 유지하고 안내 dialog, 도움말, footer 설명은 선택한 언어로 표시합니다.
-각 단계에서 직접 입력하거나 눌러야 하는 명령과 키는 굵은 노란색으로 표시되어
-설명 문장과 한눈에 구분됩니다.
-
-![한글 통합 onboarding: 가상 shell과 tmux 조작에서 Muxa watch workflow로 이어지는 단일 시나리오](demo-onboard.gif)
-
-1/20은 환영 인사로 시작해 Muxa가 왜 tmux 기초부터 안내하는지 설명합니다.
-tmux session이 관련 terminal을 하나의 작업 공간으로 유지한다는 의미를 이해한 뒤
-`tmux new-session -s muxa-onboarding`을 입력해 연습용 session으로 들어갑니다.
-tmux 구간과 watch 구간도 설명을 읽고 Enter만 누르는 방식이 아니라 실제 키를
-눌러야 진행됩니다.
-
-- `j`/`↓`: 다음 work로 이동
-- `l`/`→`: 선택한 work의 child agent로 진입
-- `Alt-T`: state/attention 순으로 정렬
-- `o`: pane preview 열기와 닫기
-- `?`/`F1`: 전체 단축키 도움말 열기와 닫기
-- `n`: new work + agent form 열기, `Esc`로 안전하게 닫기
-- `m`: 선택한 peer의 composer 열기, 빈 입력에서 `Backspace`로 닫기
-- `M`: mailbox 열기와 닫기
-- `q`: 온보딩 완료. 실제 watch에서도 종료 키
-
-macOS는 터미널이 Meta를 보내도록 설정하기 전까지 Option을 조합 키로 쓰기 때문에
-`Alt-T`가 `†`로 도착합니다. 온보딩은 이 조합 문자도 `Alt-T`로 인식하며, 두 번
-막히면 터미널 설정 안내와 함께 `→`로 건너뛸 수 있게 알려줍니다. 실제 watch에서
-`Alt` 조합을 쓰려면 `docs/WATCH.md`의 터미널 설정을 적용하세요.
-
-## 설치 없이 실행하기
-
-`scripts/onboard.sh`는 release 바이너리를 임시 디렉터리로 받아 SHA-256을 검증한
-뒤 진짜 `muxa onboard`를 실행하고, 끝나면 지웁니다. 설치가 아니라 다운로드라서
-daemon도 config도 PATH 항목도 남지 않습니다.
-
-네트워크가 없거나, 지원하지 않는 플랫폼이거나, `--no-download`를 주면 스크립트에
-내장된 shell simulation으로 넘어갑니다. 이 fallback은 실제 tour와 같은 20단계를
-같은 키로 진행하며, `muxa onboard --emit step-table`이 그 계약입니다.
-`scripts/onboarding-parity.py`가 CI에서 fallback을 이 계약에 맞춰 검증합니다.
-
-fallback은 단계와 키만 맞추고, 실제 tour의 mock watch 시뮬레이션(선택 이동에 따른
-tree 확장, 단계별 callout 배치, `F2` 언어 전환, 뒤로 가기)까지 재현하지는
-않습니다.
-
-shell 명령은 실제 tmux 진입과 재접속에 필요한 `tmux new-session`과
-`tmux attach` 두 개만 직접 입력합니다. Muxa의 긴 work/agent 명령은 따라 치지
-않으며, `n`으로 form을 열고 위치와 조작 키를 확인한 다음 `Esc`를 누르면 바로
-협업 단계로 넘어갑니다.
-`Esc`는 실제 watch와 마찬가지로 열려 있는 preview/help/form/composer를 먼저
-닫고, modal이 없을 때 tour를 종료합니다.
-
-모든 화면 설명은 보되 단축키 gate를 건너뛰려면 다음을 사용합니다.
+tour는 keypress를 가로채지 않습니다. 각 단계가 요구한 실제 tmux 또는 Muxa state를
+polling하고, 그 상태가 확인되면 다음 단계로 넘어갑니다. 한 단계에서 45초 이상
+막히면 `F12` skip을 표시합니다. `--no-quiz`는 step을 없애는 대신 처음부터 `F12`를
+표시하며, skip이 필요한 sandbox state도 일관되게 만들어 줍니다.
 
     muxa onboard --no-quiz
 
-터미널 상호작용 없이 전체 가이드를 출력할 수도 있습니다.
+## 16단계 live workflow
+
+`muxa onboard --print --lang ko`가 같은 목록을 출력합니다. 그 출력은 tour의
+단계 정의에서 직접 생성되므로, 아래 요약과 달라지면 아래가 낡은 것입니다.
+
+1. `tmux new-session -s muxa-onboarding` — session은 당신 없이도 도는 작업 공간.
+2. `Ctrl-b`, `c` — window 하나가 Work 하나.
+3. `Ctrl-b`, `s`로 tree를 보고 `q`로 닫습니다.
+4. `Ctrl-b`, `d`로 detach. client만 나가고 작업은 계속됩니다.
+5. `tmux ls`로 session이 남아 있음을 직접 확인합니다.
+6. `tmux attach -t muxa-onboarding`으로 다시 들어갑니다.
+7. `Ctrl-b`, `%`로 window를 나눕니다 (`"`는 상하). pane 하나가 agent 하나.
+8. `Enter` — tour가 연습용 agent 둘을 띄웁니다. 실제 CLI는 실행되지 않습니다.
+9. `muxa watch` — 진입점. session·window·agent를 살아있는 채로 봅니다.
+10. watch 안에서 `j`/`k` 이동, `h`/`l` 접기, `Enter`로 pane 진입, `?`로 키 목록.
+    둘러본 뒤 `q`로 나옵니다.
+11. `muxa attend` — 가장 오래 막힌 agent로 이동합니다.
+12. `Ctrl-b`, `;`로 직전 pane으로 복귀 (`Ctrl-b o`는 순환).
+13. `muxa msg send @claude "어디까지 됐나요?"` — attach 없이 질문합니다.
+14. `muxa msg list` — 보낸 것과 돌아온 답을 확인합니다.
+15. `muxa msg inbox` — codex가 보낸 요청을 가져옵니다.
+16. `Ctrl-b`, `d`로 마칩니다. tour가 전용 server와 sandbox를 삭제합니다.
+
+핵심 mapping은 `session = workspace`, `window = Work`, `pane = agent`입니다.
+터미널 상호작용 없이 같은 순서의 written guide만 출력할 수도 있습니다.
 
     muxa onboard --print --lang ko
 
-## 통합 시나리오의 tmux 구간
+## 설치 없이 실행하기
 
-Muxa workflow로 들어가기 전에 같은 과정 안에서 tmux의 session/window/pane
-구조와 기본 조작을 익힙니다. 이 구간도 실제 layout과 lifecycle을 건드리지 않는
-fullscreen mock입니다.
-현재 설정된 prefix(`Ctrl-b`, `Ctrl-a` 등)를 감지하고 가상 session에 들어간 뒤
-prefix만 직접 누르게 합니다. tmux 안에서는 현재 client가 prefix key table로 들어간 것을
-확인하자마자 root table로 되돌립니다. 화면이 넘어가기 전에 suffix를 연속해서
-누르지 말고 ✓ 확인을 기다리면 live binding은 실행되지 않습니다. 이후 단계는
-가상 prefix와 실제 suffix key로 진행하므로 live window 생성, pane 분할,
-client detach가 일어나지 않습니다.
+`scripts/onboard.sh`는 지원되는 release archive를 임시 디렉터리로 받아 SHA-256을
+검증한 뒤 진짜 `muxa onboard`를 실행하고, 끝나면 지웁니다. 설치가 아니라 일시적인
+download이므로 daemon, config, PATH 항목이 남지 않습니다.
 
-환영 dialog에서 연습용 session을 만드는 이유와 이 실습이 실제 tmux 설정을 바꾸지
-않는다는 점을 먼저 확인합니다. 이어 가상 기본 shell의 빈 prompt에서
-`tmux new-session -s muxa-onboarding`을 입력해 가상 tmux client로 들어갑니다.
-실제 키를 다음 순서로 눌러 진행합니다.
+    curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 
-- `w`: session/window tree와 session → window → pane 계층
-- `c`: 현재 session 안에 새 window를 만들고 그 window의 shell 화면으로 전환
-- `%`, `"`: pane 좌우·상하 분할
-- `→`: pane focus 이동
-- `z`, `z`: pane 확대 후 원래 split layout 복원
-- `[`, `q`: copy mode 진입과 종료
-- `d`: client를 detach하고 `[detached …]`가 있는 원래 기본 shell로 복귀
-- `tmux attach -t muxa-onboarding`, `Enter`: 기본 shell에서 직접 입력해 재연결
-- `s`, `q`, `s`: watch 열기, pane 상태 overlay 확인, watch 실습으로 이어가기
-
-`q`로 여는 pane 상태 overlay는 앞에서 `%`와 `"`로 만든 좌우 분할 후 왼쪽 상하
-분할 layout을 그대로 사용합니다. 따라서 숫자와 agent 상태가 실제 pane 위치와
-일치합니다.
-
-`w`의 tree, `c`의 활성 window, `%`와 `"`의 pane layout은 다음 단계에서도
-사라지지 않고 누적됩니다. `s` 화면은 기본 onboarding과 같은 live watch형
-header, 왼쪽 state gutter, work tree, 50/50 inspector, footer를 사용합니다.
-별도의 tmux 완료 화면이나 Muxa 시작 화면은 없습니다. managed binding을 익히는
-11단계 다음 번호에서 같은 watch 화면의 work 이동 실습이 바로 계속되며,
-처음부터 마지막까지 하나의 단계 수와 진행률을 사용합니다.
-
-여기서도 `F2`로 한글/영문을 전환하고, `Esc`로 종료하며, `--no-quiz`로 키
-gate를 건너뛸 수 있습니다. 정적 안내만 필요하면 다음을 사용합니다.
-
-    muxa onboard --print --lang ko
+launcher에는 network, 지원되는 release 플랫폼, checksum 도구, `tar`, tmux가
+필요합니다. release를 내려받아 검증할 수 없으면 다른 tour로 넘어가지 않고 명확한
+오류로 끝납니다. tmux를 사용할 수 없으면 설치된 binary의 `muxa onboard --print`를
+사용하세요.
 
 설치 직후에는 다음 순서가 권장됩니다.
 
@@ -219,7 +146,7 @@ row는 tmux window를, 펼친 child row는 agent pane을 나타냅니다.
 - Alt-S/L/D/T: workspace, latest, duration, state 정렬
 - ? 또는 F1: 전체 단축키 도움말
 
-onboarding의 한글 도움말은 watch의 실제 키 구성을 같은 순서로 설명합니다.
+onboarding의 watch 단계도 이 실제 TUI를 그대로 실행합니다.
 
 ## Agent가 Muxa MCP를 사용하는 패턴
 

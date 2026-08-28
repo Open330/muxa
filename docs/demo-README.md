@@ -10,23 +10,20 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | ------------------------- | ---------------------------------------------------------------------------------------- |
 | `docs/demo.tape`          | [VHS](https://github.com/charmbracelet/vhs) script for the hero GIF.                      |
 | `docs/demo-collab.tape`   | VHS script for the collaboration GIF.                                                     |
-| `docs/demo-onboard.tape`  | Unified shell → tmux → Muxa fullscreen walkthrough; no fixture or daemon needed.           |
 | `scripts/muxa-sandbox.sh` | The isolation itself: private socket, config, data dir, tmux server, and the `tmux` PATH shim. `up` / `daemon` / `env` / `status` / `down`. |
 | `scripts/sandbox-smoke.sh`| Lifecycle test for the sandbox — proves `down` returns the machine to clean from every state, including the ones a crash leaves. |
-| `scripts/live-tour-smoke.py`| Types a learner's commands at `muxa onboard --tour live` and checks each of the nine steps advances. |
+| `scripts/live-tour-smoke.py`| Types a learner's commands at `muxa onboard --tour live` and checks each of the sixteen steps advances. |
 | `docs/demo-setup.sh`      | The fixture layered on the sandbox: the seeded fleet, the mailbox, the ask history, and the painted panes. |
 | `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
 | `docs/demo-teardown.sh`   | Removes all of it — delegates to the sandbox, then clears the fixture-only files. Safe at any time, including after a half-finished render. |
 | `docs/demo-optimize.sh`   | Rebuilds a rendered GIF on a 64-colour palette. Run it after `vhs`, before committing.     |
 | `docs/demo.gif`           | Hero output. 1320 × 620, ~1.7 MB after optimizing.                                          |
 | `docs/demo-collab.gif`    | Collaboration output. 1320 × 720, ~1.7 MB after optimizing.                                 |
-| `docs/demo-onboard.gif`   | Korean unified onboarding output. 1320 × 720, ~1.5 MB after optimizing.                    |
 
 ## What the recordings cover
 
 The two fleet recordings are split because one GIF covering everything ran
-45 seconds, which nobody watches to the end of. Onboarding is separate because
-it is a self-contained lesson and deliberately needs no live fixture.
+45 seconds, which nobody watches to the end of.
 
 **`demo.tape` — triage.** Twenty workspace/work rows on one screen with the state
 sort floating the ones that need you; `|` cycling the list/inspector
@@ -37,16 +34,6 @@ the tmux client to the agent blocked longest.
 **`demo-collab.tape` — talking to the fleet.** `M` for the durable
 request/reply mailbox; `m` addressing whatever row the cursor is on; `a`
 asking claude a headless question and `A` browsing the answers.
-
-**`demo-onboard.tape` — learning tmux and Muxa as one model.** The welcome first
-explains why the practice session is needed. The safe shell simulation then accepts
-real `tmux new-session` and `tmux attach` input, preserves the visible
-window, pane, detach, and reattach transitions, demonstrates the managed `s`
-watch and `q` pane-state overlay as step 11, then continues directly at step 12 through
-watch's workspace/work state gutter, inspector, overlays, collaboration, and footer.
-One 20-step counter covers the scenario; there is no second welcome or phase
-completion screen. It does not use `demo-setup.sh` because onboarding must not
-touch real sessions.
 
 ## The fixture
 
@@ -86,8 +73,7 @@ cd /path/to/muxa
 cargo build --workspace  # fleet tapes use target/debug/muxa and target/debug/muxad
 vhs docs/demo.tape
 vhs docs/demo-collab.tape
-vhs docs/demo-onboard.tape
-docs/demo-optimize.sh docs/demo.gif docs/demo-collab.gif docs/demo-onboard.gif
+docs/demo-optimize.sh docs/demo.gif docs/demo-collab.gif
 ```
 
 The optimize pass is not optional housekeeping — VHS emits a 256-colour
@@ -100,8 +86,7 @@ VHS spins up `ttyd`, points headless Chrome at it, records the rendered
 terminal, and encodes the GIF. The fleet tapes run `demo-setup.sh` in their
 prelude and `demo-teardown.sh` in their postlude, so no state is left behind —
 and setup tears down before it builds, so an interrupted render does not poison
-the next one. The unified onboarding tape runs inert mocks directly and does not need
-teardown.
+the next one.
 
 You need [JetBrains Mono Nerd Font](https://github.com/ryanoasis/nerd-fonts)
 installed. Without it the terminal falls back to a font with different

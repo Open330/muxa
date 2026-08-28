@@ -16,29 +16,22 @@ This page keeps the detailed install and wiring notes out of the README.
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
 ```
 
-This path needs none of the requirements above, and installs nothing. The
-script fetches the release binary for your platform into a temporary directory,
-verifies its published SHA-256, runs the real `muxa onboard`, and deletes it on
-exit — no daemon, no config, no PATH entry, no real tmux session.
-
-With no network, on a platform without a release build, without a checksum
-tool, or with `--no-download`, the script falls back to the 20-step simulation
-embedded in it, which draws the same scenario with plain ANSI terminal controls
-and runs in any Unix-like terminal regardless of CPU architecture. The fallback
-walks the same steps in the same order and accepts the same keys — CI holds it
-to `muxa onboard --emit step-table` — but it does not reproduce the real tour's
-mock watch simulation, per-step callout placement, `F2` language switching, or
-backwards navigation. Forward tour flags after `sh -s --`:
+This path installs nothing. The script fetches the release archive for your
+platform into a temporary directory, verifies its published SHA-256, runs the
+real `muxa onboard`, and deletes it on exit — no persistent daemon, config, or
+PATH entry. The live tour uses tmux plus an isolated daemon and mailbox while it
+runs, then removes the entire sandbox. Downloading through the launcher needs
+network access, a supported release platform, a checksum tool, and `tar`; the
+interactive tour also needs tmux. It fails clearly when it cannot download and
+verify the release. Forward tour flags after `sh -s --`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-After installing Muxa, `muxa onboard` provides the native Ratatui version of
-the same practice scenario. Completing the shell tour returns to the original
-terminal and prints the recommended Homebrew command, direct-download link,
-and install-guide link.
+After installing Muxa, run `muxa onboard` directly for the same sixteen-step
+live tour, or `muxa onboard --print` when tmux is unavailable.
 
 ## One-Shot Install
 

@@ -29,7 +29,7 @@ import time
 SANDBOX_PREFIX = "muxa-onboarding"
 SANDBOX = ""
 STEP_MARK = re.compile(r"onboarding · (\d+)/(\d+)")
-TOTAL_STEPS = 15
+TOTAL_STEPS = 16
 
 
 class Terminal:
@@ -341,27 +341,31 @@ def main() -> int:
         report.check("8  splitting a pane", wait_step(terminal, 8), f"step={step()}")
 
         print("act II — muxa")
-        # The learner starts the agent themselves. `claude` resolves to the
-        # sandbox shim, so what comes up is the tour's screen and no real CLI is
-        # ever invoked — the point of the step is that they typed it.
-        which = sandbox_run("/bin/bash", "-c", "command -v claude")
+        # A bare Enter, not a typed command: `claude` is neither tmux nor muxa,
+        # and the sandbox only pretends to have it. The tour brings the agents
+        # up in response.
+        terminal.type(b"\r", 5)
         report.check(
-            "9  `claude` resolves inside the sandbox, not to a real CLI",
-            which.startswith("/tmp/") and "shim" in which,
-            which,
-        )
-        terminal.type(b"claude\r", 4)
-        report.check(
-            "9  starting claude",
+            "9  a bare Enter brings the agents up",
             wait_step(terminal, 9),
             f"step={step()}\n{terminal.text()[-800:]}",
         )
 
         panes = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
         report.check(
-            "9  the pane they started it in is claude, and codex joined",
+            "9  the pane they split became claude, and codex joined",
             len(panes) >= 3,
             str(panes),
+        )
+        # Three anonymous boxes make the mailbox steps unreadable, so each pane
+        # says who it is on its own border.
+        titles = tmux(
+            "list-panes", "-t", "muxa-onboarding:", "-F", "#{pane_title}"
+        ).stdout
+        report.check(
+            "9  every pane says who it is",
+            "@claude" in titles and "@codex" in titles and "you" in titles,
+            titles,
         )
         # The step says the agents arrived and the next one says to look at the
         # whole Work. Zooming the learner's pane hid both and left that claim
@@ -400,45 +404,53 @@ def main() -> int:
         terminal.type(b"muxa watch\r", 4)
         report.check("10  running watch", wait_step(terminal, 10), f"step={step()}")
 
+        # Watch is the entry point the rest of muxa hangs off, so the step it
+        # opens has to name its keys — the tour cannot see them pressed.
+        explains_keys = {"en": "j/k move", "ko": "j/k 이동"}[args.lang]
+        report.check(
+            "10  the step teaches watch's keys", explains_keys in title_text(), title_text()
+        )
+        terminal.type(b"q", 3)
+        report.check("11  leaving watch", wait_step(terminal, 11), f"step={step()}")
+
         explains_attend = {"en": "blocked longest", "ko": "가장 오래 막힌"}[args.lang]
         report.check(
-            "10  the step says what attend does", explains_attend in title_text(), title_text()
+            "11  the step says what attend does", explains_attend in title_text(), title_text()
         )
-        terminal.type(b"q", 2)
         terminal.type(b"muxa attend\r", 4)
-        report.check("11  attend", wait_step(terminal, 11), f"step={step()}")
+        report.check("12  attend", wait_step(terminal, 12), f"step={step()}")
 
         explains_return = {"en": "pane you were in", "ko": "직전에 있던 pane"}[args.lang]
         report.check(
-            "11  the step says what Ctrl-b ; does", explains_return in title_text(), title_text()
+            "12  the step says what Ctrl-b ; does", explains_return in title_text(), title_text()
         )
         terminal.type(b"\x02;", 3)
-        report.check("12  back in your own pane", wait_step(terminal, 12), f"step={step()}")
+        report.check("13  back in your own pane", wait_step(terminal, 13), f"step={step()}")
 
         terminal.type(b'muxa msg send @claude "how far along?"\r', 4)
-        report.check("13  messaging a peer", wait_step(terminal, 13), f"step={step()}")
+        report.check("14  messaging a peer", wait_step(terminal, 14), f"step={step()}")
 
         sent = sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--json")
         report.check(
-            "13  claude replied through muxa on its own", '"completed"' in sent, sent[-300:]
+            "14  claude replied through muxa on its own", '"completed"' in sent, sent[-300:]
         )
         # The step tells them `list` shows what came back. Reading it the way
         # they will — no `--json` — has to actually show the answer.
         answer = {"en": "regression test", "ko": "회귀 테스트"}[args.lang]
         plain = sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent")
-        report.check("13  `msg list` shows the reply body", answer in plain, plain[-300:])
+        report.check("14  `msg list` shows the reply body", answer in plain, plain[-300:])
         receipt = sandbox_muxa(muxa, "msg", "send", "@claude", "ping", "--no-reply")
         report.check(
-            "13  `msg send` answers in one line, not a JSON dump",
+            "14  `msg send` answers in one line, not a JSON dump",
             receipt.count("\n") == 1 and receipt.startswith("sent  "),
             receipt[:200],
         )
 
         terminal.type(b"muxa msg list\r", 4)
-        report.check("14  reading the mailbox", wait_step(terminal, 14), f"step={step()}")
+        report.check("15  reading the mailbox", wait_step(terminal, 15), f"step={step()}")
 
         terminal.type(b"muxa msg inbox\r", 4)
-        report.check("15  claiming the inbox", wait_step(terminal, 15), f"step={step()}")
+        report.check("16  claiming the inbox", wait_step(terminal, 16), f"step={step()}")
 
         terminal.type(b"\x02d", 4)
         for _ in range(12):

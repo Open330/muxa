@@ -42,6 +42,15 @@ const SANDBOX_SCRIPT: &str = include_str!("../../../../scripts/muxa-sandbox.sh")
 const SANDBOX_NAME_PREFIX: &str = "muxa-onboarding";
 const POLL: Duration = Duration::from_millis(250);
 
+/// The block printed when nobody is attached to a status bar.
+const RULE_WIDTH: usize = 64;
+const BAR_WIDTH: usize = 24;
+/// Commands longer than this take their own line in the closing summary.
+const ALIGN_LIMIT: usize = 32;
+/// What the learner's `PS1` renders, so a printed block can end with the same
+/// thing bash would have drawn on the line it replaced.
+const PROMPT: &str = " muxa-onboarding $ ";
+
 /// Long enough that nobody reading the screen feels rushed, short enough that
 /// an abandoned terminal does not hold a sandbox open all afternoon.
 const STEP_TIMEOUT: Duration = Duration::from_secs(900);
@@ -268,16 +277,25 @@ impl Sandbox {
         use std::fmt::Write as _;
 
         let mut body = String::from("unset PROMPT_COMMAND\n");
+        // `printf` rather than letting `history` write straight to the log:
+        // `history 1` prints nothing in a shell that has no history yet, which
+        // is exactly the pane the learner has just split. The Enter step counts
+        // lines, so an Enter pressed there appended none and the step never
+        // saw it. `printf` always writes one line, empty or not, and
+        // `ran_command` still finds the text when there is text.
+        //
+        // The reminder goes through `PROMPT_COMMAND` rather than `PS1`:
+        // `$(cat …)` strips trailing newlines, so a reminder rendered in the
+        // prompt ran straight into `muxa-onboarding $` on the same line.
+        // Inside tmux the status bar already says all this.
         let _ = writeln!(
             body,
-            "export PROMPT_COMMAND='history 1 | sed \"s/^ *[0-9]* *//\" >> {}'",
-            self.history.display()
-        );
-        let _ = writeln!(
-            body,
-            "export PS1='$([ -z \"$TMUX\" ] && cat {} 2>/dev/null)muxa-onboarding $ '",
+            "export PROMPT_COMMAND='printf \"%s\\n\" \"$(history 1 | sed \"s/^ *[0-9]* *//\")\" >> {}; \
+             [ -z \"$TMUX\" ] && cat {} 2>/dev/null'",
+            self.history.display(),
             self.cue.display()
         );
+        let _ = writeln!(body, "export PS1='{PROMPT}'");
         // Every pane, not just the first: a window the learner opens at step 2
         // would otherwise land back in their own home directory.
         let _ = writeln!(body, "export HOME='{}'", self.home.display());
@@ -336,8 +354,17 @@ impl Sandbox {
 
     fn tmux_command(&self, args: &[&str]) -> Result<String> {
         let socket = self.env_value("MUXA_TMUX_SOCKET");
+        // `-f` so no call of the tour's can start a server that reads the
+        // learner's `~/.tmux.conf`. Their hooks running inside the sandbox is
+        // what detached them the moment they attached.
+        let config = self.env_value("MUXA_SANDBOX_TMUX_CONFIG");
+        let config = if config.is_empty() {
+            "/dev/null".to_string()
+        } else {
+            config
+        };
         let out = Command::new(&self.tmux)
-            .args(["-u", "-S", &socket])
+            .args(["-u", "-f", &config, "-S", &socket])
             .args(args)
             .output()
             .context("running tmux against the sandbox")?;
@@ -532,6 +559,15 @@ impl Sandbox {
         // moment they start watch. A window is a Work, and a Work keeps its
         // name.
         self.tmux_command(&["set", "-g", "automatic-rename", "off"])?;
+        // A labelled border over every pane. Without it the mailbox steps ask
+        // the learner to believe that a message left one pane and arrived in
+        // another, while the screen shows three anonymous boxes — the whole
+        // point of the act is which pane did what, so each one says who it is
+        // and the border carries what just happened to it.
+        self.tmux_command(&["set", "-g", "pane-border-status", "top"])?;
+        self.tmux_command(&["set", "-g", "pane-border-format", " #{pane_title} "])?;
+        self.tmux_command(&["set", "-g", "pane-border-style", "fg=#30363d"])?;
+        self.tmux_command(&["set", "-g", "pane-active-border-style", "fg=#1f6feb,bold"])?;
         // Root table, so they need no prefix and cannot be confused with typing.
         self.tmux_command(&["bind-key", "-n", "F12", "set", "-g", SKIP_OPTION, "1"])?;
         self.tmux_command(&["bind-key", "-n", "F2", "set", "-g", LANGUAGE_OPTION, "1"])?;
@@ -539,12 +575,32 @@ impl Sandbox {
     }
 
     /// Reads the flag and clears it, so one keypress is one request.
-    fn consume_flag(&self, option: &str) -> Result<bool> {
-        if self.tmux_command(&["show", "-gvq", option])? != "1" {
-            return Ok(false);
+    ///
+    /// A server that has gone away is not an error here. `exit` in the
+    /// learner's pane takes the pane, and with it the last window, the session
+    /// and the server; the poll loop notices that on its own turn. Raising
+    /// here instead printed tmux's own `no server running on …` at somebody
+    /// who had just typed `exit`.
+    fn consume_flag(&self, option: &str) -> bool {
+        let Ok(value) = self.tmux_command(&["show", "-gvq", option]) else {
+            return false;
+        };
+        if value != "1" {
+            return false;
         }
-        self.tmux_command(&["set", "-gu", option])?;
-        Ok(true)
+        let _ = self.tmux_command(&["set", "-gu", option]);
+        true
+    }
+
+    /// What the learner's prompt shows above itself, until the step changes.
+    fn write_cue(&self, line: &str) -> Result<()> {
+        std::fs::write(&self.cue, line).context("writing the prompt's step reminder")
+    }
+
+    /// Whether the sandbox server is still there.
+    fn server_alive(&self) -> bool {
+        self.tmux_command(&["display-message", "-p", "#{pid}"])
+            .is_ok_and(|pid| !pid.trim().is_empty())
     }
 
     /// Has the learner run a command starting with this?
@@ -553,11 +609,11 @@ impl Sandbox {
             .is_ok_and(|log| log.lines().any(|line| line.trim().starts_with(prefix)))
     }
 
-    fn skip_requested(&self) -> Result<bool> {
+    fn skip_requested(&self) -> bool {
         self.consume_flag(SKIP_OPTION)
     }
 
-    fn language_toggled(&self) -> Result<bool> {
+    fn language_toggled(&self) -> bool {
         self.consume_flag(LANGUAGE_OPTION)
     }
 
@@ -713,28 +769,6 @@ impl Transcript {
     /// and shows whatever arrives next.
     fn pane_command(&self) -> String {
         format!("exec tail -n +1 -f {}", self.path.display())
-    }
-
-    /// A `claude` / `codex` the learner can start themselves.
-    ///
-    /// Having the agents appear on their own left the tour doing the one thing
-    /// it keeps telling them muxa does *for* them. Typing `claude` is what
-    /// starting an agent actually looks like, and the shim on the sandbox PATH
-    /// means the real CLI is never reached — the name resolves to this screen.
-    /// It records its pane so the tour knows where the agent landed.
-    fn launcher(&self, shim: &Path, name: &str, marker: &Path) -> Result<()> {
-        let body = format!(
-            r#"#!/usr/bin/env bash
-# Stands in for the {name} CLI inside `muxa onboard`. Never reaches the real
-# one: the sandbox PATH resolves the name here. Removed with the sandbox.
-printf '%s' "$TMUX_PANE" > {marker}
-exec tail -n +1 -f {log}
-"#,
-            name = name,
-            marker = marker.display(),
-            log = self.path.display(),
-        );
-        write_executable(&shim.join(name), &body)
     }
 
     /// A pane that shows the transcript *and* answers its own approval prompt.
@@ -1091,27 +1125,30 @@ fn write_opening_screens(claude: &Transcript, codex: &Transcript, language: UiLa
 }
 
 impl Sandbox {
-    /// Stage the screens and put `claude` on the learner's `PATH`, so starting
-    /// the agent is theirs to do rather than the tour's to perform.
+    /// Stage the agent screens before the step that brings them up.
     fn prepare_agents(&self, language: UiLanguage) -> Result<()> {
         let claude_screen = Transcript::new(&self.dir, "claude")?;
         let codex_screen = Transcript::new(&self.dir, "codex")?;
         write_opening_screens(&claude_screen, &codex_screen, language);
-        let marker = self.dir.join("muxa-onboarding-claude.pane");
-        claude_screen.launcher(
-            Path::new(&self.env_value("MUXA_SANDBOX_SHIM")),
-            "claude",
-            &marker,
-        )?;
         Ok(())
     }
 
-    /// Where the learner started claude, once they have.
-    fn started_pane(&self) -> Option<String> {
-        std::fs::read_to_string(self.dir.join("muxa-onboarding-claude.pane"))
-            .ok()
-            .map(|pane| pane.trim().to_string())
-            .filter(|pane| !pane.is_empty())
+    /// How many times the learner's prompt has been drawn.
+    ///
+    /// Their `PROMPT_COMMAND` appends a line each time, so this counts
+    /// keystrokes at the prompt — including the bare Enter that a step can ask
+    /// for without asking for a command.
+    fn prompt_count(&self) -> usize {
+        std::fs::read_to_string(&self.history).map_or(0, |log| log.lines().count())
+    }
+
+    /// What a pane's border says it is.
+    ///
+    /// `select-pane -T` rather than anything drawn: tmux renders the title in
+    /// the border it is already drawing, so the label cannot drift out of
+    /// alignment with the pane it names.
+    fn label_pane(&self, pane: &str, label: &str) {
+        let _ = self.tmux_command(&["select-pane", "-t", pane, "-T", label]);
     }
 
     /// Learner on the left, agents stacked on the right.
@@ -1206,13 +1243,6 @@ impl Sandbox {
         if learner.is_empty() {
             bail!("could not tell your pane from the one you split off");
         }
-        // If they started claude in the pane this guessed was theirs, theirs is
-        // the other one.
-        let learner = match self.started_pane() {
-            Some(started) if started == learner => fresh.clone(),
-            _ => learner,
-        };
-
         // Already written by `prepare_agents`; opening them again would blank
         // the screen the learner is looking at.
         let claude_screen = Transcript::open(&self.dir, "claude");
@@ -1238,37 +1268,36 @@ impl Sandbox {
             self.tmux_command(&["rename-window", "-t", &other, "release-checks"])?;
         }
 
-        // claude is wherever the learner ran it. The fallback covers a skipped
-        // step, where nobody ran anything.
-        // Skipping past that step means nobody ran anything, so the pane they
-        // split — or failing that their own — is respawned into claude
-        // instead. `respawn-pane -k` keeps the pane id, so the hook still
-        // lands on the pane the learner is looking at.
-        let claude = if let Some(pane) = self.started_pane() {
-            pane
+        // The pane they split becomes claude. `respawn-pane -k` keeps the pane
+        // id, so the hook registers the pane the learner is looking at — and
+        // watching an agent arrive in the pane *they* made is what turns "a
+        // pane is an agent" from a sentence into something they did.
+        let claude = if fresh.is_empty() {
+            learner.clone()
         } else {
-            let pane = if fresh.is_empty() {
-                learner.clone()
-            } else {
-                fresh.clone()
-            };
-            self.tmux_command(&[
-                "respawn-pane",
-                "-k",
-                "-c",
-                &self.project.to_string_lossy(),
-                "-t",
-                &pane,
-                &claude_screen.pane_command(),
-            ])?;
-            pane
+            fresh.clone()
         };
+        self.tmux_command(&[
+            "respawn-pane",
+            "-k",
+            "-c",
+            &self.project.to_string_lossy(),
+            "-t",
+            &claude,
+            &claude_screen.pane_command(),
+        ])?;
         let codex = self.split(
             &window,
             &codex_screen.answerable_pane_command(&self.dir, &approved, &declined)?,
         )?;
 
         self.lay_out_fleet(&window, &learner)?;
+        self.label_pane(
+            &learner,
+            tr(language, " you · your shell", " you · 당신의 셸"),
+        );
+        self.label_pane(&claude, " @claude");
+        self.label_pane(&codex, " @codex");
 
         let fleet = Fleet {
             learner,
@@ -1390,10 +1419,22 @@ enum Detect {
     ClientAttached,
     /// Their window has more than the pane it started with.
     PaneSplit,
-    /// The learner started claude, in whichever pane they chose.
-    StartedClaude,
+    /// The learner pressed Enter at their own shell.
+    ///
+    /// Their prompt appends a line every time it is drawn, so a bare Enter is
+    /// one line more than the step opened with. Asking them to *type* `claude`
+    /// asked for a command that is neither tmux nor muxa — the two things the
+    /// tour is here to teach — and that the sandbox only pretends to have.
+    PressedEnter,
     /// Some pane on the sandbox server is running this command.
     PaneRunning(&'static str),
+    /// They opened watch and came back out of it.
+    ///
+    /// Watch owns the keyboard while it runs, so the tour cannot see `j`, `k`
+    /// or `?` go by. Leaving it is the one transition that is visible from
+    /// outside, and it is the one worth gating on: it means they were in there
+    /// long enough to look.
+    LeftWatch,
     /// The active pane is the one `muxa attend` should have jumped to.
     ActivePaneIsCodex,
     /// They came back to their own pane.
@@ -1404,15 +1445,15 @@ enum Detect {
     ClaimedInbox,
 }
 
-struct Step {
+pub(super) struct Step {
     /// What the learner's last action actually did. Shown as this step opens,
     /// because "did that work?" is the question they are holding.
-    achieved_en: &'static str,
-    achieved_ko: &'static str,
-    title_en: &'static str,
-    title_ko: &'static str,
-    cue_en: &'static str,
-    cue_ko: &'static str,
+    pub(super) achieved_en: &'static str,
+    pub(super) achieved_ko: &'static str,
+    pub(super) title_en: &'static str,
+    pub(super) title_ko: &'static str,
+    pub(super) cue_en: &'static str,
+    pub(super) cue_ko: &'static str,
     detect: Detect,
 }
 
@@ -1494,24 +1535,35 @@ const STEPS: &[Step] = &[
     Step {
         achieved_en: "✓ split — you are in the new pane, at its own shell",
         achieved_ko: "✓ 나눴습니다 — 지금 새 pane의 셸에 있습니다",
-        title_en: "Nothing makes a pane an agent except starting one in it.",
-        title_ko: "pane을 agent로 만드는 건 거기서 agent를 띄우는 것뿐입니다.",
-        cue_en: "type:   claude                 ·   the sandbox stands in for the real CLI",
-        cue_ko: "입력:   claude                 ·   sandbox가 실제 CLI를 대신합니다",
-        detect: Detect::StartedClaude,
+        title_en: "A pane becomes an agent when one runs in it. The tour will start two.",
+        title_ko: "pane은 거기서 agent가 돌면 agent가 됩니다. tour가 둘을 띄우겠습니다.",
+        cue_en: "press   Enter                  ·   sets up the practice agents",
+        cue_ko: "Enter 를 누르세요               ·   연습용 agent를 준비합니다",
+        detect: Detect::PressedEnter,
     },
     Step {
         achieved_en: "✓ that pane is claude now, codex joined it, and your cursor is back in yours",
         achieved_ko: "✓ 그 pane이 claude가 됐고 codex도 합류했습니다 — 커서는 당신 pane에 있습니다",
-        title_en: "This window is the `checkout` Work now. See all of it at once.",
-        title_ko: "이 window가 이제 `checkout` Work입니다. 전체를 한 번에 보세요.",
-        cue_en: "run:   muxa watch            ·   q leaves it",
-        cue_ko: "입력:   muxa watch            ·   q 로 나갑니다",
+        title_en: "`muxa watch` is the way in: every session, window and agent, live.",
+        title_ko: "`muxa watch`가 진입점입니다: session·window·agent를 살아있는 채로 봅니다.",
+        cue_en: "run:   muxa watch",
+        cue_ko: "입력:   muxa watch",
         detect: Detect::PaneRunning("muxa"),
     },
     Step {
-        achieved_en: "✓ watch showed the whole Work — and codex just stopped, waiting on you",
-        achieved_ko: "✓ watch가 Work 전체를 보여줬습니다 — 그리고 codex가 멈춰서 당신을 기다립니다",
+        achieved_en:
+            "✓ watch is open — the tree is your fleet, and the row colour is each agent's state",
+        achieved_ko:
+            "✓ watch가 열렸습니다 — 트리가 당신의 fleet이고, 줄 색이 각 agent의 상태입니다",
+        title_en: "j/k move · h/l fold · Enter jumps into the selected pane · ? lists every key.",
+        title_ko: "j/k 이동 · h/l 접기 · Enter 로 선택한 pane에 진입 · ? 로 전체 키 목록.",
+        cue_en: "look around, then   q   to come back here",
+        cue_ko: "둘러본 뒤   q   로 돌아오세요",
+        detect: Detect::LeftWatch,
+    },
+    Step {
+        achieved_en: "✓ back at your shell — and codex has stopped, waiting on you",
+        achieved_ko: "✓ 셸로 돌아왔습니다 — 그리고 codex가 멈춰서 당신을 기다립니다",
         title_en: "`attend` goes to whichever agent has been blocked longest — codex, here.",
         title_ko: "`attend`는 가장 오래 막힌 agent로 갑니다 — 여기서는 codex입니다.",
         cue_en: "run:   muxa attend",
@@ -1564,17 +1616,66 @@ const STEPS: &[Step] = &[
         detect: Detect::NoClient,
     },
 ];
+/// The tour's steps, so the printable guide can be generated from them rather
+/// than kept beside them.
+pub(super) fn steps() -> &'static [Step] {
+    STEPS
+}
+
+/// How many actions the tour asks for.
+pub(super) fn step_count() -> usize {
+    STEPS.len()
+}
+
 /// The step that opens once the learner has started claude: the pane they ran
 /// it in becomes claude's, and codex lands beside it.
+/// One line of the current step, for above the shell prompt.
+///
+/// The full block is printed once, when the step changes. Running a command
+/// scrolls it away, so the prompt carries a short reminder of what was asked —
+/// otherwise the learner is left with a bare prompt and the last command's
+/// output, and the instruction somewhere above.
+fn reminder_line(index: usize, cue: &str) -> String {
+    format!(
+        "{DIM}▸ {}/{}{RESET}  {YELLOW}{cue}{RESET}\n",
+        index + 1,
+        STEPS.len()
+    )
+}
+
 const AGENTS_ARRIVE: usize = 8;
 
-/// The step that asks them to split — one before the one that asks for
-/// `claude`, which is one before the agents land.
+/// The step that asks them to split — one before the one that asks for Enter,
+/// which is one before the agents land.
 const SPLIT_STEP: usize = AGENTS_ARRIVE - 2;
+
+/// The beats that fire scripted events rather than only reading tmux.
+///
+/// Named because they were plain integers twice and a step inserted upstream
+/// silently moved what they pointed at: the send-on-skip fixup kept firing on
+/// the step before the one that sends, so the escape hatch reached an empty
+/// inbox and the tour exited. `beats_line_up_with_what_they_fire_on` holds
+/// each of these against the detect it belongs to.
+const BLOCK_CODEX_STEP: usize = 10;
+const SEND_STEP: usize = 12;
+const CLAUDE_ANSWERS_STEP: usize = 13;
+const CODEX_ASKS_STEP: usize = 14;
+const CLAUDE_FINISHES_STEP: usize = 15;
 
 // ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
+
+/// One-way facts about the run so far.
+#[derive(Default)]
+struct Seen {
+    /// They opened the session tree.
+    tree: bool,
+    /// They opened `muxa watch`.
+    watch: bool,
+    /// Their shell has drawn a prompt, so printing must make room for one.
+    prompt: bool,
+}
 
 struct Tour<'a> {
     sandbox: &'a Sandbox,
@@ -1582,9 +1683,16 @@ struct Tour<'a> {
     language: UiLanguage,
     fleet: Option<Fleet>,
     /// The tree opens and closes; the step is the whole gesture.
-    saw_tree: bool,
+    /// One-way facts about the run so far: the tree was opened, watch was
+    /// opened, the shell has drawn a prompt. Separate `bool` fields said the
+    /// same thing four times over.
+    seen: Seen,
     /// Panes present before the learner split, so the new one is identifiable.
     before_split: Vec<String>,
+    /// Prompt draws at the moment the current step opened, so a step can ask
+    /// for a bare Enter and know when it arrives.
+    prompts_at_entry: usize,
+
     /// `--no-quiz` does not remove the steps — there is nothing to remove, the
     /// tour is the real thing — so it offers the way past from the start
     /// instead of after a wait.
@@ -1647,10 +1755,10 @@ impl Tour<'_> {
                     .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_mode}"])
                     .contains("tree");
                 if in_tree {
-                    self.saw_tree = true;
+                    self.seen.tree = true;
                     return false;
                 }
-                self.saw_tree
+                self.seen.tree
             }
             Detect::NoClient => self.clients().is_empty(),
             Detect::TypedCommand(prefix) => self.sandbox.ran_command(prefix),
@@ -1669,7 +1777,19 @@ impl Tour<'_> {
                     .count()
                     >= 2
             }
-            Detect::StartedClaude => self.sandbox.started_pane().is_some(),
+            Detect::PressedEnter => self.sandbox.prompt_count() > self.prompts_at_entry,
+            Detect::LeftWatch => {
+                let running = self
+                    .sandbox
+                    .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
+                    .lines()
+                    .any(|line| line.trim() == "muxa");
+                if running {
+                    self.seen.watch = true;
+                    return false;
+                }
+                self.seen.watch
+            }
             Detect::PaneRunning(command) => self
                 .sandbox
                 .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
@@ -1740,7 +1860,7 @@ impl Tour<'_> {
                         .tmux_command(&["split-window", "-t", &format!("{session}:")])?;
                 }
             }
-            11 => {
+            SEND_STEP => {
                 // Entering the next step makes scripted claude answer the
                 // learner's request. A skipped send still needs to create that
                 // request, or the escape hatch exits on an empty inbox instead
@@ -1761,6 +1881,9 @@ impl Tour<'_> {
     /// Fired as a step opens, so the world moves on its own rather than only in
     /// response to the learner.
     fn on_enter(&mut self, index: usize) -> Result<()> {
+        // Rebased each step, so a step asking for Enter counts only the ones
+        // pressed after it opened.
+        self.prompts_at_entry = self.sandbox.prompt_count();
         // The placeholder only had to keep the server alive until the learner
         // made a session of their own. Step 5 asks them to run `tmux ls`, and a
         // mysterious `_sandbox` in that output is the tour's own plumbing
@@ -1809,11 +1932,19 @@ impl Tour<'_> {
             return Ok(());
         };
         match index {
-            9 => {
+            BLOCK_CODEX_STEP => {
                 // The row in watch flips to `waiting` because of the hook; the
                 // pane has to show *why*, or the state is a claim rather than
                 // something the learner can see for themselves.
                 fleet.codex_screen.append(&approval_block(self.language));
+                self.sandbox.label_pane(
+                    &fleet.codex,
+                    tr(
+                        self.language,
+                        " @codex  ⏸ blocked · needs approval",
+                        " @codex  ⏸ 멈춤 · 승인 필요",
+                    ),
+                );
                 self.sandbox.hook(
                     &fleet.codex,
                     "codex",
@@ -1821,30 +1952,113 @@ impl Tour<'_> {
                     r#"{"session_id":"onboarding-codex","tool_name":"shell"}"#,
                 )
             }
-            12 => {
-                fleet
-                    .claude_screen
-                    .append(&incoming_question(self.language));
-                // And claude answers through muxa, not only on its own screen.
-                self.sandbox.reply_as_claude(fleet, self.language)
-            }
-            13 => {
-                let body = tr(
-                    self.language,
-                    "the public-read boundary needs a decision before I continue",
-                    "public-read 경계는 계속하기 전에 결정이 필요합니다",
-                );
-                fleet.codex_screen.append(&outgoing_request(self.language));
-                self.sandbox
-                    .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
-                    .map(|_| ())
-            }
-            14 => {
+            CLAUDE_ANSWERS_STEP => self.claude_answers(fleet),
+            CODEX_ASKS_STEP => self.codex_asks(fleet),
+            CLAUDE_FINISHES_STEP => {
                 fleet.claude_screen.append(&finished(self.language));
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    /// claude takes the learner's question and answers it.
+    ///
+    /// The borders carry it: a message that "reached claude" is otherwise a
+    /// claim the narration makes over three anonymous boxes.
+    fn claude_answers(&self, fleet: &Fleet) -> Result<()> {
+        fleet
+            .claude_screen
+            .append(&incoming_question(self.language));
+        self.sandbox.label_pane(
+            &fleet.claude,
+            tr(
+                self.language,
+                " @claude  ← your question   → replied",
+                " @claude  ← 당신의 질문   → 답장함",
+            ),
+        );
+        self.sandbox.label_pane(
+            &fleet.learner,
+            tr(
+                self.language,
+                " you · your shell  ← claude's reply is in your mailbox",
+                " you · 당신의 셸  ← claude의 답장이 mailbox에 있습니다",
+            ),
+        );
+        // And claude answers through muxa, not only on its own screen.
+        self.sandbox.reply_as_claude(fleet, self.language)
+    }
+
+    /// codex asks the learner for a decision, the other direction.
+    fn codex_asks(&self, fleet: &Fleet) -> Result<()> {
+        let body = tr(
+            self.language,
+            "the public-read boundary needs a decision before I continue",
+            "public-read 경계는 계속하기 전에 결정이 필요합니다",
+        );
+        fleet.codex_screen.append(&outgoing_request(self.language));
+        self.sandbox.label_pane(
+            &fleet.codex,
+            tr(
+                self.language,
+                " @codex  → asked you for a decision",
+                " @codex  → 당신에게 결정을 요청함",
+            ),
+        );
+        self.sandbox.label_pane(
+            &fleet.learner,
+            tr(
+                self.language,
+                " you · your shell  ← codex is waiting on you",
+                " you · 당신의 셸  ← codex가 당신을 기다립니다",
+            ),
+        );
+        self.sandbox
+            .muxa_as(&fleet.codex, &["msg", "send", "@you", body, "--no-reply"])
+            .map(|_| ())
+    }
+
+    /// The step, for the beats where nobody is attached to a status bar.
+    ///
+    /// Bash has usually drawn its prompt on this line already, and writing
+    /// beside it is how a doubled `muxa-onboarding $` and a half-eaten Korean
+    /// line reached the learner. Erase that line first, and re-issue the
+    /// prompt afterwards — bash will not draw a second one for a line it has
+    /// finished. Before the shell exists there is nothing to erase and nothing
+    /// to replace: bash draws the first prompt itself.
+    fn print_step(&self, index: usize, achieved: &str, title: &str, cue: &str) -> Result<()> {
+        let rule = "─".repeat(RULE_WIDTH);
+        let done = (index + 1) * BAR_WIDTH / STEPS.len();
+        let bar = format!(
+            "{GREEN}{}{RESET}{DIM}{}{RESET}",
+            "━".repeat(done),
+            "━".repeat(BAR_WIDTH - done)
+        );
+        // Erase whatever bash left on this line first. Writing beside a prompt
+        // it had already drawn is where the doubled `muxa-onboarding $` and the
+        // half-eaten Korean line came from. Before the shell exists there is
+        // nothing to erase, and bash draws the first prompt itself.
+        let clear = if self.seen.prompt { "\r\x1b[2K" } else { "" };
+        let tail = if self.seen.prompt {
+            format!("{}{PROMPT}", reminder_line(index, cue))
+        } else {
+            String::new()
+        };
+        print!(
+            "{clear}\n{DIM}{rule}{RESET}\n\
+             {BOLD}muxa onboarding{RESET}  {DIM}{}/{}{RESET}  {bar}\n\
+             {GREEN}{achieved}{RESET}\n\
+             {title}\n\
+             {YELLOW}{BOLD}{cue}{RESET}\n\
+             {DIM}{rule}{RESET}\n{tail}",
+            index + 1,
+            STEPS.len()
+        );
+        std::io::stdout()
+            .flush()
+            .context("printing live-tour narration")?;
+        Ok(())
     }
 
     fn narrate(&self, index: usize, escape: bool) -> Result<()> {
@@ -1859,6 +2073,11 @@ impl Tour<'_> {
                 "막혔나요?  F12  로 이 단계를 건너뜁니다",
             )
         });
+
+        // Their prompt reads this on every redraw, so running a command does
+        // not scroll the instruction away — the block above is printed once,
+        // when the step changes, and this line comes back with every prompt.
+        self.sandbox.write_cue(&reminder_line(index, cue))?;
 
         self.sandbox.narrate(
             index + 1,
@@ -1887,19 +2106,7 @@ impl Tour<'_> {
         // ends with the prompt, so whatever they type next has one in front of
         // it.
         if self.clients().is_empty() {
-            let rule = "─".repeat(64);
-            print!(
-                "\n{DIM}{rule}{RESET}\n\
-                 {BOLD}muxa onboarding · {}/{}{RESET}   {GREEN}{achieved}{RESET}\n\
-                 {title}\n\
-                 {YELLOW}{BOLD}{cue}{RESET}\n\
-                 {DIM}{rule}{RESET}\n muxa-onboarding $ ",
-                index + 1,
-                STEPS.len()
-            );
-            std::io::stdout()
-                .flush()
-                .context("printing live-tour narration")?;
+            self.print_step(index, achieved, title, cue)?;
         }
         Ok(())
     }
@@ -1916,6 +2123,9 @@ impl Tour<'_> {
             .arg(&self.sandbox.rcfile)
             .spawn()
             .context("starting your shell")?;
+        // From here on bash owns the line, so a printed block has to clear it
+        // and put the prompt back.
+        self.seen.prompt = true;
 
         let mut index = 0usize;
         let mut entered = Instant::now();
@@ -1926,6 +2136,11 @@ impl Tour<'_> {
                 break;
             }
             if shell.try_wait().context("watching your shell")?.is_some() {
+                break;
+            }
+            // `exit` inside the last pane is a legitimate way to leave, and the
+            // tour should end the way `Ctrl-b d` ends it.
+            if !self.sandbox.server_alive() {
                 break;
             }
             if entered.elapsed() > STEP_TIMEOUT {
@@ -1941,7 +2156,7 @@ impl Tour<'_> {
                 }
                 continue;
             }
-            if self.sandbox.language_toggled()? {
+            if self.sandbox.language_toggled() {
                 self.language = match self.language {
                     UiLanguage::En => UiLanguage::Ko,
                     UiLanguage::Ko => UiLanguage::En,
@@ -1949,7 +2164,7 @@ impl Tour<'_> {
                 self.narrate(index, offered_escape)?;
                 continue;
             }
-            if self.sandbox.skip_requested()? {
+            if self.sandbox.skip_requested() {
                 self.perform(index)?;
                 index += 1;
                 entered = Instant::now();
@@ -1987,7 +2202,13 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
         )
     );
 
-    let completed = {
+    // The sandbox is kept alive past `drive` on purpose. Tearing it down first
+    // meant the learner watched a blank terminal for the several seconds it
+    // takes to stop a daemon and wait for it to actually exit, and only then
+    // got the part worth reading. Everything that does not depend on the
+    // teardown is printed before it runs; the one line that claims the sandbox
+    // is gone waits until it is.
+    let (completed, sandbox) = {
         let sandbox = Sandbox::create()?;
         // The daemon comes up before the learner has anything, because a hook
         // sent while it is down is dropped rather than queued.
@@ -1997,15 +2218,27 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
             sandbox: &sandbox,
             language,
             fleet: None,
-            saw_tree: false,
+            seen: Seen::default(),
             before_split: Vec::new(),
+            prompts_at_entry: 0,
             no_quiz,
         };
-        tour.drive()?
-        // `Drop` tears the sandbox down here, on every path including a panic.
+        (tour.drive()?, sandbox)
     };
 
-    summary(language, completed);
+    outcome_line(language, completed);
+    next_steps(language);
+    // `Drop` tears the sandbox down here, on every path including a panic.
+    drop(sandbox);
+    println!();
+    println!(
+        "  {}",
+        tr(
+            language,
+            "The sandbox is gone — no daemon, no config, nothing left on disk.",
+            "sandbox는 사라졌습니다 — daemon도 config도 남지 않았습니다.",
+        )
+    );
     Ok(())
 }
 
@@ -2027,40 +2260,230 @@ fn preflight(language: UiLanguage) -> Result<()> {
     Ok(())
 }
 
-fn summary(language: UiLanguage, completed: usize) {
+/// What the learner can do on their own machine, once the sandbox is gone.
+const OWN_FLEET: &[(&str, &str, &str)] = &[
+    (
+        "tmux new-session -s <work>",
+        "a session is a workspace",
+        "session은 workspace",
+    ),
+    (
+        "muxa watch",
+        "the way in — j/k moves, Enter jumps, ? lists the keys",
+        "진입점 — j/k 이동, Enter 진입, ? 로 키 목록",
+    ),
+    (
+        "muxa attend",
+        "jump to whichever agent has been blocked longest",
+        "가장 오래 막힌 agent로 이동",
+    ),
+    (
+        "muxa msg send @<alias> \"…\"",
+        "ask an agent without attaching",
+        "attach 없이 agent에게 묻기",
+    ),
+    (
+        "muxa msg inbox",
+        "claim what was sent to you",
+        "당신 앞으로 온 요청 가져오기",
+    ),
+];
+
+/// The parts of muxa the tour did not have room for.
+const WORTH_KNOWING: &[(&str, &str, &str)] = &[
+    (
+        "muxa peek",
+        "every pane in this window at once, with a digit to jump by",
+        "이 window의 모든 pane을 한눈에, 숫자로 이동",
+    ),
+    (
+        "muxa stats",
+        "prompt history, live agents, and how long the session has run",
+        "프롬프트 이력·활성 agent·세션 지속 시간",
+    ),
+    (
+        "muxa timeline",
+        "when each agent worked, waited, or failed",
+        "각 agent가 언제 일했고 기다렸고 실패했는지",
+    ),
+    (
+        "muxa work up",
+        "staff a whole Work at once instead of a pane at a time",
+        "pane 하나씩이 아니라 Work 전체를 한 번에 구성",
+    ),
+    (
+        "muxa doctor",
+        "check the setup end to end",
+        "설치 상태를 처음부터 끝까지 점검",
+    ),
+];
+
+/// The tour installs nothing, so it has to say how to get a real muxa.
+const INSTALLING: &[(&str, &str, &str)] = &[
+    (
+        "curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh",
+        "builds muxa and muxad, then runs `muxa init`",
+        "muxa와 muxad를 빌드하고 `muxa init`까지 실행합니다",
+    ),
+    (
+        "muxa init",
+        "wire tmux, agent hooks, and the dashboard",
+        "tmux·agent hook·대시보드 연결",
+    ),
+];
+
+/// How the tour ended, said before anything slow happens.
+fn outcome_line(language: UiLanguage, completed: usize) {
     println!();
     println!(
-        "{}",
+        "{BOLD}{}{RESET}",
         if completed >= STEPS.len() {
             tr(
                 language,
-                "Done. The sandbox is gone — no daemon, no config, nothing left on disk.",
-                "끝났습니다. sandbox는 사라졌습니다 — daemon도 config도 남지 않았습니다.",
+                "Done — all sixteen steps.",
+                "끝났습니다 — 16단계 전부.",
             )
         } else {
-            tr(
-                language,
-                "Stopped early. The sandbox is gone — no daemon, no config, nothing left on disk.",
-                "중간에 종료했습니다. sandbox는 사라졌습니다 — daemon도 config도 남지 않았습니다.",
-            )
+            tr(language, "Stopped early.", "중간에 종료했습니다.")
         }
     );
+}
+
+/// Everything below is about the learner's own machine. A tour that ends
+/// without saying how to keep what you just learned to use is a demo.
+fn next_steps(language: UiLanguage) {
+    section(
+        language,
+        "The same commands, on your own fleet",
+        "직접 쓰실 때도 같은 명령입니다",
+        OWN_FLEET,
+    );
+    section(
+        language,
+        "Worth knowing next",
+        "다음으로 볼 만한 것",
+        WORTH_KNOWING,
+    );
+    section(
+        language,
+        "Installing it for real",
+        "실제로 설치하기",
+        INSTALLING,
+    );
+
     println!();
-    println!(
-        "{}",
+    for line in [
         tr(
             language,
-            "The same commands work on your own fleet:",
-            "직접 쓰실 때도 같은 명령입니다:",
+            "Docs:  https://github.com/Open330/muxa#readme",
+            "문서:  https://github.com/Open330/muxa/blob/main/README.ko.md",
+        ),
+        tr(
+            language,
+            "Install guide:  https://github.com/Open330/muxa/blob/main/docs/INSTALL.md",
+            "설치 안내:  https://github.com/Open330/muxa/blob/main/docs/INSTALL.ko.md",
+        ),
+    ] {
+        println!("  {line}");
+    }
+    println!();
+    println!(
+        "  {}",
+        tr(
+            language,
+            "Run this tour again any time:  muxa onboard   ·   the written guide:  muxa onboard --print",
+            "이 tour는 언제든 다시:  muxa onboard   ·   문서로 보기:  muxa onboard --print",
         )
     );
-    for line in [
-        "  tmux new-session -s <work>",
-        "  muxa watch",
-        "  muxa attend",
-        "  muxa msg send @<alias> \"…\"",
-        "  muxa msg inbox",
-    ] {
-        println!("{line}");
+}
+
+/// A titled block of `command — what it is for`, aligned on the command.
+fn section(
+    language: UiLanguage,
+    title_en: &'static str,
+    title_ko: &'static str,
+    rows: &[(&'static str, &'static str, &'static str)],
+) {
+    println!();
+    println!("{BOLD}{}{RESET}", tr(language, title_en, title_ko));
+    // Aligned on the commands that fit. One long command — the install
+    // one-liner — would otherwise push every gloss beside it off the screen,
+    // so it takes a line of its own and its gloss goes underneath.
+    let width = rows
+        .iter()
+        .map(|(cmd, ..)| cmd.chars().count())
+        .filter(|len| *len <= ALIGN_LIMIT)
+        .max()
+        .unwrap_or(0);
+    for (command, gloss_en, gloss_ko) in rows {
+        let gloss = tr(language, gloss_en, gloss_ko);
+        if command.chars().count() > ALIGN_LIMIT {
+            println!("  {command}");
+            println!("  {:width$}   {DIM}{gloss}{RESET}", "");
+        } else {
+            println!("  {command:<width$}   {DIM}{gloss}{RESET}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each scripted beat fires on the step whose action it belongs to.
+    ///
+    /// These were plain integers, and inserting a step upstream moved what
+    /// every one of them pointed at without failing anything: the send-on-skip
+    /// fixup kept firing one step early, so the escape hatch reached claude's
+    /// inbox before anything was in it and the tour exited on the error. Pin
+    /// them to their detects, so the next insertion fails here instead.
+    #[test]
+    fn beats_line_up_with_what_they_fire_on() {
+        assert!(matches!(STEPS[SPLIT_STEP].detect, Detect::PaneSplit));
+        assert!(matches!(
+            STEPS[AGENTS_ARRIVE - 1].detect,
+            Detect::PressedEnter
+        ));
+        assert!(matches!(
+            STEPS[AGENTS_ARRIVE].detect,
+            Detect::PaneRunning("muxa")
+        ));
+        assert!(matches!(STEPS[SEND_STEP].detect, Detect::SentMessage));
+        assert!(matches!(
+            STEPS[CLAUDE_ANSWERS_STEP].detect,
+            Detect::TypedCommand("muxa msg list")
+        ));
+        assert!(matches!(
+            STEPS[CODEX_ASKS_STEP].detect,
+            Detect::ClaimedInbox
+        ));
+        assert!(matches!(
+            STEPS[BLOCK_CODEX_STEP].detect,
+            Detect::ActivePaneIsCodex
+        ));
+        assert_eq!(CLAUDE_FINISHES_STEP, STEPS.len() - 1);
+    }
+
+    /// Every step says what the last action accomplished, in both languages.
+    #[test]
+    fn every_step_confirms_the_action_before_it() {
+        for (index, step) in STEPS.iter().enumerate() {
+            assert!(
+                !step.achieved_en.is_empty(),
+                "step {index} has no English confirmation"
+            );
+            assert!(
+                !step.achieved_ko.is_empty(),
+                "step {index} has no Korean confirmation"
+            );
+            // Status rows render no markdown, so emphasis markers print as
+            // themselves.
+            for text in [step.title_en, step.title_ko, step.cue_en, step.cue_ko] {
+                assert!(
+                    !text.contains("**"),
+                    "step {index} carries literal asterisks: {text}"
+                );
+            }
+        }
     }
 }

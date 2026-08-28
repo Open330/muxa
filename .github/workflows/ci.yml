@@ -52,24 +52,12 @@ jobs:
       - run: cargo build --workspace --bins
       - run: cargo test --workspace
 
-  onboarding-parity:
-    name: onboarding parity
+  onboarding-script:
+    name: onboarding script
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p muxa-cli --bin muxa
       - run: shellcheck scripts/onboard.sh
-      # The shell fallback in onboard.sh must teach the same keys as the real
-      # tour; `muxa onboard --emit step-table` is the contract it is held to.
-      - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa
-      - run: python3 scripts/onboarding-parity.py --muxa target/debug/muxa --lang ko
-      # Step 6 accepts an arrow and nothing else, so an arrow the terminal
-      # tears in two has to survive the split-escape handler.
-      - run: python3 scripts/split-arrow-check.py --muxa target/debug/muxa
 
   sandbox:
     name: sandbox
@@ -86,6 +74,10 @@ jobs:
       # A sandbox that leaks a daemon or a tmux server is worse than no
       # sandbox, so the suite asserts teardown is total from every state.
       - run: scripts/sandbox-smoke.sh
+      # A sandbox that reads the caller's ~/.tmux.conf is not a sandbox: their
+      # hooks run inside it, and muxa's own `tmux-auto-view` detaches the
+      # learner the moment they attach.
+      - run: python3 scripts/config-isolation-check.py
 
   live-tour:
     name: live tour
@@ -105,6 +97,9 @@ jobs:
       # Issue #76 was a gate with no way around it; this is the check that
       # the live tour cannot repeat that.
       - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --mode skip
+      # `exit` closes the last pane, and with it the sandbox server the tour is
+      # polling. That is a way out, not a crash.
+      - run: python3 scripts/exit-check.py --muxa target/debug/muxa
 
   msrv:
     name: MSRV (1.89)
