@@ -107,6 +107,18 @@ tmux edit은 marker block으로 감쌉니다:
 JSON/TOML agent config는 command-prefix matching으로 muxa hook entry만
 제거할 수 있게 처리합니다. write 전에는 `<file>.muxa-backup-<unix_ts>` 백업을 만듭니다.
 
+## Daemon 생명주기
+
+CLI가 `--socket`, `MUXA_SOCKET`, config, XDG 기본값 순서로 소켓을 결정하므로
+일반적인 생명주기 명령에는 소켓 인자가 필요하지 않습니다.
+
+```bash
+muxa daemon start
+muxa daemon status
+muxa daemon restart
+muxa daemon stop
+```
+
 ## Daemon 수동 실행
 
 foreground:

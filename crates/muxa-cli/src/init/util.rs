@@ -4,10 +4,8 @@
 //! consumers (`detect.rs`, `files/launchd.rs`) need the same uid +
 //! socket-probe helpers, and we don't want them to drift.
 
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 /// The current process's POSIX uid as a decimal string. Falls back to
 /// `"501"` (typical macOS user) only when `id -u` itself fails — exotic
@@ -39,31 +37,7 @@ pub fn default_muxad_socket() -> PathBuf {
 /// away, which is exactly the failure mode users hit when an old
 /// muxad died but its pid was still around.
 pub fn muxad_responsive(socket: &Path) -> bool {
-    UnixStream::connect(socket).is_ok()
-}
-
-/// Block until either `muxad_responsive(socket)` returns true or the
-/// timeout elapses, polling every `interval`. Returns whether muxad
-/// became responsive in time.
-///
-/// Why polling beats a flat sleep: systemd's `enable --now` and
-/// launchd's `bootstrap` return as soon as the spawn is *initiated*,
-/// not when the child has bound its socket. A 300 ms guess works on
-/// fast hardware and fails on cold-cached / VM / CI runners. Polling
-/// adapts: typical hot-path hits the first iteration (<20 ms) and
-/// only slow boots actually wait.
-pub fn wait_for_muxad(socket: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    let interval = Duration::from_millis(20);
-    loop {
-        if muxad_responsive(socket) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(interval);
-    }
+    crate::daemon::socket_responding(socket)
 }
 
 #[cfg(test)]
@@ -100,30 +74,5 @@ mod tests {
         let path = dir.path().join("test.sock");
         let _listener = UnixListener::bind(&path).unwrap();
         assert!(muxad_responsive(&path));
-    }
-
-    #[test]
-    fn wait_returns_immediately_when_already_up() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("up.sock");
-        let _listener = UnixListener::bind(&path).unwrap();
-        let start = Instant::now();
-        let ok = wait_for_muxad(&path, Duration::from_millis(500));
-        assert!(ok);
-        assert!(start.elapsed() < Duration::from_millis(50));
-    }
-
-    #[test]
-    fn wait_times_out_when_never_up() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("never.sock");
-        let start = Instant::now();
-        let ok = wait_for_muxad(&path, Duration::from_millis(60));
-        assert!(!ok);
-        let elapsed = start.elapsed();
-        // Should respect the timeout reasonably tightly. We allow
-        // some slack for the polling interval + scheduler jitter.
-        assert!(elapsed >= Duration::from_millis(60));
-        assert!(elapsed < Duration::from_millis(250));
     }
 }

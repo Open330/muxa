@@ -122,7 +122,8 @@ muxa init
 확인:
 
 ```bash
-muxad &
+muxa daemon start
+muxa daemon status
 muxa status
 muxa watch
 ```
