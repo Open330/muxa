@@ -277,13 +277,20 @@ impl Sandbox {
         use std::fmt::Write as _;
 
         let mut body = String::from("unset PROMPT_COMMAND\n");
+        // `printf` rather than letting `history` write straight to the log:
+        // `history 1` prints nothing in a shell that has no history yet, which
+        // is exactly the pane the learner has just split. The Enter step counts
+        // lines, so an Enter pressed there appended none and the step never
+        // saw it. `printf` always writes one line, empty or not, and
+        // `ran_command` still finds the text when there is text.
+        //
         // The reminder goes through `PROMPT_COMMAND` rather than `PS1`:
         // `$(cat …)` strips trailing newlines, so a reminder rendered in the
         // prompt ran straight into `muxa-onboarding $` on the same line.
         // Inside tmux the status bar already says all this.
         let _ = writeln!(
             body,
-            "export PROMPT_COMMAND='history 1 | sed \"s/^ *[0-9]* *//\" >> {}; \
+            "export PROMPT_COMMAND='printf \"%s\\n\" \"$(history 1 | sed \"s/^ *[0-9]* *//\")\" >> {}; \
              [ -z \"$TMUX\" ] && cat {} 2>/dev/null'",
             self.history.display(),
             self.cue.display()
