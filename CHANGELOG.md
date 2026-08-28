@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A spawned peer is addressable before its agent registers.**
+  `muxa_call_peer` with `spawn_if_missing` waited for the new pane to become a
+  participant before sending, which codex can never satisfy: it fires
+  `SessionStart` when its first prompt is submitted, not when its TUI boots —
+  measured at no hook through 116s of idling, then one 0.4s after the first
+  prompt, against claude's 0.62s from launch. So the sender waited for a
+  registration that the request it was holding would have caused, the call
+  failed with advice to check hooks and retry, and the retry it named
+  (`target="pane:%N"`) hard-errored as well — leaving only the `tmux
+  capture-pane` polling this model exists to avoid.
+
+  A request may now carry a *pending pane* recipient: muxad queues it
+  immediately, delivers it once the pane reads idle, and the first agent
+  session to register on that pane adopts it, after which the request is
+  session-pinned like any other. The relaxation is deliberately narrow — only
+  an explicit pane selector resolves this way, only within the sender's room,
+  only for a pane muxa launched or discovery classified as an agent CLI, and
+  only for providers that can report readiness at all, so a spawned `opencode`
+  pane still fails fast rather than queueing work nothing would deliver. A
+  pane's startup approval gate still blocks delivery, because the bundled
+  screen manifests classify it as waiting rather than idle. `spawn_timeout_secs`
+  becomes a grace period (default 10s) instead of a deadline.
+
 - **The live tour's ending names the keys `muxa init` binds.** It taught
   `muxa watch` as something you type — true in the sandbox, where nothing is
   installed — and stopped there, so a learner who finished went on typing it
