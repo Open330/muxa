@@ -359,16 +359,20 @@ pub(crate) async fn apply_durable(
         } else {
             match recover_unreported_alias(&identity, &claim.agent.alias, claim.generation) {
                 Ok(Some(target)) => Ok(target),
-                Ok(None) => launch(&claim.agent, &resolved, claim.generation).map(|agent| {
-                    let pane = agent.pane.clone();
-                    launched.push(agent);
-                    let window =
-                        crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))
-                            .ok()
-                            .flatten()
-                            .map(|work| work.window);
-                    (pane, window)
-                }),
+                Ok(None) => launch(&claim.agent, &resolved, claim.generation, client.socket()).map(
+                    |agent| {
+                        let pane = agent.pane.clone();
+                        launched.push(agent);
+                        let window = crate::tmux_work::find_work_in(
+                            &resolved.work,
+                            Some(&resolved.workspace),
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|work| work.window);
+                        (pane, window)
+                    },
+                ),
                 Err(error) => Err(error),
             }
         };
@@ -473,6 +477,7 @@ pub(crate) async fn reconcile_run(
                             anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
                         })?;
                     crate::agent_launch::start(StartRequest {
+                        socket: client.socket().to_path_buf(),
                         agent: program,
                         placement: Placement::Pane,
                         target: None,
@@ -1203,12 +1208,18 @@ fn ask_for_request(work: &str) -> Result<Option<String>> {
     Ok((!text.is_empty()).then_some(text))
 }
 
-fn launch(agent: &DesiredAgent, resolved: &Resolved, generation: u64) -> Result<LaunchedAgent> {
+fn launch(
+    agent: &DesiredAgent,
+    resolved: &Resolved,
+    generation: u64,
+    socket: &Path,
+) -> Result<LaunchedAgent> {
     let program = AgentProgram::parse(&agent.program)
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let direction = SplitDirection::parse(agent.direction.as_deref())
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let result = crate::agent_launch::start(StartRequest {
+        socket: socket.to_path_buf(),
         agent: program,
         placement: Placement::Pane,
         target: None,

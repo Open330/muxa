@@ -622,7 +622,7 @@ async fn run_work_cmd(
     match action {
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
-        WorkCmd::Start(args) => agent_launch::run_work_start(args),
+        WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket()),
         WorkCmd::List(args) => tmux_work::run_work_list(args, client).await,
         WorkCmd::Show(args) => tmux_work::run_work_show(args),
         WorkCmd::Done(args) => tmux_work::run_work_done(args, client).await,

@@ -1433,8 +1433,11 @@ impl Effects for RealEffects {
                 Some(&work),
                 None,
                 None,
+                // No alias here, so the socket is never read — but passing
+                // the real one keeps the contract honest if that changes.
                 None,
                 None,
+                &muxa::paths::default_socket(),
             )
         })();
         if let Err(error) = marked {

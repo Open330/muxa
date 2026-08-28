@@ -1585,6 +1585,7 @@ pub fn mark_agent(
     task: Option<&str>,
     alias: Option<&str>,
     generation: Option<u64>,
+    socket: &Path,
 ) -> Result<()> {
     validate_pane_id(pane)?;
     set_option(OptionScope::Pane, pane, AGENT_OPTION, &metadata(agent, 64)?)?;
@@ -1628,13 +1629,12 @@ pub fn mark_agent(
         // same name. The write itself stays unconditional: an explicit alias
         // comes from the user's configuration and outranks anything muxa
         // minted for the slot.
-        muxa::ipc::blocking_reserve_handle(
-            &muxa::paths::default_socket(),
-            pane,
-            &alias,
-            RESERVE_TIMEOUT,
-        )
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // The caller's daemon, not whichever one `default_socket` names: a
+        // launch against any other socket reserved the name in the wrong
+        // room, and against a host with no default daemon it failed outright
+        // and took the launch down with it.
+        muxa::ipc::blocking_reserve_handle(socket, pane, &alias, RESERVE_TIMEOUT)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
     }
     if let Some(generation) = generation {

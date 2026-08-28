@@ -289,10 +289,19 @@ pub struct StartRequest {
     /// `work done` reads it back so an old pane cannot complete a new run.
     pub generation: Option<u64>,
     pub direction: SplitDirection,
+    /// The daemon this launch belongs to.
+    ///
+    /// Reserving an alias used to go to `paths::default_socket()` regardless,
+    /// so `--alias` against any other daemon reserved the name in the wrong
+    /// room — or, with no daemon on the default socket at all, failed and
+    /// rolled the whole launch back.
+    pub socket: PathBuf,
 }
 
-impl From<&StartArgs> for StartRequest {
-    fn from(args: &StartArgs) -> Self {
+impl StartRequest {
+    /// The request a `muxa agent start` invocation describes, against the
+    /// daemon the CLI resolved.
+    pub fn from_args(args: &StartArgs, socket: &Path) -> Self {
         Self {
             agent: args.agent,
             placement: args.placement,
@@ -307,6 +316,7 @@ impl From<&StartArgs> for StartRequest {
             alias: args.alias.clone(),
             generation: None,
             direction: args.direction,
+            socket: socket.to_path_buf(),
         }
     }
 }
@@ -391,14 +401,14 @@ impl AgentStartOutput {
 pub async fn run(args: StartArgs, client: &Client, socket_path: &Path) -> Result<()> {
     match args.host.resolve(muxa::backend::detect_host_env()) {
         LaunchHost::Native => run_native(args, client, socket_path).await,
-        LaunchHost::Tmux => run_tmux(args),
+        LaunchHost::Tmux => run_tmux(args, socket_path),
         LaunchHost::Auto => unreachable!("auto launch host is resolved above"),
     }
 }
 
-fn run_tmux(args: StartArgs) -> Result<()> {
+fn run_tmux(args: StartArgs, socket: &Path) -> Result<()> {
     let json = args.json;
-    let result = start(StartRequest::from(&args))?;
+    let result = start(StartRequest::from_args(&args, socket))?;
     if json {
         println!(
             "{}",
@@ -506,9 +516,10 @@ async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Res
     Ok(())
 }
 
-pub fn run_work_start(args: WorkStartArgs) -> Result<()> {
+pub fn run_work_start(args: WorkStartArgs, socket: &Path) -> Result<()> {
     let json = args.json;
     let result = start(StartRequest {
+        socket: socket.to_path_buf(),
         agent: args.agent,
         placement: Placement::Pane,
         target: None,
@@ -629,6 +640,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             request.task.as_deref(),
             request.alias.as_deref(),
             request.generation,
+            &request.socket,
         )
     })();
     if let Err(error) = mark {
@@ -979,8 +991,38 @@ fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
 mod tests {
     use super::*;
 
+    /// The socket a launch reserves its alias against is the caller's.
+    ///
+    /// It used to be `paths::default_socket()` no matter what, so an alias
+    /// went to a daemon that did not own the pane — a name taken in the wrong
+    /// room while the right one never heard, free to hand it out again.
+    /// `scripts/alias-socket-check.py` shows the two panes that results in;
+    /// this pins the wiring that carries the socket at all.
+    #[test]
+    fn agent_start_carries_the_callers_socket() {
+        let args = StartArgs {
+            agent: AgentProgram::Codex,
+            host: LaunchHost::Tmux,
+            placement: Placement::Pane,
+            target: Some("%9".into()),
+            cwd: None,
+            prompt: None,
+            name: None,
+            workspace: None,
+            work: None,
+            role: None,
+            task: None,
+            alias: Some("reviewer".into()),
+            direction: SplitDirection::Right,
+            json: false,
+        };
+        let socket = PathBuf::from("/tmp/somewhere-else.sock");
+        assert_eq!(StartRequest::from_args(&args, &socket).socket, socket);
+    }
+
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
         StartRequest {
+            socket: muxa::paths::default_socket(),
             agent,
             placement,
             target: Some("%9".into()),
