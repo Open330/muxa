@@ -11,6 +11,17 @@ Driven against a sandbox, which is the "some other daemon" case by
 construction: reserve `codex` on one pane, fire a codex session start on
 another, and read back what the second pane was given. `codex2` means the
 sandbox daemon heard the reservation; `codex` means it did not.
+
+Run it by hand:
+
+    python3 scripts/alias-socket-check.py
+
+Not wired into CI. It needs a pane to hold a running agent, and on the hosted
+runner that pane closes before `mark_agent` stamps it — the launch fails with
+`no such pane` before this gets anywhere near what it measures. It discriminates
+reliably on a developer machine: with the fix the second pane mints `codex2`,
+and with the reservation pointed back at `paths::default_socket()` it mints
+`codex`. `agent_start_carries_the_callers_socket` covers the wiring in CI.
 """
 import argparse
 import os

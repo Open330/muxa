@@ -991,6 +991,35 @@ fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
 mod tests {
     use super::*;
 
+    /// The socket a launch reserves its alias against is the caller's.
+    ///
+    /// It used to be `paths::default_socket()` no matter what, so an alias
+    /// went to a daemon that did not own the pane — a name taken in the wrong
+    /// room while the right one never heard, free to hand it out again.
+    /// `scripts/alias-socket-check.py` shows the two panes that results in;
+    /// this pins the wiring that carries the socket at all.
+    #[test]
+    fn agent_start_carries_the_callers_socket() {
+        let args = StartArgs {
+            agent: AgentProgram::Codex,
+            host: LaunchHost::Tmux,
+            placement: Placement::Pane,
+            target: Some("%9".into()),
+            cwd: None,
+            prompt: None,
+            name: None,
+            workspace: None,
+            work: None,
+            role: None,
+            task: None,
+            alias: Some("reviewer".into()),
+            direction: SplitDirection::Right,
+            json: false,
+        };
+        let socket = PathBuf::from("/tmp/somewhere-else.sock");
+        assert_eq!(StartRequest::from_args(&args, &socket).socket, socket);
+    }
+
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
         StartRequest {
             socket: muxa::paths::default_socket(),
