@@ -17,7 +17,6 @@ use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
@@ -118,8 +117,11 @@ fn apply_one(action: &Action, dry_run: bool, stamp: i64, report: &mut ApplyRepor
             }
             Ok(())
         }
-        Action::StartDaemonIfNeeded => {
-            apply_start_daemon(dry_run, report);
+        Action::StartDaemonIfNeeded {
+            socket,
+            config_path,
+        } => {
+            apply_start_daemon(socket, config_path.as_deref(), dry_run, report);
             Ok(())
         }
         Action::SourceTmuxConf { path } => apply_source_tmux(path, dry_run, report),
@@ -184,13 +186,18 @@ fn apply_delete(path: &Path, dry_run: bool, report: &mut ApplyReport) -> Result<
     }
 }
 
-fn apply_start_daemon(dry_run: bool, report: &mut ApplyReport) {
+fn apply_start_daemon(
+    socket: &Path,
+    config_path: Option<&Path>,
+    dry_run: bool,
+    report: &mut ApplyReport,
+) {
     if dry_run {
         return;
     }
     // The orchestrator skips this action when --start-daemon=false,
     // so reaching here means the user wants us to ensure muxad is up.
-    match start_muxad_detached() {
+    match crate::daemon::start_detached(socket, config_path, std::time::Duration::from_secs(3)) {
         Ok(true) => report.daemon_started = true,
         Ok(false) => {} // already running
         Err(e) => report.warnings.push(format!("could not start muxad: {e}")),
@@ -349,66 +356,10 @@ fn describe(a: &Action) -> String {
         Action::DisableSystemdUnit => "disabling muxad.service".into(),
         Action::EnableLaunchdUnit { .. } => "loading launchd LaunchAgent".into(),
         Action::DisableLaunchdUnit => "unloading launchd LaunchAgent".into(),
-        Action::StartDaemonIfNeeded => "starting muxad if needed".into(),
+        Action::StartDaemonIfNeeded { .. } => "starting muxad if needed".into(),
         Action::SourceTmuxConf { path } => format!("sourcing {}", path.display()),
         Action::PrintDashboard { .. } => "rendering dashboard info".into(),
     }
-}
-
-/// Spawn `muxad` as a detached background process. Returns `Ok(true)`
-/// when we actually launched a new one, `Ok(false)` when the daemon
-/// was already serving requests on its IPC socket.
-///
-/// We probe the socket directly rather than `pgrep -x muxad`. The
-/// pgrep approach was the source of the v0.4.0 confusion: a stale
-/// muxad pid lingered with its socket gone, pgrep said "already
-/// running", we skipped the spawn, and the user's next `muxa status`
-/// still failed. Socket-connect captures the only thing that actually
-/// matters — "is the daemon answering" — and on a true cold-start
-/// (no muxad anywhere) it errors out in microseconds anyway.
-///
-/// After spawn we *poll* for the socket to come up rather than
-/// sleeping a flat 300 ms. Hot path returns in 20-40 ms; slow
-/// hardware / VMs / CI runners get up to a generous 3 s grace before
-/// we give up and surface the failure as a warning to the caller.
-fn start_muxad_detached() -> Result<bool> {
-    use std::process::Stdio;
-    use std::time::Duration;
-
-    let socket = super::util::default_muxad_socket();
-    if super::util::muxad_responsive(&socket) {
-        return Ok(false);
-    }
-    // Detach: fork-and-forget via the shell so we don't keep the
-    // current process tied to the daemon's stdio. Output goes to
-    // `/tmp/muxad.log` for debugging.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg("nohup muxad >/tmp/muxad.log 2>&1 & disown 2>/dev/null || true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawning muxad")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "muxad spawn shell exited with {}",
-            status
-                .code()
-                .map_or_else(|| "signal".into(), |c| c.to_string())
-        ));
-    }
-    // Wait for the socket to appear so a follow-up `muxa status`
-    // doesn't race the daemon's startup. Returns false if the
-    // process didn't bind in time, in which case the orchestrator's
-    // verify step will surface a "muxad not responding" warning.
-    if !super::util::wait_for_muxad(&socket, Duration::from_secs(3)) {
-        return Err(anyhow!(
-            "muxad started but did not bind {} within 3s; check /tmp/muxad.log",
-            socket.display()
-        ));
-    }
-    Ok(true)
 }
 
 /// Render a plan as dry-run diff lines. One line per action — the
@@ -460,7 +411,7 @@ pub fn render_dry_run(plan: &Plan) -> String {
             Action::DisableLaunchdUnit => {
                 let _ = writeln!(s, "  ⚙ launchctl bootout gui/<uid>/dev.open330.muxad");
             }
-            Action::StartDaemonIfNeeded => {
+            Action::StartDaemonIfNeeded { .. } => {
                 let _ = writeln!(s, "  ⚙ start muxad if not running");
             }
             Action::SourceTmuxConf { path } => {

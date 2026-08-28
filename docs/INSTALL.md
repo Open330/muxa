@@ -126,6 +126,18 @@ JSON/TOML agent config edits use command-prefix matching so uninstall can
 remove muxa hook entries without deleting user hooks. Files are backed up
 to `<file>.muxa-backup-<unix_ts>` before writes.
 
+## Daemon Lifecycle
+
+The CLI resolves `--socket`, `MUXA_SOCKET`, config, and the XDG default in
+that order, so normal lifecycle commands do not need a socket argument:
+
+```bash
+muxa daemon start
+muxa daemon status
+muxa daemon restart
+muxa daemon stop
+```
+
 ## Manual Daemon Start
 
 Foreground:

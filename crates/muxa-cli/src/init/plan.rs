@@ -45,7 +45,10 @@ pub enum Action {
     /// on the IPC socket. Cross-platform — works regardless of which
     /// (or no) daemon-manager component was selected. Honours
     /// `--start-daemon=false`.
-    StartDaemonIfNeeded,
+    StartDaemonIfNeeded {
+        socket: PathBuf,
+        config_path: Option<PathBuf>,
+    },
     /// Reload the user's tmux config in place if a tmux server is up.
     /// No-op when not inside tmux + no live server.
     SourceTmuxConf { path: PathBuf },
@@ -74,7 +77,7 @@ impl Plan {
             | Action::DisableSystemdUnit
             | Action::EnableLaunchdUnit { .. }
             | Action::DisableLaunchdUnit
-            | Action::StartDaemonIfNeeded => true,
+            | Action::StartDaemonIfNeeded { .. } => true,
             Action::SourceTmuxConf { .. } | Action::PrintDashboard { .. } => false,
         })
     }

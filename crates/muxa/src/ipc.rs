@@ -235,6 +235,10 @@ enum RequestBody {
         limit: Option<usize>,
     },
     Health,
+    /// Ask the real daemon to drain and stop cleanly. Like `restart`, this is
+    /// opt-in so embedded IPC servers used by tests and integrations cannot
+    /// be terminated by an ordinary client connection.
+    Stop,
     /// Ask the daemon to drain and re-exec itself onto the binary currently
     /// installed at its argv[0]. Opt-in: only the real daemon installs a
     /// restart controller; embedders refuse rather than shutting down with no
@@ -470,6 +474,9 @@ const CAPABILITIES: &[&str] = &[
 /// Advertised only when the server has the controller required to come back
 /// after draining. A server without one refuses `restart`.
 const RESTART_CAPABILITY: &str = "restart";
+/// Advertised only by a server with a lifecycle controller, which can flush
+/// durable writers and remove the socket before exiting.
+const STOP_CAPABILITY: &str = "stop";
 
 #[derive(Debug, Serialize)]
 pub struct Response {
@@ -722,6 +729,7 @@ impl Response {
         let mut capabilities = CAPABILITIES.to_vec();
         if restart.is_some() {
             capabilities.push(RESTART_CAPABILITY);
+            capabilities.push(STOP_CAPABILITY);
         }
         r.capabilities = Some(capabilities);
         r.generation = restart.map(RestartController::generation);
@@ -2074,6 +2082,19 @@ async fn handle(
                     kind = "health";
                     Response::health()
                 }
+                RequestBody::Stop => {
+                    kind = "stop";
+                    match &restart {
+                        Some(controller) => {
+                            tracing::info!("stop requested over IPC");
+                            controller.stop();
+                            Response::ok()
+                        }
+                        None => Response::err(
+                            "this server cannot stop itself (no lifecycle controller installed)",
+                        ),
+                    }
+                }
                 RequestBody::Restart => {
                     kind = "restart";
                     match &restart {
@@ -3136,6 +3157,21 @@ impl Client {
         if !resp["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(format!(
                 "restart rejected: {}",
+                resp["error"].as_str().unwrap_or("(no error message)")
+            ))));
+        }
+        Ok(())
+    }
+
+    /// Ask the daemon on this socket to drain and stop. Acceptance is not
+    /// completion; callers confirm completion by waiting for the socket to
+    /// stop answering.
+    pub async fn stop(&self, deadline: Duration) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "stop" });
+        let resp = self.call_with_timeout(&req, deadline).await?;
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(format!(
+                "stop rejected: {}",
                 resp["error"].as_str().unwrap_or("(no error message)")
             ))));
         }
@@ -4979,6 +5015,7 @@ mod tests {
         assert!(caps.contains(&"rate_limited"));
         assert!(caps.contains(&"collaboration_wait"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
+        assert!(!caps.contains(&STOP_CAPABILITY));
         assert!(resp["generation"].is_null());
 
         tx.send(()).unwrap();
@@ -5005,6 +5042,7 @@ mod tests {
             .capabilities
             .iter()
             .any(|cap| cap == RESTART_CAPABILITY));
+        assert!(hello.capabilities.iter().any(|cap| cap == STOP_CAPABILITY));
         assert_eq!(hello.generation, Some(7));
 
         client
@@ -5070,7 +5108,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_is_refused_without_a_controller() {
+    async fn stop_is_advertised_accepted_and_drained() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-stop.sock");
+        let store = Store::shared();
+        let (tx, rx) = broadcast::channel(1);
+        let lifecycle = Arc::new(RestartController::new(3, tx));
+        let server =
+            Server::new(sock.clone(), store).with_restart_controller(Arc::clone(&lifecycle));
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock.clone());
+        let hello = client
+            .hello(Duration::from_secs(2))
+            .await
+            .expect("hello answers");
+        assert!(hello.capabilities.iter().any(|cap| cap == STOP_CAPABILITY));
+
+        client
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("daemon accepts stop");
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("daemon drains after accepting stop")
+            .unwrap();
+        assert!(!lifecycle.restart_requested());
+        assert!(!sock.exists(), "drained server removes its socket");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_control_is_refused_without_a_controller() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-no-restart.sock");
         let store = Store::shared();
@@ -5085,6 +5154,13 @@ mod tests {
             .await
             .expect_err("embedded server refuses restart");
         assert!(error.to_string().contains("restart"));
+        assert!(UnixStream::connect(&sock).await.is_ok());
+
+        let error = client
+            .stop(Duration::from_secs(2))
+            .await
+            .expect_err("embedded server refuses stop");
+        assert!(error.to_string().contains("stop"));
         assert!(UnixStream::connect(&sock).await.is_ok());
 
         tx.send(()).unwrap();

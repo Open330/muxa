@@ -46,6 +46,10 @@ struct Daemon {
     child: Child,
     socket: PathBuf,
     config: PathBuf,
+    /// Keep test processes away from the operator's real tmux server. This is
+    /// especially important for daemon startup, which may heal the tmux-global
+    /// `MUXA_SOCKET` when it owns the selected canonical socket.
+    tmux_tmpdir: PathBuf,
     /// Per-test history NDJSON path. Tests that want to verify on-disk
     /// persistence read this directly; tests that don't care about
     /// history simply ignore it.
@@ -71,6 +75,8 @@ impl Daemon {
         let state_path = dir.join("state.json");
         let activity_path = dir.join("activity.ndjson");
         let session_activity_path = dir.join("session-activity.json");
+        let tmux_tmpdir = dir.join("tmux-tmp");
+        std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
 
         // Default config that isolates persisted state into the per-test tempdir.
         // Tests that want richer config concatenate their own TOML body.
@@ -108,6 +114,9 @@ enabled = false
             .arg("--config")
             .arg(&cfg_path)
             .env("RUST_LOG", "muxa=warn")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env("TMUX_TMPDIR", &tmux_tmpdir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -117,6 +126,7 @@ enabled = false
             child,
             socket,
             config: cfg_path,
+            tmux_tmpdir,
             history: history_path,
             activity: activity_path,
         }
@@ -129,6 +139,9 @@ enabled = false
         // the daemon reads the temporary config while the CLI can pick up an
         // operator's real ~/.config/muxa/config.toml.
         c.env("MUXA_CONFIG", &self.config);
+        c.env_remove("TMUX");
+        c.env_remove("TMUX_PANE");
+        c.env("TMUX_TMPDIR", &self.tmux_tmpdir);
         c
     }
 
@@ -140,7 +153,11 @@ enabled = false
             .expect("send SIGTERM to muxad");
         assert!(status.success(), "kill -TERM failed: {status}");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        self.wait_for_exit(Duration::from_secs(5));
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         loop {
             if self
                 .child
@@ -153,7 +170,7 @@ enabled = false
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                panic!("muxad did not complete graceful shutdown within 5s");
+                panic!("muxad did not exit within {timeout:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -388,6 +405,61 @@ fn graceful_shutdown_drains_prompt_and_activity_writers() {
 }
 
 #[test]
+fn daemon_lifecycle_commands_round_trip() {
+    let mut daemon = Daemon::spawn();
+
+    let start = daemon
+        .cli()
+        .args(["daemon", "start"])
+        .output()
+        .expect("run daemon start");
+    assert!(start.status.success());
+    assert!(String::from_utf8_lossy(&start.stdout).contains("already running"));
+
+    let status = daemon
+        .cli()
+        .args(["daemon", "status"])
+        .output()
+        .expect("run daemon status");
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("generation: 0"));
+
+    let restart = daemon
+        .cli()
+        .args(["daemon", "restart"])
+        .output()
+        .expect("run daemon restart");
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(String::from_utf8_lossy(&restart.stdout).contains("generation: 1"));
+
+    let stop = daemon
+        .cli()
+        .args(["daemon", "stop"])
+        .output()
+        .expect("run daemon stop");
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("muxad stopped"));
+    daemon.wait_for_exit(Duration::from_secs(5));
+    assert!(!daemon.socket.exists());
+
+    let status = daemon
+        .cli()
+        .args(["daemon", "status"])
+        .output()
+        .expect("run daemon status after stop");
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("is not running"));
+}
+
+#[test]
 fn claude_statusline_forward_passes_stdin_to_command() {
     // Use `--forward cat` as a trivial passthrough: whatever we write to
     // muxa's stdin should appear verbatim on muxa's stdout. This exercises
@@ -461,6 +533,8 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
     let state_path = dir.join("state.json");
     let activity_path = dir.join("activity.ndjson");
     let session_activity_path = dir.join("session-activity.json");
+    let tmux_tmpdir = dir.join("tmux-tmp");
+    std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
 
     // Tests that want the open surface must explicitly opt into the
     // `auth = "none"` escape hatch. A `Some(token)` case is wired via
@@ -508,6 +582,9 @@ path = "{}"
         .arg("--dashboard-bind")
         .arg("127.0.0.1:0")
         .env("RUST_LOG", "muxa=info")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("TMUX_TMPDIR", &tmux_tmpdir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let Some(t) = token {
@@ -546,6 +623,7 @@ path = "{}"
             child,
             socket,
             config: cfg_path,
+            tmux_tmpdir,
             history: history_path,
             activity: activity_path,
         },

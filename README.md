@@ -133,7 +133,8 @@ muxa init
 Verify:
 
 ```bash
-muxad &
+muxa daemon start
+muxa daemon status
 muxa status
 muxa watch
 ```

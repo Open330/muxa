@@ -80,7 +80,7 @@ fn parse_preset(s: &str) -> Result<Preset, String> {
     Preset::parse(s).ok_or_else(|| format!("unknown preset '{s}' (try minimal | standard | full)"))
 }
 
-pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
+pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
     let mode = Mode::detect(args.yes);
     ui::intro(mode);
 
@@ -114,7 +114,10 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
         // is dead-on-arrival. Reported by a user on macOS — `muxa
         // status` worked but `pkill -9 muxad` left muxad gone with no
         // auto-restart.
-        plan.actions.push(plan::Action::StartDaemonIfNeeded);
+        plan.actions.push(plan::Action::StartDaemonIfNeeded {
+            socket: socket.clone(),
+            config_path,
+        });
     }
     for w in &plan.warnings {
         ui::warn_line(mode, w);
