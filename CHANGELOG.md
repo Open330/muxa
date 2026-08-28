@@ -86,6 +86,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least 80 columns on the left and stacks claude and codex on the right, which
   is both what watch needs and what the next four steps are about.
 
+  `exit` is a way out, not a crash. Typing it in the learner's pane closes the
+  pane, and with it the last window, the session and the sandbox server the
+  tour polls several times a second — which surfaced tmux's own `no server
+  running on …` at somebody who had just typed `exit`. The loop treats a
+  vanished server the way it treats `Ctrl-b d`, and `scripts/exit-check.py`
+  holds it there in CI.
+
+  The learner presses Enter rather than typing `claude`. `claude` is neither
+  tmux nor muxa — the two things the tour teaches — and the sandbox only
+  pretends to have it, so asking for it taught a command that does not exist
+  outside the tour. The step asks for Enter and says the tour is setting the
+  practice agents up.
+
+  `muxa watch` gets two steps instead of half of one, because it is the way
+  into everything else: one to open it, one that names `j`/`k`, `h`/`l`,
+  `Enter` and `?` and asks them to look around before `q`. Watch owns the
+  keyboard while it runs, so leaving it is the only transition the tour can
+  see — and it is the one worth gating on.
+
+  Every pane says who it is on its own border, and says what just happened to
+  it. `pane-border-status` plus `select-pane -T`, so the label is drawn by tmux
+  in the border it was already drawing. The mailbox steps had been asking the
+  learner to believe a message left one box and arrived in another, across
+  three boxes with nothing to tell them apart.
+
+  The scripted beats are named constants held to their steps by a test.
+  Inserting a step upstream had twice moved what a bare integer pointed at
+  without failing anything: the send-on-skip fixup fired one step early, so
+  `F12` reached claude's inbox before anything was in it and the tour exited on
+  the error.
+
   The learner starts the agent themselves. Splitting a pane is one step and
   typing `claude` in it is the next, because a pane that turns into an agent on
   its own teaches that panes become agents by magic. `claude` resolves to a
