@@ -424,6 +424,9 @@ pub(crate) async fn run_fleet(
                     include_paneless,
                     view,
                     layout,
+                    // Fleet watch renders remote hosts, and a collaboration
+                    // listing is scoped to the local daemon's rooms.
+                    screen: None,
                     sort,
                     theme,
                     caller_pane: None,

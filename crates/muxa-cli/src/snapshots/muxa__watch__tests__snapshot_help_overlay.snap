@@ -27,8 +27,8 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  [/] · f/c      (in preview) agent / geometry / content                          │                           │
 │                           │  Enter          (in preview) jump to pinned pane                                 │                           │
 │                           │  m / M          message selected agent / mailbox (b alias)                       │                           │
+│                           │  Alt-1 / Alt-2  screen: topology / collaboration across all rooms                │                           │
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
-│                           │                                                                                  │                           │
 │                           │Sorting                                                                           │                           │
 │                           │  Alt-S/L/D/T    sibling name / latest / duration / state                         │                           │
 │                           │State markers                                                                     │                           │

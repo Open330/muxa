@@ -200,6 +200,10 @@
 # view = "pane"       # full session → window → pane depth
 # layout = "tree"     # selectable hierarchy (default)
 # layout = "swarm"    # dense collaboration-room clusters
+# Which list watch opens on. `topology` is everything view/layout describe;
+# `collab` lists collaboration requests across every room the daemon holds.
+# screen = "topology" # (default)
+# screen = "collab"
 # How tree children open:
 #   focus  — selected session reveals windows; selected window reveals panes
 #            in pane view, while sibling paths stay folded (default)

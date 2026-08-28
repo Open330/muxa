@@ -169,9 +169,31 @@ Press `:` while browsing to open the command palette. Type a command and press
 `Enter`; `Tab` completes the first visible match and `Esc` cancels. Available
 commands include `refresh`, `preview`, `copy`, `attention`, `events`,
 `inspector`, `sort latest|duration|session|state`, `view pane|session|swarm`,
-`help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
+`screen topology|collab`, `help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
 Runtime `view` changes use the cached snapshot immediately and remain active
 for subsequent refreshes in the current watch process.
+
+## Screens
+
+`muxa watch` shows one of two lists, chosen with `Alt-1` / `Alt-2`, the
+`screen topology|collab` palette command, `--screen`, or `[watch] screen`.
+
+`topology` is the session → window → pane tree, and everything `view` and
+`layout` describe applies to it. `collab` lists collaboration *requests*
+instead — every room the daemon holds, not just the one under the cursor,
+which is what `M` shows. That difference in what a row *is* is why this is a
+screen rather than another `layout`.
+
+The `view` axis carries over: `session` groups the listing by tmux session,
+`window` by room, and `pane` leaves it flat. A request is filed under the room
+it was raised in, so a listing at any grouping says where the work happened.
+Typing filters on either end's alias, its `session:window`, the message, the
+kind, and the status. `Enter` attaches to the peer's pane — requests outlive
+panes, so a request whose peer is gone says so rather than doing nothing.
+
+Widening past your own mailbox is an operator-console operation, so the screen
+needs a daemon built from the same tree as the CLI; an older one is reported
+rather than silently answered with a caller-scoped listing.
 
 ## Ask
 

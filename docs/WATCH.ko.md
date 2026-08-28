@@ -121,10 +121,32 @@ inbox를 열면 확인 처리됩니다.
 탐색 중 `:`를 누르면 명령 팔레트가 열립니다. 명령을 입력하고 `Enter`로 실행하며,
 `Tab`은 첫 번째 일치 항목을 완성하고 `Esc`는 취소합니다. `refresh`, `preview`,
 `copy`, `attention`, `events`, `inspector`, `sort latest|duration|session|state`,
-`view pane|session|swarm`, `help`, `quit`를 지원합니다. `kill`과 `abort`는 기존과
+`view pane|session|swarm`, `screen topology|collab`, `help`, `quit`를
+지원합니다. `kill`과 `abort`는 기존과
 동일하게 확인 popup을 거칩니다. `view` 변경은 cached snapshot에 즉시 반영되며
 현재 watch process의 이후 refresh에도 유지됩니다.
 
+
+## 화면(Screen)
+
+`muxa watch`는 두 가지 목록 중 하나를 보여주며 `Alt-1` / `Alt-2`, 팔레트의
+`screen topology|collab`, `--screen`, `[watch] screen`으로 전환합니다.
+
+`topology`는 session → window → pane 트리이고 `view`·`layout`이 설명하는 모든
+것이 여기 적용됩니다. `collab`은 대신 협업 *request*를 나열합니다 — 커서가 놓인
+방만 보여주는 `M`과 달리 daemon이 가진 모든 room이 대상입니다. 행이 무엇이냐가
+다르기 때문에 `layout`의 값이 아니라 별도 화면입니다.
+
+`view` 축은 그대로 이어집니다: `session`은 tmux session별, `window`는 room별로
+묶고 `pane`은 평면 목록입니다. request는 그것이 제기된 room 아래에 묶이므로 어느
+묶음에서도 작업이 일어난 위치를 알 수 있습니다. 타이핑하면 양쪽 끝의 alias,
+`session:window`, 메시지, kind, status를 대상으로 필터링합니다. `Enter`는 상대
+pane으로 이동합니다 — request는 pane보다 오래 남으므로 상대 pane이 사라졌으면
+아무 일도 안 하는 대신 그 사실을 알려줍니다.
+
+자기 mailbox 너머를 보는 것은 operator console 작업이라, 이 화면은 CLI와 같은
+트리에서 빌드된 daemon을 요구합니다. 구버전 daemon은 caller 범위 결과로 조용히
+답하는 대신 그 사실을 보고합니다.
 
 ## Ask
 
