@@ -3,6 +3,7 @@
 mod activity_query;
 mod agent_launch;
 mod attend;
+mod daemon;
 mod dashboard_tui;
 mod doctor;
 mod fleet_cli;
@@ -287,6 +288,11 @@ enum Cmd {
     Init(init::Args),
     /// Run end-to-end diagnostics and report any setup issues.
     Doctor,
+    /// Start, stop, restart, or inspect the local muxad process.
+    Daemon {
+        #[command(subcommand)]
+        action: daemon::Action,
+    },
     /// Learn the work/session, agent/pane policy, normal workflow, and watch shortcuts.
     Onboard(onboarding::Args),
     /// Run a Model Context Protocol (MCP) stdio server so a coding agent
@@ -757,8 +763,11 @@ async fn main() -> Result<()> {
         Cmd::FleetRemoteAttach { token } => relay::remote_attach(&token),
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
-        Cmd::Init(init_args) => init::run(init_args, socket).await,
+        Cmd::Init(init_args) => init::run(init_args, socket, config_path).await,
         Cmd::Doctor => doctor::run(socket).await,
+        Cmd::Daemon { action } => {
+            daemon::run(action, &client, &socket, config_path.as_deref()).await
+        }
         Cmd::Onboard(onboard_args) => onboarding::run(onboard_args),
         Cmd::Mcp => mcp::run(client, cfg).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,

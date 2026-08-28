@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa daemon start|stop|restart|status` owns the local daemon lifecycle.**
+  The CLI resolves the selected socket from its normal flag, environment,
+  config, and XDG precedence instead of making operators spell a uid-scoped
+  `/tmp` path. Start is detached and idempotent, status requires a real IPC
+  handshake, restart proves that the image generation advanced, and stop
+  drains the daemon's durable writers through a new owner-socket IPC request.
+  The shellrc autostart hook now calls `muxa daemon start --quiet`, so a test or
+  onboarding daemon on another socket can no longer fool `pgrep -x muxad` into
+  suppressing the user's daemon.
+
 - **`muxa onboard --tour live` — the onboarding stops simulating muxa and
   becomes it.** Fifteen steps in two acts, against a sandbox on its own tmux
   server: Act I is real `tmux new-session`, a real second window, a real detach

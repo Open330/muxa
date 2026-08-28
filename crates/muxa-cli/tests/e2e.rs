@@ -140,7 +140,11 @@ enabled = false
             .expect("send SIGTERM to muxad");
         assert!(status.success(), "kill -TERM failed: {status}");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        self.wait_for_exit(Duration::from_secs(5));
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         loop {
             if self
                 .child
@@ -153,7 +157,7 @@ enabled = false
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                panic!("muxad did not complete graceful shutdown within 5s");
+                panic!("muxad did not exit within {timeout:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -378,6 +382,61 @@ fn graceful_shutdown_drains_prompt_and_activity_writers() {
         activity.contains("state_transition"),
         "activity:\n{activity}"
     );
+}
+
+#[test]
+fn daemon_lifecycle_commands_round_trip() {
+    let mut daemon = Daemon::spawn();
+
+    let start = daemon
+        .cli()
+        .args(["daemon", "start"])
+        .output()
+        .expect("run daemon start");
+    assert!(start.status.success());
+    assert!(String::from_utf8_lossy(&start.stdout).contains("already running"));
+
+    let status = daemon
+        .cli()
+        .args(["daemon", "status"])
+        .output()
+        .expect("run daemon status");
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("generation: 0"));
+
+    let restart = daemon
+        .cli()
+        .args(["daemon", "restart"])
+        .output()
+        .expect("run daemon restart");
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(String::from_utf8_lossy(&restart.stdout).contains("generation: 1"));
+
+    let stop = daemon
+        .cli()
+        .args(["daemon", "stop"])
+        .output()
+        .expect("run daemon stop");
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("muxad stopped"));
+    daemon.wait_for_exit(Duration::from_secs(5));
+    assert!(!daemon.socket.exists());
+
+    let status = daemon
+        .cli()
+        .args(["daemon", "status"])
+        .output()
+        .expect("run daemon status after stop");
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("is not running"));
 }
 
 #[test]
