@@ -111,6 +111,26 @@ jobs:
               bin.install "muxad"
             end
 
+            # No backticks or unescaped dollar signs in here: this file is
+            # written from an unquoted shell heredoc, which would run the one
+            # as a command and expand the other.
+            def caveats
+              <<~CAVEATS
+                Upgrading does not replace a muxad that is already running: the
+                new binary lands on disk, and the live process keeps serving
+                from the old one. Since 0.8.38 muxad notices the swap on its own
+                and re-execs onto the new build within about 30 seconds.
+
+                To pick it up immediately, or after disabling that in
+                [daemon] restart_on_new_binary:
+
+                  muxa daemon restart
+
+                Run 'muxa doctor' if anything looks stale; it reports a daemon
+                whose version has drifted from the CLI's.
+              CAVEATS
+            end
+
             service do
               run [opt_bin/"muxad"]
               keep_alive true

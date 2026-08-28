@@ -213,6 +213,34 @@ legacy run-once-at-startup behavior; `enabled = false` turns discovery off
 entirely. The rescan reuses the same `tmux list-panes` the reconciler
 already runs, so the cost is negligible.
 
+## Daemon
+
+```toml
+[daemon]
+restart_on_new_binary = true
+binary_poll_secs = 30
+```
+
+Installing a new muxa does not restart the daemon on its own. The package
+manager writes the new build and repoints whatever is on `PATH`, while the
+running process keeps its open inode and serves the old logic — and no service
+manager intervenes, because `KeepAlive` and `Restart=always` react to a process
+*exiting*, which nothing did. Left alone, the daemon can serve a build that is
+weeks old, answering `protocol mismatch` to every CLI call once the wire format
+moves on.
+
+So muxad watches the binary it would re-exec through and, when that path
+resolves to a different file for two consecutive polls, re-execs onto it. The
+confirmation poll is what keeps a half-finished install from being adopted. The
+daemon replaces itself in place (same pid), so this behaves identically under
+launchd, systemd, and a bare terminal, and a failed re-exec leaves the old image
+running rather than nothing at all.
+
+Set `restart_on_new_binary = false` when something else owns the upgrade
+sequence — say a deploy that installs several binaries and restarts them in a
+particular order. `muxa daemon restart` then does it on demand, and `muxa
+doctor` reports a daemon whose version has drifted from the CLI's.
+
 ## Reconciler
 
 ```toml

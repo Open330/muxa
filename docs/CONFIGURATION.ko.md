@@ -207,6 +207,32 @@ discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`gemini`/`
 reconciler가 이미 호출하는 `tmux list-panes`를 재사용하므로 비용은 무시할
 수준입니다.
 
+## Daemon
+
+```toml
+[daemon]
+restart_on_new_binary = true
+binary_poll_secs = 30
+```
+
+새 muxa를 설치해도 데몬은 저절로 재시작하지 않습니다. 패키지 매니저는 새 빌드를
+디스크에 쓰고 `PATH` 위의 링크만 갈아끼우는데, 돌고 있는 프로세스는 열어둔 inode를
+그대로 쓰며 옛 로직을 계속 서빙합니다. 서비스 매니저도 개입하지 않습니다 —
+`KeepAlive`나 `Restart=always`는 프로세스가 *종료될 때* 반응하는데 아무것도 종료되지
+않았기 때문입니다. 그대로 두면 데몬이 몇 주 지난 빌드를 서빙하고, 와이어 포맷이
+바뀐 뒤에는 모든 CLI 호출에 `protocol mismatch`로 답하게 됩니다.
+
+그래서 muxad는 자신이 re-exec할 경로를 감시하다가, 그 경로가 두 번 연속으로 다른
+파일을 가리키면 새 빌드로 re-exec합니다. 두 번째 확인 폴링은 설치가 끝나지 않은
+중간 상태를 새 빌드로 오인하지 않기 위한 것입니다. 데몬은 제자리에서 자신을
+교체하므로(pid 동일) launchd·systemd·맨 터미널 어디서든 동일하게 동작하고,
+re-exec이 실패해도 옛 이미지가 그대로 살아 있습니다.
+
+업그레이드 순서를 다른 쪽이 관장한다면 — 예를 들어 여러 바이너리를 설치한 뒤 정해진
+순서로 재시작하는 배포라면 — `restart_on_new_binary = false`로 끄십시오. 그때는
+`muxa daemon restart`로 직접 재시작하면 되고, CLI와 버전이 어긋난 데몬은
+`muxa doctor`가 알려줍니다.
+
 ## Reconciler
 
 ```toml

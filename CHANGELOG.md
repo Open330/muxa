@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **muxad re-execs onto a new binary on its own.** Installing muxa never
+  restarted the daemon: the package manager writes the new build and repoints
+  `PATH`, the running process keeps its open inode, and no service manager
+  intervenes because `KeepAlive` and `Restart=always` react to a process
+  *exiting*. On a live host that left a six-day-old build serving, answering
+  `protocol mismatch: server=4 client=6` to every call until it was killed by
+  hand.
+
+  muxad now watches the path it would re-exec through — `argv[0]`, followed
+  through symlinks, since on a Homebrew install the upgrade happens at the far
+  end of the `bin/` link — and re-execs when that path resolves to a different
+  file on two consecutive polls. The second poll is what keeps a half-finished
+  install from being adopted: an upgrade writes a temporary file, renames it,
+  and repoints a symlink, and a poll landing between those steps sees a file
+  that is real and about to be replaced again. Identity is device, inode, size
+  and mtime, so a write-in-place install that reuses the inode is still seen.
+
+  The daemon replaces itself in place rather than exiting for a supervisor to
+  catch, so this behaves the same under launchd, systemd, or a bare terminal,
+  and a failed re-exec leaves the old image running rather than a hole where
+  the daemon was. `[daemon] restart_on_new_binary = false` turns it off for
+  deploys that own their own restart ordering; `binary_poll_secs` (default 30)
+  sets the cadence.
+
+- **The Homebrew formula says what an upgrade does not do.** Its `caveats`
+  now note that a running muxad is not replaced by the install, name the
+  30-second window the daemon takes to pick the new build up, and give
+  `muxa daemon restart` for anyone who wants it now.
+
 ### Fixed
 
 - **A daemon left running across an upgrade now says so, and can be fixed

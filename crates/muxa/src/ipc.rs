@@ -813,6 +813,15 @@ impl RestartController {
         self.state.load(AtomicOrdering::SeqCst) == RESTART_REQUESTED
     }
 
+    /// Ask for a restart from inside the daemon itself, rather than over IPC.
+    ///
+    /// Same transition and the same refusal after a stop has won: a watcher
+    /// that notices a new binary mid-shutdown must not resurrect the process
+    /// the operator is deliberately stopping.
+    pub fn request_self_restart(&self) -> bool {
+        self.request_restart()
+    }
+
     /// Returns false only after an explicit stop has won. Repeated restart
     /// requests are idempotently accepted while the first request drains.
     fn request_restart(&self) -> bool {
