@@ -42,6 +42,15 @@ const SANDBOX_SCRIPT: &str = include_str!("../../../../scripts/muxa-sandbox.sh")
 const SANDBOX_NAME_PREFIX: &str = "muxa-onboarding";
 const POLL: Duration = Duration::from_millis(250);
 
+/// The block printed when nobody is attached to a status bar.
+const RULE_WIDTH: usize = 64;
+const BAR_WIDTH: usize = 24;
+/// Commands longer than this take their own line in the closing summary.
+const ALIGN_LIMIT: usize = 32;
+/// What the learner's `PS1` renders, so a printed block can end with the same
+/// thing bash would have drawn on the line it replaced.
+const PROMPT: &str = " muxa-onboarding $ ";
+
 /// Long enough that nobody reading the screen feels rushed, short enough that
 /// an abandoned terminal does not hold a sandbox open all afternoon.
 const STEP_TIMEOUT: Duration = Duration::from_secs(900);
@@ -268,16 +277,18 @@ impl Sandbox {
         use std::fmt::Write as _;
 
         let mut body = String::from("unset PROMPT_COMMAND\n");
+        // The reminder goes through `PROMPT_COMMAND` rather than `PS1`:
+        // `$(cat …)` strips trailing newlines, so a reminder rendered in the
+        // prompt ran straight into `muxa-onboarding $` on the same line.
+        // Inside tmux the status bar already says all this.
         let _ = writeln!(
             body,
-            "export PROMPT_COMMAND='history 1 | sed \"s/^ *[0-9]* *//\" >> {}'",
-            self.history.display()
-        );
-        let _ = writeln!(
-            body,
-            "export PS1='$([ -z \"$TMUX\" ] && cat {} 2>/dev/null)muxa-onboarding $ '",
+            "export PROMPT_COMMAND='history 1 | sed \"s/^ *[0-9]* *//\" >> {}; \
+             [ -z \"$TMUX\" ] && cat {} 2>/dev/null'",
+            self.history.display(),
             self.cue.display()
         );
+        let _ = writeln!(body, "export PS1='{PROMPT}'");
         // Every pane, not just the first: a window the learner opens at step 2
         // would otherwise land back in their own home directory.
         let _ = writeln!(body, "export HOME='{}'", self.home.display());
@@ -563,6 +574,11 @@ impl Sandbox {
         }
         let _ = self.tmux_command(&["set", "-gu", option]);
         true
+    }
+
+    /// What the learner's prompt shows above itself, until the step changes.
+    fn write_cue(&self, line: &str) -> Result<()> {
+        std::fs::write(&self.cue, line).context("writing the prompt's step reminder")
     }
 
     /// Whether the sandbox server is still there.
@@ -1597,6 +1613,20 @@ pub(super) fn step_count() -> usize {
 
 /// The step that opens once the learner has started claude: the pane they ran
 /// it in becomes claude's, and codex lands beside it.
+/// One line of the current step, for above the shell prompt.
+///
+/// The full block is printed once, when the step changes. Running a command
+/// scrolls it away, so the prompt carries a short reminder of what was asked —
+/// otherwise the learner is left with a bare prompt and the last command's
+/// output, and the instruction somewhere above.
+fn reminder_line(index: usize, cue: &str) -> String {
+    format!(
+        "{DIM}▸ {}/{}{RESET}  {YELLOW}{cue}{RESET}\n",
+        index + 1,
+        STEPS.len()
+    )
+}
+
 const AGENTS_ARRIVE: usize = 8;
 
 /// The step that asks them to split — one before the one that asks for Enter,
@@ -1620,20 +1650,33 @@ const CLAUDE_FINISHES_STEP: usize = 15;
 // Run
 // ---------------------------------------------------------------------------
 
+/// One-way facts about the run so far.
+#[derive(Default)]
+struct Seen {
+    /// They opened the session tree.
+    tree: bool,
+    /// They opened `muxa watch`.
+    watch: bool,
+    /// Their shell has drawn a prompt, so printing must make room for one.
+    prompt: bool,
+}
+
 struct Tour<'a> {
     sandbox: &'a Sandbox,
     /// Mutable: `F2` switches it mid-tour, the way the simulation's footer did.
     language: UiLanguage,
     fleet: Option<Fleet>,
     /// The tree opens and closes; the step is the whole gesture.
-    saw_tree: bool,
-    /// Set once watch is up, so leaving it can be told from never opening it.
-    saw_watch: bool,
+    /// One-way facts about the run so far: the tree was opened, watch was
+    /// opened, the shell has drawn a prompt. Separate `bool` fields said the
+    /// same thing four times over.
+    seen: Seen,
     /// Panes present before the learner split, so the new one is identifiable.
     before_split: Vec<String>,
     /// Prompt draws at the moment the current step opened, so a step can ask
     /// for a bare Enter and know when it arrives.
     prompts_at_entry: usize,
+
     /// `--no-quiz` does not remove the steps — there is nothing to remove, the
     /// tour is the real thing — so it offers the way past from the start
     /// instead of after a wait.
@@ -1696,10 +1739,10 @@ impl Tour<'_> {
                     .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_mode}"])
                     .contains("tree");
                 if in_tree {
-                    self.saw_tree = true;
+                    self.seen.tree = true;
                     return false;
                 }
-                self.saw_tree
+                self.seen.tree
             }
             Detect::NoClient => self.clients().is_empty(),
             Detect::TypedCommand(prefix) => self.sandbox.ran_command(prefix),
@@ -1726,10 +1769,10 @@ impl Tour<'_> {
                     .lines()
                     .any(|line| line.trim() == "muxa");
                 if running {
-                    self.saw_watch = true;
+                    self.seen.watch = true;
                     return false;
                 }
-                self.saw_watch
+                self.seen.watch
             }
             Detect::PaneRunning(command) => self
                 .sandbox
@@ -1960,6 +2003,48 @@ impl Tour<'_> {
             .map(|_| ())
     }
 
+    /// The step, for the beats where nobody is attached to a status bar.
+    ///
+    /// Bash has usually drawn its prompt on this line already, and writing
+    /// beside it is how a doubled `muxa-onboarding $` and a half-eaten Korean
+    /// line reached the learner. Erase that line first, and re-issue the
+    /// prompt afterwards — bash will not draw a second one for a line it has
+    /// finished. Before the shell exists there is nothing to erase and nothing
+    /// to replace: bash draws the first prompt itself.
+    fn print_step(&self, index: usize, achieved: &str, title: &str, cue: &str) -> Result<()> {
+        let rule = "─".repeat(RULE_WIDTH);
+        let done = (index + 1) * BAR_WIDTH / STEPS.len();
+        let bar = format!(
+            "{GREEN}{}{RESET}{DIM}{}{RESET}",
+            "━".repeat(done),
+            "━".repeat(BAR_WIDTH - done)
+        );
+        // Erase whatever bash left on this line first. Writing beside a prompt
+        // it had already drawn is where the doubled `muxa-onboarding $` and the
+        // half-eaten Korean line came from. Before the shell exists there is
+        // nothing to erase, and bash draws the first prompt itself.
+        let clear = if self.seen.prompt { "\r\x1b[2K" } else { "" };
+        let tail = if self.seen.prompt {
+            format!("{}{PROMPT}", reminder_line(index, cue))
+        } else {
+            String::new()
+        };
+        print!(
+            "{clear}\n{DIM}{rule}{RESET}\n\
+             {BOLD}muxa onboarding{RESET}  {DIM}{}/{}{RESET}  {bar}\n\
+             {GREEN}{achieved}{RESET}\n\
+             {title}\n\
+             {YELLOW}{BOLD}{cue}{RESET}\n\
+             {DIM}{rule}{RESET}\n{tail}",
+            index + 1,
+            STEPS.len()
+        );
+        std::io::stdout()
+            .flush()
+            .context("printing live-tour narration")?;
+        Ok(())
+    }
+
     fn narrate(&self, index: usize, escape: bool) -> Result<()> {
         let step = &STEPS[index];
         let achieved = tr(self.language, step.achieved_en, step.achieved_ko);
@@ -1972,6 +2057,11 @@ impl Tour<'_> {
                 "막혔나요?  F12  로 이 단계를 건너뜁니다",
             )
         });
+
+        // Their prompt reads this on every redraw, so running a command does
+        // not scroll the instruction away — the block above is printed once,
+        // when the step changes, and this line comes back with every prompt.
+        self.sandbox.write_cue(&reminder_line(index, cue))?;
 
         self.sandbox.narrate(
             index + 1,
@@ -2000,19 +2090,7 @@ impl Tour<'_> {
         // ends with the prompt, so whatever they type next has one in front of
         // it.
         if self.clients().is_empty() {
-            let rule = "─".repeat(64);
-            print!(
-                "\n{DIM}{rule}{RESET}\n\
-                 {BOLD}muxa onboarding · {}/{}{RESET}   {GREEN}{achieved}{RESET}\n\
-                 {title}\n\
-                 {YELLOW}{BOLD}{cue}{RESET}\n\
-                 {DIM}{rule}{RESET}\n muxa-onboarding $ ",
-                index + 1,
-                STEPS.len()
-            );
-            std::io::stdout()
-                .flush()
-                .context("printing live-tour narration")?;
+            self.print_step(index, achieved, title, cue)?;
         }
         Ok(())
     }
@@ -2115,8 +2193,7 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
             sandbox: &sandbox,
             language,
             fleet: None,
-            saw_tree: false,
-            saw_watch: false,
+            seen: Seen::default(),
             before_split: Vec::new(),
             prompts_at_entry: 0,
             no_quiz,
@@ -2147,6 +2224,78 @@ fn preflight(language: UiLanguage) -> Result<()> {
     Ok(())
 }
 
+/// What the learner can do on their own machine, once the sandbox is gone.
+const OWN_FLEET: &[(&str, &str, &str)] = &[
+    (
+        "tmux new-session -s <work>",
+        "a session is a workspace",
+        "session은 workspace",
+    ),
+    (
+        "muxa watch",
+        "the way in — j/k moves, Enter jumps, ? lists the keys",
+        "진입점 — j/k 이동, Enter 진입, ? 로 키 목록",
+    ),
+    (
+        "muxa attend",
+        "jump to whichever agent has been blocked longest",
+        "가장 오래 막힌 agent로 이동",
+    ),
+    (
+        "muxa msg send @<alias> \"…\"",
+        "ask an agent without attaching",
+        "attach 없이 agent에게 묻기",
+    ),
+    (
+        "muxa msg inbox",
+        "claim what was sent to you",
+        "당신 앞으로 온 요청 가져오기",
+    ),
+];
+
+/// The parts of muxa the tour did not have room for.
+const WORTH_KNOWING: &[(&str, &str, &str)] = &[
+    (
+        "muxa peek",
+        "every pane in this window at once, with a digit to jump by",
+        "이 window의 모든 pane을 한눈에, 숫자로 이동",
+    ),
+    (
+        "muxa stats",
+        "prompt history, live agents, and how long the session has run",
+        "프롬프트 이력·활성 agent·세션 지속 시간",
+    ),
+    (
+        "muxa timeline",
+        "when each agent worked, waited, or failed",
+        "각 agent가 언제 일했고 기다렸고 실패했는지",
+    ),
+    (
+        "muxa work up",
+        "staff a whole Work at once instead of a pane at a time",
+        "pane 하나씩이 아니라 Work 전체를 한 번에 구성",
+    ),
+    (
+        "muxa doctor",
+        "check the setup end to end",
+        "설치 상태를 처음부터 끝까지 점검",
+    ),
+];
+
+/// The tour installs nothing, so it has to say how to get a real muxa.
+const INSTALLING: &[(&str, &str, &str)] = &[
+    (
+        "curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh",
+        "builds muxa and muxad, then runs `muxa init`",
+        "muxa와 muxad를 빌드하고 `muxa init`까지 실행합니다",
+    ),
+    (
+        "muxa init",
+        "wire tmux, agent hooks, and the dashboard",
+        "tmux·agent hook·대시보드 연결",
+    ),
+];
+
 fn summary(language: UiLanguage, completed: usize) {
     println!();
     println!(
@@ -2165,23 +2314,80 @@ fn summary(language: UiLanguage, completed: usize) {
             )
         }
     );
+
+    // Everything below is about the learner's own machine. A tour that ends
+    // without saying how to keep what you just learned to use is a demo.
+    section(
+        language,
+        "The same commands, on your own fleet",
+        "직접 쓰실 때도 같은 명령입니다",
+        OWN_FLEET,
+    );
+    section(
+        language,
+        "Worth knowing next",
+        "다음으로 볼 만한 것",
+        WORTH_KNOWING,
+    );
+    section(
+        language,
+        "Installing it for real",
+        "실제로 설치하기",
+        INSTALLING,
+    );
+
     println!();
-    println!(
-        "{}",
+    for line in [
         tr(
             language,
-            "The same commands work on your own fleet:",
-            "직접 쓰실 때도 같은 명령입니다:",
+            "Docs:  https://github.com/Open330/muxa#readme",
+            "문서:  https://github.com/Open330/muxa/blob/main/README.ko.md",
+        ),
+        tr(
+            language,
+            "Install guide:  https://github.com/Open330/muxa/blob/main/docs/INSTALL.md",
+            "설치 안내:  https://github.com/Open330/muxa/blob/main/docs/INSTALL.ko.md",
+        ),
+    ] {
+        println!("  {line}");
+    }
+    println!();
+    println!(
+        "  {}",
+        tr(
+            language,
+            "Run this tour again any time:  muxa onboard   ·   the written guide:  muxa onboard --print",
+            "이 tour는 언제든 다시:  muxa onboard   ·   문서로 보기:  muxa onboard --print",
         )
     );
-    for line in [
-        "  tmux new-session -s <work>",
-        "  muxa watch",
-        "  muxa attend",
-        "  muxa msg send @<alias> \"…\"",
-        "  muxa msg inbox",
-    ] {
-        println!("{line}");
+}
+
+/// A titled block of `command — what it is for`, aligned on the command.
+fn section(
+    language: UiLanguage,
+    title_en: &'static str,
+    title_ko: &'static str,
+    rows: &[(&'static str, &'static str, &'static str)],
+) {
+    println!();
+    println!("{BOLD}{}{RESET}", tr(language, title_en, title_ko));
+    // Aligned on the commands that fit. One long command — the install
+    // one-liner — would otherwise push every gloss beside it off the screen,
+    // so it takes a line of its own and its gloss goes underneath.
+    let width = rows
+        .iter()
+        .map(|(cmd, ..)| cmd.chars().count())
+        .filter(|len| *len <= ALIGN_LIMIT)
+        .max()
+        .unwrap_or(0);
+    for (command, gloss_en, gloss_ko) in rows {
+        let gloss = tr(language, gloss_en, gloss_ko);
+        if command.chars().count() > ALIGN_LIMIT {
+            println!("  {command}");
+            println!("  {:width$}   {DIM}{gloss}{RESET}", "");
+        } else {
+            println!("  {command:<width$}   {DIM}{gloss}{RESET}");
+        }
     }
 }
 
