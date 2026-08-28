@@ -6877,6 +6877,17 @@ fn current_backend_endpoint(host: muxa::HostKind, pane_id: &str) -> Option<Backe
     })
 }
 
+/// Ask the background refresh task for an immediate sync and let the title
+/// show that one is in flight.
+///
+/// Coalesce repeated requests: a full wake slot already means a refresh is
+/// pending, so a `try_send` failure is fine — the in-flight request picks up
+/// this intent too.
+fn request_refresh(app: &mut App, wake_tx: &mpsc::Sender<()>) {
+    let _ = wake_tx.try_send(());
+    app.refresh_pending = true;
+}
+
 /// Entry point for `muxa watch`.
 ///
 /// Returns the exact topology pane (or a legacy raw pane target from an old
@@ -7082,12 +7093,7 @@ pub async fn run(
                     break;
                 }
                 Action::Refresh => {
-                    // Coalesce repeated `r` mashes: if the wake slot is
-                    // already full a request is pending, so a `try_send`
-                    // failure is fine — the in-flight request will pick
-                    // up the user's intent.
-                    let _ = wake_tx.try_send(());
-                    app.refresh_pending = true;
+                    request_refresh(&mut app, &wake_tx);
                     refresh_watch_collaboration(client, &mut app).await;
                 }
                 Action::OpenPreview => {
@@ -7214,19 +7220,7 @@ pub async fn run(
                     app.work_composer = Some(WorkComposer::default());
                 }
                 Action::SubmitRename => {
-                    let result = app.rename.as_ref().map(apply_rename);
-                    if let Some(result) = result {
-                        match result {
-                            Ok(message) => {
-                                app.rename = None;
-                                app.set_hint(message, HintLevel::Ok);
-                            }
-                            // Keep the form and its input open so a duplicate,
-                            // invalid value, or transient tmux failure can be
-                            // corrected instead of making the user retype it.
-                            Err(e) => app.set_hint(format!("rename failed: {e}"), HintLevel::Err),
-                        }
-                    }
+                    finish_rename(&mut app, &wake_tx, apply_rename);
                 }
                 Action::SubmitWorkUp => {
                     if let Some(work) = app.work_composer.take() {
@@ -9346,6 +9340,37 @@ fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> 
         }
     }
     Ok(format!("renamed {} to {name:?}", rename.level.label()))
+}
+
+/// Apply the open rename form and reconcile the list with the result.
+///
+/// The rename lands in tmux, not in muxad, so nothing on the push stream
+/// announces it. Without an explicit refresh the row keeps its old name until
+/// the next fallback tick — five seconds while the subscription is live, which
+/// reads as "the rename did not take". `compute_refresh` rescans the backends
+/// on every wake, so one request is enough to redraw the new name.
+///
+/// `apply` is injected so tests can exercise both outcomes without shelling
+/// out to tmux.
+fn finish_rename(
+    app: &mut App,
+    wake_tx: &mpsc::Sender<()>,
+    apply: impl FnOnce(&RenameComposer) -> std::result::Result<String, String>,
+) {
+    let Some(result) = app.rename.as_ref().map(apply) else {
+        return;
+    };
+    match result {
+        Ok(message) => {
+            app.rename = None;
+            app.set_hint(message, HintLevel::Ok);
+            request_refresh(app, wake_tx);
+        }
+        // Keep the form and its input open so a duplicate, invalid value, or
+        // transient tmux failure can be corrected instead of making the user
+        // retype it. Nothing changed, so nothing needs refreshing.
+        Err(e) => app.set_hint(format!("rename failed: {e}"), HintLevel::Err),
+    }
 }
 
 fn handle_rename_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
@@ -23537,6 +23562,29 @@ sort = ["state"]
         // The composer survives until the run loop takes it — the apply needs
         // the key it captured when the form opened.
         assert!(app.rename.is_some());
+    }
+
+    #[test]
+    fn rename_success_asks_for_an_immediate_refresh() {
+        // The rename lands in tmux, and muxad has nothing to announce about
+        // it. Without this wake the row keeps its old name until the fallback
+        // tick, which reads as a rename that silently did not take.
+        let mut app = rename_app(RenameLevel::Window, "cal-7306");
+        let (wake_tx, mut wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
+        finish_rename(&mut app, &wake_tx, |_| Ok("renamed window".into()));
+        assert!(app.rename.is_none(), "the form closes on success");
+        assert!(app.refresh_pending, "the title shows the sync in flight");
+        assert!(wake_rx.try_recv().is_ok(), "the refresh task was woken");
+    }
+
+    #[test]
+    fn rename_failure_keeps_the_form_and_skips_the_refresh() {
+        let mut app = rename_app(RenameLevel::Window, "cal-7306");
+        let (wake_tx, mut wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
+        finish_rename(&mut app, &wake_tx, |_| Err("duplicate window name".into()));
+        assert!(app.rename.is_some(), "the form stays open to be corrected");
+        assert!(!app.refresh_pending, "nothing changed to resync");
+        assert!(wake_rx.try_recv().is_err(), "no wake for a failed rename");
     }
 
     #[test]
