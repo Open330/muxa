@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least 80 columns on the left and stacks claude and codex on the right, which
   is both what watch needs and what the next four steps are about.
 
+  The sandbox stopped reading the caller's `~/.tmux.conf`. It never passed
+  `-f`, so the sandbox server loaded it — bindings, options and, the one that
+  actually bit, hooks. muxa's own `tmux-auto-view`, on by default since
+  v0.8.36, binds `client-attached` to hand an arriving client its own
+  session-group view; inside the sandbox that fired the instant the learner
+  ran `tmux attach`, moved them straight back out, and ended the tour at step
+  six with `[detached (from session muxa-onboarding)]`. `--tmux-config` still
+  supplies one deliberately; the default is `/dev/null`, and
+  `scripts/config-isolation-check.py` holds it there.
+
   `exit` is a way out, not a crash. Typing it in the learner's pane closes the
   pane, and with it the last window, the session and the sandbox server the
   tour polls several times a second — which surfaced tmux's own `no server
