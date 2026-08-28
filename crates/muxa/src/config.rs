@@ -1616,6 +1616,16 @@ pub enum WatchLayout {
     /// Dense animated collaboration-room clusters. Node identities and the
     /// requested topology depth remain unchanged.
     Swarm,
+    /// Flat one-row-per-Work table mirroring `muxa work list`: work identity,
+    /// workspace, pipeline generation, alias statuses, done ratio and cwd,
+    /// with the live state gauge the CLI table has no way to show.
+    ///
+    /// The same canonical node set as `tree` — the rows *are* the window
+    /// nodes, so selection, attach, preview and the composer all still address
+    /// a Work. Only the session and pane levels fold away, because the
+    /// workspace is a column here and a Work's panes are summarised by their
+    /// alias statuses.
+    Work,
 }
 
 /// What `muxa watch` is a list *of*.

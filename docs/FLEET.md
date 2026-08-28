@@ -207,7 +207,7 @@ The multi-node Fleet TUI uses the same focused navigation conventions:
 - Enter attaches directly on `local` or through a separate remote SSH TTY,
   and `?` shows help. `muxa init` binds `prefix+s` to local watch and
   `prefix+S` to Fleet watch.
-- `--view`, `--layout tree|swarm`, `--sort`, and `--theme` use the same values
+- `--view`, `--layout tree|swarm|work`, `--sort`, and `--theme` use the same values
   as native watch. `focus` expansion follows the selected view depth,
   `manual` changes only through structural keys, and global `J`/`K` jumps
   reveal only the target's ancestors.

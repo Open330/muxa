@@ -176,9 +176,25 @@ Press `:` while browsing to open the command palette. Type a command and press
 `Enter`; `Tab` completes the first visible match and `Esc` cancels. Available
 commands include `refresh`, `preview`, `copy`, `attention`, `events`,
 `inspector`, `sort latest|duration|session|state`, `view pane|session|swarm`,
-`screen topology|collab`, `help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
+`layout tree|swarm|work`, `screen topology|collab`, `help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
 Runtime `view` changes use the cached snapshot immediately and remain active
 for subsequent refreshes in the current watch process.
+
+## The work layout
+
+`W` swaps the tree for a flat table of Works — one row each, mirroring
+`muxa work list` column for column (WORK, WORKSPACE, GEN, ALIASES, DONE, CWD)
+and adding the live state gauge a CLI table cannot show. `W` again returns to
+whatever layout it interrupted, so a swarm is not silently discarded; the
+palette's `layout work` and `--layout work` reach it too, as does
+`[watch] layout = "work"`.
+
+The rows *are* the window nodes, so attach, preview, the composer and kill all
+address a Work exactly as they do in the tree, and the cursor survives a layout
+switch without translation. Only the session and pane levels fold away: the
+workspace is a column here, and a Work's panes are summarised by their alias
+statuses. Movement is over the whole list rather than the tree's sibling group,
+since a flat table shows no ancestry to move within.
 
 ## Screens
 

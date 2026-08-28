@@ -1711,7 +1711,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M          message selected agent / mailbox (b alias)",
-        "  Alt-1 / Alt-2  screen: topology / collaboration across all rooms",
+        "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  i / e          (in mailbox) claim inbox / reply",
         "Sorting",
         "  Alt-S/L/D/T    sibling name / latest / duration / state",
@@ -2730,6 +2730,9 @@ pub(crate) struct App {
     /// glance preference, not configuration.
     inspector_split: InspectorSplit,
     collaboration_mailbox: CollaborationMailboxState,
+    /// What `W` returns to. A toggle that always went back to `tree` would
+    /// silently discard a swarm the operator was in the middle of using.
+    previous_layout: WatchLayout,
     /// Fleet-wide collaboration listing, populated only while its screen is
     /// the one on show — an operator surface has no business polling every
     /// room in the daemon to render a topology tree.
@@ -2999,6 +3002,7 @@ impl App {
             collaboration_scope: muxa::config::CollaborationScope::default(),
             inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
+            previous_layout: WatchLayout::Tree,
             collab: CollabScreen::default(),
             collaboration_composer: None,
             message_skills: BTreeMap::new(),
@@ -3336,9 +3340,23 @@ impl App {
             .map(|pane| pane.key.clone())
     }
 
+    /// What `W` would switch to from here, without switching.
+    fn next_work_layout(&self) -> WatchLayout {
+        if self.watch_cfg.layout == WatchLayout::Work {
+            self.previous_layout
+        } else {
+            WatchLayout::Work
+        }
+    }
+
     pub(crate) fn apply_layout(&mut self, layout: WatchLayout) {
         if self.watch_cfg.layout == layout {
             return;
+        }
+        // Whichever route reached the work table — `W`, the palette, or a
+        // config default — `W` has to know what it interrupted.
+        if layout == WatchLayout::Work {
+            self.previous_layout = self.watch_cfg.layout;
         }
         let selected = self.selection_identity_for_rebuild();
         let agents = self.current_agents();
@@ -3476,6 +3494,9 @@ impl App {
     }
 
     fn tree_targets(&self) -> Vec<TreeTarget> {
+        if self.watch_cfg.layout == WatchLayout::Work {
+            return self.work_targets();
+        }
         let query = self.search_query.trim().to_lowercase();
         let filtering = !query.is_empty() || self.attention_only;
         let sessions = self.sorted_sessions();
@@ -3570,6 +3591,46 @@ impl App {
                     });
                 }
             }
+        }
+        targets
+    }
+
+    /// One row per Work, in the sibling order the tree would have used.
+    ///
+    /// Window nodes, not a parallel row type: everything that acts on the
+    /// cursor — attach, preview, the composer, kill — addresses a topology
+    /// key, so a Work here answers those exactly as it does in the tree, and
+    /// the selection survives a layout switch without translation.
+    fn work_targets(&self) -> Vec<TreeTarget> {
+        let query = self.search_query.trim().to_lowercase();
+        let mut targets = Vec::new();
+        let sessions: Vec<_> = self
+            .sorted_sessions()
+            .into_iter()
+            .filter(|session| tree_session_relevant(session, &query, self.attention_only))
+            .collect();
+        for session in sessions {
+            for window in self.sorted_windows(session.windows.iter().filter(|window| {
+                tree_window_relevant(window, session, &query, self.attention_only)
+            })) {
+                targets.push(TreeTarget {
+                    key: window.node_key(),
+                    // Session-row compaction is a tree affordance: it folds a
+                    // lone window into its session so the tree does not spend
+                    // two rows on one Work. Here the Work *is* the row.
+                    compacted_window: None,
+                    // Flat: no ancestry to draw, and nothing to expand into
+                    // — a Work's panes are the ALIASES column here.
+                    depth: 0,
+                    is_last_sibling: false,
+                    parent_is_last_sibling: true,
+                    has_children: false,
+                    expanded: false,
+                });
+            }
+        }
+        if let Some(last) = targets.last_mut() {
+            last.is_last_sibling = true;
         }
         targets
     }
@@ -4182,7 +4243,14 @@ impl App {
         targets: &[TreeTarget],
         current: usize,
     ) -> (Vec<usize>, usize) {
-        if self.watch_cfg.tree_expansion != WatchTreeExpansion::Focus {
+        // The accordion rule — vertical movement stays inside the selected
+        // node's sibling group — exists because the tree shows ancestry. The
+        // work table shows none: every row is a Work, and rows from different
+        // sessions are siblings of nothing, which would strand the cursor on
+        // whichever row it started on.
+        if self.watch_cfg.layout == WatchLayout::Work
+            || self.watch_cfg.tree_expansion != WatchTreeExpansion::Focus
+        {
             return ((0..targets.len()).collect(), current);
         }
 
@@ -7305,6 +7373,7 @@ pub async fn run(
                     let label = match layout {
                         WatchLayout::Tree => "tree",
                         WatchLayout::Swarm => "swarm",
+                        WatchLayout::Work => "work",
                     };
                     app.set_hint(format!("layout: {label}"), HintLevel::Ok);
                 }
@@ -8776,6 +8845,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "show swarm clusters",
     },
     CommandSpec {
+        command: "layout work",
+        description: "show one row per Work",
+    },
+    CommandSpec {
         command: "screen topology",
         description: "show sessions, windows and panes",
     },
@@ -8861,6 +8934,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "view pane" | "view panes" => Action::SetView(WatchView::Pane),
         "screen topology" | "topology" => Action::SetScreen(WatchScreen::Topology),
         "screen collab" | "collab" => Action::SetScreen(WatchScreen::Collab),
+        "layout work" | "work" => Action::SetLayout(WatchLayout::Work),
         "layout tree" => Action::SetLayout(WatchLayout::Tree),
         "layout swarm" => Action::SetLayout(WatchLayout::Swarm),
         "" => {
@@ -9198,6 +9272,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             app.open_rename();
             Action::None
         }
+        KeyCode::Char('W') if app.browse_keys_active() => Action::SetLayout(app.next_work_layout()),
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_work_parent();
@@ -13077,6 +13152,8 @@ fn render_primary_body(
     }
     if app.legacy_flat_table {
         render_table(f, area, app);
+    } else if app.watch_cfg.layout == WatchLayout::Work {
+        render_work_table(f, area, app, tree_targets.unwrap_or_default());
     } else if app.watch_cfg.layout == WatchLayout::Swarm {
         render_swarm(f, area, app, tree_targets.unwrap_or_default());
     } else {
@@ -14712,6 +14789,201 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
         .replace('\n', " ");
     parts.push(activity);
     parts.join(" · ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkTableColumn {
+    State,
+    Work,
+    Workspace,
+    Generation,
+    Aliases,
+    Done,
+    Cwd,
+}
+
+impl WorkTableColumn {
+    fn header(self) -> &'static str {
+        match self {
+            Self::State => "STATE",
+            Self::Work => "WORK",
+            Self::Workspace => "WORKSPACE",
+            Self::Generation => "GEN",
+            Self::Aliases => "ALIASES",
+            Self::Done => "DONE",
+            Self::Cwd => "CWD",
+        }
+    }
+
+    fn constraint(self) -> Constraint {
+        match self {
+            Self::State => Constraint::Length(7),
+            Self::Work | Self::Cwd => Constraint::Min(16),
+            Self::Workspace => Constraint::Length(16),
+            Self::Generation | Self::Done => Constraint::Length(5),
+            Self::Aliases => Constraint::Min(18),
+        }
+    }
+}
+
+/// Columns that fit `width`, dropped in reverse order of what identifies a
+/// Work. WORK and its live state survive to the narrowest popup; the cwd and
+/// the workspace are the first to go, being the most inferable from the rest.
+fn work_table_columns(width: u16) -> Vec<WorkTableColumn> {
+    let mut columns = vec![
+        WorkTableColumn::State,
+        WorkTableColumn::Work,
+        WorkTableColumn::Aliases,
+        WorkTableColumn::Done,
+    ];
+    if width >= 80 {
+        columns.insert(2, WorkTableColumn::Workspace);
+    }
+    if width >= 96 {
+        columns.insert(columns.len() - 1, WorkTableColumn::Generation);
+    }
+    if width >= 110 {
+        columns.push(WorkTableColumn::Cwd);
+    }
+    columns
+}
+
+/// Who is in the Work: pipeline aliases with their statuses when it has a Run,
+/// otherwise the agent programs collapsed so three claudes read as `claude x3`
+/// rather than three identical words.
+fn work_alias_summary(window: &muxa::topology::WindowNode) -> String {
+    if let Some(run) = window.pipeline_run.as_ref() {
+        if !run.aliases.is_empty() {
+            return run
+                .aliases
+                .iter()
+                .map(|alias| format!("{}:{}", alias.alias, alias.status))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        }
+    }
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for pane in &window.panes {
+        let Some(agent) = pane.agent.as_ref() else {
+            continue;
+        };
+        let label = agent_kind_short(agent.kind);
+        match counts.iter_mut().find(|(name, _)| *name == label) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return "-".to_string();
+    }
+    counts
+        .into_iter()
+        .map(|(name, count)| {
+            if count == 1 {
+                name.to_string()
+            } else {
+                format!("{name} x{count}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// `done/total`, or `-` when nothing here was ever asked to report.
+///
+/// A hand-split window has no pipeline, and `0/0` there would read as work
+/// that has not finished rather than work that never reported.
+fn work_done_cell(window: &muxa::topology::WindowNode) -> String {
+    match window.completion {
+        None => "-".to_string(),
+        Some(completion) if completion.total == 0 => "-".to_string(),
+        Some(completion) => format!("{}/{}", completion.done, completion.total),
+    }
+}
+
+fn work_cwd_cell(window: &muxa::topology::WindowNode) -> String {
+    let Some(cwd) = window.cwd.as_deref() else {
+        return "-".to_string();
+    };
+    let Some(home) = dirs::home_dir() else {
+        return cwd.to_string();
+    };
+    std::path::Path::new(cwd)
+        .strip_prefix(&home)
+        .map_or_else(|_| cwd.to_string(), |rest| format!("~/{}", rest.display()))
+}
+
+/// The flat one-row-per-Work table.
+///
+/// Mirrors `muxa work list` column for column, plus the live STATE gauge the
+/// CLI table cannot show: the point of reading this inside watch rather than
+/// in a shell is seeing which Work is working right now.
+fn render_work_table(f: &mut Frame, area: Rect, app: &mut App, targets: &[TreeTarget]) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    if targets.is_empty() {
+        render_empty_table(f, area, app, theme);
+        return;
+    }
+    let columns = work_table_columns(area.width);
+    let header =
+        Row::new(columns.iter().map(|column| column.header())).style(theme.table_header_style());
+    let spin = Spinner {
+        frame: app.anim_frame,
+        enabled: app.watch_cfg.spinner && icons_unicode(),
+    };
+    let workspace_names: HashMap<_, _> = app
+        .topology
+        .sessions
+        .iter()
+        .map(|session| (session.key.clone(), session.name.clone()))
+        .collect();
+    let rows: Vec<Row> = targets
+        .iter()
+        .filter_map(|target| {
+            let node = app.topology.find(&target.key)?;
+            let TopologyNodeRef::Window(window) = node else {
+                return None;
+            };
+            let cells = columns
+                .iter()
+                .map(|column| match column {
+                    WorkTableColumn::State => {
+                        Cell::from(tree_state_cell(target, node, theme, spin))
+                    }
+                    WorkTableColumn::Work => Cell::from(window.name.clone()),
+                    WorkTableColumn::Workspace => Cell::from(
+                        workspace_names
+                            .get(&window.key.session)
+                            .cloned()
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    WorkTableColumn::Generation => Cell::from(
+                        window
+                            .pipeline_run
+                            .as_ref()
+                            .map_or_else(|| "-".to_string(), |run| run.generation.to_string()),
+                    ),
+                    WorkTableColumn::Aliases => Cell::from(work_alias_summary(window)),
+                    WorkTableColumn::Done => Cell::from(work_done_cell(window)),
+                    WorkTableColumn::Cwd => Cell::from(work_cwd_cell(window)),
+                })
+                .collect::<Vec<_>>();
+            Some(Row::new(cells))
+        })
+        .collect();
+    let table = Table::new(rows, columns.iter().map(|column| column.constraint()))
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border_style())
+                .border_type(theme.border_type)
+                .title(" Work "),
+        )
+        .row_highlight_style(theme.selected_style())
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
 fn render_tree_table(f: &mut Frame, area: Rect, app: &mut App, tree_targets: &[TreeTarget]) {
@@ -16513,6 +16785,115 @@ mod tests {
                 expected_depths
             );
         }
+    }
+
+    fn work_layout_app() -> App {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%2", 1),
+            fake_topology_pane("default", "$2", "beta", "@2", "DOCS", 0, "%3", 0),
+        ];
+        let agents = vec![
+            topology_agent("auth", "%1", "default", AgentState::Working, "auth", 1),
+            topology_agent("auth2", "%2", "default", AgentState::Idle, "auth", 2),
+            topology_agent("docs", "%3", "default", AgentState::Idle, "docs", 3),
+        ];
+        let mut app = App::with_config(WatchConfig {
+            view: WatchView::Window,
+            layout: WatchLayout::Work,
+            sort: vec![WatchSortKey::Name, WatchSortKey::Pane],
+            hide_paneless: false,
+            ..WatchConfig::default()
+        });
+        app.set_data(agents, panes);
+        app
+    }
+
+    #[test]
+    fn the_work_layout_is_one_flat_row_per_window() {
+        // Sessions and panes fold away: the workspace is a column here, and a
+        // Work's panes are summarised by the ALIASES column.
+        let app = work_layout_app();
+        let targets = app.tree_targets();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|target| target.depth == 0));
+        let names = targets
+            .iter()
+            .map(|target| match app.topology.find(&target.key).unwrap() {
+                TopologyNodeRef::Window(window) => window.name.clone(),
+                other => panic!("work rows are window nodes, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["AUTH", "DOCS"]);
+    }
+
+    #[test]
+    fn a_work_row_still_addresses_a_window_node() {
+        // Everything that acts on the cursor speaks topology keys, so this is
+        // what keeps attach, preview and the composer working unchanged.
+        let mut app = work_layout_app();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(window)) if window.name == "AUTH"
+        ));
+        // Rows from different sessions are siblings of nothing, so the tree's
+        // accordion movement would have stranded the cursor here.
+        app.move_down();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Window(window)) if window.name == "DOCS"
+        ));
+    }
+
+    #[test]
+    fn w_returns_to_the_layout_it_interrupted() {
+        // Always returning to `tree` would silently discard a swarm the
+        // operator was in the middle of using.
+        let mut app = App::with_config(WatchConfig {
+            layout: WatchLayout::Swarm,
+            ..WatchConfig::default()
+        });
+        assert!(matches!(
+            key_action(&mut app, 'W'),
+            Action::SetLayout(WatchLayout::Work)
+        ));
+        app.apply_layout(WatchLayout::Work);
+        assert!(matches!(
+            key_action(&mut app, 'W'),
+            Action::SetLayout(WatchLayout::Swarm)
+        ));
+    }
+
+    #[test]
+    fn the_palette_reaches_the_work_table() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        assert!(matches!(
+            execute_palette_command(&mut app, "layout work"),
+            Action::SetLayout(WatchLayout::Work)
+        ));
+    }
+
+    #[test]
+    fn the_work_table_mirrors_the_work_list_columns() {
+        let mut app = work_layout_app();
+        // Wide enough that the inspector split still leaves every column.
+        let backend = ratatui::backend::TestBackend::new(240, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for column in ["WORK", "WORKSPACE", "GEN", "ALIASES", "DONE", "CWD"] {
+            assert!(painted.contains(column), "missing {column} in {painted}");
+        }
+        assert!(painted.contains("AUTH"), "{painted}");
+        assert!(painted.contains("alpha"), "{painted}");
+        // Two claudes in one window collapse rather than repeating the word.
+        assert!(painted.contains("codex x2"), "{painted}");
     }
 
     #[test]

@@ -201,7 +201,8 @@ enum Cmd {
         /// Default expansion depth: session, window (default), or pane.
         #[arg(long, value_enum)]
         view: Option<WatchViewArg>,
-        /// Presentation of the same topology: nested tree (default) or swarm.
+        /// Presentation of the same topology: nested tree (default), swarm, or
+        /// a flat one-row-per-Work table.
         #[arg(long, value_enum)]
         layout: Option<WatchLayoutArg>,
         /// Which list to open on: the topology (default), or collaboration
@@ -544,6 +545,7 @@ impl From<WatchViewArg> for muxa::config::WatchView {
 pub(crate) enum WatchLayoutArg {
     Tree,
     Swarm,
+    Work,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -566,6 +568,7 @@ impl From<WatchLayoutArg> for muxa::config::WatchLayout {
         match value {
             WatchLayoutArg::Tree => Self::Tree,
             WatchLayoutArg::Swarm => Self::Swarm,
+            WatchLayoutArg::Work => Self::Work,
         }
     }
 }
