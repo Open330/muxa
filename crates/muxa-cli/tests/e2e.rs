@@ -46,6 +46,10 @@ struct Daemon {
     child: Child,
     socket: PathBuf,
     config: PathBuf,
+    /// Keep test processes away from the operator's real tmux server. This is
+    /// especially important for daemon startup, which may heal the tmux-global
+    /// `MUXA_SOCKET` when it owns the selected canonical socket.
+    tmux_tmpdir: PathBuf,
     /// Per-test history NDJSON path. Tests that want to verify on-disk
     /// persistence read this directly; tests that don't care about
     /// history simply ignore it.
@@ -71,6 +75,8 @@ impl Daemon {
         let state_path = dir.join("state.json");
         let activity_path = dir.join("activity.ndjson");
         let session_activity_path = dir.join("session-activity.json");
+        let tmux_tmpdir = dir.join("tmux-tmp");
+        std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
 
         // Default config that isolates persisted state into the per-test tempdir.
         // Tests that want richer config concatenate their own TOML body.
@@ -108,6 +114,9 @@ enabled = false
             .arg("--config")
             .arg(&cfg_path)
             .env("RUST_LOG", "muxa=warn")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env("TMUX_TMPDIR", &tmux_tmpdir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -117,6 +126,7 @@ enabled = false
             child,
             socket,
             config: cfg_path,
+            tmux_tmpdir,
             history: history_path,
             activity: activity_path,
         }
@@ -129,6 +139,9 @@ enabled = false
         // the daemon reads the temporary config while the CLI can pick up an
         // operator's real ~/.config/muxa/config.toml.
         c.env("MUXA_CONFIG", &self.config);
+        c.env_remove("TMUX");
+        c.env_remove("TMUX_PANE");
+        c.env("TMUX_TMPDIR", &self.tmux_tmpdir);
         c
     }
 
@@ -513,6 +526,8 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
     let state_path = dir.join("state.json");
     let activity_path = dir.join("activity.ndjson");
     let session_activity_path = dir.join("session-activity.json");
+    let tmux_tmpdir = dir.join("tmux-tmp");
+    std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
 
     // Tests that want the open surface must explicitly opt into the
     // `auth = "none"` escape hatch. A `Some(token)` case is wired via
@@ -560,6 +575,9 @@ path = "{}"
         .arg("--dashboard-bind")
         .arg("127.0.0.1:0")
         .env("RUST_LOG", "muxa=info")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("TMUX_TMPDIR", &tmux_tmpdir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let Some(t) = token {
@@ -598,6 +616,7 @@ path = "{}"
             child,
             socket,
             config: cfg_path,
+            tmux_tmpdir,
             history: history_path,
             activity: activity_path,
         },
