@@ -15,27 +15,21 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
 ```
 
-이 경로에는 위 필요 조건이 적용되지 않고, 아무것도 설치하지 않습니다. script가
-플랫폼에 맞는 release 바이너리를 임시 디렉터리로 받아 공개된 SHA-256을 검증한 뒤
-진짜 `muxa onboard`를 실행하고, 끝나면 지웁니다. daemon, config, PATH 항목, 실제
-tmux session 조작이 전혀 없습니다.
-
-네트워크가 없거나, release 빌드가 없는 플랫폼이거나, checksum 도구가 없거나,
-`--no-download`를 주면 script에 내장된 20단계 simulation으로 넘어갑니다. 이
-fallback은 같은 시나리오를 순수 ANSI terminal control로 그리며 CPU architecture와
-관계없이 일반 Unix-like terminal에서 실행됩니다. 단계 순서와 입력 키는 실제 tour와
-동일하고 CI가 `muxa onboard --emit step-table`에 맞춰 검증하지만, 실제 tour의 mock
-watch 시뮬레이션·단계별 callout 배치·`F2` 언어 전환·뒤로 가기까지 재현하지는
-않습니다. tour flag는 `sh -s --` 뒤에 전달합니다.
+이 경로는 아무것도 설치하지 않습니다. script가 플랫폼에 맞는 release archive를
+임시 디렉터리로 받아 공개된 SHA-256을 검증한 뒤 진짜 `muxa onboard`를 실행하고,
+끝나면 지웁니다. daemon, config, PATH 항목은 남지 않습니다. live tour는 실행 중에만
+전용 tmux server, daemon, mailbox를 사용하고 종료할 때 sandbox 전체를 삭제합니다.
+launcher로 내려받으려면 network, 지원되는 release 플랫폼, checksum 도구, `tar`가
+필요하고 interactive tour에는 tmux도 필요합니다. release를 내려받아 검증할 수
+없으면 명확한 오류로 끝납니다. tour flag는 `sh -s --` 뒤에 전달합니다.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-Muxa를 설치한 뒤에는 `muxa onboard`로 같은 실습의 native Ratatui 버전을 실행할
-수 있습니다. shell tour를 완료하면 원래 terminal로 돌아온 뒤 권장 Homebrew 명령,
-직접 다운로드 링크와 설치 안내 링크를 짧게 출력합니다.
+Muxa를 설치한 뒤에는 `muxa onboard`로 같은 15단계 live tour를 바로 실행하거나,
+tmux를 사용할 수 없을 때 `muxa onboard --print`로 written guide를 볼 수 있습니다.
 
 ## One-Shot 설치
 

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The live sandbox is now the only `muxa onboard` tour and the default.** The
+  20-step Rust and POSIX-shell simulations, their mock renderers, the hidden
+  `--emit step-table` parity contract, and the parity/split-arrow drivers are
+  gone. `muxa onboard --print` now follows the live tour's fifteen steps.
+  `scripts/onboard.sh` remains a no-install entry point by downloading and
+  verifying a temporary release binary, but no longer carries an offline
+  fallback implementation.
+
 - **`muxa msg send`, `reply`, and `cancel` print a one-line receipt instead of
   the whole stored request.** They dumped every field of the record — each
   timestamp, each `null` — which buries the two facts the caller wants (it went
@@ -49,9 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and failed tmux, muxa, or hook commands stop with their actual error instead
   of leaving the learner at a step that can never advance.
 
-  The sandbox is torn down on every exit path, including `Ctrl-C`. The old
-  simulation remains the default (`--tour simulated`) until the live tour has
-  replaced it outright.
+  The sandbox is torn down on every exit path, including `Ctrl-C`.
 
   No step is a dead end. The sandbox server starts with `-f /dev/null`, so a
   learner who rebound their prefix is not told to press `Ctrl-b` and left
@@ -60,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the learner would have done, so Act II still has a session to put its agents
   in. The first step prints its instruction rather than painting it, because
   nobody is attached to a status bar yet. `F2` switches the narration language
-  mid-tour, as the simulation's footer did.
+  mid-tour.
 
   The scripted agents look like agents. Each pane tails a transcript the tour
   appends to, so the session *grows* — a prompt, tool calls, and, when codex
@@ -149,19 +155,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
-  release binary for the host into a temporary directory, verifies its
-  published SHA-256, runs the onboarding, and deletes it — a download, not an
-  install: no daemon, no config, no PATH entry. The embedded shell simulation
-  remains the fallback for `--no-download`, an unsupported platform, a missing
-  checksum tool, or no network, so the pipe-to-`sh` entry point keeps working
-  offline. The fallback was realigned to the real tour's step decomposition and
-  keys — the splits are one step, detach and reattach are two, pane movement
-  takes `→`, and the attention sort takes `Alt-T` (the macOS compose glyphs
-  `†`/`ˇ` included) rather than a stand-in `t`. `muxa onboard --emit
-  step-table` publishes the key each step waits for, derived by walking the
-  real gates, and `scripts/onboarding-parity.py` presses exactly those keys at
-  the fallback in CI so the two cannot drift apart again.
+- **`scripts/onboard.sh` runs the real `muxa onboard` without installing it.**
+  It fetches the release archive for the host into a temporary directory,
+  verifies its published SHA-256, runs the live tour, and deletes the archive.
+  Unsupported platforms, missing tools, and network failures now produce a
+  clear error instead of entering a separately maintained shell tour.
 
 ### Fixed
 
@@ -169,29 +167,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[watch] view = 'work'`, a value that stopped existing when the watch view
   enum became `session` / `window` / `pane`, so `muxad` refused the config and
   every GIF regeneration failed at daemon start.
-- **An arrow torn across two reads still counts.** The handler added here to
-  drop the phantom `Esc` of a split escape sequence swallowed the CSI tail and
-  returned nothing, which drops the arrow along with the `Esc` — on the one
-  step whose contract accepts an arrow and no letter. A terminal that ships
-  `\x1b` and `[C` in separate writes therefore hit the same dead end this
-  change exists to remove. The final byte now says which key it was.
-  `scripts/split-arrow-check.py` drives the real tour with the sequence torn at
-  1, 20 and 45 ms and is wired into CI.
-- **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
-  it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
-  so a terminal that composes Option instead of sending Meta — the macOS
-  default — could never satisfy it. The gate now also accepts the compose
-  glyph (`†`, `ˇ`), and two missed attempts surface the terminal
-  setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
-  `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
-  relayed through tmux or a slow pty could tear the tour down mid-step; both
-  the tour and the tmux track now confirm an `Esc` before quitting, reassemble
-  the split sequence, and deliver the represented arrow instead of swallowing
-  it. `scripts/onboard.sh` read one byte per key and so quit on *every* arrow
-  key; it now classifies the escape tail the same way and accepts the real
-  `Alt-T`. The download path also capability-checks the release before running
-  it, so a release still predating these fixes falls back to the corrected
-  embedded tour.
 - **Pasting into an attached muxa-owned PTY is safe and complete.** The attach
   relay now enables bracketed paste, forwards the restored framing to the child
   PTY so multiline input is not executed line by line, ignores leaked platform

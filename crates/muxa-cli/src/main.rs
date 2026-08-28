@@ -3477,6 +3477,9 @@ mod tests {
         };
         assert!(onboard.print);
         assert!(onboard.no_quiz);
+        assert_eq!(onboard.tour, onboarding::Tour::Live);
+        assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "live"]).is_ok());
+        assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "simulated"]).is_err());
     }
 
     #[test]
