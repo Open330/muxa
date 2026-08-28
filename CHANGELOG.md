@@ -93,6 +93,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vanished server the way it treats `Ctrl-b d`, and `scripts/exit-check.py`
   holds it there in CI.
 
+  The block printed when nobody is attached stopped fighting the shell. It was
+  written beside a prompt bash had already drawn, which doubled
+  `muxa-onboarding $` and ate characters out of the line under it. It clears
+  the line first, carries a progress bar, and re-issues the prompt itself —
+  and the prompt now shows a one-line reminder of the current step above it,
+  through `PROMPT_COMMAND` rather than `PS1`, because `$(cat …)` strips the
+  trailing newline and ran the reminder into the prompt.
+
+  The tour ends by saying what to do next: the commands it taught, the parts it
+  had no room for (`peek`, `stats`, `timeline`, `work up`, `doctor`), how to
+  install muxa for real, and links to the README and the install guide in the
+  reader's language.
+
   The learner presses Enter rather than typing `claude`. `claude` is neither
   tmux nor muxa — the two things the tour teaches — and the sandbox only
   pretends to have it, so asking for it taught a command that does not exist
