@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The live tour's ending names the keys `muxa init` binds.** It taught
+  `muxa watch` as something you type — true in the sandbox, where nothing is
+  installed — and stopped there, so a learner who finished went on typing it
+  instead of pressing `prefix + s`. The closing summary now lists `prefix + s`,
+  `S`, `D`, `q` and `,` with what each opens, and a test holds that list
+  against the bindings `muxa init` actually writes: a hand-kept copy of
+  somebody else's keys goes stale the first time they change one, and this one
+  tells the learner what their own machine will do.
+
 ### Fixed
 
 - **An alias reserved with `--alias` reached the daemon the launch was talking

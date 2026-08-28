@@ -2318,6 +2318,39 @@ const WORTH_KNOWING: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// What `muxa init` binds, once muxa is installed for real.
+///
+/// The tour teaches `muxa watch` as something you type, because in the sandbox
+/// that is what it is. On an installed muxa it is one key — and a learner who
+/// finishes without being told that goes on typing it.
+const AFTER_INIT: &[(&str, &str, &str)] = &[
+    (
+        "prefix + s",
+        "`muxa watch`, over the whole screen",
+        "`muxa watch`를 전체 화면으로",
+    ),
+    (
+        "prefix + S",
+        "the same across every host in the Fleet",
+        "Fleet의 모든 host를 한 화면에",
+    ),
+    (
+        "prefix + D",
+        "`muxa dashboard` — Work cards, prompts, collaboration",
+        "`muxa dashboard` — Work 카드·프롬프트·협업",
+    ),
+    (
+        "prefix + q",
+        "`muxa peek` — every pane in this window, with a digit to jump by",
+        "`muxa peek` — 이 window의 모든 pane, 숫자로 이동",
+    ),
+    (
+        "prefix + ,",
+        "rename the window, which is to say name the Work",
+        "window 이름 변경 — 곧 Work에 이름 붙이기",
+    ),
+];
+
 /// The tour installs nothing, so it has to say how to get a real muxa.
 const INSTALLING: &[(&str, &str, &str)] = &[
     (
@@ -2369,6 +2402,12 @@ fn next_steps(language: UiLanguage) {
         "Installing it for real",
         "실제로 설치하기",
         INSTALLING,
+    );
+    section(
+        language,
+        "What `muxa init` binds, so you stop typing them",
+        "`muxa init`이 걸어주는 키 — 이제 타이핑하지 않아도 됩니다",
+        AFTER_INIT,
     );
 
     println!();
@@ -2462,6 +2501,30 @@ mod tests {
             Detect::ActivePaneIsCodex
         ));
         assert_eq!(CLAUDE_FINISHES_STEP, STEPS.len() - 1);
+    }
+
+    /// The keys the ending promises are the keys `muxa init` actually binds.
+    ///
+    /// A hand-kept list of somebody else's bindings is a list that goes stale
+    /// the first time they change one — and this one tells the learner what
+    /// their own machine will do, so being wrong is worse than being absent.
+    #[test]
+    fn the_ending_promises_only_keys_init_binds() {
+        let bound = format!(
+            "{}\n{}\n{}",
+            crate::init::files::tmux::POPUP_BODY,
+            crate::init::files::tmux::PEEK_BODY,
+            crate::init::files::tmux::WINDOW_NAMES_BODY,
+        );
+        for (key, ..) in AFTER_INIT {
+            let suffix = key
+                .strip_prefix("prefix + ")
+                .unwrap_or_else(|| panic!("{key} is not a prefix binding"));
+            assert!(
+                bound.contains(&format!("bind-key {suffix} ")),
+                "the ending promises `{key}`, which `muxa init` does not bind"
+            );
+        }
     }
 
     /// Every step says what the last action accomplished, in both languages.
