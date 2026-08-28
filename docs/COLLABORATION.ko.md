@@ -265,7 +265,19 @@ agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
 스킬을 읽으므로 스킬 변경이나 Muxa 업그레이드 뒤에는 기존 agent를 재시작하세요.
 승인된 자동 spawn에서는 pane을 만들기 전에 daemon transition stream을 먼저 구독하고,
 해당 pane의 agent 등록 이벤트가 왔을 때만 room context를 다시 읽습니다. 기존의
-500ms 등록 polling loop는 사용하지 않습니다.
+500ms 등록 polling loop는 사용하지 않습니다. 등록은 전제 조건이 아니라 유예
+구간입니다. `spawn_timeout_secs`(기본 10초) 안에 등록되지 않으면 request는 session이
+아니라 **pane**을 수신자로 큐에 들어갑니다. 이 fallback이 없으면 세션을 지연 생성하는
+agent는 아예 동작하지 않습니다. codex는 TUI가 뜰 때가 아니라 첫 프롬프트가 제출될 때
+`SessionStart`를 발생시키므로, 보내기 전에 등록을 기다리면 지금 보내려는 그 request와
+교착합니다. muxad는 pane이 idle로 읽히는 즉시 배달하고, 그 pane에 처음 등록한 agent
+session이 request를 인계받습니다(같은 room·pane·endpoint일 때만). 그 뒤부터는 다른
+request와 똑같이 session에 고정됩니다. 준비 여부는 muxa가 그 pane에서 agent
+프로세스를 볼 수 있어야 판단되므로, 이 fallback은 discovery가 분류하거나 screen
+manifest가 있는 provider에만 적용됩니다. `opencode` pane spawn은 큐잉 대신 종전처럼
+빠르게 실패합니다.
+결과에는 `peer_pending: true`와 `request_id`가 실리며, 대기는 `muxa_wait_reply`로 합니다.
+`tmux capture-pane` polling으로 대체하지 마세요.
 
 대기는 model이 주도하는 polling loop가 아니라 MCP tool call 하나를 blocking하는
 방식입니다. muxad는 durable mailbox의 단조 증가 revision을 구독하고, revision이
@@ -351,7 +363,13 @@ prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
 
 `Working`, `WaitingInput`, `WaitingChoice`, `Error` 상태에는 입력하지 않습니다.
 화면 감지로 생성된 synthetic agent는 안정적인 session identity가 없어 room
-participant나 자동 wake 대상이 아닙니다. `wake = "never"`로 설정하면 mailbox는
+participant가 아니며 자동 선택 대상도 아닙니다. 예외는 하나입니다. muxa가 띄웠지만
+아직 agent가 등록하지 않은 pane을 **명시적으로 pane 지정**해 보낸 request는 pending
+pane 수신자를 갖고, 그 pane의 synthetic 행은 오직 배달 시점을 정하는 idle 게이트로만
+쓰입니다. 안전장치는 그대로입니다. 시작 승인 게이트는 번들 screen manifest가
+`WaitingInput`/`WaitingChoice`로 분류하므로 배달이 보류되고, muxa launch mark도 없고
+agent 프로세스로 분류되지도 않은 pane은 이 경로로 주소가 지정되지 않으므로 사람의
+shell에 request가 들어갈 일은 없습니다. `wake = "never"`로 설정하면 mailbox는
 유지하면서 모든 입력 주입을 끌 수 있습니다.
 
 기본값인 `wake_payload = "operator_full"`은 resolved sender가 operator console인

@@ -247,7 +247,21 @@ confirmation. Restart existing agents after changing skills or upgrading Muxa
 because their MCP process loads tools and templates at startup.
 For a confirmed automatic spawn, Muxa arms the daemon transition subscription
 before creating the pane and re-reads room context only when that pane's agent
-registers; there is no fixed 500 ms registration loop.
+registers; there is no fixed 500 ms registration loop. Registration is a grace
+period, not a precondition: `spawn_timeout_secs` (default 10) bounds how long
+the call waits before the request is queued against the *pane* instead of a
+session. That fallback is what makes lazily-registering agents work at all —
+codex fires `SessionStart` when its first prompt is submitted, not when its TUI
+boots, so waiting for registration before sending would deadlock against the
+very request being sent. muxad delivers a pane-addressed request as soon as the
+pane reads idle, and the first agent session to register on that pane adopts
+it — same room, same pane, same control endpoint — after which the request is
+session-pinned like any other. Readiness needs muxa to see an agent process on
+the pane, so the fallback is limited to providers discovery classifies or a
+screen manifest covers; a spawned `opencode` pane still fails fast instead of
+queueing work nothing would deliver. The result
+reports `peer_pending: true` and a `request_id` — wait on that with
+`muxa_wait_reply`, never with `tmux capture-pane` polling.
 
 Waiting is a single blocking MCP call, not a model-driven polling loop. muxad
 subscribes to a monotonic durable-mailbox revision and re-reads the exact
@@ -301,8 +315,17 @@ The mailbox is persisted to `$XDG_DATA_HOME/muxa/collaboration.json` before
 delivery. With `idle_only`, muxad injects only when the exact
 hook-authoritative participant is `Idle`. It never injects into `Working`,
 `WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic screen-detected
-agents have no stable session identity, so they are not room participants or
-auto-wake targets.
+agents have no stable session identity, so they are not room participants and
+are never selected automatically.
+
+The single exception is a request explicitly addressed to a pane Muxa launched
+whose agent has not registered yet. Such a request carries a *pending pane*
+recipient, and the pane's synthetic row serves only as the idle gate for
+delivering it. Safety is unchanged where it matters: a startup approval gate
+still blocks delivery, because the bundled screen manifests classify it as
+`WaitingInput`/`WaitingChoice` rather than `Idle`. A pane with no muxa launch
+mark and no classified agent process is never addressable this way, so a
+human's shell can never receive a queued request.
 
 `wake_payload = "operator_full"` is the default. Requests whose resolved sender
 is the operator console — currently watch and dashboard messages — are claimed

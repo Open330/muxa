@@ -182,7 +182,12 @@ Automatic spawning defaults to the other provider when possible. Before it
 creates the pane, the tool arms muxad's transition stream and then re-reads the
 authoritative room only when the spawned pane registers. This removes the old
 500 ms peer-registration polling loop and closes the fast-start lost-wakeup
-race.
+race. Registration is a grace period rather than a precondition:
+`spawn_timeout_secs` (default 10) bounds it, and a pane that has not registered
+by then receives the request as a *pending pane* recipient — muxad delivers it
+once the pane reads idle and the session that registers there adopts it. The
+result then carries `peer_pending: true`; keep waiting with `muxa_wait_reply`
+on the returned `request_id` and never fall back to `tmux capture-pane`.
 
 Registered message skills can be selected with or without a leading slash:
 
