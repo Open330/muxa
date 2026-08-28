@@ -86,6 +86,10 @@ jobs:
       # A sandbox that leaks a daemon or a tmux server is worse than no
       # sandbox, so the suite asserts teardown is total from every state.
       - run: scripts/sandbox-smoke.sh
+      # A sandbox that reads the caller's ~/.tmux.conf is not a sandbox: their
+      # hooks run inside it, and muxa's own `tmux-auto-view` detaches the
+      # learner the moment they attach.
+      - run: python3 scripts/config-isolation-check.py
 
   live-tour:
     name: live tour

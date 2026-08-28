@@ -347,8 +347,17 @@ impl Sandbox {
 
     fn tmux_command(&self, args: &[&str]) -> Result<String> {
         let socket = self.env_value("MUXA_TMUX_SOCKET");
+        // `-f` so no call of the tour's can start a server that reads the
+        // learner's `~/.tmux.conf`. Their hooks running inside the sandbox is
+        // what detached them the moment they attached.
+        let config = self.env_value("MUXA_SANDBOX_TMUX_CONFIG");
+        let config = if config.is_empty() {
+            "/dev/null".to_string()
+        } else {
+            config
+        };
         let out = Command::new(&self.tmux)
-            .args(["-u", "-S", &socket])
+            .args(["-u", "-f", &config, "-S", &socket])
             .args(args)
             .output()
             .context("running tmux against the sandbox")?;
