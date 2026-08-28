@@ -3016,6 +3016,16 @@ impl Client {
         }
     }
 
+    /// The daemon this client talks to.
+    ///
+    /// Callers that hand a socket to something else — a blocking helper, a
+    /// child process — need the one this client resolved, not whatever
+    /// `paths::default_socket()` would pick.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket_path
+    }
+
     /// Label this client for collaboration provenance. This changes audit
     /// metadata only; it grants and removes no authority.
     #[must_use]

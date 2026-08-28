@@ -78,6 +78,9 @@ jobs:
       # hooks run inside it, and muxa's own `tmux-auto-view` detaches the
       # learner the moment they attach.
       - run: python3 scripts/config-isolation-check.py
+      # An alias reserved against the wrong daemon leaves the right one
+      # unaware, and it hands the name out twice.
+      - run: python3 scripts/alias-socket-check.py
 
   live-tour:
     name: live tour

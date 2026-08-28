@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An alias reserved with `--alias` reached the daemon the launch was talking
+  to.** `mark_agent` registered the name against `paths::default_socket()`
+  regardless of `--socket`, `MUXA_SOCKET`, or a socket set in config. Against
+  any other daemon the name was taken in a room that knew nothing about the
+  pane, while the room that owned it never heard — so its next minted handle
+  could hand the same name to a second pane, and two panes answered to one
+  alias. With no daemon on the default socket the reservation was skipped
+  silently, which is the arbitration this call exists to perform.
+  `StartRequest` carries the socket now, `Client::socket()` reports it, and
+  `scripts/alias-socket-check.py` reserves `codex` in a sandbox and asserts the
+  next pane mints `codex2`.
+
 ### Changed
 
 - **The live sandbox is now the only `muxa onboard` tour and the default.** The

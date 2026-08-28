@@ -867,6 +867,7 @@ async fn call_tool(
                 Err(error) => return Ok(error_result(&error)),
             };
             let request = crate::agent_launch::StartRequest {
+                socket: client.socket().to_path_buf(),
                 agent,
                 placement,
                 target: args
@@ -1829,6 +1830,7 @@ async fn spawn_peer(
         return Err("call_peer automatic spawn currently requires a native tmux agent pane".into());
     }
     let request = crate::agent_launch::StartRequest {
+        socket: client.socket().to_path_buf(),
         agent: program,
         placement: crate::agent_launch::Placement::Pane,
         target: Some(room.current.pane.clone()),
