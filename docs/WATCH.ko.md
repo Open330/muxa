@@ -23,6 +23,13 @@ child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로
 보여줍니다. 지속되는 Work와 외부 이슈 상태는 이 tree가 아니라 `muxa dashboard`가
 담당합니다.
 
+pane 보기에서 실제 window가 하나뿐인 session은 `session › window` 한 행으로
+압축하고 pane을 바로 아래에 표시합니다. 압축 행의 선택 의미는 session으로
+유지되므로 `n`, rename, close는 계속 session을 대상으로 합니다. 정확한 window
+단위 동작은 window 보기로 전환하면 됩니다. window가 여러 개인 session은 기존의
+전체 계층을 유지하며, 검색·attention filter 중에도 일치 결과가 원래부터 단일
+window였던 것처럼 보이지 않도록 전체 session → window → pane ancestry를 표시합니다.
+
 ## 주요 키
 
 | Key | Action |

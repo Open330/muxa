@@ -7,7 +7,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Topology ──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  STATE   SESSION / WINDOW / PANE                           AGE     SUMMARY                                         │
-│  ▶       tmux:amux ▸ junia                                 —       1 window · 1 agent                              │
+│  ▶       tmux:amux ▸ junia › DOCS                          <rel> release approval                                │
 │  ◆ ● ○   tmux:default ▼ muxa                               —       2 windows · 3 agents                            │
 │> ◆ ●       ├─ ▼ TEST-0001                                  <rel> 2 agents · reviewing changes / editing middlewar│
 │  ●         │ ├─   %12  codex                               <rel> editing middleware                              │
