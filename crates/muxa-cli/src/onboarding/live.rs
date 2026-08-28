@@ -2105,6 +2105,9 @@ impl Tour<'_> {
             .arg(&self.sandbox.rcfile)
             .spawn()
             .context("starting your shell")?;
+        // From here on bash owns the line, so a printed block has to clear it
+        // and put the prompt back.
+        self.seen.prompt = true;
 
         let mut index = 0usize;
         let mut entered = Instant::now();
@@ -2181,7 +2184,13 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
         )
     );
 
-    let completed = {
+    // The sandbox is kept alive past `drive` on purpose. Tearing it down first
+    // meant the learner watched a blank terminal for the several seconds it
+    // takes to stop a daemon and wait for it to actually exit, and only then
+    // got the part worth reading. Everything that does not depend on the
+    // teardown is printed before it runs; the one line that claims the sandbox
+    // is gone waits until it is.
+    let (completed, sandbox) = {
         let sandbox = Sandbox::create()?;
         // The daemon comes up before the learner has anything, because a hook
         // sent while it is down is dropped rather than queued.
@@ -2196,11 +2205,22 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
             prompts_at_entry: 0,
             no_quiz,
         };
-        tour.drive()?
-        // `Drop` tears the sandbox down here, on every path including a panic.
+        (tour.drive()?, sandbox)
     };
 
-    summary(language, completed);
+    outcome_line(language, completed);
+    next_steps(language);
+    // `Drop` tears the sandbox down here, on every path including a panic.
+    drop(sandbox);
+    println!();
+    println!(
+        "  {}",
+        tr(
+            language,
+            "The sandbox is gone — no daemon, no config, nothing left on disk.",
+            "sandbox는 사라졌습니다 — daemon도 config도 남지 않았습니다.",
+        )
+    );
     Ok(())
 }
 
@@ -2294,27 +2314,26 @@ const INSTALLING: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn summary(language: UiLanguage, completed: usize) {
+/// How the tour ended, said before anything slow happens.
+fn outcome_line(language: UiLanguage, completed: usize) {
     println!();
     println!(
-        "{}",
+        "{BOLD}{}{RESET}",
         if completed >= STEPS.len() {
             tr(
                 language,
-                "Done. The sandbox is gone — no daemon, no config, nothing left on disk.",
-                "끝났습니다. sandbox는 사라졌습니다 — daemon도 config도 남지 않았습니다.",
+                "Done — all sixteen steps.",
+                "끝났습니다 — 16단계 전부.",
             )
         } else {
-            tr(
-                language,
-                "Stopped early. The sandbox is gone — no daemon, no config, nothing left on disk.",
-                "중간에 종료했습니다. sandbox는 사라졌습니다 — daemon도 config도 남지 않았습니다.",
-            )
+            tr(language, "Stopped early.", "중간에 종료했습니다.")
         }
     );
+}
 
-    // Everything below is about the learner's own machine. A tour that ends
-    // without saying how to keep what you just learned to use is a demo.
+/// Everything below is about the learner's own machine. A tour that ends
+/// without saying how to keep what you just learned to use is a demo.
+fn next_steps(language: UiLanguage) {
     section(
         language,
         "The same commands, on your own fleet",
