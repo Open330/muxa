@@ -37,12 +37,27 @@ HERE = pathlib.Path(__file__).resolve().parent
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--name", default="aliassock")
-    ap.add_argument("--muxa", default="target/debug/muxa")
-    ap.add_argument("--muxad", default="target/debug/muxad")
+    ap.add_argument("--muxa", help="defaults to whichever of target/{debug,release} exists")
+    ap.add_argument("--muxad", help="likewise")
     args = ap.parse_args()
 
-    muxa = str(pathlib.Path(args.muxa).resolve())
-    muxad = str(pathlib.Path(args.muxad).resolve())
+    def built(name: str, given: str | None) -> str:
+        """The binary to use: what was asked for, else whichever is built.
+
+        Defaulting to `target/debug` alone meant a release-only checkout failed
+        with `muxad not found` from inside the sandbox script, which reads as a
+        sandbox problem rather than a missing flag.
+        """
+        if given:
+            return str(pathlib.Path(given).resolve())
+        for profile in ("debug", "release"):
+            candidate = pathlib.Path("target") / profile / name
+            if candidate.exists():
+                return str(candidate.resolve())
+        sys.exit(f"no {name} built: run `cargo build --workspace --bins` or pass --{name}")
+
+    muxa = built("muxa", args.muxa)
+    muxad = built("muxad", args.muxad)
     sock = f"/tmp/{args.name}-sandbox/tmux.sock"
     script = str(HERE / "muxa-sandbox.sh")
 
