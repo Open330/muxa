@@ -13,6 +13,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -32,6 +33,14 @@ def main() -> int:
     args = ap.parse_args()
 
     muxa = str(pathlib.Path(args.muxa).resolve())
+    # A stand-in `codex`, because the runner has none and a pane whose command
+    # cannot exec closes before its metadata is stamped. Held to a gate below:
+    # if the real one ever wins the PATH, this check would be starting agents
+    # on somebody's machine rather than testing handle arbitration.
+    fake_bin = pathlib.Path(tempfile.mkdtemp())
+    fake = fake_bin / "codex"
+    fake.write_text("#!/bin/sh\nexec sleep 600\n")
+    fake.chmod(0o755)
     env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
     # No daemon on the default socket: the old code had nothing to reserve
     # against and failed the launch outright.
@@ -41,7 +50,8 @@ def main() -> int:
     failures = 0
     try:
         up = sandbox(args.name, "up", "--muxa", muxa,
-                     "--muxad", str(pathlib.Path(args.muxad).resolve()), env=env)
+                     "--muxad", str(pathlib.Path(args.muxad).resolve()),
+                     "--extra-path", str(fake_bin), env=env)
         if up.returncode != 0:
             print(f"  FAIL  sandbox did not come up\n{up.stdout}\n{up.stderr}")
             return 1
@@ -80,6 +90,15 @@ def main() -> int:
             capture_output=True, text=True, env=sandbox_env,
         ).stdout.split()
         held, other = panes[0], panes[1]
+
+        which = subprocess.run(
+            ["/bin/sh", "-c", "command -v codex"],
+            capture_output=True, text=True, env=sandbox_env,
+        ).stdout.strip()
+        if which != str(fake):
+            print(f"  FAIL  the stand-in codex does not win the sandbox PATH   ({which!r})")
+            return 1
+        print("  ok    the stand-in codex wins the sandbox PATH")
 
         started = subprocess.run(
             [muxa, "agent", "start", "--agent", "codex", "--alias", "codex",
