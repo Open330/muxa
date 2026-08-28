@@ -7,7 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`muxa msg send`, `reply`, and `cancel` print a one-line receipt instead of
+  the whole stored request.** They dumped every field of the record — each
+  timestamp, each `null` — which buries the two facts the caller wants (it went
+  through, and whether an answer is coming) under thirty lines of JSON. `--json`
+  still prints the record.
+
+- **`muxa msg list` and `muxa msg inbox` show the reply.** They printed the
+  request and its status and stopped there, so the sender saw their own question
+  marked `Completed` with the answer they came for nowhere on screen.
+
+- **Caller provenance is printed only when it is worth knowing.** Every
+  ordinary request is `matched`, and stamping `[via cli pane=%2 pid=3874566
+  matched]` on each of them turned a mailbox into a debug log. A `mismatched`
+  or `unverifiable` origin still says so.
+
 ### Added
+
+- **`muxa onboard --tour live` — the onboarding stops simulating muxa and
+  becomes it.** Fifteen steps in two acts, against a sandbox on its own tmux
+  server: Act I is real `tmux new-session`, a real second window, a real detach
+  proving the work kept running, and a real reattach; Act II adds two scripted
+  agents to the learner's own window and walks them through real `muxa watch`,
+  `muxa attend`, `muxa msg send @claude` and `muxa msg inbox` over a real
+  mailbox. The states are produced by feeding `muxad` the same hook payloads
+  the agent CLIs send, so nothing on screen is drawn.
+
+  Narration goes through tmux's own status rows rather than a pane or a popup:
+  a narration pane would be split and zoomed by the very exercises Act I
+  teaches, and `display-popup` is modal and does not expand `#{}` formats.
+  Because the narration never owns the keyboard, no step can wait on a
+  keypress — each one polls real tmux and real muxa state and advances when the
+  learner has actually done the thing, which is why the tour is driven with
+  real commands instead of a quiz. `scripts/live-tour-smoke.py` types those
+  commands in CI and checks the tour keeps up.
+
+  Each invocation now allocates its own private PID-scoped directory, daemon,
+  and tmux socket. Concurrent tours cannot erase or reuse one another's state,
+  and failed tmux, muxa, or hook commands stop with their actual error instead
+  of leaving the learner at a step that can never advance.
+
+  The sandbox is torn down on every exit path, including `Ctrl-C`. The old
+  simulation remains the default (`--tour simulated`) until the live tour has
+  replaced it outright.
+
+  No step is a dead end. The sandbox server starts with `-f /dev/null`, so a
+  learner who rebound their prefix is not told to press `Ctrl-b` and left
+  stranded; any step offers `F12` to move past it after 45 seconds, and
+  `--no-quiz` offers that from the first step; and skipping performs whatever
+  the learner would have done, so Act II still has a session to put its agents
+  in. The first step prints its instruction rather than painting it, because
+  nobody is attached to a status bar yet. `F2` switches the narration language
+  mid-tour, as the simulation's footer did.
+
+  The scripted agents look like agents. Each pane tails a transcript the tour
+  appends to, so the session *grows* — a prompt, tool calls, and, when codex
+  goes to `waiting`, the approval prompt that explains why. `muxa watch`'s
+  inspector and preview both render the selected pane's live screen, so a fleet
+  parked on one static line makes those features look broken and makes the tour
+  assert what it should be showing. Windows are named after the Work rather
+  than after whatever is running in them, so the topology reads as
+  `checkout · 3 agents` instead of `muxa` and `bash`. None of it shells out to
+  an agent CLI, and each transcript says so on its first line.
+
+  Fifteen steps, not nine, and one action each. Compressing them put two
+  instructions on a line — "see both: Ctrl-b s · then leave: Ctrl-b d" — which
+  reads as one and leaves the learner unsure which half registered. `Ctrl-b s`,
+  `tmux ls`, `Ctrl-b ;` and `muxa msg list` are steps in their own right now;
+  the learner's shell reports what it ran, so a step whose action is a command
+  can be detected rather than bolted onto the end of another cue.
+
+  The fleet stays on screen. The learner's pane was zoomed so `muxa watch`
+  could have the whole screen, which hid the two agents that had just arrived —
+  the step confirmed an arrival the learner could not see, above an instruction
+  to look at the whole Work, over a blank pane. `main-vertical` gives them at
+  least 80 columns on the left and stacks claude and codex on the right, which
+  is both what watch needs and what the next four steps are about.
+
+  The learner starts the agent themselves. Splitting a pane is one step and
+  typing `claude` in it is the next, because a pane that turns into an agent on
+  its own teaches that panes become agents by magic. `claude` resolves to a
+  shim on the sandbox `PATH`, so what comes up is the tour's screen and the
+  real CLI is never invoked — and the pane the learner ran it in is the pane
+  the hook registers, which is what turns "a pane is an agent" from a sentence
+  into something they did.
+
+  The tour runs in a workspace of its own. It has its own `HOME` and a
+  `checkout-service` tree — the files the scripted agents say they are reading,
+  so `cat crates/checkout/src/auth.rs` answers — and every pane starts there,
+  so `ls` shows the practice project and `muxa watch` stops printing the
+  learner's real path as an agent's cwd. This is a convincing workspace rather
+  than a jail: `cd /` still works, because a real filesystem confinement needs
+  bubblewrap or a mount namespace and neither is available unprivileged on
+  every platform muxa runs on.
+
+  Codex's approval prompt answers. A prompt reading `[y] yes  [n] no` that
+  swallows the keystroke invites the learner to do the one thing the tour has
+  made impossible; pressing `y` now appends the tool output and fires the hook
+  a resuming agent fires, so the row in watch goes back to `working`. claude
+  answers the learner's question through the mailbox rather than only on its
+  own screen, straight away — a reply they can find with `muxa msg list` is
+  what a durable mailbox is for.
+
+  The steps say what their commands do: that `attend` goes to whichever agent
+  has been blocked longest and lands you in its pane, and that `Ctrl-b ;`
+  returns to the pane you were in before. The placeholder session is removed as
+  soon as the learner has one of their own, so the `tmux ls` that step 3 asks
+  for shows their session and not the tour's plumbing. And the step is part of
+  the shell prompt while they are detached, instead of printed underneath a
+  prompt bash had already drawn — which read as the shell having gone away.
+
+  Every step opens by saying what the last action did — `✓ second window
+  created, see both in the top row` — because a tour that only ever says what
+  to do next leaves the learner typing commands and guessing whether any of
+  them landed. tmux's own status row is left alone for the same reason: the
+  narration had been painted over the window list, so pressing `Ctrl-b c`
+  produced no visible result anywhere on screen.
 
 - **`scripts/muxa-sandbox.sh` — a throwaway muxa that cannot reach the real
   one.** The isolation the demo recordings had grown privately is now a
@@ -196,6 +313,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before either, dropping each rather than clipping it: a truncated
   `%1242` or `@claude2` is still a well-formed address for a different
   pane.
+
+### Changed
+
+- **`scripts/onboard.sh` now runs the real `muxa onboard`.** It fetches the
+  release binary for the host into a temporary directory, verifies its
+  published SHA-256, runs the onboarding, and deletes it — a download, not an
+  install: no daemon, no config, no PATH entry. The embedded shell simulation
+  remains the fallback for `--no-download`, an unsupported platform, a missing
+  checksum tool, or no network, so the pipe-to-`sh` entry point keeps working
+  offline. The fallback was realigned to the real tour's step decomposition and
+  keys — the splits are one step, detach and reattach are two, pane movement
+  takes `→`, and the attention sort takes `Alt-T` (the macOS compose glyphs
+  `†`/`ˇ` included) rather than a stand-in `t`. `muxa onboard --emit
+  step-table` publishes the key each step waits for, derived by walking the
+  real gates, and `scripts/onboarding-parity.py` presses exactly those keys at
+  the fallback in CI so the two cannot drift apart again.
+
+### Fixed
+
+- **Onboarding no longer dead-ends on `Alt-T`, and arrow keys no longer quit
+  it.** The `Alt-T` gate was the tour's only step without an `Alt`-free path,
+  so a terminal that composes Option instead of sending Meta — the macOS
+  default — could never satisfy it. The gate now also accepts the compose
+  glyph (`†`, `ˇ`), and two missed attempts surface the terminal
+  setting from `docs/WATCH.md` plus `→` to move on. Separately, a lone
+  `ESC` byte that arrives in its own read is reported as `Esc`, so an arrow key
+  relayed through tmux or a slow pty could tear the tour down mid-step; both
+  the tour and the tmux track now confirm an `Esc` before quitting and
+  reassemble the split sequence. `scripts/onboard.sh` read one byte per key
+  and so quit on *every* arrow key; it now classifies the escape tail the same
+  way and accepts the real `Alt-T`.
 
 ## [0.8.35] - 2026-08-22
 

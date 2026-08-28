@@ -87,6 +87,25 @@ jobs:
       # sandbox, so the suite asserts teardown is total from every state.
       - run: scripts/sandbox-smoke.sh
 
+  live-tour:
+    name: live tour
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: cargo build --workspace --bins
+      # The tour claims it never intercepts a keystroke, so every step has to be
+      # reachable by typing the command the narration asks for. This types them.
+      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa
+      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --lang ko
+      # Issue #76 was a gate with no way around it; this is the check that
+      # the live tour cannot repeat that.
+      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --mode skip
+
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest

@@ -5,6 +5,7 @@
 //! fullscreen terminal to a stable `muxa watch` mock with location-aware
 //! dialogs. `--print` remains available for scripts and accessibility.
 
+mod live;
 mod tmux;
 
 use anyhow::{Context, Result};
@@ -37,9 +38,26 @@ pub struct Args {
     /// Display language: auto, en, or ko. / 표시 언어: auto, en, ko.
     #[arg(long, value_enum, default_value_t)]
     pub lang: Language,
+    /// Which tour to run: the built-in simulation, or a throwaway muxa.
+    #[arg(long, value_enum, default_value_t)]
+    pub tour: Tour,
     /// Machine-readable dump for tooling, printed instead of the tour.
     #[arg(long, value_enum, hide = true)]
     pub emit: Option<Emit>,
+}
+
+/// Which onboarding to run.
+///
+/// A value rather than a `--live` flag because `Args` is already at clippy's
+/// bool ceiling, and because the default is the thing that moves once the live
+/// tour covers both acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Tour {
+    /// Draw the scenario; change nothing, need nothing.
+    #[default]
+    Simulated,
+    /// Run the real muxa against a sandbox on its own tmux server.
+    Live,
 }
 
 /// Machine-readable dumps `muxa onboard` can print instead of running.
@@ -292,6 +310,9 @@ pub fn run(args: Args) -> Result<()> {
         return Ok(());
     }
     apply_icon_preference();
+    if args.tour == Tour::Live && !args.print {
+        return live::run(args.lang.resolve(), args.no_quiz);
+    }
     let mode = Mode::detect(args.print);
     let language = args.lang.resolve();
     match mode {
@@ -627,7 +648,7 @@ fn is_alt_chord(key: KeyEvent, letter: char) -> bool {
 /// nothing else in the same syscall, so an escape sequence split across reads —
 /// an arrow key relayed through tmux, or a slow pty — surfaces as a phantom
 /// quit. Wait this long before trusting `Esc`.
-const ESC_SEQUENCE_GRACE: Duration = Duration::from_millis(50);
+const ESC_SEQUENCE_GRACE: Duration = Duration::from_millis(100);
 
 /// Read one key, dropping the phantom `Esc` of a split escape sequence.
 pub(super) fn read_key_event() -> Result<Option<KeyEvent>> {

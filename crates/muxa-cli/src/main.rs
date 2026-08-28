@@ -33,8 +33,8 @@ use muxa::adapters::{
     OpencodeAdapter,
 };
 use muxa::collaboration::{
-    AirArtifactReference, CollaborationClientKind, CollaborationOrigin, NewRequest, RequestKind,
-    RequestMailbox, RequestStatus, WorkMode,
+    AirArtifactReference, CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch,
+    NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
 };
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
@@ -342,6 +342,9 @@ enum MsgCmd {
         /// Fire-and-forget message; do not expect a reply.
         #[arg(long)]
         no_reply: bool,
+        /// Print the stored request instead of a one-line receipt.
+        #[arg(long)]
+        json: bool,
     },
     /// Claim and print this agent's pending requests.
     Inbox {
@@ -366,6 +369,9 @@ enum MsgCmd {
         /// AIR 1 artifact reference as JSON. Repeat for multiple references.
         #[arg(long = "air-ref")]
         air_refs: Vec<String>,
+        /// Print the stored request instead of a one-line receipt.
+        #[arg(long)]
+        json: bool,
     },
     /// Wait for the structured reply to a sent request.
     Wait {
@@ -375,7 +381,12 @@ enum MsgCmd {
         timeout_secs: u64,
     },
     /// Cancel a request that the recipient has not claimed yet.
-    Cancel { request_id: String },
+    Cancel {
+        request_id: String,
+        /// Print the stored request instead of a one-line receipt.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -974,6 +985,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             paths,
             air_refs,
             no_reply,
+            json,
         } => {
             let kind = collaboration_request_kind(&kind)?;
             let air_artifacts = collaboration_air_references(&air_refs)?;
@@ -995,7 +1007,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     },
                 )
                 .await?;
-            println!("{}", serde_json::to_string_pretty(&request)?);
+            print_collaboration_receipt(&request, json)?;
         }
         MsgCmd::Inbox { json } => {
             let requests = client.collaboration_inbox(&origin).await?;
@@ -1028,6 +1040,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             status,
             artifacts,
             air_refs,
+            json,
         } => {
             let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
@@ -1040,15 +1053,15 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &air_artifacts,
                 )
                 .await?;
-            println!("{}", serde_json::to_string_pretty(&request)?);
+            print_collaboration_receipt(&request, json)?;
         }
         MsgCmd::Wait {
             request_id,
             timeout_secs,
         } => cmd_msg_wait(client, &origin, &request_id, timeout_secs).await?,
-        MsgCmd::Cancel { request_id } => {
+        MsgCmd::Cancel { request_id, json } => {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
-            println!("{}", serde_json::to_string_pretty(&request)?);
+            print_collaboration_receipt(&request, json)?;
         }
     }
     Ok(())
@@ -1069,6 +1082,42 @@ async fn cmd_msg_wait(
     } else {
         anyhow::bail!("timed out waiting for {request_id}")
     }
+}
+
+/// What `send`, `reply`, and `cancel` say when they worked.
+///
+/// They used to print the whole stored request — every timestamp, every
+/// `null` — which buries the two facts the caller wants (it went through, and
+/// whether an answer is coming) under thirty lines of JSON. `--json` still
+/// gives the record for anything that wants to parse it.
+fn print_collaboration_receipt(
+    request: &muxa::collaboration::CollaborationRequest,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(request)?);
+        return Ok(());
+    }
+    match request.status {
+        RequestStatus::Cancelled => println!("cancelled  {}", request.id),
+        // A reply on the request means this was `msg reply`, not `msg send`.
+        _ if request.reply.is_some() => {
+            println!("replied  {}  to {}", request.id, request.from.label());
+        }
+        _ => {
+            let awaiting = if request.expects_reply {
+                "awaiting reply"
+            } else {
+                "no reply expected"
+            };
+            println!(
+                "sent  {}  to {}  ({awaiting})",
+                request.id,
+                request.to.label()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_collaboration_messages(
@@ -1092,20 +1141,36 @@ fn print_collaboration_messages(
             } else {
                 format!("from {}", request.from.label())
             };
-            let provenance = request.provenance.as_ref().map_or_else(String::new, |p| {
-                let caller = p
-                    .observed_pane
-                    .as_deref()
-                    .map_or_else(|| "pane=?".into(), |pane| format!("pane={pane}"));
-                let pid = p
-                    .caller_pid
-                    .map_or_else(String::new, |pid| format!(" pid={pid}"));
-                format!("  [via {} {caller}{pid} {}]", p.client_kind, p.origin_match)
-            });
+            // Only when it is worth knowing. `matched` is every ordinary
+            // request, and printing the caller's pid and pane on each of them
+            // turns a mailbox into a debug log — which is what a first look at
+            // `muxa msg list` used to be.
+            let provenance = request
+                .provenance
+                .as_ref()
+                .filter(|p| p.origin_match != CollaborationOriginMatch::Matched)
+                .map_or_else(String::new, |p| {
+                    let caller = p
+                        .observed_pane
+                        .as_deref()
+                        .map_or_else(|| "pane=?".into(), |pane| format!("pane={pane}"));
+                    let pid = p
+                        .caller_pid
+                        .map_or_else(String::new, |pid| format!(" pid={pid}"));
+                    format!("  [via {} {caller}{pid} {}]", p.client_kind, p.origin_match)
+                });
             println!(
                 "{}  {:?}  {:?}  {}{}\n  {}",
                 request.id, request.status, request.kind, direction, provenance, request.body,
             );
+            // Without this the sender sees their own question and a status, and
+            // the answer they were told to come here for is nowhere on screen.
+            if let Some(reply) = &request.reply {
+                println!("  <- {:?}: {}", reply.status, reply.body);
+                for artifact in &reply.artifacts {
+                    println!("     {artifact}");
+                }
+            }
         }
     }
     Ok(())
