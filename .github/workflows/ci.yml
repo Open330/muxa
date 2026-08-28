@@ -93,6 +93,9 @@ jobs:
       # Issue #76 was a gate with no way around it; this is the check that
       # the live tour cannot repeat that.
       - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --mode skip
+      # `exit` closes the last pane, and with it the sandbox server the tour is
+      # polling. That is a way out, not a crash.
+      - run: python3 scripts/exit-check.py --muxa target/debug/muxa
 
   msrv:
     name: MSRV (1.89)
