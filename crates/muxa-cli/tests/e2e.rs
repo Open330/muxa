@@ -185,7 +185,10 @@ fn onboarding_prints_even_when_config_is_invalid() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Muxa live onboarding · 15 steps"));
+    // Not the count — that lives in the tour, and pinning a number here is how
+    // the guide came to claim fifteen steps while the tour ran sixteen.
+    assert!(stdout.contains("Muxa live onboarding ·"));
+    assert!(stdout.contains("steps"));
     assert!(stdout.contains("private tmux server, muxad, and mailbox"));
     assert!(stdout.contains("tmux new-session -s muxa-onboarding"));
     assert!(stdout.contains("tmux ls"));
@@ -207,7 +210,8 @@ fn onboarding_prints_even_when_config_is_invalid() {
         .expect("run Korean onboarding");
     assert!(korean.status.success());
     let stdout = String::from_utf8_lossy(&korean.stdout);
-    assert!(stdout.contains("Muxa 라이브 온보딩 · 15단계"));
+    assert!(stdout.contains("Muxa 라이브 온보딩 ·"));
+    assert!(stdout.contains("단계"));
     assert!(stdout.contains("전용 tmux server, muxad, mailbox"));
     assert!(stdout.contains("muxa msg send @claude \"어디까지 됐나요?\""));
     assert!(stdout.contains("session은 workspace"));
@@ -226,7 +230,8 @@ fn onboarding_prints_even_when_config_is_invalid() {
         .expect("run unified onboarding through the compatibility alias");
     assert!(compatibility_alias.status.success());
     let stdout = String::from_utf8_lossy(&compatibility_alias.stdout);
-    assert!(stdout.contains("Muxa 라이브 온보딩 · 15단계"));
+    assert!(stdout.contains("Muxa 라이브 온보딩 ·"));
+    assert!(stdout.contains("단계"));
     assert!(stdout.contains("muxa msg inbox"));
     assert!(stdout.contains("F12"));
 }

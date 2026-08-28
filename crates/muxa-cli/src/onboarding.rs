@@ -87,109 +87,6 @@ fn tr(language: UiLanguage, en: &'static str, ko: &'static str) -> &'static str 
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PrintableStep {
-    meaning_en: &'static str,
-    meaning_ko: &'static str,
-    action_en: &'static str,
-    action_ko: &'static str,
-}
-
-/// Written counterpart of `live::STEPS`: fifteen one-action steps in the same
-/// order. It deliberately explains effects instead of reproducing a terminal.
-const PRINTABLE_STEPS: &[PrintableStep] = &[
-    PrintableStep {
-        meaning_en: "Create a tmux session: a workspace that keeps running without you.",
-        meaning_ko: "당신 없이도 계속 실행되는 workspace인 tmux session을 만듭니다.",
-        action_en: "type:  tmux new-session -s muxa-onboarding",
-        action_ko: "입력:  tmux new-session -s muxa-onboarding",
-    },
-    PrintableStep {
-        meaning_en: "Create a second window. In Muxa, one window is one Work.",
-        meaning_ko: "두 번째 window를 만듭니다. Muxa에서 window 하나는 Work 하나입니다.",
-        action_en: "press: Ctrl-b, then c",
-        action_ko: "입력:  Ctrl-b를 눌렀다 떼고 c",
-    },
-    PrintableStep {
-        meaning_en: "Open the tree to see sessions and their windows, then close it.",
-        meaning_ko: "tree를 열어 session과 그 안의 window를 확인한 뒤 닫습니다.",
-        action_en: "press: Ctrl-b, then s; q closes the tree",
-        action_ko: "입력:  Ctrl-b를 눌렀다 떼고 s; q로 tree 닫기",
-    },
-    PrintableStep {
-        meaning_en: "Detach. The client leaves, while the session and work keep running.",
-        meaning_ko: "detach합니다. client만 나가고 session과 작업은 계속 실행됩니다.",
-        action_en: "press: Ctrl-b, then d",
-        action_ko: "입력:  Ctrl-b를 눌렀다 떼고 d",
-    },
-    PrintableStep {
-        meaning_en: "Confirm from your shell that the detached session is still running.",
-        meaning_ko: "원래 shell에서 detach한 session이 계속 실행 중인지 확인합니다.",
-        action_en: "type:  tmux ls",
-        action_ko: "입력:  tmux ls",
-    },
-    PrintableStep {
-        meaning_en: "Attach again; every window and pane is still there.",
-        meaning_ko: "다시 attach합니다. 모든 window와 pane이 그대로 남아 있습니다.",
-        action_en: "type:  tmux attach -t muxa-onboarding",
-        action_ko: "입력:  tmux attach -t muxa-onboarding",
-    },
-    PrintableStep {
-        meaning_en: "Split the window. In Muxa, one pane is one agent.",
-        meaning_ko: "window를 나눕니다. Muxa에서 pane 하나는 agent 하나입니다.",
-        action_en: "press: Ctrl-b, then % (\" splits top and bottom)",
-        action_ko: "입력:  Ctrl-b를 눌렀다 떼고 % (\"는 상하 분할)",
-    },
-    PrintableStep {
-        meaning_en: "Start an agent in the new pane. The sandbox supplies a safe CLI stand-in.",
-        meaning_ko: "새 pane에서 agent를 시작합니다. sandbox가 안전한 CLI 대역을 제공합니다.",
-        action_en: "type:  claude",
-        action_ko: "입력:  claude",
-    },
-    PrintableStep {
-        meaning_en: "See the whole checkout Work and its agents in the real Muxa watch.",
-        meaning_ko: "실제 Muxa watch에서 checkout Work와 agent 전체를 확인합니다.",
-        action_en: "run:   muxa watch (q leaves it)",
-        action_ko: "입력:  muxa watch (q로 나가기)",
-    },
-    PrintableStep {
-        meaning_en: "Jump to the agent that has been blocked longest.",
-        meaning_ko: "가장 오래 막혀 있는 agent로 이동합니다.",
-        action_en: "run:   muxa attend",
-        action_ko: "입력:  muxa attend",
-    },
-    PrintableStep {
-        meaning_en: "Return from the agent pane to the pane you were using before.",
-        meaning_ko: "agent pane에서 직전에 사용하던 자신의 pane으로 돌아갑니다.",
-        action_en: "press: Ctrl-b, then ; (Ctrl-b o cycles instead)",
-        action_ko: "입력:  Ctrl-b를 눌렀다 떼고 ; (Ctrl-b o는 순환)",
-    },
-    PrintableStep {
-        meaning_en: "Ask an agent a question without attaching to its pane.",
-        meaning_ko: "agent pane에 attach하지 않고 질문을 보냅니다.",
-        action_en: "run:   muxa msg send @claude \"how far along?\"",
-        action_ko: "입력:  muxa msg send @claude \"어디까지 됐나요?\"",
-    },
-    PrintableStep {
-        meaning_en: "List what you sent and the reply that came back.",
-        meaning_ko: "보낸 메시지와 돌아온 답장을 함께 확인합니다.",
-        action_en: "run:   muxa msg list",
-        action_ko: "입력:  muxa msg list",
-    },
-    PrintableStep {
-        meaning_en: "Claim requests addressed to you. Agents use the same Muxa mailbox.",
-        meaning_ko: "당신 앞으로 온 요청을 가져옵니다. agent도 같은 Muxa mailbox를 사용합니다.",
-        action_en: "run:   muxa msg inbox",
-        action_ko: "입력:  muxa msg inbox",
-    },
-    PrintableStep {
-        meaning_en: "Finish: session is a workspace, window is a Work, pane is an agent.",
-        meaning_ko: "완료: session은 workspace, window는 Work, pane은 agent입니다.",
-        action_en: "press: Ctrl-b, then d; the tour deletes the sandbox",
-        action_ko: "입력:  Ctrl-b를 눌렀다 떼고 d; tour가 sandbox 삭제",
-    },
-];
-
 pub fn run(args: Args) -> Result<()> {
     let language = args.lang.resolve();
     if args.print {
@@ -209,11 +106,10 @@ fn printable_guide(language: UiLanguage) -> String {
     let _ = writeln!(
         guide,
         "{}",
-        tr(
-            language,
-            "Muxa live onboarding · 15 steps",
-            "Muxa 라이브 온보딩 · 15단계"
-        )
+        match language {
+            UiLanguage::En => format!("Muxa live onboarding · {} steps", live::step_count()),
+            UiLanguage::Ko => format!("Muxa 라이브 온보딩 · {}단계", live::step_count()),
+        }
     );
     let _ = writeln!(guide, "================================");
     let _ = writeln!(guide);
@@ -237,18 +133,19 @@ fn printable_guide(language: UiLanguage) -> String {
     );
     let _ = writeln!(guide);
 
-    for (index, step) in PRINTABLE_STEPS.iter().enumerate() {
+    // Walked from the tour's own steps rather than kept beside them. The
+    // simulation had a hand-written copy of its curriculum and a whole parity
+    // harness to hold the two together; a second copy here drifted the moment
+    // a step was inserted — the guide claimed fifteen while the tour ran
+    // sixteen, and its test asserted the stale number so nothing failed.
+    for (index, step) in live::steps().iter().enumerate() {
         let _ = writeln!(
             guide,
             "{:>2}. {}",
             index + 1,
-            tr(language, step.meaning_en, step.meaning_ko)
+            tr(language, step.title_en, step.title_ko)
         );
-        let _ = writeln!(
-            guide,
-            "    {}",
-            tr(language, step.action_en, step.action_ko)
-        );
+        let _ = writeln!(guide, "    {}", tr(language, step.cue_en, step.cue_ko));
     }
 
     let _ = writeln!(guide);
@@ -298,13 +195,18 @@ mod tests {
     }
 
     #[test]
-    fn printable_guide_has_the_live_tours_fifteen_steps_in_both_languages() {
+    fn printable_guide_lists_exactly_the_tours_steps_in_both_languages() {
         for language in [UiLanguage::En, UiLanguage::Ko] {
             let guide = printable_guide(language);
             let steps = numbered_steps(&guide);
-            assert_eq!(steps.len(), 15);
+            // Against the tour, not against a number: a hand-kept count went
+            // stale the first time a step was inserted, and its test passed.
+            assert_eq!(steps.len(), live::step_count());
             assert!(steps[0].starts_with(" 1."));
-            assert!(steps[14].starts_with("15."));
+            assert!(
+                guide.contains(&format!("{} steps", live::step_count()))
+                    || guide.contains(&format!("{}단계", live::step_count()))
+            );
         }
     }
 
@@ -332,7 +234,7 @@ mod tests {
         }
 
         let korean = printable_guide(UiLanguage::Ko);
-        assert!(korean.contains("15단계"));
+        assert!(korean.contains(&format!("{}단계", live::step_count())));
         assert!(korean.contains("어디까지 됐나요?"));
     }
 }

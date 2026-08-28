@@ -1413,15 +1413,15 @@ enum Detect {
     ClaimedInbox,
 }
 
-struct Step {
+pub(super) struct Step {
     /// What the learner's last action actually did. Shown as this step opens,
     /// because "did that work?" is the question they are holding.
-    achieved_en: &'static str,
-    achieved_ko: &'static str,
-    title_en: &'static str,
-    title_ko: &'static str,
-    cue_en: &'static str,
-    cue_ko: &'static str,
+    pub(super) achieved_en: &'static str,
+    pub(super) achieved_ko: &'static str,
+    pub(super) title_en: &'static str,
+    pub(super) title_ko: &'static str,
+    pub(super) cue_en: &'static str,
+    pub(super) cue_ko: &'static str,
     detect: Detect,
 }
 
@@ -1584,6 +1584,17 @@ const STEPS: &[Step] = &[
         detect: Detect::NoClient,
     },
 ];
+/// The tour's steps, so the printable guide can be generated from them rather
+/// than kept beside them.
+pub(super) fn steps() -> &'static [Step] {
+    STEPS
+}
+
+/// How many actions the tour asks for.
+pub(super) fn step_count() -> usize {
+    STEPS.len()
+}
+
 /// The step that opens once the learner has started claude: the pane they ran
 /// it in becomes claude's, and codex lands beside it.
 const AGENTS_ARRIVE: usize = 8;
