@@ -46,7 +46,7 @@ use muxa::config::{
     WatchSummary, WatchTheme, WatchTreeExpansion, WatchView, WidthSpec,
 };
 use muxa::event::RateLimitScope;
-use muxa::ipc::{Client, RuntimeError};
+use muxa::ipc::{Client, RuntimeError, VersionSkew};
 use muxa::process_tree::WorkloadProcessKind;
 use muxa::session_activity::SessionActivity;
 use muxa::state::Agent;
@@ -981,6 +981,90 @@ impl WatchRow {
 pub(crate) struct DaemonError {
     pub message: String,
     pub self_describing: bool,
+}
+
+/// Ask the daemon who it is, and record it when the answer is a different
+/// build than this one.
+///
+/// Run once at startup and again after a restart. A skew does not change
+/// between refreshes — the daemon would have to be replaced for that, which is
+/// exactly the event we re-probe on — so this stays off the 500 ms tick.
+///
+/// A `hello` that fails outright is left alone: the daemon is unreachable or
+/// refusing, and `last_error` already carries a better sentence for that than
+/// a version comparison could.
+/// Restart the daemon from inside watch and wait for the replacement to be
+/// serving, without printing anything — the TUI owns the screen.
+///
+/// Completion is the new image's generation, not the daemon's acknowledgement.
+/// A daemon accepts a restart before it drains, so returning on the ack would
+/// report success while the old process was still the one answering, and the
+/// skew re-probe that follows would read the corpse.
+async fn restart_daemon_from_watch(client: &Client) -> std::result::Result<(), String> {
+    let before = client
+        .hello(Duration::from_secs(2))
+        .await
+        .map_err(|error| error.to_string())?;
+    if !before.capabilities.iter().any(|c| c == "restart") {
+        return Err("this muxad is too old to restart itself; run `muxa daemon restart`".into());
+    }
+    let generation = before
+        .generation
+        .ok_or_else(|| "muxad did not report an image generation".to_string())?;
+    let request_error = client.restart(Duration::from_secs(5)).await.err();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(after) = client.hello(Duration::from_secs(1)).await {
+            if after.generation.is_some_and(|now| now > generation) {
+                return Ok(());
+            }
+        }
+    }
+    Err(request_error.map_or_else(
+        || "muxad accepted the restart but did not come back".to_string(),
+        |error| error.to_string(),
+    ))
+}
+
+async fn probe_version_skew(client: &Client, app: &mut App) {
+    if let Ok(hello) = client.hello(Duration::from_secs(2)).await {
+        app.version_skew = hello.version_skew();
+    }
+}
+
+/// The one-line warning for a daemon that is out of step, or `None` when the
+/// two halves agree.
+///
+/// Covers both shapes of the same problem. A skew detected through `hello` is
+/// the quiet one — every request still succeeds, so nothing else on screen
+/// would ever mention it. A `protocol mismatch` in `last_error` is the loud
+/// one, where the daemon is old enough to refuse the requests outright and the
+/// table has been empty ever since. Both are fixed by the same keystroke, so
+/// both get the same bar.
+pub(crate) fn skew_banner(app: &App) -> Option<String> {
+    let mismatched = app
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.message.contains("protocol mismatch"));
+    let skew = app.version_skew.as_ref();
+    if skew.is_none() && !mismatched {
+        return None;
+    }
+    let versions = skew.map_or_else(
+        || "muxad is older than this CLI".to_string(),
+        |skew| {
+            format!(
+                "muxad {} \u{2260} muxa {}",
+                skew.daemon_label(),
+                skew.client
+            )
+        },
+    );
+    Some(format!(
+        "\u{26a0} {versions} \u{2014} the daemon kept running across the upgrade. \
+         Fix it here: `:daemon restart`"
+    ))
 }
 
 /// A power-user action requested against the currently-selected row.
@@ -2656,6 +2740,11 @@ pub(crate) struct App {
     pub unread_events: usize,
     pub event_inbox_open: bool,
     pub last_error: Option<DaemonError>,
+    /// Set when the daemon answering this watch is not the same build as this
+    /// binary. Held separately from `last_error` because it is not an error —
+    /// nothing has failed yet, and on a matching protocol nothing will. It is
+    /// the state that silently precedes every mismatch after an upgrade.
+    pub version_skew: Option<VersionSkew>,
     pub last_refresh: OffsetDateTime,
     /// Watch config — held by value so the rendering path doesn't need to
     /// re-resolve columns every frame, and the smoke tests can swap it in.
@@ -2985,6 +3074,7 @@ impl App {
             unread_events: 0,
             event_inbox_open: false,
             last_error: None,
+            version_skew: None,
             last_refresh: OffsetDateTime::now_utc(),
             watch_cfg: cfg,
             columns,
@@ -7114,6 +7204,10 @@ pub async fn run(
         .draw(|f| render(f, &mut app))
         .map_err(anyhow::Error::from)?;
     refresh_watch_collaboration(client, &mut app).await;
+    // After the first paint, so a stale daemon delays nothing the user sees,
+    // and before the loop, so the bar is up on the very first frame that has
+    // data on it.
+    probe_version_skew(client, &mut app).await;
 
     // Background refresh task owns its own Client clone so the borrowed
     // `client: &Client` doesn't have to outlive the task. The clone is
@@ -7250,6 +7344,33 @@ pub async fn run(
                     request_refresh(&mut app, &wake_tx);
                     refresh_watch_collaboration(client, &mut app).await;
                     refresh_fleet_collaboration(client, &mut app).await;
+                }
+                Action::RestartDaemon => {
+                    match restart_daemon_from_watch(client).await {
+                        Ok(()) => {
+                            // Re-probe rather than assuming: a restart that
+                            // came back on the same stale binary (a failed
+                            // install, a shadowed `PATH`) must keep the bar up
+                            // instead of reporting a fix that did not happen.
+                            probe_version_skew(client, &mut app).await;
+                            if app.version_skew.is_some() {
+                                app.set_hint(
+                                    "muxad restarted but is still a different build — check which binary is on PATH",
+                                    HintLevel::Err,
+                                );
+                            } else {
+                                app.last_error = None;
+                                app.set_hint(
+                                    "muxad restarted onto the installed binary",
+                                    HintLevel::Ok,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            app.set_hint(format!("muxad restart failed: {error}"), HintLevel::Err);
+                        }
+                    }
+                    request_refresh(&mut app, &wake_tx);
                 }
                 Action::OpenPreview => {
                     let pane_key = if app.uses_tree() {
@@ -8695,6 +8816,9 @@ pub(crate) enum Action {
     None,
     Quit,
     Refresh,
+    /// Drain and re-exec the daemon onto whatever binary is installed now.
+    /// The remedy for the skew bar, reachable without leaving watch.
+    RestartDaemon,
     /// Attach to a pane that was pinned by an overlay.
     AttachPane(String),
     /// Attach using the complete host+socket ancestry.
@@ -8868,6 +8992,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "interrupt selected agent pane (confirm)",
     },
     CommandSpec {
+        command: "daemon restart",
+        description: "restart a stale muxad onto the installed binary",
+    },
+    CommandSpec {
         command: "help",
         description: "show keybindings",
     },
@@ -8907,6 +9035,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "copy" | "yank" => quick_copy_action(app),
         "kill" => quick_kill_action(app),
         "abort" => quick_abort_action(app),
+        "daemon restart" => Action::RestartDaemon,
         "help" | "?" => Action::Quick(QuickAction::ShowHelp),
         "attention" => {
             app.toggle_attention_only();
@@ -13037,7 +13166,19 @@ fn render_header(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
         title
     };
 
-    let status_line = if let Some(e) = app.last_error.as_ref() {
+    // The skew bar outranks the raw daemon error. When the daemon is stale,
+    // the error text is a symptom the reader cannot act on ("protocol
+    // mismatch: server=4 client=6" names no remedy and no culprit), while the
+    // bar names both. When there is no error at all, the bar is the only thing
+    // that will ever mention the skew.
+    let status_line = if let Some(banner) = skew_banner(app) {
+        Line::from(Span::styled(
+            banner,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if let Some(e) = app.last_error.as_ref() {
         // The NotConnected variant already reads as a complete sentence
         // ("daemon not reachable at … — is `muxad` running? …"), so a
         // `daemon error: ` prefix would just stutter. Other IO errors
@@ -22654,6 +22795,78 @@ sort = ["state"]
         assert_eq!(app.paneless_attention, 2);
     }
 
+    #[test]
+    fn a_matching_daemon_raises_no_bar() {
+        let app = App::new();
+        assert_eq!(skew_banner(&app), None);
+    }
+
+    #[test]
+    fn a_skewed_daemon_names_both_versions_and_the_remedy() {
+        let mut app = App::new();
+        app.version_skew = Some(VersionSkew {
+            daemon: Some("0.8.35".to_string()),
+            client: "0.8.37",
+        });
+        let banner = skew_banner(&app).expect("a skewed daemon must raise the bar");
+        assert!(banner.contains("0.8.35"), "{banner}");
+        assert!(banner.contains("0.8.37"), "{banner}");
+        assert!(banner.contains(":daemon restart"), "{banner}");
+    }
+
+    #[test]
+    fn a_protocol_mismatch_alone_still_raises_the_bar() {
+        // The loud case: too old to answer `hello`, so there is no version to
+        // print — but the remedy is identical and must still be on screen.
+        let mut app = App::new();
+        app.last_error = Some(DaemonError {
+            message: "protocol mismatch: server=4 client=6".to_string(),
+            self_describing: false,
+        });
+        let banner = skew_banner(&app).expect("a mismatch must raise the bar");
+        assert!(banner.contains(":daemon restart"), "{banner}");
+    }
+
+    #[test]
+    fn an_unrelated_daemon_error_keeps_its_own_line() {
+        // The bar outranks the error line, so it must not claim errors that
+        // have nothing to do with a stale daemon.
+        let mut app = App::new();
+        app.last_error = Some(DaemonError {
+            message: "daemon not reachable at /tmp/muxa-501.sock".to_string(),
+            self_describing: true,
+        });
+        assert_eq!(skew_banner(&app), None);
+    }
+
+    #[test]
+    fn the_skew_bar_replaces_the_error_line_on_screen() {
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.version_skew = Some(VersionSkew {
+            daemon: Some("0.8.35".to_string()),
+            client: "0.8.37",
+        });
+        app.last_error = Some(DaemonError {
+            message: "protocol mismatch: server=4 client=6".to_string(),
+            self_describing: false,
+        });
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(dump.contains("0.8.35"), "{dump}");
+        assert!(
+            !dump.contains("protocol mismatch"),
+            "the bare mismatch text must not take the line from the remedy: {dump}"
+        );
+    }
+
     /// Footer surfaces the hidden-paneless count so the rows aren't
     /// silently lost. The hint also tells the user how to reveal them.
     #[test]
@@ -23633,6 +23846,7 @@ sort = ["state"]
             | Action::ConfirmYes
             | Action::ConfirmCancel
             | Action::Quick(_)
+            | Action::RestartDaemon
             | Action::NotApplicable(_) => {}
         }
     }
